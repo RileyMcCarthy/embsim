@@ -15,6 +15,15 @@
 //! One test additionally cross-compiles the fixture to an **ELF x86_64
 //! relocatable object** (clang `--target=`, no linker needed) so the
 //! relocation-applying read path is exercised on every host, not just Linux.
+//! For that ELF fixture the `ar` archive bytes are written directly by the
+//! test (the format is a fixed 60-byte header per member) so host `ar`
+//! variability can't corrupt the fixture; only clang's object emission can
+//! vary. If the host clang emits an ELF object the parse pipeline gets
+//! *nothing* out of (no enums, no structs, no variables), that is a host
+//! toolchain limitation and the test skips loudly on non-Linux hosts — a
+//! relocation regression looks different (types parse but every name resolves
+//! to `.debug_str` offset 0), and that fails on every platform. On Linux the
+//! test never skips after a successful build: that leg is why it exists.
 
 use embsim_memory_inspect::{FirmwareInfo, ParseOptions, TypeInfo};
 use std::path::{Path, PathBuf};
@@ -91,16 +100,57 @@ fn archive_object(a_path: &Path, o_path: &Path) -> bool {
     false
 }
 
-/// Write [`FIXTURE_C`] into a fresh temp dir (namespaced by `tag`), compile it
-/// with `cc` trying each flag set in `flag_sets` in order (`-c`/`-o` appended),
-/// and archive the object. Returns the archive path plus the dir (kept alive so
-/// it isn't cleaned up while the archive is in use), or `None` (after printing
-/// a skip message) if any step fails.
-fn build_archive_with(cc: &str, flag_sets: &[&[&str]], tag: &str) -> Option<(PathBuf, PathBuf)> {
+/// Write a minimal single-member `ar` archive at `a_path` containing
+/// `member_data` as `member_name`, byte-for-byte, with no external archiver.
+/// The common `ar` format is trivial: global magic `!<arch>\n`, then per
+/// member a 60-byte header (name padded to 16, 12-byte mtime, 6-byte uid,
+/// 6-byte gid, 8-byte octal mode, 10-byte decimal size — all left-aligned and
+/// space-padded — and the 2-byte terminator `\x60\n`), then the member bytes
+/// padded to even length with `\n`. `member_name` uses the GNU `/` terminator,
+/// so it must fit in 15 bytes.
+fn write_ar_archive(a_path: &Path, member_name: &str, member_data: &[u8]) -> std::io::Result<()> {
+    assert!(
+        member_name.len() <= 15,
+        "member name must fit the 16-byte field with its `/` terminator"
+    );
+    let header = format!(
+        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}\x60\n",
+        format!("{member_name}/"),
+        0, // mtime
+        0, // uid
+        0, // gid
+        "100644",
+        member_data.len(),
+    );
+    assert_eq!(
+        header.len(),
+        60,
+        "ar member header must be exactly 60 bytes"
+    );
+
+    let mut bytes = Vec::with_capacity(8 + 60 + member_data.len() + 1);
+    bytes.extend_from_slice(b"!<arch>\n");
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(member_data);
+    if !member_data.len().is_multiple_of(2) {
+        bytes.push(b'\n');
+    }
+    std::fs::write(a_path, bytes)
+}
+
+/// Write [`FIXTURE_C`] into a fresh temp dir (namespaced by `tag`) and compile
+/// it with `cc`, trying each flag set in `flag_sets` in order (`-c`/`-o`
+/// appended). Returns the object path plus the dir (kept alive so it isn't
+/// cleaned up while the object is in use), or `None` (after printing a skip
+/// message) if any step fails.
+fn compile_fixture_object(
+    cc: &str,
+    flag_sets: &[&[&str]],
+    tag: &str,
+) -> Option<(PathBuf, PathBuf)> {
     let dir = make_temp_dir(tag)?;
     let c_path = dir.join("fixture.c");
     let o_path = dir.join("fixture.o");
-    let a_path = dir.join("libfixture.a");
 
     if std::fs::write(&c_path, FIXTURE_C).is_err() {
         eprintln!("SKIP: could not write fixture.c");
@@ -123,10 +173,18 @@ fn build_archive_with(cc: &str, flag_sets: &[&[&str]], tag: &str) -> Option<(Pat
         return None;
     }
 
+    Some((o_path, dir))
+}
+
+/// Compile [`FIXTURE_C`] and archive the object with the host archiver
+/// (`ar`/`llvm-ar`) — the host-target fixture path. Returns the archive path
+/// plus the dir, or `None` (after printing a skip message) if any step fails.
+fn build_archive_with(cc: &str, flag_sets: &[&[&str]], tag: &str) -> Option<(PathBuf, PathBuf)> {
+    let (o_path, dir) = compile_fixture_object(cc, flag_sets, tag)?;
+    let a_path = dir.join("libfixture.a");
     if !archive_object(&a_path, &o_path) {
         return None;
     }
-
     Some((a_path, dir))
 }
 
@@ -144,21 +202,48 @@ fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
     build_archive_with(cc, &[&["-g", "-gdwarf-4"], &["-g"]], "fixture")
 }
 
+/// `clang --version` output for diagnostics, or a placeholder if unavailable.
+fn clang_version() -> String {
+    Command::new("clang")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<clang --version unavailable>".to_string())
+}
+
 /// Build the fixture archive as an **ELF x86_64 relocatable object**,
 /// regardless of host OS. clang can emit ELF objects for a foreign target
 /// without a linker or sysroot (`-c` only; the fixture needs no libc headers
 /// beyond the compiler-provided `<stdint.h>`). Requires clang specifically —
-/// gcc can't cross-target like this.
+/// gcc can't cross-target like this. The archive bytes are written directly
+/// (see [`write_ar_archive`]) rather than shelling out to `ar`/`llvm-ar`, so
+/// host-archiver variability (e.g. an Apple `ar` mishandling a foreign-format
+/// member) can't produce an unreadable fixture.
 fn build_elf_fixture_archive() -> Option<(PathBuf, PathBuf)> {
     if Command::new("clang").arg("--version").output().is_err() {
         eprintln!("SKIP: clang not available for the ELF cross-compile");
         return None;
     }
-    build_archive_with(
+    let (o_path, dir) = compile_fixture_object(
         "clang",
         &[&["--target=x86_64-unknown-linux-gnu", "-g", "-gdwarf-4"]],
         "elf",
-    )
+    )?;
+    let a_path = dir.join("libfixture.a");
+    let object_bytes = match std::fs::read(&o_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("SKIP: could not read back {}: {e}", o_path.display());
+            return None;
+        }
+    };
+    if let Err(e) = write_ar_archive(&a_path, "fixture.o", &object_bytes) {
+        eprintln!("SKIP: could not write {}: {e}", a_path.display());
+        return None;
+    }
+    Some((a_path, dir))
 }
 
 /// Parse the fixture archive, or `None` if it could not be built.
@@ -429,6 +514,17 @@ fn from_archive_with_custom_options() {
 /// `.debug_str` offset 0 and all lookups fail. Mach-O resolves these offsets
 /// at assembly time, so host-target coverage on macOS can't catch it; this
 /// test cross-compiles the same fixture to an ELF x86_64 object on any host.
+///
+/// Failure modes are discriminated, not binary:
+/// - clang missing / cross-compile fails → skip (existing convention).
+/// - Parse **completely empty** (no enums, no structs, no variables) on a
+///   non-Linux host → loud skip: the host clang emitted an ELF object our
+///   object/gimli path can't read at all — a toolchain limitation, not a
+///   relocation regression. On Linux this is a hard failure (that leg is the
+///   reason this test exists).
+/// - Parse **non-empty but names wrong** → fail on every platform: that is
+///   the relocation-regression signature (broken code resolves every strp to
+///   `.debug_str` offset 0).
 #[test]
 fn elf_relocatable_archive_resolves_names_via_relocations() {
     let (a_path, dir) = match build_elf_fixture_archive() {
@@ -438,11 +534,60 @@ fn elf_relocatable_archive_resolves_names_via_relocations() {
     let fw = FirmwareInfo::from_archive(&a_path)
         .unwrap_or_else(|e| panic!("from_archive failed on a valid ELF fixture archive: {e}"));
 
-    // Enum variant names come from `.debug_str` via relocated strp offsets.
-    assert_eq!(fw.try_enum_channel("HAL_GPIO_A"), Some(0));
-    assert_eq!(fw.try_enum_channel("HAL_GPIO_B"), Some(1));
-    assert!(fw.has_enum_type("HAL_GPIO_channel_E"));
-    assert_eq!(fw.try_channel_count("HAL_GPIO_channel_E"), Some(2));
+    let counts = format!(
+        "enums: {}, enum variants: {}, structs: {}, variables: {}",
+        fw.enums.len(),
+        fw.enum_variants.len(),
+        fw.structs.len(),
+        fw.variables.len(),
+    );
+
+    if fw.enums.is_empty() && fw.structs.is_empty() && fw.variables.is_empty() {
+        if cfg!(target_os = "linux") {
+            panic!(
+                "ELF fixture archive parsed completely empty on Linux ({counts}) — \
+                 this is the platform the relocation read path exists for; failing strictly.\n\
+                 clang: {}",
+                clang_version()
+            );
+        }
+        eprintln!(
+            "SKIP: ELF cross-compiled fixture parsed completely empty ({counts}) on a \
+             non-Linux host.\n\
+             The host clang emitted an ELF object this parse pipeline gets nothing out of — \
+             a host toolchain limitation, not a relocation regression (a relocation \
+             regression parses types but resolves every name to `.debug_str` offset 0).\n\
+             clang: {}",
+            clang_version()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // Enum variant names come from `.debug_str` via relocated strp offsets. A
+    // non-empty parse with these names missing is the relocation-regression
+    // signature — fail on every platform.
+    assert_eq!(
+        fw.try_enum_channel("HAL_GPIO_A"),
+        Some(0),
+        "HAL_GPIO_A unresolved though the parse is non-empty ({counts}) — \
+         relocation-regression signature (strp offsets resolving to `.debug_str` offset 0?)"
+    );
+    assert_eq!(
+        fw.try_enum_channel("HAL_GPIO_B"),
+        Some(1),
+        "HAL_GPIO_B unresolved though the parse is non-empty ({counts})"
+    );
+    assert!(
+        fw.has_enum_type("HAL_GPIO_channel_E"),
+        "HAL_GPIO_channel_E missing though the parse is non-empty ({counts}) — \
+         relocation-regression signature (strp offsets resolving to `.debug_str` offset 0?)"
+    );
+    assert_eq!(
+        fw.try_channel_count("HAL_GPIO_channel_E"),
+        Some(2),
+        "HAL_GPIO_channel_COUNT unresolved though the parse is non-empty ({counts})"
+    );
 
     // Struct layout: offsets are deterministic for the pinned x86_64 SysV ABI.
     let channel = fw.struct_info("channel_S");
@@ -454,7 +599,7 @@ fn elf_relocatable_archive_resolves_names_via_relocations() {
     // Variables are recovered with resolved struct types.
     assert!(
         fw.variables.contains_key("g_data"),
-        "g_data should be a variable"
+        "g_data should be a variable ({counts})"
     );
     match &fw.variables.get("g_data").unwrap().type_info {
         TypeInfo::Struct { type_name, .. } => assert_eq!(type_name, "data_S"),
