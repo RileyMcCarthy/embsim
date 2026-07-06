@@ -37,12 +37,10 @@ mod server;
 mod ui;
 
 pub use recorder::{
-    Signal, groups, CVariableWatch, FirmwareVariable,
-    record, record_at, register, register_c_variable,
-    c_watches, catalog, catalog_version, read_new_samples,
-    set_firmware_info, firmware_catalog, enum_definitions,
-    activate_firmware_signal, deactivate_signal,
-    poll_interval_us, set_poll_interval_us, resample_all, spawn_poller, clear,
+    activate_firmware_signal, c_watches, catalog, catalog_version, clear, deactivate_signal,
+    enum_definitions, firmware_catalog, groups, poll_interval_us, read_new_samples, record,
+    record_at, register, register_c_variable, resample_all, set_firmware_info,
+    set_poll_interval_us, spawn_poller, CVariableWatch, FirmwareVariable, Signal,
 };
 #[cfg(feature = "web")]
 pub use server::register_view;

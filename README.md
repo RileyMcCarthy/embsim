@@ -1,5 +1,8 @@
 # embsim
 
+[![CI](https://github.com/RileyMcCarthy/embsim/actions/workflows/ci.yml/badge.svg)](https://github.com/RileyMcCarthy/embsim/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A generic **software-in-the-loop (SIL) emulator framework** for embedded firmware.
 
 embsim links your real firmware C code against Rust implementations of its
@@ -8,10 +11,11 @@ the firmware runs unmodified on a host with **no physical hardware**. Host
 software (a desktop app, a test harness) talks to the emulated serial port
 through a `/dev` PTY symlink, exactly as it would to a real board.
 
-It was extracted from the [MaD](../../..) tensile tester but is designed to be
-reused: the `core`, `peripherals`, `models`, `runtime`, and `tools` crates carry
-no MaD- or Propeller-2-specific assumptions. A new project supplies a *platform
-crate* and a *machine*, and gets a runnable emulator.
+It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD)
+and is designed to be reused: the `core`, `peripherals`, `models`, `runtime`,
+and `tools` crates carry no project- or Propeller-2-specific assumptions. A new
+project supplies a *platform crate* and a *machine*, and gets a runnable
+emulator.
 
 ## Crate layering
 
@@ -41,7 +45,25 @@ crate* and a *machine*, and gets a runnable emulator.
 ```
 
 The dependency graph is acyclic: **no generic crate depends on a project crate.**
-MaD-specific code lives in `MaDSim/`, `embsim-mad-models/`, and `mad-protocol/`.
+Project-specific code (machine wiring, physics models, the emulator binary)
+lives in the consumer's repo — see MaD's
+[`SIL/`](https://github.com/RileyMcCarthy/MaD/tree/main/SIL) for a complete
+reference consumer.
+
+## Repository layout
+
+| Crate | Path | What it is |
+|-------|------|------------|
+| `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
+| `embsim-peripherals` | [`peripherals/`](peripherals) | GPIO, serial, encoder, pulse trains, timer, locks, threads, I2C, filesystem |
+| `embsim-models` | [`models/`](models) | Generic device/IC models (ADS122U04 ADC, limit switch, edge detector) |
+| `embsim-runtime` | [`runtime/`](runtime) | `Emulator` builder, `Platform`/`Machine` traits, init ordering |
+| `embsim-p2` | [`platforms/p2/`](platforms/p2) | Reference platform: Parallax Propeller 2 HAL trampolines + constants |
+| `embsim-build` | [`build-support/`](build-support) | Two-line `build.rs` helper to find & link `lib<firmware>.a` |
+| `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from the firmware archive |
+| `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
+| `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer (and your custom views) mount into |
+| `embsim-minimal-example` | [`examples/minimal/`](examples/minimal) | Complete runnable firmware-free template |
 
 ## What a new project provides
 
@@ -102,36 +124,71 @@ to firmware whose enums were renamed.
 A complete, runnable, firmware-free template is in
 [`examples/minimal/`](examples/minimal/src/main.rs) — `cargo run -p embsim-minimal-example`.
 
+## Using embsim in your project
+
+embsim is a Cargo workspace of path crates (not yet on crates.io). Consume it
+as a **git submodule** and point path dependencies at the crates you need:
+
+```bash
+git submodule add https://github.com/RileyMcCarthy/embsim.git vendor/embsim
+```
+
+```toml
+# your-emulator/Cargo.toml
+[dependencies]
+embsim-core        = { path = "../vendor/embsim/core" }
+embsim-peripherals = { path = "../vendor/embsim/peripherals" }
+embsim-runtime     = { path = "../vendor/embsim/runtime" }
+embsim-p2          = { path = "../vendor/embsim/platforms/p2" }   # or your own platform crate
+embsim-models      = { path = "../vendor/embsim/models" }
+
+[build-dependencies]
+embsim-build       = { path = "../vendor/embsim/build-support" }
+```
+
+Your workspace should `exclude` the submodule directory (embsim is its own
+workspace root) — path dependencies across the boundary work fine:
+
+```toml
+[workspace]
+exclude = ["vendor/embsim"]
+```
+
+Build your firmware as a static library with its HAL symbols left undefined and
+debug info enabled (`-g`), then link it from `build.rs`:
+
+```rust
+// build.rs
+fn main() {
+    embsim_build::link_firmware_static("../firmware/build", "firmware");
+}
+```
+
+The archive location can be overridden without editing `build.rs` via
+`EMBSIM_FIRMWARE_LIB_DIR` / `EMBSIM_FIRMWARE_LIB_NAME` (see the `embsim-build`
+crate docs).
+
 ## One firmware per OS process (by construction)
 
 The firmware HAL is bound through process-global `#[no_mangle]` symbols against a
 single `libfirmware.a`. **There is therefore exactly one firmware per OS
-process.** To run several instances, run several processes (the MaD Playwright
+process.** To run several instances, run several processes (MaD's Playwright
 suite does this with `workers: 1`). Do **not** try to instance-scope the HAL
 layer — the Rust statics in `peripherals` are not the constraint; the single C
 symbol set is. (The host-side *tools* — trace store, UI registry — are separate
 and may be reset between runs.)
 
-## Building & running (MaD reference)
+## Building & testing
 
-From `SIL/`:
+Every crate is testable **without any firmware**:
 
 ```bash
-make emulator     # build firmware (.a) + protocol + bridge, then cargo build
-make test         # emulator + Playwright E2E
-make playground    # run the emulator + app for manual testing
-cargo build -p mad-emulator       # just the emulator binary
-cargo run -p embsim-minimal-example   # the firmware-free template
+cargo build --workspace            # build everything
+cargo test  --workspace            # run every crate's suite
+cargo run -p embsim-minimal-example  # the firmware-free template end-to-end
 ```
 
-The firmware archive location can be overridden without editing `build.rs` via
-`EMBSIM_FIRMWARE_LIB_DIR` / `EMBSIM_FIRMWARE_LIB_NAME` (see the `embsim-build`
-crate).
-
-## Testing
-
-Every framework crate carries its own test suite and is testable **without any
-firmware** — run a crate's tests with `-p`:
+Per-crate, if you want to iterate on one area:
 
 ```bash
 cargo test -p embsim-core           # virtual clock, observers, serial PTY
@@ -145,14 +202,18 @@ cargo test -p embsim-p2             # P2 HAL trampolines + constants
 cargo test -p embsim-build          # firmware-link resolution
 ```
 
-Do **not** run a bare `cargo test` at the workspace root — that pulls in the
-MaD-specific `mad-emulator`, which links `libfirmware.a` and so needs the
-firmware built first. The framework crates above link no firmware.
-
 A few conventions the tests follow (see [`peripherals/src/pulse_out.rs`](peripherals/src/pulse_out.rs)
 for the canonical example): peripheral modules keep process-global state, so
 tests that touch a shared global serialize behind a crate-local `TEST_LOCK`
 (with poison recovery) and pin the virtual clock once; assertions check
 monotonicity / bounds / clamping rather than exact wall-clock timing. The
-`embsim-memory-inspect` DWARF test compiles a small C fixture with `cc`/`clang`
-+ `ar` and **skips gracefully** when no C toolchain is present.
+`embsim-memory-inspect` DWARF test compiles a small C fixture with `clang`
+(preferred — the parser targets clang-emitted DWARF) + `ar` and **skips
+gracefully** when no C toolchain is present.
+
+Platform support: Linux and macOS (the serial PTY and thread emulation use
+Unix APIs; Windows is not supported).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

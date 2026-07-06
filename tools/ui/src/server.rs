@@ -47,9 +47,7 @@ pub fn start(port: u16) -> std::io::Result<()> {
                 let listener = tokio::net::TcpListener::from_std(std_listener)
                     .expect("Failed to adopt UI listener into tokio runtime");
 
-                axum::serve(listener, app)
-                    .await
-                    .expect("UI server error");
+                axum::serve(listener, app).await.expect("UI server error");
             });
         })?;
 
@@ -76,20 +74,15 @@ async fn asset_handler(Path((view_id, name)): Path<(String, String)>) -> impl In
         })
     };
     match found {
-        Some((content_type, bytes)) => (
-            [(header::CONTENT_TYPE, content_type)],
-            bytes,
-        )
-            .into_response(),
+        Some((content_type, bytes)) => {
+            ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "asset not found").into_response(),
     }
 }
 
 /// Route WebSocket connections to the matching view handler.
-async fn ws_handler(
-    Path(view_id): Path<String>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+async fn ws_handler(Path(view_id): Path<String>, ws: WebSocketUpgrade) -> impl IntoResponse {
     let handler = {
         let registered = views().read();
         registered
@@ -102,9 +95,9 @@ async fn ws_handler(
         Some(h) => ws.on_upgrade(move |socket| h(socket)),
         None => ws.on_upgrade(|mut socket| async move {
             use axum::extract::ws::Message;
-            let _ = socket.send(Message::Text(
-                r#"{"error":"unknown view"}"#.into()
-            )).await;
+            let _ = socket
+                .send(Message::Text(r#"{"error":"unknown view"}"#.into()))
+                .await;
         }),
     }
 }
@@ -160,7 +153,10 @@ mod tests {
         let html = body_string(resp).await;
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("<title>embsim</title>"));
-        assert!(html.contains("<div id=\"trace-body\">hello</div>"), "view html injected");
+        assert!(
+            html.contains("<div id=\"trace-body\">hello</div>"),
+            "view html injected"
+        );
         assert!(html.contains("data-view=\"trace\""), "nav tab rendered");
 
         clear_views();

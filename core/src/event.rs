@@ -34,7 +34,9 @@ pub struct Observers<T> {
 impl<T> Observers<T> {
     /// Create an empty observer list. `const` so it can back a `static`.
     pub const fn new() -> Self {
-        Self { subs: Mutex::new(Vec::new()) }
+        Self {
+            subs: Mutex::new(Vec::new()),
+        }
     }
 
     /// Append an observer. Observers fire in the order they were added.
@@ -154,7 +156,9 @@ mod tests {
         impl Clone for Tracked {
             fn clone(&self) -> Self {
                 self.clones.fetch_add(1, Ordering::Relaxed);
-                Tracked { clones: self.clones.clone() }
+                Tracked {
+                    clones: self.clones.clone(),
+                }
             }
         }
 
@@ -171,11 +175,17 @@ mod tests {
             });
         }
 
-        ev.emit(Tracked { clones: clones.clone() });
+        ev.emit(Tracked {
+            clones: clones.clone(),
+        });
 
         // Three observers → three clones of the emitted value.
         assert_eq!(clones.load(Ordering::Relaxed), 3, "one clone per observer");
-        assert_eq!(seen.load(Ordering::Relaxed), 3, "every observer was delivered the value");
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            3,
+            "every observer was delivered the value"
+        );
     }
 
     /// `clear` empties the list so a subsequent `emit` fires nothing, and
@@ -195,7 +205,11 @@ mod tests {
         assert!(ev.is_empty());
 
         ev.emit(1);
-        assert_eq!(hits.load(Ordering::Relaxed), 0, "cleared list fires nothing");
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            0,
+            "cleared list fires nothing"
+        );
     }
 
     /// Multiple `emit` calls re-fire every observer each time (observers are not

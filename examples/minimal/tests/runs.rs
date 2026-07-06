@@ -94,5 +94,8 @@ fn minimal_example_flow_runs_ok() {
         .expect("minimal example should build")
         .run();
 
-    assert!(result.is_ok(), "minimal example run() should be Ok: {result:?}");
+    assert!(
+        result.is_ok(),
+        "minimal example run() should be Ok: {result:?}"
+    );
 }

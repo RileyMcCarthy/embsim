@@ -7,7 +7,7 @@
 
 use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use tracing::{trace, debug};
+use tracing::{debug, trace};
 
 /// Maximum serial channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 16;
@@ -58,7 +58,12 @@ static CHANNEL_RX_NEXT_V_US: [AtomicU64; MAX_CHANNELS] = {
 /// Configure the serial peripheral with the number of channels.
 /// Resets FDs, baud, and pacing schedules, so re-init yields a clean state.
 pub fn init(count: usize) {
-    assert!(count <= MAX_CHANNELS, "Serial count {} exceeds max {}", count, MAX_CHANNELS);
+    assert!(
+        count <= MAX_CHANNELS,
+        "Serial count {} exceeds max {}",
+        count,
+        MAX_CHANNELS
+    );
     reset();
     CHANNEL_COUNT.store(count, Ordering::Relaxed);
 }
@@ -195,7 +200,8 @@ pub fn transmit_data(channel: usize, data: &[u8]) {
     if fd < 0 {
         trace!(
             "serial::transmit_data(channel={}): not connected, discarding {} bytes",
-            channel, data.len()
+            channel,
+            data.len()
         );
         return;
     }
@@ -213,12 +219,20 @@ pub fn transmit_data(channel: usize, data: &[u8]) {
                 std::thread::yield_now();
             }
             Err(e) => {
-                trace!("serial::transmit_data(channel={}): write error: {}", channel, e);
+                trace!(
+                    "serial::transmit_data(channel={}): write error: {}",
+                    channel,
+                    e
+                );
                 break;
             }
         }
     }
-    trace!("serial::transmit_data(channel={}, len={})", channel, data.len());
+    trace!(
+        "serial::transmit_data(channel={}, len={})",
+        channel,
+        data.len()
+    );
 }
 
 /// Receive data with a timeout (virtual microseconds).
@@ -345,16 +359,18 @@ mod tests {
         /// lock and cascade-hang every other test.
         fn new() -> Self {
             let mut fds = [0i32; 2];
-            let rc = unsafe {
-                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
-            };
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
             assert_eq!(rc, 0, "socketpair failed");
             for &fd in &fds {
                 let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                 let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
                 assert_eq!(rc, 0, "fcntl O_NONBLOCK failed");
             }
-            Pair { a: fds[0], b: fds[1] }
+            Pair {
+                a: fds[0],
+                b: fds[1],
+            }
         }
 
         /// Write raw bytes to the far end so the channel can read them.

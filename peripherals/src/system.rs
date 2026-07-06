@@ -35,11 +35,19 @@ fn ensure_initialized() {
 /// Configure the system peripheral with max thread count. Resets the handle
 /// table first, so re-init (after [`join_all_threads`]) is a clean start.
 pub fn init(max_threads: usize) {
-    assert!(max_threads <= MAX_THREADS, "Thread count {} exceeds max {}", max_threads, MAX_THREADS);
+    assert!(
+        max_threads <= MAX_THREADS,
+        "Thread count {} exceeds max {}",
+        max_threads,
+        MAX_THREADS
+    );
     reset();
     MAX_THREAD_COUNT.store(max_threads, Ordering::Relaxed);
     ensure_initialized();
-    info!("system::init: emulator platform initialized (max_threads={})", max_threads);
+    info!(
+        "system::init: emulator platform initialized (max_threads={})",
+        max_threads
+    );
 }
 
 /// Clear the thread handle table.
@@ -92,8 +100,7 @@ pub unsafe fn start_thread(
         .spawn(move || {
             info!("Thread {} started", thread_name);
             unsafe {
-                let f: unsafe extern "C" fn(*mut std::ffi::c_void) =
-                    std::mem::transmute(func_ptr);
+                let f: unsafe extern "C" fn(*mut std::ffi::c_void) = std::mem::transmute(func_ptr);
                 f(arg_usize as *mut std::ffi::c_void);
             }
             info!("Thread {} exited", thread_name);
@@ -174,7 +181,10 @@ mod tests {
         assert!(id >= 0, "valid spawn returns a non-negative slot id");
         // Joining guarantees the thread body (and its side effect) completed.
         join_all_threads();
-        assert!(flag.load(Ordering::SeqCst), "thread body ran and set the flag");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "thread body ran and set the flag"
+        );
         reset();
     }
 

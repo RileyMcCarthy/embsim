@@ -14,11 +14,11 @@
 //! polling and added to the active signal store.
 
 use embsim_core::virtual_clock;
-use std::collections::VecDeque;
 use embsim_memory_inspect::{FirmwareInfo, TypeInfo};
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -29,9 +29,9 @@ const DEFAULT_POLL_INTERVAL_US: u64 = 10_000;
 static POLL_INTERVAL_US: AtomicU64 = AtomicU64::new(DEFAULT_POLL_INTERVAL_US);
 
 /// Conventional signal-group names. Groups are free-form strings, so a project
-/// can define its own (e.g. "Sensors", "Actuators"); these are just the ones the
-/// MaD wiring and firmware discovery use. The viewer orders these first, then
-/// any custom groups alphabetically.
+/// can define its own (e.g. "Sensors", "Actuators"); these are just the
+/// conventional ones. The viewer orders these first, then any custom groups
+/// alphabetically.
 pub mod groups {
     /// Rust hardware-model outputs (the physical components being simulated).
     pub const MODEL: &str = "Model";
@@ -269,7 +269,11 @@ pub fn poll_interval_us() -> u64 {
 pub fn set_poll_interval_us(us: u64) {
     let clamped = us.clamp(1_000, 1_000_000);
     POLL_INTERVAL_US.store(clamped, Ordering::Relaxed);
-    tracing::info!("Trace poll interval set to {}µs ({}ms)", clamped, clamped / 1000);
+    tracing::info!(
+        "Trace poll interval set to {}µs ({}ms)",
+        clamped,
+        clamped / 1000
+    );
 }
 
 /// Snapshot the latest cached value of every registered signal into the
@@ -277,7 +281,7 @@ pub fn set_poll_interval_us(us: u64) {
 /// to the ring under the cache-and-snapshot model: event sources (Model,
 /// Peripheral, and Firmware C-variable polls alike) push values into
 /// `latest_value` via [`record`], and this function — driven by the trace
-/// poll thread at [`POLL_INTERVAL_US`] cadence — writes them as samples.
+/// poll thread at `POLL_INTERVAL_US` cadence — writes them as samples.
 ///
 /// Signals that have never received a `record()` call (no `latest_value`)
 /// are skipped so the chart doesn't get spurious leading zeroes.
@@ -358,7 +362,7 @@ pub fn c_watches() -> Vec<CVariableWatch> {
 /// and reading any activated firmware C variables) at the configured cadence.
 /// Without it, the store has no time series — so a consumer that wants tracing
 /// just calls this once after wiring (the emulator runtime's `on_wired` hook is
-/// the natural place). Reads firmware C variables via a [`SymbolResolver`];
+/// the natural place). Reads firmware C variables via a `SymbolResolver`;
 /// if symbol resolution is unavailable, model/peripheral resampling still runs.
 pub fn spawn_poller(fw: &FirmwareInfo) {
     let fw = fw.clone();
@@ -385,9 +389,8 @@ fn poll_loop(fw: &FirmwareInfo) {
     loop {
         if let Some(resolver) = &resolver {
             for watch in c_watches() {
-                let value: Option<f64> = unsafe {
-                    resolver.read_field_as_f64(&fw, &watch.var_name, &watch.field_path)
-                };
+                let value: Option<f64> =
+                    unsafe { resolver.read_field_as_f64(&fw, &watch.var_name, &watch.field_path) };
                 if let Some(v) = value {
                     record(&watch.signal_name, v);
                 }
@@ -441,7 +444,11 @@ pub fn set_firmware_info(fw: &FirmwareInfo) {
     s.firmware_catalog = catalog;
     s.enum_definitions = enum_defs;
     drop(s);
-    tracing::info!("Discovered {} available firmware variables ({} enum types)", count, enum_count);
+    tracing::info!(
+        "Discovered {} available firmware variables ({} enum types)",
+        count,
+        enum_count
+    );
 }
 
 /// Get the list of all available (but not necessarily active) firmware variables.
@@ -514,7 +521,9 @@ fn walk_type_fields(
     }
 
     match type_info {
-        TypeInfo::Base { name, byte_size, .. } => {
+        TypeInfo::Base {
+            name, byte_size, ..
+        } => {
             if name.contains("char") {
                 return;
             }
@@ -522,7 +531,10 @@ fn walk_type_fields(
                 let (signal_name, field_path) = if field_prefix.is_empty() {
                     (var_name.to_string(), String::new())
                 } else {
-                    (format!("{}.{}", var_name, field_prefix), field_prefix.to_string())
+                    (
+                        format!("{}.{}", var_name, field_prefix),
+                        field_prefix.to_string(),
+                    )
                 };
                 catalog.push(FirmwareVariable {
                     signal_name,
@@ -532,12 +544,18 @@ fn walk_type_fields(
                 });
             }
         }
-        TypeInfo::Enum { type_name, byte_size } => {
+        TypeInfo::Enum {
+            type_name,
+            byte_size,
+        } => {
             if [1, 2, 4, 8].contains(byte_size) {
                 let (signal_name, field_path) = if field_prefix.is_empty() {
                     (var_name.to_string(), String::new())
                 } else {
-                    (format!("{}.{}", var_name, field_prefix), field_prefix.to_string())
+                    (
+                        format!("{}.{}", var_name, field_prefix),
+                        field_prefix.to_string(),
+                    )
                 };
                 catalog.push(FirmwareVariable {
                     signal_name,
@@ -553,7 +571,10 @@ fn walk_type_fields(
                 let (signal_name, field_path) = if field_prefix.is_empty() {
                     (var_name.to_string(), String::new())
                 } else {
-                    (format!("{}.{}", var_name, field_prefix), field_prefix.to_string())
+                    (
+                        format!("{}.{}", var_name, field_prefix),
+                        field_prefix.to_string(),
+                    )
                 };
                 catalog.push(FirmwareVariable {
                     signal_name,
@@ -567,7 +588,10 @@ fn walk_type_fields(
             let (signal_name, field_path) = if field_prefix.is_empty() {
                 (var_name.to_string(), String::new())
             } else {
-                (format!("{}.{}", var_name, field_prefix), field_prefix.to_string())
+                (
+                    format!("{}.{}", var_name, field_prefix),
+                    field_prefix.to_string(),
+                )
             };
             catalog.push(FirmwareVariable {
                 signal_name,
@@ -589,7 +613,10 @@ fn walk_type_fields(
                 }
             }
         }
-        TypeInfo::Array { element_type, count: arr_count } => {
+        TypeInfo::Array {
+            element_type,
+            count: arr_count,
+        } => {
             if is_char_type(element_type) {
                 return;
             }
@@ -738,7 +765,10 @@ mod tests {
         record("a", 2.0);
         // record() never touches the ring, so there is nothing new to read.
         let (data, _cur) = read_new_samples(&["a".to_string()], &HashMap::new());
-        assert!(data.get("a").is_none(), "record must not append to the ring");
+        assert!(
+            data.get("a").is_none(),
+            "record must not append to the ring"
+        );
     }
 
     #[test]
@@ -790,7 +820,9 @@ mod tests {
         record_at("a", 100, 1.5);
         record_at("a", 200, 2.5);
         let (data, cursors) = read_new_samples(&["a".to_string()], &HashMap::new());
-        let samples = data.get("a").expect("record_at writes directly to the ring");
+        let samples = data
+            .get("a")
+            .expect("record_at writes directly to the ring");
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].time_us, 100);
         assert_eq!(samples[0].value, 1.5);
@@ -864,7 +896,10 @@ mod tests {
             assert_eq!(got, 1, "each loop adds exactly one new sample");
             let cur = *new_cursors.get("a").unwrap();
             assert_eq!(cur, total, "cursor tracks total_written");
-            assert!(cur >= *cursors.get("a").unwrap_or(&0), "cursor is monotonic");
+            assert!(
+                cur >= *cursors.get("a").unwrap_or(&0),
+                "cursor is monotonic"
+            );
             cursors = new_cursors;
         }
     }
@@ -937,7 +972,10 @@ mod tests {
         register_c_variable("g_counter", "", groups::FIRMWARE);
         let watches = c_watches();
         assert_eq!(watches.len(), 1);
-        assert_eq!(watches[0].signal_name, "g_counter", "empty field → bare name");
+        assert_eq!(
+            watches[0].signal_name, "g_counter",
+            "empty field → bare name"
+        );
         assert_eq!(watches[0].field_path, "");
     }
 
@@ -961,7 +999,10 @@ mod tests {
         record_at("v.f", 1, 1.0);
         let before = catalog_version();
         assert!(deactivate_signal("v.f"), "active signal returns true");
-        assert!(!catalog().iter().any(|s| s.name == "v.f"), "removed from catalog");
+        assert!(
+            !catalog().iter().any(|s| s.name == "v.f"),
+            "removed from catalog"
+        );
         assert!(c_watches().is_empty(), "watch removed");
         assert!(catalog_version() > before, "deactivation bumps version");
         // Data is gone too: re-subscribing returns nothing.
@@ -999,10 +1040,7 @@ mod tests {
             EnumInfo {
                 name: "demo_mode_E".to_string(),
                 byte_size: 4,
-                variants: vec![
-                    ("DEMO_OFF".to_string(), 0),
-                    ("DEMO_ON".to_string(), 1),
-                ],
+                variants: vec![("DEMO_OFF".to_string(), 0), ("DEMO_ON".to_string(), 1)],
             },
         );
 
@@ -1202,7 +1240,9 @@ mod tests {
         test_setup();
         set_firmware_info(&sample_fw());
         let defs = enum_definitions();
-        let variants = defs.get("demo_mode_E").expect("referenced enum is collected");
+        let variants = defs
+            .get("demo_mode_E")
+            .expect("referenced enum is collected");
         assert_eq!(
             variants,
             &vec![("DEMO_OFF".to_string(), 0), ("DEMO_ON".to_string(), 1)]
@@ -1215,7 +1255,10 @@ mod tests {
         test_setup();
         set_firmware_info(&sample_fw());
         let cat = firmware_catalog();
-        let count = cat.iter().find(|v| v.signal_name == "demo_data.count").unwrap();
+        let count = cat
+            .iter()
+            .find(|v| v.signal_name == "demo_data.count")
+            .unwrap();
         assert_eq!(count.var_name, "demo_data");
         assert_eq!(count.field_path, "count", "field_path is struct-relative");
     }
@@ -1228,10 +1271,15 @@ mod tests {
         test_setup();
         set_firmware_info(&sample_fw());
         assert!(catalog().is_empty(), "discovery does not auto-activate");
-        assert!(activate_firmware_signal("demo_data.count"), "known leaf activates");
+        assert!(
+            activate_firmware_signal("demo_data.count"),
+            "known leaf activates"
+        );
         // Now it's an active signal with a C watch.
         assert!(catalog().iter().any(|s| s.name == "demo_data.count"));
-        assert!(c_watches().iter().any(|w| w.signal_name == "demo_data.count"));
+        assert!(c_watches()
+            .iter()
+            .any(|w| w.signal_name == "demo_data.count"));
     }
 
     #[test]
@@ -1239,7 +1287,10 @@ mod tests {
         let _g = lock_or_recover();
         test_setup();
         set_firmware_info(&sample_fw());
-        assert!(!activate_firmware_signal("demo_data.nope"), "unknown leaf → false");
+        assert!(
+            !activate_firmware_signal("demo_data.nope"),
+            "unknown leaf → false"
+        );
         assert!(c_watches().is_empty());
     }
 
@@ -1311,4 +1362,3 @@ mod tests {
         assert!(ts.enum_definitions.is_empty());
     }
 }
-

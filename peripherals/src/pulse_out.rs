@@ -18,7 +18,7 @@
 //!
 //! ## Core occupancy
 //!
-//! `run()` sleeps for [`POLL_TICK_US`] of virtual time between polls when the
+//! `run()` sleeps for `POLL_TICK_US` of virtual time between polls when the
 //! sequence is still in progress. This bounds the calling core's polling rate
 //! without tying it to the pulse frequency, and lets the scheduler service
 //! other cores while the pulse train continues. When the sequence is complete
@@ -101,7 +101,10 @@ pub fn init(count: usize) {
     CHANNEL_COUNT.store(count, Ordering::Relaxed);
     START_CALLBACKS.lock().unwrap().resize_with(count, || None);
     STOP_CALLBACKS.lock().unwrap().resize_with(count, || None);
-    PROGRESS_CALLBACKS.lock().unwrap().resize_with(count, || None);
+    PROGRESS_CALLBACKS
+        .lock()
+        .unwrap()
+        .resize_with(count, || None);
 }
 
 /// Clear all channel callbacks and pulse state (used by `init` and teardown).
@@ -179,7 +182,9 @@ pub fn start(channel: usize, pulses: u32, frequency: u32) {
 
     trace!(
         "pulse_out::start(ch={}, pulses={}, freq={})",
-        channel, pulses, freq
+        channel,
+        pulses,
+        freq
     );
 
     {
@@ -203,14 +208,19 @@ pub fn start(channel: usize, pulses: u32, frequency: u32) {
 
 /// Begin (or re-baseline) a continuous-velocity (NCO) pulse train at `frequency`
 /// steps/s. Resets the emitted counter to 0 and fires `on_start` so subscribers
-/// snapshot the current direction/baseline — callers re-invoke this on a
-/// direction reversal (where the rate is ~0) so `pos = base + dir × emitted`
-/// stays correct across the reversal. `frequency` 0 holds (no pulses).
+/// can re-anchor their own state (e.g. snapshot the current direction, or reset a
+/// dt baseline so the first post-restart tick doesn't see a huge interval).
+/// Callers re-invoke this on a direction reversal, where the rate passes through
+/// ~0. `frequency` 0 holds (no pulses).
 pub fn start_velocity(channel: usize, frequency: u32) {
     if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
         return;
     }
-    trace!("pulse_out::start_velocity(ch={}, freq={})", channel, frequency);
+    trace!(
+        "pulse_out::start_velocity(ch={}, freq={})",
+        channel,
+        frequency
+    );
     {
         let mut state = PULSE_STATE.lock().unwrap();
         state[channel] = PulseState {
@@ -263,7 +273,7 @@ pub fn frequency(channel: usize) -> u32 {
 /// Poll a running pulse sequence. Returns `(emitted_pulses, done)`.
 ///
 /// `emitted` advances monotonically with virtual time at the configured rate
-/// and is clamped to `total`. The call sleeps for [`POLL_TICK_US`] of virtual
+/// and is clamped to `total`. The call sleeps for `POLL_TICK_US` of virtual
 /// time when the sequence is still in progress, returning immediately once
 /// `done = true` so the caller can move on without an extra tick of latency.
 pub fn run(channel: usize) -> (u32, bool) {
@@ -303,7 +313,11 @@ pub fn run(channel: usize) -> (u32, bool) {
 
     trace!(
         "pulse_out::run(ch={}): {}/{} elapsed={}us done={}",
-        channel, emitted, snapshot.total_pulses, elapsed_us, done
+        channel,
+        emitted,
+        snapshot.total_pulses,
+        elapsed_us,
+        done
     );
 
     fire_progress(channel, emitted);
@@ -438,7 +452,11 @@ mod tests {
             last = emitted;
         }
         assert!(last > 0, "continuous velocity advanced the emitted count");
-        assert_eq!(progress.load(AtomicOrdering::Relaxed), last, "progress matches run()");
+        assert_eq!(
+            progress.load(AtomicOrdering::Relaxed),
+            last,
+            "progress matches run()"
+        );
 
         // Retarget to 0 (hold) → the cumulative count freezes (no rewind).
         set_frequency(0, 0);
@@ -542,8 +560,16 @@ mod tests {
             });
         }
         start(0, 1, 1);
-        assert_eq!(first.load(AtomicOrdering::Relaxed), 0, "first cb overwritten");
-        assert_eq!(second.load(AtomicOrdering::Relaxed), 1, "only second cb fires");
+        assert_eq!(
+            first.load(AtomicOrdering::Relaxed),
+            0,
+            "first cb overwritten"
+        );
+        assert_eq!(
+            second.load(AtomicOrdering::Relaxed),
+            1,
+            "only second cb fires"
+        );
     }
 
     #[test]

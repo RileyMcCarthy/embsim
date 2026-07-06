@@ -63,12 +63,7 @@ async fn handle_ws(mut socket: WebSocket) {
 
     loop {
         // Non-blocking receive with 100ms timeout
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            socket.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), socket.recv()).await {
             Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
                 info!("Trace viewer client disconnected");
                 return;
@@ -232,6 +227,9 @@ mod tests {
     fn ws_handler_factory_matches_registry_signature() {
         let handler: embsim_ui::WsHandler = super::ws_handler;
         // Use the binding so it isn't optimized away / flagged unused.
-        assert_eq!(handler as *const () as usize, super::ws_handler as *const () as usize);
+        assert_eq!(
+            handler as *const () as usize,
+            super::ws_handler as *const () as usize
+        );
     }
 }

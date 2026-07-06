@@ -121,17 +121,26 @@ impl fmt::Display for EmulatorError {
         match self {
             EmulatorError::Firmware(e) => write!(f, "failed to parse firmware debug info: {e}"),
             EmulatorError::MissingFirmware => {
-                write!(f, "no firmware provided (call .firmware(..) or .firmware_lib(..))")
+                write!(
+                    f,
+                    "no firmware provided (call .firmware(..) or .firmware_lib(..))"
+                )
             }
             EmulatorError::MissingMachine => write!(f, "no machine provided (call .machine(..))"),
-            EmulatorError::MissingEntry => write!(f, "no firmware entry provided (call .entry(..))"),
+            EmulatorError::MissingEntry => {
+                write!(f, "no firmware entry provided (call .entry(..))")
+            }
             EmulatorError::MissingSymbols(names) => write!(
                 f,
                 "firmware is missing {} required symbol(s): {}",
                 names.len(),
                 names.join(", ")
             ),
-            EmulatorError::TooManyChannels { peripheral, requested, max } => write!(
+            EmulatorError::TooManyChannels {
+                peripheral,
+                requested,
+                max,
+            } => write!(
                 f,
                 "{peripheral} channel count {requested} exceeds the maximum {max}"
             ),
@@ -146,9 +155,17 @@ type EntryFn = Box<dyn FnOnce()>;
 type WiredHook = Box<dyn FnOnce(&FirmwareInfo)>;
 
 /// Validate a requested channel count against a peripheral's hard maximum.
-fn check_count(peripheral: &'static str, requested: usize, max: usize) -> Result<(), EmulatorError> {
+fn check_count(
+    peripheral: &'static str,
+    requested: usize,
+    max: usize,
+) -> Result<(), EmulatorError> {
     if requested > max {
-        Err(EmulatorError::TooManyChannels { peripheral, requested, max })
+        Err(EmulatorError::TooManyChannels {
+            peripheral,
+            requested,
+            max,
+        })
     } else {
         Ok(())
     }
@@ -388,7 +405,11 @@ mod tests {
         // One over the ceiling is rejected, with the originating fields intact.
         let err = check_count("serial", 65, 64).expect_err("65 > 64 must error");
         match err {
-            EmulatorError::TooManyChannels { peripheral, requested, max } => {
+            EmulatorError::TooManyChannels {
+                peripheral,
+                requested,
+                max,
+            } => {
                 assert_eq!(peripheral, "serial");
                 assert_eq!(requested, 65);
                 assert_eq!(max, 64);

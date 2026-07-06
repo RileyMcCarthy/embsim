@@ -50,11 +50,11 @@
 //! ```
 
 mod dwarf_parser;
-mod types;
 mod runtime;
+mod types;
 
+pub use runtime::SymbolResolver;
 pub use types::{
     EnumInfo, FieldInfo, FirmwareInfo, MemInspectError, ParseOptions, StructInfo, TypeInfo,
     VariableInfo,
 };
-pub use runtime::SymbolResolver;

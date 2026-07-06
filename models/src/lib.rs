@@ -10,8 +10,8 @@
 //! input via setter functions and emits output to any number of subscribers
 //! when state changes. The project wiring layer connects these chains together.
 //!
-//! Project-specific physics (e.g. the MaD tensile tester's gantry/sample/strain
-//! gauge) lives in the consumer — see the `embsim-mad-models` crate.
+//! Project-specific physics (e.g. a tensile tester's gantry/sample/strain
+//! gauge) lives in the consumer's own models crate, wired to these primitives.
 
 pub mod ads122u04;
 pub mod edge;

@@ -18,7 +18,10 @@ pub struct ParseOptions {
 
 impl Default for ParseOptions {
     fn default() -> Self {
-        Self { pointer_size: 8, count_suffix: "_COUNT".to_string() }
+        Self {
+            pointer_size: 8,
+            count_suffix: "_COUNT".to_string(),
+        }
     }
 }
 
@@ -104,28 +107,16 @@ pub enum TypeInfo {
     ///
     /// Decoded with `f32::from_le_bytes` / `f64::from_le_bytes` rather than as
     /// an integer — decoding float bytes as an integer yields garbage.
-    Float {
-        name: String,
-        byte_size: usize,
-    },
+    Float { name: String, byte_size: usize },
     /// Enum type (stored as integer)
-    Enum {
-        type_name: String,
-        byte_size: usize,
-    },
+    Enum { type_name: String, byte_size: usize },
     /// Struct type
-    Struct {
-        type_name: String,
-        byte_size: usize,
-    },
+    Struct { type_name: String, byte_size: usize },
     /// Union type (all members share offset 0).
     ///
     /// Stored alongside structs in `FirmwareInfo::structs`; field offsets are
     /// all `0`. Treated like a struct for field-path resolution.
-    Union {
-        type_name: String,
-        byte_size: usize,
-    },
+    Union { type_name: String, byte_size: usize },
     /// A C bitfield member: a sub-byte run of bits within an underlying
     /// integer storage unit.
     ///
@@ -148,13 +139,9 @@ pub enum TypeInfo {
         count: usize,
     },
     /// Pointer type
-    Pointer {
-        byte_size: usize,
-    },
+    Pointer { byte_size: usize },
     /// Unknown / unsupported type
-    Unknown {
-        byte_size: usize,
-    },
+    Unknown { byte_size: usize },
 }
 
 impl TypeInfo {
@@ -171,7 +158,10 @@ impl TypeInfo {
             TypeInfo::Struct { byte_size, .. } => *byte_size,
             TypeInfo::Union { byte_size, .. } => *byte_size,
             TypeInfo::Bitfield { storage_size, .. } => *storage_size,
-            TypeInfo::Array { element_type, count } => element_type.byte_size() * count,
+            TypeInfo::Array {
+                element_type,
+                count,
+            } => element_type.byte_size() * count,
             TypeInfo::Pointer { byte_size } => *byte_size,
             TypeInfo::Unknown { byte_size } => *byte_size,
         }
@@ -257,8 +247,12 @@ impl FirmwareInfo {
     /// let val = fw.enum_value("HAL_GPIO_SERVO_ENA"); // e.g. 0i64
     /// ```
     pub fn enum_value(&self, variant_name: &str) -> i64 {
-        self.try_enum_value(variant_name)
-            .unwrap_or_else(|| panic!("Firmware enum variant '{}' not found in DWARF debug info", variant_name))
+        self.try_enum_value(variant_name).unwrap_or_else(|| {
+            panic!(
+                "Firmware enum variant '{}' not found in DWARF debug info",
+                variant_name
+            )
+        })
     }
 
     /// Look up an enum variant value as `usize` (for channel indices). Panics if not found.
@@ -278,8 +272,12 @@ impl FirmwareInfo {
 
     /// Get all variants of a named enum type. Panics if not found.
     pub fn enum_variants(&self, type_name: &str) -> &[(String, i64)] {
-        self.try_enum_variants(type_name)
-            .unwrap_or_else(|| panic!("Firmware enum type '{}' not found in DWARF debug info", type_name))
+        self.try_enum_variants(type_name).unwrap_or_else(|| {
+            panic!(
+                "Firmware enum type '{}' not found in DWARF debug info",
+                type_name
+            )
+        })
     }
 
     /// Get the `_COUNT` variant of an enum type (by convention). Panics if not found.
@@ -289,7 +287,10 @@ impl FirmwareInfo {
     /// ```
     pub fn channel_count(&self, type_name: &str) -> usize {
         if !self.has_enum_type(type_name) {
-            panic!("Firmware enum type '{}' not found in DWARF debug info", type_name);
+            panic!(
+                "Firmware enum type '{}' not found in DWARF debug info",
+                type_name
+            );
         }
         self.try_channel_count(type_name)
             .unwrap_or_else(|| panic!("Firmware enum type '{}' has no _COUNT variant", type_name))
@@ -302,8 +303,12 @@ impl FirmwareInfo {
 
     /// Get struct layout by type name. Panics if not found.
     pub fn struct_info(&self, type_name: &str) -> &StructInfo {
-        self.try_struct_info(type_name)
-            .unwrap_or_else(|| panic!("Firmware struct type '{}' not found in DWARF debug info", type_name))
+        self.try_struct_info(type_name).unwrap_or_else(|| {
+            panic!(
+                "Firmware struct type '{}' not found in DWARF debug info",
+                type_name
+            )
+        })
     }
 
     /// Resolve a field path to a byte offset within a struct type, or `None` if
@@ -321,14 +326,21 @@ impl FirmwareInfo {
     /// - `"channels[2].output.running"` → nested field access
     pub fn field_offset(&self, type_name: &str, path: &str) -> usize {
         if !self.structs.contains_key(type_name) {
-            panic!("Firmware struct type '{}' not found in DWARF debug info", type_name);
+            panic!(
+                "Firmware struct type '{}' not found in DWARF debug info",
+                type_name
+            );
         }
         self.try_field_offset(type_name, path)
             .unwrap_or_else(|| panic!("Field path '{}' not found in struct '{}'", path, type_name))
     }
 
     /// Internal: resolve a field path to byte offset.
-    pub(crate) fn resolve_field_offset(&self, struct_info: &StructInfo, path: &str) -> Option<usize> {
+    pub(crate) fn resolve_field_offset(
+        &self,
+        struct_info: &StructInfo,
+        path: &str,
+    ) -> Option<usize> {
         let (first, rest) = split_path(path);
         let (field_name, array_index) = parse_array_access(first);
 
@@ -338,7 +350,11 @@ impl FirmwareInfo {
 
         // Handle array indexing
         let field_type = if let Some(idx) = array_index {
-            if let TypeInfo::Array { element_type, count } = &field.type_info {
+            if let TypeInfo::Array {
+                element_type,
+                count,
+            } = &field.type_info
+            {
                 if idx >= *count {
                     return None; // Out of bounds
                 }
@@ -368,13 +384,21 @@ impl FirmwareInfo {
 
     /// Get the type of a field at the given path. Panics if not found.
     pub fn field_type(&self, type_name: &str, path: &str) -> &TypeInfo {
-        let struct_info = self.structs.get(type_name)
-            .unwrap_or_else(|| panic!("Firmware struct type '{}' not found in DWARF debug info", type_name));
+        let struct_info = self.structs.get(type_name).unwrap_or_else(|| {
+            panic!(
+                "Firmware struct type '{}' not found in DWARF debug info",
+                type_name
+            )
+        });
         self.resolve_field_type(struct_info, path)
             .unwrap_or_else(|| panic!("Field path '{}' not found in struct '{}'", path, type_name))
     }
 
-    pub(crate) fn resolve_field_type<'a>(&'a self, struct_info: &'a StructInfo, path: &str) -> Option<&'a TypeInfo> {
+    pub(crate) fn resolve_field_type<'a>(
+        &'a self,
+        struct_info: &'a StructInfo,
+        path: &str,
+    ) -> Option<&'a TypeInfo> {
         let (first, rest) = split_path(path);
         let (field_name, array_index) = parse_array_access(first);
 
@@ -452,7 +476,10 @@ mod tests {
     #[test]
     fn test_split_path() {
         assert_eq!(split_path("state"), ("state", None));
-        assert_eq!(split_path("channels[0].state"), ("channels[0]", Some("state")));
+        assert_eq!(
+            split_path("channels[0].state"),
+            ("channels[0]", Some("state"))
+        );
         assert_eq!(split_path("a.b.c"), ("a", Some("b.c")));
     }
 
@@ -477,9 +504,18 @@ mod tests {
                 ],
             },
         );
-        fw.enum_variants.insert("HAL_GPIO_SERVO_ENA".to_string(), ("HAL_GPIO_channel_E".to_string(), 0));
-        fw.enum_variants.insert("HAL_GPIO_SERVO_DIR".to_string(), ("HAL_GPIO_channel_E".to_string(), 1));
-        fw.enum_variants.insert("HAL_GPIO_channel_COUNT".to_string(), ("HAL_GPIO_channel_E".to_string(), 2));
+        fw.enum_variants.insert(
+            "HAL_GPIO_SERVO_ENA".to_string(),
+            ("HAL_GPIO_channel_E".to_string(), 0),
+        );
+        fw.enum_variants.insert(
+            "HAL_GPIO_SERVO_DIR".to_string(),
+            ("HAL_GPIO_channel_E".to_string(), 1),
+        );
+        fw.enum_variants.insert(
+            "HAL_GPIO_channel_COUNT".to_string(),
+            ("HAL_GPIO_channel_E".to_string(), 2),
+        );
         fw
     }
 
@@ -514,7 +550,10 @@ mod tests {
     fn split_path_extra_cases() {
         // A dot inside brackets does not split (no array literals use it here,
         // but the depth guard must still hold for the bracket scan).
-        assert_eq!(split_path("channels[2].output.running"), ("channels[2]", Some("output.running")));
+        assert_eq!(
+            split_path("channels[2].output.running"),
+            ("channels[2]", Some("output.running"))
+        );
         // Bare index with no trailing field.
         assert_eq!(split_path("channels[2]"), ("channels[2]", None));
         // Empty string is its own first segment.
@@ -540,19 +579,65 @@ mod tests {
     /// storage unit size (not the bit width).
     #[test]
     fn byte_size_covers_every_variant() {
-        assert_eq!(TypeInfo::Base { name: "i".into(), byte_size: 4, signed: true }.byte_size(), 4);
-        assert_eq!(TypeInfo::Float { name: "f".into(), byte_size: 8 }.byte_size(), 8);
-        assert_eq!(TypeInfo::Enum { type_name: "E".into(), byte_size: 2 }.byte_size(), 2);
-        assert_eq!(TypeInfo::Struct { type_name: "S".into(), byte_size: 16 }.byte_size(), 16);
-        assert_eq!(TypeInfo::Union { type_name: "U".into(), byte_size: 8 }.byte_size(), 8);
+        assert_eq!(
+            TypeInfo::Base {
+                name: "i".into(),
+                byte_size: 4,
+                signed: true
+            }
+            .byte_size(),
+            4
+        );
+        assert_eq!(
+            TypeInfo::Float {
+                name: "f".into(),
+                byte_size: 8
+            }
+            .byte_size(),
+            8
+        );
+        assert_eq!(
+            TypeInfo::Enum {
+                type_name: "E".into(),
+                byte_size: 2
+            }
+            .byte_size(),
+            2
+        );
+        assert_eq!(
+            TypeInfo::Struct {
+                type_name: "S".into(),
+                byte_size: 16
+            }
+            .byte_size(),
+            16
+        );
+        assert_eq!(
+            TypeInfo::Union {
+                type_name: "U".into(),
+                byte_size: 8
+            }
+            .byte_size(),
+            8
+        );
         // Bitfield returns the storage unit size, regardless of bit width.
         assert_eq!(
-            TypeInfo::Bitfield { bit_offset: 0, bit_size: 3, storage_size: 1, signed: false }.byte_size(),
+            TypeInfo::Bitfield {
+                bit_offset: 0,
+                bit_size: 3,
+                storage_size: 1,
+                signed: false
+            }
+            .byte_size(),
             1
         );
         // Array: element size (4) × count (5) = 20.
         let arr = TypeInfo::Array {
-            element_type: Box::new(TypeInfo::Base { name: "i".into(), byte_size: 4, signed: true }),
+            element_type: Box::new(TypeInfo::Base {
+                name: "i".into(),
+                byte_size: 4,
+                signed: true,
+            }),
             count: 5,
         };
         assert_eq!(arr.byte_size(), 20);
@@ -580,8 +665,24 @@ mod tests {
                 name: "inner_S".to_string(),
                 byte_size: 2,
                 fields: vec![
-                    FieldInfo { name: "a".into(), offset: 0, type_info: TypeInfo::Base { name: "u8".into(), byte_size: 1, signed: false } },
-                    FieldInfo { name: "b".into(), offset: 1, type_info: TypeInfo::Base { name: "u8".into(), byte_size: 1, signed: false } },
+                    FieldInfo {
+                        name: "a".into(),
+                        offset: 0,
+                        type_info: TypeInfo::Base {
+                            name: "u8".into(),
+                            byte_size: 1,
+                            signed: false,
+                        },
+                    },
+                    FieldInfo {
+                        name: "b".into(),
+                        offset: 1,
+                        type_info: TypeInfo::Base {
+                            name: "u8".into(),
+                            byte_size: 1,
+                            signed: false,
+                        },
+                    },
                 ],
             },
         );
@@ -593,8 +694,23 @@ mod tests {
                 name: "conv_U".to_string(),
                 byte_size: 4,
                 fields: vec![
-                    FieldInfo { name: "raw".into(), offset: 0, type_info: TypeInfo::Base { name: "u32".into(), byte_size: 4, signed: false } },
-                    FieldInfo { name: "as_f".into(), offset: 0, type_info: TypeInfo::Float { name: "float".into(), byte_size: 4 } },
+                    FieldInfo {
+                        name: "raw".into(),
+                        offset: 0,
+                        type_info: TypeInfo::Base {
+                            name: "u32".into(),
+                            byte_size: 4,
+                            signed: false,
+                        },
+                    },
+                    FieldInfo {
+                        name: "as_f".into(),
+                        offset: 0,
+                        type_info: TypeInfo::Float {
+                            name: "float".into(),
+                            byte_size: 4,
+                        },
+                    },
                 ],
             },
         );
@@ -611,17 +727,42 @@ mod tests {
                 name: "outer_S".to_string(),
                 byte_size: 16,
                 fields: vec![
-                    FieldInfo { name: "nested".into(), offset: 0, type_info: TypeInfo::Struct { type_name: "inner_S".into(), byte_size: 2 } },
+                    FieldInfo {
+                        name: "nested".into(),
+                        offset: 0,
+                        type_info: TypeInfo::Struct {
+                            type_name: "inner_S".into(),
+                            byte_size: 2,
+                        },
+                    },
                     FieldInfo {
                         name: "arr".into(),
                         offset: 2,
                         type_info: TypeInfo::Array {
-                            element_type: Box::new(TypeInfo::Struct { type_name: "inner_S".into(), byte_size: 2 }),
+                            element_type: Box::new(TypeInfo::Struct {
+                                type_name: "inner_S".into(),
+                                byte_size: 2,
+                            }),
                             count: 3,
                         },
                     },
-                    FieldInfo { name: "conv".into(), offset: 8, type_info: TypeInfo::Union { type_name: "conv_U".into(), byte_size: 4 } },
-                    FieldInfo { name: "flat".into(), offset: 12, type_info: TypeInfo::Base { name: "i32".into(), byte_size: 4, signed: true } },
+                    FieldInfo {
+                        name: "conv".into(),
+                        offset: 8,
+                        type_info: TypeInfo::Union {
+                            type_name: "conv_U".into(),
+                            byte_size: 4,
+                        },
+                    },
+                    FieldInfo {
+                        name: "flat".into(),
+                        offset: 12,
+                        type_info: TypeInfo::Base {
+                            name: "i32".into(),
+                            byte_size: 4,
+                            signed: true,
+                        },
+                    },
                 ],
             },
         );
@@ -687,7 +828,9 @@ mod tests {
         let fw = layout_fw();
 
         match fw.field_type("outer_S", "flat") {
-            TypeInfo::Base { signed, byte_size, .. } => {
+            TypeInfo::Base {
+                signed, byte_size, ..
+            } => {
                 assert!(*signed);
                 assert_eq!(*byte_size, 4);
             }
@@ -695,7 +838,9 @@ mod tests {
         }
 
         match fw.field_type("outer_S", "nested.a") {
-            TypeInfo::Base { byte_size, signed, .. } => {
+            TypeInfo::Base {
+                byte_size, signed, ..
+            } => {
                 assert_eq!(*byte_size, 1);
                 assert!(!*signed);
             }
@@ -823,7 +968,10 @@ mod tests {
     #[test]
     fn enum_value_usize_alias() {
         let fw = sample_fw();
-        assert_eq!(fw.enum_value_usize("HAL_GPIO_SERVO_DIR"), fw.enum_channel("HAL_GPIO_SERVO_DIR"));
+        assert_eq!(
+            fw.enum_value_usize("HAL_GPIO_SERVO_DIR"),
+            fw.enum_channel("HAL_GPIO_SERVO_DIR")
+        );
         assert_eq!(fw.enum_value_usize("HAL_GPIO_SERVO_DIR"), 1);
     }
 
@@ -832,7 +980,10 @@ mod tests {
     #[test]
     fn try_enum_variants_present_and_absent() {
         let fw = sample_fw();
-        assert_eq!(fw.try_enum_variants("HAL_GPIO_channel_E").map(|v| v.len()), Some(3));
+        assert_eq!(
+            fw.try_enum_variants("HAL_GPIO_channel_E").map(|v| v.len()),
+            Some(3)
+        );
         assert!(fw.try_enum_variants("Nonexistent_E").is_none());
     }
 

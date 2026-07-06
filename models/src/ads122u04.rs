@@ -120,7 +120,10 @@ impl Ads122u04 {
             .spawn(move || protocol_loop(&adc))
             .expect("Failed to start ADS122U04 thread");
 
-        debug!("ADS122U04 model initialized (firmware_fd={}, model_fd={})", firmware_fd, model_fd);
+        debug!(
+            "ADS122U04 model initialized (firmware_fd={}, model_fd={})",
+            firmware_fd, model_fd
+        );
         (instance, firmware_fd)
     }
 
@@ -147,9 +150,7 @@ impl Ads122u04 {
 /// Returns (model_fd, firmware_fd) as raw file descriptors.
 fn create_pipe_pair() -> (RawFd, RawFd) {
     let mut fds = [0i32; 2];
-    let ret = unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
-    };
+    let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     assert_eq!(ret, 0, "Failed to create ADS122U04 socket pair");
 
     // Set model side to non-blocking for polling reads
@@ -206,8 +207,7 @@ fn protocol_loop(adc: &Ads122u04) {
 
         // Send continuous conversion data if active. The conversion interval
         // is derived from CONFIG1 (DR bits + Turbo flag) so the model honors
-        // whatever rate the firmware configured via WREG (1000 SPS by default
-        // in MaD firmware).
+        // whatever rate the firmware configured via WREG.
         if continuous {
             let reg1 = adc.registers.lock().unwrap()[REG_CONFIG1];
             let interval_us = if reg1 == 0 {
@@ -309,7 +309,11 @@ fn send_conversion(adc: &Ads122u04, fd: RawFd) {
         ((value >> 8) & 0xFF) as u8,
         ((value >> 16) & 0xFF) as u8,
     ];
-    trace!("ADS122U04: sending conversion value={} bytes={:?}", value, bytes);
+    trace!(
+        "ADS122U04: sending conversion value={} bytes={:?}",
+        value,
+        bytes
+    );
     write_bytes(fd, &bytes);
 }
 
@@ -350,7 +354,11 @@ mod tests {
     /// arithmetic stays exact with `gain == 1`. The background protocol thread
     /// spawned by `new()` simply idles against the socketpair and is harmless.
     fn make_adc(gain: f64, zero_offset: i32) -> (Arc<Ads122u04>, RawFd) {
-        let config = Config { vref_mv: 2_097_152.0, gain, zero_offset };
+        let config = Config {
+            vref_mv: 2_097_152.0,
+            gain,
+            zero_offset,
+        };
         Ads122u04::new(config)
     }
 
@@ -359,7 +367,8 @@ mod tests {
     /// `send_conversion` write to `write_end`, the test reads from `read_end`.
     fn test_pair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
-        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let ret =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(ret, 0, "socketpair failed");
         // Non-blocking on both ends so a test never hangs on a read.
         for fd in fds {
@@ -487,7 +496,10 @@ mod tests {
         let (adc, _fw) = make_adc(1.0, 5000);
         adc.set_voltage(-50.0);
         let code = adc.adc_value.load(Ordering::Relaxed);
-        assert!(code < 5000, "negative voltage must read below zero offset, got {code}");
+        assert!(
+            code < 5000,
+            "negative voltage must read below zero offset, got {code}"
+        );
         // -50 * 4 = -200, + 5000 = 4800.
         assert_eq!(code, 4800);
     }
@@ -536,7 +548,11 @@ mod tests {
         let _ = process_byte(&adc, wr, st, CMD_POWERDOWN, &mut cont);
 
         assert!(!cont, "POWERDOWN clears continuous");
-        assert_eq!(regs(&adc), [0x11; REGISTER_COUNT], "POWERDOWN leaves registers intact");
+        assert_eq!(
+            regs(&adc),
+            [0x11; REGISTER_COUNT],
+            "POWERDOWN leaves registers intact"
+        );
     }
 
     /// WREG writes the data byte into the register selected by `(cmd>>1)&0xF`.
@@ -557,7 +573,11 @@ mod tests {
         // Next byte is the data payload.
         let _ = process_byte(&adc, wr, st, 0x9C, &mut cont);
 
-        assert_eq!(regs(&adc)[2], 0x9C, "WREG must store the data byte in register 2");
+        assert_eq!(
+            regs(&adc)[2],
+            0x9C,
+            "WREG must store the data byte in register 2"
+        );
         // Other registers untouched.
         assert_eq!(regs(&adc)[0], 0x00);
     }
@@ -637,7 +657,11 @@ mod tests {
         let st = process_byte(&adc, wr, ParseState::WaitSync, SYNC_BYTE, &mut cont);
         let st = process_byte(&adc, wr, st, wreg_cmd, &mut cont);
         let _ = process_byte(&adc, wr, st, 0xFF, &mut cont);
-        assert_eq!(regs(&adc), [0u8; REGISTER_COUNT], "out-of-range WREG mutates nothing");
+        assert_eq!(
+            regs(&adc),
+            [0u8; REGISTER_COUNT],
+            "out-of-range WREG mutates nothing"
+        );
     }
 
     /// A non-sync byte in WaitSync is discarded and we stay in WaitSync: a
@@ -653,7 +677,10 @@ mod tests {
         let st = process_byte(&adc, wr, ParseState::WaitSync, 0x00, &mut cont);
         // Feed START directly — interpreted as another stray non-sync byte.
         let _ = process_byte(&adc, wr, st, CMD_START, &mut cont);
-        assert!(!cont, "without a preceding SYNC, a command must not take effect");
+        assert!(
+            !cont,
+            "without a preceding SYNC, a command must not take effect"
+        );
     }
 
     /// An unknown command (sync OK, but command nibble is neither RREG/WREG nor
@@ -724,7 +751,11 @@ mod tests {
     /// `Config` derives `Clone`/`Debug`.
     #[test]
     fn config_clone_and_debug() {
-        let c = Config { vref_mv: 2048.0, gain: 4.0, zero_offset: -7 };
+        let c = Config {
+            vref_mv: 2048.0,
+            gain: 4.0,
+            zero_offset: -7,
+        };
         let c2 = c.clone();
         assert_eq!(c2.gain, 4.0);
         assert_eq!(c2.zero_offset, -7);

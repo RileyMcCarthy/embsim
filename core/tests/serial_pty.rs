@@ -53,8 +53,14 @@ fn new_creates_a_symlink() {
     let pty = Pty::new(path.to_str().unwrap()).expect("Pty::new");
 
     let meta = std::fs::symlink_metadata(&path).expect("symlink_metadata");
-    assert!(meta.file_type().is_symlink(), "created path must be a symlink");
-    assert!(path.exists(), "symlink target must resolve to an existing tty");
+    assert!(
+        meta.file_type().is_symlink(),
+        "created path must be a symlink"
+    );
+    assert!(
+        path.exists(),
+        "symlink target must resolve to an existing tty"
+    );
     assert_eq!(pty.symlink_path, path.to_str().unwrap());
 
     drop(pty);
@@ -69,8 +75,8 @@ fn master_is_valid_and_slave_is_a_tty() {
     assert!(pty.master.as_raw_fd() >= 0, "master fd should be valid");
 
     // Open the symlinked slave and confirm the kernel agrees it is a terminal.
-    let slave_fd = open(&path, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty())
-        .expect("open slave path");
+    let slave_fd =
+        open(&path, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()).expect("open slave path");
     let is_tty = nix::unistd::isatty(slave_fd).unwrap_or(false);
     let _ = close(slave_fd);
     assert!(is_tty, "slave end of the PTY must be a tty");
@@ -102,7 +108,11 @@ fn round_trip_master_to_slave() {
     let _ = close(slave_fd);
 
     assert_eq!(n, payload.len(), "all bytes should arrive at the slave");
-    assert_eq!(&buf[..n], payload, "bytes must round-trip unchanged (raw mode)");
+    assert_eq!(
+        &buf[..n],
+        payload,
+        "bytes must round-trip unchanged (raw mode)"
+    );
 
     drop(pty);
 }
@@ -117,7 +127,7 @@ fn master_is_nonblocking() {
     let mut buf = [0u8; 16];
     match read(pty.master.as_raw_fd(), &mut buf) {
         Err(nix::errno::Errno::EAGAIN) => {} // expected: no data, would-block
-        Ok(0) => {} // also acceptable: nothing available
+        Ok(0) => {}                          // also acceptable: nothing available
         other => panic!("expected EAGAIN on empty non-blocking master, got {other:?}"),
     }
 
@@ -130,12 +140,18 @@ fn master_is_nonblocking() {
 fn new_creates_missing_parent_dir() {
     let base = unique_path("nested");
     let nested = base.join("a").join("b").join("tty.sim");
-    assert!(!base.exists(), "precondition: parent dir does not exist yet");
+    assert!(
+        !base.exists(),
+        "precondition: parent dir does not exist yet"
+    );
 
     let pty = Pty::new(nested.to_str().unwrap()).expect("Pty::new with nested path");
     assert!(nested.exists(), "nested symlink should now exist");
     assert!(
-        std::fs::symlink_metadata(&nested).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&nested)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "nested path must be a symlink"
     );
 
@@ -156,7 +172,10 @@ fn new_twice_replaces_existing_symlink() {
     // Second creation on the same path must succeed (old symlink removed first).
     let second = Pty::new(path.to_str().unwrap()).expect("second Pty::new replaces symlink");
     assert!(
-        std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "path is still a symlink after replacement"
     );
 

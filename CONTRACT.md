@@ -11,8 +11,9 @@ The firmware is compiled to a static library with its HAL **left undefined**.
 When the emulator binary links that `.a`, the linker resolves each undefined
 `HAL_*` (etc.) symbol against the `#[no_mangle]` functions in the platform crate.
 There is no indirection table — symbol *names must match the firmware's HAL
-headers exactly*, including any historical spellings (MaD's firmware spells it
-`recieve`, so the trampoline is `HAL_serial_recieveByte`).
+headers exactly*, including any historical spellings (the reference `embsim-p2`
+platform's firmware spells it `recieve`, so its trampoline is
+`HAL_serial_recieveByte`).
 
 ## ABI mapping rules
 
@@ -27,12 +28,12 @@ headers exactly*, including any historical spellings (MaD's firmware spells it
 
 Every trampoline must **null/range-guard its arguments** before delegating to the
 generic peripheral (the peripherals also guard, but the platform layer is the
-ABI boundary). See `embsim/platforms/p2/src/ffi.rs` for the reference pattern.
+ABI boundary). See [`platforms/p2/src/ffi.rs`](platforms/p2/src/ffi.rs) for the reference pattern.
 
 ## Required symbol domains
 
-A platform must provide all symbols its firmware references. For the P2/MaD
-firmware these are three domains:
+A platform must provide all symbols its firmware references. For the reference
+Propeller 2 platform (`embsim-p2`) these are three domains:
 
 ### 1. HAL (the bulk — delegate to `embsim_peripherals`)
 

@@ -15,7 +15,9 @@ pub struct EdgeDetector {
 impl EdgeDetector {
     /// Create a detector seeded with an initial level.
     pub const fn new(initial: bool) -> Self {
-        Self { state: AtomicBool::new(initial) }
+        Self {
+            state: AtomicBool::new(initial),
+        }
     }
 
     /// Feed the current level. Returns `Some(level)` on a rising or falling

@@ -40,7 +40,8 @@ impl LimitSwitch {
     pub fn new(config: Config) -> Arc<Self> {
         tracing::info!(
             "limit_switch: init upper={:.1}mm lower={:.1}mm",
-            config.upper_threshold_mm, config.lower_threshold_mm
+            config.upper_threshold_mm,
+            config.lower_threshold_mm
         );
         Arc::new(Self {
             config,
@@ -64,10 +65,16 @@ impl LimitSwitch {
     /// Update limit switch states for the given position in mm.
     /// Fires callbacks only on transitions.
     pub fn update(&self, position_mm: f64) {
-        if let Some(upper) = self.upper.update(position_mm < self.config.upper_threshold_mm) {
+        if let Some(upper) = self
+            .upper
+            .update(position_mm < self.config.upper_threshold_mm)
+        {
             self.on_upper_change.emit(upper);
         }
-        if let Some(lower) = self.lower.update(position_mm > self.config.lower_threshold_mm) {
+        if let Some(lower) = self
+            .lower
+            .update(position_mm > self.config.lower_threshold_mm)
+        {
             self.on_lower_change.emit(lower);
         }
     }
@@ -88,7 +95,10 @@ mod tests {
     /// Thresholds chosen so that the band `(lower, upper)` is a real interval:
     /// upper triggers when `pos < 10.0`, lower triggers when `pos > 2.0`.
     fn config() -> Config {
-        Config { upper_threshold_mm: 10.0, lower_threshold_mm: 2.0 }
+        Config {
+            upper_threshold_mm: 10.0,
+            lower_threshold_mm: 2.0,
+        }
     }
 
     /// Records the last value and the number of times an `on_*_change` fired.
@@ -132,7 +142,11 @@ mod tests {
         // pos == 10.0: `pos < 10` is false (no change from seed → no upper
         // event); `pos > 2` is true (first lower transition → one lower event).
         sw.update(10.0);
-        assert_eq!(upper.count(), 0, "upper must not fire when predicate stays false");
+        assert_eq!(
+            upper.count(),
+            0,
+            "upper must not fire when predicate stays false"
+        );
         assert_eq!(lower.count(), 1, "lower rises on first true predicate");
         assert!(lower.last(), "lower transitioned to true");
     }
@@ -217,7 +231,11 @@ mod tests {
         sw.update(100.0);
         assert_eq!(upper.count(), 2);
         assert!(!upper.last());
-        assert_eq!(lower.count(), 1, "lower unchanged when staying above its threshold");
+        assert_eq!(
+            lower.count(),
+            1,
+            "lower unchanged when staying above its threshold"
+        );
     }
 
     /// `Observers` appends, so multiple subscribers on the same channel are all
@@ -263,16 +281,27 @@ mod tests {
 
         // Exactly at thresholds: 10.0 < 10.0 is false; 2.0 > 2.0 is false.
         sw.update(10.0); // upper false (no change), lower: 10>2 true → lower rises
-        // Reset lower below its threshold for a clean boundary check.
+                         // Reset lower below its threshold for a clean boundary check.
         sw.update(2.0); // upper: 2<10 true → upper rises; lower: 2>2 false → lower falls
         assert!(upper.last(), "upper rose crossing below 10");
-        assert!(!lower.last(), "lower fell at exactly the lower threshold (strict >)");
+        assert!(
+            !lower.last(),
+            "lower fell at exactly the lower threshold (strict >)"
+        );
         let upper_after = upper.count();
         // Re-feeding exactly the lower threshold must not re-trigger lower.
         let lower_after = lower.count();
         sw.update(2.0);
-        assert_eq!(upper.count(), upper_after, "no upper change repeating same position");
-        assert_eq!(lower.count(), lower_after, "no lower change repeating same position");
+        assert_eq!(
+            upper.count(),
+            upper_after,
+            "no upper change repeating same position"
+        );
+        assert_eq!(
+            lower.count(),
+            lower_after,
+            "no lower change repeating same position"
+        );
     }
 
     /// `Config` derives `Clone` and `Debug`; exercise both so the derives stay
@@ -297,7 +326,10 @@ mod tests {
         // below `lower` (2)... that is impossible with the default band, so use
         // a config where the upper threshold sits *below* the lower one and we
         // operate entirely under the lower threshold.
-        let cfg = Config { upper_threshold_mm: 1.0, lower_threshold_mm: 5.0 };
+        let cfg = Config {
+            upper_threshold_mm: 1.0,
+            lower_threshold_mm: 5.0,
+        };
         let sw = LimitSwitch::new(cfg);
 
         let lower_fired = Arc::new(AtomicBool::new(false));

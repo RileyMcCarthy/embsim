@@ -5,7 +5,7 @@
 //! a well-known location so host software can connect to it.
 
 use nix::pty::{openpty, OpenptyResult};
-use nix::sys::termios::{self, LocalFlags, InputFlags, OutputFlags, SetArg};
+use nix::sys::termios::{self, InputFlags, LocalFlags, OutputFlags, SetArg};
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
@@ -24,8 +24,8 @@ pub struct Pty {
 impl Pty {
     /// Create a new PTY pair and symlink the slave to `symlink_path`.
     pub fn new(symlink_path: &str) -> std::io::Result<Self> {
-        let OpenptyResult { master, slave } = openpty(None, None)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let OpenptyResult { master, slave } =
+            openpty(None, None).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         let master_fd = master;
         let slave_fd = slave;
@@ -56,7 +56,11 @@ impl Pty {
         }
         std::os::unix::fs::symlink(&slave_path, link)?;
 
-        info!("PTY created: master_fd={}, slave={}", master_fd.as_raw_fd(), slave_path);
+        info!(
+            "PTY created: master_fd={}, slave={}",
+            master_fd.as_raw_fd(),
+            slave_path
+        );
         info!("PTY symlinked: {} → {}", symlink_path, slave_path);
 
         Ok(Pty {

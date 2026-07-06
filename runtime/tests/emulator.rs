@@ -160,7 +160,10 @@ fn emulator_error_display_strings() {
     let missing_syms = EmulatorError::MissingSymbols(vec!["A_E".to_string(), "B_E".to_string()]);
     let msg = missing_syms.to_string();
     assert!(msg.contains("2"), "should report the count: {msg}");
-    assert!(msg.contains("A_E") && msg.contains("B_E"), "should list each: {msg}");
+    assert!(
+        msg.contains("A_E") && msg.contains("B_E"),
+        "should list each: {msg}"
+    );
 
     let too_many = EmulatorError::TooManyChannels {
         peripheral: "gpio",
@@ -373,7 +376,10 @@ fn full_run_with_baud_pacing_succeeds() {
         .expect("build should succeed")
         .run();
 
-    assert!(result.is_ok(), "run() with baud pacing should be Ok: {result:?}");
+    assert!(
+        result.is_ok(),
+        "run() with baud pacing should be Ok: {result:?}"
+    );
 }
 
 // ============================================================
@@ -399,9 +405,15 @@ fn run_rejects_too_many_gpio_channels() {
         .build()
         .expect("build should succeed even with an over-large count");
 
-    let err = emu.run().expect_err("run should reject the over-large count");
+    let err = emu
+        .run()
+        .expect_err("run should reject the over-large count");
     match err {
-        EmulatorError::TooManyChannels { peripheral, requested, max } => {
+        EmulatorError::TooManyChannels {
+            peripheral,
+            requested,
+            max,
+        } => {
             assert_eq!(peripheral, "gpio");
             assert_eq!(requested, 9999);
             assert_eq!(max, gpio::MAX_CHANNELS);
@@ -441,7 +453,11 @@ fn run_reports_all_missing_symbols_first() {
     let err = emu.run().expect_err("run should fail preflight");
     match err {
         EmulatorError::MissingSymbols(names) => {
-            assert_eq!(names.len(), 3, "all three missing names reported: {names:?}");
+            assert_eq!(
+                names.len(),
+                3,
+                "all three missing names reported: {names:?}"
+            );
             assert!(names.contains(&"HAL_FOO_E".to_string()));
             assert!(names.contains(&"HAL_BAR_E".to_string()));
             assert!(names.contains(&"HAL_BAZ_VARIANT".to_string()));
@@ -486,7 +502,10 @@ fn on_wired_runs_after_wire_and_before_entry() {
 
     let log = order_log.lock().unwrap();
     let wire_idx = log.iter().position(|&s| s == "wire").expect("wire ran");
-    let hook_idx = log.iter().position(|&s| s == "on_wired").expect("on_wired ran");
+    let hook_idx = log
+        .iter()
+        .position(|&s| s == "on_wired")
+        .expect("on_wired ran");
     let entry_idx = log.iter().position(|&s| s == "entry").expect("entry ran");
 
     assert!(wire_idx < hook_idx, "wire must precede on_wired: {log:?}");
@@ -494,9 +513,18 @@ fn on_wired_runs_after_wire_and_before_entry() {
 
     // And the firmware-derived steps happened before wiring.
     let counts_idx = log.iter().position(|&s| s == "counts").expect("counts ran");
-    let host_idx = log.iter().position(|&s| s == "host_ch").expect("host_ch ran");
-    assert!(counts_idx < wire_idx, "peripheral_counts before wire: {log:?}");
-    assert!(host_idx < wire_idx, "host_serial_channel before wire: {log:?}");
+    let host_idx = log
+        .iter()
+        .position(|&s| s == "host_ch")
+        .expect("host_ch ran");
+    assert!(
+        counts_idx < wire_idx,
+        "peripheral_counts before wire: {log:?}"
+    );
+    assert!(
+        host_idx < wire_idx,
+        "host_serial_channel before wire: {log:?}"
+    );
 }
 
 /// Without an `on_wired` hook, `run()` still completes (the hook is optional).
@@ -516,5 +544,8 @@ fn run_without_on_wired_hook_succeeds() {
         .expect("build should succeed")
         .run();
 
-    assert!(result.is_ok(), "run() without on_wired should be Ok: {result:?}");
+    assert!(
+        result.is_ok(),
+        "run() without on_wired should be Ok: {result:?}"
+    );
 }

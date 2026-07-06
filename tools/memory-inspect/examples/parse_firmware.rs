@@ -8,9 +8,7 @@ use std::path::Path;
 
 fn main() {
     // Simple tracing init
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args: Vec<String> = std::env::args().collect();
     let path = args
@@ -24,7 +22,12 @@ fn main() {
     enum_names.sort();
     for name in &enum_names {
         let e = &fw.enums[*name];
-        println!("  {} ({} bytes, {} variants)", name, e.byte_size, e.variants.len());
+        println!(
+            "  {} ({} bytes, {} variants)",
+            name,
+            e.byte_size,
+            e.variants.len()
+        );
         for (vname, vval) in &e.variants {
             println!("    {} = {}", vname, vval);
         }
@@ -35,7 +38,12 @@ fn main() {
     struct_names.sort();
     for name in &struct_names {
         let s = &fw.structs[*name];
-        println!("  {} ({} bytes, {} fields)", name, s.byte_size, s.fields.len());
+        println!(
+            "  {} ({} bytes, {} fields)",
+            name,
+            s.byte_size,
+            s.fields.len()
+        );
         for f in &s.fields {
             println!("    +{:4} {} ({:?})", f.offset, f.name, f.type_info);
         }
@@ -46,7 +54,12 @@ fn main() {
     var_names.sort();
     for name in &var_names {
         let v = &fw.variables[*name];
-        println!("  {} ({:?}) [{}]", name, v.type_info, v.source_file.as_deref().unwrap_or("?"));
+        println!(
+            "  {} ({:?}) [{}]",
+            name,
+            v.type_info,
+            v.source_file.as_deref().unwrap_or("?")
+        );
     }
 
     // Demonstrate the lookup API against whatever this firmware actually

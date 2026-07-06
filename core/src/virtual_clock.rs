@@ -167,7 +167,11 @@ mod tests {
         init(2.0, 1_000_000);
         assert_eq!(virtual_to_wall_us(1000), 500, "init(2.0) halves wall wait");
         init(0.5, 1_000_000);
-        assert_eq!(virtual_to_wall_us(1000), 2000, "init(0.5) doubles wall wait");
+        assert_eq!(
+            virtual_to_wall_us(1000),
+            2000,
+            "init(0.5) doubles wall wait"
+        );
         init(1.0, 1_000_000);
     }
 
@@ -242,7 +246,10 @@ mod tests {
                 break;
             }
         }
-        assert!(grew, "cycles should rise above zero as virtual time advances");
+        assert!(
+            grew,
+            "cycles should rise above zero as virtual time advances"
+        );
     }
 
     /// Re-`init` re-anchors the boot offset, so virtual time restarts near zero.

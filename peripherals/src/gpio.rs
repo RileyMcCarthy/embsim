@@ -31,7 +31,12 @@ static CHANNEL_NAMES: Mutex<Option<&'static [&'static str]>> = Mutex::new(None);
 /// Must be called before firmware starts. Resets any prior state, so calling it
 /// again (in-process restart) yields a clean bank.
 pub fn init(count: usize, names: Option<&'static [&'static str]>) {
-    assert!(count <= MAX_CHANNELS, "GPIO count {} exceeds max {}", count, MAX_CHANNELS);
+    assert!(
+        count <= MAX_CHANNELS,
+        "GPIO count {} exceeds max {}",
+        count,
+        MAX_CHANNELS
+    );
     reset();
     CHANNEL_COUNT.store(count, Ordering::Relaxed);
     *CHANNEL_NAMES.lock().unwrap() = names;
@@ -205,14 +210,24 @@ mod tests {
         let last = Arc::new(AtomicU32::new(u32::MAX));
         {
             let l = Arc::clone(&last);
-            on_change(0, move |active| l.store(active as u32, AtomicOrdering::Relaxed));
+            on_change(0, move |active| {
+                l.store(active as u32, AtomicOrdering::Relaxed)
+            });
         }
         toggle_active(0);
         assert!(get_active(0), "toggle from low → high");
-        assert_eq!(last.load(AtomicOrdering::Relaxed), 1, "callback saw new state true");
+        assert_eq!(
+            last.load(AtomicOrdering::Relaxed),
+            1,
+            "callback saw new state true"
+        );
         toggle_active(0);
         assert!(!get_active(0), "toggle from high → low");
-        assert_eq!(last.load(AtomicOrdering::Relaxed), 0, "callback saw new state false");
+        assert_eq!(
+            last.load(AtomicOrdering::Relaxed),
+            0,
+            "callback saw new state false"
+        );
     }
 
     #[test]
@@ -258,7 +273,11 @@ mod tests {
         }
         set_state(0, true);
         assert!(get_active(0), "set_state changes the observed value");
-        assert_eq!(hits.load(AtomicOrdering::Relaxed), 0, "set_state does not fire callback");
+        assert_eq!(
+            hits.load(AtomicOrdering::Relaxed),
+            0,
+            "set_state does not fire callback"
+        );
     }
 
     #[test]
@@ -289,8 +308,16 @@ mod tests {
             });
         }
         set_active(0, true);
-        assert_eq!(first.load(AtomicOrdering::Relaxed), 0, "first callback overwritten");
-        assert_eq!(second.load(AtomicOrdering::Relaxed), 1, "only the latest fires");
+        assert_eq!(
+            first.load(AtomicOrdering::Relaxed),
+            0,
+            "first callback overwritten"
+        );
+        assert_eq!(
+            second.load(AtomicOrdering::Relaxed),
+            1,
+            "only the latest fires"
+        );
     }
 
     #[test]
@@ -315,7 +342,11 @@ mod tests {
         // Channel count cleared, so re-arming and writing fires nothing.
         init(2, None);
         set_active(0, true); // callback was cleared by reset()
-        assert_eq!(hits.load(AtomicOrdering::Relaxed), 0, "callback cleared by reset");
+        assert_eq!(
+            hits.load(AtomicOrdering::Relaxed),
+            0,
+            "callback cleared by reset"
+        );
     }
 
     #[test]

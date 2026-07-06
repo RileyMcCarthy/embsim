@@ -54,8 +54,8 @@ impl SymbolResolver {
         let data = std::fs::read(path)
             .map_err(|e| format!("Failed to read binary {}: {}", path.display(), e))?;
 
-        let obj = object::File::parse(&*data)
-            .map_err(|e| format!("Failed to parse binary: {}", e))?;
+        let obj =
+            object::File::parse(&*data).map_err(|e| format!("Failed to parse binary: {}", e))?;
 
         let mut symbols = std::collections::HashMap::new();
 
@@ -80,9 +80,7 @@ impl SymbolResolver {
 
     /// Compute the load bias ("slide") between a symbol's file (link-time)
     /// address and its runtime address in the current process image.
-    fn compute_slide(
-        _symbols: &std::collections::HashMap<String, u64>,
-    ) -> u64 {
+    fn compute_slide(_symbols: &std::collections::HashMap<String, u64>) -> u64 {
         // macOS: ask dyld for the main image's ASLR slide directly.
         #[cfg(target_os = "macos")]
         {
@@ -241,7 +239,8 @@ impl SymbolResolver {
                             let field_offset = fw.resolve_field_offset(struct_info, &rest)?;
                             let field_type = fw.resolve_field_type(struct_info, &rest)?;
                             let size = field_type.byte_size();
-                            let bytes = self.read_bytes(var_name, base_offset + field_offset, size)?;
+                            let bytes =
+                                self.read_bytes(var_name, base_offset + field_offset, size)?;
                             return Self::bytes_to_f64(&field_type, &bytes, var_name, field_path);
                         }
                         _ => return None,
@@ -290,31 +289,53 @@ impl SymbolResolver {
     ) -> Option<f64> {
         let size = field_type.byte_size();
         let value = match field_type {
-            TypeInfo::Base { byte_size: 1, signed: true, .. } => {
-                i8::from_le_bytes([bytes[0]]) as f64
-            }
-            TypeInfo::Base { byte_size: 1, signed: false, .. } => {
+            TypeInfo::Base {
+                byte_size: 1,
+                signed: true,
+                ..
+            } => i8::from_le_bytes([bytes[0]]) as f64,
+            TypeInfo::Base {
+                byte_size: 1,
+                signed: false,
+                ..
+            } => {
                 // Could be bool or uint8_t — both read as u8
                 bytes[0] as f64
             }
-            TypeInfo::Base { byte_size: 2, signed: true, .. } => {
-                i16::from_le_bytes([bytes[0], bytes[1]]) as f64
-            }
-            TypeInfo::Base { byte_size: 2, signed: false, .. } => {
-                u16::from_le_bytes([bytes[0], bytes[1]]) as f64
-            }
-            TypeInfo::Base { byte_size: 4, signed: true, .. } => {
-                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
-            }
-            TypeInfo::Base { byte_size: 4, signed: false, .. } => {
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
-            }
-            TypeInfo::Base { byte_size: 8, signed: true, .. } => {
+            TypeInfo::Base {
+                byte_size: 2,
+                signed: true,
+                ..
+            } => i16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+            TypeInfo::Base {
+                byte_size: 2,
+                signed: false,
+                ..
+            } => u16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+            TypeInfo::Base {
+                byte_size: 4,
+                signed: true,
+                ..
+            } => i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
+            TypeInfo::Base {
+                byte_size: 4,
+                signed: false,
+                ..
+            } => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64,
+            TypeInfo::Base {
+                byte_size: 8,
+                signed: true,
+                ..
+            } => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&bytes[..8]);
                 i64::from_le_bytes(buf) as f64
             }
-            TypeInfo::Base { byte_size: 8, signed: false, .. } => {
+            TypeInfo::Base {
+                byte_size: 8,
+                signed: false,
+                ..
+            } => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&bytes[..8]);
                 u64::from_le_bytes(buf) as f64
@@ -322,12 +343,8 @@ impl SymbolResolver {
             TypeInfo::Enum { byte_size: 4, .. } => {
                 i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64
             }
-            TypeInfo::Enum { byte_size: 2, .. } => {
-                i16::from_le_bytes([bytes[0], bytes[1]]) as f64
-            }
-            TypeInfo::Enum { byte_size: 1, .. } => {
-                bytes[0] as f64
-            }
+            TypeInfo::Enum { byte_size: 2, .. } => i16::from_le_bytes([bytes[0], bytes[1]]) as f64,
+            TypeInfo::Enum { byte_size: 1, .. } => bytes[0] as f64,
             // IEEE-754 floats must be decoded as floats — reading their bytes
             // as an integer yields garbage (this was a latent bug).
             TypeInfo::Float { byte_size: 4, .. } => {
@@ -341,7 +358,12 @@ impl SymbolResolver {
             // Bitfield: read the underlying storage unit, then shift/mask out the
             // member's bits. `bit_offset` is relative to the member's byte offset
             // (normalized when the field was parsed). Sign-extend when signed.
-            TypeInfo::Bitfield { bit_offset, bit_size, storage_size, signed } => {
+            TypeInfo::Bitfield {
+                bit_offset,
+                bit_size,
+                storage_size,
+                signed,
+            } => {
                 if *bit_size == 0 || *bit_size > 64 {
                     return None;
                 }
@@ -349,7 +371,11 @@ impl SymbolResolver {
                 let mut buf = [0u8; 8];
                 buf[..n].copy_from_slice(&bytes[..n]);
                 let raw = u64::from_le_bytes(buf);
-                let mask = if *bit_size == 64 { u64::MAX } else { (1u64 << bit_size) - 1 };
+                let mask = if *bit_size == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bit_size) - 1
+                };
                 let field = (raw >> (bit_offset % 64)) & mask;
                 if *signed && (field >> (bit_size - 1)) & 1 == 1 {
                     // Sign-extend: set all bits above the field.
@@ -369,7 +395,6 @@ impl SymbolResolver {
 
         Some(value)
     }
-
 }
 
 // ============================================================
@@ -448,7 +473,10 @@ mod tests {
         // 1.5f32 little-endian. Decoding these bytes as an integer would give
         // 1069547520, not 1.5 — this guards the float-decode bug fix.
         let bytes = 1.5f32.to_le_bytes();
-        let ti = TypeInfo::Float { name: "float".into(), byte_size: 4 };
+        let ti = TypeInfo::Float {
+            name: "float".into(),
+            byte_size: 4,
+        };
         let v = SymbolResolver::bytes_to_f64(&ti, &bytes, "v", "f").unwrap();
         assert_eq!(v, 1.5);
     }
@@ -456,7 +484,10 @@ mod tests {
     #[test]
     fn decodes_f64() {
         let bytes = (-2.25f64).to_le_bytes();
-        let ti = TypeInfo::Float { name: "double".into(), byte_size: 8 };
+        let ti = TypeInfo::Float {
+            name: "double".into(),
+            byte_size: 8,
+        };
         let v = SymbolResolver::bytes_to_f64(&ti, &bytes, "v", "f").unwrap();
         assert_eq!(v, -2.25);
     }
@@ -465,7 +496,12 @@ mod tests {
     fn decodes_unsigned_bitfield() {
         // Extract bits [4..7) (value 0b101 = 5) from a 1-byte storage unit.
         let storage = [0b0101_0000u8];
-        let ti = TypeInfo::Bitfield { bit_offset: 4, bit_size: 3, storage_size: 1, signed: false };
+        let ti = TypeInfo::Bitfield {
+            bit_offset: 4,
+            bit_size: 3,
+            storage_size: 1,
+            signed: false,
+        };
         let v = SymbolResolver::bytes_to_f64(&ti, &storage, "v", "f").unwrap();
         assert_eq!(v, 5.0);
     }
@@ -474,7 +510,12 @@ mod tests {
     fn decodes_signed_bitfield_sign_extends() {
         // 3-bit signed field holding 0b111 = -1.
         let storage = [0b0000_0111u8];
-        let ti = TypeInfo::Bitfield { bit_offset: 0, bit_size: 3, storage_size: 1, signed: true };
+        let ti = TypeInfo::Bitfield {
+            bit_offset: 0,
+            bit_size: 3,
+            storage_size: 1,
+            signed: true,
+        };
         let v = SymbolResolver::bytes_to_f64(&ti, &storage, "v", "f").unwrap();
         assert_eq!(v, -1.0);
     }
@@ -500,7 +541,11 @@ mod tests {
                 8 => (val as i64).to_le_bytes().to_vec(),
                 _ => unreachable!(),
             };
-            let ti = TypeInfo::Base { name: "i".into(), byte_size: size, signed: true };
+            let ti = TypeInfo::Base {
+                name: "i".into(),
+                byte_size: size,
+                signed: true,
+            };
             let got = SymbolResolver::bytes_to_f64(&ti, &bytes, "v", "f").unwrap();
             assert_eq!(got, val as f64, "signed base size {size}");
         }
@@ -509,7 +554,12 @@ mod tests {
     /// Unsigned bases of every width decode to their unsigned value as f64.
     #[test]
     fn bytes_to_f64_unsigned_bases() {
-        let cases: &[(usize, u64)] = &[(1, 200), (2, 60_000), (4, 4_000_000_000), (8, 10_000_000_000)];
+        let cases: &[(usize, u64)] = &[
+            (1, 200),
+            (2, 60_000),
+            (4, 4_000_000_000),
+            (8, 10_000_000_000),
+        ];
         for &(size, val) in cases {
             let bytes = match size {
                 1 => (val as u8).to_le_bytes().to_vec(),
@@ -518,7 +568,11 @@ mod tests {
                 8 => (val as u64).to_le_bytes().to_vec(),
                 _ => unreachable!(),
             };
-            let ti = TypeInfo::Base { name: "u".into(), byte_size: size, signed: false };
+            let ti = TypeInfo::Base {
+                name: "u".into(),
+                byte_size: size,
+                signed: false,
+            };
             let got = SymbolResolver::bytes_to_f64(&ti, &bytes, "v", "f").unwrap();
             assert_eq!(got, val as f64, "unsigned base size {size}");
         }
@@ -527,9 +581,19 @@ mod tests {
     /// A 1-byte unsigned base decodes a bool's storage (0 or 1) directly.
     #[test]
     fn bytes_to_f64_bool_like_u8() {
-        let ti = TypeInfo::Base { name: "bool".into(), byte_size: 1, signed: false };
-        assert_eq!(SymbolResolver::bytes_to_f64(&ti, &[1], "v", "f").unwrap(), 1.0);
-        assert_eq!(SymbolResolver::bytes_to_f64(&ti, &[0], "v", "f").unwrap(), 0.0);
+        let ti = TypeInfo::Base {
+            name: "bool".into(),
+            byte_size: 1,
+            signed: false,
+        };
+        assert_eq!(
+            SymbolResolver::bytes_to_f64(&ti, &[1], "v", "f").unwrap(),
+            1.0
+        );
+        assert_eq!(
+            SymbolResolver::bytes_to_f64(&ti, &[0], "v", "f").unwrap(),
+            0.0
+        );
     }
 
     // ── bytes_to_f64: Enum sizes ──
@@ -537,14 +601,32 @@ mod tests {
     /// Enums of width 1/2/4 decode through their integer storage.
     #[test]
     fn bytes_to_f64_enum_sizes() {
-        let e1 = TypeInfo::Enum { type_name: "E".into(), byte_size: 1 };
-        assert_eq!(SymbolResolver::bytes_to_f64(&e1, &[7], "v", "f").unwrap(), 7.0);
+        let e1 = TypeInfo::Enum {
+            type_name: "E".into(),
+            byte_size: 1,
+        };
+        assert_eq!(
+            SymbolResolver::bytes_to_f64(&e1, &[7], "v", "f").unwrap(),
+            7.0
+        );
 
-        let e2 = TypeInfo::Enum { type_name: "E".into(), byte_size: 2 };
-        assert_eq!(SymbolResolver::bytes_to_f64(&e2, &300i16.to_le_bytes(), "v", "f").unwrap(), 300.0);
+        let e2 = TypeInfo::Enum {
+            type_name: "E".into(),
+            byte_size: 2,
+        };
+        assert_eq!(
+            SymbolResolver::bytes_to_f64(&e2, &300i16.to_le_bytes(), "v", "f").unwrap(),
+            300.0
+        );
 
-        let e4 = TypeInfo::Enum { type_name: "E".into(), byte_size: 4 };
-        assert_eq!(SymbolResolver::bytes_to_f64(&e4, &123_456i32.to_le_bytes(), "v", "f").unwrap(), 123_456.0);
+        let e4 = TypeInfo::Enum {
+            type_name: "E".into(),
+            byte_size: 4,
+        };
+        assert_eq!(
+            SymbolResolver::bytes_to_f64(&e4, &123_456i32.to_le_bytes(), "v", "f").unwrap(),
+            123_456.0
+        );
     }
 
     // ── bytes_to_f64: unsupported / degenerate ──
@@ -555,14 +637,27 @@ mod tests {
     fn bytes_to_f64_unsupported_returns_none() {
         let buf = [0u8; 8];
         let unsupported = [
-            TypeInfo::Struct { type_name: "S".into(), byte_size: 8 },
-            TypeInfo::Union { type_name: "U".into(), byte_size: 8 },
+            TypeInfo::Struct {
+                type_name: "S".into(),
+                byte_size: 8,
+            },
+            TypeInfo::Union {
+                type_name: "U".into(),
+                byte_size: 8,
+            },
             TypeInfo::Pointer { byte_size: 8 },
             TypeInfo::Unknown { byte_size: 8 },
             // A Base width the match arms don't cover (3 bytes).
-            TypeInfo::Base { name: "odd".into(), byte_size: 3, signed: false },
+            TypeInfo::Base {
+                name: "odd".into(),
+                byte_size: 3,
+                signed: false,
+            },
             // An Enum width the match arms don't cover (8 bytes).
-            TypeInfo::Enum { type_name: "E".into(), byte_size: 8 },
+            TypeInfo::Enum {
+                type_name: "E".into(),
+                byte_size: 8,
+            },
         ];
         for ti in &unsupported {
             assert!(
@@ -578,10 +673,20 @@ mod tests {
     #[test]
     fn bytes_to_f64_bitfield_invalid_width() {
         let buf = [0xFFu8; 8];
-        let zero = TypeInfo::Bitfield { bit_offset: 0, bit_size: 0, storage_size: 1, signed: false };
+        let zero = TypeInfo::Bitfield {
+            bit_offset: 0,
+            bit_size: 0,
+            storage_size: 1,
+            signed: false,
+        };
         assert!(SymbolResolver::bytes_to_f64(&zero, &buf, "v", "f").is_none());
 
-        let too_wide = TypeInfo::Bitfield { bit_offset: 0, bit_size: 65, storage_size: 8, signed: false };
+        let too_wide = TypeInfo::Bitfield {
+            bit_offset: 0,
+            bit_size: 65,
+            storage_size: 8,
+            signed: false,
+        };
         assert!(SymbolResolver::bytes_to_f64(&too_wide, &buf, "v", "f").is_none());
     }
 
@@ -589,7 +694,12 @@ mod tests {
     #[test]
     fn bytes_to_f64_bitfield_full_width() {
         let buf = 0x00FF_00FF_00FF_00FFu64.to_le_bytes();
-        let ti = TypeInfo::Bitfield { bit_offset: 0, bit_size: 64, storage_size: 8, signed: false };
+        let ti = TypeInfo::Bitfield {
+            bit_offset: 0,
+            bit_size: 64,
+            storage_size: 8,
+            signed: false,
+        };
         let got = SymbolResolver::bytes_to_f64(&ti, &buf, "v", "f").unwrap();
         assert_eq!(got, 0x00FF_00FF_00FF_00FFu64 as f64);
     }
@@ -599,7 +709,12 @@ mod tests {
     fn bytes_to_f64_bitfield_multibyte() {
         // 16-bit storage, extract bits [8..12) of 0xF300 → 0x3 = 3.
         let buf = 0xF300u16.to_le_bytes();
-        let ti = TypeInfo::Bitfield { bit_offset: 8, bit_size: 4, storage_size: 2, signed: false };
+        let ti = TypeInfo::Bitfield {
+            bit_offset: 8,
+            bit_size: 4,
+            storage_size: 2,
+            signed: false,
+        };
         let got = SymbolResolver::bytes_to_f64(&ti, &buf, "v", "f").unwrap();
         assert_eq!(got, 3.0);
     }
@@ -609,9 +724,18 @@ mod tests {
     /// `parse_array_index` parses a leading `[N]` and the remaining path.
     #[test]
     fn parse_array_index_cases() {
-        assert_eq!(SymbolResolver::parse_array_index("[3].field"), Some((3, "field".to_string())));
-        assert_eq!(SymbolResolver::parse_array_index("[0]"), Some((0, String::new())));
-        assert_eq!(SymbolResolver::parse_array_index("[12].a.b"), Some((12, "a.b".to_string())));
+        assert_eq!(
+            SymbolResolver::parse_array_index("[3].field"),
+            Some((3, "field".to_string()))
+        );
+        assert_eq!(
+            SymbolResolver::parse_array_index("[0]"),
+            Some((0, String::new()))
+        );
+        assert_eq!(
+            SymbolResolver::parse_array_index("[12].a.b"),
+            Some((12, "a.b".to_string()))
+        );
         // No leading bracket → None.
         assert_eq!(SymbolResolver::parse_array_index("no_bracket"), None);
         // Non-numeric index → None.
@@ -625,14 +749,35 @@ mod tests {
     /// Every `FromBytes` impl round-trips its little-endian encoding.
     #[test]
     fn from_bytes_round_trips() {
-        assert_eq!(<i8 as FromBytes>::from_le_bytes(&(-12i8).to_le_bytes()), -12);
+        assert_eq!(
+            <i8 as FromBytes>::from_le_bytes(&(-12i8).to_le_bytes()),
+            -12
+        );
         assert_eq!(<u8 as FromBytes>::from_le_bytes(&250u8.to_le_bytes()), 250);
-        assert_eq!(<i16 as FromBytes>::from_le_bytes(&(-1234i16).to_le_bytes()), -1234);
-        assert_eq!(<u16 as FromBytes>::from_le_bytes(&60000u16.to_le_bytes()), 60000);
-        assert_eq!(<i32 as FromBytes>::from_le_bytes(&(-100000i32).to_le_bytes()), -100000);
-        assert_eq!(<u32 as FromBytes>::from_le_bytes(&4_000_000_000u32.to_le_bytes()), 4_000_000_000);
-        assert_eq!(<i64 as FromBytes>::from_le_bytes(&(-5_000_000_000i64).to_le_bytes()), -5_000_000_000);
-        assert_eq!(<u64 as FromBytes>::from_le_bytes(&10_000_000_000u64.to_le_bytes()), 10_000_000_000);
+        assert_eq!(
+            <i16 as FromBytes>::from_le_bytes(&(-1234i16).to_le_bytes()),
+            -1234
+        );
+        assert_eq!(
+            <u16 as FromBytes>::from_le_bytes(&60000u16.to_le_bytes()),
+            60000
+        );
+        assert_eq!(
+            <i32 as FromBytes>::from_le_bytes(&(-100000i32).to_le_bytes()),
+            -100000
+        );
+        assert_eq!(
+            <u32 as FromBytes>::from_le_bytes(&4_000_000_000u32.to_le_bytes()),
+            4_000_000_000
+        );
+        assert_eq!(
+            <i64 as FromBytes>::from_le_bytes(&(-5_000_000_000i64).to_le_bytes()),
+            -5_000_000_000
+        );
+        assert_eq!(
+            <u64 as FromBytes>::from_le_bytes(&10_000_000_000u64.to_le_bytes()),
+            10_000_000_000
+        );
         // bool: any nonzero byte → true, zero → false.
         assert!(<bool as FromBytes>::from_le_bytes(&[1]));
         assert!(<bool as FromBytes>::from_le_bytes(&[0xFF]));
@@ -667,7 +812,9 @@ mod tests {
     fn new_resolves_self_and_misses_unknown_symbol() {
         let resolver = SymbolResolver::new().expect("resolver should parse the test binary");
         assert!(
-            resolver.symbol_address("definitely_not_a_symbol_xyz").is_none(),
+            resolver
+                .symbol_address("definitely_not_a_symbol_xyz")
+                .is_none(),
             "an unknown symbol must resolve to None"
         );
     }
@@ -687,7 +834,11 @@ mod tests {
         if resolver.symbol_address("EMBSIM_TEST_SYM").is_some() {
             let bytes = unsafe { resolver.read_bytes("EMBSIM_TEST_SYM", 0, 4) }
                 .expect("read_bytes should succeed for a resolvable symbol");
-            assert_eq!(bytes, vec![1, 2, 3, 4], "read_bytes must round-trip the static's contents");
+            assert_eq!(
+                bytes,
+                vec![1, 2, 3, 4],
+                "read_bytes must round-trip the static's contents"
+            );
 
             // Offset + partial length reads a sub-slice.
             let tail = unsafe { resolver.read_bytes("EMBSIM_TEST_SYM", 2, 2) }.unwrap();

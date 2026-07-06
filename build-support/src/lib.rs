@@ -11,8 +11,8 @@
 //! // build.rs
 //! fn main() {
 //!     embsim_build::link_firmware_static(
-//!         "../../Firmware/MaDCore/.pio/build/native_emulator", // default dir
-//!         "firmware",                                          // default lib name
+//!         "../firmware/.pio/build/native_emulator", // default dir
+//!         "firmware",                               // default lib name
 //!     );
 //! }
 //! ```
@@ -48,13 +48,15 @@ pub fn link_firmware_static(default_dir: &str, default_name: &str) {
     let lib_name =
         std::env::var("EMBSIM_FIRMWARE_LIB_NAME").unwrap_or_else(|_| default_name.to_string());
 
-    let lib_dir = PathBuf::from(&lib_dir_raw).canonicalize().unwrap_or_else(|e| {
-        panic!(
-            "embsim-build: firmware library directory {lib_dir_raw:?} not found ({e}).\n\
+    let lib_dir = PathBuf::from(&lib_dir_raw)
+        .canonicalize()
+        .unwrap_or_else(|e| {
+            panic!(
+                "embsim-build: firmware library directory {lib_dir_raw:?} not found ({e}).\n\
              Build the firmware static library first, or set EMBSIM_FIRMWARE_LIB_DIR \
              to the directory containing lib{lib_name}.a."
-        )
-    });
+            )
+        });
 
     let lib_path = lib_dir.join(format!("lib{lib_name}.a"));
     if !lib_path.exists() {

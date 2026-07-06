@@ -14,7 +14,9 @@ pub use embsim_core;
 pub use embsim_peripherals;
 
 // Re-export peripheral modules for convenience.
-pub use embsim_peripherals::{encoder, filesystem, gpio, i2c, lock, pulse_out, serial, system, timer};
+pub use embsim_peripherals::{
+    encoder, filesystem, gpio, i2c, lock, pulse_out, serial, system, timer,
+};
 
 mod ffi;
 mod stubs_flexc;
@@ -229,7 +231,12 @@ mod tests {
             ffi::HAL_serial_transmitData(0, std::ptr::null(), 1);
             ffi::HAL_serial_transmitData(0, b"x".as_ptr(), 0);
             // Tiny timeout keeps the (expected) failure fast.
-            assert!(!ffi::HAL_serial_recieveDataTimeout(0, std::ptr::null_mut(), 4, 100));
+            assert!(!ffi::HAL_serial_recieveDataTimeout(
+                0,
+                std::ptr::null_mut(),
+                4,
+                100
+            ));
             ffi::HAL_serial_start(0);
             ffi::HAL_serial_stop(0);
         }
@@ -326,7 +333,12 @@ mod tests {
         setup();
         THREAD_RAN.store(0, Ordering::SeqCst);
         let id = unsafe {
-            ffi::HAL_system_startThread(Some(thread_body), std::ptr::null_mut(), std::ptr::null_mut(), 0)
+            ffi::HAL_system_startThread(
+                Some(thread_body),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
         };
         assert!(id >= 0, "got a core id");
         system::join_all_threads();
@@ -355,7 +367,12 @@ mod tests {
     fn i2c_trampolines_delegate_and_guard_null() {
         let _g = guard();
         setup();
-        let mut bus = i2c::I2C { scl: 0, sda: 0, khz: 0, pullup: 0 };
+        let mut bus = i2c::I2C {
+            scl: 0,
+            sda: 0,
+            khz: 0,
+            pullup: 0,
+        };
         unsafe {
             ffi::i2c_setup(&mut bus, 1, 2, 400, 1);
             ffi::i2c_start(&mut bus);
@@ -384,7 +401,10 @@ mod tests {
         unsafe {
             assert_eq!(stubs_flexc::mount(name.as_ptr(), std::ptr::null_mut()), 0);
             assert_eq!(stubs_flexc::umount(name.as_ptr()), 0);
-            assert_eq!(stubs_flexc::mount(std::ptr::null(), std::ptr::null_mut()), -1);
+            assert_eq!(
+                stubs_flexc::mount(std::ptr::null(), std::ptr::null_mut()),
+                -1
+            );
             assert_eq!(stubs_flexc::umount(std::ptr::null()), -1);
             assert!(stubs_flexc::_vfs_open_sdcard().is_null());
         }

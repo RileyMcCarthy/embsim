@@ -75,7 +75,10 @@ mod tests {
         let us_after = get_us() as u64;
         let lo = us_before / 1000;
         let hi = us_after / 1000 + 2; // +2ms slack
-        assert!(ms + 1 >= lo && ms <= hi, "ms={ms} not within [{lo},{hi}] from us window");
+        assert!(
+            ms + 1 >= lo && ms <= hi,
+            "ms={ms} not within [{lo},{hi}] from us window"
+        );
     }
 
     #[test]
@@ -103,7 +106,10 @@ mod tests {
             }
             last = c;
         }
-        assert!(saw_growth, "cycles should advance under a positive clock freq");
+        assert!(
+            saw_growth,
+            "cycles should advance under a positive clock freq"
+        );
     }
 
     #[test]

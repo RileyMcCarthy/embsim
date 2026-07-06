@@ -34,7 +34,12 @@ thread_local! {
 /// Configure the lock pool with a maximum count. Resets the allocator and any
 /// locks held by the calling thread, so re-init yields a fresh pool.
 pub fn init(max: usize) {
-    assert!(max <= MAX_LOCKS, "Lock count {} exceeds max {}", max, MAX_LOCKS);
+    assert!(
+        max <= MAX_LOCKS,
+        "Lock count {} exceeds max {}",
+        max,
+        MAX_LOCKS
+    );
     reset();
     MAX_LOCK_COUNT.store(max, Ordering::Relaxed);
 }
@@ -91,7 +96,10 @@ pub fn try_acquire(lock: i32) -> bool {
              that re-locks the same lock. (Run with the trace viewer to find it.)",
             lock
         );
-        panic!("re-entrant lock {} acquisition (firmware self-deadlock)", lock);
+        panic!(
+            "re-entrant lock {} acquisition (firmware self-deadlock)",
+            lock
+        );
     }
 
     if let Some(guard) = LOCKS[idx].try_lock() {
@@ -218,7 +226,10 @@ mod tests {
             .map(String::as_str)
             .or_else(|| payload.downcast_ref::<&str>().copied())
             .unwrap_or("");
-        assert!(text.contains("re-entrant"), "panic names the self-deadlock: {text:?}");
+        assert!(
+            text.contains("re-entrant"),
+            "panic names the self-deadlock: {text:?}"
+        );
         // Free the still-held lock + restore a clean pool for the next test.
         release(id);
         reset();
@@ -232,9 +243,7 @@ mod tests {
         assert!(try_acquire(id), "main thread acquires");
 
         // Another thread cannot acquire while we hold it.
-        let acquired_while_held = std::thread::spawn(move || try_acquire(id))
-            .join()
-            .unwrap();
+        let acquired_while_held = std::thread::spawn(move || try_acquire(id)).join().unwrap();
         assert!(!acquired_while_held, "other thread blocked while held");
 
         // After we release, another thread can acquire it.
@@ -248,7 +257,10 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(acquired_after_release, "other thread acquires after release");
+        assert!(
+            acquired_after_release,
+            "other thread acquires after release"
+        );
         reset();
     }
 

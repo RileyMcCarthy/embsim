@@ -51,11 +51,7 @@ pub unsafe extern "C" fn HAL_serial_stop(channel: i32) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn HAL_serial_transmitData(
-    channel: i32,
-    data: *const u8,
-    len: u32,
-) {
+pub unsafe extern "C" fn HAL_serial_transmitData(channel: i32, data: *const u8, len: u32) {
     if data.is_null() || len == 0 || channel < 0 {
         return;
     }
@@ -260,13 +256,7 @@ pub unsafe extern "C" fn HAL_system_startThread(
 // ============================================================
 
 #[no_mangle]
-pub unsafe extern "C" fn i2c_setup(
-    self_: *mut i2c::I2C,
-    scl: u8,
-    sda: u8,
-    khz: u32,
-    pullup: i32,
-) {
+pub unsafe extern "C" fn i2c_setup(self_: *mut i2c::I2C, scl: u8, sda: u8, khz: u32, pullup: i32) {
     if let Some(i2c) = self_.as_mut() {
         i2c::setup(i2c, scl, sda, khz, pullup);
     }

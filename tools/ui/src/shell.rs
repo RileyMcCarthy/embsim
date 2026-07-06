@@ -37,10 +37,7 @@ pub fn render(views: &[View]) -> String {
 
         // Scoped CSS
         if !view.css.is_empty() {
-            view_styles.push_str(&format!(
-                "/* === View: {} === */\n{}\n",
-                view.id, view.css
-            ));
+            view_styles.push_str(&format!("/* === View: {} === */\n{}\n", view.id, view.css));
         }
 
         // Scoped JS
@@ -350,7 +347,10 @@ mod tests {
         assert!(html.contains(r#"⚡ embsim"#), "shell chrome present");
         // No per-view markup. (Don't test `data-view=` — the static JS selector
         // `.shell-tab[data-view="..."]` contains that substring regardless.)
-        assert!(!html.contains(r#"<button class="shell-tab"#), "no nav buttons");
+        assert!(
+            !html.contains(r#"<button class="shell-tab"#),
+            "no nav buttons"
+        );
         assert!(!html.contains("class=\"shell-view\""), "no view panels");
     }
 }

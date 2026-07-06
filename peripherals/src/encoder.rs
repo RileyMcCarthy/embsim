@@ -22,7 +22,12 @@ static ENCODER_VALUES: [AtomicI32; MAX_CHANNELS] = {
 /// Configure the encoder peripheral with the number of channels.
 /// Resets all counters, so re-init yields a clean state.
 pub fn init(count: usize) {
-    assert!(count <= MAX_CHANNELS, "Encoder count {} exceeds max {}", count, MAX_CHANNELS);
+    assert!(
+        count <= MAX_CHANNELS,
+        "Encoder count {} exceeds max {}",
+        count,
+        MAX_CHANNELS
+    );
     reset();
     CHANNEL_COUNT.store(count, Ordering::Relaxed);
 }

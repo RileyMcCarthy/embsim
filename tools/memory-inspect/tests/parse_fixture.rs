@@ -7,9 +7,10 @@
 //! structs, `float`/`double`, bitfields, a union, typedefs, an enum-typed field,
 //! and top-level variables.
 //!
-//! If no C compiler (`cc`/`clang`/`gcc`) and `ar` are available, the tests
+//! If no C compiler (`clang`/`cc`/`gcc`) and `ar` are available, the tests
 //! print a skip message and pass rather than failing on a toolchain that can't
-//! build the fixture.
+//! build the fixture. `clang` is preferred: the parser targets clang-emitted
+//! DWARF (its real use case), and gcc's DWARF encodes some shapes differently.
 
 use embsim_memory_inspect::{FirmwareInfo, ParseOptions, TypeInfo};
 use std::path::{Path, PathBuf};
@@ -28,9 +29,10 @@ data_S g_data;
 HAL_GPIO_channel_E g_sel = HAL_GPIO_B;
 "#;
 
-/// Returns the first available C compiler binary name, or `None`.
+/// Returns the first available C compiler binary name, or `None`. `clang`
+/// first — the parser targets clang-emitted DWARF, and on Linux `cc` is gcc.
 fn find_compiler() -> Option<&'static str> {
-    for cc in ["cc", "clang", "gcc"] {
+    for cc in ["clang", "cc", "gcc"] {
         if Command::new(cc).arg("--version").output().is_ok() {
             return Some(cc);
         }
@@ -41,8 +43,7 @@ fn find_compiler() -> Option<&'static str> {
 /// Returns `true` if `ar` is invokable.
 fn have_ar() -> bool {
     // `ar` with no args exits non-zero but still runs; we only need it to spawn.
-    Command::new("ar").arg("--version").output().is_ok()
-        || Command::new("ar").output().is_ok()
+    Command::new("ar").arg("--version").output().is_ok() || Command::new("ar").output().is_ok()
 }
 
 /// Build the fixture archive in a fresh temp dir and return its path plus the
@@ -68,7 +69,11 @@ fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("embsim_dwarf_fixture_{}_{}", std::process::id(), nonce));
+    let dir = std::env::temp_dir().join(format!(
+        "embsim_dwarf_fixture_{}_{}",
+        std::process::id(),
+        nonce
+    ));
     if std::fs::create_dir_all(&dir).is_err() {
         eprintln!("SKIP: could not create temp dir {}", dir.display());
         return None;
@@ -95,8 +100,7 @@ fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
 
     let c = c_path.to_str()?;
     let o = o_path.to_str()?;
-    let ok = compile(&["-g", "-gdwarf-4", "-c", c, "-o", o])
-        || compile(&["-g", "-c", c, "-o", o]);
+    let ok = compile(&["-g", "-gdwarf-4", "-c", c, "-o", o]) || compile(&["-g", "-c", c, "-o", o]);
     if !ok {
         eprintln!("SKIP: failed to compile fixture.c with {}", cc);
         return None;
@@ -173,7 +177,9 @@ fn struct_layout_and_primitive_field_types() {
 
     // int32_t state → signed 4-byte base type.
     match fw.field_type("channel_S", "state") {
-        TypeInfo::Base { signed, byte_size, .. } => {
+        TypeInfo::Base {
+            signed, byte_size, ..
+        } => {
             assert!(*signed, "int32_t must be signed");
             assert_eq!(*byte_size, 4);
         }
@@ -203,7 +209,11 @@ fn bitfield_field_is_recovered() {
 
     // Descend into the nested flags_S struct to its `running` bitfield member.
     match fw.field_type("channel_S", "flags.running") {
-        TypeInfo::Bitfield { bit_size, storage_size, .. } => {
+        TypeInfo::Bitfield {
+            bit_size,
+            storage_size,
+            ..
+        } => {
             assert_eq!(*bit_size, 1, "running is a 1-bit field");
             assert!(*storage_size >= 1);
         }
@@ -234,7 +244,10 @@ fn union_members_share_offset_zero() {
     // Both union members resolve to the same offset within channel_S.
     let raw = fw.field_offset("channel_S", "conv.raw");
     let as_f = fw.field_offset("channel_S", "conv.as_f");
-    assert_eq!(raw, as_f, "union members must share offset 0 within the union");
+    assert_eq!(
+        raw, as_f,
+        "union members must share offset 0 within the union"
+    );
 
     // conv itself is a Union field.
     match fw.field_type("channel_S", "conv") {
@@ -259,7 +272,11 @@ fn array_element_offsets_are_relative_and_bounded() {
 
     // Assert the *relationship*, never alignment-dependent absolute offsets.
     assert_eq!(one, base + elem_size, "channels[1] is one element past [0]");
-    assert_eq!(two, base + 2 * elem_size, "channels[2] is two elements past [0]");
+    assert_eq!(
+        two,
+        base + 2 * elem_size,
+        "channels[2] is two elements past [0]"
+    );
 
     // Out-of-bounds index (array has 3 elements) → None.
     assert_eq!(fw.try_field_offset("data_S", "channels[99].state"), None);
@@ -276,8 +293,14 @@ fn top_level_variables_are_recovered() {
         None => return,
     };
 
-    assert!(fw.variables.contains_key("g_data"), "g_data should be a variable");
-    assert!(fw.variables.contains_key("g_sel"), "g_sel should be a variable");
+    assert!(
+        fw.variables.contains_key("g_data"),
+        "g_data should be a variable"
+    );
+    assert!(
+        fw.variables.contains_key("g_sel"),
+        "g_sel should be a variable"
+    );
 
     // g_data's type is the data_S struct.
     match &fw.variables.get("g_data").unwrap().type_info {
@@ -305,8 +328,11 @@ fn non_archive_bytes_yield_err() {
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let junk = dir.join("not_an_archive.a");
-    std::fs::write(&junk, b"this is definitely not a valid ar archive\x00\x01\x02")
-        .expect("write junk file");
+    std::fs::write(
+        &junk,
+        b"this is definitely not a valid ar archive\x00\x01\x02",
+    )
+    .expect("write junk file");
 
     let result = FirmwareInfo::from_archive(&junk);
     assert!(result.is_err(), "junk bytes must not parse as an archive");
@@ -332,7 +358,10 @@ fn from_archive_with_custom_options() {
     };
 
     // A non-`_COUNT` suffix that no variant matches → channel_count finds nothing.
-    let opts = ParseOptions { pointer_size: 4, count_suffix: "_TOTAL".to_string() };
+    let opts = ParseOptions {
+        pointer_size: 4,
+        count_suffix: "_TOTAL".to_string(),
+    };
     let fw = FirmwareInfo::from_archive_with(&a_path, &opts)
         .expect("from_archive_with should parse a valid archive");
 
@@ -345,8 +374,8 @@ fn from_archive_with_custom_options() {
     assert_eq!(fw.try_channel_count("HAL_GPIO_channel_E"), None);
 
     // And the default-suffix parse still finds the `_COUNT` variant.
-    let default = FirmwareInfo::from_archive_with(&a_path, &ParseOptions::default())
-        .expect("default parse");
+    let default =
+        FirmwareInfo::from_archive_with(&a_path, &ParseOptions::default()).expect("default parse");
     assert_eq!(default.try_channel_count("HAL_GPIO_channel_E"), Some(2));
 
     let _ = std::fs::remove_dir_all(&dir);

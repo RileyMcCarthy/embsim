@@ -43,7 +43,12 @@ mod tests {
     use super::*;
 
     fn make_bus() -> I2C {
-        I2C { scl: 0, sda: 0, khz: 0, pullup: 0 }
+        I2C {
+            scl: 0,
+            sda: 0,
+            khz: 0,
+            pullup: 0,
+        }
     }
 
     #[test]
