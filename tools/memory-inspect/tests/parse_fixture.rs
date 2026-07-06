@@ -11,6 +11,10 @@
 //! print a skip message and pass rather than failing on a toolchain that can't
 //! build the fixture. `clang` is preferred: the parser targets clang-emitted
 //! DWARF (its real use case), and gcc's DWARF encodes some shapes differently.
+//!
+//! One test additionally cross-compiles the fixture to an **ELF x86_64
+//! relocatable object** (clang `--target=`, no linker needed) so the
+//! relocation-applying read path is exercised on every host, not just Linux.
 
 use embsim_memory_inspect::{FirmwareInfo, ParseOptions, TypeInfo};
 use std::path::{Path, PathBuf};
@@ -40,37 +44,17 @@ fn find_compiler() -> Option<&'static str> {
     None
 }
 
-/// Returns `true` if `ar` is invokable.
-fn have_ar() -> bool {
-    // `ar` with no args exits non-zero but still runs; we only need it to spawn.
-    Command::new("ar").arg("--version").output().is_ok() || Command::new("ar").output().is_ok()
-}
-
-/// Build the fixture archive in a fresh temp dir and return its path plus the
-/// dir (kept alive so it isn't cleaned up while the archive is in use). Returns
-/// `None` (after printing a skip message) if the toolchain is unavailable or a
-/// step fails.
-fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
-    let cc = match find_compiler() {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no C compiler (cc/clang/gcc) available");
-            return None;
-        }
-    };
-    if !have_ar() {
-        eprintln!("SKIP: `ar` not available");
-        return None;
-    }
-
-    // Unique temp dir under the OS temp dir, namespaced by pid + a nonce so
-    // parallel test binaries don't collide.
+/// Create a unique temp dir under the OS temp dir, namespaced by `tag` + pid +
+/// a nonce so parallel test binaries don't collide. Returns `None` (after
+/// printing a skip message) if the dir can't be created.
+fn make_temp_dir(tag: &str) -> Option<PathBuf> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!(
-        "embsim_dwarf_fixture_{}_{}",
+        "embsim_dwarf_{}_{}_{}",
+        tag,
         std::process::id(),
         nonce
     ));
@@ -78,7 +62,42 @@ fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
         eprintln!("SKIP: could not create temp dir {}", dir.display());
         return None;
     }
+    Some(dir)
+}
 
+/// Archive `o_path` into `a_path`, trying `ar` then `llvm-ar` (some system
+/// `ar`s refuse foreign-format members). Prints a skip message and returns
+/// `false` if neither produces the archive.
+fn archive_object(a_path: &Path, o_path: &Path) -> bool {
+    let (Some(a), Some(o)) = (a_path.to_str(), o_path.to_str()) else {
+        eprintln!("SKIP: non-UTF-8 temp path");
+        return false;
+    };
+    for ar in ["ar", "llvm-ar"] {
+        let _ = std::fs::remove_file(a_path);
+        let archived = Command::new(ar)
+            .args(["rcs", a, o])
+            .output()
+            .map(|out| out.status.success() && a_path.exists())
+            .unwrap_or(false);
+        if archived {
+            return true;
+        }
+    }
+    eprintln!(
+        "SKIP: failed to archive {} with ar or llvm-ar",
+        o_path.display()
+    );
+    false
+}
+
+/// Write [`FIXTURE_C`] into a fresh temp dir (namespaced by `tag`), compile it
+/// with `cc` trying each flag set in `flag_sets` in order (`-c`/`-o` appended),
+/// and archive the object. Returns the archive path plus the dir (kept alive so
+/// it isn't cleaned up while the archive is in use), or `None` (after printing
+/// a skip message) if any step fails.
+fn build_archive_with(cc: &str, flag_sets: &[&[&str]], tag: &str) -> Option<(PathBuf, PathBuf)> {
+    let dir = make_temp_dir(tag)?;
     let c_path = dir.join("fixture.c");
     let o_path = dir.join("fixture.o");
     let a_path = dir.join("libfixture.a");
@@ -88,36 +107,58 @@ fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
         return None;
     }
 
-    // Compile with DWARF debug info. Pin to DWARF v4 for the widest gimli
-    // support; if the compiler rejects the flag, fall back to plain `-g`.
-    let compile = |args: &[&str]| -> bool {
-        Command::new(cc)
-            .args(args)
-            .output()
-            .map(|o| o.status.success() && o_path.exists())
-            .unwrap_or(false)
-    };
-
     let c = c_path.to_str()?;
     let o = o_path.to_str()?;
-    let ok = compile(&["-g", "-gdwarf-4", "-c", c, "-o", o]) || compile(&["-g", "-c", c, "-o", o]);
-    if !ok {
+    let compiled = flag_sets.iter().any(|flags| {
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend_from_slice(&["-c", c, "-o", o]);
+        Command::new(cc)
+            .args(&args)
+            .output()
+            .map(|out| out.status.success() && o_path.exists())
+            .unwrap_or(false)
+    });
+    if !compiled {
         eprintln!("SKIP: failed to compile fixture.c with {}", cc);
         return None;
     }
 
-    let a = a_path.to_str()?;
-    let archived = Command::new("ar")
-        .args(["rcs", a, o])
-        .output()
-        .map(|out| out.status.success() && a_path.exists())
-        .unwrap_or(false);
-    if !archived {
-        eprintln!("SKIP: failed to archive fixture.o into libfixture.a");
+    if !archive_object(&a_path, &o_path) {
         return None;
     }
 
     Some((a_path, dir))
+}
+
+/// Build the fixture archive for the **host** target. Compiles with DWARF
+/// debug info pinned to DWARF v4 for the widest gimli support; if the compiler
+/// rejects the flag, falls back to plain `-g`.
+fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
+    let cc = match find_compiler() {
+        Some(c) => c,
+        None => {
+            eprintln!("SKIP: no C compiler (cc/clang/gcc) available");
+            return None;
+        }
+    };
+    build_archive_with(cc, &[&["-g", "-gdwarf-4"], &["-g"]], "fixture")
+}
+
+/// Build the fixture archive as an **ELF x86_64 relocatable object**,
+/// regardless of host OS. clang can emit ELF objects for a foreign target
+/// without a linker or sysroot (`-c` only; the fixture needs no libc headers
+/// beyond the compiler-provided `<stdint.h>`). Requires clang specifically —
+/// gcc can't cross-target like this.
+fn build_elf_fixture_archive() -> Option<(PathBuf, PathBuf)> {
+    if Command::new("clang").arg("--version").output().is_err() {
+        eprintln!("SKIP: clang not available for the ELF cross-compile");
+        return None;
+    }
+    build_archive_with(
+        "clang",
+        &[&["--target=x86_64-unknown-linux-gnu", "-g", "-gdwarf-4"]],
+        "elf",
+    )
 }
 
 /// Parse the fixture archive, or `None` if it could not be built.
@@ -377,6 +418,48 @@ fn from_archive_with_custom_options() {
     let default =
         FirmwareInfo::from_archive_with(&a_path, &ParseOptions::default()).expect("default parse");
     assert_eq!(default.try_channel_count("HAL_GPIO_channel_E"), Some(2));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ELF relocatable objects store DWARF cross-section references (e.g.
+/// `DW_FORM_strp` offsets into `.debug_str`) as relocations over zeroed
+/// section bytes — this is what Linux CI's toolchain produces for
+/// `libfirmware.a`. Without applying relocations, every name resolves to
+/// `.debug_str` offset 0 and all lookups fail. Mach-O resolves these offsets
+/// at assembly time, so host-target coverage on macOS can't catch it; this
+/// test cross-compiles the same fixture to an ELF x86_64 object on any host.
+#[test]
+fn elf_relocatable_archive_resolves_names_via_relocations() {
+    let (a_path, dir) = match build_elf_fixture_archive() {
+        Some(v) => v,
+        None => return,
+    };
+    let fw = FirmwareInfo::from_archive(&a_path)
+        .unwrap_or_else(|e| panic!("from_archive failed on a valid ELF fixture archive: {e}"));
+
+    // Enum variant names come from `.debug_str` via relocated strp offsets.
+    assert_eq!(fw.try_enum_channel("HAL_GPIO_A"), Some(0));
+    assert_eq!(fw.try_enum_channel("HAL_GPIO_B"), Some(1));
+    assert!(fw.has_enum_type("HAL_GPIO_channel_E"));
+    assert_eq!(fw.try_channel_count("HAL_GPIO_channel_E"), Some(2));
+
+    // Struct layout: offsets are deterministic for the pinned x86_64 SysV ABI.
+    let channel = fw.struct_info("channel_S");
+    assert!(channel.byte_size > 0, "channel_S must have a non-zero size");
+    assert_eq!(fw.field_offset("channel_S", "state"), 0);
+    assert_eq!(fw.field_offset("channel_S", "position_mm"), 4);
+    assert_eq!(fw.field_offset("channel_S", "load_n"), 8);
+
+    // Variables are recovered with resolved struct types.
+    assert!(
+        fw.variables.contains_key("g_data"),
+        "g_data should be a variable"
+    );
+    match &fw.variables.get("g_data").unwrap().type_info {
+        TypeInfo::Struct { type_name, .. } => assert_eq!(type_name, "data_S"),
+        other => panic!("g_data should be a Struct, got {other:?}"),
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

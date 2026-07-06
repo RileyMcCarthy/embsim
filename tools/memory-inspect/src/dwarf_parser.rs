@@ -3,15 +3,47 @@
 
 use crate::types::*;
 use gimli::{
-    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, RunTimeEndian, Unit, UnitOffset,
+    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, Reader as _, RunTimeEndian,
+    Unit, UnitOffset,
 };
 use object::read::archive::ArchiveFile;
 use object::{Object, ObjectSection};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, trace};
 
-type GimliReader<'a> = EndianSlice<'a, RunTimeEndian>;
+/// Reader that applies section relocations while reading.
+///
+/// Required for ELF relocatable objects (`.o` archive members), where DWARF
+/// cross-section references (e.g. `DW_FORM_strp` offsets into `.debug_str`)
+/// are stored as relocations and the raw section bytes are just 0. Sections
+/// without relocations (e.g. Mach-O string offsets) read through unchanged.
+type GimliReader<'a> = gimli::RelocateReader<EndianSlice<'a, RunTimeEndian>, &'a RelocationMap>;
+
+/// Per-section relocations, wrapping [`object::read::RelocationMap`] so
+/// [`gimli::read::Relocate`] can be implemented for a reference to it.
+/// An empty map is a no-op: every value reads back unchanged.
+#[derive(Debug, Default)]
+struct RelocationMap(object::read::RelocationMap);
+
+impl gimli::read::Relocate for &RelocationMap {
+    fn relocate_address(&self, offset: usize, value: u64) -> gimli::Result<u64> {
+        Ok(self.0.relocate(offset as u64, value))
+    }
+
+    fn relocate_offset(&self, offset: usize, value: usize) -> gimli::Result<usize> {
+        <usize as gimli::ReaderOffset>::from_u64(self.0.relocate(offset as u64, value as u64))
+    }
+}
+
+/// Owned bytes + relocations for one DWARF section. Held in a
+/// [`gimli::DwarfSections`] that outlives the borrowed readers built over it.
+#[derive(Default)]
+struct SectionData<'data> {
+    data: Cow<'data, [u8]>,
+    relocations: RelocationMap,
+}
 
 impl FirmwareInfo {
     /// Parse all DWARF debug info from a firmware static library archive, using
@@ -91,15 +123,41 @@ fn parse_object_dwarf(
         RunTimeEndian::Big
     };
 
-    let load_section = |id: gimli::SectionId| -> Result<EndianSlice<RunTimeEndian>, String> {
-        let data = obj
-            .section_by_name(id.name())
-            .and_then(|s| s.data().ok())
-            .unwrap_or(&[]);
-        Ok(EndianSlice::new(data, endian))
+    // Load each section's bytes together with its relocation map. ELF `.o`
+    // members store cross-section DWARF references as relocations over
+    // zeroed bytes, so reading raw section data would resolve every
+    // `DW_FORM_strp` name to offset 0.
+    let load_section = |id: gimli::SectionId| -> Result<SectionData, String> {
+        match obj.section_by_name(id.name()) {
+            Some(section) => {
+                let data = section
+                    .uncompressed_data()
+                    .map_err(|e| format!("Failed to read section {}: {}", id.name(), e))?;
+                // An unsupported relocation degrades to "no relocations for
+                // this section" (the previous behavior for every section)
+                // rather than failing the whole object.
+                let relocations = section.relocation_map().unwrap_or_else(|e| {
+                    debug!("Ignoring relocations for section {}: {}", id.name(), e);
+                    object::read::RelocationMap::default()
+                });
+                Ok(SectionData {
+                    data,
+                    relocations: RelocationMap(relocations),
+                })
+            }
+            None => Ok(SectionData::default()),
+        }
     };
+    let sections = gimli::DwarfSections::load(load_section)
+        .map_err(|e| format!("Failed to load DWARF sections: {}", e))?;
 
-    let dwarf = Dwarf::load(&load_section).map_err(|e| format!("Failed to load DWARF: {}", e))?;
+    // Borrow readers that apply each section's relocations while reading.
+    let dwarf = sections.borrow(|section| {
+        gimli::RelocateReader::new(
+            EndianSlice::new(&section.data, endian),
+            &section.relocations,
+        )
+    });
 
     // Iterate through compilation units
     let mut units = dwarf.units();
@@ -552,7 +610,7 @@ fn extract_entries(
                             let header = lp.header();
                             let file = header.file(idx)?;
                             let name = dwarf.attr_string(unit, file.path_name()).ok()?;
-                            Some(name.to_string_lossy().to_string())
+                            Some(name.to_string_lossy().ok()?.to_string())
                         } else {
                             None
                         }
@@ -801,9 +859,9 @@ fn get_name(
     match attr {
         AttributeValue::DebugStrRef(offset) => {
             let s = dwarf.debug_str.get_str(offset).ok()?;
-            Some(s.to_string_lossy().to_string())
+            Some(s.to_string_lossy().ok()?.to_string())
         }
-        AttributeValue::String(s) => Some(s.to_string_lossy().to_string()),
+        AttributeValue::String(s) => Some(s.to_string_lossy().ok()?.to_string()),
         _ => None,
     }
 }
