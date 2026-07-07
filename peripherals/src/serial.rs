@@ -260,8 +260,11 @@ pub fn receive_data_timeout(channel: usize, buf: &mut [u8], timeout_us: u64) -> 
     let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wall_us);
     let mut total_read = 0;
 
+    // SAFETY: `fd` is the channel FD owned by CHANNEL_FDS; it stays open for the
+    // duration of this call (borrow does not outlive it).
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     while total_read < buf.len() {
-        match nix::unistd::read(fd, &mut buf[total_read..]) {
+        match nix::unistd::read(borrowed, &mut buf[total_read..]) {
             Ok(0) => break,
             Ok(n) => {
                 total_read += n;
@@ -301,7 +304,10 @@ pub fn receive_bytes(channel: usize, buf: &mut [u8]) -> usize {
         return 0;
     }
 
-    match nix::unistd::read(fd, buf) {
+    // SAFETY: `fd` is the channel FD owned by CHANNEL_FDS; it stays open for the
+    // duration of this call (borrow does not outlive it).
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    match nix::unistd::read(borrowed, buf) {
         Ok(n) if n > 0 => {
             // Throttle consumption to virtual baud (no-op when unpaced).
             pace_rx(channel, n);
@@ -325,7 +331,10 @@ pub fn receive_byte(channel: usize) -> Option<u8> {
     }
 
     let mut byte = [0u8; 1];
-    match nix::unistd::read(fd, &mut byte) {
+    // SAFETY: `fd` is the channel FD owned by CHANNEL_FDS; it stays open for the
+    // duration of this call (borrow does not outlive it).
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    match nix::unistd::read(borrowed, &mut byte) {
         Ok(1) => {
             // Throttle consumption to virtual baud (no-op when unpaced).
             pace_rx(channel, 1);
@@ -389,7 +398,10 @@ mod tests {
         /// once the writer's `write` returns, so the data cases never race.)
         fn read_far(&self, n: usize) -> Vec<u8> {
             let mut buf = vec![0u8; n];
-            match nix::unistd::read(self.b, &mut buf) {
+            // SAFETY: `self.b` stays open for the life of `self`, which outlives
+            // this borrow.
+            let fd = unsafe { BorrowedFd::borrow_raw(self.b) };
+            match nix::unistd::read(fd, &mut buf) {
                 Ok(read) => {
                     buf.truncate(read);
                     buf

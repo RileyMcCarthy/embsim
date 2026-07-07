@@ -89,11 +89,13 @@ fn get_slave_path(fd: &OwnedFd) -> std::io::Result<String> {
 /// Set a file descriptor to non-blocking mode.
 fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    let flags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL)
+    // nix 0.31's `fcntl` takes `impl AsFd`; `&OwnedFd` borrows the fd for the
+    // call without taking ownership.
+    let flags = fcntl(fd, FcntlArg::F_GETFL)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let mut flags = OFlag::from_bits_truncate(flags);
     flags.insert(OFlag::O_NONBLOCK);
-    fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(flags))
+    fcntl(fd, FcntlArg::F_SETFL(flags))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     Ok(())
 }

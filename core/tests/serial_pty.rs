@@ -10,7 +10,7 @@ use embsim_core::serial_pty::Pty;
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use nix::unistd::{close, read, write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -32,7 +32,7 @@ fn unique_path(tag: &str) -> PathBuf {
 
 /// Read up to `buf.len()` bytes from a fd, polling briefly so a slow PTY hand-off
 /// does not race the read but nothing ever blocks indefinitely.
-fn read_bounded(fd: i32, buf: &mut [u8]) -> usize {
+fn read_bounded(fd: BorrowedFd<'_>, buf: &mut [u8]) -> usize {
     for _ in 0..200 {
         match read(fd, buf) {
             Ok(n) if n > 0 => return n,
@@ -77,7 +77,7 @@ fn master_is_valid_and_slave_is_a_tty() {
     // Open the symlinked slave and confirm the kernel agrees it is a terminal.
     let slave_fd =
         open(&path, OFlag::O_RDWR | OFlag::O_NOCTTY, Mode::empty()).expect("open slave path");
-    let is_tty = nix::unistd::isatty(slave_fd).unwrap_or(false);
+    let is_tty = nix::unistd::isatty(&slave_fd).unwrap_or(false);
     let _ = close(slave_fd);
     assert!(is_tty, "slave end of the PTY must be a tty");
 
@@ -104,7 +104,7 @@ fn round_trip_master_to_slave() {
     assert_eq!(written, payload.len());
 
     let mut buf = [0u8; 64];
-    let n = read_bounded(slave_fd, &mut buf);
+    let n = read_bounded(slave_fd.as_fd(), &mut buf);
     let _ = close(slave_fd);
 
     assert_eq!(n, payload.len(), "all bytes should arrive at the slave");
@@ -125,7 +125,7 @@ fn master_is_nonblocking() {
     let pty = Pty::new(path.to_str().unwrap()).expect("Pty::new");
 
     let mut buf = [0u8; 16];
-    match read(pty.master.as_raw_fd(), &mut buf) {
+    match read(pty.master.as_fd(), &mut buf) {
         Err(nix::errno::Errno::EAGAIN) => {} // expected: no data, would-block
         Ok(0) => {}                          // also acceptable: nothing available
         other => panic!("expected EAGAIN on empty non-blocking master, got {other:?}"),
