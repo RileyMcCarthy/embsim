@@ -29,7 +29,7 @@ tracing-subscriber = "0.3"
 parking_lot = "0.12"
 libc = "0.2"
 object = "0.39"
-gimli = "0.31"
+gimli = "0.34"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 axum = { version = "0.8", features = ["ws"] }
