@@ -188,10 +188,13 @@ fn protocol_loop(adc: &Ads122u04) {
     let mut continuous = false;
     let mut last_conversion_us: u64 = 0;
 
+    // SAFETY: `model_fd` is owned by the model's pipe pair and stays open for the
+    // life of this loop; the borrow never outlives it.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(model_fd) };
     loop {
         // Try to read incoming bytes from firmware
         let mut byte = [0u8; 1];
-        match nix::unistd::read(model_fd, &mut byte) {
+        match nix::unistd::read(borrowed, &mut byte) {
             Ok(1) => {
                 state = process_byte(adc, model_fd, state, byte[0], &mut continuous);
             }
@@ -385,8 +388,11 @@ mod tests {
         let mut out = Vec::new();
         let mut buf = [0u8; 64];
         let want = n.min(buf.len());
+        // SAFETY: `fd` is kept open by the test's pipe pair for the whole read
+        // loop; the borrow never outlives it.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         for _ in 0..1000 {
-            match nix::unistd::read(fd, &mut buf[..want]) {
+            match nix::unistd::read(borrowed, &mut buf[..want]) {
                 Ok(0) => break,
                 Ok(k) => {
                     out.extend_from_slice(&buf[..k]);
