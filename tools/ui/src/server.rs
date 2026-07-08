@@ -142,6 +142,13 @@ mod tests {
 
     /// `index_handler` renders the shell page including the registered view's
     /// markup, nav tab, and the embsim doctype/title.
+    // justification: the guard must span the whole test — the `.await`s below
+    // render responses that read the global `VIEWS` registry, so the guard has
+    // to serialize *those reads* against other `#[tokio::test]`s that mutate the
+    // registry. Dropping it before the awaits would reintroduce the race it
+    // exists to prevent. `#[tokio::test]` is current-thread, so holding a
+    // std MutexGuard across the await point cannot stall the runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn index_renders_shell_with_registered_view() {
         let _g = crate::test_lock::guard();
@@ -163,6 +170,11 @@ mod tests {
     }
 
     /// `asset_handler` returns the registered asset's bytes + content-type.
+    // justification: see `index_renders_shell_with_registered_view` — the guard
+    // must span the `.await`s that read the global `VIEWS` registry so the test
+    // stays serialized against registry-mutating tests. Current-thread runtime,
+    // so holding a std MutexGuard across the await cannot stall it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn asset_handler_serves_registered_asset() {
         let _g = crate::test_lock::guard();
@@ -184,6 +196,11 @@ mod tests {
     }
 
     /// `asset_handler` 404s for an unknown asset name or unknown view id.
+    // justification: see `index_renders_shell_with_registered_view` — the guard
+    // must span the `.await`s that read the global `VIEWS` registry so the test
+    // stays serialized against registry-mutating tests. Current-thread runtime,
+    // so holding a std MutexGuard across the await cannot stall it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn asset_handler_404_for_unknown() {
         let _g = crate::test_lock::guard();

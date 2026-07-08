@@ -56,9 +56,18 @@ pub const MAX_CHANNELS: usize = 16;
 
 static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-static START_CALLBACKS: Mutex<Vec<Option<Box<dyn Fn(u32, u32) + Send>>>> = Mutex::new(Vec::new());
-static STOP_CALLBACKS: Mutex<Vec<Option<Box<dyn Fn() + Send>>>> = Mutex::new(Vec::new());
-static PROGRESS_CALLBACKS: Mutex<Vec<Option<Box<dyn Fn(u32) + Send>>>> = Mutex::new(Vec::new());
+/// One optional per-channel callback fired when a pulse train starts,
+/// carrying `(total_pulses, frequency)`.
+type StartCallback = Option<Box<dyn Fn(u32, u32) + Send>>;
+/// One optional per-channel callback fired when a pulse train stops.
+type StopCallback = Option<Box<dyn Fn() + Send>>;
+/// One optional per-channel callback fired on progress, carrying the
+/// cumulative emitted-pulse count.
+type ProgressCallback = Option<Box<dyn Fn(u32) + Send>>;
+
+static START_CALLBACKS: Mutex<Vec<StartCallback>> = Mutex::new(Vec::new());
+static STOP_CALLBACKS: Mutex<Vec<StopCallback>> = Mutex::new(Vec::new());
+static PROGRESS_CALLBACKS: Mutex<Vec<ProgressCallback>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy)]
 struct PulseState {

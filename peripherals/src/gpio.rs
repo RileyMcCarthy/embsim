@@ -12,13 +12,22 @@ static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Channel state storage (one atomic bool per channel, thread-safe).
 static GPIO_STATE: [AtomicBool; MAX_CHANNELS] = {
+    // justification: this `const` is never read as a value; it only seeds the
+    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
+    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
+    // so the lint's "make it a static" suggestion would not compile. No interior
+    // mutability is ever observed through the const itself.
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: AtomicBool = AtomicBool::new(false);
     [INIT; MAX_CHANNELS]
 };
 
+/// One optional per-channel change callback, invoked with the new level.
+type ChangeCallback = Option<Box<dyn Fn(bool) + Send>>;
+
 /// Per-channel change callbacks — fired when firmware writes a channel.
 /// Uses Vec instead of array since Box<dyn Fn> isn't const-initializable.
-static CALLBACKS: Mutex<Vec<Option<Box<dyn Fn(bool) + Send>>>> = Mutex::new(Vec::new());
+static CALLBACKS: Mutex<Vec<ChangeCallback>> = Mutex::new(Vec::new());
 
 /// Optional channel names for logging (set at init).
 static CHANNEL_NAMES: Mutex<Option<&'static [&'static str]>> = Mutex::new(None);

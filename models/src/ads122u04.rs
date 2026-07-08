@@ -167,6 +167,10 @@ fn create_pipe_pair() -> (RawFd, RawFd) {
 // ============================================================
 
 /// Parser state for the byte-by-byte protocol.
+// justification: the shared `Wait*` prefix is deliberate — each variant names
+// what the byte-by-byte parser is *waiting for* next, so the prefix carries
+// meaning rather than being noise. Renaming would obscure the state machine.
+#[allow(clippy::enum_variant_names)]
 enum ParseState {
     /// Waiting for sync byte (0x55)
     WaitSync,
