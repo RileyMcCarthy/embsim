@@ -24,7 +24,7 @@ static NEXT_LOCK: AtomicI32 = AtomicI32::new(0);
 
 use std::cell::RefCell;
 thread_local! {
-    static HELD_LOCKS: RefCell<[bool; MAX_LOCKS]> = RefCell::new([false; MAX_LOCKS]);
+    static HELD_LOCKS: RefCell<[bool; MAX_LOCKS]> = const { RefCell::new([false; MAX_LOCKS]) };
 }
 
 // ============================================================

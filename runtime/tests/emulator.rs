@@ -175,7 +175,7 @@ fn emulator_error_display_strings() {
     assert!(msg.contains("9999"));
     assert!(msg.contains("64"));
 
-    let pty = EmulatorError::Pty(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+    let pty = EmulatorError::Pty(std::io::Error::other("boom"));
     let msg = pty.to_string();
     assert!(msg.contains("PTY"));
     assert!(msg.contains("boom"));

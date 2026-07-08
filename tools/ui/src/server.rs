@@ -92,7 +92,7 @@ async fn ws_handler(Path(view_id): Path<String>, ws: WebSocketUpgrade) -> impl I
     };
 
     match handler {
-        Some(h) => ws.on_upgrade(move |socket| h(socket)),
+        Some(h) => ws.on_upgrade(h),
         None => ws.on_upgrade(|mut socket| async move {
             use axum::extract::ws::Message;
             let _ = socket

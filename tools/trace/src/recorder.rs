@@ -390,7 +390,7 @@ fn poll_loop(fw: &FirmwareInfo) {
         if let Some(resolver) = &resolver {
             for watch in c_watches() {
                 let value: Option<f64> =
-                    unsafe { resolver.read_field_as_f64(&fw, &watch.var_name, &watch.field_path) };
+                    unsafe { resolver.read_field_as_f64(fw, &watch.var_name, &watch.field_path) };
                 if let Some(v) = value {
                     record(&watch.signal_name, v);
                 }
