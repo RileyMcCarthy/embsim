@@ -288,8 +288,8 @@ fn build_type_map(
     // This ensures that when an array element references an anonymous struct,
     // it gets the typedef name (e.g., "dev_cogManager_channelData_S").
     let typedef_targets: Vec<(String, UnitOffset)> = map
-        .iter()
-        .filter_map(|(_, dt)| {
+        .values()
+        .filter_map(|dt| {
             if let DwarfType::Typedef { _name, target } = dt {
                 if !_name.is_empty() {
                     Some((_name.clone(), *target))
