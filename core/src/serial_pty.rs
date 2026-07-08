@@ -24,21 +24,19 @@ pub struct Pty {
 impl Pty {
     /// Create a new PTY pair and symlink the slave to `symlink_path`.
     pub fn new(symlink_path: &str) -> std::io::Result<Self> {
-        let OpenptyResult { master, slave } =
-            openpty(None, None).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let OpenptyResult { master, slave } = openpty(None, None).map_err(std::io::Error::other)?;
 
         let master_fd = master;
         let slave_fd = slave;
 
         // Configure the slave for raw mode (no echo, no line buffering)
-        let mut termios_config = termios::tcgetattr(&slave_fd)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut termios_config = termios::tcgetattr(&slave_fd).map_err(std::io::Error::other)?;
         termios::cfmakeraw(&mut termios_config);
         termios_config.local_flags &= !(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG);
         termios_config.input_flags &= !(InputFlags::IXON | InputFlags::IXOFF | InputFlags::ICRNL);
         termios_config.output_flags &= !OutputFlags::OPOST;
         termios::tcsetattr(&slave_fd, SetArg::TCSANOW, &termios_config)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         // Get the slave device path
         let slave_path = get_slave_path(&slave_fd)?;
@@ -82,7 +80,7 @@ impl Drop for Pty {
 fn get_slave_path(fd: &OwnedFd) -> std::io::Result<String> {
     match nix::unistd::ttyname(fd) {
         Ok(path) => Ok(path.to_string_lossy().to_string()),
-        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        Err(e) => Err(std::io::Error::other(e)),
     }
 }
 
@@ -91,11 +89,9 @@ fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     // nix 0.31's `fcntl` takes `impl AsFd`; `&OwnedFd` borrows the fd for the
     // call without taking ownership.
-    let flags = fcntl(fd, FcntlArg::F_GETFL)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(std::io::Error::other)?;
     let mut flags = OFlag::from_bits_truncate(flags);
     flags.insert(OFlag::O_NONBLOCK);
-    fcntl(fd, FcntlArg::F_SETFL(flags))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(std::io::Error::other)?;
     Ok(())
 }

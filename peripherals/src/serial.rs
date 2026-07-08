@@ -27,12 +27,24 @@ static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// File descriptors for each channel. -1 = not connected.
 static CHANNEL_FDS: [AtomicI32; MAX_CHANNELS] = {
+    // justification: this `const` is never read as a value; it only seeds the
+    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
+    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
+    // so the lint's "make it a static" suggestion would not compile. No interior
+    // mutability is ever observed through the const itself.
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: AtomicI32 = AtomicI32::new(-1);
     [INIT; MAX_CHANNELS]
 };
 
 /// Configured baud per channel. 0 = unpaced (instant TX/RX, default).
 static CHANNEL_BAUD: [AtomicU32; MAX_CHANNELS] = {
+    // justification: this `const` is never read as a value; it only seeds the
+    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
+    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
+    // so the lint's "make it a static" suggestion would not compile. No interior
+    // mutability is ever observed through the const itself.
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: AtomicU32 = AtomicU32::new(0);
     [INIT; MAX_CHANNELS]
 };
@@ -40,6 +52,12 @@ static CHANNEL_BAUD: [AtomicU32; MAX_CHANNELS] = {
 /// Next virtual-microsecond at which the TX line is free for this channel.
 /// Advanced atomically per chunk to model serialized UART transmission.
 static CHANNEL_TX_NEXT_V_US: [AtomicU64; MAX_CHANNELS] = {
+    // justification: this `const` is never read as a value; it only seeds the
+    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
+    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
+    // so the lint's "make it a static" suggestion would not compile. No interior
+    // mutability is ever observed through the const itself.
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_CHANNELS]
 };
@@ -47,6 +65,12 @@ static CHANNEL_TX_NEXT_V_US: [AtomicU64; MAX_CHANNELS] = {
 /// Next virtual-microsecond at which the firmware may consume the next byte
 /// from the RX line. Independent of TX so the link is full-duplex.
 static CHANNEL_RX_NEXT_V_US: [AtomicU64; MAX_CHANNELS] = {
+    // justification: this `const` is never read as a value; it only seeds the
+    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
+    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
+    // so the lint's "make it a static" suggestion would not compile. No interior
+    // mutability is ever observed through the const itself.
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_CHANNELS]
 };

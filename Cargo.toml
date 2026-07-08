@@ -18,6 +18,11 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Minimum supported Rust version. Determined empirically: gimli 0.34 (pulled in
+# by tools/memory-inspect) requires rustc 1.88, and 1.88 builds the whole
+# workspace cleanly while 1.87 is rejected at the gimli version-gate. Gated by
+# the `msrv` job in .github/workflows/ci.yml.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/RileyMcCarthy/embsim"
 

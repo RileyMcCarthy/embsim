@@ -26,9 +26,12 @@
 
 use std::sync::Mutex;
 
+/// A single observer callback: invoked with each emitted value.
+type Observer<T> = Box<dyn Fn(T) + Send>;
+
 /// A list of observers notified, in registration order, when a value is emitted.
 pub struct Observers<T> {
-    subs: Mutex<Vec<Box<dyn Fn(T) + Send>>>,
+    subs: Mutex<Vec<Observer<T>>>,
 }
 
 impl<T> Observers<T> {
@@ -87,8 +90,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
-    /// `Observers` is instance-based — every test owns a fresh list, so no
-    /// process-global lock is needed (unlike the clock / peripheral suites).
+    // `Observers` is instance-based — every test owns a fresh list, so no
+    // process-global lock is needed (unlike the clock / peripheral suites).
 
     /// A freshly constructed list (via `new` and `default`) is empty: `len` is
     /// 0 and `is_empty` is true.

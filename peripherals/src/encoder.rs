@@ -11,6 +11,12 @@ static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Encoder values (atomic for thread safety).
 static ENCODER_VALUES: [AtomicI32; MAX_CHANNELS] = {
+    // justification: this `const` is never read as a value; it only seeds the
+    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
+    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
+    // so the lint's "make it a static" suggestion would not compile. No interior
+    // mutability is ever observed through the const itself.
+    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: AtomicI32 = AtomicI32::new(0);
     [INIT; MAX_CHANNELS]
 };

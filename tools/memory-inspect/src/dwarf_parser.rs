@@ -271,14 +271,10 @@ fn build_type_map(
             gimli::DW_TAG_subroutine_type => Some(DwarfType::Opaque { byte_size: 8 }),
             gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type => {
                 // Qualifiers: follow through to the target type
-                if let Some(target) = get_type_ref(entry) {
-                    Some(DwarfType::Typedef {
-                        _name: String::new(),
-                        target,
-                    })
-                } else {
-                    None
-                }
+                get_type_ref(entry).map(|target| DwarfType::Typedef {
+                    _name: String::new(),
+                    target,
+                })
             }
             _ => None,
         };
@@ -292,8 +288,8 @@ fn build_type_map(
     // This ensures that when an array element references an anonymous struct,
     // it gets the typedef name (e.g., "dev_cogManager_channelData_S").
     let typedef_targets: Vec<(String, UnitOffset)> = map
-        .iter()
-        .filter_map(|(_, dt)| {
+        .values()
+        .filter_map(|dt| {
             if let DwarfType::Typedef { _name, target } = dt {
                 if !_name.is_empty() {
                     Some((_name.clone(), *target))
@@ -453,10 +449,10 @@ fn member_to_field(type_map: &HashMap<UnitOffset, DwarfType>, member: &MemberDef
 }
 
 /// Follow a type reference through typedefs to find the underlying DwarfType.
-fn follow_typedefs<'a>(
-    type_map: &'a HashMap<UnitOffset, DwarfType>,
+fn follow_typedefs(
+    type_map: &HashMap<UnitOffset, DwarfType>,
     offset: UnitOffset,
-) -> Option<(UnitOffset, &'a DwarfType)> {
+) -> Option<(UnitOffset, &DwarfType)> {
     let mut current = offset;
     for _ in 0..20 {
         match type_map.get(&current) {

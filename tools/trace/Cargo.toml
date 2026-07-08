@@ -2,6 +2,7 @@
 name = "embsim-trace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Live trace viewer for embsim — records and visualizes model states, peripheral values, and C variables"

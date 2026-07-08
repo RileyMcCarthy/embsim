@@ -2,6 +2,7 @@
 name = "embsim-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "embsim emulator runtime — Platform/Machine traits + an Emulator builder that owns peripheral init ordering"

@@ -2,6 +2,7 @@
 name = "embsim-minimal-example"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Smallest possible embsim consumer — a hand-rolled Platform + Machine with no real firmware, as an onboarding template"
 publish = false
 

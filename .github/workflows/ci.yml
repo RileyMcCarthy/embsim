@@ -31,10 +31,20 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Doc tests
         run: cargo test --workspace --doc
+      # Feature-matrix leg: the default build has embsim-trace's `web` feature
+      # on (axum + tokio + embsim-ui). Exercise the headless recorder path with
+      # the web feature OFF so it can't silently rot.
+      - name: Build embsim-trace (web off)
+        run: cargo build -p embsim-trace --no-default-features
+      - name: Test embsim-trace (web off)
+        run: cargo test -p embsim-trace --no-default-features
 
-  # rustfmt is gating (the tree is formatted); clippy is advisory until the
-  # pre-existing lint backlog is cleared — promote it by appending
-  # `-- -D warnings` once `cargo clippy` is clean.
+  # Both rustfmt and clippy are gating. The lint backlog has been cleared, so
+  # clippy runs with `-D warnings` — any new lint fails the build. The few
+  # unavoidable lints (interior-mutable const array seeds, await-holding-lock in
+  # single-threaded tests, an intentional enum prefix) carry item-scoped
+  # `#[allow(...)]`s with `// justification:` comments; no crate-level blanket
+  # allows are used.
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -46,9 +56,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt (gating)
         run: cargo fmt --all --check
-      - name: clippy (advisory)
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets
+      - name: clippy (gating)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # API docs must build without warnings (broken intra-doc links, etc.).
   docs:
@@ -62,3 +71,27 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Supply-chain audit: RustSec advisories + license allow-list (see deny.toml).
+  # Vulnerabilities, unmaintained/unsound/yanked crates, disallowed licenses, or
+  # unknown sources all fail the build.
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # MSRV guard: the workspace pins rust-version = 1.88 (gimli 0.34). Build only
+  # — MSRV governs compilation, not test/runtime behavior.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (workspace) on MSRV
+        run: cargo build --workspace
