@@ -1,0 +1,75 @@
+# cargo-deny supply-chain policy for the embsim workspace.
+#
+# Gated in CI (`.github/workflows/ci.yml`, `supply-chain` job) via
+# EmbarkStudios/cargo-deny-action. Run locally with `cargo deny check`.
+#
+# Schema: cargo-deny 0.19.x. In this schema `[advisories]` defaults every
+# advisory kind (vulnerability / unmaintained / unsound / notice / yanked) to
+# `deny`; there are no per-kind level fields to set, so failing the build on a
+# vulnerability or an unmaintained crate is the out-of-the-box behavior. We
+# only add an explicit `[advisories.unmaintained]` scope to be unambiguous.
+
+[graph]
+# Scan the full dependency graph across every feature so both the default
+# (web-on) and `--no-default-features` (headless trace) paths are audited.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ── Advisories ────────────────────────────────────────────────────────────
+# RustSec advisory-db. Vulnerabilities, unmaintained, unsound, and yanked
+# crates all fail the check by default in this schema.
+[advisories]
+# Audit every crate in the graph, not just those pulled by a workspace member's
+# "normal" deps, when deciding whether something is unmaintained.
+unmaintained = "all"
+# No advisories are currently ignored — the tree is clean. If a real,
+# un-bumpable advisory ever appears, add a `{ id = "...", reason = "..." }`
+# entry here with justification rather than silencing the whole check.
+ignore = []
+
+# ── Licenses ──────────────────────────────────────────────────────────────
+# Allow-list built from the crates actually resolved in the tree (verified via
+# `cargo deny list` / `cargo metadata`). Every entry is a permissive /
+# BSD-family license. NO copyleft is allowed: the one weak-copyleft option in
+# the tree, LGPL-2.1-or-later, appears only in `r-efi`'s
+# `MIT OR Apache-2.0 OR LGPL-2.1-or-later` expression, so cargo-deny satisfies
+# it via MIT/Apache and LGPL is never selected.
+[licenses]
+allow = [
+    "MIT",           # the bulk of the tree (+ every embsim crate)
+    "Apache-2.0",    # the other half of most `MIT OR Apache-2.0` dual licenses
+    "Unicode-3.0",   # unicode-ident: `(MIT OR Apache-2.0) AND Unicode-3.0` — AND, so required
+    "BSD-3-Clause",  # matchit: `MIT AND BSD-3-Clause` — AND, so required
+    "BSD-2-Clause",  # zerocopy: `BSD-2-Clause OR Apache-2.0 OR MIT`
+    "BSL-1.0",       # ryu: `Apache-2.0 OR BSL-1.0`
+    "Zlib",          # miniz_oxide: `MIT OR Zlib OR Apache-2.0`
+    "0BSD",          # adler2: `0BSD OR MIT OR Apache-2.0`
+    "Unlicense",     # memchr / aho-corasick: `Unlicense OR MIT`
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# embsim-minimal-example is `publish = false` and carries no license field;
+# skip license checks for unpublished workspace members.
+ignore = true
+
+# ── Bans ──────────────────────────────────────────────────────────────────
+[bans]
+# Duplicate versions of a crate are advisory (warn) — common and low-risk in a
+# healthy tree; promote to "deny" only if we decide to enforce single-version.
+multiple-versions = "warn"
+# The only `*` requirements in the tree are the intra-workspace path deps
+# (e.g. `embsim-core = { path = "../core" }`), which carry an implicit wildcard
+# version. `allow-wildcard-paths` can't exempt them because the embsim crates
+# aren't marked `publish = false`, and crates.io forbids path deps on published
+# crates. These are first-party, in-repo deps — not unpinned external crates —
+# so wildcards are allowed. There are no external `*` version requirements.
+wildcards = "allow"
+
+# ── Sources ───────────────────────────────────────────────────────────────
+# Only crates.io (and in-tree path/git deps) are permitted.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
