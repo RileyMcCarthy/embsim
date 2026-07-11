@@ -25,12 +25,15 @@ use tracing::{debug, info, trace, warn};
 const SYNC_BYTE: u8 = 0x55;
 const CMD_RESET: u8 = 0x06;
 const CMD_START: u8 = 0x08;
-const CMD_POWERDOWN: u8 = 0x01;
+const CMD_POWERDOWN: u8 = 0x02;
 
 const REGISTER_COUNT: usize = 5;
 
 /// Index of CONFIG1 — encodes data-rate (bits 7:5) and operating mode (bit 4).
 const REG_CONFIG1: usize = 1;
+
+/// Index of CONFIG3 — bit 0 selects automatic (1) vs manual (0) data read mode.
+const REG_CONFIG3: usize = 3;
 
 /// Default conversion interval if CONFIG1 is unwritten (datasheet reset = 20 SPS).
 const DEFAULT_CONVERSION_INTERVAL_US: u64 = 50_000;
@@ -153,10 +156,14 @@ fn create_pipe_pair() -> (RawFd, RawFd) {
     let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     assert_eq!(ret, 0, "Failed to create ADS122U04 socket pair");
 
-    // Set model side to non-blocking for polling reads
-    unsafe {
-        let flags = libc::fcntl(fds[0], libc::F_GETFL);
-        libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+    // Both sides non-blocking: the model polls its end, and the firmware HAL's
+    // receive-timeout semantics depend on EAGAIN (a blocking firmware fd would
+    // hang a zero-timeout drain/poll forever instead of returning "no data").
+    for fd in fds {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 
     (fds[0], fds[1])
@@ -205,10 +212,12 @@ fn protocol_loop(adc: &Ads122u04) {
             }
         }
 
-        // Send continuous conversion data if active. The conversion interval
-        // is derived from CONFIG1 (DR bits + Turbo flag) so the model honors
-        // whatever rate the firmware configured via WREG.
-        if continuous {
+        // Send unprompted conversion data only in automatic data read mode
+        // (CONFIG3 bit 0); in manual mode results are fetched with RDATA.
+        // The conversion interval is derived from CONFIG1 (DR bits + Turbo
+        // flag) so the model honors whatever rate the firmware configured.
+        let auto_mode = (adc.registers.lock().unwrap()[REG_CONFIG3] & 0x01) != 0;
+        if continuous && auto_mode {
             let reg1 = adc.registers.lock().unwrap()[REG_CONFIG1];
             let interval_us = if reg1 == 0 {
                 DEFAULT_CONVERSION_INTERVAL_US
@@ -270,7 +279,14 @@ fn process_byte(
                 let upper_nibble = (command >> 4) & 0x0F;
                 let register = ((command >> 1) & 0x0F) as usize;
 
-                if upper_nibble == 0b0010 {
+                if upper_nibble == 0b0001 {
+                    // RDATA — transmit the most recent conversion result now.
+                    // This is the manual data read mode fetch: request/response
+                    // framing, so the host's byte alignment is deterministic.
+                    trace!("ADS122U04: RDATA");
+                    send_conversion(adc, fd);
+                    ParseState::WaitSync
+                } else if upper_nibble == 0b0010 {
                     // RREG — read register
                     if register < REGISTER_COUNT {
                         let val = adc.registers.lock().unwrap()[register];
@@ -505,6 +521,25 @@ mod tests {
     }
 
     // ── process_byte: protocol state machine ──
+
+    /// SYNC then RDATA answers with the latest 3-byte conversion immediately
+    /// (manual data read mode fetch).
+    #[test]
+    fn rdata_sends_latest_conversion() {
+        let (adc, _fw) = make_adc(1.0, 0);
+        let (wr, rd) = test_pair();
+        adc.set_voltage(100.0); // 100 mV * 4 = code 400 (vref 2^21, gain 1)
+        let mut cont = true;
+
+        let st = process_byte(&adc, wr, ParseState::WaitSync, SYNC_BYTE, &mut cont);
+        let st = process_byte(&adc, wr, st, 0x10, &mut cont);
+        assert!(matches!(st, ParseState::WaitSync), "RDATA is a single-byte command");
+
+        let b = read_n(rd, 3);
+        assert_eq!(b.len(), 3, "RDATA answers with exactly 3 bytes");
+        let code = i32::from(b[0]) | (i32::from(b[1]) << 8) | (i32::from(b[2]) << 16);
+        assert_eq!(code, 400);
+    }
 
     /// SYNC then START enters continuous mode.
     #[test]
