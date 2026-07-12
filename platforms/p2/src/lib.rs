@@ -15,7 +15,7 @@ pub use embsim_peripherals;
 
 // Re-export peripheral modules for convenience.
 pub use embsim_peripherals::{
-    encoder, filesystem, gpio, i2c, lock, pulse_out, serial, system, timer,
+    encoder, filesystem, gpio, i2c, instance, lock, pulse_out, serial, system, timer,
 };
 
 mod ffi;

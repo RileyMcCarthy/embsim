@@ -1,4 +1,9 @@
 //! Encoder — Generic position counter peripheral.
+//!
+//! State lives in a per-MCU [`Encoder`] bank owned by
+//! `instance::PeripheralInstance`. The module-level free functions route to
+//! the calling thread's instance (see `crate::instance`), so existing
+//! single-MCU consumers are unaffected.
 
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use tracing::trace;
@@ -6,64 +11,105 @@ use tracing::trace;
 /// Maximum encoder channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 16;
 
-/// Configured channel count.
-static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Encoder counter bank for one MCU instance.
+pub struct Encoder {
+    /// Configured channel count.
+    count: AtomicUsize,
+    /// Encoder values (atomic for thread safety).
+    values: [AtomicI32; MAX_CHANNELS],
+}
 
-/// Encoder values (atomic for thread safety).
-static ENCODER_VALUES: [AtomicI32; MAX_CHANNELS] = {
-    const INIT: AtomicI32 = AtomicI32::new(0);
-    [INIT; MAX_CHANNELS]
-};
+impl Encoder {
+    /// Create a bank with no channels configured, all counters at zero.
+    pub const fn new() -> Self {
+        const VALUE_INIT: AtomicI32 = AtomicI32::new(0);
+        Self {
+            count: AtomicUsize::new(0),
+            values: [VALUE_INIT; MAX_CHANNELS],
+        }
+    }
+
+    /// Configure the encoder peripheral with the number of channels.
+    /// Resets all counters, so re-init yields a clean state.
+    ///
+    /// # Panics
+    /// If `count` exceeds [`MAX_CHANNELS`].
+    pub fn init(&self, count: usize) {
+        assert!(
+            count <= MAX_CHANNELS,
+            "Encoder count {} exceeds max {}",
+            count,
+            MAX_CHANNELS
+        );
+        self.reset();
+        self.count.store(count, Ordering::Relaxed);
+    }
+
+    /// Clear all encoder values and channel count (used by `init` and teardown).
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        for v in self.values.iter() {
+            v.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Start an encoder channel (no-op in emulation).
+    pub fn start(&self, channel: usize) {
+        trace!("encoder::start(channel={})", channel);
+    }
+
+    /// Get the current encoder value.
+    pub fn value(&self, channel: usize) -> i32 {
+        if channel < self.count.load(Ordering::Relaxed) {
+            self.values[channel].load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
+    /// Set the encoder value (used by MCU HAL or wiring layer).
+    pub fn set(&self, channel: usize, val: i32) {
+        if channel < self.count.load(Ordering::Relaxed) {
+            self.values[channel].store(val, Ordering::Relaxed);
+            trace!("encoder::set(channel={}, value={})", channel, val);
+        }
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ============================================================
-// Initialization
+// Free functions — route to the calling thread's instance
 // ============================================================
 
 /// Configure the encoder peripheral with the number of channels.
 /// Resets all counters, so re-init yields a clean state.
 pub fn init(count: usize) {
-    assert!(
-        count <= MAX_CHANNELS,
-        "Encoder count {} exceeds max {}",
-        count,
-        MAX_CHANNELS
-    );
-    reset();
-    CHANNEL_COUNT.store(count, Ordering::Relaxed);
+    crate::instance::current().encoder.init(count);
 }
 
 /// Clear all encoder values and channel count (used by `init` and teardown).
 pub fn reset() {
-    CHANNEL_COUNT.store(0, Ordering::Relaxed);
-    for v in ENCODER_VALUES.iter() {
-        v.store(0, Ordering::Relaxed);
-    }
+    crate::instance::current().encoder.reset();
 }
-
-// ============================================================
-// Core API
-// ============================================================
 
 /// Start an encoder channel (no-op in emulation).
 pub fn start(channel: usize) {
-    trace!("encoder::start(channel={})", channel);
+    crate::instance::current().encoder.start(channel);
 }
 
 /// Get the current encoder value.
 pub fn value(channel: usize) -> i32 {
-    if channel < CHANNEL_COUNT.load(Ordering::Relaxed) {
-        ENCODER_VALUES[channel].load(Ordering::Relaxed)
-    } else {
-        0
-    }
+    crate::instance::current().encoder.value(channel)
 }
 
 /// Set the encoder value (used by MCU HAL or wiring layer).
 pub fn set(channel: usize, val: i32) {
-    if channel < CHANNEL_COUNT.load(Ordering::Relaxed) {
-        ENCODER_VALUES[channel].store(val, Ordering::Relaxed);
-        trace!("encoder::set(channel={}, value={})", channel, val);
-    }
+    crate::instance::current().encoder.set(channel, val);
 }
 
 // ============================================================

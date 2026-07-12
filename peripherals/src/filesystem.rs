@@ -1,18 +1,55 @@
 //! Filesystem — Mount/unmount stubs for SD card or local filesystem.
+//!
+//! The configured mount path lives in a per-MCU [`Filesystem`] owned by
+//! `instance::PeripheralInstance`. The module-level free functions route to
+//! the calling thread's instance (see `crate::instance`), so existing
+//! single-MCU consumers are unaffected.
 
 use std::ffi::CStr;
 use std::fs;
 use std::sync::OnceLock;
 use tracing::info;
 
-/// Filesystem mount path (set from project config).
-static FS_PATH: OnceLock<String> = OnceLock::new();
+/// Filesystem mount configuration for one MCU instance.
+pub struct Filesystem {
+    /// Filesystem mount path (set from project config, once per instance).
+    path: OnceLock<String>,
+}
+
+impl Filesystem {
+    /// Create an unconfigured filesystem (no path set).
+    pub const fn new() -> Self {
+        Self {
+            path: OnceLock::new(),
+        }
+    }
+
+    /// Initialize the filesystem path (first call per instance wins).
+    pub fn init(&self, path: &str) {
+        self.path.get_or_init(|| path.to_string());
+        let _ = fs::create_dir_all(path);
+        info!("Filesystem path: {}", path);
+    }
+
+    /// The configured mount path, if `init` has run for this instance.
+    pub fn path(&self) -> Option<&str> {
+        self.path.get().map(String::as_str)
+    }
+}
+
+impl Default for Filesystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================
+// Free functions — route to the calling thread's instance
+// ============================================================
 
 /// Initialize the filesystem path.
 pub fn init(path: &str) {
-    FS_PATH.get_or_init(|| path.to_string());
-    let _ = fs::create_dir_all(path);
-    info!("Filesystem path: {}", path);
+    crate::instance::current().filesystem.init(path);
 }
 
 /// Mount a filesystem path (create directory).
@@ -76,11 +113,28 @@ mod tests {
         crate::test_support::ensure_clock();
         let dir = temp_path("init");
         assert!(!dir.exists());
-        // FS_PATH is process-once; first init in the process wins. We assert the
-        // directory-creation side effect, NOT that FS_PATH changed.
+        // The default instance's path is once-per-process; first init wins. We
+        // assert the directory-creation side effect, NOT that the path changed.
         init(dir.to_str().unwrap());
         assert!(dir.exists() && dir.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_instance_path_is_independent() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        // Two instances each latch their own path — no process-global winner.
+        let a = Filesystem::new();
+        let b = Filesystem::new();
+        let dir_a = temp_path("inst_a");
+        let dir_b = temp_path("inst_b");
+        a.init(dir_a.to_str().unwrap());
+        b.init(dir_b.to_str().unwrap());
+        assert_eq!(a.path(), dir_a.to_str());
+        assert_eq!(b.path(), dir_b.to_str());
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     #[test]

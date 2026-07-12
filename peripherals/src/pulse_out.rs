@@ -26,11 +26,16 @@
 //!
 //! ## Concurrency
 //!
-//! Per-channel state is protected by a single global mutex held only across
-//! field reads/writes — never across a sleep — so multiple cores can drive
-//! independent channels in parallel without false serialization. Two cores
-//! driving the *same* channel is undefined (just like sharing an output pin
-//! on real hardware).
+//! Per-channel state is protected by a single per-instance mutex held only
+//! across field reads/writes — never across a sleep — so multiple cores can
+//! drive independent channels in parallel without false serialization. Two
+//! cores driving the *same* channel is undefined (just like sharing an output
+//! pin on real hardware).
+//!
+//! State lives in a per-MCU [`PulseOut`] bank owned by
+//! `instance::PeripheralInstance`. The module-level free functions route to
+//! the calling thread's instance (see `crate::instance`), so existing
+//! single-MCU consumers are unaffected.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -54,12 +59,6 @@ const POLL_TICK_US: u64 = 250;
 /// Maximum pulse out channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 16;
 
-static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-static START_CALLBACKS: Mutex<Vec<Option<Box<dyn Fn(u32, u32) + Send>>>> = Mutex::new(Vec::new());
-static STOP_CALLBACKS: Mutex<Vec<Option<Box<dyn Fn() + Send>>>> = Mutex::new(Vec::new());
-static PROGRESS_CALLBACKS: Mutex<Vec<Option<Box<dyn Fn(u32) + Send>>>> = Mutex::new(Vec::new());
-
 #[derive(Clone, Copy)]
 struct PulseState {
     total_pulses: u32,
@@ -73,79 +72,283 @@ struct PulseState {
     emitted_base: u64,
 }
 
-static PULSE_STATE: Mutex<[PulseState; MAX_CHANNELS]> = Mutex::new({
-    const INIT: PulseState = PulseState {
-        total_pulses: 0,
-        frequency: 1,
-        start_us: 0,
-        velocity_mode: false,
-        emitted_base: 0,
-    };
-    [INIT; MAX_CHANNELS]
-});
+const PULSE_STATE_INIT: PulseState = PulseState {
+    total_pulses: 0,
+    frequency: 1,
+    start_us: 0,
+    velocity_mode: false,
+    emitted_base: 0,
+};
 
-// ============================================================
-// Initialization
-// ============================================================
-
-/// Configure the peripheral with the number of channels.
-/// Resets all per-channel callbacks and pulse state, so re-init is a clean start.
-pub fn init(count: usize) {
-    assert!(
-        count <= MAX_CHANNELS,
-        "PulseOut count {} exceeds max {}",
-        count,
-        MAX_CHANNELS
-    );
-    reset();
-    CHANNEL_COUNT.store(count, Ordering::Relaxed);
-    START_CALLBACKS.lock().unwrap().resize_with(count, || None);
-    STOP_CALLBACKS.lock().unwrap().resize_with(count, || None);
-    PROGRESS_CALLBACKS
-        .lock()
-        .unwrap()
-        .resize_with(count, || None);
+/// Pulse-output channel bank for one MCU instance.
+pub struct PulseOut {
+    count: AtomicUsize,
+    start_callbacks: Mutex<Vec<Option<Box<dyn Fn(u32, u32) + Send>>>>,
+    stop_callbacks: Mutex<Vec<Option<Box<dyn Fn() + Send>>>>,
+    progress_callbacks: Mutex<Vec<Option<Box<dyn Fn(u32) + Send>>>>,
+    state: Mutex<[PulseState; MAX_CHANNELS]>,
 }
 
-/// Clear all channel callbacks and pulse state (used by `init` and teardown).
-pub fn reset() {
-    CHANNEL_COUNT.store(0, Ordering::Relaxed);
-    START_CALLBACKS.lock().unwrap().clear();
-    STOP_CALLBACKS.lock().unwrap().clear();
-    PROGRESS_CALLBACKS.lock().unwrap().clear();
-    let mut state = PULSE_STATE.lock().unwrap();
-    for s in state.iter_mut() {
-        *s = PulseState {
-            total_pulses: 0,
-            frequency: 1,
-            start_us: 0,
-            velocity_mode: false,
-            emitted_base: 0,
+impl PulseOut {
+    /// Create a bank with no channels configured and no callbacks.
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            start_callbacks: Mutex::new(Vec::new()),
+            stop_callbacks: Mutex::new(Vec::new()),
+            progress_callbacks: Mutex::new(Vec::new()),
+            state: Mutex::new([PULSE_STATE_INIT; MAX_CHANNELS]),
+        }
+    }
+
+    /// Configure the peripheral with the number of channels.
+    /// Resets all per-channel callbacks and pulse state, so re-init is a clean start.
+    ///
+    /// # Panics
+    /// If `count` exceeds [`MAX_CHANNELS`].
+    pub fn init(&self, count: usize) {
+        assert!(
+            count <= MAX_CHANNELS,
+            "PulseOut count {} exceeds max {}",
+            count,
+            MAX_CHANNELS
+        );
+        self.reset();
+        self.count.store(count, Ordering::Relaxed);
+        self.start_callbacks
+            .lock()
+            .unwrap()
+            .resize_with(count, || None);
+        self.stop_callbacks
+            .lock()
+            .unwrap()
+            .resize_with(count, || None);
+        self.progress_callbacks
+            .lock()
+            .unwrap()
+            .resize_with(count, || None);
+    }
+
+    /// Clear all channel callbacks and pulse state (used by `init` and teardown).
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.start_callbacks.lock().unwrap().clear();
+        self.stop_callbacks.lock().unwrap().clear();
+        self.progress_callbacks.lock().unwrap().clear();
+        let mut state = self.state.lock().unwrap();
+        for s in state.iter_mut() {
+            *s = PULSE_STATE_INIT;
+        }
+    }
+
+    /// Register a per-channel callback fired when `start()` is called. Useful
+    /// for snapshotting baseline state (encoder origin, GPIO direction).
+    pub fn on_start(&self, channel: usize, cb: impl Fn(u32, u32) + Send + 'static) {
+        register(&self.start_callbacks, channel, Box::new(cb));
+    }
+
+    /// Register a per-channel callback fired when `stop()` is called.
+    pub fn on_stop(&self, channel: usize, cb: impl Fn() + Send + 'static) {
+        register(&self.stop_callbacks, channel, Box::new(cb));
+    }
+
+    /// Register a per-channel callback fired with the cumulative `emitted` pulse
+    /// count every time progress is re-evaluated. The argument is the **same
+    /// integer** the firmware will read from `HAL_pulseOut_run` on the same call,
+    /// so subscribers (encoders, physics models) cannot drift from that view.
+    pub fn on_progress(&self, channel: usize, cb: impl Fn(u32) + Send + 'static) {
+        register(&self.progress_callbacks, channel, Box::new(cb));
+    }
+
+    fn fire_progress(&self, channel: usize, emitted: u32) {
+        if let Ok(cbs) = self.progress_callbacks.lock() {
+            if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
+                cb(emitted);
+            }
+        }
+    }
+
+    /// Start a pulse sequence. Records timing state and fires `on_start` followed
+    /// by an initial `on_progress(0)` so subscribers can align with the start
+    /// position before any pulses elapse.
+    pub fn start(&self, channel: usize, pulses: u32, frequency: u32) {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return;
+        }
+        let freq = frequency.max(1);
+
+        trace!(
+            "pulse_out::start(ch={}, pulses={}, freq={})",
+            channel,
+            pulses,
+            freq
+        );
+
+        {
+            let mut state = self.state.lock().unwrap();
+            state[channel] = PulseState {
+                total_pulses: pulses,
+                frequency: freq,
+                start_us: embsim_core::virtual_clock::virtual_us(),
+                velocity_mode: false,
+                emitted_base: 0,
+            };
+        }
+
+        if let Ok(cbs) = self.start_callbacks.lock() {
+            if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
+                cb(pulses, freq);
+            }
+        }
+        self.fire_progress(channel, 0);
+    }
+
+    /// Begin (or re-baseline) a continuous-velocity (NCO) pulse train at `frequency`
+    /// steps/s. Resets the emitted counter to 0 and fires `on_start` so subscribers
+    /// can re-anchor their own state (e.g. snapshot the current direction, or reset a
+    /// dt baseline so the first post-restart tick doesn't see a huge interval).
+    /// Callers re-invoke this on a direction reversal, where the rate passes through
+    /// ~0. `frequency` 0 holds (no pulses).
+    pub fn start_velocity(&self, channel: usize, frequency: u32) {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return;
+        }
+        trace!(
+            "pulse_out::start_velocity(ch={}, freq={})",
+            channel,
+            frequency
+        );
+        {
+            let mut state = self.state.lock().unwrap();
+            state[channel] = PulseState {
+                total_pulses: u32::MAX, // unbounded; velocity mode never "completes"
+                frequency,
+                start_us: embsim_core::virtual_clock::virtual_us(),
+                velocity_mode: true,
+                emitted_base: 0,
+            };
+        }
+        if let Ok(cbs) = self.start_callbacks.lock() {
+            if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
+                cb(0, frequency);
+            }
+        }
+        self.fire_progress(channel, 0);
+    }
+
+    /// Retarget the continuous-velocity rate without resetting the emitted counter.
+    /// The pulses already emitted at the previous rate are banked into `emitted_base`
+    /// so the running total stays monotonic. No-op outside velocity mode.
+    pub fn set_frequency(&self, channel: usize, frequency: u32) {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        let s = &mut state[channel];
+        if !s.velocity_mode {
+            return;
+        }
+        let now = embsim_core::virtual_clock::virtual_us();
+        let elapsed = now.saturating_sub(s.start_us);
+        let emitted_at_old = elapsed.saturating_mul(s.frequency as u64) / 1_000_000;
+        s.emitted_base = s.emitted_base.saturating_add(emitted_at_old);
+        s.frequency = frequency;
+        s.start_us = now;
+    }
+
+    /// Current commanded pulse frequency (steps/s) for `channel`. Plant models
+    /// integrate this *commanded* velocity (× direction) instead of the running
+    /// emitted count, which sidesteps the sub-pulse-per-tick truncation that the
+    /// integer emitted total suffers at low rates.
+    pub fn frequency(&self, channel: usize) -> u32 {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return 0;
+        }
+        self.state.lock().unwrap()[channel].frequency
+    }
+
+    /// Poll a running pulse sequence. Returns `(emitted_pulses, done)`.
+    ///
+    /// `emitted` advances monotonically with virtual time at the configured rate
+    /// and is clamped to `total`. The call sleeps for `POLL_TICK_US` of virtual
+    /// time when the sequence is still in progress, returning immediately once
+    /// `done = true` so the caller can move on without an extra tick of latency.
+    pub fn run(&self, channel: usize) -> (u32, bool) {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return (0, true);
+        }
+
+        // Snapshot state — never hold the lock across a sleep.
+        let snapshot = {
+            let state = self.state.lock().unwrap();
+            state[channel]
         };
+
+        if snapshot.total_pulses == 0 {
+            return (0, true);
+        }
+
+        let now = embsim_core::virtual_clock::virtual_us();
+        let elapsed_us = now.saturating_sub(snapshot.start_us);
+
+        // Continuous-velocity mode: cumulative emitted = banked + rate × elapsed.
+        // Never completes (the caller stops it); still yields the core via the poll
+        // sleep and fires progress so the encoder/physics track virtual time.
+        if snapshot.velocity_mode {
+            let emitted = snapshot
+                .emitted_base
+                .saturating_add(elapsed_us.saturating_mul(snapshot.frequency as u64) / 1_000_000)
+                as u32;
+            self.fire_progress(channel, emitted);
+            sleep_virtual_us(POLL_TICK_US);
+            return (emitted, false);
+        }
+
+        let emitted = ((elapsed_us.saturating_mul(snapshot.frequency as u64)) / 1_000_000)
+            .min(snapshot.total_pulses as u64) as u32;
+        let done = emitted >= snapshot.total_pulses;
+
+        trace!(
+            "pulse_out::run(ch={}): {}/{} elapsed={}us done={}",
+            channel,
+            emitted,
+            snapshot.total_pulses,
+            elapsed_us,
+            done
+        );
+
+        self.fire_progress(channel, emitted);
+
+        if !done {
+            sleep_virtual_us(POLL_TICK_US);
+        }
+
+        (emitted, done)
+    }
+
+    /// Stop a running pulse sequence and fire the `on_stop` callback.
+    pub fn stop(&self, channel: usize) {
+        trace!("pulse_out::stop(ch={})", channel);
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return;
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            state[channel].total_pulses = 0;
+            state[channel].velocity_mode = false;
+        }
+        if let Ok(cbs) = self.stop_callbacks.lock() {
+            if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
+                cb();
+            }
+        }
     }
 }
 
-// ============================================================
-// Callback registration
-// ============================================================
-
-/// Register a per-channel callback fired when `start()` is called. Useful
-/// for snapshotting baseline state (encoder origin, GPIO direction).
-pub fn on_start(channel: usize, cb: impl Fn(u32, u32) + Send + 'static) {
-    register(&START_CALLBACKS, channel, Box::new(cb));
-}
-
-/// Register a per-channel callback fired when `stop()` is called.
-pub fn on_stop(channel: usize, cb: impl Fn() + Send + 'static) {
-    register(&STOP_CALLBACKS, channel, Box::new(cb));
-}
-
-/// Register a per-channel callback fired with the cumulative `emitted` pulse
-/// count every time progress is re-evaluated. The argument is the **same
-/// integer** the firmware will read from `HAL_pulseOut_run` on the same call,
-/// so subscribers (encoders, physics models) cannot drift from that view.
-pub fn on_progress(channel: usize, cb: impl Fn(u32) + Send + 'static) {
-    register(&PROGRESS_CALLBACKS, channel, Box::new(cb));
+impl Default for PulseOut {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn register<F: ?Sized>(slot: &Mutex<Vec<Option<Box<F>>>>, channel: usize, cb: Box<F>) {
@@ -159,199 +362,85 @@ fn register<F: ?Sized>(slot: &Mutex<Vec<Option<Box<F>>>>, channel: usize, cb: Bo
     cbs[channel] = Some(cb);
 }
 
-fn fire_progress(channel: usize, emitted: u32) {
-    if let Ok(cbs) = PROGRESS_CALLBACKS.lock() {
-        if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
-            cb(emitted);
-        }
-    }
-}
-
-// ============================================================
-// Core API
-// ============================================================
-
-/// Start a pulse sequence. Records timing state and fires `on_start` followed
-/// by an initial `on_progress(0)` so subscribers can align with the start
-/// position before any pulses elapse.
-pub fn start(channel: usize, pulses: u32, frequency: u32) {
-    if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
-        return;
-    }
-    let freq = frequency.max(1);
-
-    trace!(
-        "pulse_out::start(ch={}, pulses={}, freq={})",
-        channel,
-        pulses,
-        freq
-    );
-
-    {
-        let mut state = PULSE_STATE.lock().unwrap();
-        state[channel] = PulseState {
-            total_pulses: pulses,
-            frequency: freq,
-            start_us: embsim_core::virtual_clock::virtual_us(),
-            velocity_mode: false,
-            emitted_base: 0,
-        };
-    }
-
-    if let Ok(cbs) = START_CALLBACKS.lock() {
-        if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
-            cb(pulses, freq);
-        }
-    }
-    fire_progress(channel, 0);
-}
-
-/// Begin (or re-baseline) a continuous-velocity (NCO) pulse train at `frequency`
-/// steps/s. Resets the emitted counter to 0 and fires `on_start` so subscribers
-/// can re-anchor their own state (e.g. snapshot the current direction, or reset a
-/// dt baseline so the first post-restart tick doesn't see a huge interval).
-/// Callers re-invoke this on a direction reversal, where the rate passes through
-/// ~0. `frequency` 0 holds (no pulses).
-pub fn start_velocity(channel: usize, frequency: u32) {
-    if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
-        return;
-    }
-    trace!(
-        "pulse_out::start_velocity(ch={}, freq={})",
-        channel,
-        frequency
-    );
-    {
-        let mut state = PULSE_STATE.lock().unwrap();
-        state[channel] = PulseState {
-            total_pulses: u32::MAX, // unbounded; velocity mode never "completes"
-            frequency,
-            start_us: embsim_core::virtual_clock::virtual_us(),
-            velocity_mode: true,
-            emitted_base: 0,
-        };
-    }
-    if let Ok(cbs) = START_CALLBACKS.lock() {
-        if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
-            cb(0, frequency);
-        }
-    }
-    fire_progress(channel, 0);
-}
-
-/// Retarget the continuous-velocity rate without resetting the emitted counter.
-/// The pulses already emitted at the previous rate are banked into `emitted_base`
-/// so the running total stays monotonic. No-op outside velocity mode.
-pub fn set_frequency(channel: usize, frequency: u32) {
-    if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut state = PULSE_STATE.lock().unwrap();
-    let s = &mut state[channel];
-    if !s.velocity_mode {
-        return;
-    }
-    let now = embsim_core::virtual_clock::virtual_us();
-    let elapsed = now.saturating_sub(s.start_us);
-    let emitted_at_old = elapsed.saturating_mul(s.frequency as u64) / 1_000_000;
-    s.emitted_base = s.emitted_base.saturating_add(emitted_at_old);
-    s.frequency = frequency;
-    s.start_us = now;
-}
-
-/// Current commanded pulse frequency (steps/s) for `channel`. Plant models
-/// integrate this *commanded* velocity (× direction) instead of the running
-/// emitted count, which sidesteps the sub-pulse-per-tick truncation that the
-/// integer emitted total suffers at low rates.
-pub fn frequency(channel: usize) -> u32 {
-    if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
-        return 0;
-    }
-    PULSE_STATE.lock().unwrap()[channel].frequency
-}
-
-/// Poll a running pulse sequence. Returns `(emitted_pulses, done)`.
-///
-/// `emitted` advances monotonically with virtual time at the configured rate
-/// and is clamped to `total`. The call sleeps for `POLL_TICK_US` of virtual
-/// time when the sequence is still in progress, returning immediately once
-/// `done = true` so the caller can move on without an extra tick of latency.
-pub fn run(channel: usize) -> (u32, bool) {
-    if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
-        return (0, true);
-    }
-
-    // Snapshot state — never hold the lock across a sleep.
-    let snapshot = {
-        let state = PULSE_STATE.lock().unwrap();
-        state[channel]
-    };
-
-    if snapshot.total_pulses == 0 {
-        return (0, true);
-    }
-
-    let now = embsim_core::virtual_clock::virtual_us();
-    let elapsed_us = now.saturating_sub(snapshot.start_us);
-
-    // Continuous-velocity mode: cumulative emitted = banked + rate × elapsed.
-    // Never completes (the caller stops it); still yields the core via the poll
-    // sleep and fires progress so the encoder/physics track virtual time.
-    if snapshot.velocity_mode {
-        let emitted = snapshot
-            .emitted_base
-            .saturating_add(elapsed_us.saturating_mul(snapshot.frequency as u64) / 1_000_000)
-            as u32;
-        fire_progress(channel, emitted);
-        sleep_virtual_us(POLL_TICK_US);
-        return (emitted, false);
-    }
-
-    let emitted = ((elapsed_us.saturating_mul(snapshot.frequency as u64)) / 1_000_000)
-        .min(snapshot.total_pulses as u64) as u32;
-    let done = emitted >= snapshot.total_pulses;
-
-    trace!(
-        "pulse_out::run(ch={}): {}/{} elapsed={}us done={}",
-        channel,
-        emitted,
-        snapshot.total_pulses,
-        elapsed_us,
-        done
-    );
-
-    fire_progress(channel, emitted);
-
-    if !done {
-        sleep_virtual_us(POLL_TICK_US);
-    }
-
-    (emitted, done)
-}
-
-/// Stop a running pulse sequence and fire the `on_stop` callback.
-pub fn stop(channel: usize) {
-    trace!("pulse_out::stop(ch={})", channel);
-    if channel >= CHANNEL_COUNT.load(Ordering::Relaxed) {
-        return;
-    }
-    {
-        let mut state = PULSE_STATE.lock().unwrap();
-        state[channel].total_pulses = 0;
-        state[channel].velocity_mode = false;
-    }
-    if let Ok(cbs) = STOP_CALLBACKS.lock() {
-        if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
-            cb();
-        }
-    }
-}
-
 fn sleep_virtual_us(virtual_us: u64) {
     let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(virtual_us);
     if wall_us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(wall_us));
     }
+}
+
+// ============================================================
+// Free functions — route to the calling thread's instance
+// ============================================================
+
+/// Configure the peripheral with the number of channels.
+/// Resets all per-channel callbacks and pulse state, so re-init is a clean start.
+pub fn init(count: usize) {
+    crate::instance::current().pulse_out.init(count);
+}
+
+/// Clear all channel callbacks and pulse state (used by `init` and teardown).
+pub fn reset() {
+    crate::instance::current().pulse_out.reset();
+}
+
+/// Register a per-channel callback fired when `start()` is called. Useful
+/// for snapshotting baseline state (encoder origin, GPIO direction).
+pub fn on_start(channel: usize, cb: impl Fn(u32, u32) + Send + 'static) {
+    crate::instance::current().pulse_out.on_start(channel, cb);
+}
+
+/// Register a per-channel callback fired when `stop()` is called.
+pub fn on_stop(channel: usize, cb: impl Fn() + Send + 'static) {
+    crate::instance::current().pulse_out.on_stop(channel, cb);
+}
+
+/// Register a per-channel callback fired with the cumulative `emitted` pulse
+/// count every time progress is re-evaluated. See [`PulseOut::on_progress`].
+pub fn on_progress(channel: usize, cb: impl Fn(u32) + Send + 'static) {
+    crate::instance::current()
+        .pulse_out
+        .on_progress(channel, cb);
+}
+
+/// Start a pulse sequence. See [`PulseOut::start`].
+pub fn start(channel: usize, pulses: u32, frequency: u32) {
+    crate::instance::current()
+        .pulse_out
+        .start(channel, pulses, frequency);
+}
+
+/// Begin (or re-baseline) a continuous-velocity (NCO) pulse train at `frequency`
+/// steps/s. See [`PulseOut::start_velocity`].
+pub fn start_velocity(channel: usize, frequency: u32) {
+    crate::instance::current()
+        .pulse_out
+        .start_velocity(channel, frequency);
+}
+
+/// Retarget the continuous-velocity rate without resetting the emitted counter.
+/// See [`PulseOut::set_frequency`].
+pub fn set_frequency(channel: usize, frequency: u32) {
+    crate::instance::current()
+        .pulse_out
+        .set_frequency(channel, frequency);
+}
+
+/// Current commanded pulse frequency (steps/s) for `channel`. See
+/// [`PulseOut::frequency`].
+pub fn frequency(channel: usize) -> u32 {
+    crate::instance::current().pulse_out.frequency(channel)
+}
+
+/// Poll a running pulse sequence. Returns `(emitted_pulses, done)`.
+/// See [`PulseOut::run`].
+pub fn run(channel: usize) -> (u32, bool) {
+    crate::instance::current().pulse_out.run(channel)
+}
+
+/// Stop a running pulse sequence and fire the `on_stop` callback.
+pub fn stop(channel: usize) {
+    crate::instance::current().pulse_out.stop(channel);
 }
 
 // ============================================================

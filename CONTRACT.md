@@ -10,10 +10,17 @@ function for every symbol the firmware leaves undefined, and implements
 The firmware is compiled to a static library with its HAL **left undefined**.
 When the emulator binary links that `.a`, the linker resolves each undefined
 `HAL_*` (etc.) symbol against the `#[no_mangle]` functions in the platform crate.
-There is no indirection table — symbol *names must match the firmware's HAL
-headers exactly*, including any historical spellings (the reference `embsim-p2`
-platform's firmware spells it `recieve`, so its trampoline is
-`HAL_serial_recieveByte`).
+At the *linker* level there is no indirection — symbol *names must match the
+firmware's HAL headers exactly*, including any historical spellings (the
+reference `embsim-p2` platform's firmware spells it `recieve`, so its
+trampoline is `HAL_serial_recieveByte`).
+
+At *runtime*, each trampoline delegates to a generic peripheral free function,
+and those free functions route by **thread identity** to a per-MCU
+`embsim_peripherals::instance::PeripheralInstance` (see "Peripheral instances
+& thread routing" below). A single-MCU emulator never notices: unbound threads
+fall back to a process-wide default instance that behaves exactly like the
+former process globals.
 
 ## ABI mapping rules
 
@@ -69,6 +76,54 @@ _clkset  _hubset  _reboot
 
 Compiler/CPU intrinsics the firmware emits inline on real silicon; stubbed for
 the host.
+
+## Peripheral instances & thread routing
+
+All generic peripheral state (serial FDs/baud/pacing, GPIO state + callbacks,
+encoder counters, pulse-out trains, the lock pool, the thread registry, the
+filesystem mount, and the per-MCU clock-frequency override) is owned by an
+`embsim_peripherals::instance::PeripheralInstance`. The free functions the
+trampolines call resolve the calling thread's instance:
+
+1. a thread explicitly bound via `instance::bind_current_thread(arc)` (RAII
+   guard; restores the previous binding on drop) routes to its bound instance.
+   The guard is `!Send`: it must be dropped on the thread it bound (dropping
+   it elsewhere would rewrite the wrong thread's cached binding), which is
+   what keeps the thread-local routing cache coherent by construction.
+   Nested guards must be dropped in **LIFO order** (innermost first) — an
+   out-of-order drop panics rather than leaving the thread bound to a stale
+   instance;
+2. threads spawned through `system::start_thread` — i.e. through the
+   `HAL_system_startThread` trampoline — **inherit their creator's instance**
+   (the spawn path binds the new thread before the firmware function runs);
+3. any other thread falls back to the lazily-created **default singleton**
+   (`instance::default()`), which preserves the historical single-MCU
+   behavior. `Emulator::run` initializes peripherals through the free
+   functions on an unbound thread, so a whole classic emulator lives on the
+   default instance.
+
+To support **multiple MCU instances** in one process, a platform/board layer
+must:
+
+- create one `Arc<PeripheralInstance>` per MCU and initialize/wire *that*
+  instance (`inst.serial.init(..)`, `inst.gpio.on_change(..)`, …) instead of
+  the module free functions;
+- bind the thread that runs each firmware entry point with
+  `instance::bind_current_thread` **before** calling the entry, and keep the
+  guard alive for the entry's lifetime — every thread the firmware spawns
+  through `HAL_system_startThread` then inherits the right instance
+  automatically;
+- keep model/host threads that talk to a specific MCU either bound to that
+  instance or using `inst.<peripheral>` directly (free functions on an unbound
+  thread hit the default instance, not "the nearest MCU").
+
+**Documented limit:** instance routing de-globalizes the Rust-side peripheral
+state only. A given firmware **image's own C statics** (`.data`/`.bss`) exist
+once per process, so one process can run at most **one instance of a given
+firmware image**; multi-instance means multiple *distinct* images (or
+pure-Rust components). Virtual *time* also remains process-wide
+(`embsim_core::virtual_clock` is free-running scaled wall time); only the
+clock *frequency* used for cycle math is per-instance.
 
 ## Init-before-entry ordering (handled by the runtime)
 

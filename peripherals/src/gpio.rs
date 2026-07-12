@@ -1,4 +1,9 @@
 //! GPIO — Generic channel bank with per-channel atomic state and change callbacks.
+//!
+//! State lives in a per-MCU [`Gpio`] bank owned by
+//! `instance::PeripheralInstance`. The module-level free functions route to
+//! the calling thread's instance (see `crate::instance`), so existing
+//! single-MCU consumers are unaffected.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -7,143 +12,196 @@ use tracing::trace;
 /// Maximum GPIO channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 64;
 
-/// Configured channel count (set at init, default 0).
-static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// GPIO channel bank for one MCU instance.
+pub struct Gpio {
+    /// Configured channel count (set at init, default 0).
+    count: AtomicUsize,
+    /// Channel state storage (one atomic bool per channel, thread-safe).
+    state: [AtomicBool; MAX_CHANNELS],
+    /// Per-channel change callbacks — fired when firmware writes a channel.
+    /// Uses `Vec` instead of array since `Box<dyn Fn>` is not const-initializable.
+    callbacks: Mutex<Vec<Option<Box<dyn Fn(bool) + Send>>>>,
+    /// Optional channel names for logging (set at init).
+    names: Mutex<Option<&'static [&'static str]>>,
+}
 
-/// Channel state storage (one atomic bool per channel, thread-safe).
-static GPIO_STATE: [AtomicBool; MAX_CHANNELS] = {
-    const INIT: AtomicBool = AtomicBool::new(false);
-    [INIT; MAX_CHANNELS]
-};
+impl Gpio {
+    /// Create a bank with no channels configured, all lines low.
+    pub const fn new() -> Self {
+        const STATE_INIT: AtomicBool = AtomicBool::new(false);
+        Self {
+            count: AtomicUsize::new(0),
+            state: [STATE_INIT; MAX_CHANNELS],
+            callbacks: Mutex::new(Vec::new()),
+            names: Mutex::new(None),
+        }
+    }
 
-/// Per-channel change callbacks — fired when firmware writes a channel.
-/// Uses Vec instead of array since Box<dyn Fn> isn't const-initializable.
-static CALLBACKS: Mutex<Vec<Option<Box<dyn Fn(bool) + Send>>>> = Mutex::new(Vec::new());
+    /// Configure the GPIO peripheral with the number of channels and optional names.
+    /// Must be called before firmware starts. Resets any prior state, so calling it
+    /// again (in-process restart) yields a clean bank.
+    ///
+    /// # Panics
+    /// If `count` exceeds [`MAX_CHANNELS`].
+    pub fn init(&self, count: usize, names: Option<&'static [&'static str]>) {
+        assert!(
+            count <= MAX_CHANNELS,
+            "GPIO count {} exceeds max {}",
+            count,
+            MAX_CHANNELS
+        );
+        self.reset();
+        self.count.store(count, Ordering::Relaxed);
+        *self.names.lock().unwrap() = names;
+        // Ensure callback vec is sized for all channels
+        let mut cbs = self.callbacks.lock().unwrap();
+        cbs.resize_with(count, || None);
+    }
 
-/// Optional channel names for logging (set at init).
-static CHANNEL_NAMES: Mutex<Option<&'static [&'static str]>> = Mutex::new(None);
+    /// Clear all channel state, callbacks, and names (used by `init` and teardown).
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        for state in self.state.iter() {
+            state.store(false, Ordering::Relaxed);
+        }
+        self.callbacks.lock().unwrap().clear();
+        *self.names.lock().unwrap() = None;
+    }
+
+    /// Get a channel name for logging (falls back to index if no names set).
+    fn channel_name(&self, channel: usize) -> String {
+        if let Ok(guard) = self.names.lock() {
+            if let Some(names) = *guard {
+                if channel < names.len() {
+                    return names[channel].to_string();
+                }
+            }
+        }
+        format!("{}", channel)
+    }
+
+    /// Set a GPIO channel active state. Fires the change callback if registered.
+    pub fn set_active(&self, channel: usize, active: bool) {
+        let count = self.count.load(Ordering::Relaxed);
+        if channel >= count {
+            return;
+        }
+        self.state[channel].store(active, Ordering::Relaxed);
+        trace!("GPIO {} = {}", self.channel_name(channel), active);
+
+        // Fire change callback if registered
+        if let Ok(cbs) = self.callbacks.lock() {
+            if channel < cbs.len() {
+                if let Some(cb) = cbs[channel].as_ref() {
+                    cb(active);
+                }
+            }
+        }
+    }
+
+    /// Get a GPIO channel active state.
+    pub fn get_active(&self, channel: usize) -> bool {
+        let count = self.count.load(Ordering::Relaxed);
+        if channel >= count {
+            return false;
+        }
+        self.state[channel].load(Ordering::Relaxed)
+    }
+
+    /// Toggle a GPIO channel and fire the change callback.
+    pub fn toggle_active(&self, channel: usize) {
+        let count = self.count.load(Ordering::Relaxed);
+        if channel >= count {
+            return;
+        }
+        let current = self.state[channel].load(Ordering::Relaxed);
+        let new_state = !current;
+        self.state[channel].store(new_state, Ordering::Relaxed);
+        trace!(
+            "GPIO {} toggled → {}",
+            self.channel_name(channel),
+            new_state
+        );
+
+        // Fire change callback if registered
+        if let Ok(cbs) = self.callbacks.lock() {
+            if channel < cbs.len() {
+                if let Some(cb) = cbs[channel].as_ref() {
+                    cb(new_state);
+                }
+            }
+        }
+    }
+
+    /// Set a GPIO channel state from external source (e.g., model → GPIO).
+    /// Does NOT fire change callbacks (only firmware writes trigger callbacks).
+    pub fn set_state(&self, channel: usize, state: bool) {
+        if channel < self.count.load(Ordering::Relaxed) {
+            self.state[channel].store(state, Ordering::Relaxed);
+            trace!("GPIO {} (ext) = {}", self.channel_name(channel), state);
+        }
+    }
+
+    /// Register a callback for when firmware changes a GPIO channel.
+    /// Only one callback per channel.
+    pub fn on_change(&self, channel: usize, cb: impl Fn(bool) + Send + 'static) {
+        if channel < MAX_CHANNELS {
+            if let Ok(mut cbs) = self.callbacks.lock() {
+                if channel >= cbs.len() {
+                    cbs.resize_with(channel + 1, || None);
+                }
+                cbs[channel] = Some(Box::new(cb));
+            }
+        }
+    }
+}
+
+impl Default for Gpio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ============================================================
-// Initialization
+// Free functions — route to the calling thread's instance
 // ============================================================
 
 /// Configure the GPIO peripheral with the number of channels and optional names.
-/// Must be called before firmware starts. Resets any prior state, so calling it
-/// again (in-process restart) yields a clean bank.
+/// See [`Gpio::init`].
 pub fn init(count: usize, names: Option<&'static [&'static str]>) {
-    assert!(
-        count <= MAX_CHANNELS,
-        "GPIO count {} exceeds max {}",
-        count,
-        MAX_CHANNELS
-    );
-    reset();
-    CHANNEL_COUNT.store(count, Ordering::Relaxed);
-    *CHANNEL_NAMES.lock().unwrap() = names;
-    // Ensure callback vec is sized for all channels
-    let mut cbs = CALLBACKS.lock().unwrap();
-    cbs.resize_with(count, || None);
+    crate::instance::current().gpio.init(count, names);
 }
 
 /// Clear all channel state, callbacks, and names (used by `init` and teardown).
 pub fn reset() {
-    CHANNEL_COUNT.store(0, Ordering::Relaxed);
-    for state in GPIO_STATE.iter() {
-        state.store(false, Ordering::Relaxed);
-    }
-    CALLBACKS.lock().unwrap().clear();
-    *CHANNEL_NAMES.lock().unwrap() = None;
+    crate::instance::current().gpio.reset();
 }
-
-/// Get a channel name for logging (falls back to index if no names set).
-fn channel_name(channel: usize) -> String {
-    if let Ok(guard) = CHANNEL_NAMES.lock() {
-        if let Some(names) = *guard {
-            if channel < names.len() {
-                return names[channel].to_string();
-            }
-        }
-    }
-    format!("{}", channel)
-}
-
-// ============================================================
-// Core API
-// ============================================================
 
 /// Set a GPIO channel active state. Fires the change callback if registered.
 pub fn set_active(channel: usize, active: bool) {
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if channel >= count {
-        return;
-    }
-    GPIO_STATE[channel].store(active, Ordering::Relaxed);
-    trace!("GPIO {} = {}", channel_name(channel), active);
-
-    // Fire change callback if registered
-    if let Ok(cbs) = CALLBACKS.lock() {
-        if channel < cbs.len() {
-            if let Some(cb) = cbs[channel].as_ref() {
-                cb(active);
-            }
-        }
-    }
+    crate::instance::current().gpio.set_active(channel, active);
 }
 
 /// Get a GPIO channel active state.
 pub fn get_active(channel: usize) -> bool {
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if channel >= count {
-        return false;
-    }
-    GPIO_STATE[channel].load(Ordering::Relaxed)
+    crate::instance::current().gpio.get_active(channel)
 }
 
 /// Toggle a GPIO channel and fire the change callback.
 pub fn toggle_active(channel: usize) {
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if channel >= count {
-        return;
-    }
-    let current = GPIO_STATE[channel].load(Ordering::Relaxed);
-    let new_state = !current;
-    GPIO_STATE[channel].store(new_state, Ordering::Relaxed);
-    trace!("GPIO {} toggled → {}", channel_name(channel), new_state);
-
-    // Fire change callback if registered
-    if let Ok(cbs) = CALLBACKS.lock() {
-        if channel < cbs.len() {
-            if let Some(cb) = cbs[channel].as_ref() {
-                cb(new_state);
-            }
-        }
-    }
+    crate::instance::current().gpio.toggle_active(channel);
 }
-
-// ============================================================
-// Wiring API — used by project wiring layer
-// ============================================================
 
 /// Set a GPIO channel state from external source (e.g., model → GPIO).
 /// Does NOT fire change callbacks (only firmware writes trigger callbacks).
 pub fn set_state(channel: usize, state: bool) {
-    if channel < CHANNEL_COUNT.load(Ordering::Relaxed) {
-        GPIO_STATE[channel].store(state, Ordering::Relaxed);
-        trace!("GPIO {} (ext) = {}", channel_name(channel), state);
-    }
+    crate::instance::current().gpio.set_state(channel, state);
 }
 
 /// Register a callback for when firmware changes a GPIO channel.
 /// Only one callback per channel.
 pub fn on_change(channel: usize, cb: impl Fn(bool) + Send + 'static) {
-    if channel < MAX_CHANNELS {
-        if let Ok(mut cbs) = CALLBACKS.lock() {
-            if channel >= cbs.len() {
-                cbs.resize_with(channel + 1, || None);
-            }
-            cbs[channel] = Some(Box::new(cb));
-        }
-    }
+    crate::instance::current().gpio.on_change(channel, cb);
 }
 
 // ============================================================
@@ -161,6 +219,12 @@ mod tests {
     fn setup(count: usize) {
         crate::test_support::ensure_clock();
         init(count, None);
+    }
+
+    /// The default instance's bank (what the free functions route to on an
+    /// unbound test thread) — for asserting internals like `channel_name`.
+    fn bank() -> Arc<crate::instance::PeripheralInstance> {
+        crate::instance::current()
     }
 
     #[test]
@@ -338,7 +402,7 @@ mod tests {
         // State cleared back to low.
         assert!(!get_active(0));
         // Names cleared → fallback to numeric index.
-        assert_eq!(channel_name(0), "0");
+        assert_eq!(bank().gpio.channel_name(0), "0");
         // Channel count cleared, so re-arming and writing fires nothing.
         init(2, None);
         set_active(0, true); // callback was cleared by reset()
@@ -356,13 +420,13 @@ mod tests {
         crate::test_support::ensure_clock();
         init(2, Some(NAMES));
         // In-range index resolves to its name.
-        assert_eq!(channel_name(0), "ENA");
-        assert_eq!(channel_name(1), "DIR");
+        assert_eq!(bank().gpio.channel_name(0), "ENA");
+        assert_eq!(bank().gpio.channel_name(1), "DIR");
         // Past the names slice → numeric fallback.
-        assert_eq!(channel_name(2), "2");
+        assert_eq!(bank().gpio.channel_name(2), "2");
         // With no names configured, every channel falls back to its index.
         init(2, None);
-        assert_eq!(channel_name(0), "0");
-        assert_eq!(channel_name(1), "1");
+        assert_eq!(bank().gpio.channel_name(0), "0");
+        assert_eq!(bank().gpio.channel_name(1), "1");
     }
 }
