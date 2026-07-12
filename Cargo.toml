@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "board",
     "core",
     "peripherals",
     "platforms/p2",

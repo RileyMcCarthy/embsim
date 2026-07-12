@@ -1,0 +1,12 @@
+[package]
+name = "embsim-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Component-centric board/system simulation engine for embsim (netlist ingestion, net resolution, diagnostics)"
+keywords = ["embedded", "emulator", "simulation", "sil"]
+categories = ["embedded", "simulation"]
+
+[dependencies]
+tracing.workspace = true
