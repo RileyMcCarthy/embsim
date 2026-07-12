@@ -162,6 +162,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "embsim-board"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "embsim-build"
 version = "0.1.0"
 

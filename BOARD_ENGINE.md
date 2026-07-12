@@ -323,6 +323,22 @@ Behavioral fidelity boundary, stated explicitly: **no cycle-accurate silicon
 emulation.** Raising fidelity of one peripheral later (bit-timed serial, PWM
 edges) is an internal change behind the same pin interface.
 
+## Model provenance convention
+
+Every behavioral model is only as trustworthy as its sourcing, so provenance is
+a requirement, not a nicety:
+
+- **Datasheet-backed parts** (real purchasable silicon): the module doc comment
+  names the datasheet document number and revision (e.g. `TI SBAS752B, Oct
+  2018`) and which sections govern which parts of the module. Every implemented
+  behavior carries a short in-place citation with **section and printed page**
+  (e.g. `// RREG = 0010 rrrx, replies 1 byte (SBAS752B §8.5.3.5, p.37)`).
+  Deliberate simplifications are annotated as such, citing what the full
+  behavior would be. Behavior with no datasheet basis is a defect.
+- **Physics/mechanical models** (plants, transducers): the header states the
+  governing equation or derivation and the parameter source (product listing,
+  machine spec). Magic numbers without provenance are flagged in review.
+
 ## Diagnostics
 
 Structured findings on a diagnostics bus, mirrored to `tracing`, consumable by
