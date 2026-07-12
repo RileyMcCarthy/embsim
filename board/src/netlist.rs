@@ -326,10 +326,10 @@ fn parse_component(comp: &Sexp) -> Result<ComponentDecl, NetlistError> {
 
     // KiCad 8+ exports DNP as a property named "dnp"; the `value == "X"`
     // consumer convention is applied at classification time, not here.
-    let dnp = comp
-        .children("property")
-        .iter()
-        .any(|p| p.child_arg("name").is_some_and(|n| n.eq_ignore_ascii_case("dnp")));
+    let dnp = comp.children("property").iter().any(|p| {
+        p.child_arg("name")
+            .is_some_and(|n| n.eq_ignore_ascii_case("dnp"))
+    });
 
     Ok(ComponentDecl {
         reference,

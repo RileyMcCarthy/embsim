@@ -239,7 +239,10 @@ fn starts_with_any(part: &str, prefixes: &[&str]) -> bool {
 /// `R` classify, `RJ45` does not).
 fn passive_kind(part: &str) -> Option<PassiveKind> {
     let anchored = |prefix: &str| {
-        part == prefix || part.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('_'))
+        part == prefix
+            || part
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('_'))
     };
     if anchored("LED") {
         return Some(PassiveKind::Led);
@@ -315,9 +318,7 @@ pub fn parse_passive_value(value: &str) -> Option<f64> {
     // (possibly embedded: "4k7"), anything after it must be digits (the
     // fractional part).
     let chars: Vec<char> = v.chars().collect();
-    let split = chars
-        .iter()
-        .position(|c| !c.is_ascii_digit() && *c != '.');
+    let split = chars.iter().position(|c| !c.is_ascii_digit() && *c != '.');
 
     match split {
         None => v.parse::<f64>().ok(),
@@ -424,8 +425,7 @@ mod tests {
     /// Relative-tolerance assertion for parsed SI values (multiplier
     /// arithmetic accumulates ULP-level float error).
     fn assert_parses_to(input: &str, expected: f64) {
-        let v = parse_passive_value(input)
-            .unwrap_or_else(|| panic!("{input:?} failed to parse"));
+        let v = parse_passive_value(input).unwrap_or_else(|| panic!("{input:?} failed to parse"));
         assert!(
             ((v - expected) / expected).abs() < 1e-12,
             "{input:?} parsed to {v}, expected {expected}"
@@ -542,7 +542,11 @@ mod tests {
     #[test]
     fn rescue_normalization_requires_rescue_lib() {
         assert_eq!(
-            normalize_part(&decl_with_lib("DS2_Addon-rescue", "Jumper_NO_Small-Device", "")),
+            normalize_part(&decl_with_lib(
+                "DS2_Addon-rescue",
+                "Jumper_NO_Small-Device",
+                ""
+            )),
             "Jumper_NO_Small"
         );
         // A hyphenated part in a normal lib is left alone.

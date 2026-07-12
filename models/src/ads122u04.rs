@@ -592,7 +592,10 @@ mod tests {
 
         let st = process_byte(&adc, wr, ParseState::WaitSync, SYNC_BYTE, &mut cont);
         let st = process_byte(&adc, wr, st, 0x10, &mut cont);
-        assert!(matches!(st, ParseState::WaitSync), "RDATA is a single-byte command");
+        assert!(
+            matches!(st, ParseState::WaitSync),
+            "RDATA is a single-byte command"
+        );
 
         let b = read_n(rd, 3);
         assert_eq!(b.len(), 3, "RDATA answers with exactly 3 bytes");

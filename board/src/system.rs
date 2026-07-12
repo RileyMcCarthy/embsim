@@ -378,10 +378,11 @@ impl System {
             let value_overrides = self.scenario.value_overrides().to_vec();
 
             for (path, state) in &jumpers {
-                let (bi, reference) = split_board_ref(path, &board_index)
-                    .ok_or_else(|| SystemError::UnknownEndpoint {
+                let (bi, reference) = split_board_ref(path, &board_index).ok_or_else(|| {
+                    SystemError::UnknownEndpoint {
                         endpoint: path.clone(),
-                    })?;
+                    }
+                })?;
                 let record = self.boards[bi]
                     .1
                     .records
@@ -395,10 +396,11 @@ impl System {
                 }
             }
             for (path, dnp) in &dnp_overrides {
-                let (bi, reference) = split_board_ref(path, &board_index)
-                    .ok_or_else(|| SystemError::UnknownEndpoint {
+                let (bi, reference) = split_board_ref(path, &board_index).ok_or_else(|| {
+                    SystemError::UnknownEndpoint {
                         endpoint: path.clone(),
-                    })?;
+                    }
+                })?;
                 if let Some(record) = self.boards[bi]
                     .1
                     .records
@@ -409,10 +411,11 @@ impl System {
                 }
             }
             for (path, value) in &value_overrides {
-                let (bi, reference) = split_board_ref(path, &board_index)
-                    .ok_or_else(|| SystemError::UnknownEndpoint {
+                let (bi, reference) = split_board_ref(path, &board_index).ok_or_else(|| {
+                    SystemError::UnknownEndpoint {
                         endpoint: path.clone(),
-                    })?;
+                    }
+                })?;
                 if let Some(record) = self.boards[bi]
                     .1
                     .records
@@ -466,10 +469,11 @@ impl System {
         for fault in self.scenario.faults().to_vec() {
             match fault {
                 Fault::PinDetach { endpoint } => {
-                    let (bi, pin) = split_board_pin(&endpoint, &board_index)
-                        .ok_or_else(|| SystemError::UnknownEndpoint {
+                    let (bi, pin) = split_board_pin(&endpoint, &board_index).ok_or_else(|| {
+                        SystemError::UnknownEndpoint {
                             endpoint: endpoint.clone(),
-                        })?;
+                        }
+                    })?;
                     detached.insert((bi, pin));
                 }
                 Fault::PinShort { a, b } => {
@@ -509,9 +513,7 @@ impl System {
                             // DC short (documented simplification).
                             PassiveKind::Inductor => true,
                             // DC open in the build-time pass.
-                            PassiveKind::Capacitor
-                            | PassiveKind::Diode
-                            | PassiveKind::Led => false,
+                            PassiveKind::Capacitor | PassiveKind::Diode | PassiveKind::Led => false,
                         };
                         if conducts && record.pins.len() == 2 {
                             let ohms = match kind {
@@ -542,10 +544,7 @@ impl System {
                     }
                     PartClass::Registered { pins } => {
                         for pin in pins {
-                            let key = (
-                                bi,
-                                PinRef::new(record.reference.clone(), pin.number),
-                            );
+                            let key = (bi, PinRef::new(record.reference.clone(), pin.number));
                             if detached.contains(&key) {
                                 continue;
                             }
@@ -623,10 +622,7 @@ impl System {
                 .get(&(bi, PinRef::new(connector.clone(), endpoint.pin.clone())))
                 .copied()
                 .ok_or_else(|| SystemError::UnknownEndpoint {
-                    endpoint: format!(
-                        "{}.{}.{}",
-                        endpoint.board, connector, endpoint.pin
-                    ),
+                    endpoint: format!("{}.{}.{}", endpoint.board, connector, endpoint.pin),
                 }),
             (Some(_), None) => Err(SystemError::UnknownEndpoint {
                 endpoint: format!("{}.{}", endpoint.board, endpoint.pin),
@@ -659,11 +655,10 @@ impl System {
         board_index: &HashMap<String, usize>,
         net_of_pin: &HashMap<(usize, PinRef), usize>,
     ) -> Result<usize, SystemError> {
-        let (bi, pin) = split_board_pin(endpoint, board_index).ok_or_else(|| {
-            SystemError::UnknownEndpoint {
+        let (bi, pin) =
+            split_board_pin(endpoint, board_index).ok_or_else(|| SystemError::UnknownEndpoint {
                 endpoint: endpoint.to_string(),
-            }
-        })?;
+            })?;
         net_of_pin
             .get(&(bi, pin))
             .copied()
@@ -693,8 +688,14 @@ impl System {
         detached: &HashSet<(usize, PinRef)>,
         resolver: &mut Resolver,
     ) {
-        let a_key = (bi, PinRef::new(record.reference.clone(), record.pins[0].clone()));
-        let b_key = (bi, PinRef::new(record.reference.clone(), record.pins[1].clone()));
+        let a_key = (
+            bi,
+            PinRef::new(record.reference.clone(), record.pins[0].clone()),
+        );
+        let b_key = (
+            bi,
+            PinRef::new(record.reference.clone(), record.pins[1].clone()),
+        );
         if detached.contains(&a_key) || detached.contains(&b_key) {
             return;
         }
@@ -894,10 +895,14 @@ impl Resolver {
         // for state projection).
         let mut direct_volts: HashMap<usize, Volts> = HashMap::new();
         for (net, volts) in &power_sources {
-            direct_volts.entry(self.identity.find(*net)).or_insert(*volts);
+            direct_volts
+                .entry(self.identity.find(*net))
+                .or_insert(*volts);
         }
         for (net, volts) in &stuck_sources {
-            direct_volts.entry(self.identity.find(*net)).or_insert(*volts);
+            direct_volts
+                .entry(self.identity.find(*net))
+                .or_insert(*volts);
         }
 
         // Assign states.

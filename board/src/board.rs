@@ -134,16 +134,12 @@ impl Board {
             let class = match registry.classify(decl, netlist_pins.len()) {
                 Ok(Classification::Ignored) => continue,
                 Ok(Classification::Boundary) => PartClass::Boundary,
-                Ok(Classification::Jumper { default, .. }) => {
-                    PartClass::Jumper { state: default }
-                }
-                Ok(Classification::Passive { kind, value }) => {
-                    PartClass::Passive { kind, value }
-                }
+                Ok(Classification::Jumper { default, .. }) => PartClass::Jumper { state: default },
+                Ok(Classification::Passive { kind, value }) => PartClass::Passive { kind, value },
                 Ok(Classification::Registered) => {
-                    let mut component = registry.construct(decl).expect(
-                        "classify() returned Registered, so construct() must succeed",
-                    );
+                    let mut component = registry
+                        .construct(decl)
+                        .expect("classify() returned Registered, so construct() must succeed");
                     let pins = component.pins().to_vec();
                     validate_facade(&decl.reference, &pins, &netlist_pins)?;
                     let pins_snapshot = pins.clone();
