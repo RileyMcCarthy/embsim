@@ -4,6 +4,27 @@
 //! `set_voltage()` callback, converts to ADC counts, and sends conversion
 //! data to firmware over a serial pipe when in continuous mode.
 //!
+//! # Datasheet provenance
+//!
+//! Modeled against **TI SBAS752B (May 2017, revised Oct 2018)** — the
+//! ADS122U04 datasheet; section/page citations below are to that revision.
+//! Governing sections: §8.5.1 UART interface (p.34), §8.5.2 data format
+//! (p.35), §8.5.3 commands (p.36–37), §8.5.4 data read modes (p.37),
+//! §8.6 register map (p.40–46).
+//!
+//! ## Deliberate simplifications (byte-pipe fidelity)
+//!
+//! - No baud-rate auto-detection (§8.5.1.4): the transport is a byte pipe,
+//!   so sync-word timing measurement has nothing to measure. The sync byte
+//!   itself IS required before every command, as the datasheet specifies.
+//! - No interface idle timeout (§8.5.1.5, ~32760·t_MOD): a real host that
+//!   stalls mid-command resets the interface; the model waits forever.
+//! - No td(RSRX) post-RESET delay enforcement (§8.5.3.1).
+//! - Config registers are stored/read back faithfully, but only DR/MODE
+//!   (reg 1, conversion pacing) and AUTO (reg 3 bit 0, data read mode) are
+//!   functionally interpreted; MUX/GAIN/VREF live in `Config` at build
+//!   time, and DCNT/CRC/BCS output framing modes (§8.6.2.3) are unmodeled.
+//!
 //! The ADC has no concept of force or sensors — it only knows voltage.
 //! Upstream models (e.g., strain gauge) provide voltage updates via callback.
 //!
@@ -22,11 +43,18 @@ use tracing::{debug, info, trace, warn};
 // ADS122U04 Protocol Constants
 // ============================================================
 
+/// Synchronization word — must precede every command (SBAS752B §8.5.1.4,
+/// p.34: "The host must always transmit the synchronization word first").
 const SYNC_BYTE: u8 = 0x55;
+/// RESET = `0000 011x` (SBAS752B §8.5.3 Table 15, p.36).
 const CMD_RESET: u8 = 0x06;
+/// START/SYNC = `0000 100x` (SBAS752B §8.5.3 Table 15, p.36).
 const CMD_START: u8 = 0x08;
+/// POWERDOWN = `0000 001x` (SBAS752B §8.5.3 Table 15, p.36).
 const CMD_POWERDOWN: u8 = 0x02;
 
+/// Five 8-bit configuration registers, 00h–04h (SBAS752B §8.6.1 Table 16,
+/// p.40).
 const REGISTER_COUNT: usize = 5;
 
 /// Index of CONFIG1 — encodes data-rate (bits 7:5) and operating mode (bit 4).
@@ -43,11 +71,12 @@ const ADC_MAX_CODE: f64 = 8_388_608.0; // 2^23
 
 /// Compute the conversion interval (virtual µs) from the contents of CONFIG1.
 ///
-/// CONFIG1 bit layout (per ADS122U04 datasheet):
-///   [7:5] DR   — data rate (000=20 SPS … 110=1000 SPS)
-///   [4]   MODE — 0 = normal, 1 = turbo (doubles the rate)
+/// CONFIG1 bit layout (SBAS752B §8.6.2.2 Fig. 70, p.42):
+///   [7:5] DR   — data rate (Table 20, p.42: 000=20 SPS … 110=1000 SPS)
+///   [4]   MODE — 0 = normal, 1 = turbo (512-kHz modulator, doubles the rate)
 ///
-/// Reserved DR codes (111) fall back to the fastest configured rate.
+/// Reserved DR code (111) falls back to the fastest configured rate
+/// (datasheet marks it Reserved; the fallback is a documented model choice).
 fn conversion_interval_us(reg_config1: u8) -> u64 {
     let dr = (reg_config1 >> 5) & 0b111;
     let turbo = ((reg_config1 >> 4) & 0b1) == 1;
@@ -139,9 +168,19 @@ impl Ads122u04 {
     }
 
     /// Convert input voltage (mV) to ADC counts.
+    ///
+    /// Transfer function per SBAS752B §8.5.2 (p.35, Eq. 8):
+    /// `1 LSB = (2 · VREF / Gain) / 2^24`, i.e. `code = VIN · Gain · 2^23 /
+    /// VREF`. Signals beyond full scale **clip** at 7FFFFFh / 800000h
+    /// (§8.5.2: "The output clips at these codes for signals that exceed
+    /// full-scale") — clipping applies after the configured zero offset so
+    /// the emitted 24-bit word can never wrap.
     fn voltage_to_adc(&self, voltage_mv: f64) -> i32 {
+        const CODE_MAX: i64 = 0x7F_FFFF; // +FS − 1 LSB (7FFFFFh)
+        const CODE_MIN: i64 = -0x80_0000; // −FS (800000h)
         let code = (voltage_mv * self.config.gain * ADC_MAX_CODE) / self.config.vref_mv;
-        (code as i32) + self.config.zero_offset
+        let with_offset = (code as i64) + i64::from(self.config.zero_offset);
+        with_offset.clamp(CODE_MIN, CODE_MAX) as i32
     }
 }
 
@@ -213,7 +252,10 @@ fn protocol_loop(adc: &Ads122u04) {
         }
 
         // Send unprompted conversion data only in automatic data read mode
-        // (CONFIG3 bit 0); in manual mode results are fetched with RDATA.
+        // (CONFIG3 bit 0 = AUTO, §8.6.2.4 Table 16 p.40; §8.5.4 p.37: "the
+        // ADS122U04 automatically outputs conversion data … as soon as a
+        // conversion completes"); in manual mode results are fetched with
+        // RDATA.
         // The conversion interval is derived from CONFIG1 (DR bits + Turbo
         // flag) so the model honors whatever rate the firmware configured.
         let auto_mode = (adc.registers.lock().unwrap()[REG_CONFIG3] & 0x01) != 0;
@@ -263,15 +305,23 @@ fn process_byte(
             let command = byte;
 
             if command == CMD_RESET {
+                // §8.5.3.1 (p.36) + §8.6.1 (p.40): reset restores default
+                // register values (all 0) and, per the §8.4 flow chart
+                // (p.31), returns the device to the non-converting state.
                 debug!("ADS122U04: RESET");
                 *continuous = false;
                 *adc.registers.lock().unwrap() = [0u8; REGISTER_COUNT];
                 ParseState::WaitSync
             } else if command == CMD_START {
+                // §8.5.3.2 (p.36): in continuous conversion mode START is
+                // issued once to start converting continuously. (Digital-
+                // filter restart on repeated START is not modeled.)
                 debug!("ADS122U04: START (continuous mode)");
                 *continuous = true;
                 ParseState::WaitSync
             } else if command == CMD_POWERDOWN {
+                // §8.5.3.3 (p.36): power-down stops conversions but holds
+                // all register values.
                 debug!("ADS122U04: POWERDOWN");
                 *continuous = false;
                 ParseState::WaitSync
@@ -280,14 +330,17 @@ fn process_byte(
                 let register = ((command >> 1) & 0x0F) as usize;
 
                 if upper_nibble == 0b0001 {
-                    // RDATA — transmit the most recent conversion result now.
-                    // This is the manual data read mode fetch: request/response
-                    // framing, so the host's byte alignment is deterministic.
+                    // RDATA = `0001 xxxx` (§8.5.3 Table 15, p.36): "loads the
+                    // output shift register with the most recent conversion
+                    // result" (§8.5.3.4, p.36) — the manual data read mode
+                    // fetch (§8.5.4, p.37), request/response framed.
                     trace!("ADS122U04: RDATA");
                     send_conversion(adc, fd);
                     ParseState::WaitSync
                 } else if upper_nibble == 0b0010 {
-                    // RREG — read register
+                    // RREG = `0010 rrrx` (§8.5.3 Table 15, p.36): replies
+                    // one byte; a nonexistent register reads back 00h
+                    // (§8.5.3.5, p.37).
                     if register < REGISTER_COUNT {
                         let val = adc.registers.lock().unwrap()[register];
                         trace!("ADS122U04: RREG reg={} val=0x{:02x}", register, val);
@@ -298,7 +351,10 @@ fn process_byte(
                     }
                     ParseState::WaitSync
                 } else if upper_nibble == 0b0100 {
-                    // WREG — write register, need one more data byte
+                    // WREG = `0100 rrrx dddd dddd` (§8.5.3 Table 15, p.36):
+                    // one data byte follows; writes to a nonexistent register
+                    // are ignored (§8.5.3.6, p.37). (Digital-filter restart
+                    // on writes to regs 0–3 is not modeled.)
                     trace!("ADS122U04: WREG reg={} (waiting for data)", register);
                     ParseState::WaitWriteData { register }
                 } else {
@@ -318,6 +374,9 @@ fn process_byte(
 }
 
 /// Send a 3-byte ADC conversion value to firmware.
+/// Transmit one 24-bit conversion result, least significant byte first
+/// (§8.5.3.4 NOTE, p.36: "Data words are transmitted least significant byte
+/// first"; 24-bit two's complement per §8.5.2, p.35).
 fn send_conversion(adc: &Ads122u04, fd: RawFd) {
     let value = adc.adc_value.load(Ordering::Relaxed) as u32;
     let bytes = [
@@ -756,8 +815,9 @@ mod tests {
         assert_eq!(read_n(rd, 3), vec![0x56, 0x34, 0x12]);
     }
 
-    /// Only the low 24 bits are transmitted; the top byte of the 32-bit value is
-    /// dropped, and a negative `i32` is reinterpreted via its `u32` bit pattern.
+    /// Only the low 24 bits are transmitted on the wire (the value itself is
+    /// clipped to the 24-bit code range before it ever reaches here — see
+    /// `voltage_clips_at_full_scale`).
     #[test]
     fn send_conversion_truncates_to_24_bits() {
         let (adc, _fw) = make_adc(1.0, 0);
@@ -771,6 +831,24 @@ mod tests {
             vec![0xDD, 0xCC, 0xBB],
             "low 24 bits, little-endian; high byte 0xAA dropped"
         );
+    }
+
+    /// SBAS752B §8.5.2 (p.35): "A positive full-scale input … produces an
+    /// output code of 7FFFFFh and a negative full-scale input … 800000h. The
+    /// output clips at these codes for signals that exceed full-scale."
+    #[test]
+    fn voltage_clips_at_full_scale() {
+        // vref 2^21 mV, gain 1 → +FS input = vref → code 2^23 clips to 7FFFFFh.
+        let (adc, _fw) = make_adc(1.0, 0);
+        adc.set_voltage(3_000_000.0); // well beyond +FS
+        assert_eq!(adc.adc_value.load(Ordering::Relaxed), 0x7F_FFFF);
+        adc.set_voltage(-3_000_000.0); // well beyond −FS
+        assert_eq!(adc.adc_value.load(Ordering::Relaxed), -0x80_0000);
+
+        // A zero offset near the rail also clips instead of wrapping.
+        let (adc, _fw) = make_adc(1.0, 0x7F_FF00);
+        adc.set_voltage(1_000.0); // pushes past +FS via the offset
+        assert_eq!(adc.adc_value.load(Ordering::Relaxed), 0x7F_FFFF);
     }
 
     /// Zero packs to three zero bytes.
