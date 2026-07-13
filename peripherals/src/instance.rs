@@ -285,7 +285,8 @@ mod tests {
         /// Non-blocking read of up to `n` bytes; empty vec when nothing waits.
         fn read_far(&self, n: usize) -> Vec<u8> {
             let mut buf = vec![0u8; n];
-            match nix::unistd::read(self.b, &mut buf) {
+            let fd = unsafe { BorrowedFd::borrow_raw(self.b) };
+            match nix::unistd::read(fd, &mut buf) {
                 Ok(read) => {
                     buf.truncate(read);
                     buf

@@ -136,9 +136,9 @@ mod tests {
 
         // Zero-sized handle is Copy + Clone + Debug + Default.
         let copy = p;
-        let cloned = p.clone();
+        let cloned = p;
         assert_eq!(copy.max_cores(), cloned.max_cores());
-        assert!(!format!("{:?}", P2::default()).is_empty());
+        assert!(!format!("{:?}", P2).is_empty());
     }
 
     // ── GPIO trampolines ──

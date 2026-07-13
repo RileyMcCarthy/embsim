@@ -252,7 +252,7 @@ fn build_type_map(
     let mut map = HashMap::new();
     let mut entries = unit.entries();
 
-    while let Ok(Some((_, entry))) = entries.next_dfs() {
+    while let Ok(Some(entry)) = entries.next_dfs() {
         let offset = entry.offset();
 
         let dtype = match entry.tag() {
@@ -265,22 +265,16 @@ fn build_type_map(
             gimli::DW_TAG_pointer_type => Some(DwarfType::Pointer {
                 byte_size: entry
                     .attr_value(gimli::DW_AT_byte_size)
-                    .ok()
-                    .flatten()
                     .and_then(|v| attr_to_usize(&v))
                     .unwrap_or(pointer_size), // target pointer size when DWARF omits it
             }),
             gimli::DW_TAG_subroutine_type => Some(DwarfType::Opaque { byte_size: 8 }),
             gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type => {
                 // Qualifiers: follow through to the target type
-                if let Some(target) = get_type_ref(entry) {
-                    Some(DwarfType::Typedef {
-                        _name: String::new(),
-                        target,
-                    })
-                } else {
-                    None
-                }
+                get_type_ref(entry).map(|target| DwarfType::Typedef {
+                    _name: String::new(),
+                    target,
+                })
             }
             _ => None,
         };
@@ -294,8 +288,8 @@ fn build_type_map(
     // This ensures that when an array element references an anonymous struct,
     // it gets the typedef name (e.g., "dev_cogManager_channelData_S").
     let typedef_targets: Vec<(String, UnitOffset)> = map
-        .iter()
-        .filter_map(|(_, dt)| {
+        .values()
+        .filter_map(|dt| {
             if let DwarfType::Typedef { _name, target } = dt {
                 if !_name.is_empty() {
                     Some((_name.clone(), *target))
@@ -455,10 +449,10 @@ fn member_to_field(type_map: &HashMap<UnitOffset, DwarfType>, member: &MemberDef
 }
 
 /// Follow a type reference through typedefs to find the underlying DwarfType.
-fn follow_typedefs<'a>(
-    type_map: &'a HashMap<UnitOffset, DwarfType>,
+fn follow_typedefs(
+    type_map: &HashMap<UnitOffset, DwarfType>,
     offset: UnitOffset,
-) -> Option<(UnitOffset, &'a DwarfType)> {
+) -> Option<(UnitOffset, &DwarfType)> {
     let mut current = offset;
     for _ in 0..20 {
         match type_map.get(&current) {
@@ -485,7 +479,7 @@ fn extract_entries(
 ) -> Result<(), String> {
     let mut entries = unit.entries();
 
-    while let Ok(Some((_, entry))) = entries.next_dfs() {
+    while let Ok(Some(entry)) = entries.next_dfs() {
         match entry.tag() {
             gimli::DW_TAG_typedef => {
                 // Typedefs pointing to enums or structs give us the _E / _S names
@@ -600,21 +594,17 @@ fn extract_entries(
                 let type_info = resolve_type(type_map, type_offset);
 
                 // Get source file if available
-                let source_file = entry
-                    .attr_value(gimli::DW_AT_decl_file)
-                    .ok()
-                    .flatten()
-                    .and_then(|v| {
-                        if let AttributeValue::FileIndex(idx) = v {
-                            let lp = unit.line_program.as_ref()?;
-                            let header = lp.header();
-                            let file = header.file(idx)?;
-                            let name = dwarf.attr_string(unit, file.path_name()).ok()?;
-                            Some(name.to_string_lossy().ok()?.to_string())
-                        } else {
-                            None
-                        }
-                    });
+                let source_file = entry.attr_value(gimli::DW_AT_decl_file).and_then(|v| {
+                    if let AttributeValue::FileIndex(idx) = v {
+                        let lp = unit.line_program.as_ref()?;
+                        let header = lp.header();
+                        let file = header.file(idx)?;
+                        let name = dwarf.attr_string(unit, file.path_name()).ok()?;
+                        Some(name.to_string_lossy().ok()?.to_string())
+                    } else {
+                        None
+                    }
+                });
 
                 if !info.variables.contains_key(&name) {
                     info.variables.insert(
@@ -644,11 +634,8 @@ fn parse_base_type(
     entry: &DebuggingInformationEntry<GimliReader>,
 ) -> Option<DwarfType> {
     let name = get_name(dwarf, entry)?;
-    let byte_size = entry
-        .attr_value(gimli::DW_AT_byte_size)
-        .ok()??
-        .udata_value()? as usize;
-    let encoding = entry.attr_value(gimli::DW_AT_encoding).ok()??;
+    let byte_size = entry.attr_value(gimli::DW_AT_byte_size)?.udata_value()? as usize;
+    let encoding = entry.attr_value(gimli::DW_AT_encoding)?;
 
     // `float`/`double` (and `_Float*`/`long double`) carry DW_ATE_float. These
     // MUST be decoded with f32/f64::from_le_bytes — reading their bytes as an
@@ -673,10 +660,7 @@ fn parse_enumeration(
     unit: &Unit<GimliReader>,
     entry: &DebuggingInformationEntry<GimliReader>,
 ) -> Option<DwarfType> {
-    let byte_size = entry
-        .attr_value(gimli::DW_AT_byte_size)
-        .ok()??
-        .udata_value()? as usize;
+    let byte_size = entry.attr_value(gimli::DW_AT_byte_size)?.udata_value()? as usize;
 
     // Collect enumerator children
     let mut variants = Vec::new();
@@ -728,21 +712,15 @@ fn collect_members(
         // Union members have no DW_AT_data_member_location and sit at offset 0.
         let offset = child_entry
             .attr_value(gimli::DW_AT_data_member_location)
-            .ok()
-            .flatten()
             .and_then(|v| attr_to_usize(&v))
             .unwrap_or(0);
         let type_offset = get_type_ref(child_entry).unwrap_or(UnitOffset(0));
         let bit_size = child_entry
             .attr_value(gimli::DW_AT_bit_size)
-            .ok()
-            .flatten()
             .and_then(|v| attr_to_usize(&v))
             .map(|n| n as u64);
         let data_bit_offset = child_entry
             .attr_value(gimli::DW_AT_data_bit_offset)
-            .ok()
-            .flatten()
             .and_then(|v| attr_to_usize(&v))
             .map(|n| n as u64);
         fields.push(MemberDef {
@@ -763,8 +741,6 @@ fn parse_structure(
 ) -> Option<DwarfType> {
     let byte_size = entry
         .attr_value(gimli::DW_AT_byte_size)
-        .ok()
-        .flatten()
         .and_then(|v| attr_to_usize(&v))
         .unwrap_or(0);
 
@@ -782,8 +758,6 @@ fn parse_union(
 ) -> Option<DwarfType> {
     let byte_size = entry
         .attr_value(gimli::DW_AT_byte_size)
-        .ok()
-        .flatten()
         .and_then(|v| attr_to_usize(&v))
         .unwrap_or(0);
 
@@ -811,15 +785,11 @@ fn parse_array(
                     // Try DW_AT_count first, then DW_AT_upper_bound
                     if let Some(c) = child_entry
                         .attr_value(gimli::DW_AT_count)
-                        .ok()
-                        .flatten()
                         .and_then(|v| attr_to_usize(&v))
                     {
                         count = c;
                     } else if let Some(ub) = child_entry
                         .attr_value(gimli::DW_AT_upper_bound)
-                        .ok()
-                        .flatten()
                         .and_then(|v| attr_to_usize(&v))
                     {
                         count = ub + 1; // upper_bound is inclusive
@@ -855,7 +825,7 @@ fn get_name(
     dwarf: &Dwarf<GimliReader>,
     entry: &DebuggingInformationEntry<GimliReader>,
 ) -> Option<String> {
-    let attr = entry.attr_value(gimli::DW_AT_name).ok()??;
+    let attr = entry.attr_value(gimli::DW_AT_name)?;
     match attr {
         AttributeValue::DebugStrRef(offset) => {
             let s = dwarf.debug_str.get_str(offset).ok()?;
@@ -867,7 +837,7 @@ fn get_name(
 }
 
 fn get_type_ref(entry: &DebuggingInformationEntry<GimliReader>) -> Option<UnitOffset> {
-    let attr = entry.attr_value(gimli::DW_AT_type).ok()??;
+    let attr = entry.attr_value(gimli::DW_AT_type)?;
     match attr {
         AttributeValue::UnitRef(offset) => Some(offset),
         _ => None,
@@ -875,7 +845,7 @@ fn get_type_ref(entry: &DebuggingInformationEntry<GimliReader>) -> Option<UnitOf
 }
 
 fn get_const_value(entry: &DebuggingInformationEntry<GimliReader>) -> Option<i64> {
-    let attr = entry.attr_value(gimli::DW_AT_const_value).ok()??;
+    let attr = entry.attr_value(gimli::DW_AT_const_value)?;
     match attr {
         AttributeValue::Sdata(v) => Some(v),
         AttributeValue::Udata(v) => Some(v as i64),

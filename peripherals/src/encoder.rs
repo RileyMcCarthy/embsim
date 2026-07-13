@@ -22,6 +22,11 @@ pub struct Encoder {
 impl Encoder {
     /// Create a bank with no channels configured, all counters at zero.
     pub const fn new() -> Self {
+        // justification: this `const` is never read as a value; it only seeds
+        // the `[INIT; N]` array-repeat initializer for the field below.
+        // Array-repeat syntax *requires* a `const`, and no interior mutability
+        // is ever observed through the const itself.
+        #[allow(clippy::declare_interior_mutable_const)]
         const VALUE_INIT: AtomicI32 = AtomicI32::new(0);
         Self {
             count: AtomicUsize::new(0),

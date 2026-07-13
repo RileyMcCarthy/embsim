@@ -45,12 +45,10 @@ HAL_GPIO_channel_E g_sel = HAL_GPIO_B;
 /// Returns the first available C compiler binary name, or `None`. `clang`
 /// first — the parser targets clang-emitted DWARF, and on Linux `cc` is gcc.
 fn find_compiler() -> Option<&'static str> {
-    for cc in ["clang", "cc", "gcc"] {
-        if Command::new(cc).arg("--version").output().is_ok() {
-            return Some(cc);
-        }
-    }
-    None
+    ["clang", "cc", "gcc"]
+        .into_iter()
+        .find(|&cc| Command::new(cc).arg("--version").output().is_ok())
+        .map(|v| v as _)
 }
 
 /// Create a unique temp dir under the OS temp dir, namespaced by `tag` + pid +

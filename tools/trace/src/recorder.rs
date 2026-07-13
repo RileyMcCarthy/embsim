@@ -390,7 +390,7 @@ fn poll_loop(fw: &FirmwareInfo) {
         if let Some(resolver) = &resolver {
             for watch in c_watches() {
                 let value: Option<f64> =
-                    unsafe { resolver.read_field_as_f64(&fw, &watch.var_name, &watch.field_path) };
+                    unsafe { resolver.read_field_as_f64(fw, &watch.var_name, &watch.field_path) };
                 if let Some(v) = value {
                     record(&watch.signal_name, v);
                 }
@@ -766,7 +766,7 @@ mod tests {
         // record() never touches the ring, so there is nothing new to read.
         let (data, _cur) = read_new_samples(&["a".to_string()], &HashMap::new());
         assert!(
-            data.get("a").is_none(),
+            !data.contains_key("a"),
             "record must not append to the ring"
         );
     }
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(cursors1.get("a"), Some(&2));
         // Second read with the returned cursors yields nothing new.
         let (data2, cursors2) = read_new_samples(&["a".to_string()], &cursors1);
-        assert!(data2.get("a").is_none(), "no new samples since last cursor");
+        assert!(!data2.contains_key("a"), "no new samples since last cursor");
         assert_eq!(cursors2.get("a"), Some(&2), "cursor stays put");
     }
 
@@ -913,7 +913,7 @@ mod tests {
         // Subscribing to an unknown name yields no entry and no cursor.
         let (data, cursors) = read_new_samples(&["nope".to_string()], &HashMap::new());
         assert!(data.is_empty());
-        assert!(cursors.get("nope").is_none());
+        assert!(!cursors.contains_key("nope"));
     }
 
     // ── poll interval clamp ──
@@ -1030,6 +1030,7 @@ mod tests {
     ///   - char            → EXCLUDED
     ///   - char[8] array   → EXCLUDED (is_char_type element)
     ///   - int[4] array    → INCLUDED (numeric, count <= 16)
+    ///
     /// Plus a leading-underscore variable that must be skipped entirely.
     fn sample_fw() -> FirmwareInfo {
         let mut fw = FirmwareInfo::new();

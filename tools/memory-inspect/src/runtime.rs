@@ -241,7 +241,7 @@ impl SymbolResolver {
                             let size = field_type.byte_size();
                             let bytes =
                                 self.read_bytes(var_name, base_offset + field_offset, size)?;
-                            return Self::bytes_to_f64(&field_type, &bytes, var_name, field_path);
+                            return Self::bytes_to_f64(field_type, &bytes, var_name, field_path);
                         }
                         _ => return None,
                     }
@@ -264,7 +264,7 @@ impl SymbolResolver {
 
         let bytes = self.read_bytes(var_name, offset, size)?;
 
-        Self::bytes_to_f64(&field_type, &bytes, var_name, field_path)
+        Self::bytes_to_f64(field_type, &bytes, var_name, field_path)
     }
 
     /// Parse a leading `[N]` from a field path, returning (index, rest).
@@ -538,7 +538,7 @@ mod tests {
                 1 => (val as i8).to_le_bytes().to_vec(),
                 2 => (val as i16).to_le_bytes().to_vec(),
                 4 => (val as i32).to_le_bytes().to_vec(),
-                8 => (val as i64).to_le_bytes().to_vec(),
+                8 => { val }.to_le_bytes().to_vec(),
                 _ => unreachable!(),
             };
             let ti = TypeInfo::Base {
@@ -565,7 +565,7 @@ mod tests {
                 1 => (val as u8).to_le_bytes().to_vec(),
                 2 => (val as u16).to_le_bytes().to_vec(),
                 4 => (val as u32).to_le_bytes().to_vec(),
-                8 => (val as u64).to_le_bytes().to_vec(),
+                8 => { val }.to_le_bytes().to_vec(),
                 _ => unreachable!(),
             };
             let ti = TypeInfo::Base {

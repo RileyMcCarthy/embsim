@@ -44,6 +44,11 @@ pub struct LockPool {
 impl LockPool {
     /// Create a pool with all [`MAX_LOCKS`] slots available and none allocated.
     pub fn new() -> Self {
+        // justification: this `const` is never read as a value; it only seeds
+        // the `[INIT; N]` array-repeat initializer for the field below.
+        // Array-repeat syntax *requires* a `const`, and no interior mutability
+        // is ever observed through the const itself.
+        #[allow(clippy::declare_interior_mutable_const)]
         const LOCK_INIT: Mutex<()> = Mutex::new(());
         Self {
             id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),

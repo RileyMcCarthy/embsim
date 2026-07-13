@@ -80,12 +80,21 @@ const PULSE_STATE_INIT: PulseState = PulseState {
     emitted_base: 0,
 };
 
+/// One optional per-channel callback fired when a pulse train starts,
+/// carrying `(total_pulses, frequency)`.
+type StartCallback = Option<Box<dyn Fn(u32, u32) + Send>>;
+/// One optional per-channel callback fired when a pulse train stops.
+type StopCallback = Option<Box<dyn Fn() + Send>>;
+/// One optional per-channel callback fired on progress, carrying the
+/// cumulative emitted-pulse count.
+type ProgressCallback = Option<Box<dyn Fn(u32) + Send>>;
+
 /// Pulse-output channel bank for one MCU instance.
 pub struct PulseOut {
     count: AtomicUsize,
-    start_callbacks: Mutex<Vec<Option<Box<dyn Fn(u32, u32) + Send>>>>,
-    stop_callbacks: Mutex<Vec<Option<Box<dyn Fn() + Send>>>>,
-    progress_callbacks: Mutex<Vec<Option<Box<dyn Fn(u32) + Send>>>>,
+    start_callbacks: Mutex<Vec<StartCallback>>,
+    stop_callbacks: Mutex<Vec<StopCallback>>,
+    progress_callbacks: Mutex<Vec<ProgressCallback>>,
     state: Mutex<[PulseState; MAX_CHANNELS]>,
 }
 

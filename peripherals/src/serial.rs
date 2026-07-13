@@ -40,8 +40,15 @@ pub struct Serial {
 impl Serial {
     /// Create a bank with no channels configured and nothing connected.
     pub const fn new() -> Self {
+        // justification: these `const`s are never read as values; they only
+        // seed the `[INIT; N]` array-repeat initializers for the fields below.
+        // Array-repeat syntax *requires* a `const`, and no interior mutability
+        // is ever observed through the consts themselves.
+        #[allow(clippy::declare_interior_mutable_const)]
         const FD_INIT: AtomicI32 = AtomicI32::new(-1);
+        #[allow(clippy::declare_interior_mutable_const)]
         const U32_INIT: AtomicU32 = AtomicU32::new(0);
+        #[allow(clippy::declare_interior_mutable_const)]
         const U64_INIT: AtomicU64 = AtomicU64::new(0);
         Self {
             bits_per_byte: AtomicU64::new(10),
@@ -262,8 +269,11 @@ impl Serial {
         let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wall_us);
         let mut total_read = 0;
 
+        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
+        // the duration of this call (borrow does not outlive it).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         while total_read < buf.len() {
-            match nix::unistd::read(fd, &mut buf[total_read..]) {
+            match nix::unistd::read(borrowed, &mut buf[total_read..]) {
                 Ok(0) => break,
                 Ok(n) => {
                     total_read += n;
@@ -304,7 +314,10 @@ impl Serial {
             return 0;
         }
 
-        match nix::unistd::read(fd, buf) {
+        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
+        // the duration of this call (borrow does not outlive it).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match nix::unistd::read(borrowed, buf) {
             Ok(n) if n > 0 => {
                 // Throttle consumption to virtual baud (no-op when unpaced).
                 self.pace_rx(channel, n);
@@ -328,7 +341,10 @@ impl Serial {
         }
 
         let mut byte = [0u8; 1];
-        match nix::unistd::read(fd, &mut byte) {
+        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
+        // the duration of this call (borrow does not outlive it).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match nix::unistd::read(borrowed, &mut byte) {
             Ok(1) => {
                 // Throttle consumption to virtual baud (no-op when unpaced).
                 self.pace_rx(channel, 1);
@@ -472,7 +488,8 @@ mod tests {
         /// once the writer's `write` returns, so the data cases never race.)
         fn read_far(&self, n: usize) -> Vec<u8> {
             let mut buf = vec![0u8; n];
-            match nix::unistd::read(self.b, &mut buf) {
+            let fd = unsafe { BorrowedFd::borrow_raw(self.b) };
+            match nix::unistd::read(fd, &mut buf) {
                 Ok(read) => {
                     buf.truncate(read);
                     buf

@@ -12,6 +12,9 @@ use tracing::trace;
 /// Maximum GPIO channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 64;
 
+/// One optional per-channel change callback, invoked with the new level.
+type ChangeCallback = Option<Box<dyn Fn(bool) + Send>>;
+
 /// GPIO channel bank for one MCU instance.
 pub struct Gpio {
     /// Configured channel count (set at init, default 0).
@@ -20,7 +23,7 @@ pub struct Gpio {
     state: [AtomicBool; MAX_CHANNELS],
     /// Per-channel change callbacks — fired when firmware writes a channel.
     /// Uses `Vec` instead of array since `Box<dyn Fn>` is not const-initializable.
-    callbacks: Mutex<Vec<Option<Box<dyn Fn(bool) + Send>>>>,
+    callbacks: Mutex<Vec<ChangeCallback>>,
     /// Optional channel names for logging (set at init).
     names: Mutex<Option<&'static [&'static str]>>,
 }
@@ -28,6 +31,11 @@ pub struct Gpio {
 impl Gpio {
     /// Create a bank with no channels configured, all lines low.
     pub const fn new() -> Self {
+        // justification: this `const` is never read as a value; it only seeds
+        // the `[INIT; N]` array-repeat initializer for the field below.
+        // Array-repeat syntax *requires* a `const`, and no interior mutability
+        // is ever observed through the const itself.
+        #[allow(clippy::declare_interior_mutable_const)]
         const STATE_INIT: AtomicBool = AtomicBool::new(false);
         Self {
             count: AtomicUsize::new(0),

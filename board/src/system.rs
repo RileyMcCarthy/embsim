@@ -906,7 +906,7 @@ impl Resolver {
         }
 
         // Assign states.
-        for i in 0..nets.len() {
+        for (i, net) in nets.iter_mut().enumerate() {
             let root = self.identity.find(i);
             let cluster = conduction.find(root);
 
@@ -940,7 +940,7 @@ impl Resolver {
             } else {
                 NetState::Floating
             };
-            nets[i].state = state;
+            net.state = state;
         }
 
         // Contention findings (per identity root, deduped).
