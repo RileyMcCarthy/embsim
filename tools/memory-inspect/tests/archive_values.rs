@@ -98,7 +98,11 @@ fn compile_object(
     let mut args: Vec<&str> = flags.to_vec();
     let c = c_path.to_str()?;
     let o = o_path.to_str()?;
-    args.extend_from_slice(&["-c", c, "-o", o]);
+    // The reader's documented contract requires real definitions (tentative
+    // definitions become unindexable common symbols). Modern compilers make
+    // -fno-common the default, but the fixture pins it so the tests don't
+    // depend on the host toolchain's default (older Apple clang differs).
+    args.extend_from_slice(&["-fno-common", "-c", c, "-o", o]);
     let compiled = Command::new(cc)
         .args(&args)
         .output()
