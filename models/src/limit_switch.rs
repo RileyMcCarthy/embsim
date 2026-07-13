@@ -4,6 +4,21 @@
 //! Fires callbacks only on state transitions (edge-triggered).
 //! Thresholds are configurable via `Config`.
 //!
+//! # Provenance (mechanism model — no datasheet)
+//!
+//! An ideal position comparator: the switch asserts exactly when the
+//! carriage crosses the configured threshold, matching how a physical
+//! end-of-travel switch closes at a fixed actuation point. Contact bounce,
+//! actuation hysteresis (a real switch releases at a different point than
+//! it operates), and repeatability tolerance are not modeled — the
+//! edge-triggered callback delivers one clean transition per crossing.
+//! Electrical polarity (active-low wiring, pull-ups) is the consumer's
+//! concern: the system description maps `true` to whatever level its GPIO
+//! channel expects.
+//!
+//! Parameter sources: thresholds come from the consuming system
+//! description (rig geometry), not from a part constant.
+//!
 //! Has no knowledge of GPIO or any MCU peripheral.
 
 use crate::edge::EdgeDetector;
