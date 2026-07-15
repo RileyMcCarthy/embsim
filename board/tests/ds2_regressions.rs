@@ -7,8 +7,9 @@
 //! hardware exhibited.
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Diagnostics, EndpointRef, Finding, Harness,
-    JumperState, PartRegistry, PinDecl, PinKind, Scenario, SenseKind, StreamRole, System,
+    AttachError, Board, Component, ComponentNetIo, Diagnostics, DnpState, EndpointRef, Finding,
+    Harness, JumperState, NetState, PartRegistry, PinDecl, PinKind, Scenario, SenseKind,
+    StreamRole, System,
 };
 
 // ============================================================
@@ -282,4 +283,94 @@ fn pin_short_and_net_stuck_model_the_reset_bodge() {
         "DS2Addon.~RESET",
         SenseKind::Digital
     ));
+}
+
+// ============================================================
+// Fault algebra: net_stuck fighting the powered rail
+// ============================================================
+
+/// An injected short-to-ground on the powered digital rail is two
+/// disagreeing ideal sources on one net. It must be observable —
+/// `Contention` plus a finding — never a silent first-source-wins 3.3 V
+/// projection under which the injected fault has zero effect anywhere.
+#[test]
+fn net_stuck_fighting_the_powered_rail_is_observable() {
+    let system = System::new()
+        .board("DS2Addon", ds2_board())
+        .harness(powered_bench_harness())
+        .scenario(Scenario::default().net_stuck("DS2Addon.+3V3", 0.0))
+        .build()
+        .expect("system builds");
+    let rail = system
+        .nets()
+        .iter()
+        .find(|n| n.name == "DS2Addon.+3V3")
+        .expect("rail net exists");
+    assert_eq!(
+        rail.state,
+        NetState::Contention,
+        "a stuck-at-0 on the 3.3 V rail must contend, not vanish"
+    );
+    assert!(
+        system
+            .diagnostics()
+            .findings()
+            .iter()
+            .any(|f| matches!(f, Finding::Contention { net, .. } if net == "DS2Addon.+3V3")),
+        "the short must raise a finding; got {:?}",
+        system.diagnostics().findings()
+    );
+}
+
+// ============================================================
+// Bridge-fed analog inputs through the MNA (no push-pull driver)
+// ============================================================
+
+/// The board's measurement path: the external bridge presents its output at
+/// the J2 terminals and reaches AIN0/AIN1 through the scenario-populated
+/// 4.7 kΩ filter resistors — a sourced passive network with **no push-pull
+/// driver anywhere**. The analog inputs must resolve through the cluster
+/// solver to the solved node voltage, never the `Pulled` upper-bound
+/// fallback. Shorting the ADC input pair (fault algebra) then turns the two
+/// filter legs into a genuine two-source divider: the MNA reports the
+/// 1.65 V midpoint.
+#[test]
+fn bridge_fed_analog_inputs_solve_through_the_mna() {
+    let bridge_fed = powered_bench_harness()
+        .power(ep("BENCH.A0"), ep("DS2Addon.J2.3"), 3.3)
+        .power(ep("BENCH.A1"), ep("DS2Addon.J2.4"), 0.0);
+    let populated_filters = Scenario::default()
+        .dnp_override("DS2Addon.R6", DnpState::Populated)
+        .value_override("DS2Addon.R6", "4k7")
+        .dnp_override("DS2Addon.R7", DnpState::Populated)
+        .value_override("DS2Addon.R7", "4k7");
+
+    // Live path: the engine publishes the MNA-solved node voltage.
+    let system = System::new()
+        .board("DS2Addon", ds2_board())
+        .harness(bridge_fed.clone())
+        .scenario(populated_filters.clone())
+        .start()
+        .expect("system starts");
+    let ain0 = system.net_state("DS2Addon.AIN0").expect("net exists");
+    let NetState::Analog(v) = ain0 else {
+        panic!("AIN0 must solve numerically, got {ain0:?}");
+    };
+    assert!(
+        (v - 3.3).abs() < 1e-6,
+        "unloaded filter passes the terminal voltage; got {v}"
+    );
+    system.shutdown();
+
+    let system = System::new()
+        .board("DS2Addon", ds2_board())
+        .harness(bridge_fed)
+        .scenario(populated_filters.pin_short("DS2Addon.U1.11", "DS2Addon.U1.10"))
+        .start()
+        .expect("system starts");
+    let ain = system.net_state("DS2Addon.AIN0").expect("net exists");
+    let NetState::Analog(v) = ain else {
+        panic!("shorted AIN pair must solve numerically, got {ain:?}");
+    };
+    assert!((v - 1.65).abs() < 1e-6, "hand check 1.65 V, got {v}");
 }

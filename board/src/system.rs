@@ -14,17 +14,28 @@
 //! **No implicit net-name merging across boards** — two boards both naming a
 //! net `GND` share nothing until a harness connects them, grounds included.
 //!
-//! Slice status: the builder surface, harness/scenario types, and the fault
-//! algebra are final; `System::build` (the full build-time resolution pass
-//! producing [`crate::diagnostics::Finding`]s) is the system slice.
+//! Two terminal operations share one assembly (and one resolution code path,
+//! the crate-internal `engine::Resolver` — build-time analysis and live
+//! resolution can never fork semantics):
+//!
+//! - [`System::build`] — the build-time analysis pass: resolve once, report
+//!   findings, validate every component facade, then drop the components.
+//! - [`System::start`] — the live path: spawn the single-writer net-engine
+//!   thread, attach components with engine-wired I/O handles, and return a
+//!   [`SystemHandle`] that owns both (clean engine shutdown on drop).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use crate::board::{Board, BoardError, PartClass};
-use crate::component::{ComponentNetIo, PinDecl, PinHandle, PinKind};
-use crate::diagnostics::{Diagnostics, Finding, SenseKind};
-use crate::net::{Level, Net, NetId, NetState, PinRef, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
+use crate::cluster::QuasiStaticMna;
+use crate::component::{Component, ComponentNetIo, PinDecl, PinHandle, PinKind, StreamRole};
+use crate::diagnostics::{Diagnostics, Finding};
+use crate::engine::{
+    ComponentId, Dsu, EndpointId, EngineHandle, EngineLink, Resolver, DEFAULT_HIGH_LEVEL_VOLTS,
+};
+use crate::net::{Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
 
 // ============================================================
@@ -298,6 +309,35 @@ pub struct System {
     scenario: Scenario,
 }
 
+/// One registered component prepared for attach: its wiring (per-pin net +
+/// drive endpoint) resolved against the merged system net table.
+struct PreparedComponent {
+    board: String,
+    reference: String,
+    component: Box<dyn Component>,
+    pins: Vec<PreparedPin>,
+}
+
+/// One prepared pin: every identity it answers to, its global net, its
+/// drive endpoint (when the pin can drive and is not detached), and its
+/// declared serial-stream role (for the stream I/O surface).
+struct PreparedPin {
+    number: String,
+    name: Option<String>,
+    net: usize,
+    endpoint: Option<EndpointId>,
+    stream: Option<StreamRole>,
+}
+
+/// Output of the shared assembly pass: the merged net table, the populated
+/// resolver (one code path for build-time analysis and live resolution),
+/// and the components ready to attach.
+struct Assembly {
+    nets: Vec<Net>,
+    resolver: Resolver,
+    components: Vec<PreparedComponent>,
+}
+
 impl System {
     /// Empty system.
     pub fn new() -> Self {
@@ -326,8 +366,111 @@ impl System {
     /// (jumpers, BOM overrides, fault algebra), then run the **full
     /// build-time resolution pass** so never-driven nets are reported
     /// `Floating` (and unsourced power nets `PowerNetUnsourced`, …) to their
-    /// sensing components immediately, before any traffic.
-    pub fn build(mut self) -> Result<BuiltSystem, SystemError> {
+    /// sensing components immediately, before any traffic. Components are
+    /// attached with inert I/O handles for facade validation and dropped —
+    /// use [`System::start`] to keep them running against the live engine.
+    pub fn build(self) -> Result<BuiltSystem, SystemError> {
+        let Assembly {
+            mut nets,
+            mut resolver,
+            components,
+        } = self.assemble()?;
+
+        let mut diagnostics = Diagnostics::new();
+        resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
+        // Stream routing runs at build too: byte pipes are derived from and
+        // gated by net resolution, and the routing findings
+        // (`StreamMismatch`) are build-time analysis output. The derived
+        // routes themselves only come alive on the `System::start` path.
+        let _ = resolver.route_streams(&nets, &mut diagnostics);
+
+        // Inert attach: sense() reads this build-resolved snapshot; drives
+        // and schedules are traced and dropped.
+        let states: Arc<Mutex<Vec<NetState>>> =
+            Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
+        let link = EngineLink::inert(states);
+        for mut prepared in components {
+            let io =
+                ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone());
+            prepared
+                .component
+                .attach(io)
+                .map_err(|error| SystemError::Board {
+                    name: prepared.board.clone(),
+                    error: BoardError::Attach {
+                        reference: prepared.reference.clone(),
+                        error,
+                    },
+                })?;
+            // Build-time analysis slice: the component validated its facade
+            // and is dropped here; System::start keeps it.
+        }
+
+        Ok(BuiltSystem { nets, diagnostics })
+    }
+
+    /// Assemble the system and **start the live net engine**: the
+    /// single-writer engine thread takes ownership of all net state (initial
+    /// resolution pass included, so findings are populated before any
+    /// traffic), and every registered component attaches with an I/O handle
+    /// whose drives, sense subscriptions, and schedules route to the engine.
+    ///
+    /// The returned [`SystemHandle`] owns the components and the engine;
+    /// dropping it shuts the engine down cleanly (shutdown message + join —
+    /// see [`crate::engine`] for why joining cannot deadlock with in-flight
+    /// senses).
+    pub fn start(self) -> Result<SystemHandle, SystemError> {
+        let Assembly {
+            nets,
+            resolver,
+            components,
+        } = self.assemble()?;
+
+        let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
+        let engine = EngineHandle::spawn(resolver, nets, Box::new(QuasiStaticMna));
+        let link = engine.link();
+
+        let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
+        for (index, mut prepared) in components.into_iter().enumerate() {
+            let io = ComponentNetIo::wired(
+                handle_entries(&prepared.pins, &link),
+                Some(ComponentId(index)),
+                link.clone(),
+            );
+            if let Err(error) = prepared.component.attach(io) {
+                let error = SystemError::Board {
+                    name: prepared.board.clone(),
+                    error: BoardError::Attach {
+                        reference: prepared.reference.clone(),
+                        error,
+                    },
+                };
+                // The same drop order SystemHandle documents as
+                // load-bearing must hold on this path too: components
+                // (including the failing one — it may have registered
+                // callbacks or spawned protocol threads before erroring)
+                // must never be dropped while the engine thread is still
+                // delivering callbacks. Shut the engine down first.
+                attached.push((prepared.reference, prepared.component));
+                drop(engine);
+                drop(attached);
+                return Err(error);
+            }
+            attached.push((prepared.reference, prepared.component));
+        }
+
+        Ok(SystemHandle {
+            engine,
+            net_names,
+            components: attached,
+        })
+    }
+
+    /// The shared assembly pass: merge harness-connected nets, apply the
+    /// scenario, register every electrical descriptor with the resolver, and
+    /// prepare registered components for attach. `build` and `start` differ
+    /// only in what they do with the result.
+    fn assemble(mut self) -> Result<Assembly, SystemError> {
         // -- duplicate-name gate ------------------------------------------
         let mut seen = HashSet::new();
         for (name, _) in &self.boards {
@@ -342,7 +485,7 @@ impl System {
         // union nets across (or within) boards.
         let mut nets: Vec<Net> = Vec::new();
         let mut base_of_board: Vec<usize> = Vec::new();
-        for (bi, (bname, board)) in self.boards.iter().enumerate() {
+        for (bname, board) in &self.boards {
             base_of_board.push(nets.len());
             for net in &board.nets {
                 let mut qualified = net.clone();
@@ -350,7 +493,6 @@ impl System {
                 qualified.name = format!("{bname}.{name}", name = net.name);
                 nets.push(qualified);
             }
-            let _ = bi;
         }
         let mut dsu = Dsu::new(nets.len());
 
@@ -466,6 +608,9 @@ impl System {
         }
 
         // -- scenario: fault algebra ---------------------------------------
+        // Stream drops resolve to endpoints only after the electrical
+        // descriptors are registered below; collect them here.
+        let mut stream_drops: Vec<(String, StreamDropPolicy)> = Vec::new();
         for fault in self.scenario.faults().to_vec() {
             match fault {
                 Fault::PinDetach { endpoint } => {
@@ -485,9 +630,8 @@ impl System {
                     let idx = self.named_net(&net, &nets)?;
                     stuck_sources.push((idx, volts));
                 }
-                Fault::StreamDrop { .. } => {
-                    // Stream routing is a later slice; the fault is recorded
-                    // in the scenario but has no build-time effect yet.
+                Fault::StreamDrop { endpoint, policy } => {
+                    stream_drops.push((endpoint, policy));
                 }
             }
         }
@@ -501,6 +645,7 @@ impl System {
             resolver.add_stuck_source(idx, volts);
         }
 
+        let mut endpoints: HashMap<(usize, PinRef), EndpointId> = HashMap::new();
         for (bi, (_bname, board)) in self.boards.iter().enumerate() {
             for record in &board.records {
                 if !record.fitted {
@@ -551,7 +696,24 @@ impl System {
                             let Some(&net) = net_of_pin.get(&key) else {
                                 continue;
                             };
-                            add_pin_descriptor(&mut resolver, net, pin, &key.1);
+                            if let Some(endpoint) =
+                                add_pin_descriptor(&mut resolver, net, pin, &key.1)
+                            {
+                                // Serial-capable pins register for stream
+                                // routing (their pipes derive from the nets
+                                // they drive/sense — never installed beside
+                                // them).
+                                if let Some(role) = pin.stream {
+                                    resolver.add_stream_pin(endpoint, net, role, key.1.clone());
+                                }
+                                endpoints.insert(key, endpoint);
+                            } else if pin.stream.is_some() {
+                                tracing::warn!(
+                                    reference = %record.reference,
+                                    pin = pin.number,
+                                    "stream role on a pin without a drive endpoint is ignored"
+                                );
+                            }
                         }
                     }
                     PartClass::Boundary | PartClass::Stubbed => {}
@@ -559,14 +721,28 @@ impl System {
             }
         }
 
-        // -- resolution pass -----------------------------------------------
-        let mut diagnostics = Diagnostics::new();
-        resolver.resolve(&mut nets, &mut diagnostics);
+        // -- stream-drop faults (need the endpoint table) --------------------
+        for (path, policy) in stream_drops {
+            let (bi, pin) = split_board_pin(&path, &board_index).ok_or_else(|| {
+                SystemError::UnknownEndpoint {
+                    endpoint: path.clone(),
+                }
+            })?;
+            let endpoint =
+                endpoints
+                    .get(&(bi, pin))
+                    .copied()
+                    .ok_or_else(|| SystemError::UnknownEndpoint {
+                        endpoint: path.clone(),
+                    })?;
+            resolver.add_stream_drop(endpoint, policy);
+        }
 
-        // -- attach registered components (pre-share, final net ids) --------
+        // -- prepare registered components for attach ------------------------
         let boards = std::mem::take(&mut self.boards);
+        let mut components: Vec<PreparedComponent> = Vec::new();
         for (bi, (bname, board)) in boards.into_iter().enumerate() {
-            for (reference, mut component) in board.components {
+            for (reference, component) in board.components {
                 let record = board
                     .records
                     .iter()
@@ -575,35 +751,35 @@ impl System {
                 if !record.fitted {
                     continue;
                 }
-                let mut entries: Vec<(String, PinHandle)> = Vec::new();
+                let mut prepared_pins: Vec<PreparedPin> = Vec::new();
                 if let PartClass::Registered { pins } = &record.class {
                     for pin in pins {
                         let key = (bi, PinRef::new(reference.clone(), pin.number));
                         if let Some(&net) = net_of_pin.get(&key) {
-                            let handle = PinHandle::new(NetId(net));
-                            entries.push((pin.number.to_string(), handle));
-                            if let Some(name) = pin.name {
-                                entries.push((name.to_string(), handle));
-                            }
+                            prepared_pins.push(PreparedPin {
+                                number: pin.number.to_string(),
+                                name: pin.name.map(str::to_string),
+                                net,
+                                endpoint: endpoints.get(&key).copied(),
+                                stream: pin.stream,
+                            });
                         }
                     }
                 }
-                component
-                    .attach(ComponentNetIo::from_entries(entries))
-                    .map_err(|error| SystemError::Board {
-                        name: bname.clone(),
-                        error: BoardError::Attach {
-                            reference: reference.clone(),
-                            error,
-                        },
-                    })?;
-                // Component is now attached; the live engine slice will keep
-                // it (Arc) and service its drives/senses. The build-time
-                // slice drops it after validation.
+                components.push(PreparedComponent {
+                    board: bname.clone(),
+                    reference,
+                    component,
+                    pins: prepared_pins,
+                });
             }
         }
 
-        Ok(BuiltSystem { nets, diagnostics })
+        Ok(Assembly {
+            nets,
+            resolver,
+            components,
+        })
     }
 
     /// Resolve a harness endpoint to a global net index, creating synthetic
@@ -720,275 +896,70 @@ fn split_board_pin(path: &str, boards: &HashMap<String, usize>) -> Option<(usize
     Some((*boards.get(board)?, PinRef::new(reference, pin)))
 }
 
-/// Register one component pin's electrical descriptor with the resolver.
-fn add_pin_descriptor(resolver: &mut Resolver, net: usize, pin: &PinDecl, pin_ref: &PinRef) {
+/// Register one component pin's electrical descriptor with the resolver,
+/// returning the drive endpoint for pins that can drive.
+fn add_pin_descriptor(
+    resolver: &mut Resolver,
+    net: usize,
+    pin: &PinDecl,
+    pin_ref: &PinRef,
+) -> Option<EndpointId> {
     match pin.kind {
-        PinKind::DigitalIn => resolver.add_digital_sense(net),
-        PinKind::Analog => resolver.add_analog_sense(net),
-        PinKind::PowerIn => resolver.add_power_sense(net),
+        PinKind::DigitalIn => {
+            resolver.add_digital_sense(net);
+            // Sense pins still get a released drive slot: the re-entrancy
+            // contract allows a sense callback to drive.
+            Some(resolver.add_endpoint(net, pin_ref.clone(), None))
+        }
+        PinKind::Analog => {
+            resolver.add_analog_sense(net);
+            Some(resolver.add_endpoint(net, pin_ref.clone(), None))
+        }
+        PinKind::PowerIn => {
+            resolver.add_power_sense(net);
+            None
+        }
         PinKind::PowerOut => {
             // Component-declared rail voltage arrives with the regulator
             // models (a later slice); presence is what the build-time pass
             // needs. NaN marks "sourced at an unmodeled voltage".
             resolver.add_power_source(net, f64::NAN);
+            None
         }
         PinKind::DigitalOut | PinKind::DigitalBidir => {
-            // Build-time idle: stream producers idle Driven(High) per the
-            // stream spec; plain outputs idle High as the documented
-            // build-time default (components are not running yet).
+            // Idle default: stream producers idle Driven(High) per the
+            // stream spec; plain outputs idle High as the documented default
+            // until the component drives otherwise.
             let impedance = pin.drive_impedance.unwrap_or(DEFAULT_PUSH_PULL_IMPEDANCE);
-            resolver.add_driver(net, Level::High, impedance, pin_ref.clone());
+            Some(resolver.add_endpoint(
+                net,
+                pin_ref.clone(),
+                Some(TheveninDrive {
+                    volts: DEFAULT_HIGH_LEVEL_VOLTS,
+                    impedance,
+                }),
+            ))
         }
-        PinKind::Passive => {}
+        PinKind::Passive => None,
     }
+}
+
+/// Build the (identity → handle) entries for one prepared component.
+fn handle_entries(pins: &[PreparedPin], link: &EngineLink) -> Vec<(String, PinHandle)> {
+    let mut entries = Vec::new();
+    for pin in pins {
+        let handle = PinHandle::wired(NetId(pin.net), pin.endpoint, pin.stream, link.clone());
+        entries.push((pin.number.clone(), handle.clone()));
+        if let Some(name) = &pin.name {
+            entries.push((name.clone(), handle));
+        }
+    }
+    entries
 }
 
 // ============================================================
-// Build-time resolution
+// Built system + live system handle
 // ============================================================
-
-/// Union-find over global net indices.
-struct Dsu {
-    parent: Vec<usize>,
-}
-
-impl Dsu {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-        }
-    }
-    fn len(&self) -> usize {
-        self.parent.len()
-    }
-    fn grow(&mut self, n: usize) {
-        while self.parent.len() < n {
-            self.parent.push(self.parent.len());
-        }
-    }
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x {
-            self.parent[x] = self.parent[self.parent[x]];
-            x = self.parent[x];
-        }
-        x
-    }
-    fn union(&mut self, a: usize, b: usize) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            self.parent[rb] = ra;
-        }
-    }
-}
-
-/// One push-pull driver contribution.
-struct Driver {
-    net: usize,
-    level: Level,
-    #[allow(dead_code)] // impedance projection is the cluster-solver slice
-    impedance: f64,
-    pin: PinRef,
-}
-
-/// Build-time resolution state: descriptors accumulated per global net, then
-/// resolved per conduction cluster.
-struct Resolver {
-    /// Union-find of net *identity* merges (harness wires, pin shorts).
-    identity: Dsu,
-    /// Conduction edges (resistors, inductors, closed jumpers): (a, b, ohms).
-    edges: Vec<(usize, usize, f64)>,
-    drivers: Vec<Driver>,
-    power_sources: Vec<(usize, Volts)>,
-    stuck_sources: Vec<(usize, Volts)>,
-    digital_senses: Vec<usize>,
-    analog_senses: Vec<usize>,
-    power_senses: Vec<usize>,
-    net_count: usize,
-}
-
-impl Resolver {
-    fn new(net_count: usize, identity: Dsu) -> Self {
-        Self {
-            identity,
-            edges: Vec::new(),
-            drivers: Vec::new(),
-            power_sources: Vec::new(),
-            stuck_sources: Vec::new(),
-            digital_senses: Vec::new(),
-            analog_senses: Vec::new(),
-            power_senses: Vec::new(),
-            net_count,
-        }
-    }
-
-    fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
-        self.edges.push((a, b, ohms));
-    }
-    fn add_driver(&mut self, net: usize, level: Level, impedance: f64, pin: PinRef) {
-        self.drivers.push(Driver {
-            net,
-            level,
-            impedance,
-            pin,
-        });
-    }
-    fn add_power_source(&mut self, net: usize, volts: Volts) {
-        self.power_sources.push((net, volts));
-    }
-    fn add_stuck_source(&mut self, net: usize, volts: Volts) {
-        self.stuck_sources.push((net, volts));
-    }
-    fn add_digital_sense(&mut self, net: usize) {
-        self.digital_senses.push(net);
-    }
-    fn add_analog_sense(&mut self, net: usize) {
-        self.analog_senses.push(net);
-    }
-    fn add_power_sense(&mut self, net: usize) {
-        self.power_senses.push(net);
-    }
-
-    /// Run the build-time pass: assign every net a [`NetState`] and report
-    /// findings. Identity-merged nets share state; conduction clusters share
-    /// sourced-ness.
-    fn resolve(&mut self, nets: &mut [Net], diagnostics: &mut Diagnostics) {
-        self.identity.grow(self.net_count.max(nets.len()));
-
-        // Conduction clusters: identity merges are 0-ohm, conduction edges
-        // connect within a cluster without merging identity.
-        let mut conduction = Dsu::new(nets.len());
-        for i in 0..nets.len() {
-            let root = self.identity.find(i);
-            conduction.union(root, i);
-        }
-        let edges = self.edges.clone();
-        for (a, b, _ohms) in &edges {
-            let (ra, rb) = (self.identity.find(*a), self.identity.find(*b));
-            conduction.union(ra, rb);
-        }
-
-        // Sources per conduction cluster.
-        let mut cluster_power: HashMap<usize, Volts> = HashMap::new();
-        let mut cluster_sourced: HashSet<usize> = HashSet::new();
-        let power_sources = self.power_sources.clone();
-        let stuck_sources = self.stuck_sources.clone();
-        for (net, volts) in &power_sources {
-            let c = conduction.find(self.identity.find(*net));
-            cluster_power.entry(c).or_insert(*volts);
-            cluster_sourced.insert(c);
-        }
-        for (net, _volts) in &stuck_sources {
-            let c = conduction.find(self.identity.find(*net));
-            cluster_sourced.insert(c);
-        }
-
-        // Drivers: per identity-merged net, detect contention; drivers also
-        // source their conduction cluster.
-        let mut net_drivers: HashMap<usize, Vec<&Driver>> = HashMap::new();
-        for driver in &self.drivers {
-            let root = self.identity.find(driver.net);
-            net_drivers.entry(root).or_default().push(driver);
-            cluster_sourced.insert(conduction.find(root));
-        }
-
-        // Direct source levels per identity root (power/stuck beat drivers
-        // for state projection).
-        let mut direct_volts: HashMap<usize, Volts> = HashMap::new();
-        for (net, volts) in &power_sources {
-            direct_volts
-                .entry(self.identity.find(*net))
-                .or_insert(*volts);
-        }
-        for (net, volts) in &stuck_sources {
-            direct_volts
-                .entry(self.identity.find(*net))
-                .or_insert(*volts);
-        }
-
-        // Assign states.
-        for (i, net) in nets.iter_mut().enumerate() {
-            let root = self.identity.find(i);
-            let cluster = conduction.find(root);
-
-            let state = if let Some(v) = direct_volts.get(&root) {
-                NetState::Analog(*v)
-            } else if let Some(drivers) = net_drivers.get(&root) {
-                let levels: HashSet<Level> = drivers.iter().map(|d| d.level).collect();
-                if levels.len() > 1 {
-                    NetState::Contention
-                } else {
-                    NetState::Driven(drivers[0].level)
-                }
-            } else if cluster_sourced.contains(&cluster) {
-                // Reached only through conduction edges: project as pulled
-                // toward the cluster's source. Exact series resistance is the
-                // cluster-solver slice; the build-time pass reports the sum
-                // of the cluster's edge resistances as an upper bound.
-                let total: f64 = edges
-                    .iter()
-                    .filter(|(a, b, _)| {
-                        conduction.find(self.identity.find(*a)) == cluster
-                            || conduction.find(self.identity.find(*b)) == cluster
-                    })
-                    .map(|(_, _, ohms)| ohms)
-                    .sum();
-                let level = match cluster_power.get(&cluster) {
-                    Some(v) if *v < 1.5 => Level::Low,
-                    _ => Level::High,
-                };
-                NetState::Pulled(level, total)
-            } else {
-                NetState::Floating
-            };
-            net.state = state;
-        }
-
-        // Contention findings (per identity root, deduped).
-        let mut reported_contention: HashSet<usize> = HashSet::new();
-        for i in 0..nets.len() {
-            let root = self.identity.find(i);
-            if nets[i].state == NetState::Contention && reported_contention.insert(root) {
-                let drivers = net_drivers
-                    .get(&root)
-                    .map(|ds| ds.iter().map(|d| d.pin.clone()).collect())
-                    .unwrap_or_default();
-                diagnostics.report(Finding::Contention {
-                    net: nets[root.min(i)].name.clone(),
-                    drivers,
-                });
-            }
-        }
-
-        // Floating senses (deduped per (identity root, kind)).
-        let mut reported: HashSet<(usize, SenseKind)> = HashSet::new();
-        let digital = self.digital_senses.clone();
-        let analog = self.analog_senses.clone();
-        for (senses, kind) in [(digital, SenseKind::Digital), (analog, SenseKind::Analog)] {
-            for net in senses {
-                let root = self.identity.find(net);
-                if nets[net].state == NetState::Floating && reported.insert((root, kind)) {
-                    diagnostics.report(Finding::FloatingSense {
-                        net: nets[net].name.clone(),
-                        kind,
-                    });
-                }
-            }
-        }
-
-        // Power senses: unsourced clusters (deduped per identity root).
-        let mut reported_power: HashSet<usize> = HashSet::new();
-        let power = self.power_senses.clone();
-        for net in power {
-            let root = self.identity.find(net);
-            let cluster = conduction.find(root);
-            if !cluster_sourced.contains(&cluster) && reported_power.insert(root) {
-                diagnostics.report(Finding::PowerNetUnsourced {
-                    net: nets[net].name.clone(),
-                });
-            }
-        }
-    }
-}
 
 /// A built system: system-wide resolved nets plus the diagnostics collected
 /// by the build-time resolution pass.
@@ -1010,6 +981,71 @@ impl BuiltSystem {
     pub fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
     }
+}
+
+/// A running live system: the net-engine thread plus the attached
+/// components, created by [`System::start`].
+///
+/// Dropping the handle shuts the engine down first (shutdown message +
+/// join — in-flight sense/wake callbacks complete, and joining cannot
+/// deadlock because callbacks run with no engine lock held), then drops the
+/// components.
+pub struct SystemHandle {
+    // Field order is load-bearing: the engine joins before components drop.
+    engine: EngineHandle,
+    net_names: Vec<String>,
+    components: Vec<(String, Box<dyn Component>)>,
+}
+
+impl fmt::Debug for SystemHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SystemHandle")
+            .field("engine", &self.engine)
+            .field(
+                "components",
+                &self.components.iter().map(|(r, _)| r).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl SystemHandle {
+    /// Most recently engine-published state of a net, by qualified system
+    /// name (`"Board.NETNAME"`, overline-normalized).
+    pub fn net_state(&self, name: &str) -> Option<NetState> {
+        let normalized = crate::netlist::normalize_pin_name(name);
+        let index = self.net_names.iter().position(|n| *n == normalized)?;
+        self.engine.net_state(NetId(index))
+    }
+
+    /// Most recently engine-published state of a net, by id.
+    pub fn net_state_of(&self, net: NetId) -> Option<NetState> {
+        self.engine.net_state(net)
+    }
+
+    /// Snapshot of the cumulative live findings (the initial resolution pass
+    /// runs before [`System::start`] returns, so build-time findings are
+    /// already present).
+    pub fn findings(&self) -> Vec<Finding> {
+        self.engine.findings()
+    }
+
+    /// True while the net-engine thread is alive and serving commands (see
+    /// [`crate::engine::EngineHandle::is_alive`]). Component callbacks are
+    /// panic-contained, so `false` means the engine itself failed.
+    pub fn engine_is_alive(&self) -> bool {
+        self.engine.is_alive()
+    }
+
+    /// Reference designators of the attached components, in attach order.
+    pub fn component_refs(&self) -> impl Iterator<Item = &str> {
+        self.components
+            .iter()
+            .map(|(reference, _)| reference.as_str())
+    }
+
+    /// Shut the live system down explicitly (equivalent to dropping it).
+    pub fn shutdown(self) {}
 }
 
 // ============================================================

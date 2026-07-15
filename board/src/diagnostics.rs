@@ -20,6 +20,19 @@ pub enum SenseKind {
     Analog,
 }
 
+/// Which engine-thread delivery a contained callback panic escaped from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallbackKind {
+    /// A net-sense delivery.
+    Sense,
+    /// A timer-wheel wakeup delivery.
+    Wake,
+    /// A stream byte delivery.
+    StreamByte,
+    /// A topology-epoch notification.
+    Topology,
+}
+
 /// Direction of a pin-facade mismatch between a registered component's
 /// declared pins and the netlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,6 +92,44 @@ pub enum Finding {
         part: String,
         /// Human-readable cause.
         message: String,
+    },
+    /// A component-provided callback (sense, wake, stream-byte, or
+    /// topology delivery) panicked on the engine thread. The panic is
+    /// contained — the engine stays alive and net service continues for
+    /// every other component — but the panicking component's own state is
+    /// suspect. Reported once per (kind, subscriber).
+    CallbackPanic {
+        /// Which delivery panicked.
+        kind: CallbackKind,
+        /// Identity of the failing subscriber (net name for senses,
+        /// component index for wakes, consumer pin for stream bytes).
+        subscriber: String,
+    },
+    /// The engine needed `embsim_core::virtual_clock` (a `schedule_at` /
+    /// `schedule_every` request or a paced stream write) before
+    /// `virtual_clock::init` ran. The request is dropped loudly instead of
+    /// panicking the engine thread into a silent zombie.
+    VirtualClockUninitialized {
+        /// What needed the clock.
+        context: String,
+    },
+    /// A paced stream route's in-flight queue overflowed: the producer
+    /// sustained writes above its declared baud for longer than the queue
+    /// absorbs (a producer-vs-declared-baud mismatch — exactly the class
+    /// of disagreement the framework exists to surface). Overflow bytes
+    /// are shed; the trace carries the counts.
+    StreamOverrun {
+        /// The producer pin whose route overflowed.
+        producer: PinRef,
+    },
+    /// A reserved drive enqueue sequence number never arrived (the
+    /// enqueuing thread died between reserving the seq and sending the
+    /// command). After a bounded wait the engine skips the gap — ordering
+    /// against a dead enqueuer is moot — so later drives from every other
+    /// component are not wedged forever.
+    DriveSeqGap {
+        /// The first missing sequence number.
+        seq: u64,
     },
     /// Pin-facade mismatch between a registered component and the netlist
     /// (both directions are hard build errors; the finding carries the

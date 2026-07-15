@@ -49,6 +49,14 @@ pub fn set_scale(scale: f64) {
     SCALE_DENOM.store(denom, Ordering::Relaxed);
 }
 
+/// True once `init` has run in this process. Time functions such as
+/// [`virtual_us`] panic before `init`; callers that must stay alive (e.g. a
+/// long-running engine thread validating a schedule request) check this
+/// first and fail the request loudly instead.
+pub fn is_initialized() -> bool {
+    PROCESS_ORIGIN.get().is_some()
+}
+
 /// Get virtual microseconds elapsed since the last `init`.
 pub fn virtual_us() -> u64 {
     let origin = PROCESS_ORIGIN.get().expect("Virtual clock not initialized");

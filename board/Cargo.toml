@@ -10,4 +10,5 @@ keywords = ["embedded", "emulator", "simulation", "sil"]
 categories = ["embedded", "simulation"]
 
 [dependencies]
+embsim-core = { path = "../core" }
 tracing.workspace = true

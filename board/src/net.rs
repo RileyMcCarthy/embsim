@@ -23,8 +23,10 @@ pub type Volts = f64;
 /// [`crate::component::PinDecl::drive_impedance`]).
 pub const DEFAULT_PUSH_PULL_IMPEDANCE: Ohms = 25.0;
 
-/// Series-resistance collapse threshold for stream routing: series passives
-/// below this value collapse into a serial link route.
+/// Series-resistance collapse threshold: series passives whose accumulated
+/// resistance stays below this value collapse into a serial link route, and
+/// disagreeing push-pull drivers coupled below it resolve to
+/// [`NetState::Contention`] rather than a divided voltage.
 pub const STREAM_COLLAPSE_THRESHOLD: Ohms = 1_000.0;
 
 /// Impedance-escalation ratio: a competing path whose Thevenin impedance is
