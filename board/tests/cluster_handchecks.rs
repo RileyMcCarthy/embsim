@@ -11,6 +11,7 @@ use embsim_board::{
     Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource, NetId,
     NetState, QuasiStaticMna, Volts,
 };
+use rstest::rstest;
 
 /// Unwrap a node's solved analog voltage; panics with the actual state on a
 /// projection mismatch so failures read like the hand calculation.
@@ -41,7 +42,7 @@ fn source(node: usize, volts: f64, impedance: f64) -> ClusterSource {
 // (1) Voltage divider — 3.3 V through 47 Ω then 4.7 kΩ to 0 V
 // ============================================================
 
-#[test]
+#[rstest]
 fn divider_47r_over_4k7_matches_closed_form() {
     // Hand check: V_mid = 3.3 · 4700 / (47 + 4700) = 3.267326732… V.
     let cluster = Cluster {
@@ -62,7 +63,7 @@ fn divider_47r_over_4k7_matches_closed_form() {
 // (2) Wheatstone bridge — MaD strain-gauge values
 // ============================================================
 
-#[test]
+#[rstest]
 fn wheatstone_bridge_mad_strain_gauge_matches_bridge_equation() {
     // MaD load-cell values (`SIL/models/src/strain_gauge.rs` provenance):
     // 350 Ω arms, 3.3 V excitation, rated sensitivity S = 1.0 mV/V, so the
@@ -109,7 +110,7 @@ fn wheatstone_bridge_mad_strain_gauge_matches_bridge_equation() {
 // (3) Two stiff sources fighting through a series resistor
 // ============================================================
 
-#[test]
+#[rstest]
 fn stiff_sources_fighting_through_series_resistor_sit_between_rails() {
     // The crossed-TX/RX bench case (`BOARD_ENGINE.md` "Stream endpoints"):
     // a 3.3 V/25 Ω push-pull and a 0 V/25 Ω push-pull fight through the
@@ -139,7 +140,7 @@ fn stiff_sources_fighting_through_series_resistor_sit_between_rails() {
 // (4) Disconnected island — sourced block solves, island floats
 // ============================================================
 
-#[test]
+#[rstest]
 fn disconnected_island_reports_floating_only_for_unsourced_nodes() {
     // One cluster, two components: nodes 0–1 are sourced (solve to the
     // open-circuit 3.3 V — no return path, no current); nodes 2–3 have a

@@ -448,9 +448,11 @@ impl std::error::Error for AttachError {}
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn pin_lookup_resolves_by_number_and_name() {
         let handle = PinHandle::new(NetId(7));
         let io = ComponentNetIo::from_entries([
@@ -466,7 +468,7 @@ mod tests {
     /// exactly once — the same once-at-registration contract the live path
     /// honors. A component doing floating-detection in its sense callback
     /// must behave identically under `System::build` and `System::start`.
-    #[test]
+    #[rstest]
     fn on_sense_inert_link_delivers_the_snapshot_once_synchronously() {
         use crate::engine::EngineLink;
         use crate::net::Level;
@@ -484,7 +486,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec![NetState::Driven(Level::High)]);
     }
 
-    #[test]
+    #[rstest]
     fn pin_lookup_fails_loudly_on_facade_mismatch() {
         let io = ComponentNetIo::default();
         assert_eq!(

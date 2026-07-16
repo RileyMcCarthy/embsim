@@ -403,9 +403,11 @@ pub fn normalize_pin_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn overline_syntax_normalizes() {
         assert_eq!(normalize_pin_name("~{RESET}"), "~RESET");
         assert_eq!(normalize_pin_name("~RESET"), "~RESET");
@@ -415,7 +417,7 @@ mod tests {
     /// `;` line comments — the provenance headers committed netlist
     /// artifacts carry — are skipped anywhere whitespace is legal, and a
     /// `;` inside a quoted atom stays data.
-    #[test]
+    #[rstest]
     fn line_comments_are_skipped() {
         let input = "; provenance: exported by kicad-cli\n\
                      ; regeneration: CI diff-check\n\
@@ -430,7 +432,7 @@ mod tests {
         assert_eq!(parsed.components[0].value, "47R; not a comment");
     }
 
-    #[test]
+    #[rstest]
     fn parses_the_real_ds2addon_fixture() {
         let input = include_str!("../tests/fixtures/ds2_addon.net");
         let parsed = parse(input).expect("fixture parses");
@@ -462,7 +464,7 @@ mod tests {
         assert_eq!(reset.nodes[0].pin, "3");
     }
 
-    #[test]
+    #[rstest]
     fn rejects_unsupported_versions_and_malformed_input() {
         let bad_version = r#"(export (version "Z") (components) (nets))"#;
         assert_eq!(
@@ -481,7 +483,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[rstest]
     fn quoted_atoms_unescape() {
         let input = r#"(export (version "E")
             (components (comp (ref "U1") (value "a \"b\" c")))
@@ -490,7 +492,7 @@ mod tests {
         assert_eq!(parsed.components[0].value, "a \"b\" c");
     }
 
-    #[test]
+    #[rstest]
     fn errors_display_named_causes() {
         let err = NetlistError::UnsupportedVersion {
             found: "Z".to_string(),

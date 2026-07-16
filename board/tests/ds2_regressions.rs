@@ -11,6 +11,7 @@ use embsim_board::{
     Harness, JumperState, NetState, PartRegistry, PinDecl, Scenario, SenseKind, System,
 };
 use embsim_models::ads122u04_component::ADS122U04_PINS;
+use rstest::rstest;
 
 // ============================================================
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
@@ -79,7 +80,7 @@ fn floating(diags: &Diagnostics, net: &str, kind: SenseKind) -> bool {
 /// (the `~{RESET}` net contains only U1 pin 3). Two chips appeared dead for
 /// days before a multimeter found it. The engine must report it at build,
 /// before any traffic.
-#[test]
+#[rstest]
 fn floating_reset_is_reported_at_build() {
     let system = System::new()
         .board("DS2Addon", ds2_board())
@@ -106,7 +107,7 @@ fn floating_reset_is_reported_at_build() {
 /// Bench bug: the analog domain is fully isolated on the PCB (AVDD/AGND
 /// arrive only via the J2 harness), and the datasheet's power-on reset waits
 /// for BOTH supplies — an unstrapped AVDD is a permanently silent chip.
-#[test]
+#[rstest]
 fn avdd_unstrapped_reports_power_net_unsourced() {
     let digital_only = Harness::new()
         .power(ep("BENCH.3V3"), ep("DS2Addon.J1.1"), 3.3)
@@ -150,7 +151,7 @@ fn avdd_unstrapped_reports_power_net_unsourced() {
 /// jumpers JP1/JP2 (the filter resistors are DNP). With the jumpers open —
 /// their symbol default (`Jumper_NO`) and the state the boards shipped in —
 /// AIN0/AIN1 float and conversions slam rail to rail.
-#[test]
+#[rstest]
 fn open_input_jumpers_float_the_adc_inputs() {
     // Default jumper state (open): AIN0 floats.
     let system = System::new()
@@ -195,7 +196,7 @@ fn open_input_jumpers_float_the_adc_inputs() {
 /// to the 3.3 V rail. `pin_short` is exactly that fault-algebra primitive:
 /// union the two pins' nets. With the bodge applied, the floating finding
 /// must disappear; `net_stuck` (an injected ideal source) must clear it too.
-#[test]
+#[rstest]
 fn pin_short_and_net_stuck_model_the_reset_bodge() {
     // Baseline: floating (regression 1).
     let system = System::new()
@@ -245,7 +246,7 @@ fn pin_short_and_net_stuck_model_the_reset_bodge() {
 /// disagreeing ideal sources on one net. It must be observable —
 /// `Contention` plus a finding — never a silent first-source-wins 3.3 V
 /// projection under which the injected fault has zero effect anywhere.
-#[test]
+#[rstest]
 fn net_stuck_fighting_the_powered_rail_is_observable() {
     let system = System::new()
         .board("DS2Addon", ds2_board())
@@ -286,7 +287,7 @@ fn net_stuck_fighting_the_powered_rail_is_observable() {
 /// fallback. Shorting the ADC input pair (fault algebra) then turns the two
 /// filter legs into a genuine two-source divider: the MNA reports the
 /// 1.65 V midpoint.
-#[test]
+#[rstest]
 fn bridge_fed_analog_inputs_solve_through_the_mna() {
     let bridge_fed = powered_bench_harness()
         .power(ep("BENCH.A0"), ep("DS2Addon.J2.3"), 3.3)

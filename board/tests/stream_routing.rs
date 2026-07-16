@@ -7,6 +7,7 @@
 //! 47 Ω series-resistor collapse and the crossed-TX/RX harness regression
 //! hold the engine to the same truth the hardware exhibited.
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -383,7 +384,7 @@ fn link_system(baud_hz: u32, scenario: Scenario, probe: &Probe) -> SystemHandle 
 /// The real board routes its UART through 47 Ω series resistors (R3 into
 /// U1 RX, R4 out of U1 TX). Both directions must deliver bytes through the
 /// collapsed link — against the actual `kicad-cli` netlist export.
-#[test]
+#[rstest]
 fn ds2_47_ohm_series_resistors_collapse_into_the_link() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000); // 115.2 kbaud pacing samples the clock
@@ -434,7 +435,7 @@ fn ds2_47_ohm_series_resistors_collapse_into_the_link() {
 /// the underlying nets resolve per the net rules — the TX↔TX pair goes to
 /// `Contention` as soon as the two producers actually disagree, while the
 /// RX↔RX net floats with its silent consumers.
-#[test]
+#[rstest]
 fn crossed_tx_rx_harness_raises_stream_mismatch_and_contention() {
     let mcu_tx_pin = PinRef::new("MCU", "1");
     let ads_tx_pin = PinRef::new("U1", "15");
@@ -516,7 +517,7 @@ fn crossed_tx_rx_harness_raises_stream_mismatch_and_contention() {
 /// clock (10 bits/byte, 8N1): at 50 baud a byte takes 200 virtual ms, so
 /// nothing arrives instantly and three bytes take ≥ 600 virtual ms
 /// (≥ 300 wall ms at 2× scale), in wire order.
-#[test]
+#[rstest]
 fn producer_baud_paces_bytes_against_virtual_time() {
     let _g = lock_clock();
     virtual_clock::init(2.0, 1_000_000);
@@ -551,7 +552,7 @@ fn producer_baud_paces_bytes_against_virtual_time() {
 /// `Scenario::stream_drop` byte-loss injection actually applies to the live
 /// pipe: `EveryNth` on the producer thins the stream, `All` on the consumer
 /// silences it.
-#[test]
+#[rstest]
 fn stream_drop_policies_apply_to_live_pipes() {
     // EveryNth(2) on the producer pin: every second byte written is lost.
     let probe = Probe::new();
@@ -593,7 +594,7 @@ fn stream_drop_policies_apply_to_live_pipes() {
 
 /// A detached producer pin never forms a route: writes are dropped with a
 /// trace, never delivered, never queued — and attach still succeeds.
-#[test]
+#[rstest]
 fn detached_producer_pin_breaks_the_route() {
     let probe = Probe::new();
     let system = link_system(0, Scenario::default().pin_detach("Rig.MCU.1"), &probe);
@@ -610,7 +611,7 @@ fn detached_producer_pin_breaks_the_route() {
 /// Byte pipes are gated by net resolution: when the producer releases its
 /// drive the link floats and bytes written meanwhile are dropped (not
 /// queued); re-driving the line restores delivery.
-#[test]
+#[rstest]
 fn floating_link_gates_delivery_until_redriven() {
     let probe = Probe::new();
     let system = link_system(0, Scenario::default(), &probe);

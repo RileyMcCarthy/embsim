@@ -440,6 +440,8 @@ pub fn receive_byte(channel: usize) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use nix::libc;
 
@@ -515,7 +517,7 @@ mod tests {
         init(count);
     }
 
-    #[test]
+    #[rstest]
     fn init_at_max_channels_is_allowed() {
         let _g = crate::test_support::guard();
         setup(MAX_CHANNELS);
@@ -523,7 +525,7 @@ mod tests {
         assert!(receive_byte(MAX_CHANNELS - 1).is_none());
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_channels_panics() {
         let _g = crate::test_support::guard();
@@ -531,7 +533,7 @@ mod tests {
         init(MAX_CHANNELS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn reset_sets_all_fds_to_minus_one_and_clears_pacing() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -545,7 +547,7 @@ mod tests {
         assert!(receive_byte(0).is_none());
     }
 
-    #[test]
+    #[rstest]
     fn init_channel_fd_stores_the_fd_and_enables_io() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -556,7 +558,7 @@ mod tests {
         assert_eq!(pair.read_far(2), b"hi");
     }
 
-    #[test]
+    #[rstest]
     fn transmit_to_unconnected_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -565,7 +567,7 @@ mod tests {
         // Nothing to assert beyond "did not panic / did not block".
     }
 
-    #[test]
+    #[rstest]
     fn transmit_empty_data_is_a_no_op() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -577,7 +579,7 @@ mod tests {
         assert!(got.is_empty(), "empty transmit writes nothing");
     }
 
-    #[test]
+    #[rstest]
     fn transmit_out_of_range_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -585,7 +587,7 @@ mod tests {
         transmit_data(5, b"data");
     }
 
-    #[test]
+    #[rstest]
     fn transmit_then_read_round_trips_bytes() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -595,7 +597,7 @@ mod tests {
         assert_eq!(pair.read_far(2), b"hi");
     }
 
-    #[test]
+    #[rstest]
     fn receive_byte_returns_available_then_none_when_empty() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -607,7 +609,7 @@ mod tests {
         assert_eq!(receive_byte(0), None);
     }
 
-    #[test]
+    #[rstest]
     fn receive_byte_on_unconnected_or_out_of_range_is_none() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -617,7 +619,7 @@ mod tests {
         assert_eq!(receive_byte(9), None);
     }
 
-    #[test]
+    #[rstest]
     fn receive_bytes_burst_drains_then_zero_when_empty() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -632,7 +634,7 @@ mod tests {
         assert_eq!(receive_bytes(0, &mut buf), 0);
     }
 
-    #[test]
+    #[rstest]
     fn receive_bytes_clamps_to_buffer_len() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -649,7 +651,7 @@ mod tests {
         assert_eq!(&rest[..2], b"ef");
     }
 
-    #[test]
+    #[rstest]
     fn receive_bytes_unconnected_out_of_range_or_empty_buf_is_zero() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -665,7 +667,7 @@ mod tests {
         assert_eq!(receive_bytes(0, &mut empty), 0);
     }
 
-    #[test]
+    #[rstest]
     fn receive_data_timeout_fills_buffer_when_bytes_ready() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -678,7 +680,7 @@ mod tests {
         assert_eq!(&buf, b"abcd");
     }
 
-    #[test]
+    #[rstest]
     fn receive_data_timeout_returns_false_when_short() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -692,7 +694,7 @@ mod tests {
         assert_eq!(&buf[..2], b"ab");
     }
 
-    #[test]
+    #[rstest]
     fn receive_data_timeout_empty_buf_or_unknown_channel_is_false() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -711,7 +713,7 @@ mod tests {
         assert!(!receive_data_timeout(1, &mut buf2, 100));
     }
 
-    #[test]
+    #[rstest]
     fn set_frame_bits_clamps_to_at_least_one() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -726,7 +728,7 @@ mod tests {
         set_frame_bits(10);
     }
 
-    #[test]
+    #[rstest]
     fn paced_baud_still_delivers_bytes_correctly() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -742,7 +744,7 @@ mod tests {
         assert_eq!(receive_byte(0), Some(0x42));
     }
 
-    #[test]
+    #[rstest]
     fn set_baud_zero_is_unpaced_and_resets_schedules() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -755,7 +757,7 @@ mod tests {
         assert_eq!(pair.read_far(2), b"ok");
     }
 
-    #[test]
+    #[rstest]
     fn set_baud_out_of_range_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -763,7 +765,7 @@ mod tests {
         set_baud(MAX_CHANNELS, 9600);
     }
 
-    #[test]
+    #[rstest]
     fn start_and_stop_are_no_ops() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -774,5 +776,90 @@ mod tests {
         stop(0);
         transmit_data(0, b"x");
         assert_eq!(pair.read_far(1), b"x");
+    }
+
+    /// Paced TX of `N` bytes at baud `B` with `F` frame bits must block for
+    /// approximately `N * F * 1e6 / B` virtual microseconds (scale 1.0 ⇒ wall).
+    ///
+    /// We assert a lower bound of 50% of the theoretical cost (scheduler slack
+    /// can only make sleeps shorter under load, never invent free time) and a
+    /// generous upper bound so CI hosts with jitter still pass.
+    #[rstest]
+    #[case::ten_kbaud_2b(10_000, 10, 2, 2_000)]
+    #[case::twenty_kbaud_5b(20_000, 10, 5, 2_500)]
+    #[case::frame_11(10_000, 11, 2, 2_200)]
+    fn paced_tx_blocks_for_expected_virtual_us(
+        #[case] baud: u32,
+        #[case] frame_bits: u64,
+        #[case] nbytes: usize,
+        #[case] expected_v_us: u64,
+    ) {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+        set_frame_bits(frame_bits);
+        set_baud(0, baud);
+
+        let payload = vec![0xA5u8; nbytes];
+        let t0 = std::time::Instant::now();
+        transmit_data(0, &payload);
+        let wall_us = t0.elapsed().as_micros() as u64;
+
+        assert_eq!(pair.read_far(nbytes), payload.as_slice());
+        assert!(
+            wall_us >= expected_v_us / 2,
+            "paced TX too fast: wall={wall_us}us expected≥{}us (baud={baud} F={frame_bits} N={nbytes})",
+            expected_v_us / 2
+        );
+        assert!(
+            wall_us <= expected_v_us.saturating_mul(8).saturating_add(20_000),
+            "paced TX too slow: wall={wall_us}us expected≤{}us",
+            expected_v_us.saturating_mul(8).saturating_add(20_000)
+        );
+    }
+
+    /// RX pacing is independent of TX (full duplex): a paced receive after a
+    /// paced transmit still delivers the byte and incurs its own schedule cost.
+    #[rstest]
+    fn paced_rx_is_independent_full_duplex() {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+        set_frame_bits(10);
+        set_baud(0, 50_000); // 200 us/byte — measurable but snappy
+
+        // TX half: one byte.
+        let t_tx = std::time::Instant::now();
+        transmit_data(0, b"T");
+        let tx_us = t_tx.elapsed().as_micros() as u64;
+        assert_eq!(pair.read_far(1), b"T");
+        assert!(tx_us >= 100, "TX half should sleep ~200us, got {tx_us}");
+
+        // RX half: one byte from the far end.
+        pair.write_far(b"R");
+        let t_rx = std::time::Instant::now();
+        assert_eq!(receive_byte(0), Some(b'R'));
+        let rx_us = t_rx.elapsed().as_micros() as u64;
+        assert!(rx_us >= 100, "RX half should sleep ~200us, got {rx_us}");
+    }
+
+    /// Frame-bits / baud matrix: bytes always land intact under pacing.
+    #[rstest]
+    #[case::eight_n1(10, 100_000)]
+    #[case::eight_e1(11, 100_000)]
+    #[case::seven_n1(9, 100_000)]
+    fn paced_bytes_round_trip_for_frame_and_baud(#[case] frame_bits: u64, #[case] baud: u32) {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+        set_frame_bits(frame_bits);
+        set_baud(0, baud);
+        transmit_data(0, b"xy");
+        assert_eq!(pair.read_far(2), b"xy");
+        pair.write_far(b"z");
+        assert_eq!(receive_byte(0), Some(b'z'));
     }
 }

@@ -11,6 +11,7 @@
 //!   **silent** — perfect commands in, nothing out — with the engine's
 //!   `FloatingSense` finding naming the cause. The bench bug, live.
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -261,7 +262,7 @@ fn analog_volts(system: &SystemHandle, net: &str) -> f64 {
 /// 3-byte conversion for the MNA-solved bridge differential — the whole
 /// force path (bridge sources → jumpers → AIN senses → set_voltage →
 /// protocol model → TX stream) live, no hand wiring.
-#[test]
+#[rstest]
 fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000); // 115.2 kbaud pacing samples the clock
@@ -339,7 +340,7 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
 /// the exact bench symptom: the command stream is delivered, the chip never
 /// answers. (Two boards were condemned on the bench before a multimeter
 /// found this; here it is one assertion.)
-#[test]
+#[rstest]
 fn without_the_reset_bodge_the_chip_stays_silent() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000);

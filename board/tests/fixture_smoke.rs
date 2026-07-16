@@ -4,9 +4,11 @@
 //! KiCad major; this smoke test pins the fixture's shape so a bad re-export
 //! is caught immediately.
 
+use rstest::rstest;
+
 const DS2_ADDON: &str = include_str!("fixtures/ds2_addon.net");
 
-#[test]
+#[rstest]
 fn ds2_addon_fixture_is_a_kicad_sexpr_netlist_export() {
     assert!(
         DS2_ADDON.starts_with("(export (version \"E\")"),

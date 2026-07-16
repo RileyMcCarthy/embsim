@@ -11,11 +11,13 @@ pub const JS: &str = include_str!("../static/trace.js");
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// The compile-time-embedded view assets must be non-empty, otherwise the
     /// trace tab would render blank in the embsim-ui shell.
-    #[test]
+    #[rstest]
     fn embedded_assets_are_non_empty() {
         assert!(!HTML.trim().is_empty(), "trace.html must be embedded");
         assert!(!CSS.trim().is_empty(), "trace.css must be embedded");

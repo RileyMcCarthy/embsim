@@ -641,6 +641,8 @@ fn walk_type_fields(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use embsim_memory_inspect::{EnumInfo, FieldInfo, StructInfo, VariableInfo};
     use std::sync::{Mutex as StdMutex, OnceLock};
@@ -671,7 +673,7 @@ mod tests {
 
     // ── Signal constructors and group constants ──
 
-    #[test]
+    #[rstest]
     fn signal_new_has_empty_unit() {
         // Signal::new leaves the unit blank — embsim is unit-agnostic.
         let s = Signal::new("motor.position", groups::MODEL);
@@ -680,7 +682,7 @@ mod tests {
         assert_eq!(s.unit, "");
     }
 
-    #[test]
+    #[rstest]
     fn signal_with_unit_carries_unit() {
         // with_unit records the supplied unit verbatim.
         let s = Signal::with_unit("force", groups::PERIPHERAL, "N");
@@ -689,7 +691,7 @@ mod tests {
         assert_eq!(s.unit, "N");
     }
 
-    #[test]
+    #[rstest]
     fn group_constants_have_expected_labels() {
         // The conventional group labels the wiring/firmware discovery rely on.
         assert_eq!(groups::MODEL, "Model");
@@ -699,7 +701,7 @@ mod tests {
 
     // ── register / catalog / catalog_version ──
 
-    #[test]
+    #[rstest]
     fn register_adds_to_catalog_and_bumps_version() {
         let _g = lock_or_recover();
         test_setup();
@@ -711,7 +713,7 @@ mod tests {
         assert_eq!(cat[0].name, "a");
     }
 
-    #[test]
+    #[rstest]
     fn reregistering_same_name_does_not_duplicate_or_reorder() {
         let _g = lock_or_recover();
         test_setup();
@@ -728,7 +730,7 @@ mod tests {
         assert_eq!(cat[0].unit, "mm");
     }
 
-    #[test]
+    #[rstest]
     fn catalog_version_bumps_once_per_new_signal() {
         let _g = lock_or_recover();
         test_setup();
@@ -743,7 +745,7 @@ mod tests {
         assert_eq!(catalog().len(), 1);
     }
 
-    #[test]
+    #[rstest]
     fn catalog_is_empty_after_clear() {
         let _g = lock_or_recover();
         test_setup();
@@ -756,7 +758,7 @@ mod tests {
 
     // ── record vs resample_all vs record_at ──
 
-    #[test]
+    #[rstest]
     fn record_only_updates_latest_and_does_not_append() {
         let _g = lock_or_recover();
         test_setup();
@@ -771,7 +773,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn record_on_unknown_signal_is_a_no_op() {
         let _g = lock_or_recover();
         test_setup();
@@ -781,7 +783,7 @@ mod tests {
         assert!(data.is_empty());
     }
 
-    #[test]
+    #[rstest]
     fn resample_snapshots_latest_value_into_ring() {
         let _g = lock_or_recover();
         test_setup();
@@ -795,7 +797,7 @@ mod tests {
         assert_eq!(cursors.get("a"), Some(&1));
     }
 
-    #[test]
+    #[rstest]
     fn resample_skips_signals_without_latest_value() {
         let _g = lock_or_recover();
         test_setup();
@@ -812,7 +814,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn record_at_writes_directly_and_bumps_totals() {
         let _g = lock_or_recover();
         test_setup();
@@ -831,7 +833,7 @@ mod tests {
         assert_eq!(cursors.get("a"), Some(&2), "total_written advanced by 2");
     }
 
-    #[test]
+    #[rstest]
     fn record_at_on_unknown_signal_is_a_no_op() {
         let _g = lock_or_recover();
         test_setup();
@@ -843,7 +845,7 @@ mod tests {
 
     // ── read_new_samples cursor tracking + eviction math ──
 
-    #[test]
+    #[rstest]
     fn read_new_samples_cursor_advances_then_returns_nothing_new() {
         let _g = lock_or_recover();
         test_setup();
@@ -860,7 +862,7 @@ mod tests {
         assert_eq!(cursors2.get("a"), Some(&2), "cursor stays put");
     }
 
-    #[test]
+    #[rstest]
     fn read_new_samples_returns_only_the_new_ones_after_more_writes() {
         let _g = lock_or_recover();
         test_setup();
@@ -878,7 +880,7 @@ mod tests {
         assert_eq!(cursors2.get("a"), Some(&3));
     }
 
-    #[test]
+    #[rstest]
     fn read_new_samples_never_returns_more_than_were_written() {
         let _g = lock_or_recover();
         test_setup();
@@ -904,7 +906,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn read_new_samples_ignores_unsubscribed_and_unknown() {
         let _g = lock_or_recover();
         test_setup();
@@ -918,7 +920,7 @@ mod tests {
 
     // ── poll interval clamp ──
 
-    #[test]
+    #[rstest]
     fn poll_interval_clamps_below_min() {
         let _g = lock_or_recover();
         test_setup();
@@ -928,7 +930,7 @@ mod tests {
         assert_eq!(poll_interval_us(), 1_000);
     }
 
-    #[test]
+    #[rstest]
     fn poll_interval_clamps_above_max() {
         let _g = lock_or_recover();
         test_setup();
@@ -936,7 +938,7 @@ mod tests {
         assert_eq!(poll_interval_us(), 1_000_000, "above 1s clamps down to 1s");
     }
 
-    #[test]
+    #[rstest]
     fn poll_interval_passes_through_in_range() {
         let _g = lock_or_recover();
         test_setup();
@@ -951,7 +953,7 @@ mod tests {
 
     // ── register_c_variable / c_watches ──
 
-    #[test]
+    #[rstest]
     fn register_c_variable_builds_dotted_signal_name() {
         let _g = lock_or_recover();
         test_setup();
@@ -965,7 +967,7 @@ mod tests {
         assert!(catalog().iter().any(|s| s.name == "app_control_data.state"));
     }
 
-    #[test]
+    #[rstest]
     fn register_c_variable_empty_field_uses_bare_var_name() {
         let _g = lock_or_recover();
         test_setup();
@@ -979,7 +981,7 @@ mod tests {
         assert_eq!(watches[0].field_path, "");
     }
 
-    #[test]
+    #[rstest]
     fn register_c_variable_is_idempotent() {
         let _g = lock_or_recover();
         test_setup();
@@ -991,7 +993,7 @@ mod tests {
 
     // ── deactivate_signal ──
 
-    #[test]
+    #[rstest]
     fn deactivate_signal_removes_everything_and_returns_true() {
         let _g = lock_or_recover();
         test_setup();
@@ -1010,7 +1012,7 @@ mod tests {
         assert!(data.is_empty());
     }
 
-    #[test]
+    #[rstest]
     fn deactivate_absent_signal_returns_false() {
         let _g = lock_or_recover();
         test_setup();
@@ -1154,7 +1156,7 @@ mod tests {
         fw
     }
 
-    #[test]
+    #[rstest]
     fn is_char_type_matches_only_one_byte_char() {
         // Private helper: only a 1-byte type whose name contains "char".
         assert!(is_char_type(&TypeInfo::Base {
@@ -1181,7 +1183,7 @@ mod tests {
         }));
     }
 
-    #[test]
+    #[rstest]
     fn set_firmware_info_builds_sorted_catalog_with_expected_leaves() {
         let _g = lock_or_recover();
         test_setup();
@@ -1216,7 +1218,7 @@ mod tests {
         assert_eq!(names, sorted, "firmware catalog is sorted by signal_name");
     }
 
-    #[test]
+    #[rstest]
     fn set_firmware_info_carries_enum_type_on_enum_leaves() {
         let _g = lock_or_recover();
         test_setup();
@@ -1235,7 +1237,7 @@ mod tests {
         assert!(count.enum_type.is_none());
     }
 
-    #[test]
+    #[rstest]
     fn enum_definitions_returns_variants_of_referenced_types() {
         let _g = lock_or_recover();
         test_setup();
@@ -1250,7 +1252,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn set_firmware_info_field_path_is_relative_to_var() {
         let _g = lock_or_recover();
         test_setup();
@@ -1266,7 +1268,7 @@ mod tests {
 
     // ── activate_firmware_signal ──
 
-    #[test]
+    #[rstest]
     fn activate_firmware_signal_moves_catalog_entry_into_active() {
         let _g = lock_or_recover();
         test_setup();
@@ -1283,7 +1285,7 @@ mod tests {
             .any(|w| w.signal_name == "demo_data.count"));
     }
 
-    #[test]
+    #[rstest]
     fn activate_firmware_signal_unknown_returns_false() {
         let _g = lock_or_recover();
         test_setup();
@@ -1295,7 +1297,7 @@ mod tests {
         assert!(c_watches().is_empty());
     }
 
-    #[test]
+    #[rstest]
     fn activate_firmware_signal_idempotent_when_already_active() {
         let _g = lock_or_recover();
         test_setup();
@@ -1313,7 +1315,7 @@ mod tests {
 
     // ── clear() resets everything ──
 
-    #[test]
+    #[rstest]
     fn clear_resets_signals_data_watches_and_firmware_catalog() {
         let _g = lock_or_recover();
         test_setup();
@@ -1340,7 +1342,7 @@ mod tests {
 
     // ── SignalData / TraceStore defaults (pure construction) ──
 
-    #[test]
+    #[rstest]
     fn signal_data_new_starts_empty() {
         // A fresh SignalData has no samples, zero writes, and no latest value.
         let sd = SignalData::new();
@@ -1349,7 +1351,7 @@ mod tests {
         assert!(sd.latest_value.is_none());
     }
 
-    #[test]
+    #[rstest]
     fn trace_store_new_has_default_capacity_and_empty_collections() {
         // Defaults the public API depends on (100k ring, empty everything).
         let ts = TraceStore::new();

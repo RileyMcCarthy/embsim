@@ -454,6 +454,8 @@ fn write_all(fd: BorrowedFd<'_>, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     const ANALOG_3V3: NetState = NetState::Analog(3.3);
@@ -468,14 +470,14 @@ mod tests {
 
     /// Fresh gate: everything floating, chip dead — the engine has not yet
     /// delivered any sense, and the adapter must not assume power.
-    #[test]
+    #[rstest]
     fn gate_starts_dead() {
         assert!(!Gate::new().alive());
     }
 
     /// The full bench-good configuration: both rails at 3.3 V, reset tied
     /// high (the bodge) — alive.
-    #[test]
+    #[rstest]
     fn gate_alive_with_both_rails_and_reset_high() {
         assert!(gate_with(ANALOG_3V3, ANALOG_3V3, ANALOG_3V3).alive());
         // A digitally projected reset (e.g. the R10 pull-up rev) works too.
@@ -490,13 +492,13 @@ mod tests {
 
     /// The DS2Addon bench bug: a floating `~RESET` is a silent chip even
     /// with both supplies up.
-    #[test]
+    #[rstest]
     fn gate_dead_with_floating_reset() {
         assert!(!gate_with(NetState::Floating, ANALOG_3V3, ANALOG_3V3).alive());
     }
 
     /// Reset held low (or fought over) is a held-in-reset chip.
-    #[test]
+    #[rstest]
     fn gate_dead_with_reset_low_or_contended() {
         assert!(!gate_with(NetState::Driven(Level::Low), ANALOG_3V3, ANALOG_3V3).alive());
         assert!(!gate_with(NetState::Contention, ANALOG_3V3, ANALOG_3V3).alive());
@@ -504,7 +506,7 @@ mod tests {
 
     /// POR requires BOTH supplies (SBAS752B): an unstrapped (floating) AVDD
     /// or DVDD — or a rail sourced at 0 V — is a dead chip.
-    #[test]
+    #[rstest]
     fn gate_dead_with_either_supply_down() {
         assert!(!gate_with(ANALOG_3V3, NetState::Floating, ANALOG_3V3).alive());
         assert!(!gate_with(ANALOG_3V3, ANALOG_3V3, NetState::Floating).alive());
@@ -515,7 +517,7 @@ mod tests {
     /// V_IH scales with the solved DVDD rail (0.7 · DVDD, SBAS752B §7.3):
     /// 2.4 V clears the threshold at DVDD = 3.3 V (V_IH = 2.31 V) but not at
     /// DVDD = 5.0 V (V_IH = 3.5 V).
-    #[test]
+    #[rstest]
     fn reset_threshold_tracks_dvdd() {
         let reset = NetState::Analog(2.4);
         assert!(gate_with(reset, ANALOG_3V3, ANALOG_3V3).alive());
@@ -526,7 +528,7 @@ mod tests {
 
     /// The shared pin table stays the SBAS752B p.3 truth: 16 pins, UART
     /// stream roles on TX (15, producer) and RX (16, consumer) only.
-    #[test]
+    #[rstest]
     fn pin_table_declares_the_uart_stream_pins() {
         assert_eq!(ADS122U04_PINS.len(), 16);
         for decl in &ADS122U04_PINS {

@@ -54,9 +54,11 @@ pub fn get_clock_freq() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn ms_and_us_are_monotonic_non_decreasing() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -73,7 +75,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn ms_roughly_tracks_us() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -91,7 +93,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn clock_freq_is_the_pinned_frequency() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -99,7 +101,7 @@ mod tests {
         assert_eq!(get_clock_freq(), 180_000_000);
     }
 
-    #[test]
+    #[rstest]
     fn cycles_grow_with_a_positive_frequency() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -122,7 +124,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn wait_zero_returns_immediately() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -131,7 +133,7 @@ mod tests {
         wait_us(0);
     }
 
-    #[test]
+    #[rstest]
     fn wait_small_returns_without_hanging() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();

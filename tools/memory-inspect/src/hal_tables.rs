@@ -318,6 +318,8 @@ fn field_bool(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// A struct-shaped entry from (field, value) pairs.
@@ -341,7 +343,7 @@ mod tests {
 
     /// The MaD-shaped serial table decodes entry-by-entry, taking the pin
     /// enums' numeric values and ignoring extra fields (`type`, `LSB`).
-    #[test]
+    #[rstest]
     fn serial_table_decodes_pins_and_baud() {
         let table = Value::Array(vec![
             entry(vec![
@@ -377,7 +379,7 @@ mod tests {
 
     /// The GPIO table decodes `pin` + `activeLow`; `activeLow` accepts both
     /// `Bool` and 0/1 integer shapes (compilers differ on `bool` DWARF).
-    #[test]
+    #[rstest]
     fn gpio_table_decodes_pin_and_polarity() {
         let table = Value::Array(vec![
             entry(vec![("pin", pin(6)), ("activeLow", Value::Bool(false))]),
@@ -401,7 +403,7 @@ mod tests {
 
     /// The encoder table decodes the A/B phase pins, ignoring the preset and
     /// limit fields the consumer carries alongside them.
-    #[test]
+    #[rstest]
     fn encoder_table_decodes_phase_pins() {
         let table = Value::Array(vec![entry(vec![
             ("preset", Value::Int(0)),
@@ -421,7 +423,7 @@ mod tests {
     }
 
     /// The pulse-out table decodes the step pin, ignoring timing fields.
-    #[test]
+    #[rstest]
     fn pulse_out_table_decodes_pin() {
         let table = Value::Array(vec![entry(vec![
             ("maxHardwareClockCyclePerStep", Value::Int(131_070)),
@@ -433,7 +435,7 @@ mod tests {
 
     /// A non-array value (a lone struct, a scalar) is a `Shape` error naming
     /// the symbol — never a panic.
-    #[test]
+    #[rstest]
     fn non_array_table_is_a_shape_error() {
         let lone = entry(vec![("rx", pin(0))]);
         let err = decode_serial_table(&lone, "tbl").unwrap_err();
@@ -448,7 +450,7 @@ mod tests {
 
     /// Missing fields, non-integer fields, and values that do not fit `u32`
     /// each produce a `Shape` error naming the entry index and field.
-    #[test]
+    #[rstest]
     fn field_error_paths_name_index_and_field() {
         // Missing field.
         let table = Value::Array(vec![entry(vec![("rx", pin(0)), ("tx", pin(2))])]);
@@ -486,7 +488,7 @@ mod tests {
 
     /// `HalTableError` Display renders both variants; `Read` preserves the
     /// underlying error's message and source.
-    #[test]
+    #[rstest]
     fn error_display_and_source() {
         let read: HalTableError = ValueReadError::SymbolNotFound {
             symbol: "sym".to_string(),
