@@ -8,66 +8,18 @@
 
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, Diagnostics, DnpState, EndpointRef, Finding,
-    Harness, JumperState, NetState, PartRegistry, PinDecl, PinKind, Scenario, SenseKind,
-    StreamRole, System,
+    Harness, JumperState, NetState, PartRegistry, PinDecl, Scenario, SenseKind, System,
 };
+use embsim_models::ads122u04_component::ADS122U04_PINS;
 
 // ============================================================
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
 // ============================================================
 
-/// Build-time pin facade of the ADS122U04 (the protocol model lives in
-/// `embsim-models`; this facade is what the board engine wires and checks).
+/// Build-time pin facade of the ADS122U04. The pin table is the shared
+/// truth exported by the live component (`embsim-models`), so this analysis
+/// facade and the live component can never disagree on the pinout.
 struct Ads122u04Facade;
-
-const NONE: Option<StreamRole> = None;
-
-/// TSSOP-16 (PW) pinout per SBAS752B: 1 GPIO1, 2 GPIO0, 3 ~RESET, 4 DGND,
-/// 5 AVSS, 6 AIN3, 7 AIN2, 8 REFN, 9 REFP, 10 AIN1, 11 AIN0, 12 AVDD,
-/// 13 DVDD, 14 GPIO2/DRDY, 15 TX, 16 RX.
-const ADS122U04_PINS: [PinDecl; 16] = [
-    pin("1", Some("GPIO1"), PinKind::DigitalIn, NONE),
-    pin("2", Some("GPIO0"), PinKind::DigitalIn, NONE),
-    pin("3", Some("~RESET"), PinKind::DigitalIn, NONE),
-    pin("4", Some("DGND"), PinKind::PowerIn, NONE),
-    pin("5", Some("AVSS"), PinKind::PowerIn, NONE),
-    pin("6", Some("AIN3"), PinKind::Analog, NONE),
-    pin("7", Some("AIN2"), PinKind::Analog, NONE),
-    pin("8", Some("REFN"), PinKind::Analog, NONE),
-    pin("9", Some("REFP"), PinKind::Analog, NONE),
-    pin("10", Some("AIN1"), PinKind::Analog, NONE),
-    pin("11", Some("AIN0"), PinKind::Analog, NONE),
-    pin("12", Some("AVDD"), PinKind::PowerIn, NONE),
-    pin("13", Some("DVDD"), PinKind::PowerIn, NONE),
-    pin("14", Some("DRDY"), PinKind::DigitalIn, NONE),
-    pin(
-        "15",
-        Some("TX"),
-        PinKind::DigitalOut,
-        Some(StreamRole::Producer { baud_hz: 115_200 }),
-    ),
-    pin(
-        "16",
-        Some("RX"),
-        PinKind::DigitalIn,
-        Some(StreamRole::Consumer { baud_hz: 115_200 }),
-    ),
-];
-
-const fn pin(
-    number: &'static str,
-    name: Option<&'static str>,
-    kind: PinKind,
-    stream: Option<StreamRole>,
-) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        stream,
-        drive_impedance: None,
-    }
-}
 
 impl Component for Ads122u04Facade {
     fn pins(&self) -> &[PinDecl] {

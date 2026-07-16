@@ -17,6 +17,7 @@ use embsim_board::{
     System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock;
+use embsim_models::ads122u04_component::ADS122U04_PINS;
 
 // ============================================================
 // Shared probe plumbing
@@ -136,56 +137,9 @@ impl Component for FakeMcu {
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
 // ============================================================
 
-const NONE: Option<StreamRole> = None;
-
-const fn pin(
-    number: &'static str,
-    name: Option<&'static str>,
-    kind: PinKind,
-    stream: Option<StreamRole>,
-) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        stream,
-        drive_impedance: None,
-    }
-}
-
-/// TSSOP-16 (PW) pinout per SBAS752B; TX/RX declare their UART stream roles
-/// at the chip's 115.2 kbaud default.
-const ADS122U04_PINS: [PinDecl; 16] = [
-    pin("1", Some("GPIO1"), PinKind::DigitalIn, NONE),
-    pin("2", Some("GPIO0"), PinKind::DigitalIn, NONE),
-    pin("3", Some("~RESET"), PinKind::DigitalIn, NONE),
-    pin("4", Some("DGND"), PinKind::PowerIn, NONE),
-    pin("5", Some("AVSS"), PinKind::PowerIn, NONE),
-    pin("6", Some("AIN3"), PinKind::Analog, NONE),
-    pin("7", Some("AIN2"), PinKind::Analog, NONE),
-    pin("8", Some("REFN"), PinKind::Analog, NONE),
-    pin("9", Some("REFP"), PinKind::Analog, NONE),
-    pin("10", Some("AIN1"), PinKind::Analog, NONE),
-    pin("11", Some("AIN0"), PinKind::Analog, NONE),
-    pin("12", Some("AVDD"), PinKind::PowerIn, NONE),
-    pin("13", Some("DVDD"), PinKind::PowerIn, NONE),
-    pin("14", Some("DRDY"), PinKind::DigitalIn, NONE),
-    pin(
-        "15",
-        Some("TX"),
-        PinKind::DigitalOut,
-        Some(StreamRole::Producer { baud_hz: 115_200 }),
-    ),
-    pin(
-        "16",
-        Some("RX"),
-        PinKind::DigitalIn,
-        Some(StreamRole::Consumer { baud_hz: 115_200 }),
-    ),
-];
-
-/// Stream-capturing ADS122U04 facade (the protocol model lives in
-/// `embsim-models`; routing is what this facade exercises).
+/// Stream-capturing ADS122U04 facade (the pin table is the shared truth
+/// exported by the live component in `embsim-models`; routing is what this
+/// facade exercises).
 struct Ads122u04Facade {
     tx: TxSlot,
     rx: ByteLog,
