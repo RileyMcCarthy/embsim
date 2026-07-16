@@ -166,6 +166,10 @@ name = "embsim-board"
 version = "0.1.0"
 dependencies = [
  "embsim-core",
+ "embsim-models",
+ "embsim-peripherals",
+ "libc",
+ "nix",
  "tracing",
 ]
 
@@ -205,6 +209,7 @@ dependencies = [
 name = "embsim-models"
 version = "0.1.0"
 dependencies = [
+ "embsim-board",
  "embsim-core",
  "libc",
  "nix",
