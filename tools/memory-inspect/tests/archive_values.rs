@@ -14,7 +14,7 @@
 //! (the reference consumer's `libfirmware.a`); see its doc comment for why it
 //! cannot run in this repo's CI.
 
-use embsim_memory_inspect::{ArchiveValueReader, FirmwareInfo, Value, ValueReadError};
+use embsim_memory_inspect::{hal_tables, ArchiveValueReader, FirmwareInfo, Value, ValueReadError};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,6 +38,58 @@ const bool truthy = true;
 const float ratio = 1.5f;
 int32_t zeroed[3];
 int fixture_fn(int x) { return x + 1; }
+"#;
+
+/// A second C fixture shaped exactly like the reference consumer's Phase-0
+/// HAL config tables (MaD's `src/HAL/Config/*.c`): the four wiring tables
+/// under their default symbol names, with the extra per-channel fields the
+/// consumer carries (`type`/`LSB`, presets, step timing) that the
+/// `hal_tables` decoders must ignore.
+const HAL_TABLES_C: &str = r#"
+#include <stdint.h>
+#include <stdbool.h>
+typedef enum {
+    HW_PIN_P0 = 0, HW_PIN_P2 = 2, HW_PIN_P6 = 6, HW_PIN_P8 = 8, HW_PIN_P9 = 9,
+    HW_PIN_P10 = 10, HW_PIN_P16 = 16, HW_PIN_P53 = 53, HW_PIN_P55 = 55,
+    HW_PIN_COUNT = 64
+} HW_pin_E;
+typedef enum { HAL_SERIAL_TYPE_HW = 0, HAL_SERIAL_TYPE_COUNT = 1 } HAL_serial_type_E;
+typedef struct {
+    HW_pin_E rx;
+    HW_pin_E tx;
+    int32_t baud;
+    HAL_serial_type_E type;
+    bool LSB;
+} HAL_serial_channelConfig_S;
+const HAL_serial_channelConfig_S HAL_serial_channelConfig[2] = {
+    {HW_PIN_P0, HW_PIN_P2, 115200, HAL_SERIAL_TYPE_HW, false},
+    {HW_PIN_P53, HW_PIN_P55, 2000000, HAL_SERIAL_TYPE_HW, false},
+};
+typedef struct {
+    HW_pin_E pin;
+    bool activeLow;
+} HAL_GPIO_channelConfig_S;
+const HAL_GPIO_channelConfig_S HAL_GPIO_channelConfig[2] = {
+    {HW_PIN_P6, false},
+    {HW_PIN_P16, true},
+};
+typedef struct {
+    int32_t preset;
+    int32_t lo;
+    int32_t hi;
+    HW_pin_E pinA;
+    HW_pin_E pinB;
+} HAL_encoder_config_S;
+const HAL_encoder_config_S HAL_encoder_config[1] = {
+    {0, -1000000, 1000000, HW_PIN_P9, HW_PIN_P10},
+};
+typedef struct {
+    int32_t maxHardwareClockCyclePerStep;
+    HW_pin_E pin;
+} HAL_pulseOut_channelConfig_S;
+const HAL_pulseOut_channelConfig_S HAL_pulseOut_channelConfig[1] = {
+    {131070, HW_PIN_P8},
+};
 "#;
 
 // ============================================================
@@ -334,6 +386,96 @@ fn host_archive_reads_initialized_values() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The `hal_tables` helpers decode the four HAL-shaped config tables from a
+/// compiled archive under their default (reference-consumer) symbol names,
+/// ignoring the extra per-channel fields the consumer carries.
+#[test]
+fn hal_tables_decode_from_a_compiled_fixture_archive() {
+    let cc = match find_compiler() {
+        Some(c) => c,
+        None => {
+            eprintln!("SKIP: no C compiler (cc/clang/gcc) available");
+            return;
+        }
+    };
+    let Some(dir) = make_temp_dir("hal") else {
+        return;
+    };
+    let Some(o_path) = compile_object(cc, &dir, "hal", HAL_TABLES_C, &["-g", "-gdwarf-4"]) else {
+        return;
+    };
+    let a_path = dir.join("libhal.a");
+    if !archive_objects(&a_path, &[&o_path]) {
+        return;
+    }
+
+    let fw = FirmwareInfo::from_archive(&a_path).expect("parse HAL fixture archive");
+    let values = ArchiveValueReader::from_archive(&a_path).expect("index HAL fixture archive");
+
+    let serial =
+        hal_tables::read_serial_table(&values, &fw, hal_tables::DEFAULT_SERIAL_TABLE_SYMBOL)
+            .expect("serial table decodes");
+    assert_eq!(
+        serial,
+        vec![
+            hal_tables::SerialChannelConfig {
+                rx_pin: 0,
+                tx_pin: 2,
+                baud: 115_200
+            },
+            hal_tables::SerialChannelConfig {
+                rx_pin: 53,
+                tx_pin: 55,
+                baud: 2_000_000
+            },
+        ]
+    );
+
+    let gpio = hal_tables::read_gpio_table(&values, &fw, hal_tables::DEFAULT_GPIO_TABLE_SYMBOL)
+        .expect("GPIO table decodes");
+    assert_eq!(
+        gpio,
+        vec![
+            hal_tables::GpioChannelConfig {
+                pin: 6,
+                active_low: false
+            },
+            hal_tables::GpioChannelConfig {
+                pin: 16,
+                active_low: true
+            },
+        ]
+    );
+
+    let encoder =
+        hal_tables::read_encoder_table(&values, &fw, hal_tables::DEFAULT_ENCODER_TABLE_SYMBOL)
+            .expect("encoder table decodes");
+    assert_eq!(
+        encoder,
+        vec![hal_tables::EncoderConfig {
+            pin_a: 9,
+            pin_b: 10
+        }]
+    );
+
+    let pulse =
+        hal_tables::read_pulse_out_table(&values, &fw, hal_tables::DEFAULT_PULSE_OUT_TABLE_SYMBOL)
+            .expect("pulse-out table decodes");
+    assert_eq!(pulse, vec![hal_tables::PulseOutConfig { pin: 8 }]);
+
+    // A missing table symbol surfaces as the underlying read error.
+    let err = hal_tables::read_serial_table(&values, &fw, "HAL_no_such_table").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            hal_tables::HalTableError::Read(ValueReadError::SymbolNotFound { .. })
+        ),
+        "got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Missing symbols and symbols without DWARF variable entries produce the
 /// matching typed errors, not panics.
 #[test]
@@ -565,4 +707,64 @@ fn reads_mad_hal_config_tables() {
         Some(65_535 * 2)
     );
     assert_eq!(servo.field("pin").unwrap().as_i64(), Some(8));
+
+    // ── hal_tables helpers over the same archive ──
+    // The consumer-shaped decode layer must agree with the raw reads above:
+    // this is exactly what an MCU component's pin facade consumes.
+    let serial =
+        hal_tables::read_serial_table(&values, &fw, hal_tables::DEFAULT_SERIAL_TABLE_SYMBOL)
+            .expect("serial table decodes via hal_tables");
+    println!("hal_tables serial = {serial:?}");
+    assert_eq!(
+        serial[0],
+        hal_tables::SerialChannelConfig {
+            rx_pin: 0,
+            tx_pin: 2,
+            baud: 115_200
+        },
+        "FORCE_GAUGE channel"
+    );
+    assert_eq!(
+        serial[1],
+        hal_tables::SerialChannelConfig {
+            rx_pin: 53,
+            tx_pin: 55,
+            baud: 2_000_000
+        },
+        "MAIN channel"
+    );
+
+    let gpio = hal_tables::read_gpio_table(&values, &fw, hal_tables::DEFAULT_GPIO_TABLE_SYMBOL)
+        .expect("GPIO table decodes via hal_tables");
+    assert_eq!(gpio.len(), fw.channel_count("HAL_GPIO_channel_E"));
+    assert_eq!(
+        gpio[fw.enum_channel("HAL_GPIO_SERVO_ENA")],
+        hal_tables::GpioChannelConfig {
+            pin: 6,
+            active_low: false
+        }
+    );
+    assert_eq!(
+        gpio[fw.enum_channel("HAL_GPIO_ESD_UPPER")],
+        hal_tables::GpioChannelConfig {
+            pin: 16,
+            active_low: true
+        }
+    );
+
+    let encoder =
+        hal_tables::read_encoder_table(&values, &fw, hal_tables::DEFAULT_ENCODER_TABLE_SYMBOL)
+            .expect("encoder table decodes via hal_tables");
+    assert_eq!(
+        encoder[0],
+        hal_tables::EncoderConfig {
+            pin_a: 9,
+            pin_b: 10
+        }
+    );
+
+    let pulse =
+        hal_tables::read_pulse_out_table(&values, &fw, hal_tables::DEFAULT_PULSE_OUT_TABLE_SYMBOL)
+            .expect("pulse-out table decodes via hal_tables");
+    assert_eq!(pulse[0], hal_tables::PulseOutConfig { pin: 8 });
 }
