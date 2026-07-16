@@ -301,12 +301,30 @@ impl Scenario {
 // System
 // ============================================================
 
-/// System builder: named boards + harnesses + scenario.
+/// System builder: named boards + bench components + harnesses + scenario.
 #[derive(Debug, Default)]
 pub struct System {
     boards: Vec<(String, Board)>,
+    bench: Vec<BenchComponent>,
     harnesses: Vec<Harness>,
     scenario: Scenario,
+}
+
+/// A bench component: a bare [`Component`] added to the system without a
+/// board netlist — the "bench rigs that aren't a designed PCB" case from the
+/// design doc. Its declared pins become harness-addressable nets named
+/// `"{name}.{pin}"` (the bare `P2EVAL.P0` endpoint form).
+struct BenchComponent {
+    name: String,
+    component: Box<dyn Component>,
+}
+
+impl fmt::Debug for BenchComponent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BenchComponent")
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 /// One registered component prepared for attach: its wiring (per-pin net +
@@ -347,6 +365,27 @@ impl System {
     /// Add a named board.
     pub fn board(mut self, name: &str, board: Board) -> Self {
         self.boards.push((name.to_string(), board));
+        self
+    }
+
+    /// Add a named **bench component** — a bare [`Component`] with no board
+    /// netlist (a bench rig that isn't a designed PCB, e.g. an MCU dev
+    /// board or a transducer plugged straight into a harness).
+    ///
+    /// Each declared pin gets its own global net named `"{name}.{pin}"`
+    /// (declared number and alias both resolve), addressable as a bare
+    /// harness endpoint (`"P2EVAL.P0"`). Pins get the same electrical
+    /// descriptors as netlist-registered pins — drives, senses, and serial
+    /// stream roles all participate in resolution and routing. Endpoints
+    /// under the component's name that do not match a declared pin
+    /// synthesize a fresh external net, exactly like endpoints on unknown
+    /// names (so a bench rig can also source rails the component facade
+    /// does not declare, e.g. `"P2EVAL.3V3"` as a power endpoint).
+    pub fn component(mut self, name: &str, component: Box<dyn Component>) -> Self {
+        self.bench.push(BenchComponent {
+            name: name.to_string(),
+            component,
+        });
         self
     }
 
@@ -478,6 +517,16 @@ impl System {
                 return Err(SystemError::DuplicateBoard { name: name.clone() });
             }
         }
+        // Bench components share the boards' namespace: a bare "Name.Pin"
+        // endpoint on a *known board* name is an error, so a collision would
+        // make the bench pins unreachable from any harness.
+        for bench in &self.bench {
+            if !seen.insert(bench.name.clone()) {
+                return Err(SystemError::DuplicateComponent {
+                    name: bench.name.clone(),
+                });
+            }
+        }
 
         // -- global net table ---------------------------------------------
         // Global net = (board index, board-local NetId), flattened densely.
@@ -494,6 +543,40 @@ impl System {
                 nets.push(qualified);
             }
         }
+
+        // -- bench-component pin nets ---------------------------------------
+        // Every declared pin of a bench component gets its own global net,
+        // pre-seeded into the external-net table (under the pin number AND
+        // its alias) so a bare harness endpoint ("P2EVAL.P0") resolves to
+        // the live pin instead of synthesizing a disconnected net.
+        let mut external_nets: HashMap<String, usize> = HashMap::new();
+        // Per bench component, per declared pin: its global net index.
+        let mut bench_pin_nets: Vec<Vec<usize>> = Vec::new();
+        for bench in &self.bench {
+            let mut pin_nets = Vec::new();
+            for pin in bench.component.pins() {
+                let idx = nets.len();
+                let name = format!("{}.{}", bench.name, pin.number);
+                if external_nets.insert(name.clone(), idx).is_some() {
+                    return Err(SystemError::DuplicateComponent { name });
+                }
+                if let Some(alias) = pin.name {
+                    let alias_name = format!("{}.{alias}", bench.name);
+                    if external_nets.insert(alias_name.clone(), idx).is_some() {
+                        return Err(SystemError::DuplicateComponent { name: alias_name });
+                    }
+                }
+                nets.push(Net {
+                    id: NetId(idx),
+                    name,
+                    nodes: vec![PinRef::new(bench.name.clone(), pin.number)],
+                    state: NetState::Floating,
+                });
+                pin_nets.push(idx);
+            }
+            bench_pin_nets.push(pin_nets);
+        }
+
         let mut dsu = Dsu::new(nets.len());
 
         // (board name -> index) and ((board, PinRef) -> global net) lookups.
@@ -577,9 +660,8 @@ impl System {
         let mut power_sources: Vec<(usize, Volts)> = Vec::new();
         let mut stuck_sources: Vec<(usize, Volts)> = Vec::new();
 
-        // Bench-rig externals ("P2EVAL.P0") get synthetic nets on demand.
-        let mut external_nets: HashMap<String, usize> = HashMap::new();
-
+        // Bench-rig externals not matching a bench-component pin ("BENCH.3V3")
+        // get synthetic nets on demand, added to `external_nets` above.
         let harnesses = std::mem::take(&mut self.harnesses);
         for harness in &harnesses {
             for conn in harness.connections() {
@@ -721,6 +803,31 @@ impl System {
             }
         }
 
+        // Bench-component pins get the same electrical descriptors as
+        // netlist-registered pins. There is no netlist facade to validate —
+        // the declaration is the truth the nets were synthesized from.
+        let mut bench_endpoints: Vec<Vec<Option<EndpointId>>> = Vec::new();
+        for (bench, pin_nets) in self.bench.iter().zip(&bench_pin_nets) {
+            let mut eps = Vec::new();
+            for (pin, &net) in bench.component.pins().iter().zip(pin_nets) {
+                let pin_ref = PinRef::new(bench.name.clone(), pin.number);
+                let endpoint = add_pin_descriptor(&mut resolver, net, pin, &pin_ref);
+                if let Some(ep) = endpoint {
+                    if let Some(role) = pin.stream {
+                        resolver.add_stream_pin(ep, net, role, pin_ref);
+                    }
+                } else if pin.stream.is_some() {
+                    tracing::warn!(
+                        component = %bench.name,
+                        pin = pin.number,
+                        "stream role on a pin without a drive endpoint is ignored"
+                    );
+                }
+                eps.push(endpoint);
+            }
+            bench_endpoints.push(eps);
+        }
+
         // -- stream-drop faults (need the endpoint table) --------------------
         for (path, policy) in stream_drops {
             let (bi, pin) = split_board_pin(&path, &board_index).ok_or_else(|| {
@@ -773,6 +880,33 @@ impl System {
                     pins: prepared_pins,
                 });
             }
+        }
+
+        // Bench components attach after board components, in add order.
+        let bench = std::mem::take(&mut self.bench);
+        for ((bench, pin_nets), endpoints) in
+            bench.into_iter().zip(bench_pin_nets).zip(bench_endpoints)
+        {
+            let prepared_pins: Vec<PreparedPin> = bench
+                .component
+                .pins()
+                .iter()
+                .zip(&pin_nets)
+                .zip(endpoints)
+                .map(|((pin, &net), endpoint)| PreparedPin {
+                    number: pin.number.to_string(),
+                    name: pin.name.map(str::to_string),
+                    net,
+                    endpoint,
+                    stream: pin.stream,
+                })
+                .collect();
+            components.push(PreparedComponent {
+                board: bench.name.clone(),
+                reference: bench.name,
+                component: bench.component,
+                pins: prepared_pins,
+            });
         }
 
         Ok(Assembly {
@@ -1085,6 +1219,12 @@ pub enum SystemError {
         /// The colliding name.
         name: String,
     },
+    /// A bench component's name (or one of its pin identities) collides
+    /// with a board, another bench component, or another pin.
+    DuplicateComponent {
+        /// The colliding name (`"P2EVAL"`) or dotted pin (`"P2EVAL.P0"`).
+        name: String,
+    },
     /// A harness or scenario referenced a board/connector/pin that does not
     /// exist in the system.
     UnknownEndpoint {
@@ -1106,6 +1246,9 @@ impl fmt::Display for SystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SystemError::DuplicateBoard { name } => write!(f, "duplicate board name {name:?}"),
+            SystemError::DuplicateComponent { name } => {
+                write!(f, "duplicate bench component name {name:?}")
+            }
             SystemError::UnknownEndpoint { endpoint } => {
                 write!(f, "unknown endpoint {endpoint:?}")
             }

@@ -180,9 +180,23 @@ fn parse_sexp(input: &str) -> Result<Sexp, NetlistError> {
     Ok(root)
 }
 
+/// Skip whitespace and `;`-to-end-of-line comments. KiCad itself never emits
+/// comments, but committed netlist artifacts carry provenance headers (which
+/// tool exported them, the regeneration policy), and `;` line comments are
+/// the standard s-expression form. Quoted atoms are unaffected —
+/// `parse_quoted` consumes its bytes directly.
 fn skip_ws(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && (bytes[*pos] as char).is_whitespace() {
-        *pos += 1;
+    loop {
+        while *pos < bytes.len() && (bytes[*pos] as char).is_whitespace() {
+            *pos += 1;
+        }
+        if bytes.get(*pos) == Some(&b';') {
+            while *pos < bytes.len() && bytes[*pos] != b'\n' {
+                *pos += 1;
+            }
+        } else {
+            return;
+        }
     }
 }
 
@@ -396,6 +410,24 @@ mod tests {
         assert_eq!(normalize_pin_name("~{RESET}"), "~RESET");
         assert_eq!(normalize_pin_name("~RESET"), "~RESET");
         assert_eq!(normalize_pin_name("AIN0"), "AIN0");
+    }
+
+    /// `;` line comments — the provenance headers committed netlist
+    /// artifacts carry — are skipped anywhere whitespace is legal, and a
+    /// `;` inside a quoted atom stays data.
+    #[test]
+    fn line_comments_are_skipped() {
+        let input = "; provenance: exported by kicad-cli\n\
+                     ; regeneration: CI diff-check\n\
+                     (export (version \"E\")\n\
+                       ; components section\n\
+                       (components\n\
+                         (comp (ref \"R1\") (value \"47R; not a comment\")\n\
+                           (libsource (lib \"Device\") (part \"R_Small\")))))";
+        let parsed = parse(input).expect("commented netlist parses");
+        assert_eq!(parsed.version, "E");
+        assert_eq!(parsed.components.len(), 1);
+        assert_eq!(parsed.components[0].value, "47R; not a comment");
     }
 
     #[test]
