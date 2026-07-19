@@ -86,6 +86,8 @@ impl<T> Default for Observers<T> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -95,7 +97,7 @@ mod tests {
 
     /// A freshly constructed list (via `new` and `default`) is empty: `len` is
     /// 0 and `is_empty` is true.
-    #[test]
+    #[rstest]
     fn new_and_default_are_empty() {
         let a: Observers<f64> = Observers::new();
         assert_eq!(a.len(), 0);
@@ -108,7 +110,7 @@ mod tests {
 
     /// `subscribe` APPENDS rather than overwrites: registering a second observer
     /// grows the list and BOTH fire on a single emit.
-    #[test]
+    #[rstest]
     fn subscribe_appends_and_both_fire() {
         let ev: Observers<u32> = Observers::new();
         let hits = Arc::new(AtomicU32::new(0));
@@ -132,7 +134,7 @@ mod tests {
 
     /// `emit` invokes observers in registration order. Each observer logs its
     /// own index; the recorded order must be ascending [0, 1, 2].
-    #[test]
+    #[rstest]
     fn emit_fires_in_registration_order() {
         let ev: Observers<()> = Observers::new();
         let order = Arc::new(StdMutex::new(Vec::<usize>::new()));
@@ -150,7 +152,7 @@ mod tests {
 
     /// `emit` clones the value once per observer. A `Clone`-counting payload
     /// proves each registered observer received its own clone.
-    #[test]
+    #[rstest]
     fn emit_clones_value_per_observer() {
         // Payload whose `Clone` impl bumps a shared counter.
         struct Tracked {
@@ -193,7 +195,7 @@ mod tests {
 
     /// `clear` empties the list so a subsequent `emit` fires nothing, and
     /// `is_empty`/`len` reflect the cleared state.
-    #[test]
+    #[rstest]
     fn clear_empties_and_silences_emit() {
         let ev: Observers<u8> = Observers::new();
         let hits = Arc::new(AtomicU32::new(0));
@@ -217,7 +219,7 @@ mod tests {
 
     /// Multiple `emit` calls re-fire every observer each time (observers are not
     /// one-shot).
-    #[test]
+    #[rstest]
     fn multiple_emits_refire_all_observers() {
         let ev: Observers<u32> = Observers::new();
         let hits = Arc::new(AtomicU32::new(0));
@@ -236,7 +238,7 @@ mod tests {
     }
 
     /// `emit` on an observer-less list is a harmless no-op.
-    #[test]
+    #[rstest]
     fn emit_with_no_observers_is_noop() {
         let ev: Observers<i64> = Observers::new();
         ev.emit(-42); // must not panic

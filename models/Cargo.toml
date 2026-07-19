@@ -10,7 +10,11 @@ keywords = ["embedded", "emulator", "simulation", "sil"]
 categories = ["embedded", "simulation"]
 
 [dependencies]
+embsim-board = { path = "../board" }
 embsim-core = { path = "../core" }
 nix.workspace = true
 libc.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

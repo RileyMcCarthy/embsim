@@ -206,6 +206,8 @@ pub fn join_all_threads() {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::atomic::AtomicBool;
 
@@ -223,7 +225,7 @@ mod tests {
         init(max);
     }
 
-    #[test]
+    #[rstest]
     fn init_at_max_threads_is_allowed() {
         let _g = crate::test_support::guard();
         // Exactly MAX_THREADS is the inclusive upper bound.
@@ -232,7 +234,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_threads_panics() {
         let _g = crate::test_support::guard();
@@ -240,7 +242,7 @@ mod tests {
         init(MAX_THREADS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn start_thread_runs_function_and_returns_slot_id() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -258,7 +260,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn start_thread_with_null_function_returns_minus_one() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -268,7 +270,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn slots_are_reused_after_join() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -289,7 +291,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn reset_clears_handle_table_after_join() {
         let _g = crate::test_support::guard();
         setup(2);

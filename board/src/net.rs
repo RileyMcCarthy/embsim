@@ -23,8 +23,10 @@ pub type Volts = f64;
 /// [`crate::component::PinDecl::drive_impedance`]).
 pub const DEFAULT_PUSH_PULL_IMPEDANCE: Ohms = 25.0;
 
-/// Series-resistance collapse threshold for stream routing: series passives
-/// below this value collapse into a serial link route.
+/// Series-resistance collapse threshold: series passives whose accumulated
+/// resistance stays below this value collapse into a serial link route, and
+/// disagreeing push-pull drivers coupled below it resolve to
+/// [`NetState::Contention`] rather than a divided voltage.
 pub const STREAM_COLLAPSE_THRESHOLD: Ohms = 1_000.0;
 
 /// Impedance-escalation ratio: a competing path whose Thevenin impedance is
@@ -120,20 +122,82 @@ pub struct Net {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn pin_ref_equality_is_structural() {
-        assert_eq!(PinRef::new("U1", "3"), PinRef::new("U1", "3"));
-        assert_ne!(PinRef::new("U1", "3"), PinRef::new("U1", "4"));
+    #[rstest]
+    #[case::same_pin("U1", "3", "U1", "3", true)]
+    #[case::diff_pin("U1", "3", "U1", "4", false)]
+    #[case::diff_ref("U1", "3", "U2", "3", false)]
+    fn pin_ref_equality_is_structural(
+        #[case] r1: &str,
+        #[case] p1: &str,
+        #[case] r2: &str,
+        #[case] p2: &str,
+        #[case] eq: bool,
+    ) {
+        let a = PinRef::new(r1, p1);
+        let b = PinRef::new(r2, p2);
+        assert_eq!(a == b, eq);
     }
 
-    #[test]
-    fn net_state_projections_compare() {
-        assert_eq!(NetState::Driven(Level::High), NetState::Driven(Level::High));
-        assert_ne!(
-            NetState::Driven(Level::High),
-            NetState::Pulled(Level::High, 4_700.0)
-        );
+    /// Net-state identity matrix — digital projections must not collapse into
+    /// each other under `PartialEq` (so diagnostics and tests can distinguish
+    /// Driven vs Pulled vs Contention vs Analog vs Floating).
+    #[rstest]
+    #[case::driven_h(NetState::Driven(Level::High))]
+    #[case::driven_l(NetState::Driven(Level::Low))]
+    #[case::pulled_h(NetState::Pulled(Level::High, 4_700.0))]
+    #[case::pulled_l(NetState::Pulled(Level::Low, 10_000.0))]
+    #[case::floating(NetState::Floating)]
+    #[case::contention(NetState::Contention)]
+    #[case::analog(NetState::Analog(1.65))]
+    fn net_state_equals_self(#[case] state: NetState) {
+        let copy = state;
+        assert_eq!(state, copy);
+    }
+
+    #[rstest]
+    #[case::driven_vs_pulled(NetState::Driven(Level::High), NetState::Pulled(Level::High, 4_700.0))]
+    #[case::driven_h_vs_l(NetState::Driven(Level::High), NetState::Driven(Level::Low))]
+    #[case::pulled_impedance(
+        NetState::Pulled(Level::High, 1_000.0),
+        NetState::Pulled(Level::High, 4_700.0)
+    )]
+    #[case::floating_vs_contention(NetState::Floating, NetState::Contention)]
+    #[case::analog_vs_driven(NetState::Analog(3.3), NetState::Driven(Level::High))]
+    fn net_state_projections_are_distinct(#[case] a: NetState, #[case] b: NetState) {
+        assert_ne!(a, b);
+    }
+
+    #[rstest]
+    #[case::default_pp(DEFAULT_PUSH_PULL_IMPEDANCE, 25.0)]
+    #[case::stream_collapse(STREAM_COLLAPSE_THRESHOLD, 1_000.0)]
+    #[case::escalation(ESCALATION_IMPEDANCE_RATIO, 10.0)]
+    fn published_thresholds_match_design_doc(#[case] actual: f64, #[case] expected: f64) {
+        assert!((actual - expected).abs() < f64::EPSILON);
+    }
+
+    #[rstest]
+    fn thevenin_drive_is_copy_eq() {
+        let d = TheveninDrive {
+            volts: 3.3,
+            impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
+        };
+        let d2 = d;
+        assert_eq!(d, d2);
+    }
+
+    #[rstest]
+    fn net_struct_holds_membership_and_state() {
+        let net = Net {
+            id: NetId(0),
+            name: "NET".into(),
+            nodes: vec![PinRef::new("U1", "1"), PinRef::new("R1", "1")],
+            state: NetState::Floating,
+        };
+        assert_eq!(net.nodes.len(), 2);
+        assert_eq!(net.state, NetState::Floating);
     }
 }

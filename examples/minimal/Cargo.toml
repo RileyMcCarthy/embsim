@@ -16,3 +16,6 @@ embsim-memory-inspect = { path = "../../tools/memory-inspect" }
 # Core primitives (virtual clock, PTY, event). Not strictly required by this
 # example, but listed so the template shows where the bottom layer comes from.
 embsim-core = { path = "../../core" }
+
+[dev-dependencies]
+rstest.workspace = true

@@ -95,6 +95,8 @@ pub fn vfs_open_sdcard() -> *mut std::ffi::c_void {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::ffi::CString;
 
@@ -107,7 +109,7 @@ mod tests {
         std::env::temp_dir().join(format!("embsim_fs_{}_{}_{}", tag, std::process::id(), n))
     }
 
-    #[test]
+    #[rstest]
     fn init_creates_the_directory() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -120,7 +122,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
+    #[rstest]
     fn per_instance_path_is_independent() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -137,7 +139,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
-    #[test]
+    #[rstest]
     fn mount_valid_path_returns_zero_and_creates_dir() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -150,7 +152,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
+    #[rstest]
     fn mount_null_returns_minus_one() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -159,7 +161,7 @@ mod tests {
         assert_eq!(rc, -1);
     }
 
-    #[test]
+    #[rstest]
     fn umount_valid_returns_zero() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -170,7 +172,7 @@ mod tests {
         assert_eq!(rc, 0);
     }
 
-    #[test]
+    #[rstest]
     fn umount_null_returns_minus_one() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -178,7 +180,7 @@ mod tests {
         assert_eq!(rc, -1);
     }
 
-    #[test]
+    #[rstest]
     fn vfs_open_sdcard_returns_null() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();

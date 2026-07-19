@@ -189,6 +189,8 @@ async fn handle_ws(mut socket: WebSocket) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use std::sync::Mutex as StdMutex;
 
     /// `register_view` mutates the process-global embsim-ui registry; serialize
@@ -206,7 +208,7 @@ mod tests {
     /// without panicking. The registry's contents are private to embsim-ui, so
     /// (per the assignment) we can only assert that the call succeeds and that
     /// re-registering after a clear is also fine.
-    #[test]
+    #[rstest]
     fn register_view_does_not_panic() {
         let _g = lock_or_recover();
         embsim_ui::clear_views();
@@ -223,7 +225,7 @@ mod tests {
     /// We can at least assert the handler factory matches the registry's
     /// `WsHandler` fn-pointer signature (a compile-time guarantee), without
     /// invoking it.
-    #[test]
+    #[rstest]
     fn ws_handler_factory_matches_registry_signature() {
         let handler: embsim_ui::WsHandler = super::ws_handler;
         // Use the binding so it isn't optimized away / flagged unused.

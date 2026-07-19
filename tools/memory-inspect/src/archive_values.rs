@@ -647,13 +647,15 @@ fn sign_extend(raw: u64, bits: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::types::{FieldInfo, StructInfo};
 
     // ── read_uint / sign_extend ──
 
     /// `read_uint` assembles both endiannesses and rejects bad sizes.
-    #[test]
+    #[rstest]
     fn read_uint_endianness_and_bounds() {
         let bytes = [0x01, 0x02, 0x03, 0x04];
         assert_eq!(read_uint(&bytes, 4, true), Some(0x0403_0201));
@@ -669,7 +671,7 @@ mod tests {
     }
 
     /// `sign_extend` extends negative values and passes positives through.
-    #[test]
+    #[rstest]
     fn sign_extend_cases() {
         assert_eq!(sign_extend(0xFF, 8), -1);
         assert_eq!(sign_extend(0x7F, 8), 127);
@@ -754,7 +756,7 @@ mod tests {
     }
 
     /// An array of config structs decodes element-by-element, field-by-field.
-    #[test]
+    #[rstest]
     fn decodes_array_of_config_structs() {
         let fw = config_fw();
         let ti = TypeInfo::Array {
@@ -797,7 +799,7 @@ mod tests {
 
     /// Scalar shapes decode to the matching `Value` variant (both endiannesses
     /// for a multi-byte int).
-    #[test]
+    #[rstest]
     fn decodes_scalars() {
         let fw = FirmwareInfo::new();
 
@@ -859,7 +861,7 @@ mod tests {
     }
 
     /// Bitfields extract the right bits; signed ones sign-extend.
-    #[test]
+    #[rstest]
     fn decodes_bitfields() {
         let fw = FirmwareInfo::new();
 
@@ -890,7 +892,7 @@ mod tests {
     /// absolute DWARF5 `DW_AT_data_bit_offset` the parser could not normalize
     /// to the member's byte offset) is a `Decode` error — never a silently
     /// wrapped shift returning wrong bits.
-    #[test]
+    #[rstest]
     fn out_of_range_bitfield_is_a_decode_error() {
         let fw = FirmwareInfo::new();
 
@@ -941,7 +943,7 @@ mod tests {
     }
 
     /// Pointers and unknown types decode to `Opaque`, never garbage integers.
-    #[test]
+    #[rstest]
     fn pointers_and_unknowns_are_opaque() {
         let fw = FirmwareInfo::new();
         let bytes = [0u8; 8];
@@ -957,7 +959,7 @@ mod tests {
 
     /// A struct type with no layout in `FirmwareInfo`, or bytes too short for
     /// a field, produce `Decode` errors — not panics or wrong values.
-    #[test]
+    #[rstest]
     fn decode_error_paths() {
         let fw = config_fw();
 
@@ -979,7 +981,7 @@ mod tests {
     // ── Value accessors ──
 
     /// The accessors return `Some` for matching shapes and `None` otherwise.
-    #[test]
+    #[rstest]
     fn value_accessors() {
         assert_eq!(Value::Int(-3).as_i64(), Some(-3));
         assert_eq!(Value::UInt(7).as_i64(), Some(7));
@@ -1019,7 +1021,7 @@ mod tests {
     }
 
     /// `ValueReadError` Display renders every variant with the symbol name.
-    #[test]
+    #[rstest]
     fn error_display() {
         let cases: Vec<ValueReadError> = vec![
             ValueReadError::SymbolNotFound {

@@ -14,3 +14,6 @@ embsim-core = { path = "../core" }
 parking_lot.workspace = true
 nix.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
