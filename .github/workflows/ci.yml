@@ -134,3 +134,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build (workspace) on MSRV
         run: cargo build --workspace
+
+  # Single required status check for branch protection on `main`. Aggregates
+  # every job above: fails if any FAILED/CANCELLED, passes when all succeeded.
+  # Mark "CI Gate" as the required check so individual job renames don't leave
+  # protection pointing at a missing context. Jobs are not path-filtered, so
+  # none are "legitimately skipped" today — still use always() so a cancelled
+  # matrix leg can't leave the gate stuck pending forever.
+  ci-gate:
+    name: CI Gate
+    needs:
+      - test
+      - coverage
+      - lint
+      - docs
+      - supply-chain
+      - msrv
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS"
+          failed=$(echo "$NEEDS" | jq -r 'to_entries[]
+            | select(.value.result == "failure" or .value.result == "cancelled")
+            | .key')
+          if [ -n "$failed" ]; then
+            echo "::error::CI Gate failed — these required jobs did not pass:"
+            echo "$failed"
+            exit 1
+          fi
+          echo "CI Gate passed — every required job succeeded."

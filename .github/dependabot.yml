@@ -12,3 +12,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The `msrv (1.88)` job intentionally pins `dtolnay/rust-toolchain@1.88`
+      # to the workspace `rust-version` floor. Dependabot must not open PRs
+      # that bump that pin alone (see closed #7). Raise MSRV in a dedicated
+      # PR that updates Cargo.toml rust-version + the msrv job together.
+      # Other jobs use `@stable` (floating); ignoring this action is fine.
+      - dependency-name: "dtolnay/rust-toolchain"
