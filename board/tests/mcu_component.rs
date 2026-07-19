@@ -16,6 +16,7 @@
 //! Only one test may touch the process-default peripheral instance and the
 //! process-global virtual clock; the fixture-shape tests stay pure.
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -142,7 +143,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 
 /// Firmware-side bytes cross the bridge to the peer and back, and dropping
 /// the system joins the engine and the pump threads cleanly.
-#[test]
+#[rstest]
 fn bridged_serial_channel_roundtrips_to_a_peer_board() {
     // Stream pacing samples the free-running virtual clock; 50x scale keeps
     // the 115.2 kbaud pacing sub-millisecond in wall time.
@@ -265,7 +266,7 @@ fn bridged_serial_channel_roundtrips_to_a_peer_board() {
 /// The FG channel's pin table: P0 is the Consumer-side (MCU RX) pin and P2
 /// the Producer-side (MCU TX) pin, both paced at the table's 115.2 kbaud —
 /// the emulator invents no baud of its own.
-#[test]
+#[rstest]
 fn fg_channel_pin_table_matches_the_hal_config() {
     let mcu = McuComponent::builder("p2")
         .serial_table(vec![FG])

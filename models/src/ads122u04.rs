@@ -429,6 +429,8 @@ fn write_bytes(fd: RawFd, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Build an `Ads122u04` with simple, exact transfer-function parameters.
@@ -494,7 +496,7 @@ mod tests {
 
     /// Every data-rate code maps to the datasheet interval, the reserved code
     /// (111) falls back to the fastest rate, and bit 4 (turbo) halves it.
-    #[test]
+    #[rstest]
     fn conversion_interval_full_dr_table() {
         // (DR code in bits 7:5) → expected normal-mode interval (µs).
         let table: [(u8, u64); 8] = [
@@ -527,7 +529,7 @@ mod tests {
     /// Turbo bit in isolation halves the default (DR=000) interval and the
     /// lowest data rate, independent of the other low bits which must be
     /// ignored.
-    #[test]
+    #[rstest]
     fn conversion_interval_ignores_low_bits() {
         // DR=000, turbo=0, but assorted junk in bits 3:0 — must not matter.
         assert_eq!(conversion_interval_us(0b0000_1111 & 0b0000_1111), 50_000);
@@ -539,7 +541,7 @@ mod tests {
     // ── voltage_to_adc: transfer function ──
 
     /// Zero volts maps exactly to the calibrated zero offset.
-    #[test]
+    #[rstest]
     fn voltage_zero_is_zero_offset() {
         let (adc, _fw) = make_adc(1.0, 1234);
         adc.set_voltage(0.0);
@@ -548,7 +550,7 @@ mod tests {
 
     /// A known voltage maps to `round_toward_zero(v*gain*2^23/vref) + offset`.
     /// With vref == 2^21 and gain 1, the factor `2^23/vref` is exactly 4.
-    #[test]
+    #[rstest]
     fn voltage_maps_to_expected_code() {
         let (adc, _fw) = make_adc(1.0, 0);
         adc.set_voltage(100.0);
@@ -563,7 +565,7 @@ mod tests {
     }
 
     /// Doubling the PGA gain doubles the resulting code (offset held at 0).
-    #[test]
+    #[rstest]
     fn gain_scales_code_linearly() {
         let (g1, _a) = make_adc(1.0, 0);
         let (g2, _b) = make_adc(2.0, 0);
@@ -576,7 +578,7 @@ mod tests {
     }
 
     /// A negative voltage produces a code strictly below the zero offset.
-    #[test]
+    #[rstest]
     fn negative_voltage_is_below_zero_offset() {
         let (adc, _fw) = make_adc(1.0, 5000);
         adc.set_voltage(-50.0);
@@ -593,7 +595,7 @@ mod tests {
 
     /// SYNC then RDATA answers with the latest 3-byte conversion immediately
     /// (manual data read mode fetch).
-    #[test]
+    #[rstest]
     fn rdata_sends_latest_conversion() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -614,7 +616,7 @@ mod tests {
     }
 
     /// SYNC then START enters continuous mode.
-    #[test]
+    #[rstest]
     fn sync_then_start_sets_continuous() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -628,7 +630,7 @@ mod tests {
     }
 
     /// RESET clears continuous mode and zeroes all registers.
-    #[test]
+    #[rstest]
     fn reset_clears_continuous_and_registers() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -644,7 +646,7 @@ mod tests {
     }
 
     /// POWERDOWN clears continuous mode (registers untouched).
-    #[test]
+    #[rstest]
     fn powerdown_clears_continuous() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -664,7 +666,7 @@ mod tests {
 
     /// WREG writes the data byte into the register selected by `(cmd>>1)&0xF`.
     /// `0b0100` upper nibble = WREG; register index 2 → command `0x44`.
-    #[test]
+    #[rstest]
     fn wreg_writes_selected_register() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -690,7 +692,7 @@ mod tests {
     }
 
     /// Two consecutive WREG transactions write two different registers.
-    #[test]
+    #[rstest]
     fn wreg_multiple_registers() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -712,7 +714,7 @@ mod tests {
     /// RREG (upper nibble 0b0010) returns to WaitSync and emits the register
     /// value on the fd; a subsequent SYNC+START still works, proving the state
     /// machine recovered cleanly.
-    #[test]
+    #[rstest]
     fn rreg_returns_to_waitsync_and_emits_value() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -738,7 +740,7 @@ mod tests {
 
     /// RREG on an out-of-range register index emits a single `0` byte and does
     /// not panic.
-    #[test]
+    #[rstest]
     fn rreg_invalid_register_emits_zero() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -754,7 +756,7 @@ mod tests {
 
     /// WREG to an out-of-range register index is silently ignored on the data
     /// byte (no panic, no register mutation).
-    #[test]
+    #[rstest]
     fn wreg_invalid_register_is_ignored() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -774,7 +776,7 @@ mod tests {
     /// A non-sync byte in WaitSync is discarded and we stay in WaitSync: a
     /// following command byte (without a sync first) is treated as garbage and
     /// does NOT enter continuous mode.
-    #[test]
+    #[rstest]
     fn non_sync_byte_stays_in_waitsync() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -792,7 +794,7 @@ mod tests {
 
     /// An unknown command (sync OK, but command nibble is neither RREG/WREG nor
     /// a known opcode) returns to WaitSync without side effects.
-    #[test]
+    #[rstest]
     fn unknown_command_returns_to_waitsync() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -817,7 +819,7 @@ mod tests {
 
     /// `send_conversion` writes the low, middle, then high byte of the 24-bit
     /// ADC value (little-endian).
-    #[test]
+    #[rstest]
     fn send_conversion_packs_little_endian() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -831,7 +833,7 @@ mod tests {
     /// Only the low 24 bits are transmitted on the wire (the value itself is
     /// clipped to the 24-bit code range before it ever reaches here — see
     /// `voltage_clips_at_full_scale`).
-    #[test]
+    #[rstest]
     fn send_conversion_truncates_to_24_bits() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -849,7 +851,7 @@ mod tests {
     /// SBAS752B §8.5.2 (p.35): "A positive full-scale input … produces an
     /// output code of 7FFFFFh and a negative full-scale input … 800000h. The
     /// output clips at these codes for signals that exceed full-scale."
-    #[test]
+    #[rstest]
     fn voltage_clips_at_full_scale() {
         // vref 2^21 mV, gain 1 → +FS input = vref → code 2^23 clips to 7FFFFFh.
         let (adc, _fw) = make_adc(1.0, 0);
@@ -865,7 +867,7 @@ mod tests {
     }
 
     /// Zero packs to three zero bytes.
-    #[test]
+    #[rstest]
     fn send_conversion_zero() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -875,7 +877,7 @@ mod tests {
     }
 
     /// `Config` derives `Clone`/`Debug`.
-    #[test]
+    #[rstest]
     fn config_clone_and_debug() {
         let c = Config {
             vref_mv: 2048.0,

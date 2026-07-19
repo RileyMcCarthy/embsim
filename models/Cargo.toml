@@ -15,3 +15,6 @@ embsim-core = { path = "../core" }
 nix.workspace = true
 libc.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

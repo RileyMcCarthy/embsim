@@ -40,3 +40,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+# Test harness: discrete case matrices (`#[rstest]`, `#[case]`, `#[values]`).
+# See TESTING.md. All workspace crates that ship tests take this as a
+# dev-dependency so failure names and filters stay consistent.
+rstest = "0.25"
+# Property testing for continuous domains only (MNA ladders, buffer clamps).
+# Prefer rstest for enums / channel indices / OOR grids.
+proptest = "1"

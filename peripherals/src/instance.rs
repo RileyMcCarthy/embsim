@@ -245,6 +245,8 @@ impl Drop for InstanceGuard {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use nix::libc;
     use std::os::fd::{BorrowedFd, RawFd};
@@ -306,7 +308,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn unbound_thread_falls_back_to_the_default_singleton() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -316,7 +318,7 @@ mod tests {
         assert!(Arc::ptr_eq(&default(), &default()));
     }
 
-    #[test]
+    #[rstest]
     fn two_instances_have_independent_serial_channel_state() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -350,7 +352,7 @@ mod tests {
         assert_eq!(wire_a.read_far(2), b"ok");
     }
 
-    #[test]
+    #[rstest]
     fn bound_thread_routes_free_functions_to_its_instance() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -383,7 +385,7 @@ mod tests {
         crate::serial::reset();
     }
 
-    #[test]
+    #[rstest]
     fn dropping_the_guard_restores_the_previous_binding() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -415,7 +417,7 @@ mod tests {
     /// the first drop would unbind the still-guarded instance and the second
     /// would resurrect the first's — leaving the thread bound with no live
     /// guard. The drop handler must panic instead.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "InstanceGuard dropped out of LIFO order")]
     fn non_lifo_guard_drop_panics() {
         let _g = crate::test_support::guard();
@@ -425,7 +427,7 @@ mod tests {
         drop(g1); // out of order: `_g2` is still live → panics
     }
 
-    #[test]
+    #[rstest]
     fn threads_spawned_via_system_inherit_the_creators_instance() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -463,7 +465,7 @@ mod tests {
         inst.system.reset();
     }
 
-    #[test]
+    #[rstest]
     fn clock_freq_override_is_per_instance_with_global_fallback() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -487,5 +489,129 @@ mod tests {
             inst.effective_clock_freq(),
             embsim_core::virtual_clock::clock_freq()
         );
+    }
+
+    /// GPIO free functions under two binds never cross-contaminate channel state.
+    #[rstest]
+    fn two_instances_have_independent_gpio_state() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        let a = Arc::new(PeripheralInstance::new());
+        let b = Arc::new(PeripheralInstance::new());
+        a.gpio.init(2, None);
+        b.gpio.init(2, None);
+
+        a.gpio.set_active(0, true);
+        assert!(a.gpio.get_active(0));
+        assert!(!b.gpio.get_active(0), "B must not see A's GPIO write");
+
+        b.gpio.set_active(0, true);
+        assert!(b.gpio.get_active(0));
+        // Free functions on a bound thread hit only the bound bank.
+        let for_thread = Arc::clone(&a);
+        std::thread::spawn(move || {
+            let _bind = bind_current_thread(Arc::clone(&for_thread));
+            crate::gpio::set_active(1, true);
+            assert!(crate::gpio::get_active(1));
+            assert!(crate::gpio::get_active(0), "still sees own channel 0");
+        })
+        .join()
+        .expect("gpio bind thread");
+        assert!(a.gpio.get_active(1), "bound free-fn write landed on A");
+        assert!(!b.gpio.get_active(1), "B channel 1 untouched");
+    }
+
+    /// Encoder free functions under two binds never cross-contaminate counts.
+    #[rstest]
+    fn two_instances_have_independent_encoder_state() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        let a = Arc::new(PeripheralInstance::new());
+        let b = Arc::new(PeripheralInstance::new());
+        a.encoder.init(1);
+        b.encoder.init(1);
+        a.encoder.set(0, 42);
+        assert_eq!(a.encoder.value(0), 42);
+        assert_eq!(b.encoder.value(0), 0);
+
+        let for_thread = Arc::clone(&b);
+        std::thread::spawn(move || {
+            let _bind = bind_current_thread(Arc::clone(&for_thread));
+            crate::encoder::set(0, 99);
+            assert_eq!(crate::encoder::value(0), 99);
+        })
+        .join()
+        .expect("encoder bind thread");
+        assert_eq!(b.encoder.value(0), 99);
+        assert_eq!(a.encoder.value(0), 42, "A encoder untouched by B bind");
+    }
+
+    /// Pulse-out free functions under two binds never share train state.
+    #[rstest]
+    fn two_instances_have_independent_pulse_out_state() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        let a = Arc::new(PeripheralInstance::new());
+        let b = Arc::new(PeripheralInstance::new());
+        a.pulse_out.init(1);
+        b.pulse_out.init(1);
+        // Start a long train on A; B must report idle/done.
+        a.pulse_out.start(0, 10_000, 1_000);
+        assert_eq!(b.pulse_out.run(0), (0, true), "B idle while A runs");
+
+        let for_thread = Arc::clone(&b);
+        std::thread::spawn(move || {
+            let _bind = bind_current_thread(Arc::clone(&for_thread));
+            crate::pulse_out::start(0, 5, 100_000);
+            let mut done = false;
+            for _ in 0..1_000 {
+                let (e, d) = crate::pulse_out::run(0);
+                assert!(e <= 5);
+                if d {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done, "B train completes on B");
+        })
+        .join()
+        .expect("pulse_out bind thread");
+        // A still has its own in-flight train (or at least non-idle semantics).
+        let (emitted, _) = a.pulse_out.run(0);
+        assert!(emitted <= 10_000);
+        a.pulse_out.stop(0);
+    }
+
+    /// Filesystem path is per-instance: init on A does not set B's path.
+    #[rstest]
+    fn two_instances_have_independent_filesystem_paths() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        let a = Arc::new(PeripheralInstance::new());
+        let b = Arc::new(PeripheralInstance::new());
+        let dir_a = std::env::temp_dir().join(format!("embsim_fs_a_{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("embsim_fs_b_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir_a);
+        let _ = std::fs::create_dir_all(&dir_b);
+        a.filesystem.init(dir_a.to_str().unwrap());
+        assert_eq!(a.filesystem.path(), Some(dir_a.to_str().unwrap()));
+        assert!(b.filesystem.path().is_none(), "B unconfigured");
+
+        let for_thread = Arc::clone(&b);
+        let path_b = dir_b.to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let _bind = bind_current_thread(Arc::clone(&for_thread));
+            crate::filesystem::init(&path_b);
+        })
+        .join()
+        .expect("fs bind thread");
+        assert_eq!(b.filesystem.path(), Some(dir_b.to_str().unwrap()));
+        assert_eq!(
+            a.filesystem.path(),
+            Some(dir_a.to_str().unwrap()),
+            "A path unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }

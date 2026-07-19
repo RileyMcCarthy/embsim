@@ -219,6 +219,8 @@ pub fn release(lock: i32) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Take the crate test lock (lock-pool state is process-global), pin the
@@ -228,7 +230,7 @@ mod tests {
         init(max);
     }
 
-    #[test]
+    #[rstest]
     fn init_at_max_locks_is_allowed() {
         let _g = crate::test_support::guard();
         // Exactly MAX_LOCKS is the inclusive upper bound.
@@ -238,7 +240,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_locks_panics() {
         let _g = crate::test_support::guard();
@@ -246,7 +248,7 @@ mod tests {
         init(MAX_LOCKS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn create_returns_increasing_ids_then_minus_one_when_exhausted() {
         let _g = crate::test_support::guard();
         setup(3);
@@ -259,7 +261,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn try_acquire_then_release_round_trip() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -272,7 +274,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn try_acquire_out_of_range_or_negative_is_false() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -283,7 +285,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn double_acquire_same_thread_panics() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -313,7 +315,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn lock_held_by_one_thread_blocks_another_until_release() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -342,7 +344,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn release_of_unheld_or_out_of_range_is_a_safe_no_op() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -358,7 +360,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn reset_resets_allocator_and_releases_held_locks() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -375,7 +377,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn two_pools_do_not_share_held_lock_bookkeeping() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();

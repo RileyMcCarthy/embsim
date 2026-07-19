@@ -1276,9 +1276,11 @@ impl From<HarnessError> for SystemError {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn endpoint_parses_connector_and_bare_forms() {
         assert_eq!(
             EndpointRef::parse("DS2Addon.J1.3").unwrap(),
@@ -1301,7 +1303,7 @@ mod tests {
         assert!(EndpointRef::parse("A..C").is_err());
     }
 
-    #[test]
+    #[rstest]
     fn harness_builder_accumulates_signal_and_power_wires() {
         let harness = Harness::new()
             .connect_str("EdgeBoard.J3.1", "DS2Addon.J1.2")
@@ -1319,7 +1321,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn scenario_builder_accumulates_fault_algebra() {
         let scenario = Scenario::default()
             .jumper("DS2Addon.JP1", JumperState::Closed)

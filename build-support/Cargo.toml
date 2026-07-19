@@ -10,3 +10,6 @@ keywords = ["embedded", "emulator", "build-dependencies", "sil"]
 categories = ["development-tools::build-utils", "embedded"]
 
 [dependencies]
+
+[dev-dependencies]
+rstest.workspace = true

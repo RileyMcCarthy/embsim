@@ -391,11 +391,13 @@ impl Emulator {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// `check_count` is `Ok` when the request is at or below the maximum and
     /// `Err(TooManyChannels{..})` when it exceeds it. Boundary: `max == max`.
-    #[test]
+    #[rstest]
     fn check_count_boundary_and_overflow() {
         // Below and exactly at the ceiling are accepted.
         assert!(check_count("gpio", 0, 64).is_ok());
@@ -419,7 +421,7 @@ mod tests {
     }
 
     /// A zero maximum still rejects any positive request (degenerate ceiling).
-    #[test]
+    #[rstest]
     fn check_count_zero_max_rejects_positive() {
         assert!(check_count("encoder", 0, 0).is_ok());
         assert!(check_count("encoder", 1, 0).is_err());

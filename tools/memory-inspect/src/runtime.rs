@@ -466,9 +466,11 @@ impl FromBytes for bool {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn decodes_f32_as_float_not_int() {
         // 1.5f32 little-endian. Decoding these bytes as an integer would give
         // 1069547520, not 1.5 — this guards the float-decode bug fix.
@@ -481,7 +483,7 @@ mod tests {
         assert_eq!(v, 1.5);
     }
 
-    #[test]
+    #[rstest]
     fn decodes_f64() {
         let bytes = (-2.25f64).to_le_bytes();
         let ti = TypeInfo::Float {
@@ -492,7 +494,7 @@ mod tests {
         assert_eq!(v, -2.25);
     }
 
-    #[test]
+    #[rstest]
     fn decodes_unsigned_bitfield() {
         // Extract bits [4..7) (value 0b101 = 5) from a 1-byte storage unit.
         let storage = [0b0101_0000u8];
@@ -506,7 +508,7 @@ mod tests {
         assert_eq!(v, 5.0);
     }
 
-    #[test]
+    #[rstest]
     fn decodes_signed_bitfield_sign_extends() {
         // 3-bit signed field holding 0b111 = -1.
         let storage = [0b0000_0111u8];
@@ -530,7 +532,7 @@ mod tests {
 
     /// Signed bases of every width decode to their signed value (including
     /// negatives) as f64.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_signed_bases() {
         let cases: &[(usize, i64)] = &[(1, -5), (2, -300), (4, -70_000), (8, -5_000_000_000)];
         for &(size, val) in cases {
@@ -552,7 +554,7 @@ mod tests {
     }
 
     /// Unsigned bases of every width decode to their unsigned value as f64.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_unsigned_bases() {
         let cases: &[(usize, u64)] = &[
             (1, 200),
@@ -579,7 +581,7 @@ mod tests {
     }
 
     /// A 1-byte unsigned base decodes a bool's storage (0 or 1) directly.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_bool_like_u8() {
         let ti = TypeInfo::Base {
             name: "bool".into(),
@@ -599,7 +601,7 @@ mod tests {
     // ── bytes_to_f64: Enum sizes ──
 
     /// Enums of width 1/2/4 decode through their integer storage.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_enum_sizes() {
         let e1 = TypeInfo::Enum {
             type_name: "E".into(),
@@ -633,7 +635,7 @@ mod tests {
 
     /// Unsupported types (Struct/Union/Pointer/Array/Unknown, and odd Base/Enum
     /// sizes) return `None` instead of decoding garbage.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_unsupported_returns_none() {
         let buf = [0u8; 8];
         let unsupported = [
@@ -670,7 +672,7 @@ mod tests {
     // ── bytes_to_f64: bitfield edge cases ──
 
     /// A bitfield with `bit_size == 0` or `> 64` returns `None`.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_bitfield_invalid_width() {
         let buf = [0xFFu8; 8];
         let zero = TypeInfo::Bitfield {
@@ -691,7 +693,7 @@ mod tests {
     }
 
     /// A full-width (64-bit) bitfield uses the all-ones mask without overflow.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_bitfield_full_width() {
         let buf = 0x00FF_00FF_00FF_00FFu64.to_le_bytes();
         let ti = TypeInfo::Bitfield {
@@ -705,7 +707,7 @@ mod tests {
     }
 
     /// A multi-byte unsigned bitfield extracts the right run of bits.
-    #[test]
+    #[rstest]
     fn bytes_to_f64_bitfield_multibyte() {
         // 16-bit storage, extract bits [8..12) of 0xF300 → 0x3 = 3.
         let buf = 0xF300u16.to_le_bytes();
@@ -722,7 +724,7 @@ mod tests {
     // ── parse_array_index ──
 
     /// `parse_array_index` parses a leading `[N]` and the remaining path.
-    #[test]
+    #[rstest]
     fn parse_array_index_cases() {
         assert_eq!(
             SymbolResolver::parse_array_index("[3].field"),
@@ -747,7 +749,7 @@ mod tests {
     // ── FromBytes round-trips ──
 
     /// Every `FromBytes` impl round-trips its little-endian encoding.
-    #[test]
+    #[rstest]
     fn from_bytes_round_trips() {
         assert_eq!(
             <i8 as FromBytes>::from_le_bytes(&(-12i8).to_le_bytes()),
@@ -787,7 +789,7 @@ mod tests {
     // ── SymbolResolver ──
 
     /// `from_binary` on a clearly-invalid path yields `Err`.
-    #[test]
+    #[rstest]
     fn from_binary_invalid_path_errs() {
         let res = SymbolResolver::from_binary(Path::new("/no/such/binary/embsim_xyz"));
         assert!(res.is_err(), "missing binary must error");
@@ -795,7 +797,7 @@ mod tests {
 
     /// `from_binary` on a path that exists but is not an object file yields
     /// `Err` (the parse branch).
-    #[test]
+    #[rstest]
     fn from_binary_non_object_errs() {
         let dir = std::env::temp_dir().join(format!("embsim_notobj_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -808,7 +810,7 @@ mod tests {
 
     /// `SymbolResolver::new()` parses the running test binary and reports a
     /// nonexistent symbol as `None`.
-    #[test]
+    #[rstest]
     fn new_resolves_self_and_misses_unknown_symbol() {
         let resolver = SymbolResolver::new().expect("resolver should parse the test binary");
         assert!(
@@ -822,7 +824,7 @@ mod tests {
     /// The resolver finds a symbol defined in this test binary and `read_bytes`
     /// round-trips its contents. The resolver strips the macOS leading
     /// underscore, so we look it up by its source name.
-    #[test]
+    #[rstest]
     fn resolves_and_reads_own_symbol() {
         // Touch the static so the linker can't strip it.
         assert_eq!(EMBSIM_TEST_SYM, [1, 2, 3, 4]);
@@ -849,7 +851,7 @@ mod tests {
     }
 
     /// `read_bytes` for an unknown symbol returns `None` (no panic).
-    #[test]
+    #[rstest]
     fn read_bytes_unknown_symbol_is_none() {
         let resolver = SymbolResolver::new().expect("resolver");
         let got = unsafe { resolver.read_bytes("definitely_not_a_symbol_xyz", 0, 4) };

@@ -186,6 +186,8 @@ function switchView(viewId) {{
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Build a view with distinctive id/icon/name/css/js so generated markup
@@ -204,7 +206,7 @@ mod tests {
     }
 
     /// The rendered page is a complete HTML document with the embsim title.
-    #[test]
+    #[rstest]
     fn render_is_a_full_html_document() {
         let html = render(&[view("trace", "Trace Viewer", "📊")]);
         assert!(html.contains("<!DOCTYPE html>"), "has doctype");
@@ -214,7 +216,7 @@ mod tests {
 
     /// Each view contributes one nav button carrying its id (data-view +
     /// switchView call), icon, and display name.
-    #[test]
+    #[rstest]
     fn render_emits_a_nav_button_per_view() {
         let views = [
             view("trace", "Trace Viewer", "📊"),
@@ -250,7 +252,7 @@ mod tests {
 
     /// The first view's tab is marked active (`shell-tab active`) and its panel
     /// is shown with `display:flex`; later panels are hidden with `display:none`.
-    #[test]
+    #[rstest]
     fn render_activates_only_the_first_view() {
         let html = render(&[view("first", "First", "1️⃣"), view("second", "Second", "2️⃣")]);
 
@@ -277,7 +279,7 @@ mod tests {
 
     /// Each non-empty view CSS is emitted under its own `/* === View: <id> === */`
     /// marker.
-    #[test]
+    #[rstest]
     fn render_scopes_css_under_per_view_marker() {
         let views = [view("trace", "Trace", "📊"), view("viz", "Viz", "🤖")];
         let html = render(&views);
@@ -297,7 +299,7 @@ mod tests {
 
     /// Each non-empty view JS is wrapped in an IIFE that sets `VIEW_ID` and
     /// `VIEW_WS_PATH='/ws/<id>'` and embeds the view's script body.
-    #[test]
+    #[rstest]
     fn render_wraps_js_in_iife_with_view_constants() {
         let html = render(&[view("trace", "Trace", "📊")]);
         assert!(html.contains("(function() {"), "JS wrapped in an IIFE open");
@@ -319,7 +321,7 @@ mod tests {
 
     /// A view with empty CSS/JS contributes no style block marker and no script
     /// wrapper for that view (the empty-string guards skip it).
-    #[test]
+    #[rstest]
     fn render_skips_empty_css_and_js() {
         let v = View::new("bare", "Bare", "⬜", "<p>body</p>", "", "", None);
         let html = render(&[v]);
@@ -339,7 +341,7 @@ mod tests {
 
     /// An empty view slice still renders a valid shell — full document, the
     /// embsim title bar — with no panels or tabs.
-    #[test]
+    #[rstest]
     fn render_empty_slice_is_a_valid_empty_shell() {
         let html = render(&[]);
         assert!(html.contains("<!DOCTYPE html>"), "valid document");

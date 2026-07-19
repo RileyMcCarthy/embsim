@@ -11,6 +11,7 @@
 //!   (the load-cell/transducer path);
 //! - name-collision validation (bench vs board, bench vs bench).
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -153,7 +154,7 @@ const fn analog_pin(number: &'static str) -> PinDecl {
 
 /// Two bench UARTs cross-wired by bare (alias) endpoints roundtrip bytes in
 /// both directions — the bench-MCU serial path with no board netlist at all.
-#[test]
+#[rstest]
 fn bench_uarts_roundtrip_over_bare_endpoints() {
     // Stream pacing samples the free-running virtual clock; 50x scale keeps
     // the 115.2 kbaud pacing sub-millisecond in wall time. This is the only
@@ -233,7 +234,7 @@ fn bench_uarts_roundtrip_over_bare_endpoints() {
 /// A Thevenin drive set on a bench pin resolves numerically on the sensing
 /// side of the harness, and a later `set_drive` propagates — the transducer
 /// (load-cell) mechanism with no board netlist.
-#[test]
+#[rstest]
 fn live_analog_drive_is_sensed_across_the_harness() {
     let handle: PinSlot = Arc::new(Mutex::new(None));
     let state: StateSlot = Arc::new(Mutex::new(None));
@@ -311,7 +312,7 @@ const CONN_NETLIST: &str = r#"(export (version "E")
       (node (ref "J1") (pin "2") (pintype "passive")))))"#;
 
 /// Bench names must be unique against boards and other bench components.
-#[test]
+#[rstest]
 fn bench_name_collisions_fail_loudly() {
     let registry = PartRegistry::new();
     let board = Board::from_netlist(

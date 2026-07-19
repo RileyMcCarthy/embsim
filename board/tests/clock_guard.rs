@@ -8,6 +8,7 @@
 //! thread stays alive and keeps resolving drives — never the old failure
 //! mode of `virtual_us()` panicking the engine into a silent zombie.
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,7 +97,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     pred()
 }
 
-#[test]
+#[rstest]
 fn uninitialized_clock_fails_the_schedule_loudly_and_engine_survives() {
     let driver_handle: Arc<Mutex<Option<PinHandle>>> = Arc::new(Mutex::new(None));
 

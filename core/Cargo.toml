@@ -12,3 +12,6 @@ categories = ["embedded", "simulation"]
 [dependencies]
 nix = { workspace = true, features = ["term", "fs"] }
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

@@ -102,6 +102,8 @@ pub fn virtual_cycles() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::Mutex as StdMutex;
 
@@ -120,21 +122,30 @@ mod tests {
     /// `set_scale` then `virtual_to_wall_us` is a deterministic pure mapping:
     /// at 1.0× a virtual wait equals the wall wait; at 2.0× it halves; at 0.5×
     /// it doubles. No real time elapses, so the exact arithmetic is asserted.
-    #[test]
-    fn virtual_to_wall_is_deterministic_pure_mapping() {
+    #[rstest]
+    #[case::scale_1x(1.0, 1000, 1000)]
+    #[case::scale_2x(2.0, 1000, 500)]
+    #[case::scale_half(0.5, 1000, 2000)]
+    #[case::scale_5x(5.0, 1000, 200)]
+    fn virtual_to_wall_is_deterministic_pure_mapping(
+        #[case] scale: f64,
+        #[case] virtual_us: u64,
+        #[case] expected_wall: u64,
+    ) {
         let _g = lock_or_recover();
+        set_scale(scale);
+        assert_eq!(
+            virtual_to_wall_us(virtual_us),
+            expected_wall,
+            "{scale}x: wall for {virtual_us} virtual us"
+        );
         set_scale(1.0);
-        assert_eq!(virtual_to_wall_us(1000), 1000, "1.0x: wall == virtual");
-        set_scale(2.0);
-        assert_eq!(virtual_to_wall_us(1000), 500, "2.0x: wall == virtual/2");
-        set_scale(0.5);
-        assert_eq!(virtual_to_wall_us(1000), 2000, "0.5x: wall == virtual*2");
     }
 
     /// A scale of 0.0 truncates the numerator to 0; `virtual_to_wall_us` must
     /// clamp the divisor via `numer.max(1)` so it never divides by zero. The
     /// result is therefore `wait * denom` (denom == 1000 internally).
-    #[test]
+    #[rstest]
     fn scale_zero_is_clamped_no_divide_by_zero() {
         let _g = lock_or_recover();
         set_scale(0.0);
@@ -147,7 +158,7 @@ mod tests {
 
     /// `virtual_to_wall_us(0)` is always 0 regardless of scale (no wait → no
     /// sleep), at normal, fast, slow, and clamped-zero scales.
-    #[test]
+    #[rstest]
     fn zero_wait_maps_to_zero_at_every_scale() {
         let _g = lock_or_recover();
         for s in [1.0, 2.0, 0.5, 0.0, 10.0] {
@@ -158,7 +169,7 @@ mod tests {
     }
 
     /// `init` stores the supplied clock frequency and `clock_freq` returns it.
-    #[test]
+    #[rstest]
     fn init_sets_clock_freq() {
         let _g = lock_or_recover();
         init(1.0, 180_000_000);
@@ -169,7 +180,7 @@ mod tests {
 
     /// `init` also applies the speed scale it is given (the scale feeds straight
     /// into the deterministic `virtual_to_wall_us` mapping).
-    #[test]
+    #[rstest]
     fn init_applies_speed_scale() {
         let _g = lock_or_recover();
         init(2.0, 1_000_000);
@@ -186,7 +197,7 @@ mod tests {
     /// `virtual_us` is monotonic non-decreasing across repeated reads — virtual
     /// time never runs backwards (timing magnitude is machine-dependent and not
     /// asserted, only ordering).
-    #[test]
+    #[rstest]
     fn virtual_us_is_monotonic() {
         let _g = lock_or_recover();
         init(1.0, 180_000_000);
@@ -200,7 +211,7 @@ mod tests {
 
     /// `virtual_ms` is monotonic and is exactly `virtual_us / 1000` ordering —
     /// ms can never exceed the µs reading divided by 1000.
-    #[test]
+    #[rstest]
     fn virtual_ms_tracks_virtual_us() {
         let _g = lock_or_recover();
         init(1.0, 180_000_000);
@@ -220,7 +231,7 @@ mod tests {
     /// `virtual_cycles` is 0 whenever the configured frequency is 0 (the
     /// uninitialized-frequency default), no matter how much virtual time has
     /// elapsed.
-    #[test]
+    #[rstest]
     fn virtual_cycles_zero_when_freq_zero() {
         let _g = lock_or_recover();
         // Re-anchor with an explicit zero frequency.
@@ -237,7 +248,7 @@ mod tests {
     /// With a non-zero frequency and advancing virtual time, `virtual_cycles`
     /// is monotonic non-decreasing and eventually grows above zero. The exact
     /// cycle count is wall-clock dependent and is deliberately NOT asserted.
-    #[test]
+    #[rstest]
     fn virtual_cycles_grow_with_time_when_freq_nonzero() {
         let _g = lock_or_recover();
         init(1.0, 180_000_000);
@@ -263,7 +274,7 @@ mod tests {
     /// Re-`init` re-anchors the boot offset, so virtual time restarts near zero.
     /// We can't assert an exact value (wall time keeps moving), but immediately
     /// after a re-init the reading must be small relative to a coarse ceiling.
-    #[test]
+    #[rstest]
     fn reinit_reanchors_virtual_time() {
         let _g = lock_or_recover();
         init(1.0, 180_000_000);

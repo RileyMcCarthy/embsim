@@ -458,6 +458,8 @@ pub fn stop(channel: usize) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::{
         atomic::{AtomicU32, Ordering as AtomicOrdering},
@@ -472,7 +474,7 @@ mod tests {
         init(channels);
     }
 
-    #[test]
+    #[rstest]
     fn out_of_range_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -482,7 +484,7 @@ mod tests {
         stop(99);
     }
 
-    #[test]
+    #[rstest]
     fn idle_channel_reports_done_immediately() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -490,7 +492,7 @@ mod tests {
         assert_eq!(run(0), (0, true));
     }
 
-    #[test]
+    #[rstest]
     fn start_fires_initial_progress_at_zero() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -503,7 +505,7 @@ mod tests {
         assert_eq!(progress.load(AtomicOrdering::Relaxed), 0);
     }
 
-    #[test]
+    #[rstest]
     fn run_emits_progress_and_eventually_completes() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -530,7 +532,7 @@ mod tests {
         panic!("sequence never completed");
     }
 
-    #[test]
+    #[rstest]
     fn velocity_mode_integrates_continuously_and_retargets() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -568,7 +570,7 @@ mod tests {
         assert_eq!(run(0), (0, true), "stop ends the velocity train");
     }
 
-    #[test]
+    #[rstest]
     fn stop_cancels_in_flight_sequence() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -586,7 +588,7 @@ mod tests {
         assert_eq!(run(0), (0, true));
     }
 
-    #[test]
+    #[rstest]
     fn restart_resets_baseline() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -604,7 +606,7 @@ mod tests {
         assert!(emitted <= 10);
     }
 
-    #[test]
+    #[rstest]
     fn frequency_zero_is_clamped() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -614,7 +616,7 @@ mod tests {
         assert!(emitted <= 5);
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_channels_panics() {
         let _g = crate::test_support::guard();
@@ -623,7 +625,7 @@ mod tests {
         init(MAX_CHANNELS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn on_start_fires_with_pulses_and_frequency() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -638,7 +640,7 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), (42, 1));
     }
 
-    #[test]
+    #[rstest]
     fn callbacks_are_one_per_channel_and_overwrite() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -670,7 +672,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn register_out_of_range_channel_is_ignored() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -687,7 +689,7 @@ mod tests {
         assert_eq!(hits.load(AtomicOrdering::Relaxed), 0);
     }
 
-    #[test]
+    #[rstest]
     fn run_clamps_emitted_to_total_after_overrun() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -706,7 +708,7 @@ mod tests {
         assert_eq!(last, (1, true), "completes with exactly total emitted");
     }
 
-    #[test]
+    #[rstest]
     fn reset_clears_channel_count_and_callbacks() {
         let _g = crate::test_support::guard();
         test_setup(1);
@@ -723,5 +725,64 @@ mod tests {
         start(0, 5, 1);
         assert_eq!(run(0), (0, true));
         assert_eq!(hits.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    /// Finite train of `N` pulses at frequency `F` completes only after about
+    /// `N/F` virtual seconds. `run()` sleeps `POLL_TICK_US` per poll, so elapsed
+    /// virtual time is ≥ the ideal duration and within a small number of ticks
+    /// of overshoot.
+    #[rstest]
+    #[case::n50_f5k(50, 5_000)]
+    #[case::n20_f10k(20, 10_000)]
+    #[case::n100_f20k(100, 20_000)]
+    fn finite_train_completes_near_n_over_f_virtual_seconds(#[case] n: u32, #[case] freq: u32) {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+
+        let ideal_us = (n as u64).saturating_mul(1_000_000) / freq as u64;
+        start(0, n, freq);
+        let t0 = embsim_core::virtual_clock::virtual_us();
+        let mut last = (0u32, false);
+        for _ in 0..50_000 {
+            last = run(0);
+            if last.1 {
+                break;
+            }
+        }
+        let elapsed = embsim_core::virtual_clock::virtual_us().saturating_sub(t0);
+        assert_eq!(last, (n, true), "must complete with exactly N emitted");
+        // Lower bound: integration cannot finish early of ideal duration.
+        assert!(
+            elapsed + 1 >= ideal_us,
+            "finished too early: elapsed={elapsed}us ideal={ideal_us}us"
+        );
+        // Upper bound: a few poll ticks of overshoot is fine; not multi-second hang.
+        let max_us = ideal_us
+            .saturating_add(5_000)
+            .saturating_add(POLL_TICK_US * 20);
+        assert!(
+            elapsed <= max_us,
+            "finished too late: elapsed={elapsed}us max={max_us}us"
+        );
+    }
+
+    /// Frequency / pulse-count matrix: emitted is always clamped to total.
+    #[rstest]
+    #[case::one_pulse(1, 1_000)]
+    #[case::many_fast(200, 100_000)]
+    #[case::slow(5, 500)]
+    fn run_emitted_never_exceeds_total(#[case] n: u32, #[case] freq: u32) {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+        start(0, n, freq);
+        for _ in 0..10_000 {
+            let (emitted, done) = run(0);
+            assert!(emitted <= n, "emitted {emitted} > total {n}");
+            if done {
+                assert_eq!(emitted, n);
+                return;
+            }
+        }
+        panic!("sequence never completed");
     }
 }

@@ -38,6 +38,45 @@ jobs:
         run: cargo build -p embsim-trace --no-default-features
       - name: Test embsim-trace (web off)
         run: cargo test -p embsim-trace --no-default-features
+      # Timing-sensitive paths (serial baud pacing, pulse_out integration,
+      # board stream pacing) can differ under optimisations — smoke them in
+      # release on the ubuntu leg only (macOS already ran debug).
+      - name: Release smoke (peripherals + board)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p embsim-peripherals -p embsim-board --release
+
+  # Line/region coverage report (soft gate). Publishes a job summary; does not
+  # fail on threshold yet — see coverage-baseline.txt and TESTING.md. Installs
+  # cargo-llvm-cov + llvm-tools so `cargo llvm-cov` works out of the box.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --workspace --lcov --output-path lcov.info \
+            --summary-only 2>&1 | tee coverage-summary.txt
+          {
+            echo "## Coverage (soft gate — no threshold fail)"
+            echo '```'
+            tail -40 coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload lcov
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embsim-lcov-${{ github.run_number }}
+          path: lcov.info
+          retention-days: 14
 
   # Both rustfmt and clippy are gating. The lint backlog has been cleared, so
   # clippy runs with `-D warnings` — any new lint fails the build. The few

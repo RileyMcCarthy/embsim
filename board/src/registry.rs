@@ -389,6 +389,8 @@ impl std::error::Error for RegistryError {}
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::component::{AttachError, ComponentNetIo, PinDecl};
 
@@ -432,7 +434,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn passive_values_parse_across_notations() {
         assert_parses_to("47R", 47.0);
         assert_parses_to("4k7", 4700.0);
@@ -449,7 +451,7 @@ mod tests {
         assert_eq!(parse_passive_value(""), None);
     }
 
-    #[test]
+    #[rstest]
     fn classifies_real_ds2addon_components() {
         let registry = {
             let mut r = PartRegistry::new();
@@ -504,7 +506,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn passive_matching_is_anchored_and_pin_count_validated() {
         let registry = PartRegistry::new();
         // RJ45 must NOT classify as a resistor (and has no registry entry).
@@ -539,7 +541,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn rescue_normalization_requires_rescue_lib() {
         assert_eq!(
             normalize_part(&decl_with_lib(
@@ -556,7 +558,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn construct_keys_on_part_name_with_value_fallback() {
         let mut registry = PartRegistry::new();
         registry.register("ADS122U04", |_decl| Box::new(NullComponent));

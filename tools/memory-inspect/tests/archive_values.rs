@@ -15,6 +15,7 @@
 //! cannot run in this repo's CI.
 
 use embsim_memory_inspect::{hal_tables, ArchiveValueReader, FirmwareInfo, Value, ValueReadError};
+use rstest::rstest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -376,7 +377,7 @@ fn assert_fixture_values(a_path: &Path) {
 // ============================================================
 
 /// Host-target archive: every fixture value decodes correctly.
-#[test]
+#[rstest]
 fn host_archive_reads_initialized_values() {
     let (a_path, dir) = match build_host_fixture_archive() {
         Some(v) => v,
@@ -389,7 +390,7 @@ fn host_archive_reads_initialized_values() {
 /// The `hal_tables` helpers decode the four HAL-shaped config tables from a
 /// compiled archive under their default (reference-consumer) symbol names,
 /// ignoring the extra per-channel fields the consumer carries.
-#[test]
+#[rstest]
 fn hal_tables_decode_from_a_compiled_fixture_archive() {
     let cc = match find_compiler() {
         Some(c) => c,
@@ -478,7 +479,7 @@ fn hal_tables_decode_from_a_compiled_fixture_archive() {
 
 /// Missing symbols and symbols without DWARF variable entries produce the
 /// matching typed errors, not panics.
-#[test]
+#[rstest]
 fn error_variants_for_missing_symbol_and_type_info() {
     let (a_path, dir) = match build_host_fixture_archive() {
         Some(v) => v,
@@ -513,7 +514,7 @@ fn error_variants_for_missing_symbol_and_type_info() {
 /// (non-weak) definition must win regardless of member order — a weak
 /// definition in an earlier member must not shadow the real one (linker
 /// symbol-resolution semantics).
-#[test]
+#[rstest]
 fn strong_definition_wins_over_weak_regardless_of_member_order() {
     let cc = match find_compiler() {
         Some(c) => c,
@@ -563,7 +564,7 @@ fn strong_definition_wins_over_weak_regardless_of_member_order() {
 /// Skip discrimination mirrors `parse_fixture.rs`: an *empty* DWARF parse on
 /// a non-Linux host is a toolchain limitation (loud skip); on Linux — the
 /// platform this leg exists for — it fails strictly.
-#[test]
+#[rstest]
 fn elf_archive_reads_initialized_values() {
     let (a_path, dir) = match build_elf_fixture_archive() {
         Some(v) => v,
@@ -617,7 +618,7 @@ fn mad_archive_path() -> PathBuf {
 /// ```
 ///
 /// Point `EMBSIM_MAD_FIRMWARE_ARCHIVE` at the archive to run from elsewhere.
-#[test]
+#[rstest]
 #[ignore = "reads the consuming MaD repo's libfirmware.a (cross-repo build artifact)"]
 fn reads_mad_hal_config_tables() {
     let path = mad_archive_path();

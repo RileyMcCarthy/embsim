@@ -596,6 +596,8 @@ impl std::error::Error for McuBuildError {}
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// The reference consumer's force-gauge channel shape.
@@ -607,7 +609,7 @@ mod tests {
 
     /// A bridged serial channel declares its TX pin as a stream producer and
     /// its RX pin as a stream consumer, both at the table baud, named "P{n}".
-    #[test]
+    #[rstest]
     fn bridged_serial_channel_declares_stream_pins() {
         let mcu = McuComponent::builder("p2")
             .serial_table(vec![FG])
@@ -634,7 +636,7 @@ mod tests {
 
     /// Channels that are not bridged are not declared at all — the facade
     /// stays minimal this slice.
-    #[test]
+    #[rstest]
     fn unbridged_channels_declare_no_pins() {
         let main = SerialChannelConfig {
             rx_pin: 53,
@@ -653,7 +655,7 @@ mod tests {
 
     /// GPIO declarations map direction to pin kind, carry no stream role,
     /// and default (no declaration) means no pin.
-    #[test]
+    #[rstest]
     fn gpio_declarations_follow_direction() {
         let mcu = McuComponent::builder("p2")
             .gpio(
@@ -682,7 +684,7 @@ mod tests {
 
     /// Builder validation: unknown channel, out-of-range pin, and duplicate
     /// pin claims each fail loudly with the matching error.
-    #[test]
+    #[rstest]
     fn builder_validation_errors() {
         assert_eq!(
             McuComponent::builder("p2")
@@ -727,7 +729,7 @@ mod tests {
     }
 
     /// The pin-name table covers exactly P0..=P63.
-    #[test]
+    #[rstest]
     fn pin_names_cover_the_p2_pin_space() {
         assert_eq!(pin_name(0), Some("P0"));
         assert_eq!(pin_name(63), Some("P63"));
@@ -738,7 +740,7 @@ mod tests {
     }
 
     /// Build errors render their fields.
-    #[test]
+    #[rstest]
     fn error_display() {
         assert!(McuBuildError::UnknownSerialChannel {
             channel: 3,

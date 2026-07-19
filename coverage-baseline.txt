@@ -1,0 +1,10 @@
+# Soft coverage baseline for embsim.
+#
+# The `coverage` CI job publishes a llvm-cov summary but does not fail on
+# threshold. After a few green runs, promote this file to a hard floor for
+# embsim-peripherals + embsim-board (see TESTING.md).
+#
+# Recorded at introduction of the full-coverage rewrite branch — refresh with:
+#   cargo llvm-cov --workspace --summary-only
+status=soft
+notes=no hard fail yet; track regressions via CI job summary + lcov artifact
