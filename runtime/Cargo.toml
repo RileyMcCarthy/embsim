@@ -14,3 +14,6 @@ embsim-core = { path = "../core" }
 embsim-peripherals = { path = "../peripherals" }
 embsim-memory-inspect = { path = "../tools/memory-inspect" }
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

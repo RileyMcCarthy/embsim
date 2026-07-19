@@ -1,4 +1,10 @@
 //! Timer — Timing functions backed by VirtualClock.
+//!
+//! Virtual *time* is process-wide (free-running scaled wall time in
+//! `embsim_core::virtual_clock`), but the *clock frequency* used for cycle
+//! math is per-MCU: [`get_clock_freq`] and [`get_cycles`] honor the calling
+//! thread's `instance::PeripheralInstance` clock-frequency override, falling
+//! back to the virtual clock's process-wide frequency when unset.
 
 use embsim_core::virtual_clock;
 
@@ -28,14 +34,18 @@ pub fn wait_us(us: u32) {
     }
 }
 
-/// Get raw virtual cycle counter value.
+/// Get raw virtual cycle counter value (`virtual_us * clock_freq / 1_000_000`,
+/// using the calling thread's instance clock frequency).
 pub fn get_cycles() -> u32 {
-    virtual_clock::virtual_cycles() as u32
+    let freq = crate::instance::current().effective_clock_freq() as u128;
+    let us = virtual_clock::virtual_us() as u128;
+    (us * freq / 1_000_000) as u32
 }
 
-/// Get the simulated clock frequency.
+/// Get the simulated clock frequency (the calling thread's instance override,
+/// or the process-wide virtual clock frequency when unset).
 pub fn get_clock_freq() -> u32 {
-    virtual_clock::clock_freq()
+    crate::instance::current().effective_clock_freq()
 }
 
 // ============================================================
@@ -44,9 +54,11 @@ pub fn get_clock_freq() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn ms_and_us_are_monotonic_non_decreasing() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -63,7 +75,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn ms_roughly_tracks_us() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -81,7 +93,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn clock_freq_is_the_pinned_frequency() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -89,7 +101,7 @@ mod tests {
         assert_eq!(get_clock_freq(), 180_000_000);
     }
 
-    #[test]
+    #[rstest]
     fn cycles_grow_with_a_positive_frequency() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -112,7 +124,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn wait_zero_returns_immediately() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -121,7 +133,7 @@ mod tests {
         wait_us(0);
     }
 
-    #[test]
+    #[rstest]
     fn wait_small_returns_without_hanging() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();

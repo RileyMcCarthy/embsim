@@ -4,66 +4,185 @@
 //! are ignored (OS manages thread stacks). "core" is the MCU-neutral term;
 //! a platform's own vocabulary (e.g. the Propeller 2's "cog") stays in that
 //! platform crate.
+//!
+//! State lives in a per-MCU [`System`] owned by
+//! `instance::PeripheralInstance`. The module-level free functions route to
+//! the calling thread's instance (see `crate::instance`), and threads spawned
+//! through them **inherit the creator's instance**: the spawn path binds the
+//! new thread before the firmware function runs, so every HAL call the new
+//! thread makes routes to the same MCU as its creator.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::info;
+
+use crate::instance::{self, PeripheralInstance};
 
 /// Maximum threads supported (hard ceiling of the handle table).
 pub const MAX_THREADS: usize = 32;
 
-/// Configured max thread count.
-static MAX_THREAD_COUNT: AtomicUsize = AtomicUsize::new(8);
+/// Thread/core registry for one MCU instance.
+pub struct System {
+    /// Configured max thread count.
+    max: AtomicUsize,
+    /// Thread handles for joining on shutdown.
+    handles: Mutex<Vec<Option<thread::JoinHandle<()>>>>,
+}
 
-/// Thread handles for joining on shutdown.
-static THREAD_HANDLES: Mutex<Vec<Option<thread::JoinHandle<()>>>> = Mutex::new(Vec::new());
+impl System {
+    /// Create a registry with the default 8-slot table (unsized until `init`).
+    pub const fn new() -> Self {
+        Self {
+            max: AtomicUsize::new(8),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
 
-/// Initialize thread handle storage.
-fn ensure_initialized() {
-    let mut handles = THREAD_HANDLES.lock().unwrap();
-    let max = MAX_THREAD_COUNT.load(Ordering::Relaxed);
-    if handles.is_empty() {
-        handles.resize_with(max, || None);
+    /// Initialize thread handle storage.
+    fn ensure_initialized(&self) {
+        let mut handles = self.handles.lock().unwrap();
+        let max = self.max.load(Ordering::Relaxed);
+        if handles.is_empty() {
+            handles.resize_with(max, || None);
+        }
+    }
+
+    /// Configure the system peripheral with max thread count. Resets the handle
+    /// table first, so re-init (after [`System::join_all_threads`]) is a clean start.
+    ///
+    /// # Panics
+    /// If `max_threads` exceeds [`MAX_THREADS`].
+    pub fn init(&self, max_threads: usize) {
+        assert!(
+            max_threads <= MAX_THREADS,
+            "Thread count {} exceeds max {}",
+            max_threads,
+            MAX_THREADS
+        );
+        self.reset();
+        self.max.store(max_threads, Ordering::Relaxed);
+        self.ensure_initialized();
+        info!(
+            "system::init: emulator platform initialized (max_threads={})",
+            max_threads
+        );
+    }
+
+    /// Clear the thread handle table.
+    ///
+    /// Only safe once spawned threads have finished — call
+    /// [`System::join_all_threads`] first. Clearing live handles would detach
+    /// (not stop) those threads; a firmware image is one-per-process by
+    /// construction, so a restart joins then resets.
+    pub fn reset(&self) {
+        self.handles.lock().unwrap().clear();
+    }
+
+    /// Start a new thread. Returns the thread/core ID (>= 0) or -1 on failure.
+    ///
+    /// When `inherit` is `Some`, the spawned thread is bound to that
+    /// [`PeripheralInstance`] for its whole lifetime (bound before `func`
+    /// runs, unbound after it returns) — this is how firmware threads inherit
+    /// their creator's MCU instance.
+    ///
+    /// # Safety
+    /// The function pointer and argument must be valid for the lifetime of the thread.
+    pub unsafe fn start_thread(
+        &self,
+        func: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        arg: *mut std::ffi::c_void,
+        inherit: Option<Arc<PeripheralInstance>>,
+    ) -> i32 {
+        let func = match func {
+            Some(f) => f,
+            None => {
+                tracing::error!("system::start_thread: null function pointer");
+                return -1;
+            }
+        };
+
+        self.ensure_initialized();
+
+        let mut handles = self.handles.lock().unwrap();
+
+        let slot_id = match handles.iter().position(|h| h.is_none()) {
+            Some(id) => id,
+            None => {
+                tracing::error!("system::start_thread: no available thread slots");
+                return -1;
+            }
+        };
+
+        let arg_usize = arg as usize;
+        let func_ptr = func as usize;
+        let thread_name = format!("core-{}", slot_id);
+
+        let handle = thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(move || {
+                // Inherit the creator's instance before the firmware function
+                // runs; the guard unbinds when the thread body returns.
+                let _instance_binding = inherit.map(instance::bind_current_thread);
+                info!("Thread {} started", thread_name);
+                unsafe {
+                    let f: unsafe extern "C" fn(*mut std::ffi::c_void) =
+                        std::mem::transmute(func_ptr);
+                    f(arg_usize as *mut std::ffi::c_void);
+                }
+                info!("Thread {} exited", thread_name);
+            });
+
+        match handle {
+            Ok(h) => {
+                info!("system::start_thread: started core-{}", slot_id);
+                handles[slot_id] = Some(h);
+                slot_id as i32
+            }
+            Err(e) => {
+                tracing::error!("system::start_thread: failed to spawn thread: {}", e);
+                -1
+            }
+        }
+    }
+
+    /// Wait for all threads to finish (called from main on shutdown).
+    pub fn join_all_threads(&self) {
+        let mut handles = self.handles.lock().unwrap();
+        for (i, handle) in handles.iter_mut().enumerate() {
+            if let Some(h) = handle.take() {
+                info!("Joining core-{}", i);
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+impl Default for System {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 // ============================================================
-// Initialization
+// Free functions — route to the calling thread's instance
 // ============================================================
 
 /// Configure the system peripheral with max thread count. Resets the handle
 /// table first, so re-init (after [`join_all_threads`]) is a clean start.
 pub fn init(max_threads: usize) {
-    assert!(
-        max_threads <= MAX_THREADS,
-        "Thread count {} exceeds max {}",
-        max_threads,
-        MAX_THREADS
-    );
-    reset();
-    MAX_THREAD_COUNT.store(max_threads, Ordering::Relaxed);
-    ensure_initialized();
-    info!(
-        "system::init: emulator platform initialized (max_threads={})",
-        max_threads
-    );
+    crate::instance::current().system.init(max_threads);
 }
 
-/// Clear the thread handle table.
-///
-/// Only safe once spawned threads have finished — call [`join_all_threads`]
-/// first. Clearing live handles would detach (not stop) those threads; the
-/// firmware is one-per-process by construction, so a restart joins then resets.
+/// Clear the thread handle table. See [`System::reset`].
 pub fn reset() {
-    THREAD_HANDLES.lock().unwrap().clear();
+    crate::instance::current().system.reset();
 }
-
-// ============================================================
-// Core API
-// ============================================================
 
 /// Start a new thread. Returns the thread/core ID (>= 0) or -1 on failure.
+///
+/// The spawned thread inherits the calling thread's [`PeripheralInstance`],
+/// so its HAL calls route to the same MCU as its creator's.
 ///
 /// # Safety
 /// The function pointer and argument must be valid for the lifetime of the thread.
@@ -71,63 +190,14 @@ pub unsafe fn start_thread(
     func: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
     arg: *mut std::ffi::c_void,
 ) -> i32 {
-    let func = match func {
-        Some(f) => f,
-        None => {
-            tracing::error!("system::start_thread: null function pointer");
-            return -1;
-        }
-    };
-
-    ensure_initialized();
-
-    let mut handles = THREAD_HANDLES.lock().unwrap();
-
-    let slot_id = match handles.iter().position(|h| h.is_none()) {
-        Some(id) => id,
-        None => {
-            tracing::error!("system::start_thread: no available thread slots");
-            return -1;
-        }
-    };
-
-    let arg_usize = arg as usize;
-    let func_ptr = func as usize;
-    let thread_name = format!("core-{}", slot_id);
-
-    let handle = thread::Builder::new()
-        .name(thread_name.clone())
-        .spawn(move || {
-            info!("Thread {} started", thread_name);
-            unsafe {
-                let f: unsafe extern "C" fn(*mut std::ffi::c_void) = std::mem::transmute(func_ptr);
-                f(arg_usize as *mut std::ffi::c_void);
-            }
-            info!("Thread {} exited", thread_name);
-        });
-
-    match handle {
-        Ok(h) => {
-            info!("system::start_thread: started core-{}", slot_id);
-            handles[slot_id] = Some(h);
-            slot_id as i32
-        }
-        Err(e) => {
-            tracing::error!("system::start_thread: failed to spawn thread: {}", e);
-            -1
-        }
-    }
+    let inst = crate::instance::current();
+    let inherit = Arc::clone(&inst);
+    inst.system.start_thread(func, arg, Some(inherit))
 }
 
 /// Wait for all threads to finish (called from main on shutdown).
 pub fn join_all_threads() {
-    let mut handles = THREAD_HANDLES.lock().unwrap();
-    for (i, handle) in handles.iter_mut().enumerate() {
-        if let Some(h) = handle.take() {
-            info!("Joining core-{}", i);
-            let _ = h.join();
-        }
-    }
+    crate::instance::current().system.join_all_threads();
 }
 
 // ============================================================
@@ -136,6 +206,8 @@ pub fn join_all_threads() {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::atomic::AtomicBool;
 
@@ -153,7 +225,7 @@ mod tests {
         init(max);
     }
 
-    #[test]
+    #[rstest]
     fn init_at_max_threads_is_allowed() {
         let _g = crate::test_support::guard();
         // Exactly MAX_THREADS is the inclusive upper bound.
@@ -162,7 +234,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_threads_panics() {
         let _g = crate::test_support::guard();
@@ -170,7 +242,7 @@ mod tests {
         init(MAX_THREADS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn start_thread_runs_function_and_returns_slot_id() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -188,7 +260,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn start_thread_with_null_function_returns_minus_one() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -198,7 +270,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn slots_are_reused_after_join() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -219,7 +291,7 @@ mod tests {
         reset();
     }
 
-    #[test]
+    #[rstest]
     fn reset_clears_handle_table_after_join() {
         let _g = crate::test_support::guard();
         setup(2);

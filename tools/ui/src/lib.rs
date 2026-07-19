@@ -155,6 +155,8 @@ pub(crate) mod test_lock {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Registry tests share the crate-wide `VIEWS` lock (see [`crate::test_lock`])
@@ -178,7 +180,7 @@ mod tests {
 
     /// `View::new` copies every argument into the matching field and starts with
     /// an empty asset list and no WebSocket handler.
-    #[test]
+    #[rstest]
     fn view_new_sets_all_fields_and_empty_assets() {
         let v = View::new(
             "trace",
@@ -201,7 +203,7 @@ mod tests {
 
     /// A `View` can carry a WebSocket handler; `ws_handler` is `Some` when one
     /// is supplied to `new`.
-    #[test]
+    #[rstest]
     fn view_new_accepts_ws_handler() {
         fn handler(_ws: WebSocket) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(async {})
@@ -215,7 +217,7 @@ mod tests {
 
     /// `with_asset` appends a `ViewAsset` with the given name, bytes, and
     /// content-type, and returns the view for chaining.
-    #[test]
+    #[rstest]
     fn with_asset_appends_one_asset() {
         let v = sample_view("v").with_asset("chart.js", b"BYTES", "application/javascript");
         assert_eq!(v.assets.len(), 1);
@@ -227,7 +229,7 @@ mod tests {
 
     /// `with_asset` chains: each call appends (never overwrites), preserving the
     /// call order of the assets.
-    #[test]
+    #[rstest]
     fn with_asset_chains_and_preserves_order() {
         let v = sample_view("v")
             .with_asset("a.js", b"AAA", "text/javascript")
@@ -241,7 +243,7 @@ mod tests {
     }
 
     /// An empty byte slice is a valid asset payload.
-    #[test]
+    #[rstest]
     fn with_asset_allows_empty_bytes() {
         let v = sample_view("v").with_asset("empty", b"", "text/plain");
         assert_eq!(v.assets.len(), 1);
@@ -252,7 +254,7 @@ mod tests {
 
     /// After `clear_views()` then a single `register_view`, the registry holds
     /// exactly that one view.
-    #[test]
+    #[rstest]
     fn register_then_views_contains_exactly_that_view() {
         let _g = lock_or_recover();
         clear_views();
@@ -263,7 +265,7 @@ mod tests {
     }
 
     /// `clear_views()` empties the registry even when several views are present.
-    #[test]
+    #[rstest]
     fn clear_views_empties_the_registry() {
         let _g = lock_or_recover();
         clear_views();
@@ -275,7 +277,7 @@ mod tests {
     }
 
     /// Registering two views preserves their insertion order.
-    #[test]
+    #[rstest]
     fn register_preserves_insertion_order() {
         let _g = lock_or_recover();
         clear_views();
@@ -288,7 +290,7 @@ mod tests {
     }
 
     /// `clear_views()` on an already-empty registry is a no-op (idempotent).
-    #[test]
+    #[rstest]
     fn clear_views_on_empty_is_noop() {
         let _g = lock_or_recover();
         clear_views();

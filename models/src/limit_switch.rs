@@ -4,6 +4,21 @@
 //! Fires callbacks only on state transitions (edge-triggered).
 //! Thresholds are configurable via `Config`.
 //!
+//! # Provenance (mechanism model — no datasheet)
+//!
+//! An ideal position comparator: the switch asserts exactly when the
+//! carriage crosses the configured threshold, matching how a physical
+//! end-of-travel switch closes at a fixed actuation point. Contact bounce,
+//! actuation hysteresis (a real switch releases at a different point than
+//! it operates), and repeatability tolerance are not modeled — the
+//! edge-triggered callback delivers one clean transition per crossing.
+//! Electrical polarity (active-low wiring, pull-ups) is the consumer's
+//! concern: the system description maps `true` to whatever level its GPIO
+//! channel expects.
+//!
+//! Parameter sources: thresholds come from the consuming system
+//! description (rig geometry), not from a part constant.
+//!
 //! Has no knowledge of GPIO or any MCU peripheral.
 
 use crate::edge::EdgeDetector;
@@ -89,6 +104,8 @@ impl LimitSwitch {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -131,7 +148,7 @@ mod tests {
     /// position that leaves the upper predicate false (so no upper event) while
     /// raising the lower predicate confirms only the genuinely-changed channel
     /// fires.
-    #[test]
+    #[rstest]
     fn starts_idle_and_quiet_in_band() {
         let sw = LimitSwitch::new(config());
         let upper = Recorder::new();
@@ -154,7 +171,7 @@ mod tests {
     /// Moving past the upper threshold fires `upper(true)` exactly once; holding
     /// there fires nothing more; moving back above the threshold fires
     /// `upper(false)` once.
-    #[test]
+    #[rstest]
     fn upper_threshold_edge_triggers_both_directions() {
         let sw = LimitSwitch::new(config());
         let upper = Recorder::new();
@@ -183,7 +200,7 @@ mod tests {
 
     /// Moving past the lower threshold fires `lower(true)` once; holding fires
     /// nothing; dropping back below fires `lower(false)` once.
-    #[test]
+    #[rstest]
     fn lower_threshold_edge_triggers_both_directions() {
         let sw = LimitSwitch::new(config());
         let lower = Recorder::new();
@@ -212,7 +229,7 @@ mod tests {
     /// A position strictly inside the band trips *both* switches on the first
     /// update (both predicates become true) and the two channels are
     /// independent.
-    #[test]
+    #[rstest]
     fn position_in_band_trips_both_independently() {
         let sw = LimitSwitch::new(config());
         let upper = Recorder::new();
@@ -240,7 +257,7 @@ mod tests {
 
     /// `Observers` appends, so multiple subscribers on the same channel are all
     /// notified with the same value — neither silently overwrites the other.
-    #[test]
+    #[rstest]
     fn multiple_subscribers_all_notified() {
         let sw = LimitSwitch::new(config());
         let a = Recorder::new();
@@ -259,7 +276,7 @@ mod tests {
     /// With no subscribers, `update` crossing thresholds is a safe no-op (the
     /// edge state still advances internally so later subscribers see correct
     /// transitions).
-    #[test]
+    #[rstest]
     fn update_without_subscribers_is_safe() {
         let sw = LimitSwitch::new(config());
         sw.update(5.0);
@@ -271,7 +288,7 @@ mod tests {
     /// Equality is *not* a trigger: `pos == upper_threshold` keeps `pos < upper`
     /// false, and `pos == lower_threshold` keeps `pos > lower` false. Confirms
     /// the strict-inequality boundary semantics.
-    #[test]
+    #[rstest]
     fn threshold_boundaries_are_strict() {
         let sw = LimitSwitch::new(config());
         let upper = Recorder::new();
@@ -306,7 +323,7 @@ mod tests {
 
     /// `Config` derives `Clone` and `Debug`; exercise both so the derives stay
     /// covered as the struct evolves.
-    #[test]
+    #[rstest]
     fn config_is_clone_and_debug() {
         let c = config();
         let c2 = c.clone();
@@ -320,7 +337,7 @@ mod tests {
     /// the *upper* threshold (while staying permanently below the *lower*
     /// threshold) toggles the upper recorder repeatedly and never fires the
     /// lower callback at all.
-    #[test]
+    #[rstest]
     fn channels_do_not_cross_talk() {
         // Widen the band so we can move across `upper` (10) while always staying
         // below `lower` (2)... that is impossible with the default band, so use

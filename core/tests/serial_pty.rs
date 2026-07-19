@@ -10,6 +10,7 @@ use embsim_core::serial_pty::Pty;
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use nix::unistd::{close, read, write};
+use rstest::rstest;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +48,7 @@ fn read_bounded(fd: BorrowedFd<'_>, buf: &mut [u8]) -> usize {
 
 /// `Pty::new` creates a symlink at the requested path; the path exists and is
 /// genuinely a symlink (not a regular file).
-#[test]
+#[rstest]
 fn new_creates_a_symlink() {
     let path = unique_path("symlink");
     let pty = Pty::new(path.to_str().unwrap()).expect("Pty::new");
@@ -67,7 +68,7 @@ fn new_creates_a_symlink() {
 }
 
 /// The master fd is valid (>= 0) and the symlinked slave path points at a tty.
-#[test]
+#[rstest]
 fn master_is_valid_and_slave_is_a_tty() {
     let path = unique_path("tty");
     let pty = Pty::new(path.to_str().unwrap()).expect("Pty::new");
@@ -86,7 +87,7 @@ fn master_is_valid_and_slave_is_a_tty() {
 
 /// Round-trip: bytes written to the master fd are read back from the slave end,
 /// byte-for-byte, with no echo (raw mode) and no line buffering.
-#[test]
+#[rstest]
 fn round_trip_master_to_slave() {
     let path = unique_path("roundtrip");
     let pty = Pty::new(path.to_str().unwrap()).expect("Pty::new");
@@ -119,7 +120,7 @@ fn round_trip_master_to_slave() {
 
 /// The master fd is non-blocking: a read with no pending data returns `EAGAIN`
 /// rather than blocking the caller forever.
-#[test]
+#[rstest]
 fn master_is_nonblocking() {
     let path = unique_path("nonblock");
     let pty = Pty::new(path.to_str().unwrap()).expect("Pty::new");
@@ -136,7 +137,7 @@ fn master_is_nonblocking() {
 
 /// `Pty::new` creates a missing parent directory rather than failing when the
 /// requested symlink lives under a not-yet-existing nested path.
-#[test]
+#[rstest]
 fn new_creates_missing_parent_dir() {
     let base = unique_path("nested");
     let nested = base.join("a").join("b").join("tty.sim");
@@ -162,7 +163,7 @@ fn new_creates_missing_parent_dir() {
 
 /// Calling `Pty::new` twice on the SAME path replaces the existing symlink
 /// instead of erroring on the pre-existing file.
-#[test]
+#[rstest]
 fn new_twice_replaces_existing_symlink() {
     let path = unique_path("replace");
 
@@ -187,7 +188,7 @@ fn new_twice_replaces_existing_symlink() {
 }
 
 /// `Drop` removes the symlink: after the `Pty` is dropped the path is gone.
-#[test]
+#[rstest]
 fn drop_removes_the_symlink() {
     let path = unique_path("drop");
     {

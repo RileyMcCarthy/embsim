@@ -4,6 +4,11 @@
 //! manages raw FDs and has no knowledge of what's on the other end
 //! (a host PTY, a peer socket, a sensor model, etc). Channel assignment is
 //! done by the project wiring layer via `init_channel_fd()`.
+//!
+//! State lives in a per-MCU [`Serial`] bank owned by
+//! `instance::PeripheralInstance`. The module-level free functions route to
+//! the calling thread's instance (see `crate::instance`), so existing
+//! single-MCU consumers are unaffected.
 
 use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -12,360 +17,421 @@ use tracing::{debug, trace};
 /// Maximum serial channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 16;
 
-/// Bits clocked per byte on the wire, for baud pacing. Defaults to 10 (8N1:
-/// 1 start + 8 data + 1 stop). Configure via [`set_frame_bits`] for other UART
-/// frames (e.g. 11 for 8E1 / 8N2, 9 for 7N1).
-static BITS_PER_BYTE: AtomicU64 = AtomicU64::new(10);
+/// FD-bridged serial channel bank for one MCU instance.
+pub struct Serial {
+    /// Bits clocked per byte on the wire, for baud pacing. Defaults to 10
+    /// (8N1: 1 start + 8 data + 1 stop). Configure via [`Serial::set_frame_bits`]
+    /// for other UART frames (e.g. 11 for 8E1 / 8N2, 9 for 7N1).
+    bits_per_byte: AtomicU64,
+    /// Configured channel count.
+    count: AtomicUsize,
+    /// File descriptors for each channel. -1 = not connected.
+    fds: [AtomicI32; MAX_CHANNELS],
+    /// Configured baud per channel. 0 = unpaced (instant TX/RX, default).
+    baud: [AtomicU32; MAX_CHANNELS],
+    /// Next virtual-microsecond at which the TX line is free for this channel.
+    /// Advanced atomically per chunk to model serialized UART transmission.
+    tx_next_v_us: [AtomicU64; MAX_CHANNELS],
+    /// Next virtual-microsecond at which the firmware may consume the next
+    /// byte from the RX line. Independent of TX so the link is full-duplex.
+    rx_next_v_us: [AtomicU64; MAX_CHANNELS],
+}
+
+impl Serial {
+    /// Create a bank with no channels configured and nothing connected.
+    pub const fn new() -> Self {
+        // justification: these `const`s are never read as values; they only
+        // seed the `[INIT; N]` array-repeat initializers for the fields below.
+        // Array-repeat syntax *requires* a `const`, and no interior mutability
+        // is ever observed through the consts themselves.
+        #[allow(clippy::declare_interior_mutable_const)]
+        const FD_INIT: AtomicI32 = AtomicI32::new(-1);
+        #[allow(clippy::declare_interior_mutable_const)]
+        const U32_INIT: AtomicU32 = AtomicU32::new(0);
+        #[allow(clippy::declare_interior_mutable_const)]
+        const U64_INIT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            bits_per_byte: AtomicU64::new(10),
+            count: AtomicUsize::new(0),
+            fds: [FD_INIT; MAX_CHANNELS],
+            baud: [U32_INIT; MAX_CHANNELS],
+            tx_next_v_us: [U64_INIT; MAX_CHANNELS],
+            rx_next_v_us: [U64_INIT; MAX_CHANNELS],
+        }
+    }
+
+    /// Set the number of bits clocked per byte (used by baud pacing). Default 10.
+    pub fn set_frame_bits(&self, bits: u64) {
+        self.bits_per_byte.store(bits.max(1), Ordering::Relaxed);
+    }
+
+    /// Configure the serial peripheral with the number of channels.
+    /// Resets FDs, baud, and pacing schedules, so re-init yields a clean state.
+    ///
+    /// # Panics
+    /// If `count` exceeds [`MAX_CHANNELS`].
+    pub fn init(&self, count: usize) {
+        assert!(
+            count <= MAX_CHANNELS,
+            "Serial count {} exceeds max {}",
+            count,
+            MAX_CHANNELS
+        );
+        self.reset();
+        self.count.store(count, Ordering::Relaxed);
+    }
+
+    /// Disconnect all channels and clear baud/pacing state (used by `init` and
+    /// teardown). Does not close FDs — the owner of the FD (e.g. the PTY) does that.
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        for ch in 0..MAX_CHANNELS {
+            self.fds[ch].store(-1, Ordering::Relaxed);
+            self.baud[ch].store(0, Ordering::Relaxed);
+            self.tx_next_v_us[ch].store(0, Ordering::Relaxed);
+            self.rx_next_v_us[ch].store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Initialize a serial channel with a file descriptor.
+    pub fn init_channel_fd(&self, channel: usize, fd: RawFd) {
+        if channel < MAX_CHANNELS {
+            self.fds[channel].store(fd, Ordering::Relaxed);
+            debug!("Serial channel {} initialized with fd={}", channel, fd);
+        }
+    }
+
+    /// Configure deterministic baud-rate pacing for a channel (full-duplex).
+    ///
+    /// `baud == 0` disables pacing (instant TX/RX, default). Any positive value
+    /// enables both directions: every `transmit_data` and every successful read
+    /// reserves a slot on its respective TX or RX schedule and blocks (in wall
+    /// time) for the virtual duration a real UART would spend clocking those
+    /// bytes (`bytes * 10 / baud` seconds at 8N1).
+    ///
+    /// All scheduling decisions read `embsim_core::virtual_clock`, so timing is
+    /// reproducible across runs and scales correctly with `--speed`.
+    ///
+    /// Calling `set_baud` resets both TX and RX schedules for the channel.
+    pub fn set_baud(&self, channel: usize, baud: u32) {
+        if channel >= MAX_CHANNELS {
+            return;
+        }
+        self.baud[channel].store(baud, Ordering::Relaxed);
+        self.tx_next_v_us[channel].store(0, Ordering::Relaxed);
+        self.rx_next_v_us[channel].store(0, Ordering::Relaxed);
+        if baud == 0 {
+            debug!("Serial channel {} baud pacing disabled", channel);
+        } else {
+            debug!(
+                "Serial channel {} baud pacing enabled at {} bps ({} us/byte, full-duplex)",
+                channel,
+                baud,
+                self.bits_per_byte.load(Ordering::Relaxed) * 1_000_000 / baud as u64
+            );
+        }
+    }
+
+    /// Reserve a slot of `n` bytes on the given direction's schedule and block
+    /// (in wall time) for the equivalent virtual duration. No-op when `baud` is 0.
+    fn pace_bytes(&self, slot: &AtomicU64, baud: u32, n: usize) {
+        if n == 0 || baud == 0 {
+            return;
+        }
+
+        let bits_per_byte = self.bits_per_byte.load(Ordering::Relaxed);
+        let cost_v_us = (n as u64).saturating_mul(bits_per_byte * 1_000_000) / baud as u64;
+        if cost_v_us == 0 {
+            return;
+        }
+
+        let now_v = embsim_core::virtual_clock::virtual_us();
+
+        let mut current = slot.load(Ordering::Relaxed);
+        let end_v = loop {
+            let start_v = current.max(now_v);
+            let end_v = start_v.saturating_add(cost_v_us);
+            match slot.compare_exchange_weak(current, end_v, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break end_v,
+                Err(actual) => current = actual,
+            }
+        };
+
+        let wait_v_us = end_v.saturating_sub(now_v);
+        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(wait_v_us);
+        if wall_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(wall_us));
+        }
+    }
+
+    /// Reserve a TX slot of `n` bytes; sleeps to model the firmware blocking
+    /// while the UART clocks the bytes out.
+    fn pace_tx(&self, channel: usize, n: usize) {
+        if channel >= MAX_CHANNELS {
+            return;
+        }
+        let baud = self.baud[channel].load(Ordering::Relaxed);
+        self.pace_bytes(&self.tx_next_v_us[channel], baud, n);
+    }
+
+    /// Reserve an RX slot of `n` bytes; called after a successful read so the
+    /// firmware can never consume bytes faster than the wire could deliver them.
+    fn pace_rx(&self, channel: usize, n: usize) {
+        if channel >= MAX_CHANNELS {
+            return;
+        }
+        let baud = self.baud[channel].load(Ordering::Relaxed);
+        self.pace_bytes(&self.rx_next_v_us[channel], baud, n);
+    }
+
+    /// Start a serial channel (no-op in emulation, channels are FD-based).
+    pub fn start(&self, channel: usize) {
+        trace!("serial::start(channel={})", channel);
+    }
+
+    /// Stop a serial channel (no-op in emulation).
+    pub fn stop(&self, channel: usize) {
+        trace!("serial::stop(channel={})", channel);
+    }
+
+    /// Transmit data on a serial channel.
+    pub fn transmit_data(&self, channel: usize, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let count = self.count.load(Ordering::Relaxed);
+        if channel >= count {
+            trace!("serial::transmit_data(channel={}): unknown", channel);
+            return;
+        }
+
+        let fd = self.fds[channel].load(Ordering::Relaxed);
+        if fd < 0 {
+            trace!(
+                "serial::transmit_data(channel={}): not connected, discarding {} bytes",
+                channel,
+                data.len()
+            );
+            return;
+        }
+
+        // Reserve and wait for our slot on the simulated wire before clocking the
+        // bytes out. No-op unless `set_baud` has been called for this channel.
+        self.pace_tx(channel, data.len());
+
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut written = 0;
+        while written < data.len() {
+            match nix::unistd::write(borrowed, &data[written..]) {
+                Ok(n) => written += n,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    std::thread::yield_now();
+                }
+                Err(e) => {
+                    trace!(
+                        "serial::transmit_data(channel={}): write error: {}",
+                        channel,
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+        trace!(
+            "serial::transmit_data(channel={}, len={})",
+            channel,
+            data.len()
+        );
+    }
+
+    /// Receive data with a timeout (virtual microseconds).
+    /// Returns true if all `buf.len()` bytes were received before timeout.
+    pub fn receive_data_timeout(&self, channel: usize, buf: &mut [u8], timeout_us: u64) -> bool {
+        let count = self.count.load(Ordering::Relaxed);
+        if buf.is_empty() || channel >= count {
+            let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
+            if wall_us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(wall_us));
+            }
+            return false;
+        }
+
+        let fd = self.fds[channel].load(Ordering::Relaxed);
+        if fd < 0 {
+            let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
+            if wall_us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(wall_us));
+            }
+            return false;
+        }
+
+        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wall_us);
+        let mut total_read = 0;
+
+        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
+        // the duration of this call (borrow does not outlive it).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        while total_read < buf.len() {
+            match nix::unistd::read(borrowed, &mut buf[total_read..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total_read += n;
+                    // Throttle consumption to virtual baud. Sleeps wall-time
+                    // equivalent of n*10/baud virtual µs; no-op when unpaced.
+                    self.pace_rx(channel, n);
+                    if total_read >= buf.len() {
+                        break;
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                Err(_) => break,
+            }
+        }
+
+        total_read == buf.len()
+    }
+
+    /// Receive up to `buf.len()` bytes in a single non-blocking read.
+    ///
+    /// Returns the number of bytes read (0 if none were available). Like
+    /// [`Serial::receive_byte`], a successful read is paced to the configured
+    /// baud so the firmware can never consume bytes faster than the wire would
+    /// deliver them.
+    pub fn receive_bytes(&self, channel: usize, buf: &mut [u8]) -> usize {
+        let count = self.count.load(Ordering::Relaxed);
+        if buf.is_empty() || channel >= count {
+            return 0;
+        }
+
+        let fd = self.fds[channel].load(Ordering::Relaxed);
+        if fd < 0 {
+            return 0;
+        }
+
+        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
+        // the duration of this call (borrow does not outlive it).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match nix::unistd::read(borrowed, buf) {
+            Ok(n) if n > 0 => {
+                // Throttle consumption to virtual baud (no-op when unpaced).
+                self.pace_rx(channel, n);
+                n
+            }
+            _ => 0,
+        }
+    }
+
+    /// Receive a single byte (non-blocking).
+    /// Returns Some(byte) if a byte was available, None otherwise.
+    pub fn receive_byte(&self, channel: usize) -> Option<u8> {
+        let count = self.count.load(Ordering::Relaxed);
+        if channel >= count {
+            return None;
+        }
+
+        let fd = self.fds[channel].load(Ordering::Relaxed);
+        if fd < 0 {
+            return None;
+        }
+
+        let mut byte = [0u8; 1];
+        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
+        // the duration of this call (borrow does not outlive it).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        match nix::unistd::read(borrowed, &mut byte) {
+            Ok(1) => {
+                // Throttle consumption to virtual baud (no-op when unpaced).
+                self.pace_rx(channel, 1);
+                Some(byte[0])
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for Serial {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================
+// Free functions — route to the calling thread's instance
+// ============================================================
 
 /// Set the number of bits clocked per byte (used by baud pacing). Default 10.
 pub fn set_frame_bits(bits: u64) {
-    BITS_PER_BYTE.store(bits.max(1), Ordering::Relaxed);
+    crate::instance::current().serial.set_frame_bits(bits);
 }
-
-/// Configured channel count.
-static CHANNEL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// File descriptors for each channel. -1 = not connected.
-static CHANNEL_FDS: [AtomicI32; MAX_CHANNELS] = {
-    // justification: this `const` is never read as a value; it only seeds the
-    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
-    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
-    // so the lint's "make it a static" suggestion would not compile. No interior
-    // mutability is ever observed through the const itself.
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicI32 = AtomicI32::new(-1);
-    [INIT; MAX_CHANNELS]
-};
-
-/// Configured baud per channel. 0 = unpaced (instant TX/RX, default).
-static CHANNEL_BAUD: [AtomicU32; MAX_CHANNELS] = {
-    // justification: this `const` is never read as a value; it only seeds the
-    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
-    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
-    // so the lint's "make it a static" suggestion would not compile. No interior
-    // mutability is ever observed through the const itself.
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicU32 = AtomicU32::new(0);
-    [INIT; MAX_CHANNELS]
-};
-
-/// Next virtual-microsecond at which the TX line is free for this channel.
-/// Advanced atomically per chunk to model serialized UART transmission.
-static CHANNEL_TX_NEXT_V_US: [AtomicU64; MAX_CHANNELS] = {
-    // justification: this `const` is never read as a value; it only seeds the
-    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
-    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
-    // so the lint's "make it a static" suggestion would not compile. No interior
-    // mutability is ever observed through the const itself.
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_CHANNELS]
-};
-
-/// Next virtual-microsecond at which the firmware may consume the next byte
-/// from the RX line. Independent of TX so the link is full-duplex.
-static CHANNEL_RX_NEXT_V_US: [AtomicU64; MAX_CHANNELS] = {
-    // justification: this `const` is never read as a value; it only seeds the
-    // `[INIT; N]` array-repeat initializer for the `static` above. Array-repeat
-    // syntax *requires* a `const` (a `static` is a place, not a copyable const),
-    // so the lint's "make it a static" suggestion would not compile. No interior
-    // mutability is ever observed through the const itself.
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_CHANNELS]
-};
-
-// ============================================================
-// Initialization
-// ============================================================
 
 /// Configure the serial peripheral with the number of channels.
 /// Resets FDs, baud, and pacing schedules, so re-init yields a clean state.
 pub fn init(count: usize) {
-    assert!(
-        count <= MAX_CHANNELS,
-        "Serial count {} exceeds max {}",
-        count,
-        MAX_CHANNELS
-    );
-    reset();
-    CHANNEL_COUNT.store(count, Ordering::Relaxed);
+    crate::instance::current().serial.init(count);
 }
 
 /// Disconnect all channels and clear baud/pacing state (used by `init` and
 /// teardown). Does not close FDs — the owner of the FD (e.g. the PTY) does that.
 pub fn reset() {
-    CHANNEL_COUNT.store(0, Ordering::Relaxed);
-    for ch in 0..MAX_CHANNELS {
-        CHANNEL_FDS[ch].store(-1, Ordering::Relaxed);
-        CHANNEL_BAUD[ch].store(0, Ordering::Relaxed);
-        CHANNEL_TX_NEXT_V_US[ch].store(0, Ordering::Relaxed);
-        CHANNEL_RX_NEXT_V_US[ch].store(0, Ordering::Relaxed);
-    }
+    crate::instance::current().serial.reset();
 }
 
 /// Initialize a serial channel with a file descriptor.
 pub fn init_channel_fd(channel: usize, fd: RawFd) {
-    if channel < MAX_CHANNELS {
-        CHANNEL_FDS[channel].store(fd, Ordering::Relaxed);
-        debug!("Serial channel {} initialized with fd={}", channel, fd);
-    }
+    crate::instance::current()
+        .serial
+        .init_channel_fd(channel, fd);
 }
 
 /// Configure deterministic baud-rate pacing for a channel (full-duplex).
-///
-/// `baud == 0` disables pacing (instant TX/RX, default). Any positive value
-/// enables both directions: every `transmit_data` and every successful read
-/// reserves a slot on its respective TX or RX schedule and blocks (in wall
-/// time) for the virtual duration a real UART would spend clocking those
-/// bytes (`bytes * 10 / baud` seconds at 8N1).
-///
-/// All scheduling decisions read `embsim_core::virtual_clock`, so timing is
-/// reproducible across runs and scales correctly with `--speed`.
-///
-/// Calling `set_baud` resets both TX and RX schedules for the channel.
+/// See [`Serial::set_baud`].
 pub fn set_baud(channel: usize, baud: u32) {
-    if channel >= MAX_CHANNELS {
-        return;
-    }
-    CHANNEL_BAUD[channel].store(baud, Ordering::Relaxed);
-    CHANNEL_TX_NEXT_V_US[channel].store(0, Ordering::Relaxed);
-    CHANNEL_RX_NEXT_V_US[channel].store(0, Ordering::Relaxed);
-    if baud == 0 {
-        debug!("Serial channel {} baud pacing disabled", channel);
-    } else {
-        debug!(
-            "Serial channel {} baud pacing enabled at {} bps ({} us/byte, full-duplex)",
-            channel,
-            baud,
-            BITS_PER_BYTE.load(Ordering::Relaxed) * 1_000_000 / baud as u64
-        );
-    }
+    crate::instance::current().serial.set_baud(channel, baud);
 }
-
-/// Reserve a slot of `n` bytes on the given direction's schedule and block
-/// (in wall time) for the equivalent virtual duration. No-op when `baud` is 0.
-fn pace_bytes(slot: &AtomicU64, baud: u32, n: usize) {
-    if n == 0 || baud == 0 {
-        return;
-    }
-
-    let bits_per_byte = BITS_PER_BYTE.load(Ordering::Relaxed);
-    let cost_v_us = (n as u64).saturating_mul(bits_per_byte * 1_000_000) / baud as u64;
-    if cost_v_us == 0 {
-        return;
-    }
-
-    let now_v = embsim_core::virtual_clock::virtual_us();
-
-    let mut current = slot.load(Ordering::Relaxed);
-    let end_v = loop {
-        let start_v = current.max(now_v);
-        let end_v = start_v.saturating_add(cost_v_us);
-        match slot.compare_exchange_weak(current, end_v, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break end_v,
-            Err(actual) => current = actual,
-        }
-    };
-
-    let wait_v_us = end_v.saturating_sub(now_v);
-    let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(wait_v_us);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
-}
-
-/// Reserve a TX slot of `n` bytes; sleeps to model the firmware blocking
-/// while the UART clocks the bytes out.
-fn pace_tx(channel: usize, n: usize) {
-    if channel >= MAX_CHANNELS {
-        return;
-    }
-    let baud = CHANNEL_BAUD[channel].load(Ordering::Relaxed);
-    pace_bytes(&CHANNEL_TX_NEXT_V_US[channel], baud, n);
-}
-
-/// Reserve an RX slot of `n` bytes; called after a successful read so the
-/// firmware can never consume bytes faster than the wire could deliver them.
-fn pace_rx(channel: usize, n: usize) {
-    if channel >= MAX_CHANNELS {
-        return;
-    }
-    let baud = CHANNEL_BAUD[channel].load(Ordering::Relaxed);
-    pace_bytes(&CHANNEL_RX_NEXT_V_US[channel], baud, n);
-}
-
-// ============================================================
-// Core API
-// ============================================================
 
 /// Start a serial channel (no-op in emulation, channels are FD-based).
 pub fn start(channel: usize) {
-    trace!("serial::start(channel={})", channel);
+    crate::instance::current().serial.start(channel);
 }
 
 /// Stop a serial channel (no-op in emulation).
 pub fn stop(channel: usize) {
-    trace!("serial::stop(channel={})", channel);
+    crate::instance::current().serial.stop(channel);
 }
 
 /// Transmit data on a serial channel.
 pub fn transmit_data(channel: usize, data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if channel >= count {
-        trace!("serial::transmit_data(channel={}): unknown", channel);
-        return;
-    }
-
-    let fd = CHANNEL_FDS[channel].load(Ordering::Relaxed);
-    if fd < 0 {
-        trace!(
-            "serial::transmit_data(channel={}): not connected, discarding {} bytes",
-            channel,
-            data.len()
-        );
-        return;
-    }
-
-    // Reserve and wait for our slot on the simulated wire before clocking the
-    // bytes out. No-op unless `set_baud` has been called for this channel.
-    pace_tx(channel, data.len());
-
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut written = 0;
-    while written < data.len() {
-        match nix::unistd::write(borrowed, &data[written..]) {
-            Ok(n) => written += n,
-            Err(nix::errno::Errno::EAGAIN) => {
-                std::thread::yield_now();
-            }
-            Err(e) => {
-                trace!(
-                    "serial::transmit_data(channel={}): write error: {}",
-                    channel,
-                    e
-                );
-                break;
-            }
-        }
-    }
-    trace!(
-        "serial::transmit_data(channel={}, len={})",
-        channel,
-        data.len()
-    );
+    crate::instance::current()
+        .serial
+        .transmit_data(channel, data);
 }
 
 /// Receive data with a timeout (virtual microseconds).
 /// Returns true if all `len` bytes were received before timeout.
 pub fn receive_data_timeout(channel: usize, buf: &mut [u8], timeout_us: u64) -> bool {
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if buf.is_empty() || channel >= count {
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
-        return false;
-    }
-
-    let fd = CHANNEL_FDS[channel].load(Ordering::Relaxed);
-    if fd < 0 {
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
-        return false;
-    }
-
-    let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wall_us);
-    let mut total_read = 0;
-
-    // SAFETY: `fd` is the channel FD owned by CHANNEL_FDS; it stays open for the
-    // duration of this call (borrow does not outlive it).
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    while total_read < buf.len() {
-        match nix::unistd::read(borrowed, &mut buf[total_read..]) {
-            Ok(0) => break,
-            Ok(n) => {
-                total_read += n;
-                // Throttle consumption to virtual baud. Sleeps wall-time
-                // equivalent of n*10/baud virtual µs; no-op when unpaced.
-                pace_rx(channel, n);
-                if total_read >= buf.len() {
-                    break;
-                }
-            }
-            Err(nix::errno::Errno::EAGAIN) => {
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(100));
-            }
-            Err(_) => break,
-        }
-    }
-
-    total_read == buf.len()
+    crate::instance::current()
+        .serial
+        .receive_data_timeout(channel, buf, timeout_us)
 }
 
 /// Receive up to `buf.len()` bytes in a single non-blocking read.
-///
-/// Returns the number of bytes read (0 if none were available). Like
-/// [`receive_byte`], a successful read is paced to the configured baud so the
-/// firmware can never consume bytes faster than the wire would deliver them.
+/// See [`Serial::receive_bytes`].
 pub fn receive_bytes(channel: usize, buf: &mut [u8]) -> usize {
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if buf.is_empty() || channel >= count {
-        return 0;
-    }
-
-    let fd = CHANNEL_FDS[channel].load(Ordering::Relaxed);
-    if fd < 0 {
-        return 0;
-    }
-
-    // SAFETY: `fd` is the channel FD owned by CHANNEL_FDS; it stays open for the
-    // duration of this call (borrow does not outlive it).
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    match nix::unistd::read(borrowed, buf) {
-        Ok(n) if n > 0 => {
-            // Throttle consumption to virtual baud (no-op when unpaced).
-            pace_rx(channel, n);
-            n
-        }
-        _ => 0,
-    }
+    crate::instance::current()
+        .serial
+        .receive_bytes(channel, buf)
 }
 
 /// Receive a single byte (non-blocking).
 /// Returns Some(byte) if a byte was available, None otherwise.
 pub fn receive_byte(channel: usize) -> Option<u8> {
-    let count = CHANNEL_COUNT.load(Ordering::Relaxed);
-    if channel >= count {
-        return None;
-    }
-
-    let fd = CHANNEL_FDS[channel].load(Ordering::Relaxed);
-    if fd < 0 {
-        return None;
-    }
-
-    let mut byte = [0u8; 1];
-    // SAFETY: `fd` is the channel FD owned by CHANNEL_FDS; it stays open for the
-    // duration of this call (borrow does not outlive it).
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    match nix::unistd::read(borrowed, &mut byte) {
-        Ok(1) => {
-            // Throttle consumption to virtual baud (no-op when unpaced).
-            pace_rx(channel, 1);
-            Some(byte[0])
-        }
-        _ => None,
-    }
+    crate::instance::current().serial.receive_byte(channel)
 }
 
 // ============================================================
@@ -374,6 +440,8 @@ pub fn receive_byte(channel: usize) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use nix::libc;
 
@@ -422,8 +490,6 @@ mod tests {
         /// once the writer's `write` returns, so the data cases never race.)
         fn read_far(&self, n: usize) -> Vec<u8> {
             let mut buf = vec![0u8; n];
-            // SAFETY: `self.b` stays open for the life of `self`, which outlives
-            // this borrow.
             let fd = unsafe { BorrowedFd::borrow_raw(self.b) };
             match nix::unistd::read(fd, &mut buf) {
                 Ok(read) => {
@@ -451,7 +517,7 @@ mod tests {
         init(count);
     }
 
-    #[test]
+    #[rstest]
     fn init_at_max_channels_is_allowed() {
         let _g = crate::test_support::guard();
         setup(MAX_CHANNELS);
@@ -459,7 +525,7 @@ mod tests {
         assert!(receive_byte(MAX_CHANNELS - 1).is_none());
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_channels_panics() {
         let _g = crate::test_support::guard();
@@ -467,7 +533,7 @@ mod tests {
         init(MAX_CHANNELS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn reset_sets_all_fds_to_minus_one_and_clears_pacing() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -481,7 +547,7 @@ mod tests {
         assert!(receive_byte(0).is_none());
     }
 
-    #[test]
+    #[rstest]
     fn init_channel_fd_stores_the_fd_and_enables_io() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -492,7 +558,7 @@ mod tests {
         assert_eq!(pair.read_far(2), b"hi");
     }
 
-    #[test]
+    #[rstest]
     fn transmit_to_unconnected_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -501,7 +567,7 @@ mod tests {
         // Nothing to assert beyond "did not panic / did not block".
     }
 
-    #[test]
+    #[rstest]
     fn transmit_empty_data_is_a_no_op() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -513,7 +579,7 @@ mod tests {
         assert!(got.is_empty(), "empty transmit writes nothing");
     }
 
-    #[test]
+    #[rstest]
     fn transmit_out_of_range_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -521,7 +587,7 @@ mod tests {
         transmit_data(5, b"data");
     }
 
-    #[test]
+    #[rstest]
     fn transmit_then_read_round_trips_bytes() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -531,7 +597,7 @@ mod tests {
         assert_eq!(pair.read_far(2), b"hi");
     }
 
-    #[test]
+    #[rstest]
     fn receive_byte_returns_available_then_none_when_empty() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -543,7 +609,7 @@ mod tests {
         assert_eq!(receive_byte(0), None);
     }
 
-    #[test]
+    #[rstest]
     fn receive_byte_on_unconnected_or_out_of_range_is_none() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -553,7 +619,7 @@ mod tests {
         assert_eq!(receive_byte(9), None);
     }
 
-    #[test]
+    #[rstest]
     fn receive_bytes_burst_drains_then_zero_when_empty() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -568,7 +634,7 @@ mod tests {
         assert_eq!(receive_bytes(0, &mut buf), 0);
     }
 
-    #[test]
+    #[rstest]
     fn receive_bytes_clamps_to_buffer_len() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -585,7 +651,7 @@ mod tests {
         assert_eq!(&rest[..2], b"ef");
     }
 
-    #[test]
+    #[rstest]
     fn receive_bytes_unconnected_out_of_range_or_empty_buf_is_zero() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -601,7 +667,7 @@ mod tests {
         assert_eq!(receive_bytes(0, &mut empty), 0);
     }
 
-    #[test]
+    #[rstest]
     fn receive_data_timeout_fills_buffer_when_bytes_ready() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -614,7 +680,7 @@ mod tests {
         assert_eq!(&buf, b"abcd");
     }
 
-    #[test]
+    #[rstest]
     fn receive_data_timeout_returns_false_when_short() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -628,7 +694,7 @@ mod tests {
         assert_eq!(&buf[..2], b"ab");
     }
 
-    #[test]
+    #[rstest]
     fn receive_data_timeout_empty_buf_or_unknown_channel_is_false() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -647,7 +713,7 @@ mod tests {
         assert!(!receive_data_timeout(1, &mut buf2, 100));
     }
 
-    #[test]
+    #[rstest]
     fn set_frame_bits_clamps_to_at_least_one() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -662,7 +728,7 @@ mod tests {
         set_frame_bits(10);
     }
 
-    #[test]
+    #[rstest]
     fn paced_baud_still_delivers_bytes_correctly() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -678,7 +744,7 @@ mod tests {
         assert_eq!(receive_byte(0), Some(0x42));
     }
 
-    #[test]
+    #[rstest]
     fn set_baud_zero_is_unpaced_and_resets_schedules() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -691,7 +757,7 @@ mod tests {
         assert_eq!(pair.read_far(2), b"ok");
     }
 
-    #[test]
+    #[rstest]
     fn set_baud_out_of_range_channel_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -699,7 +765,7 @@ mod tests {
         set_baud(MAX_CHANNELS, 9600);
     }
 
-    #[test]
+    #[rstest]
     fn start_and_stop_are_no_ops() {
         let _g = crate::test_support::guard();
         let pair = Pair::new();
@@ -710,5 +776,90 @@ mod tests {
         stop(0);
         transmit_data(0, b"x");
         assert_eq!(pair.read_far(1), b"x");
+    }
+
+    /// Paced TX of `N` bytes at baud `B` with `F` frame bits must block for
+    /// approximately `N * F * 1e6 / B` virtual microseconds (scale 1.0 ⇒ wall).
+    ///
+    /// We assert a lower bound of 50% of the theoretical cost (scheduler slack
+    /// can only make sleeps shorter under load, never invent free time) and a
+    /// generous upper bound so CI hosts with jitter still pass.
+    #[rstest]
+    #[case::ten_kbaud_2b(10_000, 10, 2, 2_000)]
+    #[case::twenty_kbaud_5b(20_000, 10, 5, 2_500)]
+    #[case::frame_11(10_000, 11, 2, 2_200)]
+    fn paced_tx_blocks_for_expected_virtual_us(
+        #[case] baud: u32,
+        #[case] frame_bits: u64,
+        #[case] nbytes: usize,
+        #[case] expected_v_us: u64,
+    ) {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+        set_frame_bits(frame_bits);
+        set_baud(0, baud);
+
+        let payload = vec![0xA5u8; nbytes];
+        let t0 = std::time::Instant::now();
+        transmit_data(0, &payload);
+        let wall_us = t0.elapsed().as_micros() as u64;
+
+        assert_eq!(pair.read_far(nbytes), payload.as_slice());
+        assert!(
+            wall_us >= expected_v_us / 2,
+            "paced TX too fast: wall={wall_us}us expected≥{}us (baud={baud} F={frame_bits} N={nbytes})",
+            expected_v_us / 2
+        );
+        assert!(
+            wall_us <= expected_v_us.saturating_mul(8).saturating_add(20_000),
+            "paced TX too slow: wall={wall_us}us expected≤{}us",
+            expected_v_us.saturating_mul(8).saturating_add(20_000)
+        );
+    }
+
+    /// RX pacing is independent of TX (full duplex): a paced receive after a
+    /// paced transmit still delivers the byte and incurs its own schedule cost.
+    #[rstest]
+    fn paced_rx_is_independent_full_duplex() {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+        set_frame_bits(10);
+        set_baud(0, 50_000); // 200 us/byte — measurable but snappy
+
+        // TX half: one byte.
+        let t_tx = std::time::Instant::now();
+        transmit_data(0, b"T");
+        let tx_us = t_tx.elapsed().as_micros() as u64;
+        assert_eq!(pair.read_far(1), b"T");
+        assert!(tx_us >= 100, "TX half should sleep ~200us, got {tx_us}");
+
+        // RX half: one byte from the far end.
+        pair.write_far(b"R");
+        let t_rx = std::time::Instant::now();
+        assert_eq!(receive_byte(0), Some(b'R'));
+        let rx_us = t_rx.elapsed().as_micros() as u64;
+        assert!(rx_us >= 100, "RX half should sleep ~200us, got {rx_us}");
+    }
+
+    /// Frame-bits / baud matrix: bytes always land intact under pacing.
+    #[rstest]
+    #[case::eight_n1(10, 100_000)]
+    #[case::eight_e1(11, 100_000)]
+    #[case::seven_n1(9, 100_000)]
+    fn paced_bytes_round_trip_for_frame_and_baud(#[case] frame_bits: u64, #[case] baud: u32) {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+        set_frame_bits(frame_bits);
+        set_baud(0, baud);
+        transmit_data(0, b"xy");
+        assert_eq!(pair.read_far(2), b"xy");
+        pair.write_far(b"z");
+        assert_eq!(receive_byte(0), Some(b'z'));
     }
 }

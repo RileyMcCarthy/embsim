@@ -10,6 +10,7 @@
 //! poison the way `pulse_out.rs` does). We assert ONLY panic / no-panic — the
 //! emitted directives are inert outside a real build script.
 
+use rstest::rstest;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,7 +85,7 @@ fn touch_lib(dir: &Path, name: &str) {
 
 /// Pointing the env-var dir at a real directory that contains `libfoo.a` with
 /// name `foo` does NOT panic.
-#[test]
+#[rstest]
 fn present_lib_does_not_panic() {
     let _g = lock_or_recover();
     let _env = EnvGuard::capture();
@@ -101,7 +102,7 @@ fn present_lib_does_not_panic() {
 
 /// With only the dir overridden, the default *name* is honored — `lib<default>.a`
 /// present means no panic.
-#[test]
+#[rstest]
 fn default_name_is_used_when_name_var_unset() {
     let _g = lock_or_recover();
     let _env = EnvGuard::capture();
@@ -118,7 +119,7 @@ fn default_name_is_used_when_name_var_unset() {
 /// With NO env vars set, the default dir + name path is taken; a real dir +
 /// matching lib passed as the defaults means no panic. (Proves both fall back
 /// to the arguments.)
-#[test]
+#[rstest]
 fn falls_back_to_arguments_when_no_env() {
     let _g = lock_or_recover();
     let _env = EnvGuard::capture();
@@ -137,7 +138,7 @@ fn falls_back_to_arguments_when_no_env() {
 // ============================================================
 
 /// A real dir that is MISSING `lib<name>.a` panics.
-#[test]
+#[rstest]
 #[should_panic(expected = "not found")]
 fn missing_lib_in_existing_dir_panics() {
     let _g = lock_or_recover();
@@ -151,7 +152,7 @@ fn missing_lib_in_existing_dir_panics() {
 }
 
 /// A nonexistent directory (cannot be canonicalized) panics.
-#[test]
+#[rstest]
 #[should_panic(expected = "not found")]
 fn nonexistent_dir_panics() {
     let _g = lock_or_recover();
@@ -172,7 +173,7 @@ fn nonexistent_dir_panics() {
 /// Even when the *default* dir is bogus, an env override that points at a real
 /// dir with the lib wins — i.e. the env var, not the argument, is consulted
 /// first for the directory.
-#[test]
+#[rstest]
 fn env_dir_overrides_bogus_default() {
     let _g = lock_or_recover();
     let _env = EnvGuard::capture();

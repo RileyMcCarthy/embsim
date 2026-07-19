@@ -4,6 +4,27 @@
 //! `set_voltage()` callback, converts to ADC counts, and sends conversion
 //! data to firmware over a serial pipe when in continuous mode.
 //!
+//! # Datasheet provenance
+//!
+//! Modeled against **TI SBAS752B (May 2017, revised Oct 2018)** — the
+//! ADS122U04 datasheet; section/page citations below are to that revision.
+//! Governing sections: §8.5.1 UART interface (p.34), §8.5.2 data format
+//! (p.35), §8.5.3 commands (p.36–37), §8.5.4 data read modes (p.37),
+//! §8.6 register map (p.40–46).
+//!
+//! ## Deliberate simplifications (byte-pipe fidelity)
+//!
+//! - No baud-rate auto-detection (§8.5.1.4): the transport is a byte pipe,
+//!   so sync-word timing measurement has nothing to measure. The sync byte
+//!   itself IS required before every command, as the datasheet specifies.
+//! - No interface idle timeout (§8.5.1.5, ~32760·t_MOD): a real host that
+//!   stalls mid-command resets the interface; the model waits forever.
+//! - No td(RSRX) post-RESET delay enforcement (§8.5.3.1).
+//! - Config registers are stored/read back faithfully, but only DR/MODE
+//!   (reg 1, conversion pacing) and AUTO (reg 3 bit 0, data read mode) are
+//!   functionally interpreted; MUX/GAIN/VREF live in `Config` at build
+//!   time, and DCNT/CRC/BCS output framing modes (§8.6.2.3) are unmodeled.
+//!
 //! The ADC has no concept of force or sensors — it only knows voltage.
 //! Upstream models (e.g., strain gauge) provide voltage updates via callback.
 //!
@@ -22,15 +43,25 @@ use tracing::{debug, info, trace, warn};
 // ADS122U04 Protocol Constants
 // ============================================================
 
+/// Synchronization word — must precede every command (SBAS752B §8.5.1.4,
+/// p.34: "The host must always transmit the synchronization word first").
 const SYNC_BYTE: u8 = 0x55;
+/// RESET = `0000 011x` (SBAS752B §8.5.3 Table 15, p.36).
 const CMD_RESET: u8 = 0x06;
+/// START/SYNC = `0000 100x` (SBAS752B §8.5.3 Table 15, p.36).
 const CMD_START: u8 = 0x08;
-const CMD_POWERDOWN: u8 = 0x01;
+/// POWERDOWN = `0000 001x` (SBAS752B §8.5.3 Table 15, p.36).
+const CMD_POWERDOWN: u8 = 0x02;
 
+/// Five 8-bit configuration registers, 00h–04h (SBAS752B §8.6.1 Table 16,
+/// p.40).
 const REGISTER_COUNT: usize = 5;
 
 /// Index of CONFIG1 — encodes data-rate (bits 7:5) and operating mode (bit 4).
 const REG_CONFIG1: usize = 1;
+
+/// Index of CONFIG3 — bit 0 selects automatic (1) vs manual (0) data read mode.
+const REG_CONFIG3: usize = 3;
 
 /// Default conversion interval if CONFIG1 is unwritten (datasheet reset = 20 SPS).
 const DEFAULT_CONVERSION_INTERVAL_US: u64 = 50_000;
@@ -40,11 +71,12 @@ const ADC_MAX_CODE: f64 = 8_388_608.0; // 2^23
 
 /// Compute the conversion interval (virtual µs) from the contents of CONFIG1.
 ///
-/// CONFIG1 bit layout (per ADS122U04 datasheet):
-///   [7:5] DR   — data rate (000=20 SPS … 110=1000 SPS)
-///   [4]   MODE — 0 = normal, 1 = turbo (doubles the rate)
+/// CONFIG1 bit layout (SBAS752B §8.6.2.2 Fig. 70, p.42):
+///   [7:5] DR   — data rate (Table 20, p.42: 000=20 SPS … 110=1000 SPS)
+///   [4]   MODE — 0 = normal, 1 = turbo (512-kHz modulator, doubles the rate)
 ///
-/// Reserved DR codes (111) fall back to the fastest configured rate.
+/// Reserved DR code (111) falls back to the fastest configured rate
+/// (datasheet marks it Reserved; the fallback is a documented model choice).
 fn conversion_interval_us(reg_config1: u8) -> u64 {
     let dr = (reg_config1 >> 5) & 0b111;
     let turbo = ((reg_config1 >> 4) & 0b1) == 1;
@@ -136,9 +168,19 @@ impl Ads122u04 {
     }
 
     /// Convert input voltage (mV) to ADC counts.
+    ///
+    /// Transfer function per SBAS752B §8.5.2 (p.35, Eq. 8):
+    /// `1 LSB = (2 · VREF / Gain) / 2^24`, i.e. `code = VIN · Gain · 2^23 /
+    /// VREF`. Signals beyond full scale **clip** at 7FFFFFh / 800000h
+    /// (§8.5.2: "The output clips at these codes for signals that exceed
+    /// full-scale") — clipping applies after the configured zero offset so
+    /// the emitted 24-bit word can never wrap.
     fn voltage_to_adc(&self, voltage_mv: f64) -> i32 {
+        const CODE_MAX: i64 = 0x7F_FFFF; // +FS − 1 LSB (7FFFFFh)
+        const CODE_MIN: i64 = -0x80_0000; // −FS (800000h)
         let code = (voltage_mv * self.config.gain * ADC_MAX_CODE) / self.config.vref_mv;
-        (code as i32) + self.config.zero_offset
+        let with_offset = (code as i64) + i64::from(self.config.zero_offset);
+        with_offset.clamp(CODE_MIN, CODE_MAX) as i32
     }
 }
 
@@ -153,10 +195,14 @@ fn create_pipe_pair() -> (RawFd, RawFd) {
     let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     assert_eq!(ret, 0, "Failed to create ADS122U04 socket pair");
 
-    // Set model side to non-blocking for polling reads
-    unsafe {
-        let flags = libc::fcntl(fds[0], libc::F_GETFL);
-        libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+    // Both sides non-blocking: the model polls its end, and the firmware HAL's
+    // receive-timeout semantics depend on EAGAIN (a blocking firmware fd would
+    // hang a zero-timeout drain/poll forever instead of returning "no data").
+    for fd in fds {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 
     (fds[0], fds[1])
@@ -212,10 +258,15 @@ fn protocol_loop(adc: &Ads122u04) {
             }
         }
 
-        // Send continuous conversion data if active. The conversion interval
-        // is derived from CONFIG1 (DR bits + Turbo flag) so the model honors
-        // whatever rate the firmware configured via WREG.
-        if continuous {
+        // Send unprompted conversion data only in automatic data read mode
+        // (CONFIG3 bit 0 = AUTO, §8.6.2.4 Table 16 p.40; §8.5.4 p.37: "the
+        // ADS122U04 automatically outputs conversion data … as soon as a
+        // conversion completes"); in manual mode results are fetched with
+        // RDATA.
+        // The conversion interval is derived from CONFIG1 (DR bits + Turbo
+        // flag) so the model honors whatever rate the firmware configured.
+        let auto_mode = (adc.registers.lock().unwrap()[REG_CONFIG3] & 0x01) != 0;
+        if continuous && auto_mode {
             let reg1 = adc.registers.lock().unwrap()[REG_CONFIG1];
             let interval_us = if reg1 == 0 {
                 DEFAULT_CONVERSION_INTERVAL_US
@@ -261,15 +312,23 @@ fn process_byte(
             let command = byte;
 
             if command == CMD_RESET {
+                // §8.5.3.1 (p.36) + §8.6.1 (p.40): reset restores default
+                // register values (all 0) and, per the §8.4 flow chart
+                // (p.31), returns the device to the non-converting state.
                 debug!("ADS122U04: RESET");
                 *continuous = false;
                 *adc.registers.lock().unwrap() = [0u8; REGISTER_COUNT];
                 ParseState::WaitSync
             } else if command == CMD_START {
+                // §8.5.3.2 (p.36): in continuous conversion mode START is
+                // issued once to start converting continuously. (Digital-
+                // filter restart on repeated START is not modeled.)
                 debug!("ADS122U04: START (continuous mode)");
                 *continuous = true;
                 ParseState::WaitSync
             } else if command == CMD_POWERDOWN {
+                // §8.5.3.3 (p.36): power-down stops conversions but holds
+                // all register values.
                 debug!("ADS122U04: POWERDOWN");
                 *continuous = false;
                 ParseState::WaitSync
@@ -277,8 +336,18 @@ fn process_byte(
                 let upper_nibble = (command >> 4) & 0x0F;
                 let register = ((command >> 1) & 0x0F) as usize;
 
-                if upper_nibble == 0b0010 {
-                    // RREG — read register
+                if upper_nibble == 0b0001 {
+                    // RDATA = `0001 xxxx` (§8.5.3 Table 15, p.36): "loads the
+                    // output shift register with the most recent conversion
+                    // result" (§8.5.3.4, p.36) — the manual data read mode
+                    // fetch (§8.5.4, p.37), request/response framed.
+                    trace!("ADS122U04: RDATA");
+                    send_conversion(adc, fd);
+                    ParseState::WaitSync
+                } else if upper_nibble == 0b0010 {
+                    // RREG = `0010 rrrx` (§8.5.3 Table 15, p.36): replies
+                    // one byte; a nonexistent register reads back 00h
+                    // (§8.5.3.5, p.37).
                     if register < REGISTER_COUNT {
                         let val = adc.registers.lock().unwrap()[register];
                         trace!("ADS122U04: RREG reg={} val=0x{:02x}", register, val);
@@ -289,7 +358,10 @@ fn process_byte(
                     }
                     ParseState::WaitSync
                 } else if upper_nibble == 0b0100 {
-                    // WREG — write register, need one more data byte
+                    // WREG = `0100 rrrx dddd dddd` (§8.5.3 Table 15, p.36):
+                    // one data byte follows; writes to a nonexistent register
+                    // are ignored (§8.5.3.6, p.37). (Digital-filter restart
+                    // on writes to regs 0–3 is not modeled.)
                     trace!("ADS122U04: WREG reg={} (waiting for data)", register);
                     ParseState::WaitWriteData { register }
                 } else {
@@ -309,6 +381,9 @@ fn process_byte(
 }
 
 /// Send a 3-byte ADC conversion value to firmware.
+/// Transmit one 24-bit conversion result, least significant byte first
+/// (§8.5.3.4 NOTE, p.36: "Data words are transmitted least significant byte
+/// first"; 24-bit two's complement per §8.5.2, p.35).
 fn send_conversion(adc: &Ads122u04, fd: RawFd) {
     let value = adc.adc_value.load(Ordering::Relaxed) as u32;
     let bytes = [
@@ -354,6 +429,8 @@ fn write_bytes(fd: RawFd, data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Build an `Ads122u04` with simple, exact transfer-function parameters.
@@ -419,7 +496,7 @@ mod tests {
 
     /// Every data-rate code maps to the datasheet interval, the reserved code
     /// (111) falls back to the fastest rate, and bit 4 (turbo) halves it.
-    #[test]
+    #[rstest]
     fn conversion_interval_full_dr_table() {
         // (DR code in bits 7:5) → expected normal-mode interval (µs).
         let table: [(u8, u64); 8] = [
@@ -452,7 +529,7 @@ mod tests {
     /// Turbo bit in isolation halves the default (DR=000) interval and the
     /// lowest data rate, independent of the other low bits which must be
     /// ignored.
-    #[test]
+    #[rstest]
     fn conversion_interval_ignores_low_bits() {
         // DR=000, turbo=0, but assorted junk in bits 3:0 — must not matter.
         assert_eq!(conversion_interval_us(0b0000_1111 & 0b0000_1111), 50_000);
@@ -464,7 +541,7 @@ mod tests {
     // ── voltage_to_adc: transfer function ──
 
     /// Zero volts maps exactly to the calibrated zero offset.
-    #[test]
+    #[rstest]
     fn voltage_zero_is_zero_offset() {
         let (adc, _fw) = make_adc(1.0, 1234);
         adc.set_voltage(0.0);
@@ -473,7 +550,7 @@ mod tests {
 
     /// A known voltage maps to `round_toward_zero(v*gain*2^23/vref) + offset`.
     /// With vref == 2^21 and gain 1, the factor `2^23/vref` is exactly 4.
-    #[test]
+    #[rstest]
     fn voltage_maps_to_expected_code() {
         let (adc, _fw) = make_adc(1.0, 0);
         adc.set_voltage(100.0);
@@ -488,7 +565,7 @@ mod tests {
     }
 
     /// Doubling the PGA gain doubles the resulting code (offset held at 0).
-    #[test]
+    #[rstest]
     fn gain_scales_code_linearly() {
         let (g1, _a) = make_adc(1.0, 0);
         let (g2, _b) = make_adc(2.0, 0);
@@ -501,7 +578,7 @@ mod tests {
     }
 
     /// A negative voltage produces a code strictly below the zero offset.
-    #[test]
+    #[rstest]
     fn negative_voltage_is_below_zero_offset() {
         let (adc, _fw) = make_adc(1.0, 5000);
         adc.set_voltage(-50.0);
@@ -516,8 +593,30 @@ mod tests {
 
     // ── process_byte: protocol state machine ──
 
+    /// SYNC then RDATA answers with the latest 3-byte conversion immediately
+    /// (manual data read mode fetch).
+    #[rstest]
+    fn rdata_sends_latest_conversion() {
+        let (adc, _fw) = make_adc(1.0, 0);
+        let (wr, rd) = test_pair();
+        adc.set_voltage(100.0); // 100 mV * 4 = code 400 (vref 2^21, gain 1)
+        let mut cont = true;
+
+        let st = process_byte(&adc, wr, ParseState::WaitSync, SYNC_BYTE, &mut cont);
+        let st = process_byte(&adc, wr, st, 0x10, &mut cont);
+        assert!(
+            matches!(st, ParseState::WaitSync),
+            "RDATA is a single-byte command"
+        );
+
+        let b = read_n(rd, 3);
+        assert_eq!(b.len(), 3, "RDATA answers with exactly 3 bytes");
+        let code = i32::from(b[0]) | (i32::from(b[1]) << 8) | (i32::from(b[2]) << 16);
+        assert_eq!(code, 400);
+    }
+
     /// SYNC then START enters continuous mode.
-    #[test]
+    #[rstest]
     fn sync_then_start_sets_continuous() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -531,7 +630,7 @@ mod tests {
     }
 
     /// RESET clears continuous mode and zeroes all registers.
-    #[test]
+    #[rstest]
     fn reset_clears_continuous_and_registers() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -547,7 +646,7 @@ mod tests {
     }
 
     /// POWERDOWN clears continuous mode (registers untouched).
-    #[test]
+    #[rstest]
     fn powerdown_clears_continuous() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -567,7 +666,7 @@ mod tests {
 
     /// WREG writes the data byte into the register selected by `(cmd>>1)&0xF`.
     /// `0b0100` upper nibble = WREG; register index 2 → command `0x44`.
-    #[test]
+    #[rstest]
     fn wreg_writes_selected_register() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -593,7 +692,7 @@ mod tests {
     }
 
     /// Two consecutive WREG transactions write two different registers.
-    #[test]
+    #[rstest]
     fn wreg_multiple_registers() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -615,7 +714,7 @@ mod tests {
     /// RREG (upper nibble 0b0010) returns to WaitSync and emits the register
     /// value on the fd; a subsequent SYNC+START still works, proving the state
     /// machine recovered cleanly.
-    #[test]
+    #[rstest]
     fn rreg_returns_to_waitsync_and_emits_value() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -641,7 +740,7 @@ mod tests {
 
     /// RREG on an out-of-range register index emits a single `0` byte and does
     /// not panic.
-    #[test]
+    #[rstest]
     fn rreg_invalid_register_emits_zero() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -657,7 +756,7 @@ mod tests {
 
     /// WREG to an out-of-range register index is silently ignored on the data
     /// byte (no panic, no register mutation).
-    #[test]
+    #[rstest]
     fn wreg_invalid_register_is_ignored() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -677,7 +776,7 @@ mod tests {
     /// A non-sync byte in WaitSync is discarded and we stay in WaitSync: a
     /// following command byte (without a sync first) is treated as garbage and
     /// does NOT enter continuous mode.
-    #[test]
+    #[rstest]
     fn non_sync_byte_stays_in_waitsync() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -695,7 +794,7 @@ mod tests {
 
     /// An unknown command (sync OK, but command nibble is neither RREG/WREG nor
     /// a known opcode) returns to WaitSync without side effects.
-    #[test]
+    #[rstest]
     fn unknown_command_returns_to_waitsync() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, _rd) = test_pair();
@@ -720,7 +819,7 @@ mod tests {
 
     /// `send_conversion` writes the low, middle, then high byte of the 24-bit
     /// ADC value (little-endian).
-    #[test]
+    #[rstest]
     fn send_conversion_packs_little_endian() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -731,9 +830,10 @@ mod tests {
         assert_eq!(read_n(rd, 3), vec![0x56, 0x34, 0x12]);
     }
 
-    /// Only the low 24 bits are transmitted; the top byte of the 32-bit value is
-    /// dropped, and a negative `i32` is reinterpreted via its `u32` bit pattern.
-    #[test]
+    /// Only the low 24 bits are transmitted on the wire (the value itself is
+    /// clipped to the 24-bit code range before it ever reaches here — see
+    /// `voltage_clips_at_full_scale`).
+    #[rstest]
     fn send_conversion_truncates_to_24_bits() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -748,8 +848,26 @@ mod tests {
         );
     }
 
+    /// SBAS752B §8.5.2 (p.35): "A positive full-scale input … produces an
+    /// output code of 7FFFFFh and a negative full-scale input … 800000h. The
+    /// output clips at these codes for signals that exceed full-scale."
+    #[rstest]
+    fn voltage_clips_at_full_scale() {
+        // vref 2^21 mV, gain 1 → +FS input = vref → code 2^23 clips to 7FFFFFh.
+        let (adc, _fw) = make_adc(1.0, 0);
+        adc.set_voltage(3_000_000.0); // well beyond +FS
+        assert_eq!(adc.adc_value.load(Ordering::Relaxed), 0x7F_FFFF);
+        adc.set_voltage(-3_000_000.0); // well beyond −FS
+        assert_eq!(adc.adc_value.load(Ordering::Relaxed), -0x80_0000);
+
+        // A zero offset near the rail also clips instead of wrapping.
+        let (adc, _fw) = make_adc(1.0, 0x7F_FF00);
+        adc.set_voltage(1_000.0); // pushes past +FS via the offset
+        assert_eq!(adc.adc_value.load(Ordering::Relaxed), 0x7F_FFFF);
+    }
+
     /// Zero packs to three zero bytes.
-    #[test]
+    #[rstest]
     fn send_conversion_zero() {
         let (adc, _fw) = make_adc(1.0, 0);
         let (wr, rd) = test_pair();
@@ -759,7 +877,7 @@ mod tests {
     }
 
     /// `Config` derives `Clone`/`Debug`.
-    #[test]
+    #[rstest]
     fn config_clone_and_debug() {
         let c = Config {
             vref_mv: 2048.0,

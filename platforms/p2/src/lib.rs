@@ -15,7 +15,7 @@ pub use embsim_peripherals;
 
 // Re-export peripheral modules for convenience.
 pub use embsim_peripherals::{
-    encoder, filesystem, gpio, i2c, lock, pulse_out, serial, system, timer,
+    encoder, filesystem, gpio, i2c, instance, lock, pulse_out, serial, system, timer,
 };
 
 mod ffi;
@@ -68,6 +68,7 @@ mod tests {
     //! pinned exactly once (re-`init` would re-anchor time for sibling tests).
     //! The submodules `ffi`/`stubs_flexc`/`stubs_p2` are crate-private but their
     //! `pub extern "C"` symbols are reachable here via `crate::...` paths.
+    use rstest::rstest;
 
     use super::*;
     use embsim_peripherals::{encoder, gpio, i2c, lock, pulse_out, serial, system};
@@ -122,7 +123,7 @@ mod tests {
     // ── Platform constants + trait impl ──
 
     /// The P2 constants and the `Platform` impl report the documented values.
-    #[test]
+    #[rstest]
     fn platform_constants_and_trait() {
         assert_eq!(P2_CLOCK_FREQ, 180_000_000);
         assert_eq!(P2_MAX_COGS, 8);
@@ -145,7 +146,7 @@ mod tests {
 
     /// `HAL_GPIO_*` delegate to the generic gpio bank, and a negative channel is
     /// a safe no-op / false.
-    #[test]
+    #[rstest]
     fn gpio_trampolines_delegate_and_guard() {
         let _g = guard();
         setup();
@@ -169,7 +170,7 @@ mod tests {
 
     /// `HAL_serial_transmitData` and `HAL_serial_recieveByte` move real bytes
     /// across the wired fd, and `recieveByte` is non-blocking (false when idle).
-    #[test]
+    #[rstest]
     fn serial_transmit_and_receive_roundtrip() {
         let _g = guard();
         setup();
@@ -200,7 +201,7 @@ mod tests {
 
     /// `HAL_serial_recieveDataTimeout` fills the buffer and returns true when all
     /// bytes are available.
-    #[test]
+    #[rstest]
     fn serial_receive_data_timeout_full_read() {
         let _g = guard();
         setup();
@@ -218,7 +219,7 @@ mod tests {
     }
 
     /// Serial trampolines guard null pointers and negative channels without UB.
-    #[test]
+    #[rstest]
     fn serial_trampolines_guard_null_and_negative() {
         let _g = guard();
         setup();
@@ -245,7 +246,7 @@ mod tests {
     // ── Encoder trampolines ──
 
     /// `HAL_encoder_*` delegate to the encoder bank; negatives are guarded.
-    #[test]
+    #[rstest]
     fn encoder_trampolines_delegate_and_guard() {
         let _g = guard();
         setup();
@@ -263,7 +264,7 @@ mod tests {
 
     /// `HAL_pulseOut_run` writes the emitted count and returns done; a null
     /// out-pointer or negative channel returns true (done) safely.
-    #[test]
+    #[rstest]
     fn pulseout_trampolines_delegate_and_guard() {
         let _g = guard();
         setup();
@@ -285,7 +286,7 @@ mod tests {
     // ── Timer trampolines ──
 
     /// `HAL_time_*` route through the virtual clock; clock-freq matches the P2.
-    #[test]
+    #[rstest]
     fn timer_trampolines() {
         let _g = guard();
         setup();
@@ -303,7 +304,7 @@ mod tests {
     // ── Lock trampolines ──
 
     /// `HAL_lock_*` allocate/acquire/release; a negative id is rejected.
-    #[test]
+    #[rstest]
     fn lock_trampolines() {
         let _g = guard();
         setup();
@@ -327,7 +328,7 @@ mod tests {
     }
 
     /// `HAL_system_startThread` spawns + runs the function; null function → -1.
-    #[test]
+    #[rstest]
     fn system_start_thread_runs_then_joins() {
         let _g = guard();
         setup();
@@ -352,7 +353,7 @@ mod tests {
 
     /// `HAL_system_init` is a safe no-op log. (`HAL_system_reboot` is NOT called —
     /// it terminates the process.)
-    #[test]
+    #[rstest]
     fn system_init_is_safe_noop() {
         let _g = guard();
         setup();
@@ -363,7 +364,7 @@ mod tests {
 
     /// I2C trampolines delegate with a valid handle and return defaults (and no
     /// UB) on a null `self`.
-    #[test]
+    #[rstest]
     fn i2c_trampolines_delegate_and_guard_null() {
         let _g = guard();
         setup();
@@ -393,7 +394,7 @@ mod tests {
 
     /// `mount`/`umount` succeed for a valid C string and reject null; the VFS
     /// open returns null.
-    #[test]
+    #[rstest]
     fn flexc_vfs_stubs() {
         let _g = guard();
         let dir = std::env::temp_dir().join("embsim_p2_mount_test");
@@ -412,12 +413,55 @@ mod tests {
     }
 
     /// `_clkset`/`_hubset` are no-ops. (`_reboot` is NOT called — it exits.)
-    #[test]
+    #[rstest]
     fn p2_intrinsic_stubs_are_noops() {
         let _g = guard();
         unsafe {
             stubs_p2::_clkset(0, 0);
             stubs_p2::_hubset(0);
         }
+    }
+
+    /// HAL trampolines honor `bind_current_thread`: a bound thread's
+    /// `HAL_GPIO_setActive` / `HAL_encoder_set` land on that instance's banks,
+    /// not the default singleton.
+    #[rstest]
+    fn trampolines_route_to_bound_peripheral_instance() {
+        let _g = guard();
+        setup();
+
+        // Default bank starts low / zero.
+        assert!(!gpio::get_active(0));
+        assert_eq!(encoder::value(0), 0);
+
+        let inst = std::sync::Arc::new(instance::PeripheralInstance::new());
+        inst.gpio.init(4, None);
+        inst.encoder.init(2);
+
+        let for_thread = std::sync::Arc::clone(&inst);
+        std::thread::spawn(move || {
+            let _bind = instance::bind_current_thread(std::sync::Arc::clone(&for_thread));
+            unsafe {
+                ffi::HAL_GPIO_setActive(0, true);
+                ffi::HAL_encoder_set(0, 1234);
+            }
+            assert!(gpio::get_active(0), "free-fn path sees bound GPIO");
+            assert_eq!(encoder::value(0), 1234);
+        })
+        .join()
+        .expect("bound trampoline thread");
+
+        assert!(inst.gpio.get_active(0), "write landed on bound instance");
+        assert_eq!(inst.encoder.value(0), 1234);
+        // Default singleton (what setup() initialized) must stay clean.
+        assert!(
+            !gpio::get_active(0),
+            "default instance GPIO must not see the bound write"
+        );
+        assert_eq!(
+            encoder::value(0),
+            0,
+            "default instance encoder must not see the bound write"
+        );
     }
 }

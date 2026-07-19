@@ -48,11 +48,33 @@
 //! // (resolve symbol address from the running binary's symbol table)
 //! let state: i32 = unsafe { fw.read_field("dev_cogManager_data", "channels[0].state") }.unwrap();
 //! ```
+//!
+//! A third path reads the **initialized values** of global data symbols
+//! straight from the archive — no running binary required. This is how a
+//! consumer's HAL wiring/config tables (pin maps, bauds) are read for the
+//! board engine's pin facade (see [`ArchiveValueReader`]):
+//!
+//! ```rust,ignore
+//! use embsim_memory_inspect::ArchiveValueReader;
+//!
+//! let values = ArchiveValueReader::from_archive("path/to/libfirmware.a".as_ref()).unwrap();
+//! let cfg = values.read_value(&fw, "HAL_serial_channelConfig").unwrap();
+//! let rx = cfg.index(0).unwrap().field("rx").unwrap().as_i64(); // e.g. Some(0)
+//! ```
+//!
+//! The [`hal_tables`] module layers consumer-shaped decoding on top of that
+//! path: the four HAL wiring tables (serial, GPIO, encoder, pulse-out)
+//! decode into plain Rust structs, with the table symbol names as
+//! parameters (defaults document the reference consumer's names).
 
+pub mod hal_tables;
+
+mod archive_values;
 mod dwarf_parser;
 mod runtime;
 mod types;
 
+pub use archive_values::{ArchiveValueReader, Value, ValueReadError};
 pub use runtime::SymbolResolver;
 pub use types::{
     EnumInfo, FieldInfo, FirmwareInfo, MemInspectError, ParseOptions, StructInfo, TypeInfo,

@@ -40,6 +40,8 @@ pub fn stop(_i2c: &mut I2C) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn make_bus() -> I2C {
@@ -51,7 +53,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn setup_start_stop_do_not_panic() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -62,7 +64,7 @@ mod tests {
         stop(&mut bus);
     }
 
-    #[test]
+    #[rstest]
     fn write_always_reports_failure() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
@@ -72,7 +74,7 @@ mod tests {
         assert!(!write(&mut bus, 0xFF));
     }
 
-    #[test]
+    #[rstest]
     fn read_always_returns_zero() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();

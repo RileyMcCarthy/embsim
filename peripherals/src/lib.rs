@@ -4,11 +4,20 @@
 //! encoder counters, pulse output, timers, lock pools, thread management,
 //! I2C stubs, and filesystem mounting. These have NO knowledge of any specific
 //! MCU — platform crates (e.g., `embsim-p2`) add FFI trampolines on top.
+//!
+//! All peripheral state is owned per emulated MCU by
+//! [`instance::PeripheralInstance`]. The module-level free functions (and the
+//! platform trampolines built on them) resolve the calling thread's instance
+//! — bound threads route to their instance, everything else to a lazily
+//! created default singleton — so single-MCU consumers use the free functions
+//! exactly as before, while multi-MCU consumers create one instance per MCU
+//! and bind the threads that run its firmware (see `crate::instance`).
 
 pub mod encoder;
 pub mod filesystem;
 pub mod gpio;
 pub mod i2c;
+pub mod instance;
 pub mod lock;
 pub mod pulse_out;
 pub mod serial;
@@ -21,9 +30,10 @@ pub mod timer;
 /// `embsim_core::virtual_clock`. Re-initializing that clock re-anchors virtual
 /// time to zero, which would corrupt any sibling test mid-flight. So this module
 /// pins the clock exactly once (at 1.0x / 180 MHz) and never touches it again,
-/// and serializes every test in the crate behind a single mutex so global
-/// peripheral state (channel counts, FDs, callbacks, lock pools) can never be
-/// observed half-reset by a concurrently-running test.
+/// and serializes every test in the crate behind a single mutex so the shared
+/// default `instance::PeripheralInstance` (channel counts, FDs, callbacks,
+/// lock pools — what the free functions route to on unbound test threads) can
+/// never be observed half-reset by a concurrently-running test.
 ///
 /// Every test in this crate must start with:
 /// ```ignore
