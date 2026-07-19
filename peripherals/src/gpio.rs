@@ -218,6 +218,8 @@ pub fn on_change(channel: usize, cb: impl Fn(bool) + Send + 'static) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -235,7 +237,21 @@ mod tests {
         crate::instance::current()
     }
 
-    #[test]
+    #[rstest]
+    #[case::zero(0)]
+    #[case::one(1)]
+    #[case::four(4)]
+    #[case::max(MAX_CHANNELS)]
+    fn init_count_allowed(#[case] n: usize) {
+        let _g = crate::test_support::guard();
+        setup(n);
+        if n > 0 {
+            assert!(!get_active(0));
+            assert!(!get_active(n - 1));
+        }
+    }
+
+    #[rstest]
     fn init_at_max_channels_is_allowed() {
         let _g = crate::test_support::guard();
         // Exactly MAX_CHANNELS is the inclusive upper bound.
@@ -244,7 +260,7 @@ mod tests {
         assert!(!get_active(MAX_CHANNELS - 1));
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_channels_panics() {
         let _g = crate::test_support::guard();
@@ -252,7 +268,7 @@ mod tests {
         init(MAX_CHANNELS + 1, None);
     }
 
-    #[test]
+    #[rstest]
     fn set_and_get_active_in_range() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -263,7 +279,7 @@ mod tests {
         assert!(!get_active(2));
     }
 
-    #[test]
+    #[rstest]
     fn out_of_range_set_active_is_a_no_op_and_get_returns_false() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -275,7 +291,7 @@ mod tests {
         assert!(!get_active(1));
     }
 
-    #[test]
+    #[rstest]
     fn toggle_active_flips_state_and_fires_callback() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -302,7 +318,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn toggle_out_of_range_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -311,7 +327,7 @@ mod tests {
         assert!(!get_active(0));
     }
 
-    #[test]
+    #[rstest]
     fn set_active_fires_change_callback_with_value() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -330,7 +346,7 @@ mod tests {
         assert_eq!(value.load(AtomicOrdering::Relaxed), 1);
     }
 
-    #[test]
+    #[rstest]
     fn set_state_changes_value_but_does_not_fire_callback() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -352,7 +368,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn set_state_out_of_range_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -361,7 +377,7 @@ mod tests {
         assert!(!get_active(7));
     }
 
-    #[test]
+    #[rstest]
     fn on_change_is_one_per_channel_re_register_overwrites() {
         let _g = crate::test_support::guard();
         setup(1);
@@ -392,7 +408,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn reset_clears_state_callbacks_and_names() {
         let _g = crate::test_support::guard();
         static NAMES: &[&str] = &["ALPHA", "BETA"];
@@ -421,7 +437,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn channel_name_uses_names_when_set_else_index() {
         let _g = crate::test_support::guard();
         static NAMES: &[&str] = &["ENA", "DIR"];

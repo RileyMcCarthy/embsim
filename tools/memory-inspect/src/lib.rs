@@ -61,6 +61,13 @@
 //! let cfg = values.read_value(&fw, "HAL_serial_channelConfig").unwrap();
 //! let rx = cfg.index(0).unwrap().field("rx").unwrap().as_i64(); // e.g. Some(0)
 //! ```
+//!
+//! The [`hal_tables`] module layers consumer-shaped decoding on top of that
+//! path: the four HAL wiring tables (serial, GPIO, encoder, pulse-out)
+//! decode into plain Rust structs, with the table symbol names as
+//! parameters (defaults document the reference consumer's names).
+
+pub mod hal_tables;
 
 mod archive_values;
 mod dwarf_parser;

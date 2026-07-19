@@ -12,6 +12,7 @@
 //! `TEST_LOCK` for robustness if more are added later, and recover from poison
 //! the way `pulse_out.rs` does.
 
+use rstest::rstest;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -77,7 +78,7 @@ impl Machine for MiniMachine {
 }
 
 /// The minimal example flow builds and runs to completion.
-#[test]
+#[rstest]
 fn minimal_example_flow_runs_ok() {
     let _g = lock_or_recover();
     let pty = unique_path("ok");

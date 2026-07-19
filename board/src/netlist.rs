@@ -180,9 +180,23 @@ fn parse_sexp(input: &str) -> Result<Sexp, NetlistError> {
     Ok(root)
 }
 
+/// Skip whitespace and `;`-to-end-of-line comments. KiCad itself never emits
+/// comments, but committed netlist artifacts carry provenance headers (which
+/// tool exported them, the regeneration policy), and `;` line comments are
+/// the standard s-expression form. Quoted atoms are unaffected —
+/// `parse_quoted` consumes its bytes directly.
 fn skip_ws(bytes: &[u8], pos: &mut usize) {
-    while *pos < bytes.len() && (bytes[*pos] as char).is_whitespace() {
-        *pos += 1;
+    loop {
+        while *pos < bytes.len() && (bytes[*pos] as char).is_whitespace() {
+            *pos += 1;
+        }
+        if bytes.get(*pos) == Some(&b';') {
+            while *pos < bytes.len() && bytes[*pos] != b'\n' {
+                *pos += 1;
+            }
+        } else {
+            return;
+        }
     }
 }
 
@@ -389,16 +403,36 @@ pub fn normalize_pin_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn overline_syntax_normalizes() {
         assert_eq!(normalize_pin_name("~{RESET}"), "~RESET");
         assert_eq!(normalize_pin_name("~RESET"), "~RESET");
         assert_eq!(normalize_pin_name("AIN0"), "AIN0");
     }
 
-    #[test]
+    /// `;` line comments — the provenance headers committed netlist
+    /// artifacts carry — are skipped anywhere whitespace is legal, and a
+    /// `;` inside a quoted atom stays data.
+    #[rstest]
+    fn line_comments_are_skipped() {
+        let input = "; provenance: exported by kicad-cli\n\
+                     ; regeneration: CI diff-check\n\
+                     (export (version \"E\")\n\
+                       ; components section\n\
+                       (components\n\
+                         (comp (ref \"R1\") (value \"47R; not a comment\")\n\
+                           (libsource (lib \"Device\") (part \"R_Small\")))))";
+        let parsed = parse(input).expect("commented netlist parses");
+        assert_eq!(parsed.version, "E");
+        assert_eq!(parsed.components.len(), 1);
+        assert_eq!(parsed.components[0].value, "47R; not a comment");
+    }
+
+    #[rstest]
     fn parses_the_real_ds2addon_fixture() {
         let input = include_str!("../tests/fixtures/ds2_addon.net");
         let parsed = parse(input).expect("fixture parses");
@@ -430,7 +464,7 @@ mod tests {
         assert_eq!(reset.nodes[0].pin, "3");
     }
 
-    #[test]
+    #[rstest]
     fn rejects_unsupported_versions_and_malformed_input() {
         let bad_version = r#"(export (version "Z") (components) (nets))"#;
         assert_eq!(
@@ -449,7 +483,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[rstest]
     fn quoted_atoms_unescape() {
         let input = r#"(export (version "E")
             (components (comp (ref "U1") (value "a \"b\" c")))
@@ -458,7 +492,7 @@ mod tests {
         assert_eq!(parsed.components[0].value, "a \"b\" c");
     }
 
-    #[test]
+    #[rstest]
     fn errors_display_named_causes() {
         let err = NetlistError::UnsupportedVersion {
             found: "Z".to_string(),

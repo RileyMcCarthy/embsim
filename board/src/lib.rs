@@ -27,12 +27,15 @@
 //! - [`board`] — [`Board::from_netlist`]: netlist + registry → components + nets
 //! - [`system`] — [`System`]: boards + harnesses + scenario overrides + fault algebra
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
+//! - [`mcu`] — [`McuComponent`]: the MCU as a component (force-path slice: serial
+//!   channels bridged to stream pins; the firmware-entry inversion is deferred)
 
 pub mod board;
 pub mod cluster;
 pub mod component;
 pub mod diagnostics;
 pub mod engine;
+pub mod mcu;
 pub mod net;
 pub mod netlist;
 pub mod registry;
@@ -48,6 +51,7 @@ pub use component::{
 };
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
 pub use engine::EngineHandle;
+pub use mcu::{McuBuildError, McuBuilder, McuComponent};
 pub use net::{Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts};
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use registry::{Classification, JumperState, PartRegistry, PassiveKind, RegistryError};

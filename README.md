@@ -202,17 +202,28 @@ cargo test -p embsim-p2             # P2 HAL trampolines + constants
 cargo test -p embsim-build          # firmware-link resolution
 ```
 
-A few conventions the tests follow (see [`peripherals/src/pulse_out.rs`](peripherals/src/pulse_out.rs)
-for the canonical example): peripheral modules keep process-global state, so
-tests that touch a shared global serialize behind a crate-local `TEST_LOCK`
-(with poison recovery) and pin the virtual clock once; assertions check
-monotonicity / bounds / clamping rather than exact wall-clock timing. The
-`embsim-memory-inspect` DWARF test compiles a small C fixture with `clang`
-(preferred — the parser targets clang-emitted DWARF) + `ar` and **skips
-gracefully** when no C toolchain is present.
+Release-mode smoke (timing paths):
+
+```bash
+cargo test -p embsim-peripherals -p embsim-board --release
+```
+
+Coverage (optional locally; published by the `coverage` CI job):
+
+```bash
+cargo llvm-cov --workspace --summary-only
+```
+
+**Test conventions** (required for new tests) live in [`TESTING.md`](TESTING.md):
+prefer `#[rstest]` + named `#[case]`s; peripheral free-function tests take
+`test_support::guard()` + `ensure_clock()`; assert virtual-time contracts and
+clamps rather than flaky wall timing. Consumer repos (e.g. MaD) should re-run
+this suite against the pinned submodule commit on SIL-related PRs.
 
 Platform support: Linux and macOS (the serial PTY and thread emulation use
-Unix APIs; Windows is not supported).
+Unix APIs; Windows is not supported). The `embsim-memory-inspect` DWARF test
+compiles a small C fixture with `clang` (preferred) + `ar` and **skips
+gracefully** when no C toolchain is present.
 
 ## License
 

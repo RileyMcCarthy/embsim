@@ -390,6 +390,8 @@ fn solve_dense(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<Volts
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn three_node_cluster() -> Cluster {
@@ -417,7 +419,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn source_free_cluster_solves_floating_for_all_nodes() {
         let solution = QuasiStaticMna.solve(&three_node_cluster(), &ClusterInputs::default());
         assert_eq!(solution.node_states.len(), 3);
@@ -428,7 +430,7 @@ mod tests {
         assert_eq!(solution.state_of(NetId(9)), None);
     }
 
-    #[test]
+    #[rstest]
     fn sourced_cluster_is_not_floating() {
         let inputs = ClusterInputs {
             sources: vec![ClusterSource {
@@ -443,7 +445,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn unloaded_chain_sits_at_the_source_open_circuit_voltage() {
         // One source, no return path: no current flows, so every node solves
         // to the source's open-circuit voltage exactly.
@@ -460,7 +462,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn zero_ohm_edge_merges_nodes_into_a_supernode() {
         // 3.3 V ideal at n0; 0 Ω n0–n1 (hard merge); 100 Ω n1–n2;
         // 100 Ω n2–n3; 0 V ideal at n3. Hand check: n0 = n1 = 3.3 V,
@@ -506,7 +508,7 @@ mod tests {
         assert!(analog_volts(&solution, NetId(3)).abs() < 1e-6);
     }
 
-    #[test]
+    #[rstest]
     fn non_finite_and_negative_edges_are_open() {
         // n0 sourced; n1 behind an infinite edge, n2 behind a NaN edge,
         // n3 behind a negative edge — all three are open, hence Floating.
@@ -544,7 +546,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn invalid_sources_are_ignored() {
         // Non-finite volts/impedance, negative impedance, and a source on a
         // node outside the cluster all contribute nothing → all Floating.
@@ -578,7 +580,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
     fn ideal_source_is_clamped_not_divided_by_zero() {
         let cluster = Cluster {
             nodes: vec![NetId(0)],

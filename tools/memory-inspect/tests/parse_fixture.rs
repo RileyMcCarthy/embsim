@@ -26,6 +26,7 @@
 //! test never skips after a successful build: that leg is why it exists.
 
 use embsim_memory_inspect::{FirmwareInfo, ParseOptions, TypeInfo};
+use rstest::rstest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -253,7 +254,7 @@ fn parse_fixture() -> Option<(FirmwareInfo, PathBuf)> {
 }
 
 /// The enum is recovered with its variants, values, and `_COUNT` convention.
-#[test]
+#[rstest]
 fn enum_variants_values_and_count() {
     let (fw, _dir) = match parse_fixture() {
         Some(v) => v,
@@ -284,7 +285,7 @@ fn enum_variants_values_and_count() {
 
 /// Struct layouts are recovered, including the nested struct and primitive
 /// field types (signed int, float, double).
-#[test]
+#[rstest]
 fn struct_layout_and_primitive_field_types() {
     let (fw, _dir) = match parse_fixture() {
         Some(v) => v,
@@ -324,7 +325,7 @@ fn struct_layout_and_primitive_field_types() {
 }
 
 /// Bitfield members are recovered as [`TypeInfo::Bitfield`].
-#[test]
+#[rstest]
 fn bitfield_field_is_recovered() {
     let (fw, _dir) = match parse_fixture() {
         Some(v) => v,
@@ -352,7 +353,7 @@ fn bitfield_field_is_recovered() {
 }
 
 /// A union is stored among structs and all its members sit at offset 0.
-#[test]
+#[rstest]
 fn union_members_share_offset_zero() {
     let (fw, _dir) = match parse_fixture() {
         Some(v) => v,
@@ -382,7 +383,7 @@ fn union_members_share_offset_zero() {
 
 /// Array element offsets advance by exactly the element's byte size, and
 /// out-of-bounds indices resolve to `None`.
-#[test]
+#[rstest]
 fn array_element_offsets_are_relative_and_bounded() {
     let (fw, _dir) = match parse_fixture() {
         Some(v) => v,
@@ -410,7 +411,7 @@ fn array_element_offsets_are_relative_and_bounded() {
 }
 
 /// Top-level variables are recovered, including their resolved types.
-#[test]
+#[rstest]
 fn top_level_variables_are_recovered() {
     let (fw, _dir) = match parse_fixture() {
         Some(v) => v,
@@ -440,7 +441,7 @@ fn top_level_variables_are_recovered() {
 }
 
 /// Parsing junk bytes (not an `ar` archive) yields an `Err`, not a panic.
-#[test]
+#[rstest]
 fn non_archive_bytes_yield_err() {
     let dir = std::env::temp_dir().join(format!(
         "embsim_dwarf_junk_{}_{}",
@@ -465,7 +466,7 @@ fn non_archive_bytes_yield_err() {
 }
 
 /// Reading a nonexistent path yields an `Err` (the IO branch of the error type).
-#[test]
+#[rstest]
 fn missing_file_yields_err() {
     let missing = Path::new("/this/path/should/not/exist/embsim_xyz.a");
     let result = FirmwareInfo::from_archive(missing);
@@ -474,7 +475,7 @@ fn missing_file_yields_err() {
 
 /// `from_archive_with` honors a custom `count_suffix` while still parsing the
 /// full archive, and the default `_COUNT` suffix is overridden.
-#[test]
+#[rstest]
 fn from_archive_with_custom_options() {
     let (a_path, dir) = match build_fixture_archive() {
         Some(v) => v,
@@ -523,7 +524,7 @@ fn from_archive_with_custom_options() {
 /// - Parse **non-empty but names wrong** → fail on every platform: that is
 ///   the relocation-regression signature (broken code resolves every strp to
 ///   `.debug_str` offset 0).
-#[test]
+#[rstest]
 fn elf_relocatable_archive_resolves_names_via_relocations() {
     let (a_path, dir) = match build_elf_fixture_archive() {
         Some(v) => v,

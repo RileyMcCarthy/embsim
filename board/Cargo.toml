@@ -11,4 +11,16 @@ categories = ["embedded", "simulation"]
 
 [dependencies]
 embsim-core = { path = "../core" }
+# The MCU component bridges serial channels into the peripheral banks
+# (peripherals never depends back on board — no cycle).
+embsim-peripherals = { path = "../peripherals" }
+libc.workspace = true
+nix.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+# Dev-only cycle (allowed by Cargo): the DS2Addon integration tests exercise
+# the live ADS122U04 component and share its pin-facade table, so the board
+# tests import the models crate that depends on this one.
+embsim-models = { path = "../models" }

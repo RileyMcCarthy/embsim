@@ -191,9 +191,11 @@ impl Diagnostics {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn collector_records_in_order_and_answers_contains() {
         let mut diags = Diagnostics::new();
         assert!(diags.is_empty());
@@ -216,7 +218,7 @@ mod tests {
         }));
     }
 
-    #[test]
+    #[rstest]
     fn findings_carry_asserted_fields() {
         let finding = Finding::UnconnectedRegistryPin {
             reference: "U1".to_string(),

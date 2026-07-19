@@ -7,6 +7,7 @@
 //! 47 Ω series-resistor collapse and the crossed-TX/RX harness regression
 //! hold the engine to the same truth the hardware exhibited.
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use embsim_board::{
     System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock;
+use embsim_models::ads122u04_component::ADS122U04_PINS;
 
 // ============================================================
 // Shared probe plumbing
@@ -136,56 +138,9 @@ impl Component for FakeMcu {
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
 // ============================================================
 
-const NONE: Option<StreamRole> = None;
-
-const fn pin(
-    number: &'static str,
-    name: Option<&'static str>,
-    kind: PinKind,
-    stream: Option<StreamRole>,
-) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        stream,
-        drive_impedance: None,
-    }
-}
-
-/// TSSOP-16 (PW) pinout per SBAS752B; TX/RX declare their UART stream roles
-/// at the chip's 115.2 kbaud default.
-const ADS122U04_PINS: [PinDecl; 16] = [
-    pin("1", Some("GPIO1"), PinKind::DigitalIn, NONE),
-    pin("2", Some("GPIO0"), PinKind::DigitalIn, NONE),
-    pin("3", Some("~RESET"), PinKind::DigitalIn, NONE),
-    pin("4", Some("DGND"), PinKind::PowerIn, NONE),
-    pin("5", Some("AVSS"), PinKind::PowerIn, NONE),
-    pin("6", Some("AIN3"), PinKind::Analog, NONE),
-    pin("7", Some("AIN2"), PinKind::Analog, NONE),
-    pin("8", Some("REFN"), PinKind::Analog, NONE),
-    pin("9", Some("REFP"), PinKind::Analog, NONE),
-    pin("10", Some("AIN1"), PinKind::Analog, NONE),
-    pin("11", Some("AIN0"), PinKind::Analog, NONE),
-    pin("12", Some("AVDD"), PinKind::PowerIn, NONE),
-    pin("13", Some("DVDD"), PinKind::PowerIn, NONE),
-    pin("14", Some("DRDY"), PinKind::DigitalIn, NONE),
-    pin(
-        "15",
-        Some("TX"),
-        PinKind::DigitalOut,
-        Some(StreamRole::Producer { baud_hz: 115_200 }),
-    ),
-    pin(
-        "16",
-        Some("RX"),
-        PinKind::DigitalIn,
-        Some(StreamRole::Consumer { baud_hz: 115_200 }),
-    ),
-];
-
-/// Stream-capturing ADS122U04 facade (the protocol model lives in
-/// `embsim-models`; routing is what this facade exercises).
+/// Stream-capturing ADS122U04 facade (the pin table is the shared truth
+/// exported by the live component in `embsim-models`; routing is what this
+/// facade exercises).
 struct Ads122u04Facade {
     tx: TxSlot,
     rx: ByteLog,
@@ -429,7 +384,7 @@ fn link_system(baud_hz: u32, scenario: Scenario, probe: &Probe) -> SystemHandle 
 /// The real board routes its UART through 47 Ω series resistors (R3 into
 /// U1 RX, R4 out of U1 TX). Both directions must deliver bytes through the
 /// collapsed link — against the actual `kicad-cli` netlist export.
-#[test]
+#[rstest]
 fn ds2_47_ohm_series_resistors_collapse_into_the_link() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000); // 115.2 kbaud pacing samples the clock
@@ -480,7 +435,7 @@ fn ds2_47_ohm_series_resistors_collapse_into_the_link() {
 /// the underlying nets resolve per the net rules — the TX↔TX pair goes to
 /// `Contention` as soon as the two producers actually disagree, while the
 /// RX↔RX net floats with its silent consumers.
-#[test]
+#[rstest]
 fn crossed_tx_rx_harness_raises_stream_mismatch_and_contention() {
     let mcu_tx_pin = PinRef::new("MCU", "1");
     let ads_tx_pin = PinRef::new("U1", "15");
@@ -562,7 +517,7 @@ fn crossed_tx_rx_harness_raises_stream_mismatch_and_contention() {
 /// clock (10 bits/byte, 8N1): at 50 baud a byte takes 200 virtual ms, so
 /// nothing arrives instantly and three bytes take ≥ 600 virtual ms
 /// (≥ 300 wall ms at 2× scale), in wire order.
-#[test]
+#[rstest]
 fn producer_baud_paces_bytes_against_virtual_time() {
     let _g = lock_clock();
     virtual_clock::init(2.0, 1_000_000);
@@ -597,7 +552,7 @@ fn producer_baud_paces_bytes_against_virtual_time() {
 /// `Scenario::stream_drop` byte-loss injection actually applies to the live
 /// pipe: `EveryNth` on the producer thins the stream, `All` on the consumer
 /// silences it.
-#[test]
+#[rstest]
 fn stream_drop_policies_apply_to_live_pipes() {
     // EveryNth(2) on the producer pin: every second byte written is lost.
     let probe = Probe::new();
@@ -639,7 +594,7 @@ fn stream_drop_policies_apply_to_live_pipes() {
 
 /// A detached producer pin never forms a route: writes are dropped with a
 /// trace, never delivered, never queued — and attach still succeeds.
-#[test]
+#[rstest]
 fn detached_producer_pin_breaks_the_route() {
     let probe = Probe::new();
     let system = link_system(0, Scenario::default().pin_detach("Rig.MCU.1"), &probe);
@@ -656,7 +611,7 @@ fn detached_producer_pin_breaks_the_route() {
 /// Byte pipes are gated by net resolution: when the producer releases its
 /// drive the link floats and bytes written meanwhile are dropped (not
 /// queued); re-driving the line restores delivery.
-#[test]
+#[rstest]
 fn floating_link_gates_delivery_until_redriven() {
     let probe = Probe::new();
     let system = link_system(0, Scenario::default(), &probe);

@@ -132,6 +132,8 @@ pub fn set_value(channel: usize, val: i32) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Take the crate test lock, pin the clock, and reset the encoder bank.
@@ -140,7 +142,20 @@ mod tests {
         init(count);
     }
 
-    #[test]
+    #[rstest]
+    #[case::zero(0)]
+    #[case::one(1)]
+    #[case::four(4)]
+    #[case::max(MAX_CHANNELS)]
+    fn init_count_allowed(#[case] n: usize) {
+        let _g = crate::test_support::guard();
+        setup(n);
+        if n > 0 {
+            assert_eq!(value(n - 1), 0);
+        }
+    }
+
+    #[rstest]
     fn init_at_max_channels_is_allowed() {
         let _g = crate::test_support::guard();
         // Exactly MAX_CHANNELS is the inclusive upper bound.
@@ -148,7 +163,7 @@ mod tests {
         assert_eq!(value(MAX_CHANNELS - 1), 0);
     }
 
-    #[test]
+    #[rstest]
     #[should_panic(expected = "exceeds max")]
     fn init_above_max_channels_panics() {
         let _g = crate::test_support::guard();
@@ -156,7 +171,7 @@ mod tests {
         init(MAX_CHANNELS + 1);
     }
 
-    #[test]
+    #[rstest]
     fn value_and_set_in_range() {
         let _g = crate::test_support::guard();
         setup(4);
@@ -167,7 +182,7 @@ mod tests {
         assert_eq!(value(2), i32::MAX);
     }
 
-    #[test]
+    #[rstest]
     fn out_of_range_value_is_zero_and_set_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -179,7 +194,7 @@ mod tests {
         assert_eq!(value(0), 0);
     }
 
-    #[test]
+    #[rstest]
     fn set_value_is_an_alias_for_set() {
         let _g = crate::test_support::guard();
         setup(2);
@@ -190,7 +205,7 @@ mod tests {
         assert_eq!(value(50), 0);
     }
 
-    #[test]
+    #[rstest]
     fn reset_zeroes_all_values_and_count() {
         let _g = crate::test_support::guard();
         setup(3);
@@ -208,7 +223,7 @@ mod tests {
         assert_eq!(value(2), 0);
     }
 
-    #[test]
+    #[rstest]
     fn start_is_a_no_op() {
         let _g = crate::test_support::guard();
         setup(1);

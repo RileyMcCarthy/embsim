@@ -8,66 +8,19 @@
 
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, Diagnostics, DnpState, EndpointRef, Finding,
-    Harness, JumperState, NetState, PartRegistry, PinDecl, PinKind, Scenario, SenseKind,
-    StreamRole, System,
+    Harness, JumperState, NetState, PartRegistry, PinDecl, Scenario, SenseKind, System,
 };
+use embsim_models::ads122u04_component::ADS122U04_PINS;
+use rstest::rstest;
 
 // ============================================================
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
 // ============================================================
 
-/// Build-time pin facade of the ADS122U04 (the protocol model lives in
-/// `embsim-models`; this facade is what the board engine wires and checks).
+/// Build-time pin facade of the ADS122U04. The pin table is the shared
+/// truth exported by the live component (`embsim-models`), so this analysis
+/// facade and the live component can never disagree on the pinout.
 struct Ads122u04Facade;
-
-const NONE: Option<StreamRole> = None;
-
-/// TSSOP-16 (PW) pinout per SBAS752B: 1 GPIO1, 2 GPIO0, 3 ~RESET, 4 DGND,
-/// 5 AVSS, 6 AIN3, 7 AIN2, 8 REFN, 9 REFP, 10 AIN1, 11 AIN0, 12 AVDD,
-/// 13 DVDD, 14 GPIO2/DRDY, 15 TX, 16 RX.
-const ADS122U04_PINS: [PinDecl; 16] = [
-    pin("1", Some("GPIO1"), PinKind::DigitalIn, NONE),
-    pin("2", Some("GPIO0"), PinKind::DigitalIn, NONE),
-    pin("3", Some("~RESET"), PinKind::DigitalIn, NONE),
-    pin("4", Some("DGND"), PinKind::PowerIn, NONE),
-    pin("5", Some("AVSS"), PinKind::PowerIn, NONE),
-    pin("6", Some("AIN3"), PinKind::Analog, NONE),
-    pin("7", Some("AIN2"), PinKind::Analog, NONE),
-    pin("8", Some("REFN"), PinKind::Analog, NONE),
-    pin("9", Some("REFP"), PinKind::Analog, NONE),
-    pin("10", Some("AIN1"), PinKind::Analog, NONE),
-    pin("11", Some("AIN0"), PinKind::Analog, NONE),
-    pin("12", Some("AVDD"), PinKind::PowerIn, NONE),
-    pin("13", Some("DVDD"), PinKind::PowerIn, NONE),
-    pin("14", Some("DRDY"), PinKind::DigitalIn, NONE),
-    pin(
-        "15",
-        Some("TX"),
-        PinKind::DigitalOut,
-        Some(StreamRole::Producer { baud_hz: 115_200 }),
-    ),
-    pin(
-        "16",
-        Some("RX"),
-        PinKind::DigitalIn,
-        Some(StreamRole::Consumer { baud_hz: 115_200 }),
-    ),
-];
-
-const fn pin(
-    number: &'static str,
-    name: Option<&'static str>,
-    kind: PinKind,
-    stream: Option<StreamRole>,
-) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        stream,
-        drive_impedance: None,
-    }
-}
 
 impl Component for Ads122u04Facade {
     fn pins(&self) -> &[PinDecl] {
@@ -127,7 +80,7 @@ fn floating(diags: &Diagnostics, net: &str, kind: SenseKind) -> bool {
 /// (the `~{RESET}` net contains only U1 pin 3). Two chips appeared dead for
 /// days before a multimeter found it. The engine must report it at build,
 /// before any traffic.
-#[test]
+#[rstest]
 fn floating_reset_is_reported_at_build() {
     let system = System::new()
         .board("DS2Addon", ds2_board())
@@ -154,7 +107,7 @@ fn floating_reset_is_reported_at_build() {
 /// Bench bug: the analog domain is fully isolated on the PCB (AVDD/AGND
 /// arrive only via the J2 harness), and the datasheet's power-on reset waits
 /// for BOTH supplies — an unstrapped AVDD is a permanently silent chip.
-#[test]
+#[rstest]
 fn avdd_unstrapped_reports_power_net_unsourced() {
     let digital_only = Harness::new()
         .power(ep("BENCH.3V3"), ep("DS2Addon.J1.1"), 3.3)
@@ -198,7 +151,7 @@ fn avdd_unstrapped_reports_power_net_unsourced() {
 /// jumpers JP1/JP2 (the filter resistors are DNP). With the jumpers open —
 /// their symbol default (`Jumper_NO`) and the state the boards shipped in —
 /// AIN0/AIN1 float and conversions slam rail to rail.
-#[test]
+#[rstest]
 fn open_input_jumpers_float_the_adc_inputs() {
     // Default jumper state (open): AIN0 floats.
     let system = System::new()
@@ -243,7 +196,7 @@ fn open_input_jumpers_float_the_adc_inputs() {
 /// to the 3.3 V rail. `pin_short` is exactly that fault-algebra primitive:
 /// union the two pins' nets. With the bodge applied, the floating finding
 /// must disappear; `net_stuck` (an injected ideal source) must clear it too.
-#[test]
+#[rstest]
 fn pin_short_and_net_stuck_model_the_reset_bodge() {
     // Baseline: floating (regression 1).
     let system = System::new()
@@ -293,7 +246,7 @@ fn pin_short_and_net_stuck_model_the_reset_bodge() {
 /// disagreeing ideal sources on one net. It must be observable —
 /// `Contention` plus a finding — never a silent first-source-wins 3.3 V
 /// projection under which the injected fault has zero effect anywhere.
-#[test]
+#[rstest]
 fn net_stuck_fighting_the_powered_rail_is_observable() {
     let system = System::new()
         .board("DS2Addon", ds2_board())
@@ -334,7 +287,7 @@ fn net_stuck_fighting_the_powered_rail_is_observable() {
 /// fallback. Shorting the ADC input pair (fault algebra) then turns the two
 /// filter legs into a genuine two-source divider: the MNA reports the
 /// 1.65 V midpoint.
-#[test]
+#[rstest]
 fn bridge_fed_analog_inputs_solve_through_the_mna() {
     let bridge_fed = powered_bench_harness()
         .power(ep("BENCH.A0"), ep("DS2Addon.J2.3"), 3.3)

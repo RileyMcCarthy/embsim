@@ -471,9 +471,11 @@ fn parse_array_access(field: &str) -> (&str, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
+    #[rstest]
     fn test_split_path() {
         assert_eq!(split_path("state"), ("state", None));
         assert_eq!(
@@ -483,7 +485,7 @@ mod tests {
         assert_eq!(split_path("a.b.c"), ("a", Some("b.c")));
     }
 
-    #[test]
+    #[rstest]
     fn test_parse_array_access() {
         assert_eq!(parse_array_access("channels"), ("channels", None));
         assert_eq!(parse_array_access("channels[0]"), ("channels", Some(0)));
@@ -519,7 +521,7 @@ mod tests {
         fw
     }
 
-    #[test]
+    #[rstest]
     fn try_lookups_return_none_for_missing() {
         let fw = sample_fw();
         // Present
@@ -535,7 +537,7 @@ mod tests {
         assert!(!fw.has_enum_type("Nonexistent_E"));
     }
 
-    #[test]
+    #[rstest]
     fn panicking_wrappers_agree_with_try() {
         let fw = sample_fw();
         assert_eq!(fw.enum_channel("HAL_GPIO_SERVO_DIR"), 1);
@@ -546,7 +548,7 @@ mod tests {
     // ── Path parsing additional cases ──
 
     /// `split_path` handles dots inside bracketed indices and trailing segments.
-    #[test]
+    #[rstest]
     fn split_path_extra_cases() {
         // A dot inside brackets does not split (no array literals use it here,
         // but the depth guard must still hold for the bracket scan).
@@ -564,7 +566,7 @@ mod tests {
 
     /// `parse_array_access` parses indices, including zero and large values, and
     /// returns `None` for a non-numeric index.
-    #[test]
+    #[rstest]
     fn parse_array_access_extra_cases() {
         assert_eq!(parse_array_access("x[0]"), ("x", Some(0)));
         assert_eq!(parse_array_access("x[12345]"), ("x", Some(12345)));
@@ -577,7 +579,7 @@ mod tests {
     /// [`TypeInfo::byte_size`] returns the right size for every variant, with
     /// `Array` multiplying element size by count and `Bitfield` returning the
     /// storage unit size (not the bit width).
-    #[test]
+    #[rstest]
     fn byte_size_covers_every_variant() {
         assert_eq!(
             TypeInfo::Base {
@@ -771,7 +773,7 @@ mod tests {
 
     /// Nested-struct, array-index, and union field paths resolve to the right
     /// byte offsets.
-    #[test]
+    #[rstest]
     fn resolve_field_offset_paths() {
         let fw = layout_fw();
 
@@ -798,7 +800,7 @@ mod tests {
 
     /// Field-path resolution returns `None` for out-of-bounds indices, indexing
     /// a non-array, descending into a non-struct, and missing field names.
-    #[test]
+    #[rstest]
     fn resolve_field_offset_none_paths() {
         let fw = layout_fw();
 
@@ -823,7 +825,7 @@ mod tests {
     }
 
     /// `resolve_field_type` yields the correct leaf type for each path shape.
-    #[test]
+    #[rstest]
     fn resolve_field_type_paths() {
         let fw = layout_fw();
 
@@ -868,7 +870,7 @@ mod tests {
     // ── Panicking wrappers panic on missing; try_* return None ──
 
     /// `field_offset` panics when the struct type is missing.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn field_offset_panics_on_missing_type() {
         let fw = layout_fw();
@@ -876,7 +878,7 @@ mod tests {
     }
 
     /// `field_offset` panics when the field path is missing.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn field_offset_panics_on_missing_path() {
         let fw = layout_fw();
@@ -884,7 +886,7 @@ mod tests {
     }
 
     /// `field_type` panics when the struct type is missing.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn field_type_panics_on_missing_type() {
         let fw = layout_fw();
@@ -892,7 +894,7 @@ mod tests {
     }
 
     /// `field_type` panics when the field path is missing.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn field_type_panics_on_missing_path() {
         let fw = layout_fw();
@@ -900,7 +902,7 @@ mod tests {
     }
 
     /// `struct_info` panics on a missing type; `try_struct_info` returns None.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn struct_info_panics_on_missing() {
         let fw = layout_fw();
@@ -908,7 +910,7 @@ mod tests {
     }
 
     /// `enum_value` panics on a missing variant.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn enum_value_panics_on_missing() {
         let fw = sample_fw();
@@ -916,7 +918,7 @@ mod tests {
     }
 
     /// `enum_variants` panics on a missing enum type.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn enum_variants_panics_on_missing() {
         let fw = sample_fw();
@@ -924,7 +926,7 @@ mod tests {
     }
 
     /// `channel_count` panics when the enum type is missing.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "not found")]
     fn channel_count_panics_on_missing_type() {
         let fw = sample_fw();
@@ -932,7 +934,7 @@ mod tests {
     }
 
     /// `channel_count` panics when the enum exists but has no `_COUNT` variant.
-    #[test]
+    #[rstest]
     #[should_panic(expected = "_COUNT")]
     fn channel_count_panics_without_count_variant() {
         let mut fw = FirmwareInfo::new();
@@ -951,7 +953,7 @@ mod tests {
 
     /// `FirmwareInfo::default` and `ParseOptions::default` produce the documented
     /// defaults.
-    #[test]
+    #[rstest]
     fn defaults_are_sane() {
         let fw = FirmwareInfo::default();
         assert!(fw.enums.is_empty());
@@ -965,7 +967,7 @@ mod tests {
     }
 
     /// `enum_value_usize` is an alias for `enum_channel`.
-    #[test]
+    #[rstest]
     fn enum_value_usize_alias() {
         let fw = sample_fw();
         assert_eq!(
@@ -977,7 +979,7 @@ mod tests {
 
     /// `try_enum_variants` returns the slice for a present type and `None` for
     /// an absent one.
-    #[test]
+    #[rstest]
     fn try_enum_variants_present_and_absent() {
         let fw = sample_fw();
         assert_eq!(
@@ -988,7 +990,7 @@ mod tests {
     }
 
     /// `MemInspectError` Display renders both variants with a readable message.
-    #[test]
+    #[rstest]
     fn meminspect_error_display() {
         let io = MemInspectError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"));
         let s = io.to_string();

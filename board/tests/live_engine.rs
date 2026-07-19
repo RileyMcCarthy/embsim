@@ -3,6 +3,7 @@
 //! exercising `System::start` attach / schedule / drive / sense /
 //! shutdown through the public API only, without any consumer firmware.
 
+use rstest::rstest;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,7 +112,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 // The smoke test
 // ============================================================
 
-#[test]
+#[rstest]
 fn live_system_routes_schedule_drive_and_sense_through_the_engine() {
     // The timer wheel samples the free-running virtual clock.
     embsim_core::virtual_clock::init(1.0, 1_000_000);

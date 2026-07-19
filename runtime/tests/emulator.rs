@@ -14,6 +14,7 @@
 //!    UNIQUE host-pty path under `std::env::temp_dir()`. They recover from lock
 //!    poisoning the same way `pulse_out.rs` does.
 
+use rstest::rstest;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -78,13 +79,15 @@ impl Platform for MiniPlatform {
     }
 }
 
-/// A configurable machine. `gpio`/`serial` counts and the set of
-/// `required_symbols` are parameterized so a single type drives the happy path,
-/// the `TooManyChannels` path, the `MissingSymbols` path, and the ordering hook
-/// test. `wire_flag`/`wired_log` let a test observe wiring + ordering.
+/// A configurable machine. `gpio`/`serial`/`encoder`/`pulse_out` counts and the
+/// set of `required_symbols` are parameterized so a single type drives the happy
+/// path, the `TooManyChannels` path, the `MissingSymbols` path, and the ordering
+/// hook test. `wire_flag`/`wired_log` let a test observe wiring + ordering.
 struct MiniMachine {
     gpio: usize,
     serial: usize,
+    encoder: usize,
+    pulse_out: usize,
     required: &'static [&'static str],
     /// Set to `true` inside `wire`, so a test can prove `wire` ran.
     wire_flag: Arc<AtomicU32>,
@@ -98,6 +101,8 @@ impl MiniMachine {
         Self {
             gpio: 1,
             serial: 1,
+            encoder: 0,
+            pulse_out: 0,
             required: &[],
             wire_flag: Arc::new(AtomicU32::new(0)),
             order_log: Arc::new(Mutex::new(Vec::new())),
@@ -115,6 +120,8 @@ impl Machine for MiniMachine {
         PeripheralCounts {
             gpio: self.gpio,
             serial: self.serial,
+            encoder: self.encoder,
+            pulse_out: self.pulse_out,
             ..Default::default()
         }
     }
@@ -138,7 +145,7 @@ impl Machine for MiniMachine {
 // ============================================================
 
 /// Every `EmulatorError` variant renders a message containing its key text.
-#[test]
+#[rstest]
 fn emulator_error_display_strings() {
     let firmware = EmulatorError::Firmware("bad dwarf".to_string());
     assert!(firmware.to_string().contains("bad dwarf"));
@@ -182,7 +189,7 @@ fn emulator_error_display_strings() {
 }
 
 /// `MissingSymbols` with an empty list still renders cleanly (count 0).
-#[test]
+#[rstest]
 fn missing_symbols_empty_list_displays_zero() {
     let e = EmulatorError::MissingSymbols(vec![]);
     let msg = e.to_string();
@@ -190,7 +197,7 @@ fn missing_symbols_empty_list_displays_zero() {
 }
 
 /// `EmulatorError` is a real `std::error::Error` (usable as `Box<dyn Error>`).
-#[test]
+#[rstest]
 fn emulator_error_is_std_error() {
     fn as_error(e: EmulatorError) -> Box<dyn Error> {
         Box::new(e)
@@ -207,7 +214,7 @@ fn emulator_error_is_std_error() {
 // ============================================================
 
 /// `PeripheralCounts::default()` is all-zero / `None`.
-#[test]
+#[rstest]
 fn peripheral_counts_default_is_zeroed() {
     let c = PeripheralCounts::default();
     assert_eq!(c.gpio, 0);
@@ -235,7 +242,7 @@ fn assert_build_err(result: Result<Emulator, EmulatorError>, label: &str) -> Emu
 }
 
 /// `build()` with no machine -> `MissingMachine`. (No PTY is created.)
-#[test]
+#[rstest]
 fn build_without_machine_errors() {
     let err = assert_build_err(
         Emulator::builder(MiniPlatform)
@@ -248,7 +255,7 @@ fn build_without_machine_errors() {
 }
 
 /// `build()` with a machine but no entry -> `MissingEntry`.
-#[test]
+#[rstest]
 fn build_without_entry_errors() {
     let err = assert_build_err(
         Emulator::builder(MiniPlatform)
@@ -262,7 +269,7 @@ fn build_without_entry_errors() {
 
 /// `build()` with machine + entry but neither firmware nor firmware_lib ->
 /// `MissingFirmware`.
-#[test]
+#[rstest]
 fn build_without_firmware_errors() {
     let err = assert_build_err(
         Emulator::builder(MiniPlatform)
@@ -276,7 +283,7 @@ fn build_without_firmware_errors() {
 
 /// `build()` with a `firmware_lib` pointing at a nonexistent archive ->
 /// `EmulatorError::Firmware(_)` (the parse fails before the PTY is created).
-#[test]
+#[rstest]
 fn build_with_bad_firmware_lib_errors() {
     let err = assert_build_err(
         Emulator::builder(MiniPlatform)
@@ -291,7 +298,7 @@ fn build_with_bad_firmware_lib_errors() {
 
 /// Validation order: machine is checked before entry. With neither, the FIRST
 /// missing-piece error (`MissingMachine`) surfaces.
-#[test]
+#[rstest]
 fn build_reports_machine_before_entry() {
     let err = assert_build_err(
         Emulator::builder(MiniPlatform)
@@ -308,7 +315,7 @@ fn build_reports_machine_before_entry() {
 
 /// A complete `build()? .run()?` over the minimal-example shape returns `Ok`,
 /// runs the entry, and fires `wire`.
-#[test]
+#[rstest]
 fn full_run_succeeds_and_wires() {
     let _g = lock_or_recover();
 
@@ -338,7 +345,7 @@ fn full_run_succeeds_and_wires() {
 }
 
 /// `Emulator::firmware()` borrows the parsed info after a successful build.
-#[test]
+#[rstest]
 fn emulator_exposes_firmware_after_build() {
     let _g = lock_or_recover();
     let pty = unique_pty_path("fwacc");
@@ -359,7 +366,7 @@ fn emulator_exposes_firmware_after_build() {
 
 /// `host_serial_baud` > 0 takes the baud-pacing branch in `run()` and still
 /// returns `Ok`.
-#[test]
+#[rstest]
 fn full_run_with_baud_pacing_succeeds() {
     let _g = lock_or_recover();
     let pty = unique_pty_path("baud");
@@ -386,15 +393,58 @@ fn full_run_with_baud_pacing_succeeds() {
 // 5. TooManyChannels (caught in run(), build() succeeds)
 // ============================================================
 
-/// A machine asking for 9999 gpio channels (> gpio::MAX_CHANNELS) builds fine
-/// but `run()` returns `TooManyChannels { peripheral: "gpio", .. }`.
-#[test]
-fn run_rejects_too_many_gpio_channels() {
+fn set_too_many_gpio(m: &mut MiniMachine) {
+    m.gpio = 9999;
+}
+fn set_too_many_serial(m: &mut MiniMachine) {
+    m.serial = 9999;
+}
+fn set_too_many_encoder(m: &mut MiniMachine) {
+    m.encoder = 9999;
+}
+fn set_too_many_pulse_out(m: &mut MiniMachine) {
+    m.pulse_out = 9999;
+}
+
+/// A machine asking for too many channels of any sized peripheral builds fine
+/// but `run()` returns `TooManyChannels` with the matching peripheral name.
+#[rstest]
+#[case::gpio("gpio", 9999, gpio::MAX_CHANNELS, set_too_many_gpio)]
+#[case::serial(
+    "serial",
+    9999,
+    embsim_peripherals::serial::MAX_CHANNELS,
+    set_too_many_serial
+)]
+#[case::encoder(
+    "encoder",
+    9999,
+    embsim_peripherals::encoder::MAX_CHANNELS,
+    set_too_many_encoder
+)]
+#[case::pulse_out(
+    "pulse_out",
+    9999,
+    embsim_peripherals::pulse_out::MAX_CHANNELS,
+    set_too_many_pulse_out
+)]
+fn run_rejects_too_many_channels(
+    #[case] name: &'static str,
+    #[case] requested: usize,
+    #[case] max: usize,
+    #[case] configure: fn(&mut MiniMachine),
+) {
     let _g = lock_or_recover();
-    let pty = unique_pty_path("toomany");
+    let pty = unique_pty_path(&format!("toomany_{name}"));
 
     let mut machine = MiniMachine::new();
-    machine.gpio = 9999;
+    // Host serial channel 0 must stay valid for the PTY bridge when serial is
+    // not the peripheral under test — leave serial at 1 unless serial itself
+    // is the oversize request.
+    if name != "serial" {
+        machine.serial = 1;
+    }
+    configure(&mut machine);
 
     let emu = Emulator::builder(MiniPlatform)
         .firmware(FirmwareInfo::new())
@@ -411,15 +461,14 @@ fn run_rejects_too_many_gpio_channels() {
     match err {
         EmulatorError::TooManyChannels {
             peripheral,
-            requested,
-            max,
+            requested: got_req,
+            max: got_max,
         } => {
-            assert_eq!(peripheral, "gpio");
-            assert_eq!(requested, 9999);
-            assert_eq!(max, gpio::MAX_CHANNELS);
-            assert_eq!(max, 64);
+            assert_eq!(peripheral, name);
+            assert_eq!(got_req, requested);
+            assert_eq!(got_max, max);
         }
-        other => panic!("expected TooManyChannels, got {other:?}"),
+        other => panic!("expected TooManyChannels for {name}, got {other:?}"),
     }
 }
 
@@ -430,7 +479,7 @@ fn run_rejects_too_many_gpio_channels() {
 /// A machine whose `required_symbols` are absent from an empty `FirmwareInfo`
 /// makes `run()` return `MissingSymbols` listing ALL of them — and it happens
 /// in preflight, so even an absurd channel count never trips `TooManyChannels`.
-#[test]
+#[rstest]
 fn run_reports_all_missing_symbols_first() {
     let _g = lock_or_recover();
     let pty = unique_pty_path("missingsym");
@@ -471,7 +520,7 @@ fn run_reports_all_missing_symbols_first() {
 // ============================================================
 
 /// The `on_wired` hook fires after `wire()` and before the firmware entry.
-#[test]
+#[rstest]
 fn on_wired_runs_after_wire_and_before_entry() {
     let _g = lock_or_recover();
     let pty = unique_pty_path("onwired");
@@ -528,7 +577,7 @@ fn on_wired_runs_after_wire_and_before_entry() {
 }
 
 /// Without an `on_wired` hook, `run()` still completes (the hook is optional).
-#[test]
+#[rstest]
 fn run_without_on_wired_hook_succeeds() {
     let _g = lock_or_recover();
     let pty = unique_pty_path("nohook");

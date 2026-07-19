@@ -1837,6 +1837,8 @@ impl Drop for EngineHandle {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::cluster::QuasiStaticMna;
     use std::sync::atomic::AtomicBool;
@@ -1903,7 +1905,7 @@ mod tests {
     /// Drives are applied in enqueue-seq order — the authoritative event
     /// order — even when they arrive on the channel out of order (two racing
     /// enqueuers can interleave reserve-then-send).
-    #[test]
+    #[rstest]
     fn drives_apply_in_enqueue_seq_order_despite_arrival_order() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -1951,7 +1953,7 @@ mod tests {
 
     /// Two threads racing the public drive path: every drive is applied
     /// individually (no coalescing, no loss) in a valid enqueue order.
-    #[test]
+    #[rstest]
     fn racing_public_drives_all_apply_individually() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -1987,7 +1989,7 @@ mod tests {
     /// enqueued (NOT applied inline) and lands in a later engine iteration.
     /// The full driver → net → sense → drive loop converges without
     /// deadlocking.
-    #[test]
+    #[rstest]
     fn sense_callback_drive_is_enqueued_not_inline_and_loop_converges() {
         let mut resolver = Resolver::new(2, Dsu::new(2));
         let e_a = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -2065,7 +2067,7 @@ mod tests {
     /// semantics), so every resolution pass would re-deliver the rail's
     /// sense — and a sense callback that drives a pin on delivery would
     /// livelock the engine.
-    #[test]
+    #[rstest]
     fn unmodeled_power_rail_publishes_stable_non_nan_state() {
         let mut resolver = Resolver::new(2, Dsu::new(2));
         // The `PowerOut` registration path (`system.rs` add_pin_descriptor).
@@ -2108,7 +2110,7 @@ mod tests {
     /// re-deliver the sense, whose drive forces another pass: a livelock at
     /// 100% CPU. The loop must converge to exactly the one registration
     /// delivery.
-    #[test]
+    #[rstest]
     fn nan_rail_sense_feedback_loop_converges() {
         let mut resolver = Resolver::new(2, Dsu::new(2));
         resolver.add_power_source(0, f64::NAN);
@@ -2171,7 +2173,7 @@ mod tests {
     /// A competing source within ESCALATION_IMPEDANCE_RATIO of the strongest
     /// driver escalates the whole cluster through the ClusterSolver; a weak
     /// competing path (or an agreeing one) stays on the digital fast path.
-    #[test]
+    #[rstest]
     fn competing_path_within_ratio_escalates_to_cluster_solver() {
         let calls: Arc<StdMutex<Vec<Vec<NetId>>>> = Arc::new(StdMutex::new(Vec::new()));
         let solver = RecordingSolver {
@@ -2227,7 +2229,7 @@ mod tests {
     /// disagreeing ideal sources: the root projects Contention with a
     /// finding — never a silent first-source-wins `Analog(3.3)` (fault
     /// algebra: an injected short-to-ground must be observable).
-    #[test]
+    #[rstest]
     fn stuck_fault_fighting_a_power_rail_projects_contention() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         resolver.add_power_source(0, 3.3);
@@ -2260,7 +2262,7 @@ mod tests {
     /// — has no push-pull driver anywhere, yet must reach the cluster solver
     /// and report the divided node voltage, not the `Pulled` upper-bound
     /// fallback.
-    #[test]
+    #[rstest]
     fn sourced_divider_without_a_driver_reaches_the_cluster_solver() {
         // 3.3 V —4.7 kΩ— mid —4.7 kΩ— 0 V: V_mid = 1.65 V.
         let mut resolver = Resolver::new(3, Dsu::new(3));
@@ -2292,7 +2294,7 @@ mod tests {
     /// the solved node voltage; the same topology with a digital-only sense
     /// keeps the fast-path `Pulled` projection (escalating it would erase
     /// the meaningful pull-up view).
-    #[test]
+    #[rstest]
     fn analog_sense_escalates_sourced_cluster_but_pull_up_stays_pulled() {
         // 3.3 V rail —4.7 kΩ— AIN (no load: solves to the rail's OCV).
         let mut resolver = Resolver::new(2, Dsu::new(2));
@@ -2340,7 +2342,7 @@ mod tests {
 
     /// `schedule_at` fires exactly once, at-or-after its virtual deadline
     /// (timestamps are sampled from the free-running scaled clock).
-    #[test]
+    #[rstest]
     fn one_shot_timer_fires_once_at_virtual_deadline() {
         let _g = lock_clock();
         virtual_clock::init(50.0, 1_000_000);
@@ -2367,7 +2369,7 @@ mod tests {
     }
 
     /// `schedule_every` keeps firing with non-decreasing sampled timestamps.
-    #[test]
+    #[rstest]
     fn periodic_timer_fires_repeatedly_against_scaled_clock() {
         let _g = lock_clock();
         virtual_clock::init(50.0, 1_000_000);
@@ -2391,7 +2393,7 @@ mod tests {
     }
 
     /// Deadlines already in the past fire immediately, in deadline order.
-    #[test]
+    #[rstest]
     fn late_wakeups_fire_immediately_in_deadline_order() {
         let _g = lock_clock();
         virtual_clock::init(1.0, 1_000_000);
@@ -2426,7 +2428,7 @@ mod tests {
 
     /// Dropping the handle with pending far-future timers joins promptly —
     /// no detached thread, no deadlock against the parked wheel.
-    #[test]
+    #[rstest]
     fn shutdown_joins_cleanly_with_pending_timers() {
         let _g = lock_clock();
         virtual_clock::init(1.0, 1_000_000);
@@ -2451,7 +2453,7 @@ mod tests {
     /// non-empty (enqueuing is far cheaper than the resolution pass each
     /// `Drive` costs), yet a due wake must still fire — the drain batch is
     /// bounded ([`COMMAND_DRAIN_BATCH_MAX`]).
-    #[test]
+    #[rstest]
     fn sustained_drive_flood_does_not_starve_the_timer_wheel() {
         let _g = lock_clock();
         virtual_clock::init(1.0, 1_000_000);
@@ -2491,7 +2493,7 @@ mod tests {
     /// later drive forever: after [`DRIVE_SEQ_STALL_TIMEOUT`] the engine
     /// reports [`Finding::DriveSeqGap`] naming the missing seq and applies
     /// the buffered drives.
-    #[test]
+    #[rstest]
     fn missing_drive_seq_is_skipped_after_a_bounded_wait() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -2528,7 +2530,7 @@ mod tests {
     /// the engine stays alive ([`EngineHandle::is_alive`]), and other
     /// subscribers keep being served — one misbehaving component must not
     /// end net service for the rest of the system.
-    #[test]
+    #[rstest]
     fn sense_callback_panic_is_contained_and_reported() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -2566,7 +2568,7 @@ mod tests {
     }
 
     /// Inert handles (build-time analysis path) are safe no-ops.
-    #[test]
+    #[rstest]
     fn inert_handles_are_safe_noops() {
         let handle = crate::component::PinHandle::new(NetId(0));
         handle.set_drive(Some(high())); // dropped with a trace, no panic
@@ -2582,7 +2584,7 @@ mod tests {
     /// STREAM_COLLAPSE_THRESHOLD resolve to Contention (net rules: for
     /// signaling purposes the collapsed link is one node); the same fight
     /// through resistance at/above the threshold does not contend.
-    #[test]
+    #[rstest]
     fn disagreeing_drivers_through_collapsed_resistance_resolve_contention() {
         // 25 Ω high vs 25 Ω low through 47 Ω: Contention on both roots.
         let mut resolver = Resolver::new(2, Dsu::new(2));
@@ -2628,7 +2630,7 @@ mod tests {
 
     /// Stream routes collapse series passives below the threshold
     /// (accumulated along the path) and stop at/above it.
-    #[test]
+    #[rstest]
     fn stream_routes_collapse_series_passives_below_threshold() {
         // producer(0) --47Ω-- (1) --47Ω-- consumer(2), plus a consumer
         // behind a 4.7 kΩ edge that must NOT be routed.
@@ -2655,7 +2657,7 @@ mod tests {
 
     /// Two producers reachable from each other (the crossed-TX/RX harness)
     /// raise StreamMismatch once per pair, and neither producer routes.
-    #[test]
+    #[rstest]
     fn facing_producers_raise_stream_mismatch_and_do_not_route() {
         let mut resolver = Resolver::new(2, Dsu::new(2));
         let p_a = resolver.add_endpoint(0, PinRef::new("MCU", "1"), Some(high()));
@@ -2687,7 +2689,7 @@ mod tests {
     /// with a [`Finding::StreamOverrun`] naming the producer pin — the
     /// surface for a producer-vs-declared-baud mismatch — instead of
     /// growing an infinite TX buffer no UART has.
-    #[test]
+    #[rstest]
     fn paced_route_queue_overflow_sheds_with_a_finding() {
         let _g = lock_clock();
         virtual_clock::init(1.0, 1_000_000);

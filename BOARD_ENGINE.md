@@ -277,7 +277,10 @@ actually has (an N-pin net has no "where" for a generic open):
 - `stream_drop(endpoint, policy)` — byte-loss injection on a serial route.
 
 Harness endpoints are `Board.Connector.Pin` references; bare MCU-pin endpoints
-(`P2EVAL.P0`) are allowed for bench rigs that aren't a designed PCB.
+(`P2EVAL.P0`) are allowed for bench rigs that aren't a designed PCB —
+`System::component(name, component)` registers such a **bench component**
+(no board netlist; each declared pin becomes a `{name}.{pin}` net addressable
+as a bare endpoint, with full electrical descriptors and stream roles).
 Deliberately wrong harnesses (swapped pins) are valid fixtures — the
 `StreamMismatch`/`Contention`/`Floating` findings are the assertion targets.
 
@@ -318,6 +321,20 @@ Channel behavior stays HAL-granular (byte pipes, GPIO levels); pins are
 topology. Baud and channel parameters come from the same tables — the emulator
 stops inventing its own defaults (consumers may keep explicit pacing overrides
 for tests).
+
+> **Slice status (2026-07):** the MCU-as-a-component pattern ships in
+> `board/src/mcu.rs` for the **serial force path**: HAL-table-shaped configs
+> in, `"P{n}"` stream pins out, socketpair bridges into the
+> `embsim-peripherals` serial bank, with baud taken from the table. The entry
+> inversion in point 1 is **deferred** — firmware still boots via
+> `embsim_runtime::Emulator::run` on the caller's thread against the default
+> `PeripheralInstance`, and `McuComponent` targets the attach thread's
+> (default) instance until the inversion slice moves the entry onto a
+> component-owned thread. Point 3's table read path is
+> `embsim-memory-inspect`'s `hal_tables` module (symbol names parameterized;
+> the reference consumer's names are the documented defaults). GPIO channels
+> are declaration-only on the component; encoder/pulse-out channels remain
+> consumer-hand-wired this slice.
 
 Behavioral fidelity boundary, stated explicitly: **no cycle-accurate silicon
 emulation.** Raising fidelity of one peripheral later (bit-timed serial, PWM
