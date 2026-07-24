@@ -77,7 +77,17 @@ impl Serial {
             count,
             MAX_CHANNELS
         );
-        self.reset();
+        // Sizing and wiring commute: a component (or runtime) may install
+        // channel FDs before OR after the firmware sizes the bank — in the
+        // owned-execution MCU flow the firmware's own HAL init runs inside
+        // the entry, strictly after attach installed the bridges, and must
+        // not sever them. Pacing state is still cleared (a re-init restarts
+        // the wire clock); full disconnection is `reset()`'s job (teardown).
+        for ch in 0..MAX_CHANNELS {
+            self.baud[ch].store(0, Ordering::Relaxed);
+            self.tx_next_v_us[ch].store(0, Ordering::Relaxed);
+            self.rx_next_v_us[ch].store(0, Ordering::Relaxed);
+        }
         self.count.store(count, Ordering::Relaxed);
     }
 

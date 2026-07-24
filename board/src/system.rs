@@ -498,6 +498,15 @@ impl System {
             attached.push((prepared.reference, prepared.component));
         }
 
+        // Every component is attached and the engine is live: let components
+        // begin execution they own (MCU firmware entries). Runs strictly
+        // after the attach loop so the first instruction of any spawned
+        // entry observes a fully-wired system (the init-ordering contract in
+        // BOARD_ENGINE.md "The MCU as a component").
+        for (_, component) in attached.iter_mut() {
+            component.start();
+        }
+
         Ok(SystemHandle {
             engine,
             net_names,

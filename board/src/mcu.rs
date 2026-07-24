@@ -1,21 +1,40 @@
 //! McuComponent — the MCU as a [`Component`] (`BOARD_ENGINE.md`, "The MCU as
-//! a component"), **force-path slice**: HAL-table-shaped configs in, physical
-//! stream pins out, socketpair bridges into the `embsim-peripherals` serial
-//! bank.
+//! a component"): HAL-table-shaped configs in, physical stream pins out,
+//! socketpair bridges into the `embsim-peripherals` serial bank, and —
+//! given a firmware entry — its own execution.
 //!
-//! # Slice scope (and what is deferred)
+//! # Two modes
 //!
-//! This slice bridges **serial channels only**. Firmware keeps booting
-//! exactly as today — `embsim_runtime::Emulator::run` executes the entry on
-//! the caller's thread against the **default** `PeripheralInstance` — so the
-//! "engine spawns the firmware entry on a component-owned thread" inversion
-//! from `BOARD_ENGINE.md` point 1 is **deferred**, and with it per-component
-//! peripheral-instance wiring: [`McuComponent::attach`] installs its channel
-//! FDs into the *calling thread's* instance (the default instance in today's
-//! boot flow) and will target its own instance when the entry-inversion
-//! slice lands. GPIO channels can be *declared* (pin facade only, direction
-//! per channel); encoder and pulse-out channels stay consumer-hand-wired and
-//! are not declared at all this slice.
+//! - **Owned-execution mode** ([`McuBuilder::entry`] given): the component
+//!   creates its own [`PeripheralInstance`] at build; [`McuComponent::attach`]
+//!   installs the channel FDs there; [`Component::start`] — which
+//!   [`crate::System::start`] calls only after *every* component has
+//!   attached — spawns the entry on a thread bound to that instance, so all
+//!   HAL free functions the firmware calls (and threads it spawns through
+//!   the HAL, via `system::start_thread` inheritance) route to this MCU's
+//!   peripherals. This is the "engine spawns the firmware entry" inversion
+//!   from `BOARD_ENGINE.md` point 1.
+//! - **Facade mode** (no entry): [`McuComponent::attach`] installs the FDs
+//!   into the *calling thread's* instance — the default one when the
+//!   consumer boots firmware through `embsim_runtime::Emulator::run` on the
+//!   main thread, which keeps existing boot flows working unchanged.
+//!
+//! Limits: one firmware *image* links once per process (its C statics are
+//! process-global even though its HAL peripherals are not), so two
+//! owned-execution MCUs must run distinct images. GPIO channels can be
+//! *declared* (pin facade only, direction per channel); encoder and
+//! pulse-out channels stay consumer-hand-wired and are not declared yet —
+//! reach them through [`McuComponent::instance`] in the meantime.
+//!
+//! # Shutdown
+//!
+//! A firmware entry typically never returns, so its thread is **detached**:
+//! dropping the [`crate::SystemHandle`] joins the engine and the serial
+//! pumps and disconnects the channel FDs (the firmware thread then sees
+//! "not connected", never a closed descriptor), but does not attempt to
+//! join the entry thread — process teardown reclaims it. The entry thread's
+//! binding guard holds its own `Arc` to the instance, so peripherals stay
+//! valid for the thread's whole life regardless of drop order.
 //!
 //! # Config structs are deliberate duplicates
 //!
@@ -79,7 +98,7 @@
 
 use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use embsim_peripherals::instance::PeripheralInstance;
@@ -157,12 +176,25 @@ fn pin_name(pin: u32) -> Option<&'static str> {
 /// Builder for [`McuComponent`]: the serial table (as read from the
 /// firmware's HAL config tables), which channels to bridge, and any GPIO
 /// channels to declare.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct McuBuilder {
     name: String,
     serial_table: Vec<SerialChannelConfig>,
     bridged_serial: Vec<usize>,
     gpio: Vec<(GpioChannelConfig, GpioDirection)>,
+    entry: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for McuBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McuBuilder")
+            .field("name", &self.name)
+            .field("serial_table", &self.serial_table)
+            .field("bridged_serial", &self.bridged_serial)
+            .field("gpio", &self.gpio)
+            .field("entry", &self.entry.as_ref().map(|_| "FnOnce"))
+            .finish()
+    }
 }
 
 impl McuBuilder {
@@ -197,6 +229,28 @@ impl McuBuilder {
     /// arrives with a later slice; undeclared channels stay hand-wired.
     pub fn gpio(mut self, config: GpioChannelConfig, direction: GpioDirection) -> Self {
         self.gpio.push((config, direction));
+        self
+    }
+
+    /// Give the MCU its firmware entry (typically a closure calling the
+    /// consumer's `extern "C"` entry, e.g. `mad_begin()`), switching the
+    /// component into **owned-execution mode**: it creates its own
+    /// [`PeripheralInstance`], `attach` installs the channel FDs there
+    /// instead of the calling thread's instance, and
+    /// [`Component::start`] spawns `entry` on a thread bound to it — so
+    /// every HAL free function the firmware calls (and every thread it
+    /// spawns through the HAL) routes to this component's peripherals.
+    ///
+    /// The entry typically never returns; its thread is detached (see the
+    /// module docs' shutdown notes). One firmware *image* still links once
+    /// per process (its C statics are process-global) — two entry-mode
+    /// components must run distinct images.
+    ///
+    /// Without an entry the component stays in **facade mode**: today's
+    /// boot flow (`embsim_runtime::Emulator::run` executing the entry on
+    /// the caller's thread against the default instance) works unchanged.
+    pub fn entry(mut self, entry: impl FnOnce() + Send + 'static) -> Self {
+        self.entry = Some(Box::new(entry));
         self
     }
 
@@ -262,12 +316,23 @@ impl McuBuilder {
             });
         }
 
+        // Owned-execution mode: the component gets its own peripheral
+        // instance up front so `attach` has a stable target before `start`
+        // spawns the entry.
+        let own_instance = self
+            .entry
+            .is_some()
+            .then(|| Arc::new(PeripheralInstance::new()));
+
         Ok(McuComponent {
             name: self.name,
             pins,
             bridges,
             pumps: Vec::new(),
             instance: None,
+            own_instance,
+            entry: Mutex::new(self.entry),
+            entry_thread: None,
         })
     }
 }
@@ -308,9 +373,20 @@ pub struct McuComponent {
     pins: Vec<PinDecl>,
     bridges: Vec<SerialBridge>,
     pumps: Vec<Pump>,
-    /// The peripheral instance the channel FDs were installed into (the
-    /// attach thread's instance — the default one in today's boot flow).
+    /// The peripheral instance the channel FDs were installed into: the
+    /// component's own instance in owned-execution mode, otherwise the
+    /// attach thread's instance (the default one in today's boot flow).
     instance: Option<Arc<PeripheralInstance>>,
+    /// Owned-execution mode only: the instance this MCU's firmware runs
+    /// against, created at build so `attach` and `start` agree on it.
+    own_instance: Option<Arc<PeripheralInstance>>,
+    /// The firmware entry, consumed by [`Component::start`]. The `Mutex`
+    /// exists only to keep the component `Sync` (a bare `FnOnce` box is
+    /// not); it is accessed exclusively through `&mut self`.
+    entry: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The spawned entry thread. Never joined — a firmware entry typically
+    /// never returns; see the module docs' shutdown notes.
+    entry_thread: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for McuComponent {
@@ -333,6 +409,20 @@ impl McuComponent {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// The peripheral instance this MCU's firmware runs against — `Some`
+    /// only in owned-execution mode (an entry was given). Consumers use it
+    /// to reach peripherals the pin facade does not bridge yet (hand-wired
+    /// GPIO/encoder/pulse callbacks during the migration window).
+    pub fn instance(&self) -> Option<&Arc<PeripheralInstance>> {
+        self.own_instance.as_ref()
+    }
+
+    /// Whether the spawned firmware entry thread is still running. `false`
+    /// before [`Component::start`] and after an entry that returned.
+    pub fn entry_running(&self) -> bool {
+        self.entry_thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
 }
 
 impl Component for McuComponent {
@@ -341,10 +431,13 @@ impl Component for McuComponent {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        // The calling thread's peripheral instance — the process default in
-        // today's boot flow (see the module docs; per-component instances
-        // arrive with the entry-inversion slice).
-        let instance = embsim_peripherals::instance::current();
+        // Owned-execution mode targets the component's own instance; facade
+        // mode targets the calling thread's instance (the process default in
+        // today's Emulator::run boot flow).
+        let instance = match &self.own_instance {
+            Some(own) => Arc::clone(own),
+            None => embsim_peripherals::instance::current(),
+        };
 
         for bridge in &self.bridges {
             // Validated at build: both pins are <= P63.
@@ -426,6 +519,34 @@ impl Component for McuComponent {
 
         self.instance = Some(instance);
         Ok(())
+    }
+
+    fn start(&mut self) {
+        // Facade mode: nothing to run. (`get_mut`: the mutex is a Sync
+        // shim, never contended — see the field docs.)
+        let Some(entry) = self.entry.get_mut().expect("never poisoned").take() else {
+            return;
+        };
+        let instance = Arc::clone(
+            self.own_instance
+                .as_ref()
+                .expect("an entry always builds with its own instance"),
+        );
+        let thread = std::thread::Builder::new()
+            .name(format!("mcu-{}-entry", self.name))
+            .spawn(move || {
+                // Route every peripheral free function on this thread — and,
+                // via `system::start_thread` inheritance, every thread the
+                // firmware spawns through the HAL — to this component's
+                // instance. The entry typically never returns, so the guard
+                // lives for the thread's life (and its `Arc` keeps the
+                // instance alive even if the component drops first).
+                let _bind = embsim_peripherals::instance::bind_current_thread(instance);
+                entry();
+            })
+            .expect("spawn the MCU entry thread");
+        tracing::info!(mcu = %self.name, "firmware entry spawned on component-owned instance");
+        self.entry_thread = Some(thread);
     }
 }
 

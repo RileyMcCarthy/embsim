@@ -117,6 +117,14 @@ must:
   instance or using `inst.<peripheral>` directly (free functions on an unbound
   thread hit the default instance, not "the nearest MCU").
 
+`embsim-board`'s `McuComponent` discharges all three obligations when built
+with `McuBuilder::entry` (owned-execution mode): it creates the instance,
+installs its serial bridges there at attach, and `Component::start` spawns
+the entry on a thread bound for the entry's lifetime. Firmware that sizes
+its serial bank *inside* the entry is safe: `Serial::init` preserves
+already-installed channel FDs (sizing and wiring commute); only `reset()`
+disconnects.
+
 **Documented limit:** instance routing de-globalizes the Rust-side peripheral
 state only. A given firmware **image's own C statics** (`.data`/`.bss`) exist
 once per process, so one process can run at most **one instance of a given
