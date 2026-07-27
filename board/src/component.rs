@@ -105,6 +105,15 @@ pub trait Component: Send + Sync {
     /// components store typed pin handles without interior mutability and
     /// fail loudly on facade mismatch.
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError>;
+
+    /// Runs once on the live path ([`crate::System::start`]) after EVERY
+    /// component in the system has attached — the init-ordering point where
+    /// a component may begin execution it owns (an MCU spawning its firmware
+    /// entry thread). By this point all bridged I/O is wired and the engine
+    /// is delivering, so code started here observes a fully-connected
+    /// system from its first instruction. Build-time analysis
+    /// ([`crate::System::build`]) never calls it. Default: nothing.
+    fn start(&mut self) {}
 }
 
 // ============================================================
