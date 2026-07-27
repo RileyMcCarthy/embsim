@@ -484,7 +484,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let states = Arc::new(Mutex::new(vec![NetState::Driven(Level::High)]));
-        let link = EngineLink::inert(states);
+        let link = EngineLink::inert(states, Arc::new(Mutex::new(Vec::new())));
         let handle = PinHandle::wired(NetId(0), None, None, link.clone());
         let io = ComponentNetIo::wired([("1".to_string(), handle)], None, link);
 

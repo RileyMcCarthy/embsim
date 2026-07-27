@@ -7,7 +7,9 @@
 //! 1. **auto** — passive primitives (`R*`/`C*`/`L*`/`LED`/`D_*`, pin-count
 //!    validated), connectors/screw terminals (board boundary pins), jumpers
 //!    (stateful shorts), and ignored mechanicals (mounting holes, logos,
-//!    test points).
+//!    test points). A board-specific connector symbol whose part name matches
+//!    no prefix joins this tier through
+//!    [`PartRegistry::register_boundary`].
 //! 2. **registry** — anything else, keyed by part name, falling back to
 //!    `value`; consumer-registered [`Component`] constructor, with an
 //!    expansion hook (one netlist component → N primitives, for
@@ -15,10 +17,21 @@
 //! 3. **error** — no registry match: system construction fails; a per-board
 //!    explicit stub list is the only escape.
 //!
+//! # Netlists with no `libsource`
+//!
+//! Every tier keys on the libsource **part** name, which an EDA export always
+//! carries — but a netlist transcribed from a vendor PDF has no symbol library
+//! to name, so every `part` is empty and the whole board lands in tier 3.
+//! [`PartRegistry::classify_unnamed_by_reference`] opts such a board into a
+//! narrow fallback: when (and only when) a component's part name is empty, the
+//! auto tier matches against a class name derived from its **reference
+//! designator prefix** ([`reference_designator_class`]). See that function for
+//! the prefix table and why the fallback is opt-in.
+//!
 //! Slice status: types and API surface are final; the classification and
 //! value-parsing bodies are the classification slice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::component::Component;
@@ -103,6 +116,8 @@ pub type ExpansionHook = Box<dyn Fn(&ComponentDecl) -> Vec<ComponentDecl> + Send
 pub struct PartRegistry {
     constructors: HashMap<String, ComponentCtor>,
     expansions: HashMap<String, ExpansionHook>,
+    boundaries: HashSet<String>,
+    reference_fallback: bool,
 }
 
 impl fmt::Debug for PartRegistry {
@@ -113,6 +128,8 @@ impl fmt::Debug for PartRegistry {
                 &self.constructors.keys().collect::<Vec<_>>(),
             )
             .field("expansions", &self.expansions.keys().collect::<Vec<_>>())
+            .field("boundaries", &self.boundaries.iter().collect::<Vec<_>>())
+            .field("reference_fallback", &self.reference_fallback)
             .finish()
     }
 }
@@ -130,6 +147,47 @@ impl PartRegistry {
         ctor: impl Fn(&ComponentDecl) -> Box<dyn Component> + Send + Sync + 'static,
     ) {
         self.constructors.insert(part.into(), Box::new(ctor));
+    }
+
+    /// Declare a part name to be a **board boundary** — a connector or socket
+    /// whose pins are harness attachment points and which contributes nothing
+    /// electrical of its own.
+    ///
+    /// The auto tier already recognizes KiCad's standard `Conn*` /
+    /// `Screw_Terminal*` symbols. Boards that draw their own connector symbol
+    /// (`P2_EDGE_MODULE_SOCKET`, `Edge Socket Pads`, a shrouded-header
+    /// footprint from a project library) match no prefix and would otherwise
+    /// need a per-board stub entry, which says "electrically absent" where the
+    /// truth is "this is where the harness plugs in". Declaring the part name
+    /// here classifies every instance as [`Classification::Boundary`], exactly
+    /// like a `Conn_01x05`.
+    ///
+    /// Boundary declarations win over the registry: a part that is both
+    /// registered and declared boundary classifies as a boundary (the
+    /// declaration is the more specific statement about the board).
+    pub fn register_boundary(&mut self, part: impl Into<String>) {
+        self.boundaries.insert(part.into());
+    }
+
+    /// True when `part` (already rescue-normalized) is a declared boundary.
+    pub fn is_boundary(&self, part: &str) -> bool {
+        self.boundaries.contains(part)
+    }
+
+    /// Opt this registry into classifying components whose libsource **part
+    /// name is empty** from their reference-designator prefix
+    /// ([`reference_designator_class`]).
+    ///
+    /// Off by default, and deliberately so. In an EDA export every component
+    /// carries a `(libsource (part …))`, so an empty part name there means the
+    /// export is damaged or the fixture is truncated — silently classifying
+    /// `C7` as a capacitor because of its *name* would paper over that. The
+    /// fallback exists for netlists that never had a symbol library to name:
+    /// a whole-module netlist transcribed from a vendor PDF (this crate's
+    /// `p2_ec32mb.net` fixture), or a hand-written harness description.
+    /// Components with a non-empty part name are unaffected either way.
+    pub fn classify_unnamed_by_reference(&mut self, enabled: bool) {
+        self.reference_fallback = enabled;
     }
 
     /// Register an expansion hook for a part name (one netlist component →
@@ -170,25 +228,40 @@ impl PartRegistry {
     ) -> Result<Classification, RegistryError> {
         let part = normalize_part(decl);
 
+        // The name the AUTO tiers match on. Normally the libsource part name;
+        // for a netlist that carries no libsource at all, and only when the
+        // consumer opted in, a class name synthesized from the reference
+        // designator prefix (see `classify_unnamed_by_reference`). Tier 2 and
+        // the error tier always report the real part name, so a synthetic
+        // class never leaks into a registry key or a diagnostic.
+        let auto: &str = match (part.is_empty() && self.reference_fallback)
+            .then(|| reference_designator_class(&decl.reference))
+        {
+            Some(Some(synthetic)) => synthetic,
+            _ => part.as_str(),
+        };
+
         // Tier 1a: ignored mechanicals — absent from the built board.
-        if starts_with_any(&part, &["MountingHole", "Logo", "TestPoint", "Fiducial"]) {
+        if starts_with_any(auto, &["MountingHole", "Logo", "TestPoint", "Fiducial"]) {
             return Ok(Classification::Ignored);
         }
 
-        // Tier 1b: connectors / screw terminals — board boundary pins.
-        if starts_with_any(&part, &["Conn", "Screw_Terminal"]) {
+        // Tier 1b: connectors / screw terminals — board boundary pins. The
+        // consumer's explicit declarations join this tier for project-library
+        // connector symbols that match no prefix.
+        if starts_with_any(auto, &["Conn", "Screw_Terminal"]) || self.is_boundary(&part) {
             return Ok(Classification::Boundary);
         }
 
         // Tier 1c: jumpers — stateful shorts, default state from the name.
-        if part.starts_with("Jumper") || part.starts_with("SolderJumper") {
-            let default = if part.contains("_NC") || part.contains("_Bridged") {
+        if auto.starts_with("Jumper") || auto.starts_with("SolderJumper") {
+            let default = if auto.contains("_NC") || auto.contains("_Bridged") {
                 JumperState::Closed
             } else {
                 // `_NO` / `_Open` / unmarked jumpers default open.
                 JumperState::Open
             };
-            let selectable = part.starts_with("Jumper_3") || part.starts_with("SolderJumper_3");
+            let selectable = auto.starts_with("Jumper_3") || auto.starts_with("SolderJumper_3");
             return Ok(Classification::Jumper {
                 default,
                 selectable,
@@ -197,7 +270,7 @@ impl PartRegistry {
 
         // Tier 1d: passive primitives — the part-name class is anchored so
         // e.g. "RJ45" never classifies as a resistor.
-        if let Some(kind) = passive_kind(&part) {
+        if let Some(kind) = passive_kind(auto) {
             if pin_count != 2 {
                 return Err(RegistryError::BadPinCount {
                     reference: decl.reference.clone(),
@@ -232,6 +305,53 @@ impl PartRegistry {
 /// True when `part` starts with any of the given prefixes.
 fn starts_with_any(part: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| part.starts_with(p))
+}
+
+// ============================================================
+// Reference-designator classification (no-libsource fallback)
+// ============================================================
+
+/// The auto-tier class name a reference designator implies, for netlists that
+/// carry no libsource part name to key on (see
+/// [`PartRegistry::classify_unnamed_by_reference`]).
+///
+/// The **whole leading alphabetic run** of the reference must equal a table
+/// entry — `R7` and `R` match `R`, while `RN7` (a resistor network) and
+/// `PCB` match nothing and fall through to the registry. Matching the whole
+/// run rather than a prefix is what keeps a multi-letter designator class from
+/// being silently mistaken for a single-letter one, which is the only way this
+/// fallback could quietly misclassify a part.
+///
+/// | Reference prefix | Class | Result |
+/// |---|---|---|
+/// | `R` | `R` | resistor (value parsed; conducts) |
+/// | `C` | `C` | capacitor (DC-open in the build pass) |
+/// | `L` | `L` | inductor (DC short) |
+/// | `D` | `D` | diode — LEDs share the `D` prefix and are DC-open either way |
+/// | `J`, `P` | `Conn` | board boundary (connector, socket, pad pair) |
+/// | `TP` | `TestPoint` | ignored |
+/// | `H`, `MK` | `MountingHole` | ignored |
+///
+/// Everything else — `U`, `IC`, `Q`, `X`, `S`, `SW`, `FB`, … — returns `None`
+/// so active silicon still has to be registered by the consumer. That is the
+/// point: the fallback classifies the parts whose behavior the engine already
+/// knows, and refuses to guess at the ones it does not.
+pub fn reference_designator_class(reference: &str) -> Option<&'static str> {
+    let prefix: String = reference
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .flat_map(char::to_uppercase)
+        .collect();
+    match prefix.as_str() {
+        "R" => Some("R"),
+        "C" => Some("C"),
+        "L" => Some("L"),
+        "D" => Some("D"),
+        "J" | "P" => Some("Conn"),
+        "TP" => Some("TestPoint"),
+        "H" | "MK" => Some("MountingHole"),
+        _ => None,
+    }
 }
 
 /// Passive-primitive class from an anchored part-name pattern: the class
@@ -555,6 +675,241 @@ mod tests {
         assert_eq!(
             normalize_part(&decl_with_lib("SomeLib", "PART-7", "")),
             "PART-7"
+        );
+    }
+
+    // --------------------------------------------------------
+    // Declared boundaries
+    // --------------------------------------------------------
+
+    /// A project-library connector symbol matches no `Conn*` prefix; declaring
+    /// the part name puts it in the auto boundary tier instead of forcing a
+    /// per-board stub that would claim "electrically absent".
+    #[rstest]
+    fn declared_boundary_parts_classify_as_boundaries() {
+        let mut registry = PartRegistry::new();
+        // Undeclared: the 80-finger edge socket is a hard error.
+        assert!(matches!(
+            registry.classify(
+                &decl_with_lib(
+                    "P2_EDGE_MODULE_SOCKET",
+                    "P2_EDGE_MODULE_SOCKET",
+                    "P2_EDGE_MODULE_SOCKET"
+                ),
+                80
+            ),
+            Err(RegistryError::UnknownPart { .. })
+        ));
+
+        registry.register_boundary("P2_EDGE_MODULE_SOCKET");
+        assert!(registry.is_boundary("P2_EDGE_MODULE_SOCKET"));
+        assert_eq!(
+            registry.classify(
+                &decl_with_lib(
+                    "P2_EDGE_MODULE_SOCKET",
+                    "P2_EDGE_MODULE_SOCKET",
+                    "P2_EDGE_MODULE_SOCKET"
+                ),
+                80
+            ),
+            Ok(Classification::Boundary)
+        );
+    }
+
+    /// A boundary declaration is the more specific statement about the board,
+    /// so it wins over a registry constructor for the same part name.
+    #[rstest]
+    fn boundary_declaration_wins_over_a_registry_entry() {
+        let mut registry = PartRegistry::new();
+        registry.register("MYSTERY_SOCKET", |_| Box::new(NullComponent));
+        assert_eq!(
+            registry.classify(&decl_with_lib("Lib", "MYSTERY_SOCKET", "X1"), 4),
+            Ok(Classification::Registered)
+        );
+        registry.register_boundary("MYSTERY_SOCKET");
+        assert_eq!(
+            registry.classify(&decl_with_lib("Lib", "MYSTERY_SOCKET", "X1"), 4),
+            Ok(Classification::Boundary)
+        );
+    }
+
+    // --------------------------------------------------------
+    // Reference-designator fallback (no-libsource netlists)
+    // --------------------------------------------------------
+
+    #[rstest]
+    #[case::resistor("R100", Some("R"))]
+    #[case::resistor_bare("R", Some("R"))]
+    #[case::capacitor("C516", Some("C"))]
+    #[case::inductor("L401", Some("L"))]
+    #[case::diode("D601", Some("D"))]
+    #[case::connector("J203", Some("Conn"))]
+    #[case::plug("P1", Some("Conn"))]
+    #[case::test_point("TP4", Some("TestPoint"))]
+    #[case::mounting_hole("H5", Some("MountingHole"))]
+    #[case::mounting_hole_alt("MK1", Some("MountingHole"))]
+    #[case::lowercase("r7", Some("R"))]
+    // The whole alphabetic run must match: a resistor NETWORK is not a
+    // resistor, and these three must not be mistaken for `C`/`P`/`R`.
+    #[case::resistor_network("RN7", None)]
+    #[case::pcb("PCB", None)]
+    #[case::layout_node("NC_Net", None)]
+    // Active silicon always falls through to the consumer's registry.
+    #[case::ic("U100", None)]
+    #[case::ic_alt("IC14", None)]
+    #[case::transistor("Q1", None)]
+    #[case::crystal("X100", None)]
+    #[case::switch("S301", None)]
+    #[case::empty("", None)]
+    fn reference_designator_classes_match_the_whole_alphabetic_run(
+        #[case] reference: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(reference_designator_class(reference), expected);
+    }
+
+    /// One `ComponentDecl` shaped like the `p2_ec32mb.net` fixture's: a value
+    /// and a reference, and **no libsource at all**.
+    fn unnamed(reference: &str, value: &str) -> ComponentDecl {
+        ComponentDecl {
+            reference: reference.to_string(),
+            value: value.to_string(),
+            footprint: String::new(),
+            lib: String::new(),
+            part: String::new(),
+            sheetpath: "/".to_string(),
+            dnp: false,
+        }
+    }
+
+    /// With the fallback off (the default) a no-libsource board is entirely
+    /// unclassified — the state that makes the opt-in worth having.
+    #[rstest]
+    fn without_the_fallback_unnamed_parts_are_hard_errors() {
+        let registry = PartRegistry::new();
+        assert_eq!(
+            registry.classify(&unnamed("R100", "10.5K"), 2),
+            Err(RegistryError::UnknownPart {
+                reference: "R100".to_string(),
+                part: String::new()
+            })
+        );
+        assert!(matches!(
+            registry.classify(&unnamed("J203", "Edge Socket Pads"), 60),
+            Err(RegistryError::UnknownPart { .. })
+        ));
+    }
+
+    /// With the fallback on, the real fixture's passives and pad/socket
+    /// symbols classify — values parsed — while its active silicon still has
+    /// to be registered.
+    #[rstest]
+    fn reference_fallback_classifies_the_ec32mb_fixture_shapes() {
+        let mut registry = PartRegistry::new();
+        registry.classify_unnamed_by_reference(true);
+        registry.register("P2X8C4M64P", |_| Box::new(NullComponent));
+
+        // R100: the 10.5 kΩ reset pull-up — parsed, so it conducts.
+        assert_eq!(
+            registry.classify(&unnamed("R100", "10.5K"), 2),
+            Ok(Classification::Passive {
+                kind: PassiveKind::Resistor,
+                value: Some(10_500.0)
+            })
+        );
+        // C100: a decoupling cap whose value field carries a voltage rating —
+        // classifies, value unparsed (DC-open either way).
+        assert_eq!(
+            registry.classify(&unnamed("C100", "4.7uF 6.3V"), 2),
+            Ok(Classification::Passive {
+                kind: PassiveKind::Capacitor,
+                value: None
+            })
+        );
+        assert_eq!(
+            registry.classify(&unnamed("L401", "3.3uH 6.6A 28.6mOhm"), 2),
+            Ok(Classification::Passive {
+                kind: PassiveKind::Inductor,
+                value: None
+            })
+        );
+        // D601 is a white LED; the `D` prefix cannot tell LED from diode, and
+        // both are DC-open in the build pass.
+        assert_eq!(
+            registry.classify(&unnamed("D601", "White"), 2),
+            Ok(Classification::Passive {
+                kind: PassiveKind::Diode,
+                value: None
+            })
+        );
+        // The 80-finger edge socket and the mounting-hole pads are boundaries.
+        assert_eq!(
+            registry.classify(&unnamed("J203", "Edge Socket Pads"), 60),
+            Ok(Classification::Boundary)
+        );
+        assert_eq!(
+            registry.classify(&unnamed("J701", "Mounting Hole Vss"), 1),
+            Ok(Classification::Boundary)
+        );
+        // Registered active silicon keys on the VALUE (there is no part name).
+        assert_eq!(
+            registry.classify(&unnamed("U100", "P2X8C4M64P"), 86),
+            Ok(Classification::Registered)
+        );
+        // Unregistered active silicon still fails loudly.
+        assert_eq!(
+            registry.classify(&unnamed("U301", "SPI Flash 16MB (128Mb)"), 8),
+            Err(RegistryError::UnknownPart {
+                reference: "U301".to_string(),
+                part: String::new()
+            })
+        );
+        // A BOM-only refdes has no class at all — the per-board stub list is
+        // the documented escape.
+        assert!(matches!(
+            registry.classify(&unnamed("PCB", "PCB for P2 EC Module"), 0),
+            Err(RegistryError::UnknownPart { .. })
+        ));
+    }
+
+    /// The fallback fires only for an EMPTY part name: a component that names
+    /// its symbol keeps classifying on the symbol, even when its reference
+    /// prefix says something else.
+    #[rstest]
+    fn reference_fallback_never_overrides_a_named_part() {
+        let mut registry = PartRegistry::new();
+        registry.classify_unnamed_by_reference(true);
+        // `J1` with an ADS122U04 symbol is a chip, not a connector.
+        registry.register("ADS122U04", |_| Box::new(NullComponent));
+        assert_eq!(
+            registry.classify(&decl_with_lib("DS2", "ADS122U04", "ADS122U04"), 16),
+            Ok(Classification::Registered)
+        );
+        // And `U1` with a resistor symbol is still a resistor.
+        assert_eq!(
+            registry.classify(&decl_with_lib("Device", "R_Small", "47R"), 2),
+            Ok(Classification::Passive {
+                kind: PassiveKind::Resistor,
+                value: Some(47.0)
+            })
+        );
+    }
+
+    /// Pin-count validation still applies to a reference-classified passive,
+    /// and the error reports the real (empty) part name rather than the
+    /// synthetic class.
+    #[rstest]
+    fn reference_classified_passives_are_pin_count_validated() {
+        let mut registry = PartRegistry::new();
+        registry.classify_unnamed_by_reference(true);
+        assert_eq!(
+            registry.classify(&unnamed("R9", "10k"), 3),
+            Err(RegistryError::BadPinCount {
+                reference: "R9".to_string(),
+                part: String::new(),
+                expected: 2,
+                found: 3
+            })
         );
     }
 

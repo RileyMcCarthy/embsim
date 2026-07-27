@@ -246,12 +246,19 @@ pub(crate) enum Command {
     Shutdown,
 }
 
+/// Attach-time drives recorded on the inert (build-time) link, in issue
+/// order: the build pass applies them before it resolves for real.
+pub(crate) type IdleDriveLog = Arc<Mutex<Vec<(EndpointId, Option<TheveninDrive>)>>>;
+
 /// Cloneable client half of the engine: command sender, the global drive
 /// sequence counter, and the engine-published net-state table.
 ///
 /// An **inert** link (`tx == None`) is what the build-time analysis path
-/// hands out: senses read the build-resolved snapshot; drives and schedules
-/// are traced and dropped.
+/// hands out: senses read the build-resolved snapshot, schedules are traced
+/// and dropped, and drives are *recorded* so the build pass can apply a
+/// component's idle drive before it publishes findings (a component that
+/// releases a `DigitalOut` pin at attach must not be analyzed as if it were
+/// driving the engine's idle-high default).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EngineLink {
     /// Command queue into the engine thread; `None` on the inert build path.
@@ -260,15 +267,20 @@ pub(crate) struct EngineLink {
     pub(crate) drive_seq: Arc<AtomicU64>,
     /// Engine-published resolved state per net (build snapshot when inert).
     pub(crate) states: Arc<Mutex<Vec<NetState>>>,
+    /// Inert path only: drives issued during attach, in issue order, for the
+    /// build pass to apply before it resolves for real.
+    pub(crate) recorded_drives: Option<IdleDriveLog>,
 }
 
 impl EngineLink {
-    /// Inert link over a fixed state snapshot (the build-time analysis path).
-    pub(crate) fn inert(states: Arc<Mutex<Vec<NetState>>>) -> Self {
+    /// Inert link over a fixed state snapshot (the build-time analysis
+    /// path), recording attach-time drives into `recorded_drives`.
+    pub(crate) fn inert(states: Arc<Mutex<Vec<NetState>>>, recorded_drives: IdleDriveLog) -> Self {
         Self {
             tx: None,
             drive_seq: Arc::new(AtomicU64::new(0)),
             states,
+            recorded_drives: Some(recorded_drives),
         }
     }
 
@@ -285,6 +297,20 @@ impl EngineLink {
                 }
             }
             None => {
+                // Drives are recorded (the build pass applies them before it
+                // resolves); everything else is genuinely dropped.
+                if let (
+                    Command::Drive {
+                        endpoint, drive, ..
+                    },
+                    Some(log),
+                ) = (&command, &self.recorded_drives)
+                {
+                    log.lock()
+                        .expect("drive log never poisoned")
+                        .push((*endpoint, *drive));
+                    return true;
+                }
                 tracing::debug!("inert engine link (build-time analysis path); command dropped");
                 false
             }
@@ -500,6 +526,17 @@ impl Resolver {
     /// state; conduction clusters share sourced-ness. Clusters where a
     /// competing source sits within [`ESCALATION_IMPEDANCE_RATIO`] of the
     /// strongest driver escalate to `solver`.
+    /// The identity root of every net, after harness/pin-short merges:
+    /// two nets are electrically the same node iff their roots are equal.
+    ///
+    /// Net *names* deliberately survive a merge (each keeps its own board's
+    /// label), so name comparison cannot answer "are these connected?" —
+    /// this can. Snapshotted for [`crate::BuiltSystem`] so connectivity
+    /// claims are assertable without a live engine.
+    pub(crate) fn identity_roots(&mut self, net_count: usize) -> Vec<usize> {
+        (0..net_count).map(|i| self.identity.find(i)).collect()
+    }
+
     pub(crate) fn resolve(
         &mut self,
         nets: &mut [Net],
@@ -1773,6 +1810,8 @@ impl EngineHandle {
                 tx: Some(tx),
                 drive_seq: Arc::new(AtomicU64::new(0)),
                 states,
+                // Live path: drives go to the engine, never to a log.
+                recorded_drives: None,
             },
             diagnostics,
             join: Some(join),

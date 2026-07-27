@@ -39,6 +39,33 @@ use crate::net::{Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUS
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
 
 // ============================================================
+// Qualified net names
+// ============================================================
+
+/// Canonicalize a dotted `Board.NETNAME` reference the way the assembly
+/// stored it: the board prefix is passed through verbatim and the net part —
+/// everything after the FIRST `.` — goes through
+/// [`crate::netlist::normalize_net_name`], so both the overline rewrite
+/// (`~{RESET}` → `~RESET`) and the sheet-scoped leaf rewrite
+/// (`/Sheet2/~{FOO}` → `/Sheet2/~FOO`) fire.
+///
+/// Splitting on the first `.` (not the last) is deliberate: board names hold
+/// no dots, while KiCad net labels legitimately do.
+///
+/// Both name-keyed lookups — [`System::named_net`] (which resolves
+/// `Scenario::net_stuck` targets) and [`SystemHandle::net_state`] — must use
+/// this, or a caller naming a net exactly as the netlist spells it silently
+/// fails to find a net that exists.
+fn normalize_qualified_net_name(path: &str) -> String {
+    match path.split_once('.') {
+        Some((board, net)) => {
+            format!("{board}.{}", crate::netlist::normalize_net_name(net))
+        }
+        None => crate::netlist::normalize_net_name(path),
+    }
+}
+
+// ============================================================
 // Harness endpoints
 // ============================================================
 
@@ -427,7 +454,8 @@ impl System {
         // and schedules are traced and dropped.
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
-        let link = EngineLink::inert(states);
+        let recorded_drives = Arc::new(Mutex::new(Vec::new()));
+        let link = EngineLink::inert(Arc::clone(&states), Arc::clone(&recorded_drives));
         for mut prepared in components {
             let io =
                 ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone());
@@ -445,7 +473,36 @@ impl System {
             // and is dropped here; System::start keeps it.
         }
 
-        Ok(BuiltSystem { nets, diagnostics })
+        // Apply the drives components issued during attach, then resolve
+        // again so the published states and findings describe the system as
+        // its components actually idle it. Without this, a component that
+        // *releases* a `DigitalOut` pin (an end switch with an open contact,
+        // an open-drain output) is analyzed as if it drove the engine's
+        // idle-high default — the build pass would report `Driven(High)` on a
+        // net the live system floats, and miss the `FloatingSense` the
+        // consumer needs to see.
+        //
+        // One extra pass is enough: these are attach-time idle drives, not a
+        // feedback loop (senses are read from the snapshot, and a component
+        // cannot observe this second resolution to react to it). Live
+        // feedback is the engine's job, on the `start` path.
+        let idle_drives = std::mem::take(&mut *recorded_drives.lock().expect("never poisoned"));
+        if !idle_drives.is_empty() {
+            for (endpoint, drive) in idle_drives {
+                resolver.set_drive(endpoint, drive);
+            }
+            diagnostics = Diagnostics::new();
+            resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
+            let _ = resolver.route_streams(&nets, &mut diagnostics);
+            *states.lock().expect("never poisoned") = nets.iter().map(|n| n.state).collect();
+        }
+
+        let roots = resolver.identity_roots(nets.len());
+        Ok(BuiltSystem {
+            nets,
+            diagnostics,
+            roots,
+        })
     }
 
     /// Assemble the system and **start the live net engine**: the
@@ -988,7 +1045,7 @@ impl System {
 
     /// Global net index of a dotted `Board.NETNAME` reference.
     fn named_net(&self, path: &str, nets: &[Net]) -> Result<usize, SystemError> {
-        let normalized = crate::netlist::normalize_pin_name(path);
+        let normalized = normalize_qualified_net_name(path);
         nets.iter()
             .position(|n| n.name == normalized)
             .ok_or_else(|| SystemError::UnknownEndpoint {
@@ -1110,6 +1167,8 @@ fn handle_entries(pins: &[PreparedPin], link: &EngineLink) -> Vec<(String, PinHa
 pub struct BuiltSystem {
     nets: Vec<Net>,
     diagnostics: Diagnostics,
+    /// Identity root per net index (harness/pin-short merges).
+    roots: Vec<usize>,
 }
 
 impl BuiltSystem {
@@ -1117,6 +1176,42 @@ impl BuiltSystem {
     /// [`crate::net::NetId`].
     pub fn nets(&self) -> &[Net] {
         &self.nets
+    }
+
+    /// Whether two nets are the same electrical node — i.e. a harness wire
+    /// or `pin_short` merged them.
+    ///
+    /// A merge does **not** rename nets: each keeps its own board's label
+    /// (`EdgeBoard./Sheet2/IEND_U+` stays distinct from `END_U.COM` in
+    /// [`BuiltSystem::nets`]), so comparing names — or comparing resolved
+    /// [`NetState`]s, which are equal for any two floating nets whether or
+    /// not they touch — cannot answer "is this wired?". This can.
+    pub fn nets_are_merged(&self, a: NetId, b: NetId) -> bool {
+        match (self.roots.get(a.0), self.roots.get(b.0)) {
+            (Some(ra), Some(rb)) => ra == rb,
+            _ => false,
+        }
+    }
+
+    /// Index of a net by qualified name (`"Board.NETNAME"`, overline- and
+    /// sheet-normalized like the assembly stored it).
+    pub fn net_id(&self, name: &str) -> Option<NetId> {
+        let normalized = normalize_qualified_net_name(name);
+        self.nets
+            .iter()
+            .position(|n| n.name == normalized)
+            .map(NetId)
+    }
+
+    /// Whether two nets named as the netlist spells them are the same
+    /// electrical node. Returns `false` if either name is unknown — callers
+    /// asserting connectivity should check [`BuiltSystem::net_id`] first if
+    /// they want a typo to fail loudly instead of reading as "not wired".
+    pub fn names_are_merged(&self, a: &str, b: &str) -> bool {
+        match (self.net_id(a), self.net_id(b)) {
+            (Some(a), Some(b)) => self.nets_are_merged(a, b),
+            _ => false,
+        }
     }
 
     /// Findings from the build-time resolution pass (and, later, the live
@@ -1156,7 +1251,7 @@ impl SystemHandle {
     /// Most recently engine-published state of a net, by qualified system
     /// name (`"Board.NETNAME"`, overline-normalized).
     pub fn net_state(&self, name: &str) -> Option<NetState> {
-        let normalized = crate::netlist::normalize_pin_name(name);
+        let normalized = normalize_qualified_net_name(name);
         let index = self.net_names.iter().position(|n| *n == normalized)?;
         self.engine.net_state(NetId(index))
     }
@@ -1354,5 +1449,31 @@ mod tests {
         );
         assert_eq!(scenario.value_overrides().len(), 1);
         assert_eq!(scenario.dnp_overrides().len(), 1);
+    }
+
+    /// A dotted reference must canonicalize exactly the way the assembly
+    /// stored the net: board prefix verbatim, net part through the net
+    /// normalizer. Naming a net the way the netlist spells it — with the
+    /// overline braces, or sheet-scoped — has to resolve, or `net_stuck`
+    /// silently misses a net that exists.
+    #[rstest]
+    #[case("DS2Addon.~{RESET}", "DS2Addon.~RESET")]
+    #[case("DS2Addon.~RESET", "DS2Addon.~RESET")]
+    #[case(
+        "EdgeBoard./MaD_Edge_Sheet2/~{IFG_RX}",
+        "EdgeBoard./MaD_Edge_Sheet2/~IFG_RX"
+    )]
+    #[case(
+        "EdgeBoard./MaD_Edge_Sheet2/IFG_RX",
+        "EdgeBoard./MaD_Edge_Sheet2/IFG_RX"
+    )]
+    // A net label containing a dot keeps everything after the FIRST dot.
+    #[case("Board.A.B", "Board.A.B")]
+    #[case("GND", "GND")]
+    fn qualified_net_names_canonicalize_like_the_assembly(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(normalize_qualified_net_name(input), expected);
     }
 }
