@@ -13,7 +13,7 @@ use std::fmt;
 
 use crate::component::{AttachError, Component, PinDecl};
 use crate::net::{Net, NetId, NetState, PinRef};
-use crate::netlist::{normalize_pin_name, NetlistError, ParsedNetlist};
+use crate::netlist::{normalize_net_name, NetlistError, ParsedNetlist};
 use crate::registry::{Classification, JumperState, PartRegistry, PassiveKind, RegistryError};
 
 // ============================================================
@@ -168,15 +168,18 @@ impl Board {
             });
         }
 
-        // Board-local nets. Net names get overline-normalized so consumers
-        // and findings agree on one spelling (`~{RESET}` -> `~RESET`).
+        // Board-local nets, one per netlist net in export order. Names get
+        // overline-normalized so consumers and findings agree on one spelling
+        // (`~{RESET}` -> `~RESET`); the sheet path of a hierarchical local
+        // label is kept verbatim, so `/Sheet2/SIGNAL` and `/Sheet3/SIGNAL`
+        // stay two distinguishable nets (see `normalize_net_name`).
         let nets = netlist
             .nets
             .iter()
             .enumerate()
             .map(|(i, decl)| Net {
                 id: NetId(i),
-                name: normalize_pin_name(&decl.name),
+                name: normalize_net_name(&decl.name),
                 nodes: decl
                     .nodes
                     .iter()

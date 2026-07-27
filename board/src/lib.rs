@@ -54,7 +54,10 @@ pub use engine::EngineHandle;
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};
 pub use net::{Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts};
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
-pub use registry::{Classification, JumperState, PartRegistry, PassiveKind, RegistryError};
+pub use registry::{
+    reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind,
+    RegistryError,
+};
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
     HarnessError, Scenario, StreamDropPolicy, System, SystemError, SystemHandle,
