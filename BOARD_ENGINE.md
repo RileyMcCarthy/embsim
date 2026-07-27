@@ -288,12 +288,17 @@ Deliberately wrong harnesses (swapped pins) are valid fixtures — the
 
 A platform crate (per `CONTRACT.md`) provides the MCU component:
 
-1. **Firmware image**: the consumer's static library. The engine **spawns** the
-   entry on a component-owned thread (today `embsim_runtime::Emulator::run`
-   executes the entry synchronously on the caller's thread and blocks;
-   `System::build` must return, so this moves). CONTRACT.md's init-ordering
-   section is re-stated for the board engine: `attach()` and net service must
-   be live before firmware entry.
+1. **Firmware image**: the consumer's static library. The engine **spawns**
+   the entry on a component-owned thread: `McuBuilder::entry` puts the
+   component in owned-execution mode, and `Component::start` — called by
+   `System::start` strictly after every component has attached — spawns the
+   entry bound to the component's own `PeripheralInstance`. CONTRACT.md's
+   init-ordering section is re-stated for the board engine: `attach()` and
+   net service are live before the firmware entry's first instruction, and
+   peripheral-bank sizing performed *inside* the entry commutes with the
+   bridges attach installed (`serial::init` preserves installed FDs).
+   Entry-less components stay in facade mode: `Emulator::run` on the
+   caller's thread against the default instance keeps working unchanged.
 2. **Peripherals**: the generic peripheral emulations become fields of the MCU
    component instance rather than process globals. The full global-state
    inventory this de-globalizes: serial (`CHANNEL_FDS`/baud/pacing), GPIO
@@ -325,12 +330,11 @@ for tests).
 > **Slice status (2026-07):** the MCU-as-a-component pattern ships in
 > `board/src/mcu.rs` for the **serial force path**: HAL-table-shaped configs
 > in, `"P{n}"` stream pins out, socketpair bridges into the
-> `embsim-peripherals` serial bank, with baud taken from the table. The entry
-> inversion in point 1 is **deferred** — firmware still boots via
-> `embsim_runtime::Emulator::run` on the caller's thread against the default
-> `PeripheralInstance`, and `McuComponent` targets the attach thread's
-> (default) instance until the inversion slice moves the entry onto a
-> component-owned thread. Point 3's table read path is
+> `embsim-peripherals` serial bank, with baud taken from the table. The
+> entry inversion in point 1 is **delivered**: `McuBuilder::entry` +
+> `Component::start` spawn the firmware on a component-owned instance
+> (facade mode without an entry keeps the `Emulator::run` flow working).
+> Point 3's table read path is
 > `embsim-memory-inspect`'s `hal_tables` module (symbol names parameterized;
 > the reference consumer's names are the documented defaults). GPIO channels
 > are declaration-only on the component; encoder/pulse-out channels remain

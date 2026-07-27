@@ -285,3 +285,114 @@ fn fg_channel_pin_table_matches_the_hal_config() {
     assert_eq!(rx.kind, PinKind::DigitalIn);
     assert_eq!(rx.stream, Some(StreamRole::Consumer { baud_hz: 115_200 }));
 }
+
+// ============================================================
+// Owned-execution mode (the entry inversion)
+// ============================================================
+
+/// With an entry, the system spawns the firmware on a thread bound to the
+/// component's OWN peripheral instance: HAL free functions called by the
+/// entry route there (not the process default), the bank sizing the
+/// firmware performs inside the entry does not sever the attach-installed
+/// bridge (init/wiring commute), and the entry's bytes cross the netlist
+/// to the peer. SystemHandle drop must not hang on the detached entry
+/// thread.
+#[rstest]
+fn entry_runs_on_the_component_instance_and_reaches_the_peer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    virtual_clock::init(50.0, 1_000_000);
+
+    let peer_tx: TxSlot = Arc::new(Mutex::new(None));
+    let peer_rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
+
+    // Set by the entry thread; read by the test.
+    static ROUTED_OFF_DEFAULT: AtomicBool = AtomicBool::new(false);
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    let mut registry = PartRegistry::new();
+    registry.register("MCU_P2", |_decl| {
+        Box::new(
+            McuComponent::builder("p2-owned")
+                .serial_table(vec![FG])
+                .bridge_serial(0)
+                .entry(|| {
+                    // The inversion's core claim: this thread's instance is
+                    // NOT the process default.
+                    let mine = embsim_peripherals::instance::current();
+                    let default = embsim_peripherals::instance::default();
+                    ROUTED_OFF_DEFAULT.store(!Arc::ptr_eq(&mine, &default), Ordering::Relaxed);
+
+                    // Firmware-style boot: size the bank INSIDE the entry —
+                    // strictly after attach installed the bridge FD, which
+                    // must survive (sizing and wiring commute).
+                    serial::init(1);
+                    serial::transmit_data(0, b"BOOT");
+
+                    // A firmware main loop that never returns until the
+                    // test releases it (the thread is detached by design).
+                    while !STOP.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+                .build()
+                .expect("MCU builds with an entry"),
+        )
+    });
+    {
+        let (tx, rx) = (Arc::clone(&peer_tx), Arc::clone(&peer_rx));
+        registry.register("PEER_UART", move |_decl| {
+            Box::new(PeerUart::new(115_200, Arc::clone(&tx), Arc::clone(&rx)))
+        });
+    }
+
+    let mcu_board = Board::from_netlist(
+        embsim_board::netlist::parse(MCU_NETLIST).expect("MCU netlist parses"),
+        &registry,
+    )
+    .expect("MCU board builds");
+    let peer_board = Board::from_netlist(
+        embsim_board::netlist::parse(PEER_NETLIST).expect("peer netlist parses"),
+        &registry,
+    )
+    .expect("peer board builds");
+
+    let harness = Harness::new()
+        .connect_str("McuBoard.J1.1", "PeerBoard.J1.2")
+        .expect("endpoints parse")
+        .connect_str("PeerBoard.J1.1", "McuBoard.J1.2")
+        .expect("endpoints parse");
+
+    let system = System::new()
+        .board("McuBoard", mcu_board)
+        .board("PeerBoard", peer_board)
+        .harness(harness)
+        .start()
+        .expect("live system starts");
+
+    // The entry's boot bytes cross the bridge: proof its HAL calls landed
+    // on the attached (component-owned) instance with the bridge intact.
+    assert!(
+        wait_for(
+            || peer_rx.lock().unwrap().as_slice() == b"BOOT",
+            Duration::from_secs(5)
+        ),
+        "entry bytes must reach the peer; got {:?}",
+        peer_rx.lock().unwrap()
+    );
+    assert!(
+        ROUTED_OFF_DEFAULT.load(Ordering::Relaxed),
+        "the entry thread must be bound to the component's own instance, \
+         not the process default"
+    );
+
+    // Dropping the system joins the engine and pumps; the still-running
+    // entry thread is detached and must not block shutdown.
+    let start = Instant::now();
+    drop(system);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "shutdown must not wait on the detached entry thread"
+    );
+    STOP.store(true, Ordering::Relaxed);
+}
