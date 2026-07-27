@@ -7,6 +7,9 @@
 //!   (pin facade, power/reset gate, stream pump)
 //! - [`limit_switch`] — position-threshold limit switch
 //! - [`edge`] — edge-detection primitive shared by threshold models
+//! - [`machine`] — the **physical world** as harness-attached `embsim-board`
+//!   components: a step/direction motor drive, a quadrature encoder, and an
+//!   end-of-travel switch, each with a real pin facade
 //!
 //! Models communicate through [`embsim_core::event::Observers`]: each accepts
 //! input via setter functions and emits output to any number of subscribers
@@ -19,3 +22,4 @@ pub mod ads122u04;
 pub mod ads122u04_component;
 pub mod edge;
 pub mod limit_switch;
+pub mod machine;
