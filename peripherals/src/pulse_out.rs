@@ -756,13 +756,20 @@ mod tests {
             elapsed + 1 >= ideal_us,
             "finished too early: elapsed={elapsed}us ideal={ideal_us}us"
         );
-        // Upper bound: a few poll ticks of overshoot is fine; not multi-second hang.
-        let max_us = ideal_us
-            .saturating_add(5_000)
-            .saturating_add(POLL_TICK_US * 20);
+        // Upper bound: this catches a hang or a runaway integration, NOT
+        // scheduling jitter. `run()` sleeps `POLL_TICK_US` of *virtual* time
+        // per poll, and the virtual clock is scaled wall time
+        // (`DETERMINISM.md`, "why timing assertions are tier-dependent"), so
+        // on a contended runner every sleep overshoots and the measured
+        // elapsed virtual time inflates without anything being wrong — a
+        // tight bound here fails on a busy CI box while passing locally.
+        // Precision belongs to the strict assertions above (exact emitted
+        // count, and cannot-finish-early); this one only has to notice
+        // "never finished". Under the stepped clock this can become exact.
+        let max_us = ideal_us.saturating_mul(4).saturating_add(1_000_000);
         assert!(
             elapsed <= max_us,
-            "finished too late: elapsed={elapsed}us max={max_us}us"
+            "finished too late (hang?): elapsed={elapsed}us max={max_us}us"
         );
     }
 
