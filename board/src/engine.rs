@@ -68,6 +68,29 @@
 //! `virtual_clock::init` has run are dropped with a
 //! [`Finding::VirtualClockUninitialized`] instead of panicking the engine
 //! thread, and [`EngineHandle::is_alive`] reports engine-thread health.
+//!
+//! # Review rule: no unordered iteration on an engine path
+//!
+//! **Never iterate a `HashMap` or `HashSet` on an engine path without an
+//! explicit sort.** `std`'s hasher is randomly seeded — and `RandomState::new`
+//! re-keys on *every* map construction, so a map built per call has a fresh
+//! order per call. Any hash order that reaches a published value therefore
+//! makes the engine irreproducible, and the effect is often a last-bit float
+//! difference rather than an obvious reordering. The three sanctioned shapes:
+//!
+//! 1. **Dense index** — walk the `Vec` (`self.slots`, `self.streams`,
+//!    `self.nets`, `0..n`) and use the map only for keyed lookups. Preferred:
+//!    it needs no sort and the order is meaningful.
+//! 2. **Explicit sort** — `collect()` the keys, `sort_unstable()`, then
+//!    iterate (`driver_roots`, `extra_clusters`, `path_roots`, `fighting`).
+//! 3. **Membership only** — a set used purely as a dedup gate or a
+//!    `contains`/`len` test, never iterated into an output. These carry an
+//!    inline `// hash-order: …` comment saying why order cannot escape.
+//!
+//! Grep gate: `\.values\(\)|\.keys\(\)|\.iter\(\)` over a `HashMap`/`HashSet`
+//! in this module, `cluster.rs`, or `system.rs` should show only shapes 2 and
+//! 3. `DETERMINISM.md` (Phase D0 item (d)) is the authoritative statement of
+//! this rule; `BOARD_ENGINE.md` cross-references it.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -85,6 +108,7 @@ use crate::cluster::{
 };
 use crate::component::StreamRole;
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
+use crate::event_log::{EngineEvent, EventLog};
 use crate::net::{
     Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, ESCALATION_IMPEDANCE_RATIO,
     STREAM_COLLAPSE_THRESHOLD,
@@ -145,13 +169,20 @@ const DRIVE_SEQ_STALL_TIMEOUT: Duration = Duration::from_millis(250);
 // ============================================================
 
 /// Dense index of one drive-capable pin endpoint, assigned at assembly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct EndpointId(pub(crate) usize);
+///
+/// Public because it is one of the canonical identities the determinism event
+/// log records (`DETERMINISM.md`, "Trace normalization spec": canonicalize
+/// identity to the dense ids that already exist — never a thread name, never a
+/// pointer, never a `HashMap` order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EndpointId(pub usize);
 
 /// Dense index of one attached component, assigned at assembly (keys the
 /// timer wheel's wakeup delivery).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ComponentId(pub(crate) usize);
+///
+/// Public for the same reason as [`EndpointId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ComponentId(pub usize);
 
 // ============================================================
 // Engine commands + client link
@@ -622,20 +653,29 @@ impl Resolver {
         // declared impedance; power rails and stuck faults as ideal 0-ohm
         // sources; NaN "unmodeled voltage" rails are skipped — they source
         // the cluster but cannot enter a numeric solve).
+        //
+        // **Determinism (load-bearing):** iterate the DENSE drive table, never
+        // `net_drivers` (a `HashMap`). This `Vec`'s order becomes the float
+        // accumulation order of `matrix[c][c] += g` and `rhs[c] += i` in
+        // [`crate::cluster::QuasiStaticMna::solve`], so hash iteration order
+        // would publish last-bit-different `NetState::Analog` voltages from
+        // one *process* to the next — `std`'s hasher is randomly seeded per
+        // process. Slots and `net_drivers`' member lists are both built in
+        // endpoint order, so this is the same multiset in a canonical order.
+        // See `DETERMINISM.md`, "One real hash-order defect".
         let mut cluster_sources: HashMap<usize, Vec<ClusterSource>> = HashMap::new();
-        for slots in net_drivers.values() {
-            for &si in slots {
-                let drive = drive_of(si);
-                let net = self.slots[si].net;
-                cluster_sources
-                    .entry(cluster_of[net])
-                    .or_default()
-                    .push(ClusterSource {
-                        node: NetId(root_of[net]),
-                        volts: drive.volts,
-                        impedance: drive.impedance,
-                    });
-            }
+        for slot in &self.slots {
+            let Some(drive) = slot.drive else {
+                continue;
+            };
+            cluster_sources
+                .entry(cluster_of[slot.net])
+                .or_default()
+                .push(ClusterSource {
+                    node: NetId(root_of[slot.net]),
+                    volts: drive.volts,
+                    impedance: drive.impedance,
+                });
         }
         for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
             if volts.is_nan() {
@@ -662,8 +702,12 @@ impl Resolver {
         // two push-pull outputs).
         let mut contended: HashMap<usize, Vec<usize>> = HashMap::new();
         {
+            // hash-order shape 2: keys collected then sorted, so the pair
+            // walk below is in root order.
             let mut driver_roots: Vec<usize> = net_drivers.keys().copied().collect();
             driver_roots.sort_unstable();
+            // hash-order shape 3: this set is only ever asked for `.len()`
+            // (below, "does this pair disagree?"), never iterated.
             let levels_of = |root: usize| -> HashSet<Level> {
                 net_drivers[&root]
                     .iter()
@@ -690,6 +734,9 @@ impl Resolver {
                     }
                 }
             }
+            // hash-order shape 3: `values_mut` mutates each Vec in place —
+            // which Vec is visited first cannot affect any of them, and each
+            // is sorted here so the reported driver list is canonical.
             for fighting in contended.values_mut() {
                 fighting.sort_unstable();
                 fighting.dedup();
@@ -724,6 +771,10 @@ impl Resolver {
             };
             solver.solve(&Cluster { nodes, resistors }, &inputs)
         };
+        // hash-order: `escalated` is keyed access only (`contains_key`, `get`,
+        // `entry`) and never iterated. `driver_roots` is shape 2 — the escalation
+        // decision below runs in root order, so which cluster wins the
+        // `contains_key` short-circuit is fixed.
         let mut escalated: HashMap<usize, ClusterSolution> = HashMap::new();
         let mut driver_roots: Vec<usize> = net_drivers.keys().copied().collect();
         driver_roots.sort_unstable();
@@ -733,6 +784,9 @@ impl Resolver {
                 continue;
             }
             let slots = &net_drivers[&root];
+            // hash-order shape 3: `.len()` gates, and the `.next()` below runs
+            // only when the set holds exactly one element — so iteration order
+            // has nothing to choose between.
             let levels: HashSet<Level> = slots
                 .iter()
                 .map(|&si| level_of_volts(drive_of(si).volts))
@@ -755,6 +809,10 @@ impl Resolver {
             }
             // Sources reachable through conduction edges within the cluster.
             let dist = min_path_ohms(&root_edges, root);
+            // Order-independent by arithmetic: `f64::min` over a set of
+            // finite values gives the same result in any order, so this
+            // consumer of `cluster_sources` is safe regardless. The MNA
+            // accumulation is the one that is not — see its assembly above.
             if let Some(sources) = cluster_sources.get(&cluster) {
                 for source in sources {
                     if source.node.0 == root || level_of_volts(source.volts) == level {
@@ -804,11 +862,15 @@ impl Resolver {
                 .or_default()
                 .insert(level);
         }
+        // hash-order shape 3: `ideal_contended` is only ever `.contains`-ed
+        // during state assignment; it is never iterated into an output.
         let ideal_contended: HashSet<usize> = ideal_root_levels
             .iter()
             .filter(|(_, levels)| levels.len() > 1)
             .map(|(&root, _)| root)
             .collect();
+        // hash-order shape 2: collected from a map, then sorted + deduped
+        // below, so the solve order over extra clusters is cluster order.
         let mut extra_clusters: Vec<usize> = ideal_cluster_levels
             .iter()
             .filter(|(_, levels)| levels.len() > 1)
@@ -876,6 +938,10 @@ impl Resolver {
 
         // -- findings ---------------------------------------------------------
         // Contention (per identity root, deduped).
+        // hash-order shape 3: every `reported*` set below is a dedup gate —
+        // `.insert()` returning false suppresses a duplicate. The findings
+        // themselves are emitted while walking dense indices, so their order is
+        // net order, not hash order.
         let mut reported_contention: HashSet<usize> = HashSet::new();
         for i in 0..n {
             let root = root_of[i];
@@ -957,6 +1023,7 @@ impl Resolver {
             .collect();
 
         let mut routes = Vec::new();
+        // hash-order shape 3: dedup gate for the StreamMismatch pair report.
         let mut reported_pairs: HashSet<(usize, usize)> = HashSet::new();
         for (pi, producer) in self.streams.iter().enumerate() {
             let StreamRole::Producer { baud_hz } = producer.role else {
@@ -1013,6 +1080,9 @@ impl Resolver {
             // for the added subtlety: over-gating can only drop bytes a
             // real link might have carried; it never leaks bytes onto a
             // broken one.
+            // hash-order shape 2: `min_path_ohms` returns a `HashMap`, but its
+            // *values* are order-independent (relaxation over the `root_edges`
+            // Vec to a fixpoint) and the keys collected here are sorted below.
             let mut path_roots: Vec<usize> = dist
                 .iter()
                 .filter(|(_, &ohms)| ohms < STREAM_COLLAPSE_THRESHOLD)
@@ -1183,6 +1253,12 @@ struct EngineCore {
     solver: Box<dyn ClusterSolver>,
     states: Arc<Mutex<Vec<NetState>>>,
     diagnostics: Arc<Mutex<Diagnostics>>,
+    // hash-order: every map below is **keyed access only** — `get`, `entry`,
+    // `insert`, `contains_key`. None is iterated. Sense delivery walks
+    // `self.nets` by index and the per-net callbacks are a `Vec` in
+    // registration order; `reroute_streams` walks `self.streams` in
+    // registration order. Adding an iteration over any of these needs a sort
+    // (see the module's review rule).
     sense_subs: HashMap<usize, Vec<SenseCallback>>,
     wake_subs: HashMap<usize, WakeCallback>,
     /// Live stream routes, keyed by producer endpoint index. Rebuilt (and
@@ -1203,6 +1279,10 @@ struct EngineCore {
     /// Gap watchdog: the missing seq currently being waited on and when the
     /// wait started (wall clock). `None` when no gap is outstanding.
     drive_stall: Option<(u64, Instant)>,
+    /// Determinism Oracle 1 (`crate::event_log`). Disabled by default; every
+    /// recording site is closure-guarded, so an off log costs one `Option`
+    /// check.
+    event_log: EventLog,
 }
 
 impl EngineCore {
@@ -1211,6 +1291,8 @@ impl EngineCore {
     fn report_finding(&self, finding: Finding) {
         let mut cumulative = self.diagnostics.lock().unwrap();
         if !cumulative.contains(&finding) {
+            self.event_log
+                .record(|| EngineEvent::Finding(finding.clone()));
             cumulative.report(finding);
         }
     }
@@ -1268,11 +1350,24 @@ impl EngineCore {
 
         // Sense delivery: engine thread, no lock held. A callback that
         // drives a pin enqueues; the drive lands in a later iteration.
+        //
+        // The event log records the net-state *sequence* here — changed nets
+        // only, walked in net index order — plus each sense delivery. Both are
+        // in the set `DETERMINISM.md` claims T0 already determines (resolution
+        // is pure; per-net callbacks are a `Vec` in registration order).
         for (i, net) in self.nets.iter().enumerate() {
             let changed = old.get(i).is_none_or(|prev| !same_state(prev, &net.state));
             if changed {
+                self.event_log.record(|| EngineEvent::NetResolved {
+                    net: NetId(i),
+                    state: net.state,
+                });
                 if let Some(subs) = self.sense_subs.get(&i) {
                     for callback in subs {
+                        self.event_log.record(|| EngineEvent::SenseDelivered {
+                            net: NetId(i),
+                            state: net.state,
+                        });
                         self.deliver_contained(CallbackKind::Sense, &net.name, || {
                             callback(net.state);
                         });
@@ -1292,6 +1387,8 @@ impl EngineCore {
         let mut cumulative = self.diagnostics.lock().unwrap();
         for finding in pass.findings() {
             if !cumulative.contains(finding) {
+                self.event_log
+                    .record(|| EngineEvent::Finding(finding.clone()));
                 cumulative.report(finding.clone());
             }
         }
@@ -1305,6 +1402,8 @@ impl EngineCore {
         let mut pass = Diagnostics::new();
         let specs = self.resolver.route_streams(&self.nets, &mut pass);
         self.merge_findings(&pass);
+        let epoch = self.topology_epoch;
+        self.event_log.record(|| EngineEvent::Reroute { epoch });
         self.routes = specs
             .into_iter()
             .map(|spec| {
@@ -1354,7 +1453,7 @@ impl EngineCore {
             // in write order, without ever touching the virtual clock.
             let consumers = route.consumers.clone();
             let path_roots = route.path_roots.clone();
-            self.deliver_stream_bytes(&consumers, &path_roots, &bytes);
+            self.deliver_stream_bytes(endpoint, &consumers, &path_roots, &bytes);
             return;
         }
         // Paced delivery needs the virtual clock — validated loudly here so
@@ -1428,7 +1527,7 @@ impl EngineCore {
         if let Some(deadline) = next {
             self.arm(deadline, TimerTarget::Stream(endpoint), None);
         }
-        self.deliver_stream_bytes(&consumers, &path_roots, &due);
+        self.deliver_stream_bytes(endpoint, &consumers, &path_roots, &due);
     }
 
     /// Deliver bytes to a route's consumers, gated by net resolution: a link
@@ -1437,6 +1536,7 @@ impl EngineCore {
     /// forever). Callbacks run on the engine thread with no lock held.
     fn deliver_stream_bytes(
         &mut self,
+        producer: EndpointId,
         consumers: &[EndpointId],
         path_roots: &[usize],
         bytes: &[u8],
@@ -1478,6 +1578,15 @@ impl EngineCore {
                     }
                 }
                 if let Some(subs) = self.stream_subs.get(&consumer.0) {
+                    // One record per (byte, consumer) that actually crosses —
+                    // the wire event, not the fan-out to however many callbacks
+                    // that endpoint registered. Bytes the drop policy ate above
+                    // never reach here, so the log shows what the link carried.
+                    self.event_log.record(|| EngineEvent::StreamByte {
+                        producer,
+                        consumer: *consumer,
+                        byte,
+                    });
                     for callback in subs {
                         self.deliver_contained(CallbackKind::StreamByte, &subscribers[ci], || {
                             callback(byte);
@@ -1492,7 +1601,13 @@ impl EngineCore {
     /// each so senses observe the authoritative event order.
     fn apply_ready_drives(&mut self) {
         while let Some((endpoint, drive)) = self.pending_drives.remove(&self.next_drive_seq) {
+            let seq = self.next_drive_seq;
             self.next_drive_seq += 1;
+            self.event_log.record(|| EngineEvent::DriveApplied {
+                seq,
+                endpoint,
+                drive,
+            });
             self.resolver.set_drive(endpoint, drive);
             self.resolve_and_publish();
         }
@@ -1549,6 +1664,7 @@ impl EngineCore {
             match head.target {
                 TimerTarget::Wake(component) => {
                     if let Some(callback) = self.wake_subs.get(&component.0) {
+                        self.event_log.record(|| EngineEvent::Wake { component });
                         let subscriber = format!("component {}", component.0);
                         self.deliver_contained(CallbackKind::Wake, &subscriber, || {
                             callback(now);
@@ -1608,6 +1724,8 @@ impl EngineCore {
                     .unwrap_or_else(|| format!("net {}", net.0));
                 // Deliver the current state once at registration, so e.g. a
                 // floating ~RESET is reported before any traffic.
+                self.event_log
+                    .record(|| EngineEvent::SenseDelivered { net, state });
                 self.deliver_contained(CallbackKind::Sense, &subscriber, || callback(state));
                 self.sense_subs.entry(net.0).or_default().push(callback);
             }
@@ -1739,6 +1857,7 @@ impl EngineCore {
 pub struct EngineHandle {
     link: EngineLink,
     diagnostics: Arc<Mutex<Diagnostics>>,
+    event_log: EventLog,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1747,7 +1866,9 @@ impl EngineHandle {
     /// resolution pass **and** the initial stream-routing pass run
     /// synchronously *before* the thread starts, so never-driven nets are
     /// reported and routing findings (`StreamMismatch`) are populated by the
-    /// time this returns — before any traffic.
+    /// time this returns — before any traffic. Those two passes therefore land
+    /// in `event_log` from the *calling* thread, which is still single-writer:
+    /// the engine thread does not exist yet.
     ///
     /// # Panics
     /// Panics if the OS refuses to spawn the engine thread.
@@ -1755,6 +1876,7 @@ impl EngineHandle {
         resolver: Resolver,
         nets: Vec<Net>,
         solver: Box<dyn ClusterSolver>,
+        event_log: EventLog,
     ) -> Self {
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
@@ -1794,6 +1916,7 @@ impl EngineHandle {
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
             drive_stall: None,
+            event_log: event_log.clone(),
         };
         core.resolve_and_publish();
         // Byte pipes are derived from net resolution, never installed
@@ -1814,6 +1937,7 @@ impl EngineHandle {
                 recorded_drives: None,
             },
             diagnostics,
+            event_log,
             join: Some(join),
         }
     }
@@ -1821,6 +1945,12 @@ impl EngineHandle {
     /// Cloneable client link for attaching components.
     pub(crate) fn link(&self) -> EngineLink {
         self.link.clone()
+    }
+
+    /// Handle to this engine's determinism event log (`crate::event_log`).
+    /// Reads empty when the log was never enabled.
+    pub fn event_log(&self) -> EventLog {
+        self.event_log.clone()
     }
 
     /// Most recently published state of one net.
@@ -1949,7 +2079,12 @@ mod tests {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e1 = resolver.add_endpoint(0, PinRef::new("U2", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let log = sense_log(&handle, NetId(0));
 
         // seq 1 arrives FIRST; the engine must hold it until seq 0 lands.
@@ -1997,7 +2132,12 @@ mod tests {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e1 = resolver.add_endpoint(0, PinRef::new("U2", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let log = sense_log(&handle, NetId(0));
 
         let link = handle.link();
@@ -2034,7 +2174,12 @@ mod tests {
         let e_a = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e_a2 = resolver.add_endpoint(0, PinRef::new("U3", "1"), None);
         let e_b = resolver.add_endpoint(1, PinRef::new("U2", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let link = handle.link();
 
         // Sense on net A: on High, snapshot net B (must still be un-driven —
@@ -2113,7 +2258,12 @@ mod tests {
         resolver.add_power_source(0, f64::NAN);
         resolver.add_digital_sense(0);
         let e1 = resolver.add_endpoint(1, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let rail_log = sense_log(&handle, NetId(0));
         let sig_log = sense_log(&handle, NetId(1));
 
@@ -2154,7 +2304,12 @@ mod tests {
         let mut resolver = Resolver::new(2, Dsu::new(2));
         resolver.add_power_source(0, f64::NAN);
         let e1 = resolver.add_endpoint(1, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let link = handle.link();
 
         let deliveries = Arc::new(AtomicU64::new(0));
@@ -2262,6 +2417,209 @@ mod tests {
             "agreeing source must not escalate"
         );
         assert_eq!(net_table[0].state, NetState::Driven(Level::High));
+    }
+
+    /// One recorded source list: `(volts, impedance)` per [`ClusterSource`], in
+    /// the order the resolver handed them to the solver.
+    type SourceList = Vec<(Volts, Ohms)>;
+
+    /// Accumulated source lists, one per solver call.
+    type SourceListLog = Arc<StdMutex<Vec<SourceList>>>;
+
+    /// Records the exact [`ClusterSource`] list the resolver hands the solver
+    /// — i.e. the accumulation order of `matrix[c][c] += g` / `rhs[c] += i` —
+    /// then defers to the real solver so states stay meaningful.
+    struct SourceOrderSolver {
+        seen: SourceListLog,
+    }
+
+    impl ClusterSolver for SourceOrderSolver {
+        fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
+            self.seen.lock().unwrap().push(
+                inputs
+                    .sources
+                    .iter()
+                    .map(|s| (s.volts, s.impedance))
+                    .collect(),
+            );
+            QuasiStaticMna.solve(cluster, inputs)
+        }
+    }
+
+    /// Build one conduction cluster of `drivers` agreeing push-pull drivers
+    /// (each on its own net, distinct impedances so the recorded source list
+    /// is a distinguishable permutation) plus one analog sense that forces
+    /// the cluster through the solver.
+    fn one_cluster_many_drivers(drivers: usize) -> (Resolver, Vec<Net>) {
+        let count = drivers + 1;
+        let mut resolver = Resolver::new(count, Dsu::new(count));
+        for i in 0..drivers {
+            resolver.add_endpoint(
+                i,
+                PinRef::new("U1", "1"),
+                Some(TheveninDrive {
+                    volts: 3.3,
+                    // Distinct, non-round impedances: the recorded list is
+                    // only a fingerprint of iteration order if its entries
+                    // are distinguishable.
+                    impedance: 25.0 + i as f64,
+                }),
+            );
+        }
+        // Chain every net into ONE conduction cluster. All drivers agree on
+        // level, so this is not the contention fast path.
+        for i in 0..drivers {
+            resolver.add_edge(i, i + 1, 10.0);
+        }
+        // An analog sense in a sourced cluster always escalates to the solver
+        // (`resolve`, "escalation beyond driver roots").
+        resolver.add_analog_sense(drivers);
+        (resolver, nets(count))
+    }
+
+    /// The per-cluster source list must be assembled by walking the **dense**
+    /// drive table, so its order is endpoint order and nothing else. It used
+    /// to be built by iterating `net_drivers.values()` — a `HashMap` — and
+    /// that `Vec` order is the float accumulation order inside
+    /// [`QuasiStaticMna::solve`] (`DETERMINISM.md`, "One real hash-order
+    /// defect").
+    ///
+    /// This is the *direct* regression gate for the fix: it asserts the exact
+    /// permutation rather than a downstream numeric consequence. With eight
+    /// distinguishable sources, a `HashMap` iteration order that happened to
+    /// come out ascending is a 1-in-8! (≈ 2.5e-5) fluke, so a reintroduced
+    /// hash walk fails here in-process — which bit-exactness alone cannot do
+    /// (see the sibling test).
+    #[rstest]
+    #[case::two(2)]
+    #[case::three(3)]
+    #[case::eight(8)]
+    fn cluster_sources_follow_dense_endpoint_order(#[case] drivers: usize) {
+        let seen: SourceListLog = Arc::new(StdMutex::new(Vec::new()));
+        let solver = SourceOrderSolver {
+            seen: Arc::clone(&seen),
+        };
+
+        let (mut resolver, mut net_table) = one_cluster_many_drivers(drivers);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &solver);
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the analog sense must escalate exactly one cluster; got {recorded:?}"
+        );
+        let expected: SourceList = (0..drivers).map(|i| (3.3, 25.0 + i as f64)).collect();
+        assert_eq!(
+            recorded[0], expected,
+            "cluster sources must arrive in dense endpoint order, not hash order"
+        );
+    }
+
+    /// The numeric consequence of the ordering fix: a cluster whose sources
+    /// **share one MNA supernode** solves to a **bit-identical** node voltage
+    /// across many repeated resolutions.
+    ///
+    /// Two things about this are worth recording, because both correct a
+    /// prediction in `DETERMINISM.md`:
+    ///
+    /// 1. **The defect needed sources on the same supernode**, not merely two
+    ///    sources in a cluster. Order only reaches a float through the
+    ///    accumulations `matrix[c][c] += g` / `rhs[c] += i`
+    ///    ([`QuasiStaticMna::solve`]), so it takes ≥ 2 sources on distinct
+    ///    identity roots that a **0 Ω conduction edge** merges into one
+    ///    supernode — which is exactly this topology. Sources on separate
+    ///    supernodes each stamp their own diagonal and cannot disagree.
+    /// 2. **In-process repetition does catch it.** The doc predicted it could
+    ///    not, on the theory that one process shares one `HashMap` seed. That
+    ///    is not how `std` behaves: `RandomState::new` bumps its thread-local
+    ///    key on *every* `HashMap::new`, and `resolve` builds a fresh
+    ///    `net_drivers` map per call — so the iteration order varied per pass,
+    ///    and this test failed 12/12 processes with the defect in place
+    ///    (observed spread: 4 distinct bit patterns, ~4 ULP around
+    ///    2.894382877392857 V). Multi-process comparison stays worthwhile for
+    ///    hash order held in a *long-lived* map and for cross-architecture
+    ///    float differences, but it is not the only net that catches this.
+    #[rstest]
+    fn repeated_resolutions_of_a_multi_source_cluster_are_bit_identical() {
+        // Six agreeing drivers at awkward (volts, Ω), each on its own net,
+        // all merged into ONE supernode by 0 Ω edges — so every driver's
+        // Norton conductance and injection accumulate into the same
+        // `matrix[c][c]` / `rhs[c]`. A 0 V rail 37 Ω away escalates the
+        // cluster, and the solved voltage has a full mantissa to disagree in.
+        let build = || {
+            let mut resolver = Resolver::new(7, Dsu::new(7));
+            let drivers = [
+                (3.31, 23.7),
+                (3.29, 31.1),
+                (3.27, 47.3),
+                (3.33, 19.9),
+                (3.19, 29.3),
+                (3.23, 41.7),
+            ];
+            for (i, (volts, impedance)) in drivers.into_iter().enumerate() {
+                resolver.add_endpoint(
+                    i,
+                    PinRef::new("U1", "1"),
+                    Some(TheveninDrive { volts, impedance }),
+                );
+            }
+            for i in 0..5 {
+                resolver.add_edge(i, i + 1, 0.0);
+            }
+            resolver.add_edge(5, 6, 37.0);
+            resolver.add_power_source(6, 0.0);
+            (resolver, nets(7))
+        };
+
+        let sources_seen: SourceListLog = Arc::new(StdMutex::new(Vec::new()));
+        let solver = SourceOrderSolver {
+            seen: Arc::clone(&sources_seen),
+        };
+
+        let mut first: Option<Volts> = None;
+        for pass in 0..64 {
+            let (mut resolver, mut net_table) = build();
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &solver);
+            let NetState::Analog(volts) = net_table[0].state else {
+                panic!(
+                    "pass {pass}: the cluster must solve numerically, got {:?}",
+                    net_table[0].state
+                );
+            };
+            match first {
+                None => first = Some(volts),
+                Some(expected) => assert!(
+                    volts.total_cmp(&expected).is_eq(),
+                    "pass {pass}: node voltage drifted from {expected:?} to {volts:?} \
+                     — resolution is not a pure function of the drive table"
+                ),
+            }
+        }
+
+        // Not vacuous: every pass really did put ≥ 2 sources through the
+        // solver, in dense endpoint order. Without this the test could pass on
+        // a topology that never escalates, or one whose cluster carries a
+        // single source (no accumulation order to get wrong).
+        let recorded = sources_seen.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 64, "every pass must escalate exactly once");
+        let expected: SourceList = vec![
+            (3.31, 23.7),
+            (3.29, 31.1),
+            (3.27, 47.3),
+            (3.33, 19.9),
+            (3.19, 29.3),
+            (3.23, 41.7),
+            (0.0, 0.0), // the ideal rail, appended after the drivers
+        ];
+        for (pass, sources) in recorded.iter().enumerate() {
+            assert_eq!(
+                *sources, expected,
+                "pass {pass}: source order must be dense endpoint order"
+            );
+        }
     }
 
     /// A `net_stuck` fault fighting a power rail on the SAME root is two
@@ -2376,6 +2734,7 @@ mod tests {
             Resolver::new(0, Dsu::new(0)),
             Vec::new(),
             Box::new(QuasiStaticMna),
+            EventLog::disabled(),
         )
     }
 
@@ -2498,7 +2857,12 @@ mod tests {
         virtual_clock::init(1.0, 1_000_000);
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let log = wake_log(&handle, ComponentId(0));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2536,7 +2900,12 @@ mod tests {
     fn missing_drive_seq_is_skipped_after_a_bounded_wait() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let link = handle.link();
 
         // Reserve seq 0 and "die" before sending it; seq 1 arrives normally.
@@ -2573,7 +2942,12 @@ mod tests {
     fn sense_callback_panic_is_contained_and_reported() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
         let link = handle.link();
 
         link.send(Command::RegisterSense {
@@ -2738,7 +3112,12 @@ mod tests {
         resolver.add_edge(0, 1, 47.0);
         resolver.add_stream_pin(p, 0, producer(300), PinRef::new("U1", "15"));
         resolver.add_stream_pin(c, 1, consumer(300), PinRef::new("U2", "16"));
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+        );
 
         // One write larger than the cap: the excess sheds, loudly.
         handle.link().send(Command::StreamWrite {
