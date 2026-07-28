@@ -1,8 +1,11 @@
 # Deterministic execution mode
 
-**Status:** design only, nothing implemented (2026-07-26). Companion to
-[`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
-[`CONTRACT.md`](CONTRACT.md).
+**Status:** **Phase D0 implemented** (hygiene: hash-order fix, the `wait_*`
+chokepoint, the engine event log, the review rule); D1–D3 design only. Companion
+to [`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
+[`CONTRACT.md`](CONTRACT.md) ("Waiting"). What D0 shipped, and the two
+predictions below it corrected, are in
+[Recommendation and phasing](#recommendation-and-phasing).
 
 The requirement this document answers is a consumer's, stated plainly: *"once
 it's all connected the SIL model runs deterministically."* Today it does not,
@@ -62,7 +65,8 @@ is real, but it is not the class of bug this machine's SIL suite is hunting.
 - **Net resolution is pure.** `Resolver::resolve` is a function of (identity
   merges, conduction edges, the drive table, power/stuck sources, sense
   registrations). It contains no clock read and no I/O.
-- **Hash-order hygiene is mostly already right.** `resolve` sorts everywhere
+- **Hash-order hygiene is mostly already right** — and fully right as of D0.
+  `resolve` sorts everywhere
   iteration order could reach an outcome (`driver_roots.sort_unstable()`,
   `fighting.sort_unstable()`, `extra_clusters.sort_unstable()`), and the
   engine's `HashMap` fields (`sense_subs`, `wake_subs`, `routes`,
@@ -80,6 +84,10 @@ is real, but it is not the class of bug this machine's SIL suite is hunting.
   path.
 
 ### One real hash-order defect, worth fixing regardless of tier
+
+**Fixed in Phase D0** — the analysis below is the original one; see
+[What D0 measured](#what-d0-measured) for the two ways reality was narrower and
+worse than predicted.
 
 `Resolver::resolve` builds the per-cluster source list by iterating a `HashMap`:
 
@@ -132,13 +140,24 @@ numeric output.
   `DRIVE_SEQ_STALL_TIMEOUT` (`Instant::now`) in `check_drive_stall`;
   `Serial::receive_data_timeout`'s `Instant`-based deadline plus its 100 µs
   `EAGAIN` sleep; `poll_loop`'s 500 ms warm-up sleep.
-- **Real sleeps standing in for virtual waits** — 9 sites:
-  `peripherals/src/timer.rs` (`wait_ms`, `wait_us`),
-  `peripherals/src/serial.rs` (`pace_bytes`, two timeout paths, the EAGAIN
-  poll), `peripherals/src/pulse_out.rs` (`sleep_virtual_us`),
+- **Real sleeps standing in for virtual waits** — **12 sites** (count verified
+  at D0; an earlier draft said 9):
+  `peripherals/src/serial.rs` ×4 (`pace_bytes`, two timeout guard paths, the
+  EAGAIN poll), `peripherals/src/timer.rs` ×2 (`wait_ms`, `wait_us`),
+  `tools/trace/src/recorder.rs` ×2 (the 500 ms warm-up, the poll cadence),
+  `peripherals/src/pulse_out.rs` (`sleep_virtual_us`),
   `platforms/p2/src/ffi.rs` (`HAL_serial_recieveDataTimeout` guard path),
   `models/src/ads122u04.rs` and `models/src/ads122u04_component.rs` (poll
-  cadence), `tools/trace/src/recorder.rs`.
+  cadence).
+
+  **Phase D0 converted all 12.** Every one now goes through
+  `virtual_clock::wait_until` / `wait_virtual_us` / `wait_wall_us`, with a single
+  `thread::sleep` behind them in `core/src/virtual_clock.rs`. Two of the twelve
+  were wall waits by nature and are now *named* as such (`wait_wall_us`): the
+  serial EAGAIN retry interval and the trace poller's warm-up. Both are on this
+  "not determined" list on purpose — D1 must virtualize them deliberately, and
+  naming them means it will find them instead of discovering them as a
+  stepped-mode hang.
 
 The practical shape of T0: a scenario *usually* produces the same outcome and
 flakes when a threshold sits near a timing boundary. `TESTING.md` rule 4
@@ -312,10 +331,29 @@ that answer it:
 
 The cheapest path to T1 is a **behavior-preserving refactor first**: introduce
 `virtual_clock::wait_until` whose free-running implementation is exactly
-today's `sleep(virtual_to_wall_us(d))`, then mechanically convert all 9 sleep
+today's `sleep(virtual_to_wall_us(d))`, then mechanically convert all sleep
 sites. Nothing changes observably, every wait becomes mode-agnostic, and
 stepped mode afterwards is a new implementation behind calls that already exist
 — not a rewrite spread across five crates.
+
+**Done in Phase D0.** The lever turned out to need three entry points rather
+than one, because most call sites hold a *duration* rather than a deadline and
+two hold neither:
+
+- `wait_until(deadline_v_us)` — the absolute form, and the one D1 swaps. Used
+  where the site really has a deadline (`Serial::pace_bytes`'s reserved wire
+  slot).
+- `wait_virtual_us(d_us)` — the relative form, `wait_until(now + d)` in stepped
+  mode. Needs no clock origin, which is what let the `HAL_time_wait*` path stay
+  safe before `init`.
+- `wait_wall_us(d_us)` — explicitly *not* virtual, for the two waits that track
+  host time. Converting these silently would have changed behavior under a
+  non-1.0 scale; naming them keeps free-running byte-identical **and** leaves D1
+  a grep-able list.
+
+All three funnel into one private `park_wall_us`, the only `thread::sleep` in
+the workspace outside tests. `CONTRACT.md` ("Waiting") makes this binding on
+platform crates.
 
 ## T2: whole-system schedule determinism (sketch)
 
@@ -403,6 +441,12 @@ new and one existing.
 
 ### Oracle 1 (new, and the real one): the engine event log
 
+**Implemented in Phase D0** as `board/src/event_log.rs`, enabled with
+`System::event_log()` and read back with `SystemHandle::event_log()`. The
+normalization spec below is implemented verbatim by
+`EngineEventRecord::normalized`; `normalized_shape` is the same line without
+`v_us`, which is the projection free-running mode can actually be held to.
+
 An append-only, opt-in sink on the engine — `Diagnostics`-shaped, emitted from
 the engine thread so it is totally ordered by construction:
 
@@ -450,15 +494,24 @@ needs normalization before it can be compared.
 ### Tests
 
 - **N-run identity** — `board/tests/determinism.rs` (its own binary, per
-  `TESTING.md` rule 5, because it initializes the clock in stepped mode). Run
-  the same `System` + `Scenario` N = 5 times in-process, `assert_eq!` the event
-  logs. `#[rstest]` cases over a scenario matrix: nominal, `pin_detach` on
-  AVDD, `stream_drop(EveryNth(3))`, crossed-TX/RX harness, jumper open/closed.
-- **Multi-process identity** — in-process repetition shares one `HashMap` seed,
-  so it *cannot* catch hash-order nondeterminism (exactly the
-  `cluster_sources` defect above). CI must run the binary N times as separate
-  processes. Keep this even after the `BTreeMap`/sorted-iteration hygiene fixes:
-  it is the backstop that proves the hygiene.
+  `TESTING.md` rule 5). Run the same `System` + `Scenario` N = 5 times
+  in-process and compare the normalized event logs. `#[rstest]` cases over a
+  scenario matrix: nominal, `pin_detach` on AVDD, `stream_drop(EveryNth(3))`,
+  crossed-TX/RX harness, jumper open/closed.
+
+  **Landed at D0 as an observational suite** (four cases: nominal analog
+  cluster, `net_stuck`, paced stream, `stream_drop(EveryNth(3))`). Free-running
+  mode cannot yet be held to full identity, so the binary *asserts* the
+  timestamp-free projection — the order T0 already determines — and *reports*
+  the timestamped divergence with numbers. It also carries its own
+  anti-vacuity guards: an empty log fails, and the comparator is checked
+  against reordered/truncated/mutated synthetic logs. D1 turns the reported
+  divergence into an assertion and adds the remaining matrix cases.
+- **Multi-process identity** — CI must run the binary N times as separate
+  processes. (The original rationale — "in-process repetition shares one
+  `HashMap` seed, so it cannot catch hash-order nondeterminism" — is wrong; see
+  [What D0 measured](#what-d0-measured). It remains worth building for hash
+  order held in long-lived maps and for cross-architecture float differences.)
 - **Golden traces** — `board/tests/fixtures/traces/*.jsonl`, normalized as
   above, for a handful of canonical scenarios; compare, and rewrite under
   `EMBSIM_BLESS=1`. This turns "did this firmware/model change alter the wire
@@ -485,13 +538,18 @@ data instead of speculation.
 
 Four phases, each independently shippable and CI-gated. **Do not start at T1.**
 
-- **Phase D0 — determinism hygiene (do now, no new mode).** (a) Fix the
-  `cluster_sources` hash-order defect. (b) Introduce `wait_until` and
-  mechanically convert all 12 non-test sleep sites (peripherals/src/serial.rs x4, peripherals/src/timer.rs x2, tools/trace/src/recorder.rs x2, peripherals/src/pulse_out.rs, platforms/p2/src/ffi.rs, models/src/ads122u04.rs, models/src/ads122u04_component.rs) — behavior-preserving. (c) Land the
-  engine `EventLog` and the N-run comparison test *in free-running mode as an
-  observational test* so the baseline is measured rather than guessed. (d) Add
-  a review rule: no `HashMap`/`HashSet` iteration on an engine path without a
-  sort. Cheap, no behavior change, and it turns T1 from a rewrite into a swap.
+- **Phase D0 — determinism hygiene. ✅ DONE.** Landed: the `cluster_sources`
+  hash-order fix (dense drive-table walk) with an exact source-order regression
+  gate; `virtual_clock::{wait_until, wait_virtual_us, wait_wall_us}` as the
+  single wait chokepoint, with all 12 non-test sleep sites converted
+  behavior-preservingly; the opt-in engine `EventLog` (Oracle 1) with its
+  normalization contract and an **observational** N-run comparison in
+  `board/tests/determinism.rs` that asserts the T0-determined event *order* and
+  reports the timestamp divergence; and the no-unordered-iteration review rule
+  (below) with the engine/resolver/cluster/routing paths audited clean. No new
+  clock mode, no behavior change — T1 is now a swap rather than a rewrite. See
+  [What D0 measured](#what-d0-measured) for the two predictions in this document
+  that the implementation corrected.
 - **Phase D1 — T1 for the board and models.** Stepped clock mode, engine as
   time authority, actor registry, models moved onto engine wakeups.
   **Deliberately defer the serial queue transport:** first prove determinism
@@ -510,6 +568,85 @@ Four phases, each independently shippable and CI-gated. **Do not start at T1.**
   layer or a static queue. Record the virtual-cost decision (T2 §3) before
   writing code.
 - **Never — T3.** Instruction-level lockstep.
+
+### D0 review rule: no unordered iteration on an engine path
+
+**Never iterate a `HashMap` or `HashSet` on an engine path without an explicit
+sort.** In force as of Phase D0; enforced by review and by grep, not by the
+compiler. Three sanctioned shapes:
+
+1. **Dense index** — walk the `Vec` (`slots`, `streams`, `nets`, `0..n`) and use
+   the map only for keyed lookups. Preferred: no sort needed, and the resulting
+   order means something.
+2. **Explicit sort** — `collect()` the keys, `sort_unstable()`, iterate.
+3. **Membership only** — a set used purely as a dedup gate or a `contains`/`len`
+   test, never iterated into an output. Every such site carries an inline
+   `// hash-order: …` comment stating why order cannot escape.
+
+The rule is stricter than "sort your maps" for a reason the audit turned up:
+`std::collections::hash_map::RandomState::new` re-keys on **every map
+construction**, not once per process, so a map built inside a per-call function
+has a *different* iteration order on every call. Unordered iteration is
+therefore not merely irreproducible across processes — it is irreproducible
+within one.
+
+Audited at D0 across `engine.rs`, `cluster.rs`, `system.rs`, and the
+stream-routing path: one real violation (`cluster_sources`, fixed), ten
+membership/sorted sites annotated, and one deliberate non-engine exemption
+(`PartRegistry`'s `fmt::Debug`, which no decision reads). `BOARD_ENGINE.md`
+carries the summary; `engine.rs`'s module docs carry the enforceable form.
+
+### What D0 measured
+
+Implementing D0 corrected two claims made above. Both are left in place in
+their original sections so the reasoning is still readable; this is the
+correction.
+
+1. **The `cluster_sources` defect needed sources on the same MNA supernode**,
+   not merely "a cluster with two or more driver sources". Source order reaches a
+   float only through `matrix[c][c] += g` / `rhs[c] += i`, so it takes ≥ 2
+   sources whose nodes the solver merges into one supernode — distinct identity
+   roots (hence distinct `net_drivers` keys) joined by a **0 Ω conduction
+   edge**. Sources on separate supernodes each stamp their own diagonal and
+   cannot disagree; several drivers on one *identity root* land under a single
+   `HashMap` key and so were already walked in dense order. Reproduced with six
+   drivers on six 0 Ω-merged nets: 12/12 processes disagreed, spread across 4
+   distinct bit patterns ≈ 4 ULP around 2.894 382 877 392 857 V.
+2. **"In-process repetition cannot catch hash-order nondeterminism" was wrong**
+   (see "Multi-process identity"). `resolve` builds `net_drivers` fresh per
+   call, and `RandomState::new` re-keys per construction, so repeated
+   resolutions in one process already varied — the bit-exactness test failed
+   12/12 processes with the defect in place. Multi-process comparison is still
+   worth building for D1, but for *long-lived* maps (`EngineCore`'s fields) and
+   for cross-architecture float differences, not as the only net under this
+   class of bug.
+
+The measured free-running baseline, from `board/tests/determinism.rs` (N = 5 runs
+per scenario, clock re-anchored per run):
+
+| scenario | records/run | order identical | timestamped logs identical | final `v_us` spread |
+|---|---|---|---|---|
+| nominal analog cluster | 63 | 5/5 | 0/4 | 20–45 ms |
+| `net_stuck` on the shared node | 65 | 5/5 | 0/4 | 19–48 ms |
+| paced stream, 16 bytes | 18 | 5/5 | 0/4 | 11–58 ms |
+| paced stream, `stream_drop(EveryNth(3))` | 12 | 5/5 | 0/4 | 9–34 ms |
+
+The record counts and the order columns were **identical across three repeats
+of the whole suite and across separate processes**; only the `v_us` spread
+moved, and it moves with host load — which is the definition of the problem.
+
+Read that as: **the order is already fully reproducible for scenarios with a
+single-threaded stimulus and no periodic timers; every timestamp is not.** The
+first timestamp divergence is at record 0 in every case — sampled wall time
+differs from the very first event, so there is no prefix of agreement to erode.
+Phase D1 is what turns the third column into 5/5 and the last into 0.
+
+Two caveats on the numbers, so they are not over-read. The scenarios drive pins
+from the *test* thread precisely to remove the racing `next_drive_seq`
+`fetch_add`, which "Not determined" correctly names as the reason T1 needs actor
+scheduling; a multi-threaded stimulus is not expected to hold this order, and
+D0 does not claim it does. And they use no periodic timers, whose *fire count*
+is wall-dependent and therefore changes the record count run to run.
 
 ### What the consumer actually gets, per tier
 

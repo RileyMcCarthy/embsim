@@ -11,6 +11,10 @@ cargo test --workspace --all-targets
 cargo test --workspace --doc
 cargo test -p embsim-trace --no-default-features   # headless recorder path
 cargo test -p embsim-peripherals -p embsim-board --release   # timing-sensitive smoke
+
+# Determinism baseline (Oracle 1). `--nocapture` prints the measured
+# free-running divergence per scenario; see rule 8 below.
+cargo test -p embsim-board --test determinism -- --nocapture
 ```
 
 Per-crate iteration:
@@ -65,13 +69,24 @@ cargo llvm-cov --workspace --summary-only
 
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`
-   binary (see `clock_guard.rs`).
+   binary (see `clock_guard.rs`). The same applies in reverse to cases that
+   *re-anchor* the clock between runs: `determinism.rs` calls
+   `virtual_clock::init` before every run of its N-run matrix, so it must not
+   share a process with cases that assume a monotonically accumulating clock.
 
 6. **Property tests (`proptest`)** only for continuous domains (e.g. MNA
    resistor ladders). Use fixed seeds when non-determinism would flake CI.
 
 7. **Strengthen, don't weaken.** Rewrites and refactors must keep or tighten
    existing assertions.
+
+8. **Determinism suites report what they cannot yet assert.** `determinism.rs`
+   compares N normalized engine event logs. In free-running mode it asserts the
+   event *order* (what `DETERMINISM.md` T0 lists as determined) and **prints**
+   the timestamp divergence rather than failing on wall-clock jitter — the
+   baseline is measured, not guessed. A suite that reports must still be unable
+   to pass vacuously: `determinism.rs` fails on an empty log and checks its own
+   comparator against reordered/truncated/mutated synthetic logs.
 
 ## What each layer should cover
 

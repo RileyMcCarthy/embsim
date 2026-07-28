@@ -65,8 +65,23 @@ atomic, and wakeup timestamps are sampled from wall time. A stepped
 discrete-event clock mode, what "quiescent" would have to mean with pump threads
 and real fds in the picture, what extending determinism across the
 firmware↔engine boundary would cost, and how CI would prove any of it are
-specified separately in [`DETERMINISM.md`](DETERMINISM.md) — design only;
-nothing in *this* document changes yet.
+specified separately in [`DETERMINISM.md`](DETERMINISM.md).
+
+Two engine rules from that document are **in force today** (Phase D0), and both
+are enforced by review rather than by the compiler:
+
+- **No `HashMap`/`HashSet` iteration on an engine path without an explicit
+  sort.** Walk a dense `Vec` and use the map for keyed lookups, or collect and
+  `sort_unstable()`. A set used purely as a membership/dedup gate is fine and
+  carries an inline `// hash-order: …` note saying why order cannot escape. The
+  rule exists because `std`'s hasher is randomly seeded *per map construction*,
+  so an unordered walk that reaches a float accumulation makes the engine
+  irreproducible in a way that looks like a last-bit rounding difference. See
+  `engine.rs`'s module docs for the sanctioned shapes.
+- **The engine's event order is observable**: `System::event_log()` turns on an
+  append-only transcript of drives, resolutions, sense deliveries, wakeups,
+  stream bytes, reroutes, and findings, with a normalization contract for
+  comparing runs (`board/src/event_log.rs`). Off by default.
 
 ## Core abstractions
 

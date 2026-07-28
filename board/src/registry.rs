@@ -121,6 +121,12 @@ pub struct PartRegistry {
 }
 
 impl fmt::Debug for PartRegistry {
+    /// hash-order: these three are the only unordered iterations left in the
+    /// crate, and they are **not** on an engine path — `Debug` output for a
+    /// human, reached by no resolution, routing, or classification decision
+    /// (lookups all go through `get`). Sorting them would only be cosmetic, so
+    /// the exemption is recorded here rather than paid for. See the review rule
+    /// in `crate::engine`'s module docs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PartRegistry")
             .field(
