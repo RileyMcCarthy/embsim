@@ -37,6 +37,26 @@ Every trampoline must **null/range-guard its arguments** before delegating to th
 generic peripheral (the peripherals also guard, but the platform layer is the
 ABI boundary). See [`platforms/p2/src/ffi.rs`](platforms/p2/src/ffi.rs) for the reference pattern.
 
+## Waiting: never `thread::sleep`
+
+A trampoline (and the generic peripheral behind it) must **never call
+`std::thread::sleep` directly**. Every wait goes through
+`embsim_core::virtual_clock`:
+
+| call | use for |
+|---|---|
+| `wait_until(deadline_v_us)` | an absolute virtual deadline the caller already holds (a reserved wire slot) |
+| `wait_virtual_us(d_us)` | a relative span of virtual time (`HAL_time_waitMs`/`waitUs`, a receive timeout, a poll cadence) |
+| `wait_wall_us(d_us)` | a wait that is real time **by nature** — the retry interval of a spin on a host fd, a startup warm-up |
+
+Two reasons this is a contract and not a style preference. A raw sleep ignores
+the emulator's time scale, so `--speed 50` silently stops applying to whatever
+the trampoline waits on. And the virtual forms are the single seam
+[`DETERMINISM.md`](DETERMINISM.md) Phase D1 replaces to park callers on a
+stepped clock — a direct sleep is invisible to that swap and becomes a
+stepped-mode hang. Reach for `wait_wall_us` only when the wait genuinely tracks
+host time, and say so in a comment; D1 revisits exactly those sites.
+
 ## Required symbol domains
 
 A platform must provide all symbols its firmware references. For the reference

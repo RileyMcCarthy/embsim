@@ -4,9 +4,31 @@
 //! At 1x: virtual time == wall time
 //! At 5x: virtual time advances 5x faster (waits are 5x shorter)
 //! At 0.5x: virtual time advances 0.5x (waits are 2x longer)
+//!
+//! # Waiting
+//!
+//! Nothing outside this module may call [`std::thread::sleep`] to serve a
+//! *simulated* wait. Every wait in the workspace goes through one of three
+//! functions here, and one private `park_wall_us` is the only place that
+//! actually sleeps:
+//!
+//! | call | meaning |
+//! |---|---|
+//! | [`wait_until`] | park until virtual time reaches an absolute deadline |
+//! | [`wait_virtual_us`] | park for a *relative* span of virtual time |
+//! | [`wait_wall_us`] | park for real time — deliberately **not** virtual |
+//!
+//! This is the migration lever for `DETERMINISM.md` Phase D1: a stepped clock
+//! replaces the bodies of the first two (register a deadline, mark the caller
+//! parked, block until the scheduler advances) without touching a single call
+//! site. [`wait_wall_us`] marks the waits that are wall-clock *by nature* —
+//! fd-poll retry cadence, a startup warm-up — which D1 must revisit
+//! deliberately as a semantic change, not sweep up by accident. See
+//! `DETERMINISM.md`, "T1 §5 Migration lever" and "Wall-clock deadlines inside
+//! the simulation".
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Global virtual clock state.
 static SCALE_NUMER: AtomicU64 = AtomicU64::new(1);
@@ -83,6 +105,65 @@ pub fn virtual_to_wall_us(virtual_wait_us: u64) -> u64 {
 /// Get the simulated clock frequency.
 pub fn clock_freq() -> u32 {
     CLOCK_FREQ.load(Ordering::Relaxed)
+}
+
+// ============================================================
+// Waiting — the single chokepoint between virtual and wall time
+// ============================================================
+
+/// Park the caller for `wall_us` of **real** time. The only `thread::sleep`
+/// serving a simulated wait in the workspace; a zero wait never sleeps.
+fn park_wall_us(wall_us: u64) {
+    if wall_us > 0 {
+        std::thread::sleep(Duration::from_micros(wall_us));
+    }
+}
+
+/// Park the caller for `d_us` of **virtual** time (a relative wait).
+///
+/// Free-running: the scaled wall equivalent, i.e. exactly
+/// `sleep(virtual_to_wall_us(d_us))`. Needs no clock origin, so it is safe
+/// before [`init`] — a wait span is pure scale arithmetic, unlike
+/// [`wait_until`], which must read the current time.
+///
+/// This is the sibling of [`wait_until`] for the many call sites that know how
+/// long to wait but not *when* they started (`HAL_time_waitUs`, a poll
+/// cadence, a receive timeout). In `DETERMINISM.md` Phase D1 it becomes
+/// `wait_until(virtual_us() + d_us)` against the stepped clock.
+pub fn wait_virtual_us(d_us: u64) {
+    park_wall_us(virtual_to_wall_us(d_us));
+}
+
+/// Park the caller until virtual time reaches the absolute deadline
+/// `deadline_v_us`. Returns immediately when the deadline has already passed.
+///
+/// This is the form `DETERMINISM.md` Phase D1 swaps out: in stepped mode it
+/// registers a pending deadline, marks the caller parked, and blocks until the
+/// scheduler advances virtual time to it. Prefer it wherever the call site
+/// genuinely holds a deadline (a reserved wire slot, a scheduled edge) rather
+/// than a duration — an absolute deadline cannot drift, and it is the only
+/// form a discrete-event scheduler can serve.
+///
+/// # Panics
+/// Panics if [`init`] has not run — reading "now" requires the clock origin.
+/// Callers that must survive an uninitialized clock check
+/// [`is_initialized`] first, or use [`wait_virtual_us`].
+pub fn wait_until(deadline_v_us: u64) {
+    let now = virtual_us();
+    wait_virtual_us(deadline_v_us.saturating_sub(now));
+}
+
+/// Park the caller for `d_us` of **real** time, bypassing the virtual clock.
+///
+/// Reserved for waits that are wall-clock by nature and must stay that way in
+/// free-running mode: the retry cadence of a spin on a real file descriptor,
+/// and a fixed startup warm-up. These are the sites `DETERMINISM.md` (T1 §4,
+/// "Wall-clock deadlines inside the simulation") says must *become* virtual —
+/// naming them here means D1 can find them, rather than discovering them as a
+/// stepped-mode hang. Do not reach for this for anything the simulation's
+/// timing depends on; use [`wait_until`] or [`wait_virtual_us`].
+pub fn wait_wall_us(d_us: u64) {
+    park_wall_us(d_us);
 }
 
 /// Get virtual cycle count (`virtual_us * clock_freq / 1_000_000`).
@@ -269,6 +350,94 @@ mod tests {
             grew,
             "cycles should rise above zero as virtual time advances"
         );
+    }
+
+    /// [`wait_virtual_us`] is exactly the old inline
+    /// `sleep(virtual_to_wall_us(d))` shape it replaced: a zero span never
+    /// sleeps, and a non-zero span parks for at least the scaled wall
+    /// equivalent. Only the lower bound is asserted — a host may always
+    /// oversleep (`TESTING.md` rule 4).
+    #[rstest]
+    #[case::zero_at_1x(1.0, 0)]
+    #[case::zero_at_10x(10.0, 0)]
+    #[case::span_at_1x(1.0, 2_000)]
+    #[case::span_at_10x(10.0, 20_000)]
+    fn wait_virtual_us_parks_for_the_scaled_wall_equivalent(
+        #[case] scale: f64,
+        #[case] span_v_us: u64,
+    ) {
+        let _g = lock_or_recover();
+        init(scale, 1_000_000);
+        let expected_wall = virtual_to_wall_us(span_v_us);
+        let start = Instant::now();
+        wait_virtual_us(span_v_us);
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        assert!(
+            elapsed_us + 1_000 >= expected_wall,
+            "{scale}x: {span_v_us} virtual µs should park ~{expected_wall} wall µs, \
+             parked {elapsed_us}"
+        );
+        init(1.0, 1_000_000);
+    }
+
+    /// [`wait_virtual_us`] needs no clock origin (it is pure scale
+    /// arithmetic), which is why the sites that only know a *duration* — the
+    /// `HAL_time_wait*` trampolines, a receive timeout — use it rather than
+    /// [`wait_until`]. Asserted as a zero-span no-op so the case is cheap
+    /// whether or not a sibling test already ran `init` in this process.
+    #[rstest]
+    fn wait_virtual_us_needs_no_clock_origin() {
+        let _g = lock_or_recover();
+        wait_virtual_us(0);
+    }
+
+    /// [`wait_until`] treats its argument as an absolute deadline: a deadline
+    /// already in the past returns immediately (never a negative wait that
+    /// wraps into a very long sleep), and a future deadline parks until virtual
+    /// time reaches it.
+    #[rstest]
+    fn wait_until_is_an_absolute_deadline_and_never_wraps() {
+        let _g = lock_or_recover();
+        init(1.0, 1_000_000);
+
+        // Past deadline: immediate. `saturating_sub` is what makes this safe.
+        let start = Instant::now();
+        wait_until(0);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "a past deadline must return immediately, took {:?}",
+            start.elapsed()
+        );
+
+        // Future deadline: virtual time has passed it on return.
+        let deadline = virtual_us() + 2_000;
+        wait_until(deadline);
+        assert!(
+            virtual_us() >= deadline,
+            "wait_until must not return before its deadline"
+        );
+    }
+
+    /// [`wait_wall_us`] is deliberately unscaled — that is its whole reason to
+    /// exist. At 10x a 2 ms *wall* wait still takes ~2 ms, where the same span
+    /// through [`wait_virtual_us`] would take ~0.2 ms.
+    #[rstest]
+    fn wait_wall_us_ignores_the_time_scale() {
+        let _g = lock_or_recover();
+        init(10.0, 1_000_000);
+        let start = Instant::now();
+        wait_wall_us(2_000);
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        assert!(
+            elapsed_us + 500 >= 2_000,
+            "a wall wait must not be divided by the 10x scale, parked {elapsed_us} µs"
+        );
+        assert_eq!(
+            virtual_to_wall_us(2_000),
+            200,
+            "the same span as a VIRTUAL wait would have been 200 wall µs"
+        );
+        init(1.0, 1_000_000);
     }
 
     /// Re-`init` re-anchors the boot offset, so virtual time restarts near zero.

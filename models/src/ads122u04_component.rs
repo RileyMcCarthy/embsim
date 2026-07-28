@@ -60,7 +60,6 @@ use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use embsim_board::component::StreamTx;
 use embsim_board::{
@@ -415,13 +414,15 @@ fn pump_loop(fd: &OwnedFd, tx: &StreamTx, gate: &Gate, shutdown: &AtomicBool) {
                 break;
             }
         }
-        let wall_us = if virtual_clock::is_initialized() {
-            virtual_clock::virtual_to_wall_us(PUMP_POLL_VIRTUAL_US)
+        // Poll cadence: virtual when there is a clock to scale against, a
+        // fixed wall fallback otherwise (this pump can outlive an emulator
+        // teardown). Both go through the clock's wait chokepoint so Phase D1
+        // can move the pump onto the engine wheel from one place
+        // (`DETERMINISM.md` T1 §4).
+        if virtual_clock::is_initialized() {
+            virtual_clock::wait_virtual_us(PUMP_POLL_VIRTUAL_US);
         } else {
-            PUMP_POLL_FALLBACK_WALL_US
-        };
-        if wall_us > 0 {
-            std::thread::sleep(Duration::from_micros(wall_us));
+            virtual_clock::wait_wall_us(PUMP_POLL_FALLBACK_WALL_US);
         }
     }
 }

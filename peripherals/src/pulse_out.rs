@@ -371,11 +371,13 @@ fn register<F: ?Sized>(slot: &Mutex<Vec<Option<Box<F>>>>, channel: usize, cb: Bo
     cbs[channel] = Some(cb);
 }
 
+/// Park the pulse-train thread for one span of virtual time.
+///
+/// Thin alias for [`embsim_core::virtual_clock::wait_virtual_us`] — kept so
+/// the pulse-train loop reads in its own vocabulary, but the wait itself lives
+/// in the clock's single chokepoint (`DETERMINISM.md` T1 §5).
 fn sleep_virtual_us(virtual_us: u64) {
-    let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(virtual_us);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    embsim_core::virtual_clock::wait_virtual_us(virtual_us);
 }
 
 // ============================================================

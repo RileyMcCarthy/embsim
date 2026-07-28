@@ -20,18 +20,12 @@ pub fn get_us() -> u32 {
 
 /// Blocking wait for specified virtual milliseconds.
 pub fn wait_ms(ms: u32) {
-    let wall_us = virtual_clock::virtual_to_wall_us(ms as u64 * 1000);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    virtual_clock::wait_virtual_us(ms as u64 * 1000);
 }
 
 /// Blocking wait for specified virtual microseconds.
 pub fn wait_us(us: u32) {
-    let wall_us = virtual_clock::virtual_to_wall_us(us as u64);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    virtual_clock::wait_virtual_us(us as u64);
 }
 
 /// Get raw virtual cycle counter value (`virtual_us * clock_freq / 1_000_000`,

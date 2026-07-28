@@ -283,11 +283,10 @@ fn protocol_loop(adc: &Ads122u04) {
         // Sleep briefly to avoid busy-looping. Must be substantially finer than
         // the configured conversion interval so we don't miss the 1000 SPS edge
         // (1 ms period). 250 µs gives at least 4× oversample at the fastest
-        // non-turbo rate the firmware supports.
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(250);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        // non-turbo rate the firmware supports. The cadence is virtual because
+        // the interval it oversamples is (`DETERMINISM.md` T1 §4 replaces this
+        // whole loop with an engine wheel entry in Phase D1).
+        embsim_core::virtual_clock::wait_virtual_us(250);
     }
 }
 

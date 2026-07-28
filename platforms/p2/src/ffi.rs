@@ -67,10 +67,9 @@ pub unsafe extern "C" fn HAL_serial_recieveDataTimeout(
     timeout_us: u32,
 ) -> bool {
     if data.is_null() || len == 0 || channel < 0 {
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us as u64);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        // Guard path: the firmware still observes its full virtual timeout, so
+        // a bad argument cannot make a blocking receive return instantly.
+        embsim_core::virtual_clock::wait_virtual_us(timeout_us as u64);
         return false;
     }
     let buf = std::slice::from_raw_parts_mut(data, len as usize);
