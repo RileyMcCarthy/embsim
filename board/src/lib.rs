@@ -27,6 +27,8 @@
 //! - [`board`] — [`Board::from_netlist`]: netlist + registry → components + nets
 //! - [`system`] — [`System`]: boards + harnesses + scenario overrides + fault algebra
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
+//! - [`event_log`] — opt-in [`EventLog`]: the engine's totally-ordered event transcript
+//!   (determinism Oracle 1, `DETERMINISM.md`) with its normalization contract
 //! - [`mcu`] — [`McuComponent`]: the MCU as a component (force-path slice: serial
 //!   channels bridged to stream pins; the firmware-entry inversion is deferred)
 
@@ -35,6 +37,7 @@ pub mod cluster;
 pub mod component;
 pub mod diagnostics;
 pub mod engine;
+pub mod event_log;
 pub mod mcu;
 pub mod net;
 pub mod netlist;
@@ -50,7 +53,8 @@ pub use component::{
     AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, StreamRole,
 };
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
-pub use engine::EngineHandle;
+pub use engine::{ComponentId, EndpointId, EngineHandle};
+pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};
 pub use net::{Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts};
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};

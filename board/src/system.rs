@@ -35,6 +35,7 @@ use crate::diagnostics::{Diagnostics, Finding};
 use crate::engine::{
     ComponentId, Dsu, EndpointId, EngineHandle, EngineLink, Resolver, DEFAULT_HIGH_LEVEL_VOLTS,
 };
+use crate::event_log::EventLog;
 use crate::net::{Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
 
@@ -335,6 +336,9 @@ pub struct System {
     bench: Vec<BenchComponent>,
     harnesses: Vec<Harness>,
     scenario: Scenario,
+    /// Determinism Oracle 1 (`crate::event_log`); disabled unless
+    /// [`System::event_log`] was called.
+    event_log: EventLog,
 }
 
 /// A bench component: a bare [`Component`] added to the system without a
@@ -413,6 +417,19 @@ impl System {
             name: name.to_string(),
             component,
         });
+        self
+    }
+
+    /// Enable the engine **event log** — determinism Oracle 1
+    /// (`DETERMINISM.md`, "Proving it: determinism testing"; see
+    /// [`crate::event_log`] for the record vocabulary and the normalization
+    /// contract). Off by default, and zero cost when off.
+    ///
+    /// Read the log back from [`SystemHandle::event_log`] after
+    /// [`System::start`]. The [`System::build`] analysis path has no engine and
+    /// so records nothing.
+    pub fn event_log(mut self) -> Self {
+        self.event_log = EventLog::enabled();
         self
     }
 
@@ -516,6 +533,7 @@ impl System {
     /// see [`crate::engine`] for why joining cannot deadlock with in-flight
     /// senses).
     pub fn start(self) -> Result<SystemHandle, SystemError> {
+        let event_log = self.event_log.clone();
         let Assembly {
             nets,
             resolver,
@@ -523,7 +541,7 @@ impl System {
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
-        let engine = EngineHandle::spawn(resolver, nets, Box::new(QuasiStaticMna));
+        let engine = EngineHandle::spawn(resolver, nets, Box::new(QuasiStaticMna), event_log);
         let link = engine.link();
 
         let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
@@ -1273,6 +1291,13 @@ impl SystemHandle {
     /// panic-contained, so `false` means the engine itself failed.
     pub fn engine_is_alive(&self) -> bool {
         self.engine.is_alive()
+    }
+
+    /// Handle to this system's engine event log (determinism Oracle 1 — see
+    /// [`System::event_log`] and [`crate::event_log`]). Reads empty unless the
+    /// log was enabled on the builder.
+    pub fn event_log(&self) -> EventLog {
+        self.engine.event_log()
     }
 
     /// Reference designators of the attached components, in attach order.
