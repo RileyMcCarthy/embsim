@@ -131,6 +131,22 @@ pub enum Finding {
         /// The first missing sequence number.
         seq: u64,
     },
+    /// **Stepped clock mode only.** A registered
+    /// `embsim_core::virtual_clock` actor never parked at a virtual deadline,
+    /// so the engine could not reach the quiescence barrier
+    /// (`DETERMINISM.md` T1 §4) within its timeout.
+    ///
+    /// The engine advances anyway rather than hanging — but **this finding
+    /// voids the run's determinism guarantee**, and is the marker a
+    /// golden-trace comparison should fail on rather than mysteriously
+    /// diverge. Common causes: an actor blocked on a real file descriptor or a
+    /// host mutex (neither is visible to the barrier — that is Phase D2's
+    /// transport work), or an actor spinning without ever calling a
+    /// `virtual_clock` wait.
+    QuiescenceTimeout {
+        /// Names of the actors still runnable, in registration order.
+        actors: Vec<String>,
+    },
     /// Pin-facade mismatch between a registered component and the netlist
     /// (both directions are hard build errors; the finding carries the
     /// specifics).

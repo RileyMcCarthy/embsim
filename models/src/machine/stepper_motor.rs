@@ -1152,7 +1152,7 @@ mod tests {
 
     /// Position is a closed form of elapsed virtual time, so reading it at any
     /// cadence gives the same answer — the property a per-tick integrator
-    /// cannot offer against a free-running clock.
+    /// cannot offer against the default free-running clock.
     #[rstest]
     fn read_cadence_does_not_change_the_answer() {
         let config = Config {

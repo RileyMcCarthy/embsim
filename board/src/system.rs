@@ -27,6 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::board::{Board, BoardError, PartClass};
 use crate::cluster::QuasiStaticMna;
@@ -339,6 +340,9 @@ pub struct System {
     /// Determinism Oracle 1 (`crate::event_log`); disabled unless
     /// [`System::event_log`] was called.
     event_log: EventLog,
+    /// Stepped-clock quiescence timeout override; `None` uses the engine
+    /// default. See [`System::quiescence_timeout`].
+    quiescence_timeout: Option<Duration>,
 }
 
 /// A bench component: a bare [`Component`] added to the system without a
@@ -430,6 +434,21 @@ impl System {
     /// so records nothing.
     pub fn event_log(mut self) -> Self {
         self.event_log = EventLog::enabled();
+        self
+    }
+
+    /// Override how long the engine waits for every registered
+    /// `embsim_core::virtual_clock` actor to park before reporting
+    /// [`Finding::QuiescenceTimeout`] and advancing anyway.
+    ///
+    /// **Stepped clock mode only**; ignored while free-running. The default
+    /// ([`crate::engine::STEPPED_QUIESCENCE_TIMEOUT`]) is deliberately
+    /// generous — reaching it means a defect, and the finding says the run is
+    /// no longer reproducible. Raise it for a consumer whose actors do heavy
+    /// work between parks; lower it in a test that means to provoke the
+    /// stall.
+    pub fn quiescence_timeout(mut self, timeout: Duration) -> Self {
+        self.quiescence_timeout = Some(timeout);
         self
     }
 
@@ -534,6 +553,7 @@ impl System {
     /// senses).
     pub fn start(self) -> Result<SystemHandle, SystemError> {
         let event_log = self.event_log.clone();
+        let quiescence_timeout = self.quiescence_timeout;
         let Assembly {
             nets,
             resolver,
@@ -541,7 +561,13 @@ impl System {
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
-        let engine = EngineHandle::spawn(resolver, nets, Box::new(QuasiStaticMna), event_log);
+        let engine = EngineHandle::spawn(
+            resolver,
+            nets,
+            Box::new(QuasiStaticMna),
+            event_log,
+            quiescence_timeout,
+        );
         let link = engine.link();
 
         let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
@@ -581,6 +607,13 @@ impl System {
         for (_, component) in attached.iter_mut() {
             component.start();
         }
+
+        // The system is assembled. Release the engine's hold on virtual time:
+        // under a **stepped** clock nothing may advance until every component
+        // has registered its schedules, or a second component's period would be
+        // anchored at a different instant from run to run (a no-op in
+        // free-running mode — see `engine::Command::ReleaseTime`).
+        engine.release_time();
 
         Ok(SystemHandle {
             engine,

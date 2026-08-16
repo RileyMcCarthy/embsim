@@ -27,10 +27,12 @@
 //!   callbacks; time-driven work uses the engine's timer wheel
 //!   (`schedule_at` / `schedule_every`). Idle components cost nothing
 //!   (`BOARD_ENGINE.md`, "Execution model").
-//! - **State is computed at read time**, in closed form, from *sampled*
-//!   virtual time — never integrated per tick. `embsim_core::virtual_clock`
-//!   is free-running scaled wall time with no step/pause API, so a per-tick
-//!   integrator's answer would depend on how often anyone looked.
+//! - **State is computed at read time**, in closed form, from the virtual
+//!   clock — never integrated per tick. In the default (free-running) clock
+//!   mode `embsim_core::virtual_clock` is scaled wall time, so a per-tick
+//!   integrator's answer would depend on how often anyone looked; a closed
+//!   form is immune, and is also what makes these parts correct unchanged
+//!   under the stepped clock of `DETERMINISM.md` Phase D1.
 //! - **Split into a `Component` and a cheap handle.** The `Component` is
 //!   moved into the [`embsim_board::System`]; the handle
 //!   ([`stepper_motor::MotorShaft`], [`quadrature_encoder::EncoderInput`],

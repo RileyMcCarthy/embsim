@@ -50,22 +50,40 @@ lock-free paths:
   (`io.schedule_at(v_us)` / `io.schedule_every(v_us)`), served by a timer wheel
   on the engine thread keyed to virtual time. Idle components cost nothing.
 
-Note on time: `embsim_core::virtual_clock` is **free-running scaled wall time**
-(no step/pause API, no central tick loop), so wakeup timestamps are sampled,
-not deterministic. Time-sensitive state must be computed at *read time* (as the
-RC closed form is), never integrated per tick.
+Note on time: `embsim_core::virtual_clock` runs in one of two modes
+(`DETERMINISM.md` T1 §1). The **default is free-running scaled wall time**, in
+which wakeup timestamps are sampled, not deterministic. **Stepped mode**
+(`ClockMode::Stepped`, opt-in per process) makes the engine the *time
+authority*: it advances virtual time to the next scheduled event once every
+registered actor is parked, so a wake fires exactly at its deadline. Either
+way, time-sensitive state must be computed at *read time* (as the RC closed form
+is), never integrated per tick — free-running still coalesces missed periodic
+deadlines, and a component that assumes otherwise breaks the moment it runs in
+the default mode.
 
 ### Determinism of this execution model
 
 The ordering rules above (enqueue-seq for drives, `(deadline, schedule)` for the
 wheel, per-producer FIFO for streams) make the engine's event order
-**consistent** — every observer agrees on one order — but not yet
-**reproducible**: the sequence numbers themselves are handed out by a racing
-atomic, and wakeup timestamps are sampled from wall time. A stepped
-discrete-event clock mode, what "quiescent" would have to mean with pump threads
-and real fds in the picture, what extending determinism across the
-firmware↔engine boundary would cost, and how CI would prove any of it are
-specified separately in [`DETERMINISM.md`](DETERMINISM.md).
+**consistent** — every observer agrees on one order — but not, in free-running
+mode, **reproducible**: the sequence numbers themselves are handed out by a
+racing atomic, and wakeup timestamps are sampled from wall time. In **stepped**
+mode (`DETERMINISM.md` Phase D1) a system whose actors are all engine-hosted
+produces a byte-identical event trace across runs and processes; what
+"quiescent" means with pump threads and real fds in the picture, what extending
+that across the firmware↔engine boundary would cost, and how CI proves it are in
+[`DETERMINISM.md`](DETERMINISM.md).
+
+Practical consequence for component authors: **take your time from the engine.**
+A component that gets its cadence from `io.schedule_at` / `io.schedule_every`
+and does its work in `on_wake` is deterministic for free in stepped mode,
+because it is not a separate actor at all — its callback runs on the engine
+thread. A component that spawns a thread with its own poll loop has to register
+that thread with `virtual_clock::register_actor` and park through the clock, and
+even then it can only be as deterministic as whatever it is polling.
+`embsim_models::ads122u04_component` is the reference conversion in both
+directions: its output pump became a wheel entry, its model's protocol thread
+became a registered actor.
 
 Two engine rules from that document are **in force today** (Phase D0), and both
 are enforced by review rather than by the compiler:

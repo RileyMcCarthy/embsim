@@ -12,9 +12,15 @@ cargo test --workspace --doc
 cargo test -p embsim-trace --no-default-features   # headless recorder path
 cargo test -p embsim-peripherals -p embsim-board --release   # timing-sensitive smoke
 
-# Determinism baseline (Oracle 1). `--nocapture` prints the measured
-# free-running divergence per scenario; see rule 8 below.
+# Determinism (Oracle 1). `--nocapture` prints, per case, the asserted stepped
+# identity and the measured free-running divergence; see rule 8 below.
 cargo test -p embsim-board --test determinism -- --nocapture
+# Stepped-clock mechanics (the barrier, the time-release, the wedge report).
+cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
+
+# Re-bless the golden traces after an INTENDED engine/model behavior change.
+# Review the diff: it is the wire behavior of the system.
+EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism
 ```
 
 Per-crate iteration:
@@ -74,19 +80,36 @@ cargo llvm-cov --workspace --summary-only
    `virtual_clock::init` before every run of its N-run matrix, so it must not
    share a process with cases that assume a monotonically accumulating clock.
 
+   **Clock *mode* is process-global too, and stricter.** A binary that enters
+   `ClockMode::Stepped` must serialize every case behind one suite mutex
+   (`determinism.rs` and `stepped_clock.rs` both do) — two cases in different
+   modes at once measure each other. And `init_mode(Stepped)` **panics** if any
+   `virtual_clock` actor is still registered, so a binary whose cases create
+   components that spawn long-lived actor threads (the ADS122U04 model does)
+   must enter stepped mode before the first one exists. That is why
+   `ads122u04_stepped.rs` is its own binary with a single case.
+
 6. **Property tests (`proptest`)** only for continuous domains (e.g. MNA
    resistor ladders). Use fixed seeds when non-determinism would flake CI.
 
 7. **Strengthen, don't weaken.** Rewrites and refactors must keep or tighten
    existing assertions.
 
-8. **Determinism suites report what they cannot yet assert.** `determinism.rs`
-   compares N normalized engine event logs. In free-running mode it asserts the
-   event *order* (what `DETERMINISM.md` T0 lists as determined) and **prints**
-   the timestamp divergence rather than failing on wall-clock jitter — the
-   baseline is measured, not guessed. A suite that reports must still be unable
-   to pass vacuously: `determinism.rs` fails on an empty log and checks its own
-   comparator against reordered/truncated/mutated synthetic logs.
+8. **Determinism suites assert what their mode can promise, and report the
+   rest.** `determinism.rs` compares N normalized engine event logs in *both*
+   clock modes. **Stepped**: the full timestamped projection must be identical
+   across runs, across processes, and against a golden trace — a drift is a
+   regression. **Free-running**: the event *order* is asserted and the timestamp
+   divergence is **printed**, never failed on, because wall-clock jitter is the
+   thing that mode has. Never "fix" a free-running flake by asserting timestamps
+   there; move the case to stepped mode.
+
+   A suite that reports must still be unable to pass vacuously.
+   `determinism.rs` fails on an empty log, checks its own comparator against
+   reordered/truncated/mutated synthetic logs, asserts that the full and
+   shape projections really do differ on a 1 µs timestamp change, asserts that
+   free-running *does* diverge where stepped does not, and requires every named
+   case to have a golden.
 
 ## What each layer should cover
 
@@ -97,6 +120,7 @@ cargo llvm-cov --workspace --summary-only
 | Models | protocol/state | clamp, invalid cmd | DR/gain tables, thresholds |
 | Runtime | full no-firmware run | missing symbols, ceilings | TooManyChannels per peripheral |
 | Board | drive/sense/stream | contention, facade mismatch | net truth table, drop policies |
+| Stepped clock | N-run + golden identity | wedged actor, held time-release | case matrix × {free-running, stepped} |
 | P2 trampolines | null/neg guards | bind routing | channel index grids |
 | Tools | parse/record/render | empty/unknown | DWARF flag matrices |
 

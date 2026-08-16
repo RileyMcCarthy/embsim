@@ -1,8 +1,8 @@
 //! Timer — Timing functions backed by VirtualClock.
 //!
-//! Virtual *time* is process-wide (free-running scaled wall time in
-//! `embsim_core::virtual_clock`), but the *clock frequency* used for cycle
-//! math is per-MCU: [`get_clock_freq`] and [`get_cycles`] honor the calling
+//! Virtual *time* is process-wide (`embsim_core::virtual_clock`: scaled wall
+//! time by default, or engine-stepped under `ClockMode::Stepped`), but the
+//! *clock frequency* used for cycle math is per-MCU: [`get_clock_freq`] and [`get_cycles`] honor the calling
 //! thread's `instance::PeripheralInstance` clock-frequency override, falling
 //! back to the virtual clock's process-wide frequency when unset.
 

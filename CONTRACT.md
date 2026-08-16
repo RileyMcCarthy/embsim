@@ -51,11 +51,37 @@ A trampoline (and the generic peripheral behind it) must **never call
 
 Two reasons this is a contract and not a style preference. A raw sleep ignores
 the emulator's time scale, so `--speed 50` silently stops applying to whatever
-the trampoline waits on. And the virtual forms are the single seam
-[`DETERMINISM.md`](DETERMINISM.md) Phase D1 replaces to park callers on a
-stepped clock — a direct sleep is invisible to that swap and becomes a
-stepped-mode hang. Reach for `wait_wall_us` only when the wait genuinely tracks
-host time, and say so in a comment; D1 revisits exactly those sites.
+the trampoline waits on. And the virtual forms are the seam
+[`DETERMINISM.md`](DETERMINISM.md) Phase D1 **already** replaced: in
+`ClockMode::Stepped` they park the caller until the engine advances virtual time
+to the deadline. A direct sleep is invisible to that — it neither holds time
+back nor gets released by it — so under a stepped clock it becomes a hang or a
+skipped instant. Reach for `wait_wall_us` only when the wait genuinely tracks
+host time, and say so in a comment: in stepped mode every such call is counted
+by `virtual_clock::stepped_wall_sleep_count()` and logged at error level, and
+the determinism suite asserts that count stays at zero.
+
+### Threads that can create work must register
+
+A platform or model thread that does simulation work between waits must
+register itself:
+
+```rust
+let _actor = embsim_core::virtual_clock::register_actor("my-protocol-thread");
+```
+
+The guard is `!Send` (drop it on the thread that took it) and unregisters on
+drop, including on unwind. Registration is free in free-running mode — nothing
+consults the registry there — so register unconditionally.
+
+In stepped mode the engine will not advance virtual time while any registered
+actor is runnable, which is what stops a thread executing "later" work at an
+earlier virtual instant. An **unregistered** thread that parks through
+`wait_until` is still released correctly (its deadline is visible to the
+scheduler) but cannot hold time back — it may therefore observe a later `now`
+than it asked for. A thread blocked on a real file descriptor, an OS mutex, or a
+channel is invisible to the barrier entirely; that is the boundary
+`DETERMINISM.md` Phase D2 addresses, not something a platform crate can fix.
 
 ## Required symbol domains
 
@@ -149,9 +175,9 @@ disconnects.
 state only. A given firmware **image's own C statics** (`.data`/`.bss`) exist
 once per process, so one process can run at most **one instance of a given
 firmware image**; multi-instance means multiple *distinct* images (or
-pure-Rust components). Virtual *time* also remains process-wide
-(`embsim_core::virtual_clock` is free-running scaled wall time); only the
-clock *frequency* used for cycle math is per-instance.
+pure-Rust components). Virtual *time* also remains process-wide — one clock, one
+`ClockMode`, one actor registry for the whole process; only the clock
+*frequency* used for cycle math is per-instance.
 
 ## Init-before-entry ordering (handled by the runtime)
 

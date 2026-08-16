@@ -382,7 +382,13 @@ impl ComponentNetIo {
     /// [`schedule_at`](Self::schedule_at) /
     /// [`schedule_every`](Self::schedule_every) deliveries (last
     /// registration wins). The callback runs on the engine thread with the
-    /// sampled virtual time (µs) and no engine lock held.
+    /// current virtual time (µs) and no engine lock held.
+    ///
+    /// A component whose time comes from here is **deterministic for free** in
+    /// stepped clock mode: it is not a separate actor at all, so nothing about
+    /// it can race the engine (`DETERMINISM.md` T1 §4). Prefer a wakeup over a
+    /// thread with its own poll loop wherever the work is non-blocking —
+    /// `embsim_models::ads122u04_component` is the reference conversion.
     pub fn on_wake(&self, callback: impl Fn(u64) + Send + 'static) {
         let Some(component) = self.component else {
             tracing::debug!("on_wake on an inert io handle dropped");
@@ -395,9 +401,14 @@ impl ComponentNetIo {
     }
 
     /// Request a one-shot wakeup at the given absolute virtual time (µs),
-    /// served by the engine thread's timer wheel. Timestamps are sampled
-    /// from the free-running scaled clock — a deadline already in the past
-    /// fires immediately, in deadline order. Requires `virtual_clock::init`.
+    /// served by the engine thread's timer wheel. A deadline already in the
+    /// past fires immediately, in deadline order. Requires
+    /// `virtual_clock::init`.
+    ///
+    /// Free-running: the delivered timestamp is *sampled* from the scaled
+    /// clock, so a wake lands at or after its deadline by an unspecified
+    /// margin. Stepped: the engine advances virtual time **to** the deadline,
+    /// so the delivered timestamp is exactly `at_us`.
     pub fn schedule_at(&self, at_us: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_at on an inert io handle dropped");
@@ -410,6 +421,13 @@ impl ComponentNetIo {
     /// deadlines coalesce (one catch-up fire, then back on period) — compute
     /// time-dependent state at read time, never per tick. Requires
     /// `virtual_clock::init`.
+    ///
+    /// The period is anchored at the virtual instant the engine *handles* this
+    /// request. In stepped mode that instant is pinned for the whole system:
+    /// virtual time is held until every component has attached and started, so
+    /// two components' periods are anchored together, run after run.
+    /// Free-running coalescing is unreachable in stepped mode — the engine
+    /// never advances past a deadline it has not fired.
     pub fn schedule_every(&self, period_us: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_every on an inert io handle dropped");
