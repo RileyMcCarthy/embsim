@@ -21,14 +21,29 @@
 //! Time-driven behavior is engine-owned: components request wakeups via
 //! [`crate::component::ComponentNetIo::schedule_at`] /
 //! [`crate::component::ComponentNetIo::schedule_every`], served by a timer
-//! wheel keyed to `embsim_core::virtual_clock` **virtual time**. The clock is
-//! free-running scaled wall time (no step/pause API), so wakeup timestamps
-//! are *sampled*, not deterministic: late wakeups fire immediately, in
-//! deadline order, and missed periodic deadlines coalesce (one catch-up fire,
-//! then back on period) — time-dependent component state must be computed at
-//! read time, never integrated per tick. Idle components cost nothing — the
-//! engine parks on its command queue (`recv_timeout`) until the next wheel
-//! deadline, or indefinitely when the wheel is empty.
+//! wheel keyed to `embsim_core::virtual_clock` **virtual time**. Idle
+//! components cost nothing. The engine runs one of two loops, chosen by the
+//! clock's mode (`DETERMINISM.md` T1):
+//!
+//! - **Free-running** (default): the clock is scaled wall time, so wakeup
+//!   timestamps are *sampled*, not deterministic — late wakeups fire
+//!   immediately, in deadline order, and missed periodic deadlines coalesce
+//!   (one catch-up fire, then back on period). The engine parks on its command
+//!   queue (`recv_timeout`) until the next wheel deadline, or indefinitely when
+//!   the wheel is empty.
+//! - **Stepped**: the engine is the **time authority**
+//!   (`EngineCore::run_stepped_iteration`). It waits for every registered
+//!   `virtual_clock` actor to park, drains its queue completely, fires every
+//!   entry due at `now`, loops that to a fixpoint, then advances virtual time
+//!   to `min(wheel head, earliest parked deadline)`. A wake therefore fires
+//!   *exactly* at its deadline and the coalescing branch is unreachable.
+//!   Virtual time is additionally held until `System::start` has attached and
+//!   started every component (`Command::ReleaseTime`), so two components'
+//!   periods are anchored at the same instant run after run.
+//!
+//! Either way, time-dependent component state must be computed at read time,
+//! never integrated per tick: a component that assumes exact wakeups breaks the
+//! moment it runs in the default mode.
 //!
 //! Build-time analysis and live resolution share **one code path**: the
 //! crate-internal `Resolver` in this module is populated by `System`
@@ -68,6 +83,29 @@
 //! `virtual_clock::init` has run are dropped with a
 //! [`Finding::VirtualClockUninitialized`] instead of panicking the engine
 //! thread, and [`EngineHandle::is_alive`] reports engine-thread health.
+//!
+//! # Review rule: no unordered iteration on an engine path
+//!
+//! **Never iterate a `HashMap` or `HashSet` on an engine path without an
+//! explicit sort.** `std`'s hasher is randomly seeded — and `RandomState::new`
+//! re-keys on *every* map construction, so a map built per call has a fresh
+//! order per call. Any hash order that reaches a published value therefore
+//! makes the engine irreproducible, and the effect is often a last-bit float
+//! difference rather than an obvious reordering. The three sanctioned shapes:
+//!
+//! 1. **Dense index** — walk the `Vec` (`self.slots`, `self.streams`,
+//!    `self.nets`, `0..n`) and use the map only for keyed lookups. Preferred:
+//!    it needs no sort and the order is meaningful.
+//! 2. **Explicit sort** — `collect()` the keys, `sort_unstable()`, then
+//!    iterate (`driver_roots`, `extra_clusters`, `path_roots`, `fighting`).
+//! 3. **Membership only** — a set used purely as a dedup gate or a
+//!    `contains`/`len` test, never iterated into an output. These carry an
+//!    inline `// hash-order: …` comment saying why order cannot escape.
+//!
+//! Grep gate: `\.values\(\)|\.keys\(\)|\.iter\(\)` over a `HashMap`/`HashSet`
+//! in this module, `cluster.rs`, or `system.rs` should show only shapes 2 and
+//! 3. `DETERMINISM.md` (Phase D0 item (d)) is the authoritative statement of
+//! this rule; `BOARD_ENGINE.md` cross-references it.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
@@ -85,6 +123,7 @@ use crate::cluster::{
 };
 use crate::component::StreamRole;
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
+use crate::event_log::{EngineEvent, EventLog};
 use crate::net::{
     Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, ESCALATION_IMPEDANCE_RATIO,
     STREAM_COLLAPSE_THRESHOLD,
@@ -138,20 +177,52 @@ const STREAM_ROUTE_QUEUE_MAX: usize = 8192;
 /// `pending_drives` — no timeout, no symptom beyond the board going quiet.
 /// The wait is wall-clock (enqueuing is wall-side) and generous: a live
 /// enqueuer covers the reserve→send window in nanoseconds.
+///
+/// **Free-running only.** In stepped mode the watchdog is disabled: a
+/// wall-clock timeout inside the simulation is exactly the coupling stepped
+/// mode exists to remove, and under actor accounting a dead enqueuer is
+/// detected exactly (its actor never re-parks → [`Finding::QuiescenceTimeout`])
+/// rather than by timeout. `DETERMINISM.md` T1 §3.
 const DRIVE_SEQ_STALL_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Stepped mode: how long the engine waits for every registered actor to park
+/// before declaring the barrier wedged
+/// ([`virtual_clock::await_quiescence`] → [`Finding::QuiescenceTimeout`]).
+///
+/// Wall-clock on purpose — it is not part of the simulation, it is the escape
+/// hatch for an actor that never parks. Generous, because reaching it means a
+/// defect: a run that trips it is not reproducible, and says so. Overridable
+/// per system with [`crate::System::quiescence_timeout`].
+pub const STEPPED_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Stepped mode: how long the engine parks on its command queue when there is
+/// nothing to advance to (empty wheel, no pending park deadline).
+///
+/// Observationally inert — the loop body does nothing when nothing is due — so
+/// this poll cadence cannot reach any recorded event. It exists so that an
+/// actor registering, or parking, while the engine is idle is noticed without
+/// a second wakeup channel into the clock.
+const STEPPED_IDLE_POLL: Duration = Duration::from_millis(2);
 
 // ============================================================
 // Identity
 // ============================================================
 
 /// Dense index of one drive-capable pin endpoint, assigned at assembly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct EndpointId(pub(crate) usize);
+///
+/// Public because it is one of the canonical identities the determinism event
+/// log records (`DETERMINISM.md`, "Trace normalization spec": canonicalize
+/// identity to the dense ids that already exist — never a thread name, never a
+/// pointer, never a `HashMap` order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EndpointId(pub usize);
 
 /// Dense index of one attached component, assigned at assembly (keys the
 /// timer wheel's wakeup delivery).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ComponentId(pub(crate) usize);
+///
+/// Public for the same reason as [`EndpointId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ComponentId(pub usize);
 
 // ============================================================
 // Engine commands + client link
@@ -242,16 +313,33 @@ pub(crate) enum Command {
         /// Delivery callback.
         callback: StreamCallback,
     },
+    /// Stepped mode only: the system is fully assembled — every component has
+    /// attached and started — so the engine may begin advancing virtual time.
+    ///
+    /// Without this barrier a two-component system is not reproducible: the
+    /// engine could advance between one component's `schedule_every` and the
+    /// next's, so the second component's period would be anchored at a
+    /// different instant from run to run. Sent once by `System::start` after
+    /// the `Component::start` loop; a no-op in free-running mode, where time
+    /// runs regardless.
+    ReleaseTime,
     /// Stop the engine loop; pending drives and timers are discarded.
     Shutdown,
 }
+
+/// Attach-time drives recorded on the inert (build-time) link, in issue
+/// order: the build pass applies them before it resolves for real.
+pub(crate) type IdleDriveLog = Arc<Mutex<Vec<(EndpointId, Option<TheveninDrive>)>>>;
 
 /// Cloneable client half of the engine: command sender, the global drive
 /// sequence counter, and the engine-published net-state table.
 ///
 /// An **inert** link (`tx == None`) is what the build-time analysis path
-/// hands out: senses read the build-resolved snapshot; drives and schedules
-/// are traced and dropped.
+/// hands out: senses read the build-resolved snapshot, schedules are traced
+/// and dropped, and drives are *recorded* so the build pass can apply a
+/// component's idle drive before it publishes findings (a component that
+/// releases a `DigitalOut` pin at attach must not be analyzed as if it were
+/// driving the engine's idle-high default).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EngineLink {
     /// Command queue into the engine thread; `None` on the inert build path.
@@ -260,15 +348,20 @@ pub(crate) struct EngineLink {
     pub(crate) drive_seq: Arc<AtomicU64>,
     /// Engine-published resolved state per net (build snapshot when inert).
     pub(crate) states: Arc<Mutex<Vec<NetState>>>,
+    /// Inert path only: drives issued during attach, in issue order, for the
+    /// build pass to apply before it resolves for real.
+    pub(crate) recorded_drives: Option<IdleDriveLog>,
 }
 
 impl EngineLink {
-    /// Inert link over a fixed state snapshot (the build-time analysis path).
-    pub(crate) fn inert(states: Arc<Mutex<Vec<NetState>>>) -> Self {
+    /// Inert link over a fixed state snapshot (the build-time analysis
+    /// path), recording attach-time drives into `recorded_drives`.
+    pub(crate) fn inert(states: Arc<Mutex<Vec<NetState>>>, recorded_drives: IdleDriveLog) -> Self {
         Self {
             tx: None,
             drive_seq: Arc::new(AtomicU64::new(0)),
             states,
+            recorded_drives: Some(recorded_drives),
         }
     }
 
@@ -285,6 +378,20 @@ impl EngineLink {
                 }
             }
             None => {
+                // Drives are recorded (the build pass applies them before it
+                // resolves); everything else is genuinely dropped.
+                if let (
+                    Command::Drive {
+                        endpoint, drive, ..
+                    },
+                    Some(log),
+                ) = (&command, &self.recorded_drives)
+                {
+                    log.lock()
+                        .expect("drive log never poisoned")
+                        .push((*endpoint, *drive));
+                    return true;
+                }
                 tracing::debug!("inert engine link (build-time analysis path); command dropped");
                 false
             }
@@ -500,6 +607,17 @@ impl Resolver {
     /// state; conduction clusters share sourced-ness. Clusters where a
     /// competing source sits within [`ESCALATION_IMPEDANCE_RATIO`] of the
     /// strongest driver escalate to `solver`.
+    /// The identity root of every net, after harness/pin-short merges:
+    /// two nets are electrically the same node iff their roots are equal.
+    ///
+    /// Net *names* deliberately survive a merge (each keeps its own board's
+    /// label), so name comparison cannot answer "are these connected?" —
+    /// this can. Snapshotted for [`crate::BuiltSystem`] so connectivity
+    /// claims are assertable without a live engine.
+    pub(crate) fn identity_roots(&mut self, net_count: usize) -> Vec<usize> {
+        (0..net_count).map(|i| self.identity.find(i)).collect()
+    }
+
     pub(crate) fn resolve(
         &mut self,
         nets: &mut [Net],
@@ -585,20 +703,29 @@ impl Resolver {
         // declared impedance; power rails and stuck faults as ideal 0-ohm
         // sources; NaN "unmodeled voltage" rails are skipped — they source
         // the cluster but cannot enter a numeric solve).
+        //
+        // **Determinism (load-bearing):** iterate the DENSE drive table, never
+        // `net_drivers` (a `HashMap`). This `Vec`'s order becomes the float
+        // accumulation order of `matrix[c][c] += g` and `rhs[c] += i` in
+        // [`crate::cluster::QuasiStaticMna::solve`], so hash iteration order
+        // would publish last-bit-different `NetState::Analog` voltages from
+        // one *process* to the next — `std`'s hasher is randomly seeded per
+        // process. Slots and `net_drivers`' member lists are both built in
+        // endpoint order, so this is the same multiset in a canonical order.
+        // See `DETERMINISM.md`, "One real hash-order defect".
         let mut cluster_sources: HashMap<usize, Vec<ClusterSource>> = HashMap::new();
-        for slots in net_drivers.values() {
-            for &si in slots {
-                let drive = drive_of(si);
-                let net = self.slots[si].net;
-                cluster_sources
-                    .entry(cluster_of[net])
-                    .or_default()
-                    .push(ClusterSource {
-                        node: NetId(root_of[net]),
-                        volts: drive.volts,
-                        impedance: drive.impedance,
-                    });
-            }
+        for slot in &self.slots {
+            let Some(drive) = slot.drive else {
+                continue;
+            };
+            cluster_sources
+                .entry(cluster_of[slot.net])
+                .or_default()
+                .push(ClusterSource {
+                    node: NetId(root_of[slot.net]),
+                    volts: drive.volts,
+                    impedance: drive.impedance,
+                });
         }
         for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
             if volts.is_nan() {
@@ -625,8 +752,12 @@ impl Resolver {
         // two push-pull outputs).
         let mut contended: HashMap<usize, Vec<usize>> = HashMap::new();
         {
+            // hash-order shape 2: keys collected then sorted, so the pair
+            // walk below is in root order.
             let mut driver_roots: Vec<usize> = net_drivers.keys().copied().collect();
             driver_roots.sort_unstable();
+            // hash-order shape 3: this set is only ever asked for `.len()`
+            // (below, "does this pair disagree?"), never iterated.
             let levels_of = |root: usize| -> HashSet<Level> {
                 net_drivers[&root]
                     .iter()
@@ -653,6 +784,9 @@ impl Resolver {
                     }
                 }
             }
+            // hash-order shape 3: `values_mut` mutates each Vec in place —
+            // which Vec is visited first cannot affect any of them, and each
+            // is sorted here so the reported driver list is canonical.
             for fighting in contended.values_mut() {
                 fighting.sort_unstable();
                 fighting.dedup();
@@ -687,6 +821,10 @@ impl Resolver {
             };
             solver.solve(&Cluster { nodes, resistors }, &inputs)
         };
+        // hash-order: `escalated` is keyed access only (`contains_key`, `get`,
+        // `entry`) and never iterated. `driver_roots` is shape 2 — the escalation
+        // decision below runs in root order, so which cluster wins the
+        // `contains_key` short-circuit is fixed.
         let mut escalated: HashMap<usize, ClusterSolution> = HashMap::new();
         let mut driver_roots: Vec<usize> = net_drivers.keys().copied().collect();
         driver_roots.sort_unstable();
@@ -696,6 +834,9 @@ impl Resolver {
                 continue;
             }
             let slots = &net_drivers[&root];
+            // hash-order shape 3: `.len()` gates, and the `.next()` below runs
+            // only when the set holds exactly one element — so iteration order
+            // has nothing to choose between.
             let levels: HashSet<Level> = slots
                 .iter()
                 .map(|&si| level_of_volts(drive_of(si).volts))
@@ -718,6 +859,10 @@ impl Resolver {
             }
             // Sources reachable through conduction edges within the cluster.
             let dist = min_path_ohms(&root_edges, root);
+            // Order-independent by arithmetic: `f64::min` over a set of
+            // finite values gives the same result in any order, so this
+            // consumer of `cluster_sources` is safe regardless. The MNA
+            // accumulation is the one that is not — see its assembly above.
             if let Some(sources) = cluster_sources.get(&cluster) {
                 for source in sources {
                     if source.node.0 == root || level_of_volts(source.volts) == level {
@@ -767,11 +912,15 @@ impl Resolver {
                 .or_default()
                 .insert(level);
         }
+        // hash-order shape 3: `ideal_contended` is only ever `.contains`-ed
+        // during state assignment; it is never iterated into an output.
         let ideal_contended: HashSet<usize> = ideal_root_levels
             .iter()
             .filter(|(_, levels)| levels.len() > 1)
             .map(|(&root, _)| root)
             .collect();
+        // hash-order shape 2: collected from a map, then sorted + deduped
+        // below, so the solve order over extra clusters is cluster order.
         let mut extra_clusters: Vec<usize> = ideal_cluster_levels
             .iter()
             .filter(|(_, levels)| levels.len() > 1)
@@ -839,6 +988,10 @@ impl Resolver {
 
         // -- findings ---------------------------------------------------------
         // Contention (per identity root, deduped).
+        // hash-order shape 3: every `reported*` set below is a dedup gate —
+        // `.insert()` returning false suppresses a duplicate. The findings
+        // themselves are emitted while walking dense indices, so their order is
+        // net order, not hash order.
         let mut reported_contention: HashSet<usize> = HashSet::new();
         for i in 0..n {
             let root = root_of[i];
@@ -920,6 +1073,7 @@ impl Resolver {
             .collect();
 
         let mut routes = Vec::new();
+        // hash-order shape 3: dedup gate for the StreamMismatch pair report.
         let mut reported_pairs: HashSet<(usize, usize)> = HashSet::new();
         for (pi, producer) in self.streams.iter().enumerate() {
             let StreamRole::Producer { baud_hz } = producer.role else {
@@ -976,6 +1130,9 @@ impl Resolver {
             // for the added subtlety: over-gating can only drop bytes a
             // real link might have carried; it never leaks bytes onto a
             // broken one.
+            // hash-order shape 2: `min_path_ohms` returns a `HashMap`, but its
+            // *values* are order-independent (relaxation over the `root_edges`
+            // Vec to a fixpoint) and the keys collected here are sorted below.
             let mut path_roots: Vec<usize> = dist
                 .iter()
                 .filter(|(_, &ohms)| ohms < STREAM_COLLAPSE_THRESHOLD)
@@ -1146,6 +1303,12 @@ struct EngineCore {
     solver: Box<dyn ClusterSolver>,
     states: Arc<Mutex<Vec<NetState>>>,
     diagnostics: Arc<Mutex<Diagnostics>>,
+    // hash-order: every map below is **keyed access only** — `get`, `entry`,
+    // `insert`, `contains_key`. None is iterated. Sense delivery walks
+    // `self.nets` by index and the per-net callbacks are a `Vec` in
+    // registration order; `reroute_streams` walks `self.streams` in
+    // registration order. Adding an iteration over any of these needs a sort
+    // (see the module's review rule).
     sense_subs: HashMap<usize, Vec<SenseCallback>>,
     wake_subs: HashMap<usize, WakeCallback>,
     /// Live stream routes, keyed by producer endpoint index. Rebuilt (and
@@ -1165,7 +1328,28 @@ struct EngineCore {
     next_drive_seq: u64,
     /// Gap watchdog: the missing seq currently being waited on and when the
     /// wait started (wall clock). `None` when no gap is outstanding.
+    /// Free-running only (see [`DRIVE_SEQ_STALL_TIMEOUT`]).
     drive_stall: Option<(u64, Instant)>,
+    /// Stepped mode: has [`Command::ReleaseTime`] arrived? Virtual time is held
+    /// at its initial value until it does, so every component's first schedule
+    /// is anchored at the same instant.
+    clock_released: bool,
+    /// Stepped mode: reported [`Finding::QuiescenceTimeout`] already? The
+    /// finding is deduped on the cumulative bus anyway; this keeps the engine
+    /// from re-waiting the full timeout on every iteration once an actor is
+    /// known to be wedged.
+    quiescence_stalled: bool,
+    /// How long [`Self::await_actor_quiescence`] waits before declaring the
+    /// barrier wedged ([`STEPPED_QUIESCENCE_TIMEOUT`] unless overridden).
+    quiescence_timeout: Duration,
+    /// Stepped mode: `(missing seq, already reported)` for the drive-seq gap
+    /// the idle diagnostic is watching, so it fires once per gap — and only
+    /// after the gap has survived two consecutive idle polls.
+    stepped_gap_logged: Option<(u64, bool)>,
+    /// Determinism Oracle 1 (`crate::event_log`). Disabled by default; every
+    /// recording site is closure-guarded, so an off log costs one `Option`
+    /// check.
+    event_log: EventLog,
 }
 
 impl EngineCore {
@@ -1174,6 +1358,8 @@ impl EngineCore {
     fn report_finding(&self, finding: Finding) {
         let mut cumulative = self.diagnostics.lock().unwrap();
         if !cumulative.contains(&finding) {
+            self.event_log
+                .record(|| EngineEvent::Finding(finding.clone()));
             cumulative.report(finding);
         }
     }
@@ -1231,11 +1417,24 @@ impl EngineCore {
 
         // Sense delivery: engine thread, no lock held. A callback that
         // drives a pin enqueues; the drive lands in a later iteration.
+        //
+        // The event log records the net-state *sequence* here — changed nets
+        // only, walked in net index order — plus each sense delivery. Both are
+        // in the set `DETERMINISM.md` claims T0 already determines (resolution
+        // is pure; per-net callbacks are a `Vec` in registration order).
         for (i, net) in self.nets.iter().enumerate() {
             let changed = old.get(i).is_none_or(|prev| !same_state(prev, &net.state));
             if changed {
+                self.event_log.record(|| EngineEvent::NetResolved {
+                    net: NetId(i),
+                    state: net.state,
+                });
                 if let Some(subs) = self.sense_subs.get(&i) {
                     for callback in subs {
+                        self.event_log.record(|| EngineEvent::SenseDelivered {
+                            net: NetId(i),
+                            state: net.state,
+                        });
                         self.deliver_contained(CallbackKind::Sense, &net.name, || {
                             callback(net.state);
                         });
@@ -1255,6 +1454,8 @@ impl EngineCore {
         let mut cumulative = self.diagnostics.lock().unwrap();
         for finding in pass.findings() {
             if !cumulative.contains(finding) {
+                self.event_log
+                    .record(|| EngineEvent::Finding(finding.clone()));
                 cumulative.report(finding.clone());
             }
         }
@@ -1268,6 +1469,8 @@ impl EngineCore {
         let mut pass = Diagnostics::new();
         let specs = self.resolver.route_streams(&self.nets, &mut pass);
         self.merge_findings(&pass);
+        let epoch = self.topology_epoch;
+        self.event_log.record(|| EngineEvent::Reroute { epoch });
         self.routes = specs
             .into_iter()
             .map(|spec| {
@@ -1317,7 +1520,7 @@ impl EngineCore {
             // in write order, without ever touching the virtual clock.
             let consumers = route.consumers.clone();
             let path_roots = route.path_roots.clone();
-            self.deliver_stream_bytes(&consumers, &path_roots, &bytes);
+            self.deliver_stream_bytes(endpoint, &consumers, &path_roots, &bytes);
             return;
         }
         // Paced delivery needs the virtual clock — validated loudly here so
@@ -1391,7 +1594,7 @@ impl EngineCore {
         if let Some(deadline) = next {
             self.arm(deadline, TimerTarget::Stream(endpoint), None);
         }
-        self.deliver_stream_bytes(&consumers, &path_roots, &due);
+        self.deliver_stream_bytes(endpoint, &consumers, &path_roots, &due);
     }
 
     /// Deliver bytes to a route's consumers, gated by net resolution: a link
@@ -1400,6 +1603,7 @@ impl EngineCore {
     /// forever). Callbacks run on the engine thread with no lock held.
     fn deliver_stream_bytes(
         &mut self,
+        producer: EndpointId,
         consumers: &[EndpointId],
         path_roots: &[usize],
         bytes: &[u8],
@@ -1441,6 +1645,15 @@ impl EngineCore {
                     }
                 }
                 if let Some(subs) = self.stream_subs.get(&consumer.0) {
+                    // One record per (byte, consumer) that actually crosses —
+                    // the wire event, not the fan-out to however many callbacks
+                    // that endpoint registered. Bytes the drop policy ate above
+                    // never reach here, so the log shows what the link carried.
+                    self.event_log.record(|| EngineEvent::StreamByte {
+                        producer,
+                        consumer: *consumer,
+                        byte,
+                    });
                     for callback in subs {
                         self.deliver_contained(CallbackKind::StreamByte, &subscribers[ci], || {
                             callback(byte);
@@ -1455,7 +1668,13 @@ impl EngineCore {
     /// each so senses observe the authoritative event order.
     fn apply_ready_drives(&mut self) {
         while let Some((endpoint, drive)) = self.pending_drives.remove(&self.next_drive_seq) {
+            let seq = self.next_drive_seq;
             self.next_drive_seq += 1;
+            self.event_log.record(|| EngineEvent::DriveApplied {
+                seq,
+                endpoint,
+                drive,
+            });
             self.resolver.set_drive(endpoint, drive);
             self.resolve_and_publish();
         }
@@ -1470,6 +1689,12 @@ impl EngineCore {
     /// buffered seq — ordering against a dead enqueuer is moot. The run
     /// loop bounds its park time while a gap is outstanding, so detection
     /// does not depend on further traffic arriving.
+    ///
+    /// **Free-running only.** Stepped mode disables it (`DETERMINISM.md`
+    /// T1 §3): an `Instant`-based timeout inside the simulation is exactly the
+    /// wall-clock coupling stepped mode removes, and a dead enqueuer shows up
+    /// there as an actor that never re-parks — detected exactly, by
+    /// [`Finding::QuiescenceTimeout`], rather than by a guess at a duration.
     fn check_drive_stall(&mut self) {
         let Some((&lowest, _)) = self.pending_drives.first_key_value() else {
             self.drive_stall = None;
@@ -1498,20 +1723,28 @@ impl EngineCore {
     }
 
     /// Fire every wheel entry whose deadline has passed, in `(deadline,
-    /// schedule)` order. Wake timestamps are sampled from the free-running
-    /// virtual clock; missed periodic deadlines coalesce to one catch-up
-    /// fire, then re-arm on period. Stream targets deliver their route's
-    /// due bytes instead of a wake callback.
-    fn fire_due_timers(&mut self) {
+    /// schedule)` order; returns how many fired.
+    ///
+    /// In free-running mode wake timestamps are *sampled* from the scaled wall
+    /// clock and missed periodic deadlines coalesce to one catch-up fire, then
+    /// re-arm on period. In stepped mode `now` is exactly the instant the
+    /// engine advanced to, so a wake fires at its scheduled deadline and the
+    /// catch-up branch is unreachable: the engine never advances past a
+    /// deadline it has not fired. Stream targets deliver their route's due
+    /// bytes instead of a wake callback.
+    fn fire_due_timers(&mut self) -> usize {
+        let mut fired = 0usize;
         while let Some(&Reverse(head)) = self.wheel.peek() {
             let now = virtual_clock::virtual_us();
             if head.deadline_us > now {
                 break;
             }
             self.wheel.pop();
+            fired += 1;
             match head.target {
                 TimerTarget::Wake(component) => {
                     if let Some(callback) = self.wake_subs.get(&component.0) {
+                        self.event_log.record(|| EngineEvent::Wake { component });
                         let subscriber = format!("component {}", component.0);
                         self.deliver_contained(CallbackKind::Wake, &subscriber, || {
                             callback(now);
@@ -1533,6 +1766,7 @@ impl EngineCore {
                 TimerTarget::Stream(endpoint) => self.deliver_due_stream(endpoint, now),
             }
         }
+        fired
     }
 
     /// Push a wheel entry.
@@ -1571,6 +1805,8 @@ impl EngineCore {
                     .unwrap_or_else(|| format!("net {}", net.0));
                 // Deliver the current state once at registration, so e.g. a
                 // floating ~RESET is reported before any traffic.
+                self.event_log
+                    .record(|| EngineEvent::SenseDelivered { net, state });
                 self.deliver_contained(CallbackKind::Sense, &subscriber, || callback(state));
                 self.sense_subs.entry(net.0).or_default().push(callback);
             }
@@ -1619,51 +1855,230 @@ impl EngineCore {
                     .or_default()
                     .push(callback);
             }
+            Command::ReleaseTime => {
+                self.clock_released = true;
+            }
             Command::Shutdown => return true,
         }
         false
     }
 
-    /// Engine thread body: fire due timers, run the drive-gap watchdog,
-    /// park on the queue until the next wheel deadline or stall check (or
-    /// indefinitely when neither is pending), then handle commands in
-    /// bounded batches ([`COMMAND_DRAIN_BATCH_MAX`]) so due timers keep
-    /// firing under sustained command load.
+    /// Engine thread body. The mode is re-read every iteration (one relaxed
+    /// atomic load), so a consumer that selects stepped mode after spawning the
+    /// system still gets it — and free-running remains byte-for-byte the loop
+    /// it has always been.
     fn run(mut self, rx: Receiver<Command>) {
         loop {
-            self.fire_due_timers();
-            self.check_drive_stall();
-            let command = match self.next_wall_wait_us() {
-                None => match rx.recv() {
-                    Ok(c) => c,
-                    Err(_) => break, // every handle dropped without Shutdown
-                },
-                Some(wait_wall) => match rx.recv_timeout(Duration::from_micros(wait_wall)) {
-                    Ok(c) => c,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                },
+            let done = if virtual_clock::is_stepped() {
+                self.run_stepped_iteration(&rx)
+            } else {
+                self.run_free_running_iteration(&rx)
             };
-            if self.handle(command) {
+            if done {
                 break;
             }
-            // Bounded drain: a saturated queue must not starve the timer
-            // wheel — control returns to the timer check above after at
-            // most COMMAND_DRAIN_BATCH_MAX further commands. A disconnect
-            // observed here is handled by the blocking receive above.
-            let mut shutdown = false;
-            let mut drained = 0;
-            while drained < COMMAND_DRAIN_BATCH_MAX {
-                let Ok(command) = rx.try_recv() else { break };
-                drained += 1;
-                if self.handle(command) {
-                    shutdown = true;
-                    break;
+        }
+    }
+
+    /// One free-running iteration (unchanged behavior): fire due timers, run
+    /// the drive-gap watchdog, park on the queue until the next wheel deadline
+    /// or stall check (or indefinitely when neither is pending), then handle
+    /// commands in bounded batches ([`COMMAND_DRAIN_BATCH_MAX`]) so due timers
+    /// keep firing under sustained command load. Returns `true` to stop.
+    fn run_free_running_iteration(&mut self, rx: &Receiver<Command>) -> bool {
+        self.fire_due_timers();
+        self.check_drive_stall();
+        let command = match self.next_wall_wait_us() {
+            None => match rx.recv() {
+                Ok(c) => c,
+                Err(_) => return true, // every handle dropped without Shutdown
+            },
+            Some(wait_wall) => match rx.recv_timeout(Duration::from_micros(wait_wall)) {
+                Ok(c) => c,
+                Err(RecvTimeoutError::Timeout) => return false,
+                Err(RecvTimeoutError::Disconnected) => return true,
+            },
+        };
+        if self.handle(command) {
+            return true;
+        }
+        // Bounded drain: a saturated queue must not starve the timer wheel —
+        // control returns to the timer check above after at most
+        // COMMAND_DRAIN_BATCH_MAX further commands. A disconnect observed here
+        // is handled by the blocking receive above.
+        let mut drained = 0;
+        while drained < COMMAND_DRAIN_BATCH_MAX {
+            let Ok(command) = rx.try_recv() else { break };
+            drained += 1;
+            if self.handle(command) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One stepped iteration — the engine as the **time authority**
+    /// (`DETERMINISM.md` T1 §3). Returns `true` to stop.
+    ///
+    /// 1. **Quiesce.** Wait for every registered actor to park. Only then is
+    ///    the set of pending work stable enough to reason about.
+    /// 2. **Drain the command queue completely.** [`COMMAND_DRAIN_BATCH_MAX`]
+    ///    exists only to stop a command flood from starving *wall-clock*
+    ///    timers; with time advanced by the engine itself starvation is
+    ///    impossible, and a partial drain would make the applied prefix depend
+    ///    on arrival timing.
+    /// 3. **Fire every wheel entry due at `now`**, in `(deadline, seq)` order.
+    /// 4. Loop 1–3 to a fixpoint: a callback fired in step 3 may have enqueued
+    ///    drives, and a released actor may have enqueued anything.
+    /// 5. **Advance** to `min(wheel head, earliest pending park deadline)`.
+    ///    With nothing to advance to, park on the command queue — a scripted
+    ///    stimulus thread is not an actor, and waiting for it is the normal
+    ///    idle state, not a wedge (see "Deviations from the design doc" in
+    ///    `DETERMINISM.md`).
+    ///
+    /// The resulting per-instant order is fixed: released actors run to their
+    /// next park first, then the engine drains and fires. What is *not* fixed
+    /// is the interleaving of two actors released at the same instant — they
+    /// race `next_drive_seq`, exactly as `DETERMINISM.md` says T1 does not fix.
+    fn run_stepped_iteration(&mut self, rx: &Receiver<Command>) -> bool {
+        loop {
+            self.await_actor_quiescence();
+            let mut work = 0usize;
+            loop {
+                match rx.try_recv() {
+                    Ok(command) => {
+                        work += 1;
+                        if self.handle(command) {
+                            return true;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return true,
                 }
             }
-            if shutdown {
+            work += self.fire_due_timers();
+            if work == 0 {
                 break;
             }
+        }
+
+        let now = virtual_clock::virtual_us();
+        let next = match (self.clock_released, self.next_virtual_deadline()) {
+            // Time is held until the system has finished assembling.
+            (false, _) => None,
+            (true, next) => next,
+        };
+        match next {
+            Some(deadline) if deadline > now => {
+                if let Err(error) = virtual_clock::advance_to(deadline) {
+                    // Unreachable while this engine is the only scheduler:
+                    // `next_virtual_deadline` is >= now by construction and the
+                    // mode was stepped one instruction ago. Report rather than
+                    // panic — an engine thread that dies is a silent zombie.
+                    tracing::error!(?error, deadline, now, "stepped clock advance rejected");
+                }
+                false
+            }
+            // Something is already due at `now`: the fixpoint loop above will
+            // fire it on the next pass.
+            Some(_) => false,
+            None => {
+                self.warn_on_stepped_drive_gap();
+                match rx.recv_timeout(STEPPED_IDLE_POLL) {
+                    Ok(command) => self.handle(command),
+                    Err(RecvTimeoutError::Timeout) => false,
+                    Err(RecvTimeoutError::Disconnected) => true,
+                }
+            }
+        }
+    }
+
+    /// Stepped mode's replacement for the drive-gap *watchdog*: a **name**, not
+    /// a timeout.
+    ///
+    /// [`check_drive_stall`](Self::check_drive_stall) is disabled here
+    /// (`DETERMINISM.md` T1 §3). For a registered actor that is exactly right —
+    /// a dead enqueuer is detected as an actor that never re-parks. But a
+    /// **non-actor** enqueuer that dies between reserving a seq and sending the
+    /// command leaves a gap nothing detects, and the only symptom would be the
+    /// board going quiet. So when the engine is fully idle — nothing to advance
+    /// to, every actor parked — and drives are still buffered, say so.
+    ///
+    /// Deliberately a `tracing::error!` and **not** a [`Finding`]: a finding
+    /// would land in the event log at a wall-dependent moment and make an
+    /// otherwise-reproducible run diverge. Reported once per distinct gap, and
+    /// only after the *same* gap has survived two consecutive idle polls — a
+    /// live enqueuer covers the reserve→send window in nanoseconds, so one
+    /// observation could still be catching a healthy race in flight.
+    fn warn_on_stepped_drive_gap(&mut self) {
+        let Some((&lowest, _)) = self.pending_drives.first_key_value() else {
+            self.stepped_gap_logged = None;
+            return;
+        };
+        let missing = self.next_drive_seq;
+        match self.stepped_gap_logged {
+            // Same gap, already reported (or: first sighting → wait one poll).
+            Some((seq, reported)) if seq == missing => {
+                if reported {
+                    return;
+                }
+                self.stepped_gap_logged = Some((missing, true));
+            }
+            // A new gap (or the gap moved): start over, say nothing yet.
+            _ => {
+                self.stepped_gap_logged = Some((missing, false));
+                return;
+            }
+        }
+        tracing::error!(
+            missing_seq = missing,
+            lowest_buffered = lowest,
+            buffered = self.pending_drives.len(),
+            "stepped clock: the engine is idle with drives buffered behind a missing \
+             enqueue seq. The wall-clock stall watchdog is disabled in stepped mode; \
+             an enqueuer that is a registered actor would have been caught by the \
+             quiescence barrier, so this gap belongs to an unregistered thread \
+             (DETERMINISM.md T1 §3)"
+        );
+    }
+
+    /// Stepped mode: block until every registered actor is parked, reporting a
+    /// [`Finding::QuiescenceTimeout`] if one never does.
+    ///
+    /// An actor that never parks cannot be waited out — it would hang the
+    /// engine — and it cannot be stepped over either, because whatever it is
+    /// about to do belongs at the current instant. So the engine reports it
+    /// loudly and carries on with a *degraded* guarantee: the finding is the
+    /// marker that this run is no longer reproducible.
+    fn await_actor_quiescence(&mut self) {
+        if self.quiescence_stalled {
+            return; // already reported; do not re-wait the full timeout
+        }
+        match virtual_clock::await_quiescence(self.quiescence_timeout) {
+            virtual_clock::Quiescence::Reached { .. } => {}
+            virtual_clock::Quiescence::Stalled { actors } => {
+                tracing::error!(
+                    ?actors,
+                    "stepped clock: actor(s) never parked at a virtual deadline; \
+                     virtual time is advancing without them and this run is NOT \
+                     reproducible (DETERMINISM.md T1 §4)"
+                );
+                self.quiescence_stalled = true;
+                self.report_finding(Finding::QuiescenceTimeout { actors });
+            }
+        }
+    }
+
+    /// Stepped mode: the next virtual instant anything is waiting for — the
+    /// earlier of the wheel head and the earliest pending park deadline across
+    /// every waiter (registered actor or not; an unregistered waiter cannot
+    /// hold time back, but it must still be released).
+    fn next_virtual_deadline(&self) -> Option<u64> {
+        let wheel = self.wheel.peek().map(|&Reverse(head)| head.deadline_us);
+        let parked = virtual_clock::scheduler_state().next_deadline_us;
+        match (wheel, parked) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -1672,6 +2087,8 @@ impl EngineCore {
     /// drive-gap stall check. `None` parks indefinitely (empty wheel, no
     /// gap). The virtual clock is only read while the wheel is non-empty,
     /// so a timer-free system never requires `virtual_clock::init`.
+    ///
+    /// Free-running only — stepped mode uses [`Self::next_virtual_deadline`].
     fn next_wall_wait_us(&self) -> Option<u64> {
         let wheel_wait = self.wheel.peek().map(|&Reverse(head)| {
             let now = virtual_clock::virtual_us();
@@ -1702,6 +2119,7 @@ impl EngineCore {
 pub struct EngineHandle {
     link: EngineLink,
     diagnostics: Arc<Mutex<Diagnostics>>,
+    event_log: EventLog,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1710,7 +2128,9 @@ impl EngineHandle {
     /// resolution pass **and** the initial stream-routing pass run
     /// synchronously *before* the thread starts, so never-driven nets are
     /// reported and routing findings (`StreamMismatch`) are populated by the
-    /// time this returns — before any traffic.
+    /// time this returns — before any traffic. Those two passes therefore land
+    /// in `event_log` from the *calling* thread, which is still single-writer:
+    /// the engine thread does not exist yet.
     ///
     /// # Panics
     /// Panics if the OS refuses to spawn the engine thread.
@@ -1718,6 +2138,8 @@ impl EngineHandle {
         resolver: Resolver,
         nets: Vec<Net>,
         solver: Box<dyn ClusterSolver>,
+        event_log: EventLog,
+        quiescence_timeout: Option<Duration>,
     ) -> Self {
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
@@ -1757,6 +2179,11 @@ impl EngineHandle {
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
             drive_stall: None,
+            clock_released: false,
+            quiescence_stalled: false,
+            quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
+            stepped_gap_logged: None,
+            event_log: event_log.clone(),
         };
         core.resolve_and_publish();
         // Byte pipes are derived from net resolution, never installed
@@ -1773,8 +2200,11 @@ impl EngineHandle {
                 tx: Some(tx),
                 drive_seq: Arc::new(AtomicU64::new(0)),
                 states,
+                // Live path: drives go to the engine, never to a log.
+                recorded_drives: None,
             },
             diagnostics,
+            event_log,
             join: Some(join),
         }
     }
@@ -1782,6 +2212,20 @@ impl EngineHandle {
     /// Cloneable client link for attaching components.
     pub(crate) fn link(&self) -> EngineLink {
         self.link.clone()
+    }
+
+    /// Tell the engine the system is fully assembled, so a **stepped** clock
+    /// may begin advancing ([`Command::ReleaseTime`]). Called once by
+    /// `System::start` after every component has attached and started; a no-op
+    /// in free-running mode.
+    pub(crate) fn release_time(&self) {
+        self.link.send(Command::ReleaseTime);
+    }
+
+    /// Handle to this engine's determinism event log (`crate::event_log`).
+    /// Reads empty when the log was never enabled.
+    pub fn event_log(&self) -> EventLog {
+        self.event_log.clone()
     }
 
     /// Most recently published state of one net.
@@ -1910,7 +2354,13 @@ mod tests {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e1 = resolver.add_endpoint(0, PinRef::new("U2", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let log = sense_log(&handle, NetId(0));
 
         // seq 1 arrives FIRST; the engine must hold it until seq 0 lands.
@@ -1958,7 +2408,13 @@ mod tests {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e1 = resolver.add_endpoint(0, PinRef::new("U2", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let log = sense_log(&handle, NetId(0));
 
         let link = handle.link();
@@ -1995,7 +2451,13 @@ mod tests {
         let e_a = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e_a2 = resolver.add_endpoint(0, PinRef::new("U3", "1"), None);
         let e_b = resolver.add_endpoint(1, PinRef::new("U2", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let link = handle.link();
 
         // Sense on net A: on High, snapshot net B (must still be un-driven —
@@ -2074,7 +2536,13 @@ mod tests {
         resolver.add_power_source(0, f64::NAN);
         resolver.add_digital_sense(0);
         let e1 = resolver.add_endpoint(1, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let rail_log = sense_log(&handle, NetId(0));
         let sig_log = sense_log(&handle, NetId(1));
 
@@ -2115,7 +2583,13 @@ mod tests {
         let mut resolver = Resolver::new(2, Dsu::new(2));
         resolver.add_power_source(0, f64::NAN);
         let e1 = resolver.add_endpoint(1, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let link = handle.link();
 
         let deliveries = Arc::new(AtomicU64::new(0));
@@ -2223,6 +2697,209 @@ mod tests {
             "agreeing source must not escalate"
         );
         assert_eq!(net_table[0].state, NetState::Driven(Level::High));
+    }
+
+    /// One recorded source list: `(volts, impedance)` per [`ClusterSource`], in
+    /// the order the resolver handed them to the solver.
+    type SourceList = Vec<(Volts, Ohms)>;
+
+    /// Accumulated source lists, one per solver call.
+    type SourceListLog = Arc<StdMutex<Vec<SourceList>>>;
+
+    /// Records the exact [`ClusterSource`] list the resolver hands the solver
+    /// — i.e. the accumulation order of `matrix[c][c] += g` / `rhs[c] += i` —
+    /// then defers to the real solver so states stay meaningful.
+    struct SourceOrderSolver {
+        seen: SourceListLog,
+    }
+
+    impl ClusterSolver for SourceOrderSolver {
+        fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
+            self.seen.lock().unwrap().push(
+                inputs
+                    .sources
+                    .iter()
+                    .map(|s| (s.volts, s.impedance))
+                    .collect(),
+            );
+            QuasiStaticMna.solve(cluster, inputs)
+        }
+    }
+
+    /// Build one conduction cluster of `drivers` agreeing push-pull drivers
+    /// (each on its own net, distinct impedances so the recorded source list
+    /// is a distinguishable permutation) plus one analog sense that forces
+    /// the cluster through the solver.
+    fn one_cluster_many_drivers(drivers: usize) -> (Resolver, Vec<Net>) {
+        let count = drivers + 1;
+        let mut resolver = Resolver::new(count, Dsu::new(count));
+        for i in 0..drivers {
+            resolver.add_endpoint(
+                i,
+                PinRef::new("U1", "1"),
+                Some(TheveninDrive {
+                    volts: 3.3,
+                    // Distinct, non-round impedances: the recorded list is
+                    // only a fingerprint of iteration order if its entries
+                    // are distinguishable.
+                    impedance: 25.0 + i as f64,
+                }),
+            );
+        }
+        // Chain every net into ONE conduction cluster. All drivers agree on
+        // level, so this is not the contention fast path.
+        for i in 0..drivers {
+            resolver.add_edge(i, i + 1, 10.0);
+        }
+        // An analog sense in a sourced cluster always escalates to the solver
+        // (`resolve`, "escalation beyond driver roots").
+        resolver.add_analog_sense(drivers);
+        (resolver, nets(count))
+    }
+
+    /// The per-cluster source list must be assembled by walking the **dense**
+    /// drive table, so its order is endpoint order and nothing else. It used
+    /// to be built by iterating `net_drivers.values()` — a `HashMap` — and
+    /// that `Vec` order is the float accumulation order inside
+    /// [`QuasiStaticMna::solve`] (`DETERMINISM.md`, "One real hash-order
+    /// defect").
+    ///
+    /// This is the *direct* regression gate for the fix: it asserts the exact
+    /// permutation rather than a downstream numeric consequence. With eight
+    /// distinguishable sources, a `HashMap` iteration order that happened to
+    /// come out ascending is a 1-in-8! (≈ 2.5e-5) fluke, so a reintroduced
+    /// hash walk fails here in-process — which bit-exactness alone cannot do
+    /// (see the sibling test).
+    #[rstest]
+    #[case::two(2)]
+    #[case::three(3)]
+    #[case::eight(8)]
+    fn cluster_sources_follow_dense_endpoint_order(#[case] drivers: usize) {
+        let seen: SourceListLog = Arc::new(StdMutex::new(Vec::new()));
+        let solver = SourceOrderSolver {
+            seen: Arc::clone(&seen),
+        };
+
+        let (mut resolver, mut net_table) = one_cluster_many_drivers(drivers);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &solver);
+
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the analog sense must escalate exactly one cluster; got {recorded:?}"
+        );
+        let expected: SourceList = (0..drivers).map(|i| (3.3, 25.0 + i as f64)).collect();
+        assert_eq!(
+            recorded[0], expected,
+            "cluster sources must arrive in dense endpoint order, not hash order"
+        );
+    }
+
+    /// The numeric consequence of the ordering fix: a cluster whose sources
+    /// **share one MNA supernode** solves to a **bit-identical** node voltage
+    /// across many repeated resolutions.
+    ///
+    /// Two things about this are worth recording, because both correct a
+    /// prediction in `DETERMINISM.md`:
+    ///
+    /// 1. **The defect needed sources on the same supernode**, not merely two
+    ///    sources in a cluster. Order only reaches a float through the
+    ///    accumulations `matrix[c][c] += g` / `rhs[c] += i`
+    ///    ([`QuasiStaticMna::solve`]), so it takes ≥ 2 sources on distinct
+    ///    identity roots that a **0 Ω conduction edge** merges into one
+    ///    supernode — which is exactly this topology. Sources on separate
+    ///    supernodes each stamp their own diagonal and cannot disagree.
+    /// 2. **In-process repetition does catch it.** The doc predicted it could
+    ///    not, on the theory that one process shares one `HashMap` seed. That
+    ///    is not how `std` behaves: `RandomState::new` bumps its thread-local
+    ///    key on *every* `HashMap::new`, and `resolve` builds a fresh
+    ///    `net_drivers` map per call — so the iteration order varied per pass,
+    ///    and this test failed 12/12 processes with the defect in place
+    ///    (observed spread: 4 distinct bit patterns, ~4 ULP around
+    ///    2.894382877392857 V). Multi-process comparison stays worthwhile for
+    ///    hash order held in a *long-lived* map and for cross-architecture
+    ///    float differences, but it is not the only net that catches this.
+    #[rstest]
+    fn repeated_resolutions_of_a_multi_source_cluster_are_bit_identical() {
+        // Six agreeing drivers at awkward (volts, Ω), each on its own net,
+        // all merged into ONE supernode by 0 Ω edges — so every driver's
+        // Norton conductance and injection accumulate into the same
+        // `matrix[c][c]` / `rhs[c]`. A 0 V rail 37 Ω away escalates the
+        // cluster, and the solved voltage has a full mantissa to disagree in.
+        let build = || {
+            let mut resolver = Resolver::new(7, Dsu::new(7));
+            let drivers = [
+                (3.31, 23.7),
+                (3.29, 31.1),
+                (3.27, 47.3),
+                (3.33, 19.9),
+                (3.19, 29.3),
+                (3.23, 41.7),
+            ];
+            for (i, (volts, impedance)) in drivers.into_iter().enumerate() {
+                resolver.add_endpoint(
+                    i,
+                    PinRef::new("U1", "1"),
+                    Some(TheveninDrive { volts, impedance }),
+                );
+            }
+            for i in 0..5 {
+                resolver.add_edge(i, i + 1, 0.0);
+            }
+            resolver.add_edge(5, 6, 37.0);
+            resolver.add_power_source(6, 0.0);
+            (resolver, nets(7))
+        };
+
+        let sources_seen: SourceListLog = Arc::new(StdMutex::new(Vec::new()));
+        let solver = SourceOrderSolver {
+            seen: Arc::clone(&sources_seen),
+        };
+
+        let mut first: Option<Volts> = None;
+        for pass in 0..64 {
+            let (mut resolver, mut net_table) = build();
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &solver);
+            let NetState::Analog(volts) = net_table[0].state else {
+                panic!(
+                    "pass {pass}: the cluster must solve numerically, got {:?}",
+                    net_table[0].state
+                );
+            };
+            match first {
+                None => first = Some(volts),
+                Some(expected) => assert!(
+                    volts.total_cmp(&expected).is_eq(),
+                    "pass {pass}: node voltage drifted from {expected:?} to {volts:?} \
+                     — resolution is not a pure function of the drive table"
+                ),
+            }
+        }
+
+        // Not vacuous: every pass really did put ≥ 2 sources through the
+        // solver, in dense endpoint order. Without this the test could pass on
+        // a topology that never escalates, or one whose cluster carries a
+        // single source (no accumulation order to get wrong).
+        let recorded = sources_seen.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 64, "every pass must escalate exactly once");
+        let expected: SourceList = vec![
+            (3.31, 23.7),
+            (3.29, 31.1),
+            (3.27, 47.3),
+            (3.33, 19.9),
+            (3.19, 29.3),
+            (3.23, 41.7),
+            (0.0, 0.0), // the ideal rail, appended after the drivers
+        ];
+        for (pass, sources) in recorded.iter().enumerate() {
+            assert_eq!(
+                *sources, expected,
+                "pass {pass}: source order must be dense endpoint order"
+            );
+        }
     }
 
     /// A `net_stuck` fault fighting a power rail on the SAME root is two
@@ -2337,6 +3014,8 @@ mod tests {
             Resolver::new(0, Dsu::new(0)),
             Vec::new(),
             Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
         )
     }
 
@@ -2459,7 +3138,13 @@ mod tests {
         virtual_clock::init(1.0, 1_000_000);
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let log = wake_log(&handle, ComponentId(0));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2497,7 +3182,13 @@ mod tests {
     fn missing_drive_seq_is_skipped_after_a_bounded_wait() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let link = handle.link();
 
         // Reserve seq 0 and "die" before sending it; seq 1 arrives normally.
@@ -2534,7 +3225,13 @@ mod tests {
     fn sense_callback_panic_is_contained_and_reported() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
-        let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
         let link = handle.link();
 
         link.send(Command::RegisterSense {
@@ -2699,7 +3396,13 @@ mod tests {
         resolver.add_edge(0, 1, 47.0);
         resolver.add_stream_pin(p, 0, producer(300), PinRef::new("U1", "15"));
         resolver.add_stream_pin(c, 1, consumer(300), PinRef::new("U2", "16"));
-        let handle = EngineHandle::spawn(resolver, nets(2), Box::new(QuasiStaticMna));
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(2),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
 
         // One write larger than the cap: the excess sheds, loudly.
         handle.link().send(Command::StreamWrite {

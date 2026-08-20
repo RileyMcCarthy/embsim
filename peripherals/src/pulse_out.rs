@@ -371,11 +371,13 @@ fn register<F: ?Sized>(slot: &Mutex<Vec<Option<Box<F>>>>, channel: usize, cb: Bo
     cbs[channel] = Some(cb);
 }
 
+/// Park the pulse-train thread for one span of virtual time.
+///
+/// Thin alias for [`embsim_core::virtual_clock::wait_virtual_us`] — kept so
+/// the pulse-train loop reads in its own vocabulary, but the wait itself lives
+/// in the clock's single chokepoint (`DETERMINISM.md` T1 §5).
 fn sleep_virtual_us(virtual_us: u64) {
-    let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(virtual_us);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    embsim_core::virtual_clock::wait_virtual_us(virtual_us);
 }
 
 // ============================================================
@@ -756,13 +758,20 @@ mod tests {
             elapsed + 1 >= ideal_us,
             "finished too early: elapsed={elapsed}us ideal={ideal_us}us"
         );
-        // Upper bound: a few poll ticks of overshoot is fine; not multi-second hang.
-        let max_us = ideal_us
-            .saturating_add(5_000)
-            .saturating_add(POLL_TICK_US * 20);
+        // Upper bound: this catches a hang or a runaway integration, NOT
+        // scheduling jitter. `run()` sleeps `POLL_TICK_US` of *virtual* time
+        // per poll, and the virtual clock is scaled wall time
+        // (`DETERMINISM.md`, "why timing assertions are tier-dependent"), so
+        // on a contended runner every sleep overshoots and the measured
+        // elapsed virtual time inflates without anything being wrong — a
+        // tight bound here fails on a busy CI box while passing locally.
+        // Precision belongs to the strict assertions above (exact emitted
+        // count, and cannot-finish-early); this one only has to notice
+        // "never finished". Under the stepped clock this can become exact.
+        let max_us = ideal_us.saturating_mul(4).saturating_add(1_000_000);
         assert!(
             elapsed <= max_us,
-            "finished too late: elapsed={elapsed}us max={max_us}us"
+            "finished too late (hang?): elapsed={elapsed}us max={max_us}us"
         );
     }
 

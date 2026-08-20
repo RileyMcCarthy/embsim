@@ -175,6 +175,17 @@ impl ClusterSolver for QuasiStaticMna {
         let n = cluster.nodes.len();
 
         // Cluster-local dense index per node (first occurrence wins).
+        //
+        // hash-order: `node_index` is keyed access only (`get`, `entry`, index)
+        // and is never iterated. Everything downstream — `dsu`, `edges`,
+        // `sources`, `reachable`, `compact`, and the returned `node_states` —
+        // is built by walking `cluster.nodes` / `cluster.resistors` /
+        // `inputs.sources`, all `Vec`s, so the whole solve is a pure function of
+        // those slices *in their given order*. That last clause is why the
+        // resolver must hand `inputs.sources` over in a canonical order: the
+        // `matrix[c][c] += g` / `rhs[c] += i` accumulation below is where source
+        // order becomes float rounding (`DETERMINISM.md`, "One real hash-order
+        // defect").
         let mut node_index: HashMap<NetId, usize> = HashMap::with_capacity(n);
         for (i, &id) in cluster.nodes.iter().enumerate() {
             node_index.entry(id).or_insert(i);

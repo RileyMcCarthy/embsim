@@ -5,9 +5,41 @@
 //! with a named error, and the test suite carries one fixture per supported
 //! KiCad major (`tests/fixtures/`).
 //!
-//! Slice status: the shared declaration types are final; [`parse`] and the
-//! hand-written s-expression tokenizer (no external deps) are the follow-up
-//! parser slice.
+//! Both flat and **hierarchical** (multi-sheet) exports are supported: the
+//! reference fixtures are `ds2_addon.net` (flat, one sheet) and
+//! `mad_edge.net` (three sheets, 168 components / 243 nets). Hierarchical
+//! designs bring two extra concerns, both handled here:
+//!
+//! - components carry a `(sheetpath (names "/MaD_Edge_Sheet2/"))` naming the
+//!   sheet instance they were placed on ([`ComponentDecl::sheetpath`]);
+//! - **local labels are sheet-scoped**, so their nets export as
+//!   `/<sheet>/<label>` — see "Net names" below for the canonical spelling.
+//!
+//! # Net names
+//!
+//! The canonical net name is the **full exported name, sheet path included**.
+//! [`normalize_net_name`] only canonicalizes overline syntax on the leaf; it
+//! never strips the path. Rationale and the display-only helpers are on
+//! [`normalize_net_name`], [`net_sheet_path`], and [`net_short_label`].
+//!
+//! # Deliberately ignored export forms
+//!
+//! These appear in every real export and carry no engine meaning:
+//!
+//! - `(design …)` — source path, export date, per-sheet title blocks. The
+//!   absolute source path and the timestamp differ on every re-export, which
+//!   is why fixture checks compare parsed *shape*, never bytes.
+//! - `(libparts …)` / `(libraries …)` — per-symbol pin tables and library
+//!   search paths. Pin identity and electrical descriptors come from a
+//!   component's own [`crate::component::PinDecl`] facade, not from the
+//!   schematic symbol, so the symbol's `(pin (num …) (name …) (type …))` rows
+//!   are not authoritative here.
+//! - comp `(datasheet …)`, `(description …)`, `(fields …)`, and every
+//!   `(property …)` except `dnp` — BOM and documentation metadata
+//!   (`LCSC`, `DIGIKEY`, `Height`, `ki_keywords`, …).
+//! - `(tstamps …)`, both at comp level and inside `(sheetpath …)` — UUID
+//!   instance paths. Sheet *names* are already unique per sheet instance, so
+//!   the UUIDs add nothing structural.
 
 use std::fmt;
 
@@ -29,7 +61,10 @@ pub struct ComponentDecl {
     pub lib: String,
     /// Libsource part name (`"C_Small"`), pre-normalization.
     pub part: String,
-    /// Hierarchical sheet path (`"/"` for flat designs).
+    /// Hierarchical sheet-instance path the symbol was placed on (`"/"` for
+    /// the root sheet, `"/MaD_Edge_Sheet2/"` for a sub-sheet). Taken from
+    /// `(sheetpath (names …))`; the companion `(tstamps …)` UUID path is
+    /// ignored because sheet names are already unique per instance.
     pub sheetpath: String,
     /// True when the KiCad `dnp` property is set (the `value == "X"` consumer
     /// convention is applied at classification time, not here).
@@ -45,6 +80,15 @@ pub struct NodeDecl {
     pub pin: String,
     /// KiCad pinfunction alias (`"AIN0"`), when the symbol names the pin.
     pub pinfunction: Option<String>,
+    /// KiCad electrical pin type from the *schematic symbol* (`"passive"`,
+    /// `"power_in"`, `"tri_state"`, `"open_collector"`, and the
+    /// `"+no_connect"`-suffixed variants), when the export carries one.
+    ///
+    /// **Informational only.** The engine's electrical descriptors come from
+    /// the component's own [`crate::component::PinDecl`], never from the
+    /// schematic — this is kept so diagnostics can say "the schematic marks
+    /// this pin no-connect" instead of reporting a mystery floating sense.
+    pub pintype: Option<String>,
 }
 
 /// One `(net …)` entry from the netlist's `(nets …)` section.
@@ -52,7 +96,9 @@ pub struct NodeDecl {
 pub struct NetDecl {
     /// Netlist net code (`"6"`).
     pub code: String,
-    /// Net name (`"AIN0"`).
+    /// Net name exactly as exported — sheet path included for sheet-scoped
+    /// local labels (`"AIN0"`, `"/MaD_Edge_Sheet2/IFG_RX"`). Canonicalize
+    /// with [`normalize_net_name`]; never strip the path.
     pub name: String,
     /// Member pins.
     pub nodes: Vec<NodeDecl>,
@@ -187,7 +233,11 @@ fn parse_sexp(input: &str) -> Result<Sexp, NetlistError> {
 /// `parse_quoted` consumes its bytes directly.
 fn skip_ws(bytes: &[u8], pos: &mut usize) {
     loop {
-        while *pos < bytes.len() && (bytes[*pos] as char).is_whitespace() {
+        // ASCII-only whitespace on purpose: s-expression whitespace is ASCII,
+        // and a byte-wise `as char` test would treat UTF-8 continuation bytes
+        // (0xA0 in many 2- and 3-byte sequences) as NBSP whitespace and split
+        // a multi-byte atom in half.
+        while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
             *pos += 1;
         }
         if bytes.get(*pos) == Some(&b';') {
@@ -228,25 +278,34 @@ fn parse_list(bytes: &[u8], pos: &mut usize) -> Result<Sexp, NetlistError> {
     }
 }
 
+/// Consume a quoted atom.
+///
+/// Accumulates **bytes** and decodes once at the close quote: real exports
+/// carry multi-byte UTF-8 inside quoted atoms (`"470 µF"`, `"60 mΩ@10V"`,
+/// `"±20%"`), and a per-byte `as char` push would transliterate each
+/// continuation byte into its own Latin-1 character (`µ` → `Âµ`) — which for a
+/// value field such as `"4µ7"` would then defeat
+/// [`crate::registry::parse_passive_value`]'s `µ` multiplier.
 fn parse_quoted(bytes: &[u8], pos: &mut usize) -> Result<Sexp, NetlistError> {
     *pos += 1; // consume opening quote
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     while let Some(&b) = bytes.get(*pos) {
         match b {
             b'"' => {
                 *pos += 1;
-                return Ok(Sexp::Atom(out));
+                return Ok(Sexp::Atom(String::from_utf8_lossy(&out).into_owned()));
             }
             b'\\' => {
-                // KiCad escapes quotes and backslashes inside quoted atoms.
+                // KiCad escapes quotes and backslashes inside quoted atoms;
+                // only ASCII is ever escaped, so the escapee is one byte.
                 *pos += 1;
                 if let Some(&esc) = bytes.get(*pos) {
-                    out.push(esc as char);
+                    out.push(esc);
                     *pos += 1;
                 }
             }
             _ => {
-                out.push(b as char);
+                out.push(b);
                 *pos += 1;
             }
         }
@@ -259,7 +318,8 @@ fn parse_quoted(bytes: &[u8], pos: &mut usize) -> Result<Sexp, NetlistError> {
 fn parse_bare(bytes: &[u8], pos: &mut usize) -> Sexp {
     let start = *pos;
     while let Some(&b) = bytes.get(*pos) {
-        if b == b'(' || b == b')' || b == b'"' || (b as char).is_whitespace() {
+        // ASCII-only whitespace, for the reason given in `skip_ws`.
+        if b == b'(' || b == b')' || b == b'"' || b.is_ascii_whitespace() {
             break;
         }
         *pos += 1;
@@ -380,10 +440,12 @@ fn parse_net(net: &Sexp) -> Result<NetDecl, NetlistError> {
             })?
             .to_string();
         let pinfunction = node.child_arg("pinfunction").map(str::to_string);
+        let pintype = node.child_arg("pintype").map(str::to_string);
         nodes.push(NodeDecl {
             reference,
             pin,
             pinfunction,
+            pintype,
         });
     }
 
@@ -391,6 +453,9 @@ fn parse_net(net: &Sexp) -> Result<NetDecl, NetlistError> {
 }
 
 /// Normalize KiCad overline pin-name syntax: `~{RESET}` ≡ `~RESET`.
+///
+/// Pin identities never contain a sheet path; for **net** names use
+/// [`normalize_net_name`], which applies this to the leaf label only.
 pub fn normalize_pin_name(name: &str) -> String {
     match name
         .strip_prefix("~{")
@@ -399,6 +464,80 @@ pub fn normalize_pin_name(name: &str) -> String {
         Some(inner) => format!("~{inner}"),
         None => name.to_string(),
     }
+}
+
+// ============================================================
+// Net names (hierarchical sheets)
+// ============================================================
+
+/// Canonicalize an exported net name.
+///
+/// **The canonical name is the full exported name, sheet path included.** A
+/// KiCad local label is scoped to the sheet instance it was drawn on and
+/// exports as `/<sheet>/<label>` (`/MaD_Edge_Sheet2/IFG_RX`), while global
+/// labels, power symbols, and root-sheet labels export bare (`GND`, `+3.3V`,
+/// `P16`). This function keeps the path verbatim and only rewrites overline
+/// syntax on the **leaf** label, so `/Sheet2/~{OE}` becomes `/Sheet2/~OE`
+/// while a bare `~{RESET}` net normalizes exactly as
+/// [`normalize_pin_name`] always did.
+///
+/// The path is **never** stripped. Two sheets may carry the same leaf label —
+/// `/Sheet2/SIGNAL` and `/Sheet3/SIGNAL` are two electrically distinct nets —
+/// so stripping would collapse them to one name and hand every name-keyed
+/// lookup (scenario `net_stuck`, diagnostics, dumps) a silent cross-sheet
+/// merge. That is precisely the failure mode the design's "no implicit
+/// net-name merging" rule exists to prevent, and it would be invisible: the
+/// nets stay separate in the graph while every human-readable artifact claims
+/// they are one. [`net_short_label`] provides the shortened spelling for
+/// display, where ambiguity is cosmetic rather than structural.
+pub fn normalize_net_name(name: &str) -> String {
+    match net_sheet_path(name) {
+        Some(path) => format!(
+            "{path}{leaf}",
+            leaf = normalize_pin_name(&name[path.len()..])
+        ),
+        None => normalize_pin_name(name),
+    }
+}
+
+/// The sheet-instance prefix of a sheet-scoped net name, both slashes
+/// included (`"/MaD_Edge_Sheet2/"` for `"/MaD_Edge_Sheet2/IFG_RX"`), or
+/// `None` for a globally-scoped name (`"GND"`).
+///
+/// Recognized only when the name starts with `/`, so a label that merely
+/// contains a slash (`"A/B"` drawn on the root sheet) is not mistaken for a
+/// path. Nested sheets keep their whole prefix (`"/Top/Inner/"`), and a name
+/// that is just `"/GND"` yields the root path `"/"`.
+pub fn net_sheet_path(name: &str) -> Option<&str> {
+    if !name.starts_with('/') {
+        return None;
+    }
+    name.rfind('/').map(|i| &name[..=i])
+}
+
+/// Display-only leaf label of a net name: the segment after the sheet path
+/// (`"IFG_RX"` for `"/MaD_Edge_Sheet2/IFG_RX"`, `"GND"` for `"GND"`).
+///
+/// **Not an identity.** Leaf labels are not unique across sheets — identify a
+/// net by its full name or by [`crate::net::NetId`], and use this only where
+/// a shorter label is wanted for a human (trace views, dumps, log lines).
+pub fn net_short_label(name: &str) -> &str {
+    match net_sheet_path(name) {
+        Some(path) => &name[path.len()..],
+        None => name,
+    }
+}
+
+/// True for KiCad's synthesized net names: `Net-(U1-TX)` for an unlabeled net
+/// and `unconnected-(U9-NC-Pad1)` for a no-connect stub.
+///
+/// A *naming* heuristic with no electrical meaning — callers use it to keep
+/// expected single-pin stubs out of the findings noise (in the reference
+/// hierarchical fixture all 47 `unconnected-(…)` nets have exactly one node
+/// whose [`NodeDecl::pintype`] carries `no_connect`).
+pub fn is_autogenerated_net_name(name: &str) -> bool {
+    let leaf = net_short_label(name);
+    leaf.starts_with("Net-(") || leaf.starts_with("unconnected-(")
 }
 
 #[cfg(test)]
@@ -498,5 +637,185 @@ mod tests {
             found: "Z".to_string(),
         };
         assert!(err.to_string().contains("\"Z\""));
+    }
+
+    // --------------------------------------------------------
+    // Hierarchical sheets: net names
+    // --------------------------------------------------------
+
+    /// Two sheets, each with a local label spelled `SIGNAL`, plus one global
+    /// net. The shape the canonical-naming decision has to survive.
+    const TWO_SHEET_NETLIST: &str = r#"(export (version "E")
+        (components
+          (comp (ref "R1") (value "10k")
+            (libsource (lib "Device") (part "R_Small"))
+            (sheetpath (names "/Sheet2/") (tstamps "/1111/"))
+            (tstamps "00000000-0000-0000-0000-000000000001"))
+          (comp (ref "R2") (value "10k")
+            (libsource (lib "Device") (part "R_Small"))
+            (sheetpath (names "/Sheet3/") (tstamps "/2222/"))
+            (tstamps "00000000-0000-0000-0000-000000000002")))
+        (nets
+          (net (code "1") (name "/Sheet2/SIGNAL")
+            (node (ref "R1") (pin "1") (pinfunction "1") (pintype "passive")))
+          (net (code "2") (name "/Sheet3/SIGNAL")
+            (node (ref "R2") (pin "1") (pinfunction "1") (pintype "passive")))
+          (net (code "3") (name "GND")
+            (node (ref "R1") (pin "2") (pinfunction "2") (pintype "passive"))
+            (node (ref "R2") (pin "2") (pinfunction "2") (pintype "passive")))))"#;
+
+    #[rstest]
+    #[case::sheet_scoped("/MaD_Edge_Sheet2/IFG_RX", Some("/MaD_Edge_Sheet2/"), "IFG_RX")]
+    #[case::nested("/Top/Inner/CLK", Some("/Top/Inner/"), "CLK")]
+    #[case::global("GND", None, "GND")]
+    #[case::power("+3.3V", None, "+3.3V")]
+    #[case::autogen("Net-(U1-TX)", None, "Net-(U1-TX)")]
+    // A label that merely contains a slash is not a path (no leading `/`).
+    #[case::slash_in_label("A/B", None, "A/B")]
+    // Degenerate: a bare leading slash is the root sheet.
+    #[case::root_only("/GND", Some("/"), "GND")]
+    #[case::empty("", None, "")]
+    fn sheet_paths_and_short_labels_split_on_the_leading_slash(
+        #[case] name: &str,
+        #[case] path: Option<&str>,
+        #[case] leaf: &str,
+    ) {
+        assert_eq!(net_sheet_path(name), path);
+        assert_eq!(net_short_label(name), leaf);
+    }
+
+    /// Canonicalization keeps the sheet path verbatim and rewrites overline
+    /// syntax on the leaf only.
+    #[rstest]
+    #[case::bare_overline("~{RESET}", "~RESET")]
+    #[case::scoped_overline("/Sheet2/~{OE}", "/Sheet2/~OE")]
+    #[case::scoped_plain("/MaD_Edge_Sheet2/IFG_RX", "/MaD_Edge_Sheet2/IFG_RX")]
+    #[case::already_normal("/Sheet2/~OE", "/Sheet2/~OE")]
+    // Overline inside an autogenerated name is not a prefix — left alone.
+    #[case::autogen_overline("Net-(U1-~{DRDY})", "Net-(U1-~{DRDY})")]
+    #[case::global("GND", "GND")]
+    fn normalize_net_name_never_strips_the_sheet_path(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(normalize_net_name(name), expected);
+    }
+
+    /// The reason the path is never stripped: same-leaf labels on two sheets
+    /// are two electrically distinct nets, and the leaf alone cannot tell
+    /// them apart.
+    #[rstest]
+    fn same_leaf_label_on_two_sheets_stays_two_distinct_nets() {
+        let parsed = parse(TWO_SHEET_NETLIST).expect("two-sheet netlist parses");
+        assert_eq!(parsed.nets.len(), 3);
+
+        let scoped: Vec<&NetDecl> = parsed
+            .nets
+            .iter()
+            .filter(|n| net_sheet_path(&n.name).is_some())
+            .collect();
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped[0].name, "/Sheet2/SIGNAL");
+        assert_eq!(scoped[1].name, "/Sheet3/SIGNAL");
+        assert_ne!(scoped[0].code, scoped[1].code);
+        assert_ne!(
+            normalize_net_name(&scoped[0].name),
+            normalize_net_name(&scoped[1].name),
+            "canonical names must stay distinct"
+        );
+
+        // Membership proves they are separate nets, not one net named twice.
+        assert_eq!(scoped[0].nodes[0].reference, "R1");
+        assert_eq!(scoped[1].nodes[0].reference, "R2");
+
+        // And the counterfactual: stripping to leaf labels collapses three
+        // names into two — the silent cross-sheet merge we refuse.
+        let canonical: std::collections::HashSet<String> =
+            parsed.nets.iter().map(|n| n.name.clone()).collect();
+        let stripped: std::collections::HashSet<&str> = parsed
+            .nets
+            .iter()
+            .map(|n| net_short_label(&n.name))
+            .collect();
+        assert_eq!(canonical.len(), 3);
+        assert_eq!(stripped.len(), 2);
+    }
+
+    #[rstest]
+    #[case::unlabeled("Net-(U1-TX)", true)]
+    #[case::no_connect("unconnected-(U9-NC-Pad1)", true)]
+    #[case::scoped_unlabeled("/Sheet2/Net-(U1-TX)", true)]
+    #[case::named("GND", false)]
+    #[case::named_lookalike("Net_Control", false)]
+    #[case::scoped_named("/MaD_Edge_Sheet2/IFG_RX", false)]
+    fn autogenerated_net_names_are_recognized(#[case] name: &str, #[case] expected: bool) {
+        assert_eq!(is_autogenerated_net_name(name), expected);
+    }
+
+    // --------------------------------------------------------
+    // Hierarchical sheets: component + node fields
+    // --------------------------------------------------------
+
+    /// `(sheetpath (names …))` is captured; the companion `(tstamps …)` and
+    /// the comp-level `(tstamps …)` are ignored by design.
+    #[rstest]
+    fn component_sheetpaths_are_captured() {
+        let parsed = parse(TWO_SHEET_NETLIST).unwrap();
+        assert_eq!(parsed.components[0].sheetpath, "/Sheet2/");
+        assert_eq!(parsed.components[1].sheetpath, "/Sheet3/");
+    }
+
+    /// A comp without `(sheetpath …)` defaults to the root sheet.
+    #[rstest]
+    fn missing_sheetpath_defaults_to_root() {
+        let input = r#"(export (version "E")
+            (components (comp (ref "R1") (value "10k")))
+            (nets))"#;
+        assert_eq!(parse(input).unwrap().components[0].sheetpath, "/");
+    }
+
+    /// `(pintype …)` is captured when present and stays `None` otherwise —
+    /// informational, so its absence is never an error.
+    #[rstest]
+    fn node_pintype_is_captured_when_present() {
+        let parsed = parse(TWO_SHEET_NETLIST).unwrap();
+        assert_eq!(parsed.nets[0].nodes[0].pintype.as_deref(), Some("passive"));
+
+        let bare = r#"(export (version "E") (components)
+            (nets (net (code "1") (name "N") (node (ref "U1") (pin "1")))))"#;
+        let node = &parse(bare).unwrap().nets[0].nodes[0];
+        assert_eq!(node.pintype, None);
+        assert_eq!(node.pinfunction, None);
+    }
+
+    /// Real exports carry multi-byte UTF-8 inside quoted atoms (`470 µF`,
+    /// `60 mΩ@10V`, `±20%`). Bytes must survive intact — a per-byte push
+    /// would turn `µ` into `Âµ` and defeat the `µ` value multiplier.
+    #[rstest]
+    fn quoted_atoms_preserve_multibyte_utf8() {
+        let input = r#"(export (version "E")
+            (components
+              (comp (ref "C1") (value "4µ7")
+                (footprint "R_0805")
+                (libsource (lib "Device") (part "C_Small") (description "470 µF ±20% 60 mΩ"))))
+            (nets))"#;
+        let comp = &parse(input).unwrap().components[0];
+        assert_eq!(comp.value, "4µ7");
+        assert_eq!(
+            crate::registry::parse_passive_value(&comp.value),
+            Some(4.7e-6)
+        );
+    }
+
+    /// An empty libsource `lib` is normal in real exports (project-local /
+    /// cached symbols) — classification keys on `part`, so it must parse
+    /// without complaint.
+    #[rstest]
+    fn empty_libsource_lib_is_accepted() {
+        let input = r#"(export (version "E")
+            (components
+              (comp (ref "IC6") (value "NSI50010YT1G")
+                (libsource (lib "") (part "NSI50010YT1G_1") (description ""))))
+            (nets))"#;
+        let comp = &parse(input).unwrap().components[0];
+        assert_eq!(comp.lib, "");
+        assert_eq!(comp.part, "NSI50010YT1G_1");
     }
 }

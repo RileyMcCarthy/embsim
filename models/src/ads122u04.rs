@@ -227,7 +227,24 @@ enum ParseState {
 }
 
 /// Main protocol loop — runs on its own thread.
+///
+/// The thread registers as an `embsim_core::virtual_clock` **actor**: in
+/// stepped clock mode the scheduler must not advance virtual time while this
+/// loop is mid-iteration, or a conversion could be emitted at an instant that
+/// depends on host scheduling (`DETERMINISM.md` T1 §4). Registration is free in
+/// free-running mode.
+///
+/// `DETERMINISM.md` T1 §4 recommends option (a) for this loop — fold it onto
+/// the engine wheel and delete the thread — and D1 did exactly that for the
+/// *component* adapter's output pump. It is deliberately **not** done for this
+/// loop: [`Ads122u04`] is a standalone model that owns a socketpair and has no
+/// engine handle (the hand-wired consumer path constructs it directly, with no
+/// board in the picture). Turning it into a pollable state machine belongs with
+/// the in-process transport of Phase D2, which is what removes the fd this loop
+/// exists to service. Option (b) — a registered actor parking on the virtual
+/// clock — is what D1 ships.
 fn protocol_loop(adc: &Ads122u04) {
+    let _actor = embsim_core::virtual_clock::register_actor("ads122u04-protocol");
     let model_fd = adc.model_fd.load(Ordering::Relaxed);
     if model_fd < 0 {
         warn!("ADS122U04: model_fd not initialized");
@@ -280,14 +297,13 @@ fn protocol_loop(adc: &Ads122u04) {
             }
         }
 
-        // Sleep briefly to avoid busy-looping. Must be substantially finer than
+        // Park briefly to avoid busy-looping. Must be substantially finer than
         // the configured conversion interval so we don't miss the 1000 SPS edge
         // (1 ms period). 250 µs gives at least 4× oversample at the fastest
-        // non-turbo rate the firmware supports.
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(250);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        // non-turbo rate the firmware supports. The cadence is virtual because
+        // the interval it oversamples is — and in stepped mode this park is
+        // where the registered actor above releases the quiescence barrier.
+        embsim_core::virtual_clock::wait_virtual_us(250);
     }
 }
 

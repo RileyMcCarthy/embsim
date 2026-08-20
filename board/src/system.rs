@@ -27,6 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::board::{Board, BoardError, PartClass};
 use crate::cluster::QuasiStaticMna;
@@ -35,8 +36,36 @@ use crate::diagnostics::{Diagnostics, Finding};
 use crate::engine::{
     ComponentId, Dsu, EndpointId, EngineHandle, EngineLink, Resolver, DEFAULT_HIGH_LEVEL_VOLTS,
 };
+use crate::event_log::EventLog;
 use crate::net::{Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
+
+// ============================================================
+// Qualified net names
+// ============================================================
+
+/// Canonicalize a dotted `Board.NETNAME` reference the way the assembly
+/// stored it: the board prefix is passed through verbatim and the net part —
+/// everything after the FIRST `.` — goes through
+/// [`crate::netlist::normalize_net_name`], so both the overline rewrite
+/// (`~{RESET}` → `~RESET`) and the sheet-scoped leaf rewrite
+/// (`/Sheet2/~{FOO}` → `/Sheet2/~FOO`) fire.
+///
+/// Splitting on the first `.` (not the last) is deliberate: board names hold
+/// no dots, while KiCad net labels legitimately do.
+///
+/// Both name-keyed lookups — [`System::named_net`] (which resolves
+/// `Scenario::net_stuck` targets) and [`SystemHandle::net_state`] — must use
+/// this, or a caller naming a net exactly as the netlist spells it silently
+/// fails to find a net that exists.
+fn normalize_qualified_net_name(path: &str) -> String {
+    match path.split_once('.') {
+        Some((board, net)) => {
+            format!("{board}.{}", crate::netlist::normalize_net_name(net))
+        }
+        None => crate::netlist::normalize_net_name(path),
+    }
+}
 
 // ============================================================
 // Harness endpoints
@@ -308,6 +337,12 @@ pub struct System {
     bench: Vec<BenchComponent>,
     harnesses: Vec<Harness>,
     scenario: Scenario,
+    /// Determinism Oracle 1 (`crate::event_log`); disabled unless
+    /// [`System::event_log`] was called.
+    event_log: EventLog,
+    /// Stepped-clock quiescence timeout override; `None` uses the engine
+    /// default. See [`System::quiescence_timeout`].
+    quiescence_timeout: Option<Duration>,
 }
 
 /// A bench component: a bare [`Component`] added to the system without a
@@ -389,6 +424,34 @@ impl System {
         self
     }
 
+    /// Enable the engine **event log** — determinism Oracle 1
+    /// (`DETERMINISM.md`, "Proving it: determinism testing"; see
+    /// [`crate::event_log`] for the record vocabulary and the normalization
+    /// contract). Off by default, and zero cost when off.
+    ///
+    /// Read the log back from [`SystemHandle::event_log`] after
+    /// [`System::start`]. The [`System::build`] analysis path has no engine and
+    /// so records nothing.
+    pub fn event_log(mut self) -> Self {
+        self.event_log = EventLog::enabled();
+        self
+    }
+
+    /// Override how long the engine waits for every registered
+    /// `embsim_core::virtual_clock` actor to park before reporting
+    /// [`Finding::QuiescenceTimeout`] and advancing anyway.
+    ///
+    /// **Stepped clock mode only**; ignored while free-running. The default
+    /// ([`crate::engine::STEPPED_QUIESCENCE_TIMEOUT`]) is deliberately
+    /// generous — reaching it means a defect, and the finding says the run is
+    /// no longer reproducible. Raise it for a consumer whose actors do heavy
+    /// work between parks; lower it in a test that means to provoke the
+    /// stall.
+    pub fn quiescence_timeout(mut self, timeout: Duration) -> Self {
+        self.quiescence_timeout = Some(timeout);
+        self
+    }
+
     /// Add an inter-board harness.
     pub fn harness(mut self, harness: Harness) -> Self {
         self.harnesses.push(harness);
@@ -427,7 +490,8 @@ impl System {
         // and schedules are traced and dropped.
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
-        let link = EngineLink::inert(states);
+        let recorded_drives = Arc::new(Mutex::new(Vec::new()));
+        let link = EngineLink::inert(Arc::clone(&states), Arc::clone(&recorded_drives));
         for mut prepared in components {
             let io =
                 ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone());
@@ -445,7 +509,36 @@ impl System {
             // and is dropped here; System::start keeps it.
         }
 
-        Ok(BuiltSystem { nets, diagnostics })
+        // Apply the drives components issued during attach, then resolve
+        // again so the published states and findings describe the system as
+        // its components actually idle it. Without this, a component that
+        // *releases* a `DigitalOut` pin (an end switch with an open contact,
+        // an open-drain output) is analyzed as if it drove the engine's
+        // idle-high default — the build pass would report `Driven(High)` on a
+        // net the live system floats, and miss the `FloatingSense` the
+        // consumer needs to see.
+        //
+        // One extra pass is enough: these are attach-time idle drives, not a
+        // feedback loop (senses are read from the snapshot, and a component
+        // cannot observe this second resolution to react to it). Live
+        // feedback is the engine's job, on the `start` path.
+        let idle_drives = std::mem::take(&mut *recorded_drives.lock().expect("never poisoned"));
+        if !idle_drives.is_empty() {
+            for (endpoint, drive) in idle_drives {
+                resolver.set_drive(endpoint, drive);
+            }
+            diagnostics = Diagnostics::new();
+            resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
+            let _ = resolver.route_streams(&nets, &mut diagnostics);
+            *states.lock().expect("never poisoned") = nets.iter().map(|n| n.state).collect();
+        }
+
+        let roots = resolver.identity_roots(nets.len());
+        Ok(BuiltSystem {
+            nets,
+            diagnostics,
+            roots,
+        })
     }
 
     /// Assemble the system and **start the live net engine**: the
@@ -459,6 +552,8 @@ impl System {
     /// see [`crate::engine`] for why joining cannot deadlock with in-flight
     /// senses).
     pub fn start(self) -> Result<SystemHandle, SystemError> {
+        let event_log = self.event_log.clone();
+        let quiescence_timeout = self.quiescence_timeout;
         let Assembly {
             nets,
             resolver,
@@ -466,7 +561,13 @@ impl System {
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
-        let engine = EngineHandle::spawn(resolver, nets, Box::new(QuasiStaticMna));
+        let engine = EngineHandle::spawn(
+            resolver,
+            nets,
+            Box::new(QuasiStaticMna),
+            event_log,
+            quiescence_timeout,
+        );
         let link = engine.link();
 
         let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
@@ -506,6 +607,13 @@ impl System {
         for (_, component) in attached.iter_mut() {
             component.start();
         }
+
+        // The system is assembled. Release the engine's hold on virtual time:
+        // under a **stepped** clock nothing may advance until every component
+        // has registered its schedules, or a second component's period would be
+        // anchored at a different instant from run to run (a no-op in
+        // free-running mode — see `engine::Command::ReleaseTime`).
+        engine.release_time();
 
         Ok(SystemHandle {
             engine,
@@ -988,7 +1096,7 @@ impl System {
 
     /// Global net index of a dotted `Board.NETNAME` reference.
     fn named_net(&self, path: &str, nets: &[Net]) -> Result<usize, SystemError> {
-        let normalized = crate::netlist::normalize_pin_name(path);
+        let normalized = normalize_qualified_net_name(path);
         nets.iter()
             .position(|n| n.name == normalized)
             .ok_or_else(|| SystemError::UnknownEndpoint {
@@ -1110,6 +1218,8 @@ fn handle_entries(pins: &[PreparedPin], link: &EngineLink) -> Vec<(String, PinHa
 pub struct BuiltSystem {
     nets: Vec<Net>,
     diagnostics: Diagnostics,
+    /// Identity root per net index (harness/pin-short merges).
+    roots: Vec<usize>,
 }
 
 impl BuiltSystem {
@@ -1117,6 +1227,42 @@ impl BuiltSystem {
     /// [`crate::net::NetId`].
     pub fn nets(&self) -> &[Net] {
         &self.nets
+    }
+
+    /// Whether two nets are the same electrical node — i.e. a harness wire
+    /// or `pin_short` merged them.
+    ///
+    /// A merge does **not** rename nets: each keeps its own board's label
+    /// (`EdgeBoard./Sheet2/IEND_U+` stays distinct from `END_U.COM` in
+    /// [`BuiltSystem::nets`]), so comparing names — or comparing resolved
+    /// [`NetState`]s, which are equal for any two floating nets whether or
+    /// not they touch — cannot answer "is this wired?". This can.
+    pub fn nets_are_merged(&self, a: NetId, b: NetId) -> bool {
+        match (self.roots.get(a.0), self.roots.get(b.0)) {
+            (Some(ra), Some(rb)) => ra == rb,
+            _ => false,
+        }
+    }
+
+    /// Index of a net by qualified name (`"Board.NETNAME"`, overline- and
+    /// sheet-normalized like the assembly stored it).
+    pub fn net_id(&self, name: &str) -> Option<NetId> {
+        let normalized = normalize_qualified_net_name(name);
+        self.nets
+            .iter()
+            .position(|n| n.name == normalized)
+            .map(NetId)
+    }
+
+    /// Whether two nets named as the netlist spells them are the same
+    /// electrical node. Returns `false` if either name is unknown — callers
+    /// asserting connectivity should check [`BuiltSystem::net_id`] first if
+    /// they want a typo to fail loudly instead of reading as "not wired".
+    pub fn names_are_merged(&self, a: &str, b: &str) -> bool {
+        match (self.net_id(a), self.net_id(b)) {
+            (Some(a), Some(b)) => self.nets_are_merged(a, b),
+            _ => false,
+        }
     }
 
     /// Findings from the build-time resolution pass (and, later, the live
@@ -1156,7 +1302,7 @@ impl SystemHandle {
     /// Most recently engine-published state of a net, by qualified system
     /// name (`"Board.NETNAME"`, overline-normalized).
     pub fn net_state(&self, name: &str) -> Option<NetState> {
-        let normalized = crate::netlist::normalize_pin_name(name);
+        let normalized = normalize_qualified_net_name(name);
         let index = self.net_names.iter().position(|n| *n == normalized)?;
         self.engine.net_state(NetId(index))
     }
@@ -1178,6 +1324,13 @@ impl SystemHandle {
     /// panic-contained, so `false` means the engine itself failed.
     pub fn engine_is_alive(&self) -> bool {
         self.engine.is_alive()
+    }
+
+    /// Handle to this system's engine event log (determinism Oracle 1 — see
+    /// [`System::event_log`] and [`crate::event_log`]). Reads empty unless the
+    /// log was enabled on the builder.
+    pub fn event_log(&self) -> EventLog {
+        self.engine.event_log()
     }
 
     /// Reference designators of the attached components, in attach order.
@@ -1354,5 +1507,31 @@ mod tests {
         );
         assert_eq!(scenario.value_overrides().len(), 1);
         assert_eq!(scenario.dnp_overrides().len(), 1);
+    }
+
+    /// A dotted reference must canonicalize exactly the way the assembly
+    /// stored the net: board prefix verbatim, net part through the net
+    /// normalizer. Naming a net the way the netlist spells it — with the
+    /// overline braces, or sheet-scoped — has to resolve, or `net_stuck`
+    /// silently misses a net that exists.
+    #[rstest]
+    #[case("DS2Addon.~{RESET}", "DS2Addon.~RESET")]
+    #[case("DS2Addon.~RESET", "DS2Addon.~RESET")]
+    #[case(
+        "EdgeBoard./MaD_Edge_Sheet2/~{IFG_RX}",
+        "EdgeBoard./MaD_Edge_Sheet2/~IFG_RX"
+    )]
+    #[case(
+        "EdgeBoard./MaD_Edge_Sheet2/IFG_RX",
+        "EdgeBoard./MaD_Edge_Sheet2/IFG_RX"
+    )]
+    // A net label containing a dot keeps everything after the FIRST dot.
+    #[case("Board.A.B", "Board.A.B")]
+    #[case("GND", "GND")]
+    fn qualified_net_names_canonicalize_like_the_assembly(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(normalize_qualified_net_name(input), expected);
     }
 }

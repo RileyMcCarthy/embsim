@@ -208,6 +208,20 @@ Release-mode smoke (timing paths):
 cargo test -p embsim-peripherals -p embsim-board --release
 ```
 
+Determinism (the `determinism` CI job). In **stepped clock mode** the board
+engine is a discrete-event simulator in virtual time, and a scenario's engine
+event log — order *and* every timestamp — is identical across runs, across
+processes, and against a blessed golden trace. Free-running (the default) is
+unchanged and is held only to the event order:
+
+```bash
+cargo test -p embsim-board --test determinism -- --nocapture
+cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
+```
+
+The design, the honest limits, and the measured numbers are in
+[`DETERMINISM.md`](DETERMINISM.md).
+
 Coverage (optional locally; published by the `coverage` CI job):
 
 ```bash

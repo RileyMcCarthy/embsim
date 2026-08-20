@@ -167,11 +167,12 @@ impl Serial {
             }
         };
 
-        let wait_v_us = end_v.saturating_sub(now_v);
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(wait_v_us);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        // The reserved slot end is an absolute virtual deadline, so this is
+        // the `wait_until` form (`DETERMINISM.md` T1 §5). Re-reading "now"
+        // inside `wait_until` can only shorten the sleep by however long the
+        // CAS above took, which lands the caller *closer* to `end_v` than the
+        // old `end_v - now_v` span did.
+        embsim_core::virtual_clock::wait_until(end_v);
     }
 
     /// Reserve a TX slot of `n` bytes; sleeps to model the firmware blocking
@@ -259,19 +260,15 @@ impl Serial {
     pub fn receive_data_timeout(&self, channel: usize, buf: &mut [u8], timeout_us: u64) -> bool {
         let count = self.count.load(Ordering::Relaxed);
         if buf.is_empty() || channel >= count {
-            let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-            if wall_us > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(wall_us));
-            }
+            // Nothing to read from: burn the caller's whole virtual timeout,
+            // exactly as a real UART with no traffic would.
+            embsim_core::virtual_clock::wait_virtual_us(timeout_us);
             return false;
         }
 
         let fd = self.fds[channel].load(Ordering::Relaxed);
         if fd < 0 {
-            let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-            if wall_us > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(wall_us));
-            }
+            embsim_core::virtual_clock::wait_virtual_us(timeout_us);
             return false;
         }
 
@@ -298,7 +295,14 @@ impl Serial {
                     if std::time::Instant::now() >= deadline {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    // Retry cadence for a spin on a REAL file descriptor, so
+                    // it is wall time by nature and stays unscaled (see
+                    // `wait_wall_us`). `DETERMINISM.md` T1 §4 has this whole
+                    // path — `Instant` deadline included — replaced by a
+                    // `QueueTransport` park in Phase D2; until then, scaling
+                    // the retry interval would only change how hard this
+                    // thread spins, not what it observes.
+                    embsim_core::virtual_clock::wait_wall_us(100);
                 }
                 Err(_) => break,
             }
