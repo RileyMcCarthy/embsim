@@ -11,12 +11,37 @@
 //!   ENA  ──┘                         └── MotorShaft::on_position_change(mm)
 //! ```
 //!
+//! # Two ways the STEP input arrives
+//!
+//! The drive is told a *rate*, not a position, and it can learn that rate two
+//! ways. Both are live at once; whichever the system description wires up wins.
+//!
+//! 1. **Edges** — the classic path. `STEP` is a plain digital input and the
+//!    plant reconstructs the rate from transition timing (below). Exact, and
+//!    the only option for a source that really does toggle a pin, but it costs
+//!    the engine one drive + resolution + sense per step.
+//! 2. **A rate-carried train** — `STEP` also declares
+//!    [`embsim_board::StreamRole::PulseSink`], so a source that publishes
+//!    [`embsim_board::PulseTrain`] segments (an
+//!    [`embsim_board::McuComponent`] with a bridged pulse-out channel) hands
+//!    the drive its frequency, direction and accumulated count **once per rate
+//!    change**. The plant folds the exact pulse count out of each segment at
+//!    read time, so a 100 kHz train costs no more engine traffic than a 1 Hz
+//!    one and the step count still matches the firmware's own view bit for
+//!    bit. This is the path that lets a consumer stop hand-wiring the
+//!    carriage; the fidelity it trades away is listed on
+//!    [`embsim_board::PulseTrain`].
+//!
+//! A rate-carried train **suspends the edge machinery**: it supplies its own
+//! rate, so the stall window ([`DEFAULT_STALL_INTERVALS`]) — which exists only
+//! to notice a *measured* train going quiet — does not apply to it. A finite
+//! train instead stops commanding exactly when its last pulse goes out.
+//!
 //! # Provenance (physics model — no datasheet)
 //!
 //! ## Governing equations
 //!
-//! The drive is told a *rate*, not a position, so the plant reconstructs the
-//! rate from **STEP edge timing** and integrates it:
+//! On the edge path the plant reconstructs the rate from **STEP edge timing**:
 //!
 //! ```text
 //!   f_step[k] = 1e6 / (t[k] − t[k−1])         steps/s, from the last two
@@ -24,6 +49,10 @@
 //!   v_cmd     = ±f_step[k]                    sign from the DIR level
 //!                                            latched at edge k
 //! ```
+//!
+//! On the rate-carried path `v_cmd = ±freq_hz` straight from the segment, with
+//! the sign from [`Config::train_direction`]. Everything downstream — the lag,
+//! the load, the observers — is identical.
 //!
 //! Motor plus carriage is a first-order velocity lag with a viscous load —
 //! `dv/dt = (v_cmd − v)/τ` — solved **exactly** over each segment of constant
@@ -102,7 +131,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, Volts,
+    AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, PulseTrain,
+    StreamRole, Volts,
 };
 use embsim_core::event::Observers;
 use embsim_core::virtual_clock;
@@ -168,6 +198,23 @@ pub enum StepEdge {
     Falling,
 }
 
+/// Where a **rate-carried** STEP train takes its direction from.
+///
+/// A pulse source that is only a step clock has no direction of its own, so
+/// the default matches the real wiring: the drive samples its own DIR input.
+/// A source that *does* stamp a direction (an MCU whose pulse channel names a
+/// direction GPIO) lets a drive with no DIR pin still count signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrainDirection {
+    /// This component's `DIR` pin, latched at every fold point — the classic
+    /// step/direction wiring.
+    #[default]
+    DirPin,
+    /// The direction the train itself carries
+    /// ([`embsim_board::PulseTrain::direction`]).
+    Train,
+}
+
 /// Step/direction drive configuration. Build with [`Config::new`] and
 /// override the fields a particular machine needs.
 #[derive(Debug, Clone)]
@@ -200,6 +247,10 @@ pub struct Config {
     /// Virtual-time cadence for [`MotorShaft::on_position_change`], or `None`
     /// for a purely pull-based plant that arms no timer at all.
     pub observe_interval_us: Option<u64>,
+    /// Where a rate-carried STEP train takes its direction from
+    /// ([`TrainDirection::DirPin`] by default). Irrelevant on the edge path,
+    /// where DIR is always latched at the edge.
+    pub train_direction: TrainDirection,
 }
 
 impl Config {
@@ -219,6 +270,7 @@ impl Config {
             max_stall_us: DEFAULT_MAX_STALL_US,
             input_threshold_volts: DEFAULT_INPUT_THRESHOLD_VOLTS,
             observe_interval_us: Some(DEFAULT_OBSERVE_INTERVAL_US),
+            train_direction: TrainDirection::DirPin,
         }
     }
 
@@ -273,7 +325,22 @@ const fn input(number: &'static str) -> PinDecl {
 /// The drive's logic inputs: `STEP`, `DIR`, `ENA` — all sensed, never driven
 /// (the drive presents high-impedance opto/receiver inputs; the board on the
 /// other side of the harness owns the drive strength).
-pub const STEPPER_PINS: [PinDecl; 3] = [input("STEP"), input("DIR"), input("ENA")];
+///
+/// `STEP` additionally declares [`StreamRole::PulseSink`], so a rate-carried
+/// train routed to that net reaches the plant without a per-step edge. The
+/// declaration is inert when nothing on the net is a pulse source: the route
+/// never forms and the edge path is what runs.
+pub const STEPPER_PINS: [PinDecl; 3] = [
+    PinDecl {
+        number: "STEP",
+        name: None,
+        kind: PinKind::DigitalIn,
+        stream: Some(StreamRole::PulseSink),
+        drive_impedance: None,
+    },
+    input("DIR"),
+    input("ENA"),
+];
 
 // ============================================================
 // Plant
@@ -299,6 +366,23 @@ struct Plant {
     /// Counted STEP edges, signed by direction — the raw *commanded* step
     /// count, independent of the plant's lag and load.
     steps: i64,
+    /// The rate-carried train currently presented on `STEP`, **exactly as it
+    /// was published** — never re-anchored. `None` on the edge path.
+    ///
+    /// Keeping the publisher's anchor is what makes the fold lossless: every
+    /// reading derives from the one `emitted_at` the source anchored, so the
+    /// integer truncation happens once instead of once per read. Re-basing on
+    /// every read would trail the true count by up to a pulse each time (see
+    /// [`embsim_board::PulseSegment::rebased_at`]).
+    train: Option<PulseTrain>,
+    /// Pulses of the current train already folded into `train_steps`,
+    /// measured from that train's own baseline. Reset when a new segment
+    /// replaces it.
+    train_folded: u64,
+    /// Signed pulses folded out of rate-carried trains — the same quantity
+    /// `steps` is for edges, kept apart so a defect in one path cannot look
+    /// like the other.
+    train_steps: i64,
     /// Last position (rounded to whole steps) published to observers.
     emitted: i64,
     /// Last projected STEP level, for edge detection.
@@ -320,6 +404,9 @@ impl Plant {
             last_edge_us: None,
             interval_us: None,
             steps: 0,
+            train: None,
+            train_folded: 0,
+            train_steps: 0,
             emitted: 0,
             step_level: None,
             // Before DIR ever presents a level the drive assumes forward;
@@ -372,10 +459,59 @@ impl MotorCore {
         Some(edge.saturating_add(window.clamp(1, self.config.max_stall_us)))
     }
 
-    /// Advance the closed form to `to_us`, splitting at the stall deadline so
-    /// each segment sees a constant commanded rate.
+    /// Sign a rate-carried train's pulses carry, per
+    /// [`Config::train_direction`].
+    fn train_sign(&self, plant: &Plant, train: &PulseTrain) -> i64 {
+        match self.config.train_direction {
+            TrainDirection::Train => train.direction.sign(),
+            TrainDirection::DirPin => {
+                if plant.forward {
+                    1
+                } else {
+                    -1
+                }
+            }
+        }
+    }
+
+    /// Commanded rate (steps/s) implied by the current rate-carried train, or
+    /// `0` while the drive is disabled.
+    fn train_rate(&self, plant: &Plant, train: &PulseTrain) -> f64 {
+        if !plant.enabled {
+            return 0.0;
+        }
+        self.train_sign(plant, train) as f64 * f64::from(train.pulses.freq_hz)
+    }
+
+    /// Virtual time (µs) at which the current rate-carried finite train emits
+    /// its last pulse.
+    fn train_end(&self, plant: &Plant) -> Option<u64> {
+        plant.train?.completes_at()
+    }
+
+    /// Advance the closed form to `to_us`, splitting wherever the commanded
+    /// rate changes on its own so each segment sees a constant `cmd`.
+    ///
+    /// Two such splits exist and they belong to the two input paths: the
+    /// edge path's stall expiry, and a rate-carried finite train's completion.
+    /// They are mutually exclusive — a train suspends the edge machinery — so
+    /// the two branches never interleave.
     fn advance(&self, plant: &mut Plant, to_us: u64) {
         if to_us <= plant.now_us {
+            return;
+        }
+        if plant.train.is_some() {
+            match self.train_end(plant) {
+                // Already finished on an earlier advance.
+                Some(end) if end <= plant.now_us => plant.cmd = 0.0,
+                // Finishes inside this advance: integrate up to it, then coast.
+                Some(end) if end < to_us => {
+                    self.fold_and_integrate(plant, end);
+                    plant.cmd = 0.0;
+                }
+                _ => {}
+            }
+            self.fold_and_integrate(plant, to_us);
             return;
         }
         match self.stall_deadline(plant) {
@@ -389,6 +525,58 @@ impl MotorCore {
             _ => {}
         }
         self.integrate(plant, to_us);
+    }
+
+    /// Fold the rate-carried train's pulses up to `to_us` into `train_steps`.
+    ///
+    /// Exact and idempotent by construction: `train_folded` records how much
+    /// of *this* segment has already been counted, and every reading comes
+    /// from the publisher's own anchor, so folding at every advance — which is
+    /// every read — can neither double-count a pulse nor miss one. The sign is
+    /// taken at fold time, which is why callers advance the plant *before*
+    /// latching a new direction.
+    fn fold(&self, plant: &mut Plant, to_us: u64) {
+        let Some(train) = plant.train else {
+            return;
+        };
+        let total = train.emitted_at(to_us).saturating_sub(train.pulses.emitted);
+        let pulses = total.saturating_sub(plant.train_folded);
+        // A disabled drive ignores the train, but the pulses still went out:
+        // consuming them here is what stops them arriving late on re-enable.
+        if plant.enabled && pulses > 0 {
+            let sign = self.train_sign(plant, &train);
+            plant.train_steps += sign * i64::try_from(pulses).unwrap_or(i64::MAX);
+        }
+        plant.train_folded = total;
+    }
+
+    /// [`Self::fold`] the train, then integrate the plant over the same span.
+    fn fold_and_integrate(&self, plant: &mut Plant, to_us: u64) {
+        self.fold(plant, to_us);
+        self.integrate(plant, to_us);
+    }
+
+    /// Present a new rate-carried train on `STEP`.
+    ///
+    /// The outgoing train is folded up to the new segment's start instant
+    /// first, so the pulses on each side of a rate (or direction) change keep
+    /// their own rate and sign — which is what makes a reversal exact.
+    fn set_train(&self, train: PulseTrain) {
+        let mut plant = self.plant.lock().unwrap();
+        // The engine may deliver later than the source acted (free-running);
+        // never rewind the plant to match.
+        let at = train.pulses.since_us.max(plant.now_us);
+        self.advance(&mut plant, at);
+        // `advance` is a no-op when `at == now_us`, so fold explicitly. It is
+        // idempotent, so doing both is safe.
+        self.fold(&mut plant, at);
+        plant.cmd = self.train_rate(&plant, &train);
+        plant.train = Some(train);
+        plant.train_folded = 0;
+        // A rate-carried train supplies its own rate, so the edge path's
+        // phase measurement (and its stall window) must not also apply.
+        plant.last_edge_us = None;
+        plant.interval_us = None;
     }
 
     /// One closed-form segment at the current `plant.cmd`.
@@ -441,14 +629,24 @@ impl MotorCore {
         };
     }
 
-    /// Latch a new DIR level. A `None` projection (floating / contended DIR)
-    /// holds the last latched direction.
-    fn set_dir(&self, level: Option<Level>) {
+    /// Latch a new DIR level at `now_us`. A `None` projection (floating /
+    /// contended DIR) holds the last latched direction.
+    ///
+    /// The plant is advanced first: on the rate-carried path that folds
+    /// everything emitted so far under the *old* direction, so a reversal
+    /// mid-train splits exactly at the instant DIR changed rather than
+    /// re-signing pulses that already went out.
+    fn set_dir(&self, now_us: u64, level: Option<Level>) {
+        let mut plant = self.plant.lock().unwrap();
+        self.advance(&mut plant, now_us);
         let Some(level) = level else {
             tracing::debug!("stepper_motor: DIR has no level; holding last latched direction");
             return;
         };
-        self.plant.lock().unwrap().forward = level == self.config.dir_forward_level;
+        plant.forward = level == self.config.dir_forward_level;
+        if let Some(train) = plant.train {
+            plant.cmd = self.train_rate(&plant, &train);
+        }
     }
 
     /// Apply a new ENA level at `now_us`. Disabling ends the train: the
@@ -463,6 +661,12 @@ impl MotorCore {
             plant.interval_us = None;
         }
         plant.enabled = enabled;
+        // A rate-carried train keeps running at its source whether or not the
+        // drive is listening, so enabling mid-train picks it up at its current
+        // rate (and disabling drops it) without waiting for the next segment.
+        if let Some(train) = plant.train {
+            plant.cmd = self.train_rate(&plant, &train);
+        }
     }
 
     /// Detect a counted STEP edge from a new net state.
@@ -555,12 +759,25 @@ impl MotorShaft {
         self.core.read("velocity_counts_per_s", |plant| plant.vel)
     }
 
-    /// Counted STEP edges, signed by the direction latched at each edge — the
-    /// raw commanded step count, with no lag and no load loss. Use it when a
-    /// test needs to know what the firmware *asked* for;
-    /// [`MotorShaft::position_counts`] is what the machine *did*.
+    /// Commanded step count with no lag and no load loss — counted STEP edges
+    /// signed by the direction latched at each edge, **plus** the pulses
+    /// folded out of any rate-carried train. Use it when a test needs to know
+    /// what the firmware *asked* for; [`MotorShaft::position_counts`] is what
+    /// the machine *did*.
+    ///
+    /// On the rate-carried path this is exact: the fold uses the same integer
+    /// arithmetic the pulse-out peripheral hands the firmware.
     pub fn commanded_steps(&self) -> i64 {
-        self.core.plant.lock().unwrap().steps
+        self.core
+            .read("commanded_steps", |plant| plant.steps + plant.train_steps)
+    }
+
+    /// The rate-carried train currently presented on `STEP`, exactly as the
+    /// source published it; `None` on the edge path. A test asserting *what
+    /// was published* (rather than what the plant integrated to) reads it
+    /// here.
+    pub fn train(&self) -> Option<PulseTrain> {
+        self.core.read("train", |plant| plant.train)
     }
 
     /// Whether the drive is currently enabled. A floating or fought-over ENA
@@ -667,7 +884,8 @@ impl Component for StepperMotor {
         {
             let core = Arc::clone(&self.core);
             io.on_sense("DIR", move |state| {
-                core.set_dir(level_of("DIR", state, threshold));
+                let now_us = core.sample_now("DIR").unwrap_or(0);
+                core.set_dir(now_us, level_of("DIR", state, threshold));
             })?;
         }
         {
@@ -681,6 +899,13 @@ impl Component for StepperMotor {
                     None => core.plant.lock().unwrap().step_level = level,
                 }
             })?;
+        }
+        // The rate-carried path, registered last so ENA and DIR have settled
+        // before a train can be folded against them (the engine delivers the
+        // routed source's current train once at registration).
+        {
+            let core = Arc::clone(&self.core);
+            io.on_pulse("STEP", move |train| core.set_train(train))?;
         }
 
         if let Some(period_us) = self.core.config.observe_interval_us {
@@ -713,6 +938,8 @@ fn level_of(pin: &'static str, state: NetState, threshold: Volts) -> Option<Leve
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+
+    use embsim_board::{PulseDirection, PulseSegment};
 
     use super::*;
 
@@ -929,7 +1156,10 @@ mod tests {
         );
         assert!(core.plant.lock().unwrap().forward);
 
-        core.set_dir(Some(Level::Low));
+        // Bind `now` first: the guard from a `lock()` inside the argument list
+        // would live to the end of the statement and self-deadlock `set_dir`.
+        let now_us = core.plant.lock().unwrap().now_us;
+        core.set_dir(now_us, Some(Level::Low));
         assert!(!core.plant.lock().unwrap().forward, "DIR low = reverse");
 
         // Resume the train from wherever the previous one settled.
@@ -975,7 +1205,7 @@ mod tests {
             dir_forward_level: forward_level,
             ..quasi_static()
         });
-        core.set_dir(Some(dir));
+        core.set_dir(0, Some(dir));
         core.step_edge(1_000);
         assert_eq!(steps(&core), expect_sign);
     }
@@ -985,8 +1215,8 @@ mod tests {
     #[rstest]
     fn floating_dir_holds_the_last_latched_direction() {
         let core = enabled_core(quasi_static());
-        core.set_dir(Some(Level::Low));
-        core.set_dir(None);
+        core.set_dir(0, Some(Level::Low));
+        core.set_dir(0, None);
         assert!(!core.plant.lock().unwrap().forward);
         core.step_edge(1_000);
         assert_eq!(steps(&core), -1);
@@ -1217,17 +1447,34 @@ mod tests {
     // ========================================================
 
     /// The declared facade is exactly the three logic inputs, all sensed — the
-    /// drive presents high-impedance inputs and never sources the net.
+    /// drive presents high-impedance inputs and never sources the net. `STEP`
+    /// additionally declares [`StreamRole::PulseSink`] so a rate-carried train
+    /// can route to it; a motor drive is still never a *serial* endpoint.
     #[rstest]
-    fn pin_facade_is_three_sensed_inputs() {
+    #[case::step("STEP", Some(StreamRole::PulseSink))]
+    #[case::dir("DIR", None)]
+    #[case::ena("ENA", None)]
+    fn pin_facade_is_three_sensed_inputs(#[case] number: &str, #[case] role: Option<StreamRole>) {
         let motor = StepperMotor::new(Config::new(8_192.0)).expect("builds");
         let pins = motor.pins();
         assert_eq!(pins.len(), 3);
-        for (decl, expect) in pins.iter().zip(["STEP", "DIR", "ENA"]) {
-            assert_eq!(decl.number, expect);
-            assert_eq!(decl.kind, PinKind::DigitalIn);
-            assert_eq!(decl.stream, None, "a motor drive is not a serial endpoint");
-        }
+        assert_eq!(
+            pins.iter().map(|p| p.number).collect::<Vec<_>>(),
+            ["STEP", "DIR", "ENA"]
+        );
+        let decl = pins
+            .iter()
+            .find(|p| p.number == number)
+            .expect("declared pin");
+        assert_eq!(decl.kind, PinKind::DigitalIn);
+        assert_eq!(decl.stream, role);
+        assert!(
+            !matches!(
+                decl.stream,
+                Some(StreamRole::Producer { .. } | StreamRole::Consumer { .. })
+            ),
+            "a motor drive is not a serial endpoint"
+        );
     }
 
     /// The shaft is a handle onto the same plant, not a copy of it.
@@ -1242,5 +1489,215 @@ mod tests {
         assert!(shaft.enabled());
         assert!(shaft.forward());
         assert!(format!("{motor:?}").contains("MotorCore"));
+    }
+
+    // ========================================================
+    // The rate-carried path
+    // ========================================================
+
+    /// A constant-rate segment anchored at `since_us`.
+    fn train(freq_hz: u32, since_us: u64, total: Option<u64>) -> PulseTrain {
+        PulseTrain {
+            pulses: PulseSegment {
+                emitted: 0,
+                freq_hz,
+                total,
+                since_us,
+            },
+            direction: PulseDirection::Forward,
+        }
+    }
+
+    /// Advance the plant to `to_us` without any input — what a read does.
+    fn read_at(core: &MotorCore, to_us: u64) {
+        let mut plant = core.plant.lock().unwrap();
+        core.advance(&mut plant, to_us);
+    }
+
+    fn train_steps(core: &MotorCore) -> i64 {
+        core.plant.lock().unwrap().train_steps
+    }
+
+    /// One rate-carried segment yields the exact pulse count at every instant,
+    /// with **no** per-step traffic: the whole train below is one `set_train`.
+    #[rstest]
+    #[case::one_second(1_000_000, 8_192)]
+    #[case::quarter_second(250_000, 2_048)]
+    #[case::sub_pulse(100, 0)]
+    fn a_rate_carried_segment_folds_the_exact_pulse_count(
+        #[case] elapsed_us: u64,
+        #[case] expect: i64,
+    ) {
+        let core = enabled_core(quasi_static());
+        core.set_train(train(8_192, 0, None));
+        read_at(&core, elapsed_us);
+        assert_eq!(train_steps(&core), expect);
+    }
+
+    /// **The exactness claim.** Reading the plant at arbitrary, uneven instants
+    /// must not change the count: folding is anchored to the publisher's own
+    /// segment, so a hundred reads total exactly what one read would.
+    #[rstest]
+    fn folding_is_independent_of_how_often_the_plant_is_read() {
+        let one_read = {
+            let core = enabled_core(quasi_static());
+            core.set_train(train(8_192, 0, None));
+            read_at(&core, 1_000_000);
+            train_steps(&core)
+        };
+
+        let many_reads = {
+            let core = enabled_core(quasi_static());
+            core.set_train(train(8_192, 0, None));
+            // Deliberately uneven, prime-ish spacing: a per-read re-anchor
+            // would truncate at each of these and lose pulses.
+            let mut t = 0;
+            for step in 1..=100u64 {
+                t += 7 * step + 3;
+                read_at(&core, t.min(1_000_000));
+            }
+            read_at(&core, 1_000_000);
+            train_steps(&core)
+        };
+
+        assert_eq!(
+            many_reads, one_read,
+            "100 reads folded {many_reads} pulses where 1 read folded {one_read}"
+        );
+        assert_eq!(one_read, 8_192);
+    }
+
+    /// A finite train stops commanding exactly when its last pulse goes out —
+    /// the plant needs no stall window to notice, because the segment says so.
+    #[rstest]
+    fn a_finite_train_completes_at_its_own_ceiling() {
+        let core = enabled_core(quasi_static());
+        core.set_train(train(1_000, 0, Some(10)));
+        read_at(&core, 5_000);
+        assert_eq!(train_steps(&core), 5, "half way in");
+
+        read_at(&core, 10_000);
+        assert_eq!(train_steps(&core), 10);
+        read_at(&core, 10_000_000);
+        assert_eq!(
+            train_steps(&core),
+            10,
+            "the ceiling holds however long the plant runs on"
+        );
+        assert_eq!(
+            core.plant.lock().unwrap().cmd,
+            0.0,
+            "a completed train commands nothing"
+        );
+    }
+
+    /// A direction change mid-train splits the count at the instant it
+    /// arrived: pulses before keep their sign, pulses after take the new one.
+    #[rstest]
+    #[case::from_the_dir_pin(TrainDirection::DirPin)]
+    #[case::from_the_train(TrainDirection::Train)]
+    fn a_mid_train_reversal_signs_each_side_separately(#[case] source: TrainDirection) {
+        let core = enabled_core(Config {
+            train_direction: source,
+            ..quasi_static()
+        });
+        core.set_train(train(1_000, 0, None));
+        read_at(&core, 6_000);
+        assert_eq!(train_steps(&core), 6);
+
+        // The source re-anchors at the split; the sink is told both halves.
+        match source {
+            TrainDirection::DirPin => core.set_dir(6_000, Some(Level::Low)),
+            TrainDirection::Train => core.set_train(PulseTrain {
+                pulses: PulseSegment {
+                    emitted: 6,
+                    freq_hz: 1_000,
+                    total: None,
+                    since_us: 6_000,
+                },
+                direction: PulseDirection::Reverse,
+            }),
+        }
+
+        read_at(&core, 10_000);
+        assert_eq!(
+            train_steps(&core),
+            2,
+            "6 forward then 4 reverse is +2, not ±10"
+        );
+    }
+
+    /// A disabled drive ignores the train it is being handed, and enabling
+    /// mid-train picks it up at its current rate rather than waiting for the
+    /// next segment — the source keeps running either way.
+    #[rstest]
+    fn a_disabled_drive_ignores_a_running_train_until_it_is_enabled() {
+        let core = core(quasi_static());
+        core.set_train(train(1_000, 0, None));
+        read_at(&core, 5_000);
+        assert_eq!(train_steps(&core), 0, "a disabled drive counts nothing");
+
+        core.set_ena(5_000, Some(Level::High));
+        read_at(&core, 9_000);
+        assert_eq!(
+            train_steps(&core),
+            4,
+            "only the pulses since the enable are counted"
+        );
+
+        core.set_ena(9_000, Some(Level::Low));
+        read_at(&core, 20_000);
+        assert_eq!(train_steps(&core), 4, "disabling stops counting again");
+        assert_eq!(core.plant.lock().unwrap().cmd, 0.0);
+    }
+
+    /// A rate-carried train supplies its own rate, so the edge path's stall
+    /// window — which exists only to notice a *measured* train going quiet —
+    /// must not expire it. A minute of silence at a constant rate is a minute
+    /// of travel, not a stall.
+    #[rstest]
+    fn a_rate_carried_train_is_not_subject_to_the_stall_window() {
+        let core = enabled_core(quasi_static());
+        // Seed the edge path first, so its stall state exists to be cleared.
+        core.step_edge(1_000);
+        core.step_edge(2_000);
+        core.set_train(train(1_000, 2_000, None));
+        {
+            let plant = core.plant.lock().unwrap();
+            assert!(plant.last_edge_us.is_none(), "phase measurement cleared");
+            assert!(plant.interval_us.is_none(), "stall window cleared");
+        }
+
+        read_at(&core, 60_002_000);
+        assert_eq!(train_steps(&core), 60_000, "60 s at 1 kHz");
+        assert!(
+            core.plant.lock().unwrap().cmd > 0.0,
+            "the train is still commanding after a minute of no events"
+        );
+    }
+
+    /// `commanded_steps` is the sum of both paths, and the shaft exposes the
+    /// train that produced the rate-carried half.
+    #[rstest]
+    fn commanded_steps_sums_both_input_paths() {
+        let motor = StepperMotor::new(quasi_static()).expect("builds");
+        let shaft = motor.shaft();
+        motor.core.set_ena(0, Some(Level::High));
+        motor.core.step_edge(1_000);
+        motor.core.step_edge(2_000);
+
+        let published = train(1_000, 2_000, Some(3));
+        motor.core.set_train(published);
+        {
+            let mut plant = motor.core.plant.lock().unwrap();
+            motor.core.advance(&mut plant, 5_000);
+        }
+
+        assert_eq!(shaft.commanded_steps(), 5, "2 edges + 3 rate-carried");
+        assert_eq!(
+            shaft.train(),
+            Some(published),
+            "the shaft reports the train as it was published, un-anchored"
+        );
     }
 }
