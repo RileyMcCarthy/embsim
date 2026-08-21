@@ -29,6 +29,8 @@ pub enum CallbackKind {
     Wake,
     /// A stream byte delivery.
     StreamByte,
+    /// A pulse-train (rate-change) delivery.
+    Pulse,
     /// A topology-epoch notification.
     Topology,
 }

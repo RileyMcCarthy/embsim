@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex};
 
 use embsim_core::virtual_clock;
 
+use crate::component::{PulseDirection, PulseTrain};
 use crate::diagnostics::Finding;
 use crate::engine::{ComponentId, EndpointId};
 use crate::net::{Level, NetId, NetState, TheveninDrive};
@@ -126,6 +127,20 @@ pub enum EngineEvent {
         /// The byte.
         byte: u8,
     },
+    /// A pulse train crossed a derived pulse route to one sink — one record
+    /// per **rate change**, never per pulse (that is the representation's
+    /// point; see [`crate::component::StreamRole::PulseSource`]). The record
+    /// carries the whole segment, so a trace comparison catches a wrong
+    /// frequency, direction, ceiling or baseline count, not just "a train
+    /// happened".
+    PulseUpdate {
+        /// Source endpoint the train was published on.
+        source: EndpointId,
+        /// Sink endpoint it was delivered to.
+        sink: EndpointId,
+        /// The constant-rate segment.
+        train: PulseTrain,
+    },
     /// A stream-routing pass ran, publishing a topology epoch.
     Reroute {
         /// Topology epoch after the pass.
@@ -195,6 +210,16 @@ impl EngineEventRecord {
                 "stream_byte producer={} consumer={} byte={byte:#04x}",
                 producer.0, consumer.0
             ),
+            EngineEvent::PulseUpdate {
+                source,
+                sink,
+                train,
+            } => format!(
+                "pulse source={} sink={} {}",
+                source.0,
+                sink.0,
+                train_form(train)
+            ),
             EngineEvent::Reroute { epoch } => format!("reroute epoch={epoch}"),
             EngineEvent::Finding(finding) => {
                 format!("finding {}", elide_host_paths(&format!("{finding:?}")))
@@ -238,6 +263,27 @@ fn state_form(state: &NetState) -> String {
         NetState::Analog(volts) => format!("analog:{}uv", quantize(*volts, VOLT_QUANTUM_PER_V)),
         NetState::Contention => "contention".to_string(),
     }
+}
+
+/// Canonical encoding of a pulse train. Every field is an integer already —
+/// counts, hertz, microseconds — so nothing here needs quantizing, which is
+/// exactly why a rate is a better thing to put on a golden trace than a
+/// reconstructed edge sequence.
+fn train_form(train: &PulseTrain) -> String {
+    let total = match train.pulses.total {
+        Some(total) => total.to_string(),
+        None => "unbounded".to_string(),
+    };
+    format!(
+        "freq={}hz dir={} emitted={} total={total} since={}us",
+        train.pulses.freq_hz,
+        match train.direction {
+            PulseDirection::Forward => "fwd",
+            PulseDirection::Reverse => "rev",
+        },
+        train.pulses.emitted,
+        train.pulses.since_us,
+    )
 }
 
 /// Canonical encoding of a digital level.

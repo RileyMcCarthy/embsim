@@ -11,15 +11,16 @@
 //! resolution pass → findings) and the **live net-engine slice**
 //! (`System::start`): the single-writer engine thread with its drive queue
 //! and timer wheel, the quasi-static MNA cluster solver ([`QuasiStaticMna`]),
-//! and stream byte pipes (routing, baud pacing, drop policies) derived from
-//! net resolution. Both paths drive one shared resolution code path. Still
+//! stream byte pipes (routing, baud pacing, drop policies) derived from
+//! net resolution, and rate-carried pulse trains ([`PulseTrain`]) on the same
+//! derived routes. Both paths drive one shared resolution code path. Still
 //! deferred to later slices: live topology mutation and its epoch
 //! notification (the seam is registered), dead-band [`Finding::AmbiguousLevel`]
 //! projection, and transducer primitives.
 //!
 //! Module map (mirrors the design doc's crate layout):
 //! - [`netlist`] — KiCad s-expression netlist parser → [`ComponentDecl`]/[`NetDecl`] graph
-//! - [`component`] — [`Component`] trait, [`PinDecl`], [`PinKind`], [`StreamRole`], [`ComponentNetIo`]
+//! - [`component`] — [`Component`] trait, [`PinDecl`], [`PinKind`], [`StreamRole`], [`PulseTrain`], [`ComponentNetIo`]
 //! - [`registry`] — [`PartRegistry`]: identity → constructor; auto-classification tiers
 //! - [`engine`] — the live single-writer net engine: drive queue, resolution, timer wheel, stream routing
 //! - [`net`] — net state model ([`NetState`]) and shared net/pin identity types
@@ -29,8 +30,8 @@
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
 //! - [`event_log`] — opt-in [`EventLog`]: the engine's totally-ordered event transcript
 //!   (determinism Oracle 1, `DETERMINISM.md`) with its normalization contract
-//! - [`mcu`] — [`McuComponent`]: the MCU as a component (force-path slice: serial
-//!   channels bridged to stream pins; the firmware-entry inversion is deferred)
+//! - [`mcu`] — [`McuComponent`]: the MCU as a component — serial, GPIO,
+//!   pulse-out and encoder channels bridged to physical pins
 
 pub mod board;
 pub mod cluster;
@@ -50,7 +51,8 @@ pub use cluster::{
     QuasiStaticMna,
 };
 pub use component::{
-    AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, StreamRole,
+    AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, PulseDirection,
+    PulseSegment, PulseTrain, PulseTx, StreamRole, StreamTx,
 };
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
