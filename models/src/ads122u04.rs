@@ -259,20 +259,33 @@ fn protocol_loop(adc: &Ads122u04) {
     // life of this loop; the borrow never outlives it.
     let borrowed = unsafe { BorrowedFd::borrow_raw(model_fd) };
     loop {
-        // Try to read incoming bytes from firmware
-        let mut byte = [0u8; 1];
-        match nix::unistd::read(borrowed, &mut byte) {
-            Ok(1) => {
-                state = process_byte(adc, model_fd, state, byte[0], &mut continuous);
+        // Drain every byte the firmware has sent since the last wake, rather than
+        // one per sleep interval. A real ADS122U04 answers RDATA at UART speed, so
+        // consuming a single byte per 250 µs throttles the link to ~4 kB/s. A
+        // free-running poller (the firmware's force-gauge task issues RDATA
+        // back-to-back, bounded only by round-trip latency) then outruns the model
+        // and builds an unbounded command backlog: each queued byte adds 250 µs of
+        // latency, so after ~4000 bytes the reply lands after the firmware's 1 s
+        // read timeout and the gauge is declared unresponsive. Draining keeps
+        // latency bounded by the firmware's own request rate.
+        let mut read_failed = false;
+        loop {
+            let mut byte = [0u8; 1];
+            match nix::unistd::read(borrowed, &mut byte) {
+                Ok(1) => {
+                    state = process_byte(adc, model_fd, state, byte[0], &mut continuous);
+                }
+                // EOF (0 bytes) or no data queued: nothing more to consume this wake.
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => break,
+                Err(e) => {
+                    warn!("ADS122U04: read error: {}", e);
+                    read_failed = true;
+                    break;
+                }
             }
-            Ok(_) => {}
-            Err(nix::errno::Errno::EAGAIN) => {
-                // No data available — proceed to send conversions if needed
-            }
-            Err(e) => {
-                warn!("ADS122U04: read error: {}", e);
-                break;
-            }
+        }
+        if read_failed {
+            break;
         }
 
         // Send unprompted conversion data only in automatic data read mode
@@ -506,6 +519,63 @@ mod tests {
 
     fn regs(adc: &Ads122u04) -> [u8; REGISTER_COUNT] {
         *adc.registers.lock().unwrap()
+    }
+
+    /// Read from `fd` until `n` bytes arrive or `deadline` elapses.
+    fn read_n_until(fd: RawFd, n: usize, deadline: std::time::Duration) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut buf = [0u8; 1024];
+        // SAFETY: `fd` is kept open by the caller's pipe pair for the whole read.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let start = std::time::Instant::now();
+        while out.len() < n && start.elapsed() < deadline {
+            match nix::unistd::read(borrowed, &mut buf) {
+                Ok(0) => break,
+                Ok(k) => out.extend_from_slice(&buf[..k]),
+                Err(nix::errno::Errno::EAGAIN) => std::thread::yield_now(),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// REGRESSION: the loop must consume everything the firmware has sent since
+    /// the last wake, not one byte per sleep interval.
+    ///
+    /// Firmware polls this chip in manual-read mode — it issues SYNC+RDATA
+    /// back-to-back, bounded only by round-trip latency, never by a timer. When
+    /// the loop took a single byte per 250 µs sleep the link was throttled to
+    /// ~4 kB/s, so a free-running poller outran the model and every queued byte
+    /// added another 250 µs of latency. The backlog grows without bound: after a
+    /// few thousand bytes the reply to the *current* request arrives later than
+    /// the firmware's read timeout, the gauge is declared unresponsive, and a
+    /// running test is aborted by the resulting fault.
+    ///
+    /// 800 frames is 1600 request bytes = 400 ms of pure sleeping under the old
+    /// behaviour, so the 150 ms deadline cannot be met by anything that paces
+    /// itself per byte, while draining answers them in a couple of wakes.
+    #[test]
+    fn back_to_back_rdata_is_answered_without_falling_behind() {
+        const FRAMES: usize = 800;
+        const RDATA: u8 = 0x10;
+
+        let (_adc, fw_fd) = make_adc(1.0, 0);
+
+        let mut req = Vec::with_capacity(FRAMES * 2);
+        for _ in 0..FRAMES {
+            req.extend_from_slice(&[SYNC_BYTE, RDATA]);
+        }
+        write_bytes(fw_fd, &req);
+
+        let got = read_n_until(fw_fd, FRAMES * 3, std::time::Duration::from_millis(150));
+        assert_eq!(
+            got.len(),
+            FRAMES * 3,
+            "every RDATA must be answered promptly: got {} of {} bytes — the model \
+             is pacing itself per byte and falling behind the poller",
+            got.len(),
+            FRAMES * 3
+        );
     }
 
     // ── conversion_interval_us: DR table + turbo halving ──
