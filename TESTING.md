@@ -18,6 +18,12 @@ cargo test -p embsim-board --test determinism -- --nocapture
 # Stepped-clock mechanics (the barrier, the time-release, the wedge report).
 cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 
+# Peripheral pin bridges. Each is its own binary because it owns the
+# process-default peripheral banks (see rule 5). `--nocapture` prints the
+# measured engine-event budget and the stepped N-run identity.
+cargo test -p embsim-board --test pulse_bridge --test carriage_seam -- --nocapture
+cargo test -p embsim-board --test pulse_bridge_stepped -- --nocapture
+
 # Re-bless the golden traces after an INTENDED engine/model behavior change.
 # Review the diff: it is the wire behavior of the system.
 EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism
@@ -89,6 +95,16 @@ cargo llvm-cov --workspace --summary-only
    must enter stepped mode before the first one exists. That is why
    `ads122u04_stepped.rs` is its own binary with a single case.
 
+   **The process-default peripheral banks are the same kind of global.** A case
+   that plays firmware through the `embsim-peripherals` free functions
+   (`pulse_out::start`, `gpio::set_active`, …) shares one bank with every other
+   case in its process, so those cases live in their own binary, take one suite
+   lock, and `reset()` the banks they used on the way out —
+   `pulse_bridge.rs`, `pulse_bridge_stepped.rs` and `carriage_seam.rs` are the
+   pattern. Keeping them out of `determinism.rs` is deliberate: its cases are
+   pure board components, and a global bank underneath them would make an
+   unrelated failure look like a determinism regression.
+
 6. **Property tests (`proptest`)** only for continuous domains (e.g. MNA
    resistor ladders). Use fixed seeds when non-determinism would flake CI.
 
@@ -120,6 +136,7 @@ cargo llvm-cov --workspace --summary-only
 | Models | protocol/state | clamp, invalid cmd | DR/gain tables, thresholds |
 | Runtime | full no-firmware run | missing symbols, ceilings | TooManyChannels per peripheral |
 | Board | drive/sense/stream | contention, facade mismatch | net truth table, drop policies |
+| Pin bridges | exact counts, GPIO both ways, encoder counts | slip, floating input, unbridged channel | polarity matrix, direction mapping, level projection |
 | Stepped clock | N-run + golden identity | wedged actor, held time-release | case matrix × {free-running, stepped} |
 | P2 trampolines | null/neg guards | bind routing | channel index grids |
 | Tools | parse/record/render | empty/unknown | DWARF flag matrices |
