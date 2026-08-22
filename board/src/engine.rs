@@ -121,7 +121,7 @@ use embsim_core::virtual_clock;
 use crate::cluster::{
     Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource,
 };
-use crate::component::StreamRole;
+use crate::component::{PulseTrain, StreamRole};
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
 use crate::event_log::{EngineEvent, EventLog};
 use crate::net::{
@@ -246,6 +246,12 @@ pub(crate) type TopologyCallback = Box<dyn Fn(u64) + Send>;
 /// contract.
 pub(crate) type StreamCallback = Box<dyn Fn(u8) + Send>;
 
+/// Pulse-train delivery callback: called from the engine thread once per
+/// **rate change** routed to a pulse sink; no engine lock held. Never once
+/// per pulse — that is the whole point of the representation
+/// ([`crate::component::StreamRole::PulseSource`]).
+pub(crate) type PulseCallback = Box<dyn Fn(PulseTrain) + Send>;
+
 /// One message on the engine's MPSC command queue.
 pub(crate) enum Command {
     /// A pin drive (`None` releases to high-Z), stamped with its enqueue
@@ -312,6 +318,25 @@ pub(crate) enum Command {
         endpoint: EndpointId,
         /// Delivery callback.
         callback: StreamCallback,
+    },
+    /// A pulse source published a new constant-rate segment. Delivered to the
+    /// sinks on the source's derived route (gated by net resolution, like
+    /// stream bytes), and retained so a sink registering later sees the
+    /// channel's current state. Carries no enqueue sequence for the same
+    /// reason [`Command::StreamWrite`] does not: per-source order is this
+    /// channel's order, and cross-source ordering is not meaningful.
+    PulseUpdate {
+        /// Source endpoint.
+        endpoint: EndpointId,
+        /// The segment that just began.
+        train: PulseTrain,
+    },
+    /// Subscribe a pulse-train callback to a pulse sink endpoint.
+    RegisterPulseSink {
+        /// Sink endpoint.
+        endpoint: EndpointId,
+        /// Delivery callback.
+        callback: PulseCallback,
     },
     /// Stepped mode only: the system is fully assembled — every component has
     /// attached and started — so the engine may begin advancing virtual time.
@@ -465,6 +490,17 @@ struct StreamPin {
     net: usize,
     role: StreamRole,
     pin: PinRef,
+}
+
+/// One derived source→sinks pulse route (see [`Resolver::route_pulses`]).
+pub(crate) struct PulseRouteSpec {
+    /// Pulse source endpoint the route originates at.
+    pub(crate) source: EndpointId,
+    /// Sink endpoints reachable through the collapsed link.
+    pub(crate) sinks: Vec<EndpointId>,
+    /// Identity roots of every net the collapsed link spans — delivery is
+    /// gated on their resolved state, exactly as stream bytes are.
+    pub(crate) path_roots: Vec<usize>,
 }
 
 /// One derived producer→consumers serial route (see
@@ -1120,6 +1156,10 @@ impl Resolver {
                 .filter(|s| matches!(s.role, StreamRole::Consumer { .. }) && reachable(s.net))
                 .map(|s| s.endpoint)
                 .collect();
+            // Pulse roles share the `streams` registration table but are a
+            // different channel: they neither consume bytes nor count as a
+            // facing producer. `route_pulses` derives their routes over the
+            // same topology.
             // Deliberately conservative gate: EVERY identity root within
             // the collapse radius of the producer is collected, not just
             // roots on a producer→consumer path — so delivery is also
@@ -1143,6 +1183,99 @@ impl Resolver {
                 producer: producer.endpoint,
                 baud_hz,
                 consumers,
+                path_roots,
+            });
+        }
+        routes
+    }
+
+    /// Derive the **pulse** routes from the current net topology — the
+    /// step-clock analogue of [`Resolver::route_streams`], over the same
+    /// collapsed-conduction reachability ([`STREAM_COLLAPSE_THRESHOLD`]), so a
+    /// step signal that passes through series resistors or an isolator's
+    /// short-circuit stub reaches the drive exactly like a byte route does.
+    ///
+    /// Two pulse sources reachable from each other raise
+    /// [`Finding::StreamMismatch`] once per pair and neither routes: two step
+    /// clocks driving one line is the same class of wiring error as two UART
+    /// transmitters, and the underlying net additionally resolves
+    /// `Contention` on its own.
+    ///
+    /// Runs wherever `route_streams` runs, from the same pass, so pulse routes
+    /// can never outlive the topology they were derived from.
+    pub(crate) fn route_pulses(
+        &mut self,
+        nets: &[Net],
+        diagnostics: &mut Diagnostics,
+    ) -> Vec<PulseRouteSpec> {
+        self.identity.grow(self.net_count.max(nets.len()));
+        let n = nets.len();
+        let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
+        let root_edges: Vec<(usize, usize, f64)> = self
+            .edges
+            .iter()
+            .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
+            .filter(|(a, b, _)| a != b)
+            .collect();
+
+        let mut routes = Vec::new();
+        // hash-order shape 3: dedup gate for the paired mismatch report.
+        let mut reported_pairs: HashSet<(usize, usize)> = HashSet::new();
+        for (si, source) in self.streams.iter().enumerate() {
+            if source.role != StreamRole::PulseSource {
+                continue;
+            }
+            let origin = root_of[source.net];
+            let dist = min_path_ohms(&root_edges, origin);
+            let reachable = |net: usize| {
+                dist.get(&root_of[net])
+                    .is_some_and(|&ohms| ohms < STREAM_COLLAPSE_THRESHOLD)
+            };
+
+            let facing: Vec<usize> = self
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(oi, other)| {
+                    *oi != si && other.role == StreamRole::PulseSource && reachable(other.net)
+                })
+                .map(|(oi, _)| oi)
+                .collect();
+            if !facing.is_empty() {
+                for oi in facing {
+                    let pair = (si.min(oi), si.max(oi));
+                    if reported_pairs.insert(pair) {
+                        diagnostics.report(Finding::StreamMismatch {
+                            net: nets[origin].name.clone(),
+                            producers: vec![
+                                self.streams[pair.0].pin.clone(),
+                                self.streams[pair.1].pin.clone(),
+                            ],
+                        });
+                    }
+                }
+                continue;
+            }
+
+            let sinks: Vec<EndpointId> = self
+                .streams
+                .iter()
+                .filter(|s| s.role == StreamRole::PulseSink && reachable(s.net))
+                .map(|s| s.endpoint)
+                .collect();
+            // Same deliberately conservative gate as the byte routes: every
+            // identity root within the collapse radius, sorted.
+            // hash-order shape 2: `min_path_ohms` values are order-independent
+            // and the collected keys are sorted here.
+            let mut path_roots: Vec<usize> = dist
+                .iter()
+                .filter(|(_, &ohms)| ohms < STREAM_COLLAPSE_THRESHOLD)
+                .map(|(&root, _)| root)
+                .collect();
+            path_roots.sort_unstable();
+            routes.push(PulseRouteSpec {
+                source: source.endpoint,
+                sinks,
                 path_roots,
             });
         }
@@ -1273,6 +1406,17 @@ struct LiveRoute {
     line_next_v_us: u64,
 }
 
+/// Live per-source pulse route: the derived sinks and the delivery gate.
+///
+/// Deliberately has no queue and no pacing slot — a pulse channel carries a
+/// *rate*, so there is nothing in flight between rate changes.
+struct LivePulseRoute {
+    /// Sink endpoints on the collapsed link.
+    sinks: Vec<EndpointId>,
+    /// Identity roots of the nets the link spans (delivery gate).
+    path_roots: Vec<usize>,
+}
+
 /// Byte-loss injection state for one endpoint (`Scenario::stream_drop`).
 struct DropState {
     policy: StreamDropPolicy,
@@ -1306,7 +1450,7 @@ struct EngineCore {
     // hash-order: every map below is **keyed access only** — `get`, `entry`,
     // `insert`, `contains_key`. None is iterated. Sense delivery walks
     // `self.nets` by index and the per-net callbacks are a `Vec` in
-    // registration order; `reroute_streams` walks `self.streams` in
+    // registration order; `reroute_channels` walks `self.streams` in
     // registration order. Adding an iteration over any of these needs a sort
     // (see the module's review rule).
     sense_subs: HashMap<usize, Vec<SenseCallback>>,
@@ -1316,6 +1460,16 @@ struct EngineCore {
     routes: HashMap<usize, LiveRoute>,
     /// Stream byte subscriptions, keyed by consumer endpoint index.
     stream_subs: HashMap<usize, Vec<StreamCallback>>,
+    /// Live pulse routes, keyed by source endpoint index. Rebuilt on every
+    /// routing pass.
+    pulse_routes: HashMap<usize, LivePulseRoute>,
+    /// Pulse-train subscriptions, keyed by sink endpoint index.
+    pulse_subs: HashMap<usize, Vec<PulseCallback>>,
+    /// The latest train published by each pulse source, keyed by source
+    /// endpoint index. Retained across routing passes so a sink registering
+    /// after the source published still learns the channel's current state
+    /// (the once-at-registration contract `on_sense` honors).
+    pulse_state: HashMap<usize, PulseTrain>,
     /// `stream_drop` fault state, keyed by endpoint index.
     drop_state: HashMap<usize, DropState>,
     topology_observers: Vec<TopologyCallback>,
@@ -1461,13 +1615,18 @@ impl EngineCore {
         }
     }
 
-    /// (Re-)derive the stream routes from the current topology and merge the
-    /// routing findings (`StreamMismatch`). Runs at spawn and on any
-    /// topology-affecting change; in-flight bytes on stale routes are
+    /// (Re-)derive the stream **and pulse** routes from the current topology
+    /// and merge the routing findings (`StreamMismatch`). Runs at spawn and on
+    /// any topology-affecting change; in-flight bytes on stale routes are
     /// discarded — a broken route stops delivery, it never queues forever.
-    fn reroute_streams(&mut self) {
+    ///
+    /// Pulse routes carry nothing in flight (a rate, not a queue), so a
+    /// re-derivation loses no pulses: each source's current train is retained
+    /// in `pulse_state` and handed to any sink that registers afterwards.
+    fn reroute_channels(&mut self) {
         let mut pass = Diagnostics::new();
         let specs = self.resolver.route_streams(&self.nets, &mut pass);
+        let pulse_specs = self.resolver.route_pulses(&self.nets, &mut pass);
         self.merge_findings(&pass);
         let epoch = self.topology_epoch;
         self.event_log.record(|| EngineEvent::Reroute { epoch });
@@ -1486,6 +1645,82 @@ impl EngineCore {
                 )
             })
             .collect();
+        self.pulse_routes = pulse_specs
+            .into_iter()
+            .map(|spec| {
+                (
+                    spec.source.0,
+                    LivePulseRoute {
+                        sinks: spec.sinks,
+                        path_roots: spec.path_roots,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Publish a pulse source's new constant-rate segment: retain it as the
+    /// channel's current state, then deliver it to every routed sink.
+    ///
+    /// Gated by net resolution exactly as stream bytes are — a link whose nets
+    /// resolve `Contention`/`Floating` cannot carry a clean step clock, so the
+    /// train is retained but not delivered (see [`PulseTrain`]'s fidelity
+    /// limits for what that does and does not model).
+    fn pulse_update(&mut self, source: EndpointId, train: PulseTrain) {
+        self.pulse_state.insert(source.0, train);
+        let Some(route) = self.pulse_routes.get(&source.0) else {
+            tracing::debug!(
+                endpoint = source.0,
+                "pulse train not delivered: source has no valid route"
+            );
+            return;
+        };
+        let sinks = route.sinks.clone();
+        let path_roots = route.path_roots.clone();
+        if !self.route_is_signal_capable(&path_roots) {
+            tracing::debug!(
+                endpoint = source.0,
+                "pulse train not delivered: a net on the route is not signal-capable"
+            );
+            return;
+        }
+        for sink in sinks {
+            self.deliver_pulse_to(source, sink, train);
+        }
+    }
+
+    /// Deliver one train to one sink's callbacks, panic-contained, recording
+    /// the wire event.
+    fn deliver_pulse_to(&self, source: EndpointId, sink: EndpointId, train: PulseTrain) {
+        let Some(subs) = self.pulse_subs.get(&sink.0) else {
+            return;
+        };
+        self.event_log.record(|| EngineEvent::PulseUpdate {
+            source,
+            sink,
+            train,
+        });
+        let subscriber = self
+            .resolver
+            .streams
+            .iter()
+            .find(|s| s.endpoint == sink)
+            .map(|s| format!("{}.{}", s.pin.reference, s.pin.pin))
+            .unwrap_or_else(|| format!("pulse sink endpoint {}", sink.0));
+        for callback in subs {
+            self.deliver_contained(CallbackKind::Pulse, &subscriber, || callback(train));
+        }
+    }
+
+    /// Whether every net a derived route spans currently projects a usable
+    /// signal (the shared byte/pulse delivery gate).
+    fn route_is_signal_capable(&self, path_roots: &[usize]) -> bool {
+        path_roots.iter().all(|&root| {
+            matches!(
+                self.nets.get(root).map(|net| net.state),
+                Some(NetState::Driven(_) | NetState::Pulled(_, _) | NetState::Analog(_))
+            )
+        })
     }
 
     /// Clock producer bytes onto their derived route: apply the
@@ -1611,13 +1846,7 @@ impl EngineCore {
         if bytes.is_empty() {
             return;
         }
-        let broken = path_roots.iter().any(|&root| {
-            !matches!(
-                self.nets.get(root).map(|net| net.state),
-                Some(NetState::Driven(_) | NetState::Pulled(_, _) | NetState::Analog(_))
-            )
-        });
-        if broken {
+        if !self.route_is_signal_capable(path_roots) {
             tracing::debug!(
                 dropped = bytes.len(),
                 "stream bytes dropped: a net on the route is not signal-capable"
@@ -1854,6 +2083,34 @@ impl EngineCore {
                     .entry(endpoint.0)
                     .or_default()
                     .push(callback);
+            }
+            Command::PulseUpdate { endpoint, train } => {
+                self.pulse_update(endpoint, train);
+            }
+            Command::RegisterPulseSink { endpoint, callback } => {
+                self.pulse_subs
+                    .entry(endpoint.0)
+                    .or_default()
+                    .push(callback);
+                // Once-at-registration delivery, mirroring `RegisterSense`: a
+                // sink that attaches after its source published must not wait
+                // for the next rate change to learn the channel's state.
+                // hash-order: `pulse_routes` is walked in *source endpoint*
+                // order, and at most one source routes to a given sink (two
+                // would have raised StreamMismatch and neither would route),
+                // so the sort only pins which "cannot happen" case wins.
+                let mut sources: Vec<usize> = self
+                    .pulse_routes
+                    .iter()
+                    .filter(|(_, route)| route.sinks.contains(&endpoint))
+                    .map(|(&source, _)| source)
+                    .collect();
+                sources.sort_unstable();
+                for source in sources {
+                    if let Some(&train) = self.pulse_state.get(&source) {
+                        self.deliver_pulse_to(EndpointId(source), endpoint, train);
+                    }
+                }
             }
             Command::ReleaseTime => {
                 self.clock_released = true;
@@ -2171,6 +2428,9 @@ impl EngineHandle {
             wake_subs: HashMap::new(),
             routes: HashMap::new(),
             stream_subs: HashMap::new(),
+            pulse_routes: HashMap::new(),
+            pulse_subs: HashMap::new(),
+            pulse_state: HashMap::new(),
             drop_state,
             topology_observers: Vec::new(),
             topology_epoch: 0,
@@ -2186,9 +2446,10 @@ impl EngineHandle {
             event_log: event_log.clone(),
         };
         core.resolve_and_publish();
-        // Byte pipes are derived from net resolution, never installed
-        // beside it: the routing pass runs against the just-resolved nets.
-        core.reroute_streams();
+        // Byte pipes and pulse routes are derived from net resolution, never
+        // installed beside it: the routing pass runs against the just-resolved
+        // nets.
+        core.reroute_channels();
 
         let join = std::thread::Builder::new()
             .name("embsim-board-net-engine".to_string())
@@ -3379,6 +3640,105 @@ mod tests {
                 if producers.contains(&PinRef::new("MCU", "1"))
                     && producers.contains(&PinRef::new("U1", "15"))
         )));
+    }
+
+    /// Pulse routes derive over the same collapsed-conduction reachability as
+    /// byte routes — a step clock through series resistors reaches the drive,
+    /// one behind a 4.7 kΩ isolation resistor does not — and pulse roles are
+    /// invisible to the byte routing that shares their registration table.
+    #[rstest]
+    fn pulse_routes_collapse_series_passives_and_ignore_byte_roles() {
+        // source(0) --47Ω-- (1) --47Ω-- sink(2), a sink behind 4.7 kΩ that
+        // must NOT route, and a UART consumer that is not a pulse sink at all.
+        let mut resolver = Resolver::new(5, Dsu::new(5));
+        let source = resolver.add_endpoint(0, PinRef::new("MCU", "P8"), Some(high()));
+        let near = resolver.add_endpoint(2, PinRef::new("DRV", "STEP"), None);
+        let far = resolver.add_endpoint(3, PinRef::new("FAR", "STEP"), None);
+        let uart = resolver.add_endpoint(4, PinRef::new("U2", "16"), None);
+        resolver.add_edge(0, 1, 47.0);
+        resolver.add_edge(1, 2, 47.0);
+        resolver.add_edge(0, 3, 4_700.0);
+        resolver.add_edge(0, 4, 47.0);
+        resolver.add_stream_pin(source, 0, StreamRole::PulseSource, PinRef::new("MCU", "P8"));
+        resolver.add_stream_pin(near, 2, StreamRole::PulseSink, PinRef::new("DRV", "STEP"));
+        resolver.add_stream_pin(far, 3, StreamRole::PulseSink, PinRef::new("FAR", "STEP"));
+        resolver.add_stream_pin(uart, 4, consumer(115_200), PinRef::new("U2", "16"));
+
+        let net_table = nets(5);
+        let mut diags = Diagnostics::new();
+        let routes = resolver.route_pulses(&net_table, &mut diags);
+        assert!(diags.is_empty(), "no mismatch: {:?}", diags.findings());
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].source, source);
+        assert_eq!(
+            routes[0].sinks,
+            vec![near],
+            "only the sink inside the collapse radius routes"
+        );
+
+        // …and the byte router sees no producer here at all, so a pulse source
+        // never manufactures a serial route.
+        let mut diags = Diagnostics::new();
+        assert!(resolver.route_streams(&net_table, &mut diags).is_empty());
+        assert!(diags.is_empty(), "{:?}", diags.findings());
+    }
+
+    /// Two step clocks driving one line is the same wiring error as two UART
+    /// transmitters: reported once per pair, and neither routes.
+    #[rstest]
+    fn facing_pulse_sources_raise_stream_mismatch_and_do_not_route() {
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        let a = resolver.add_endpoint(0, PinRef::new("MCU", "P8"), Some(high()));
+        let b = resolver.add_endpoint(1, PinRef::new("ALT", "P9"), Some(high()));
+        let sink = resolver.add_endpoint(2, PinRef::new("DRV", "STEP"), None);
+        resolver.add_edge(0, 1, 47.0);
+        resolver.add_edge(1, 2, 47.0);
+        resolver.add_stream_pin(a, 0, StreamRole::PulseSource, PinRef::new("MCU", "P8"));
+        resolver.add_stream_pin(b, 1, StreamRole::PulseSource, PinRef::new("ALT", "P9"));
+        resolver.add_stream_pin(sink, 2, StreamRole::PulseSink, PinRef::new("DRV", "STEP"));
+
+        let net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        let routes = resolver.route_pulses(&net_table, &mut diags);
+        assert!(routes.is_empty(), "facing pulse sources must not route");
+        assert_eq!(
+            diags.len(),
+            1,
+            "one finding per pair: {:?}",
+            diags.findings()
+        );
+        assert!(diags.findings().iter().any(|f| matches!(
+            f,
+            Finding::StreamMismatch { producers, .. }
+                if producers.contains(&PinRef::new("MCU", "P8"))
+                    && producers.contains(&PinRef::new("ALT", "P9"))
+        )));
+    }
+
+    /// A source with nowhere to send still routes (with no sinks) rather than
+    /// vanishing, so its train is retained and a sink attaching later can be
+    /// served — and a lone sink is inert, not an error.
+    #[rstest]
+    fn a_pulse_source_with_no_sink_routes_to_nobody() {
+        let mut resolver = Resolver::new(2, Dsu::new(2));
+        let source = resolver.add_endpoint(0, PinRef::new("MCU", "P8"), Some(high()));
+        let orphan = resolver.add_endpoint(1, PinRef::new("DRV", "STEP"), None);
+        resolver.add_stream_pin(source, 0, StreamRole::PulseSource, PinRef::new("MCU", "P8"));
+        resolver.add_stream_pin(orphan, 1, StreamRole::PulseSink, PinRef::new("DRV", "STEP"));
+
+        let net_table = nets(2);
+        let mut diags = Diagnostics::new();
+        let routes = resolver.route_pulses(&net_table, &mut diags);
+        assert_eq!(routes.len(), 1, "the source still has a route");
+        assert!(
+            routes[0].sinks.is_empty(),
+            "an unconnected sink is not reachable"
+        );
+        assert!(
+            diags.is_empty(),
+            "and nothing is wrong: {:?}",
+            diags.findings()
+        );
     }
 
     /// The paced in-flight queue is capped at [`STREAM_ROUTE_QUEUE_MAX`]:

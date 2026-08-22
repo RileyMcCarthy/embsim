@@ -402,23 +402,41 @@ A platform crate (per `CONTRACT.md`) provides the MCU component:
    asserts the tables are present and non-empty before the emulator boots, so
    "table optimized away" is a build failure, not a mystery unwired pin.
 
-Channel behavior stays HAL-granular (byte pipes, GPIO levels); pins are
-topology. Baud and channel parameters come from the same tables — the emulator
-stops inventing its own defaults (consumers may keep explicit pacing overrides
-for tests).
+Channel behavior stays HAL-granular (byte pipes, GPIO levels, pulse rates);
+pins are topology. Baud and channel parameters come from the same tables — the
+emulator stops inventing its own defaults (consumers may keep explicit pacing
+overrides for tests).
 
-> **Slice status (2026-07):** the MCU-as-a-component pattern ships in
-> `board/src/mcu.rs` for the **serial force path**: HAL-table-shaped configs
-> in, `"P{n}"` stream pins out, socketpair bridges into the
-> `embsim-peripherals` serial bank, with baud taken from the table. The
-> entry inversion in point 1 is **delivered**: `McuBuilder::entry` +
-> `Component::start` spawn the firmware on a component-owned instance
-> (facade mode without an entry keeps the `Emulator::run` flow working).
-> Point 3's table read path is
+> **Slice status (2026-08):** the MCU-as-a-component pattern ships in
+> `board/src/mcu.rs` for **all four channel kinds**, each opt-in per channel
+> through `McuBuilder`: serial (socketpair bridges into the peripheral serial
+> bank, baud from the table), GPIO (**bidirectional** — firmware writes drive
+> the net, external drives sense back into the bank, both honouring the
+> table's `active_low`), pulse-out (one STEP pin, below), and encoder (a
+> quadrature pin pair ×4-decoded into the bank as *increments*, so firmware
+> homing re-bases rather than being overwritten). The entry inversion in
+> point 1 is **delivered**: `McuBuilder::entry` + `Component::start` spawn the
+> firmware on a component-owned instance (facade mode without an entry keeps
+> the `Emulator::run` flow working). Point 3's table read path is
 > `embsim-memory-inspect`'s `hal_tables` module (symbol names parameterized;
-> the reference consumer's names are the documented defaults). GPIO channels
-> are declaration-only on the component; encoder/pulse-out channels remain
-> consumer-hand-wired this slice.
+> the reference consumer's names are the documented defaults).
+>
+> **A step clock is a rate on the wire, not edges.** Channel behavior stays
+> HAL-granular everywhere else, but a pulse-out channel is the one signal
+> whose edge count runs orders of magnitude ahead of the rest of the board: at
+> the reference machine's 8192 steps/mm, one mm/s is 8192 edges/s, each of
+> which would be a drive, a cluster resolution and a sense delivery through
+> the single-writer engine. So a `StreamRole::PulseSource` pin carries a
+> `PulseTrain` — frequency, direction, accumulated count and an anchor
+> instant — published **once per rate change** and integrated by
+> `StreamRole::PulseSink` consumers at *read* time, the discipline
+> `DETERMINISM.md` mandates. Counts stay exact: `PulseTrain::emitted_at` is
+> the same integer arithmetic `HAL_pulseOut_run` hands the firmware. Measured:
+> a four-segment motion profile delivering ~150 000 pulses costs **31 engine
+> events**, unchanged as the pulse count moves by tens of thousands
+> (`board/tests/pulse_bridge.rs`). The fidelity this trades away — no edges,
+> no pulse width, no per-edge DIR sampling, and up to one pulse of phase per
+> direction split — is enumerated on `PulseTrain`.
 
 Behavioral fidelity boundary, stated explicitly: **no cycle-accurate silicon
 emulation.** Raising fidelity of one peripheral later (bit-timed serial, PWM
@@ -459,6 +477,12 @@ present-but-undeclared).
   driver, source-free singular cluster) asserted to µV.
 - Streams: routing through series passives, crossed-producer detection, route
   invalidation on jumper/fault changes.
+- Pin bridges: fake firmware driving the peripheral free functions with peer
+  components watching the pins — exact step counts, mid-train direction
+  reversal, GPIO in both directions at the channel's polarity, encoder counts
+  arriving, an asserted engine-event ceiling at a realistic step rate, and a
+  stepped-mode N-run identity over all of it
+  (`board/tests/{pulse_bridge,pulse_bridge_stepped,carriage_seam}.rs`).
 - System: a two-component smoke board (fake MCU pin driver + fake sensor)
   exercising attach/schedule/diagnostics without any consumer firmware.
 - Whole machine: the reference consumer's three real boards — a vendor MCU
