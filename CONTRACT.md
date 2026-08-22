@@ -57,6 +57,14 @@ System   HAL_system_init  HAL_system_reboot  HAL_system_startThread
 I2C      i2c_setup  i2c_start  i2c_write  i2c_read  i2c_stop
 ```
 
+Native SIL cannot preempt host machine code (unlike an ISS). Every HAL
+trampoline **charges** one unit of the calling cog's quantum; after a
+full slice the trampoline parks so other cogs and peripherals can run.
+Firmware is free to spin (`LOCKTRY`, UART poll, free-running cogs) as on
+silicon. Blocking waits (`HAL_time_waitUs`, serial timeout, pulse-out
+ticks) already park and reset the slice. A cog that never hits HAL still
+freezes time — that is an ISS problem, not a firmware yield problem.
+
 (Your firmware's set will differ — provide what *its* HAL headers declare.)
 
 ### 2. Platform VFS / filesystem (FlexC VFS for the P2)
@@ -130,8 +138,9 @@ state only. A given firmware **image's own C statics** (`.data`/`.bss`) exist
 once per process, so one process can run at most **one instance of a given
 firmware image**; multi-instance means multiple *distinct* images (or
 pure-Rust components). Virtual *time* also remains process-wide
-(`embsim_core::virtual_clock` is free-running scaled wall time); only the
-clock *frequency* used for cycle math is per-instance.
+(`embsim_core::virtual_clock` is a process-wide quantum-barrier counter;
+time jumps when every firmware core is parked, capped by the quantum);
+only the clock *frequency* used for cycle math is per-instance.
 
 ## Init-before-entry ordering (handled by the runtime)
 

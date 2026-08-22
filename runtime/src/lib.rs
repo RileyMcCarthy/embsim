@@ -378,7 +378,10 @@ impl Emulator {
         }
 
         // 6. Hand control to the firmware. Keep `pty` alive across this call.
+        // The entry thread is a time participant until it returns so waits
+        // during init sync with the cores `start_thread` will spawn.
         info!("Starting firmware...");
+        let _time = virtual_clock::participate();
         (entry)();
 
         info!("Firmware entry returned, waiting for threads...");

@@ -284,10 +284,7 @@ fn protocol_loop(adc: &Ads122u04) {
         // the configured conversion interval so we don't miss the 1000 SPS edge
         // (1 ms period). 250 µs gives at least 4× oversample at the fastest
         // non-turbo rate the firmware supports.
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(250);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        embsim_core::virtual_clock::wait_us(250);
     }
 }
 

@@ -397,7 +397,8 @@ impl ComponentNetIo {
     /// Request a one-shot wakeup at the given absolute virtual time (µs),
     /// served by the engine thread's timer wheel. Timestamps are sampled
     /// from the free-running scaled clock — a deadline already in the past
-    /// fires immediately, in deadline order. Requires `virtual_clock::init`.
+    /// fires immediately, in deadline order. Parks on the quantum clock.
+    /// Requires `virtual_clock::init`.
     pub fn schedule_at(&self, at_us: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_at on an inert io handle dropped");

@@ -1,7 +1,7 @@
 //! embsim-core — Core infrastructure for embedded MCU simulation.
 //!
 //! Provides MCU-agnostic primitives shared by all platform crates:
-//! - `virtual_clock` — scalable time for deterministic emulation
+//! - `virtual_clock` — quantum-barrier virtual time (Renode-style sync)
 //! - `serial_pty` — PTY pair creation for host ↔ firmware serial communication
 //! - `event` — multi-subscriber callback primitive for model/peripheral events
 

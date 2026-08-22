@@ -22,13 +22,13 @@
 //! [`crate::component::ComponentNetIo::schedule_at`] /
 //! [`crate::component::ComponentNetIo::schedule_every`], served by a timer
 //! wheel keyed to `embsim_core::virtual_clock` **virtual time**. The clock is
-//! free-running scaled wall time (no step/pause API), so wakeup timestamps
-//! are *sampled*, not deterministic: late wakeups fire immediately, in
-//! deadline order, and missed periodic deadlines coalesce (one catch-up fire,
-//! then back on period) — time-dependent component state must be computed at
-//! read time, never integrated per tick. Idle components cost nothing — the
-//! engine parks on its command queue (`recv_timeout`) until the next wheel
-//! deadline, or indefinitely when the wheel is empty.
+//! a quantum-barrier counter (Renode-style): it jumps when every firmware
+//! core is parked, capped by the quantum, so wakeup timestamps are
+//! deterministic. Late wakeups fire immediately, in deadline order, and
+//! missed periodic deadlines coalesce (one catch-up fire, then back on
+//! period). Idle components cost nothing — the engine parks on
+//! [`virtual_clock::wait_until_or_kicked`] until the next wheel deadline
+//! (or on the command channel when the wheel is empty).
 //!
 //! Build-time analysis and live resolution share **one code path**: the
 //! crate-internal `Resolver` in this module is populated by `System`
@@ -73,7 +73,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -281,6 +281,10 @@ impl EngineLink {
                     tracing::debug!("net engine has shut down; command dropped");
                     false
                 } else {
+                    // Wake a quantum wait so the engine can drain this command.
+                    if virtual_clock::is_initialized() {
+                        virtual_clock::kick();
+                    }
                     true
                 }
             }
@@ -1625,65 +1629,73 @@ impl EngineCore {
     }
 
     /// Engine thread body: fire due timers, run the drive-gap watchdog,
-    /// park on the queue until the next wheel deadline or stall check (or
-    /// indefinitely when neither is pending), then handle commands in
+    /// park on the quantum clock until the next wheel deadline (or on the
+    /// command channel when the wheel is empty), then handle commands in
     /// bounded batches ([`COMMAND_DRAIN_BATCH_MAX`]) so due timers keep
     /// firing under sustained command load.
     fn run(mut self, rx: Receiver<Command>) {
         loop {
             self.fire_due_timers();
             self.check_drive_stall();
-            let command = match self.next_wall_wait_us() {
-                None => match rx.recv() {
-                    Ok(c) => c,
-                    Err(_) => break, // every handle dropped without Shutdown
-                },
-                Some(wait_wall) => match rx.recv_timeout(Duration::from_micros(wait_wall)) {
-                    Ok(c) => c,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                },
-            };
-            if self.handle(command) {
-                break;
-            }
-            // Bounded drain: a saturated queue must not starve the timer
-            // wheel — control returns to the timer check above after at
-            // most COMMAND_DRAIN_BATCH_MAX further commands. A disconnect
-            // observed here is handled by the blocking receive above.
+
+            let mut got = 0usize;
             let mut shutdown = false;
-            let mut drained = 0;
-            while drained < COMMAND_DRAIN_BATCH_MAX {
-                let Ok(command) = rx.try_recv() else { break };
-                drained += 1;
-                if self.handle(command) {
-                    shutdown = true;
-                    break;
+            while got < COMMAND_DRAIN_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(command) => {
+                        got += 1;
+                        if self.handle(command) {
+                            shutdown = true;
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        shutdown = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
                 }
             }
             if shutdown {
                 break;
             }
-        }
-    }
 
-    /// Wall-clock park bound (µs) until the engine must wake without a
-    /// command: the earlier of the next wheel deadline and the outstanding
-    /// drive-gap stall check. `None` parks indefinitely (empty wheel, no
-    /// gap). The virtual clock is only read while the wheel is non-empty,
-    /// so a timer-free system never requires `virtual_clock::init`.
-    fn next_wall_wait_us(&self) -> Option<u64> {
-        let wheel_wait = self.wheel.peek().map(|&Reverse(head)| {
-            let now = virtual_clock::virtual_us();
-            virtual_clock::virtual_to_wall_us(head.deadline_us.saturating_sub(now))
-        });
-        let stall_wait = self.drive_stall.map(|(_, since)| {
-            let remaining = DRIVE_SEQ_STALL_TIMEOUT.saturating_sub(since.elapsed());
-            u64::try_from(remaining.as_micros()).unwrap_or(u64::MAX)
-        });
-        match (wheel_wait, stall_wait) {
-            (Some(wheel), Some(stall)) => Some(wheel.min(stall)),
-            (wheel, stall) => wheel.or(stall),
+            let stall_wait = self.drive_stall.map(|(_, since)| {
+                let remaining = DRIVE_SEQ_STALL_TIMEOUT.saturating_sub(since.elapsed());
+                u64::try_from(remaining.as_micros()).unwrap_or(u64::MAX)
+            });
+            let wheel = self.wheel.peek().map(|&Reverse(head)| head.deadline_us);
+
+            if let Some(deadline) = wheel {
+                if virtual_clock::is_initialized() {
+                    let _ = virtual_clock::wait_until_or_kicked(deadline);
+                    continue;
+                }
+            }
+            if let Some(stall_us) = stall_wait {
+                match rx.recv_timeout(Duration::from_micros(stall_us.max(1))) {
+                    Ok(c) => {
+                        if self.handle(c) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+                continue;
+            }
+            if got > 0 {
+                // Re-check stall/timers; do not park until those run.
+                continue;
+            }
+            match rx.recv() {
+                Ok(c) => {
+                    if self.handle(c) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
 }
@@ -1822,6 +1834,9 @@ impl Drop for EngineHandle {
         if let Some(tx) = self.link.tx.take() {
             // Ignore the error: the thread may already have exited.
             let _ = tx.send(Command::Shutdown);
+            if virtual_clock::is_initialized() {
+                virtual_clock::kick();
+            }
         }
         if let Some(join) = self.join.take() {
             if join.join().is_err() {
@@ -2340,17 +2355,16 @@ mod tests {
         )
     }
 
-    /// `schedule_at` fires exactly once, at-or-after its virtual deadline
-    /// (timestamps are sampled from the free-running scaled clock).
+    /// `schedule_at` fires exactly once, at-or-after its virtual deadline.
     #[rstest]
     fn one_shot_timer_fires_once_at_virtual_deadline() {
         let _g = lock_clock();
-        virtual_clock::init(50.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
         let now = virtual_clock::virtual_us();
-        let deadline = now + 100_000; // 100 virtual ms = 2 wall ms at 50x
+        let deadline = now + 100_000; // 100 virtual ms, unpaced jump
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(0),
             at_us: deadline,
@@ -2372,13 +2386,13 @@ mod tests {
     #[rstest]
     fn periodic_timer_fires_repeatedly_against_scaled_clock() {
         let _g = lock_clock();
-        virtual_clock::init(50.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
         handle.link().send(Command::ScheduleEvery {
             component: ComponentId(0),
-            period_us: 20_000, // 0.4 wall ms at 50x
+            period_us: 20_000,
         });
         assert!(
             wait_for(|| log.lock().unwrap().len() >= 3, Duration::from_secs(5)),
@@ -2396,8 +2410,8 @@ mod tests {
     #[rstest]
     fn late_wakeups_fire_immediately_in_deadline_order() {
         let _g = lock_clock();
-        virtual_clock::init(1.0, 1_000_000);
-        std::thread::sleep(Duration::from_millis(5)); // let virtual time pass both deadlines
+        virtual_clock::init(0.0, 1_000_000);
+        virtual_clock::advance(5_000); // both 1_000 and 2_000 us deadlines are now late
         let handle = empty_engine();
 
         let order: Arc<StdMutex<Vec<u32>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -2456,7 +2470,7 @@ mod tests {
     #[rstest]
     fn sustained_drive_flood_does_not_starve_the_timer_wheel() {
         let _g = lock_clock();
-        virtual_clock::init(1.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let handle = EngineHandle::spawn(resolver, nets(1), Box::new(QuasiStaticMna));

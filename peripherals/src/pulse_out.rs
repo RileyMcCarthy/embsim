@@ -372,10 +372,7 @@ fn register<F: ?Sized>(slot: &Mutex<Vec<Option<Box<F>>>>, channel: usize, cb: Bo
 }
 
 fn sleep_virtual_us(virtual_us: u64) {
-    let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(virtual_us);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    embsim_core::virtual_clock::wait_us(virtual_us);
 }
 
 // ============================================================

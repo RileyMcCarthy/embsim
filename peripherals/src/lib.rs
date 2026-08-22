@@ -62,6 +62,6 @@ pub(crate) mod test_support {
     /// test. Pinned at 1.0x speed and a 180 MHz simulated clock.
     pub fn ensure_clock() {
         static C: OnceLock<()> = OnceLock::new();
-        C.get_or_init(|| embsim_core::virtual_clock::init(1.0, 180_000_000));
+        C.get_or_init(|| embsim_core::virtual_clock::init(0.0, 180_000_000));
     }
 }

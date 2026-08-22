@@ -401,10 +401,7 @@ fn poll_loop(fw: &FirmwareInfo) {
         resample_all();
 
         let interval_us = poll_interval_us();
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(interval_us);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        embsim_core::virtual_clock::wait_us(interval_us);
     }
 }
 

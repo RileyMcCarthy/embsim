@@ -57,11 +57,12 @@ cargo llvm-cov --workspace --summary-only
    ```
 
    Never call `virtual_clock::init` / `set_scale` from `embsim-peripherals`
-   tests (the shared clock is pinned once — see `peripherals/src/lib.rs`).
+   tests (the shared clock is pinned once, unpaced — see `peripherals/src/lib.rs`).
 
 4. **Assert contracts, not wall flakiness.** Prefer virtual-time schedules,
-   monotonicity, clamps, and ε windows. Dedicated paced-stream tests that pin
-   scale and assert wall delay are the exception (document why).
+   monotonicity, clamps, and ε windows. `virtual_clock::init(0.0, freq)` is
+   unpaced (jumps are instant). Dedicated paced-stream tests that pin
+   `speed > 0` and assert wall delay are the exception (document why).
 
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`

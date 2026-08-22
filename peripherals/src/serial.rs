@@ -120,7 +120,8 @@ impl Serial {
     /// bytes (`bytes * 10 / baud` seconds at 8N1).
     ///
     /// All scheduling decisions read `embsim_core::virtual_clock`, so timing is
-    /// reproducible across runs and scales correctly with `--speed`.
+    /// a quantum-barrier park (not a wall sleep) and stays in lockstep with
+    /// other cores. Interactive `--speed` pacing is applied by the clock itself.
     ///
     /// Calling `set_baud` resets both TX and RX schedules for the channel.
     pub fn set_baud(&self, channel: usize, baud: u32) {
@@ -142,8 +143,8 @@ impl Serial {
         }
     }
 
-    /// Reserve a slot of `n` bytes on the given direction's schedule and block
-    /// (in wall time) for the equivalent virtual duration. No-op when `baud` is 0.
+    /// Reserve a slot of `n` bytes on the given direction's schedule and park
+    /// until that virtual instant. No-op when `baud` is 0.
     fn pace_bytes(&self, slot: &AtomicU64, baud: u32, n: usize) {
         if n == 0 || baud == 0 {
             return;
@@ -167,11 +168,7 @@ impl Serial {
             }
         };
 
-        let wait_v_us = end_v.saturating_sub(now_v);
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(wait_v_us);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        embsim_core::virtual_clock::wait_until(end_v);
     }
 
     /// Reserve a TX slot of `n` bytes; sleeps to model the firmware blocking
@@ -259,24 +256,17 @@ impl Serial {
     pub fn receive_data_timeout(&self, channel: usize, buf: &mut [u8], timeout_us: u64) -> bool {
         let count = self.count.load(Ordering::Relaxed);
         if buf.is_empty() || channel >= count {
-            let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-            if wall_us > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(wall_us));
-            }
+            embsim_core::virtual_clock::wait_us(timeout_us);
             return false;
         }
 
         let fd = self.fds[channel].load(Ordering::Relaxed);
         if fd < 0 {
-            let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-            if wall_us > 0 {
-                std::thread::sleep(std::time::Duration::from_micros(wall_us));
-            }
+            embsim_core::virtual_clock::wait_us(timeout_us);
             return false;
         }
 
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wall_us);
+        let deadline_v = embsim_core::virtual_clock::virtual_us().saturating_add(timeout_us);
         let mut total_read = 0;
 
         // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
@@ -287,18 +277,17 @@ impl Serial {
                 Ok(0) => break,
                 Ok(n) => {
                     total_read += n;
-                    // Throttle consumption to virtual baud. Sleeps wall-time
-                    // equivalent of n*10/baud virtual µs; no-op when unpaced.
+                    // Throttle consumption to virtual baud (park, not wall sleep).
                     self.pace_rx(channel, n);
                     if total_read >= buf.len() {
                         break;
                     }
                 }
                 Err(nix::errno::Errno::EAGAIN) => {
-                    if std::time::Instant::now() >= deadline {
+                    if embsim_core::virtual_clock::virtual_us() >= deadline_v {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    embsim_core::virtual_clock::wait_until(deadline_v);
                 }
                 Err(_) => break,
             }
@@ -788,12 +777,9 @@ mod tests {
         assert_eq!(pair.read_far(1), b"x");
     }
 
-    /// Paced TX of `N` bytes at baud `B` with `F` frame bits must block for
-    /// approximately `N * F * 1e6 / B` virtual microseconds (scale 1.0 ⇒ wall).
-    ///
-    /// We assert a lower bound of 50% of the theoretical cost (scheduler slack
-    /// can only make sleeps shorter under load, never invent free time) and a
-    /// generous upper bound so CI hosts with jitter still pass.
+    /// Paced TX of `N` bytes at baud `B` with `F` frame bits must advance
+    /// virtual time by `N * F * 1e6 / B` microseconds (unpaced clock: no wall
+    /// sleep).
     #[rstest]
     #[case::ten_kbaud_2b(10_000, 10, 2, 2_000)]
     #[case::twenty_kbaud_5b(20_000, 10, 5, 2_500)]
@@ -812,20 +798,19 @@ mod tests {
         set_baud(0, baud);
 
         let payload = vec![0xA5u8; nbytes];
-        let t0 = std::time::Instant::now();
+        let t0 = embsim_core::virtual_clock::virtual_us();
         transmit_data(0, &payload);
-        let wall_us = t0.elapsed().as_micros() as u64;
+        let elapsed = embsim_core::virtual_clock::virtual_us().saturating_sub(t0);
 
         assert_eq!(pair.read_far(nbytes), payload.as_slice());
         assert!(
-            wall_us >= expected_v_us / 2,
-            "paced TX too fast: wall={wall_us}us expected≥{}us (baud={baud} F={frame_bits} N={nbytes})",
-            expected_v_us / 2
+            elapsed >= expected_v_us,
+            "paced TX too little virtual time: elapsed={elapsed}us expected≥{expected_v_us}us (baud={baud} F={frame_bits} N={nbytes})"
         );
         assert!(
-            wall_us <= expected_v_us.saturating_mul(8).saturating_add(20_000),
-            "paced TX too slow: wall={wall_us}us expected≤{}us",
-            expected_v_us.saturating_mul(8).saturating_add(20_000)
+            elapsed <= expected_v_us.saturating_add(embsim_core::virtual_clock::DEFAULT_QUANTUM_US),
+            "paced TX jumped too far: elapsed={elapsed}us expected≤{}",
+            expected_v_us.saturating_add(embsim_core::virtual_clock::DEFAULT_QUANTUM_US)
         );
     }
 
@@ -838,21 +823,25 @@ mod tests {
         setup(1);
         init_channel_fd(0, pair.a);
         set_frame_bits(10);
-        set_baud(0, 50_000); // 200 us/byte — measurable but snappy
+        set_baud(0, 50_000); // 200 us/byte
 
-        // TX half: one byte.
-        let t_tx = std::time::Instant::now();
+        let t0 = embsim_core::virtual_clock::virtual_us();
         transmit_data(0, b"T");
-        let tx_us = t_tx.elapsed().as_micros() as u64;
+        let tx_elapsed = embsim_core::virtual_clock::virtual_us().saturating_sub(t0);
         assert_eq!(pair.read_far(1), b"T");
-        assert!(tx_us >= 100, "TX half should sleep ~200us, got {tx_us}");
+        assert!(
+            tx_elapsed >= 200,
+            "TX half should cost ~200 virtual us, got {tx_elapsed}"
+        );
 
-        // RX half: one byte from the far end.
         pair.write_far(b"R");
-        let t_rx = std::time::Instant::now();
+        let t1 = embsim_core::virtual_clock::virtual_us();
         assert_eq!(receive_byte(0), Some(b'R'));
-        let rx_us = t_rx.elapsed().as_micros() as u64;
-        assert!(rx_us >= 100, "RX half should sleep ~200us, got {rx_us}");
+        let rx_elapsed = embsim_core::virtual_clock::virtual_us().saturating_sub(t1);
+        assert!(
+            rx_elapsed >= 200,
+            "RX half should cost ~200 virtual us, got {rx_elapsed}"
+        );
     }
 
     /// Frame-bits / baud matrix: bytes always land intact under pacing.

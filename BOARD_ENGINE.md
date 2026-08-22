@@ -50,10 +50,13 @@ lock-free paths:
   (`io.schedule_at(v_us)` / `io.schedule_every(v_us)`), served by a timer wheel
   on the engine thread keyed to virtual time. Idle components cost nothing.
 
-Note on time: `embsim_core::virtual_clock` is **free-running scaled wall time**
-(no step/pause API, no central tick loop), so wakeup timestamps are sampled,
-not deterministic. Time-sensitive state must be computed at *read time* (as the
-RC closed form is), never integrated per tick.
+Note on time: `embsim_core::virtual_clock` is a **quantum-barrier counter**
+(Renode-style: time jumps when every firmware core is parked, capped by the
+quantum; [`pause`] freezes it). Wakeup timestamps are deterministic. Optional
+wall pacing (`init(speed, …)` with `speed > 0`) sleeps *after* a jump for
+interactive 1×; tests use `speed = 0` (unpaced). Time-sensitive analog state
+is still computed at *read time* (the RC closed form), never integrated per
+tick.
 
 ## Core abstractions
 

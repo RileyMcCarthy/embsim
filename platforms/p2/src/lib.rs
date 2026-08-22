@@ -89,10 +89,10 @@ mod tests {
         })
     }
 
-    /// Pin the shared virtual clock exactly once (1.0x at the P2's 180 MHz).
+    /// Pin the shared virtual clock exactly once (unpaced, P2 180 MHz).
     fn ensure_clock() {
         static C: OnceLock<()> = OnceLock::new();
-        C.get_or_init(|| embsim_core::virtual_clock::init(1.0, P2_CLOCK_FREQ));
+        C.get_or_init(|| embsim_core::virtual_clock::init(0.0, P2_CLOCK_FREQ));
     }
 
     /// Re-initialize every peripheral to a known clean state before a test.
@@ -317,6 +317,27 @@ mod tests {
             ffi::HAL_lock_release(id);
             assert!(!ffi::HAL_lock_try(-1), "negative id rejected");
         }
+    }
+
+    /// A participating cog is preempted at HAL after one quantum of work,
+    /// so firmware can free-run (`LOCKTRY` / UART poll) without yield macros.
+    #[rstest]
+    fn hal_work_consumes_a_quantum() {
+        let _g = guard();
+        setup();
+        let _p = embsim_core::virtual_clock::participate();
+        let q = embsim_core::virtual_clock::quantum_us();
+        let t0 = embsim_core::virtual_clock::virtual_us();
+        unsafe {
+            for _ in 0..q {
+                let _ = ffi::HAL_GPIO_getActive(0);
+            }
+        }
+        assert_eq!(
+            embsim_core::virtual_clock::virtual_us(),
+            t0 + q,
+            "one HAL call per µs of slice, then park"
+        );
     }
 
     // ── System trampolines ──

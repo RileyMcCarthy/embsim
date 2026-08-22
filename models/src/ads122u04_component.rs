@@ -415,13 +415,10 @@ fn pump_loop(fd: &OwnedFd, tx: &StreamTx, gate: &Gate, shutdown: &AtomicBool) {
                 break;
             }
         }
-        let wall_us = if virtual_clock::is_initialized() {
-            virtual_clock::virtual_to_wall_us(PUMP_POLL_VIRTUAL_US)
+        if virtual_clock::is_initialized() {
+            virtual_clock::wait_us(PUMP_POLL_VIRTUAL_US);
         } else {
-            PUMP_POLL_FALLBACK_WALL_US
-        };
-        if wall_us > 0 {
-            std::thread::sleep(Duration::from_micros(wall_us));
+            std::thread::sleep(Duration::from_micros(PUMP_POLL_FALLBACK_WALL_US));
         }
     }
 }

@@ -124,6 +124,9 @@ impl System {
                 // Inherit the creator's instance before the firmware function
                 // runs; the guard unbinds when the thread body returns.
                 let _instance_binding = inherit.map(instance::bind_current_thread);
+                // Hold a time-participant slot so this core parks on wait/yield
+                // instead of freezing the quantum barrier as "always running".
+                let _time = embsim_core::virtual_clock::participate();
                 info!("Thread {} started", thread_name);
                 unsafe {
                     let f: unsafe extern "C" fn(*mut std::ffi::c_void) =
