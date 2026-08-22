@@ -124,6 +124,9 @@ impl System {
                 // Inherit the creator's instance before the firmware function
                 // runs; the guard unbinds when the thread body returns.
                 let _instance_binding = inherit.map(instance::bind_current_thread);
+                // Firmware cogs are time actors: HAL `charge` can park them so
+                // a LOCKTRY/UART spin does not freeze stepped virtual time.
+                let _actor = embsim_core::virtual_clock::register_actor(&thread_name);
                 info!("Thread {} started", thread_name);
                 unsafe {
                     let f: unsafe extern "C" fn(*mut std::ffi::c_void) =
