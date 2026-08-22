@@ -72,7 +72,15 @@ let _actor = embsim_core::virtual_clock::register_actor("my-protocol-thread");
 
 The guard is `!Send` (drop it on the thread that took it) and unregisters on
 drop, including on unwind. Registration is free in free-running mode — nothing
-consults the registry there — so register unconditionally.
+consults the registry there — so register unconditionally. Firmware threads
+spawned through `HAL_system_startThread` register as `core-N`.
+
+Native firmware is host machine code, so the emulator cannot preempt it
+except at a HAL trampoline. Every HAL entry **charges** one unit of the
+calling cog's quantum (`virtual_clock::charge`); after a full slice the
+trampoline parks via `wait_virtual_us`. Firmware may spin (`LOCKTRY`,
+UART poll) with no yield macros. A cog that never hits HAL still cannot
+be stopped — that is an ISS problem.
 
 In stepped mode the engine will not advance virtual time while any registered
 actor is runnable, which is what stops a thread executing "later" work at an

@@ -66,6 +66,15 @@
 //! - **Not seen:** whether an actor *will* register. New actors start runnable,
 //!   so registering one while the scheduler is mid-advance is a race the
 //!   scheduler cannot arbitrate. Register before the system starts.
+//!
+//! # Native firmware: preemption at HAL
+//!
+//! Host-compiled firmware is real machine code. The emulator is not in the
+//! instruction stream, so a cog that never waits (`LOCKTRY` spin, UART poll)
+//! would stay runnable forever and freeze stepped time. Platform trampolines
+//! call [`charge`] on every HAL entry; after [`DEFAULT_QUANTUM_US`] of charged
+//! work the cog parks through [`wait_virtual_us`]. Firmware stays free to
+//! spin. A cog that never hits HAL still cannot be stopped — that needs an ISS.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -295,6 +304,10 @@ pub fn clock_freq() -> u32 {
     CLOCK_FREQ.load(Ordering::Relaxed)
 }
 
+/// HAL-proxy work that exhausts a cog's slice, after which [`charge`] parks.
+/// 1 ms, a common Renode quantum.
+pub const DEFAULT_QUANTUM_US: u64 = 1_000;
+
 // ============================================================
 // Waiting — the single chokepoint between virtual and wall time
 // ============================================================
@@ -341,6 +354,7 @@ pub fn stepped_wall_sleep_count() -> u64 {
 /// long to wait but not *when* they started (`HAL_time_waitUs`, a poll
 /// cadence, a receive timeout).
 pub fn wait_virtual_us(d_us: u64) {
+    SLICE_USED_US.set(0);
     if is_stepped() {
         park_until_virtual(NOW_US.load(Ordering::Relaxed).saturating_add(d_us));
         return;
@@ -369,6 +383,7 @@ pub fn wait_virtual_us(d_us: u64) {
 /// requires the clock origin. Callers that must survive an uninitialized clock
 /// check [`is_initialized`] first, or use [`wait_virtual_us`].
 pub fn wait_until(deadline_v_us: u64) {
+    SLICE_USED_US.set(0);
     if is_stepped() {
         park_until_virtual(deadline_v_us);
         return;
@@ -391,6 +406,28 @@ pub fn wait_until(deadline_v_us: u64) {
 /// or [`wait_virtual_us`].
 pub fn wait_wall_us(d_us: u64) {
     park_wall_us(d_us);
+}
+
+/// Account for guest work on this thread (one HAL call ≈ 1 µs of slice).
+///
+/// Native SIL executes host machine code, so the emulator is not in the
+/// instruction stream. Platform trampolines call this on HAL entry; after
+/// [`DEFAULT_QUANTUM_US`] of charged work the thread parks via
+/// [`wait_virtual_us`] so other actors and the engine can run.
+///
+/// No-op if this thread is not a registered [`Actor`] (unit tests, host
+/// tooling). A real [`wait_virtual_us`] / [`wait_until`] resets the slice.
+pub fn charge(us: u64) {
+    if us == 0 || THREAD_ACTOR.with(|slot| slot.get()).is_none() {
+        return;
+    }
+    let used = SLICE_USED_US.get().saturating_add(us);
+    if used < DEFAULT_QUANTUM_US {
+        SLICE_USED_US.set(used);
+        return;
+    }
+    SLICE_USED_US.set(0);
+    wait_virtual_us(used);
 }
 
 // ============================================================
@@ -445,6 +482,9 @@ static QUIESCENT: Condvar = Condvar::new();
 thread_local! {
     /// Actor id bound to this thread by [`register_actor`], if any.
     static THREAD_ACTOR: Cell<Option<u64>> = const { Cell::new(None) };
+    /// HAL-proxy work charged against this thread's quantum. Reset by
+    /// [`wait_until`] / [`wait_virtual_us`] / actor drop.
+    static SLICE_USED_US: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Take the scheduler lock, recovering from poison. A thread that panicked
@@ -493,6 +533,7 @@ impl Actor {
 impl Drop for Actor {
     fn drop(&mut self) {
         THREAD_ACTOR.with(|slot| slot.set(None));
+        SLICE_USED_US.set(0);
         let quiescent = {
             let mut sched = lock_sched();
             if let Some(state) = sched.actors.remove(&self.id) {
@@ -1383,5 +1424,73 @@ mod tests {
             "re-anchored virtual_us should be small, got {after}"
         );
         let _ = before;
+    }
+
+    /// Host threads that are not actors must not be preempted.
+    #[rstest]
+    fn charge_is_a_no_op_without_an_actor() {
+        let _g = SteppedGuard::enter();
+        for _ in 0..10_000 {
+            charge(1);
+        }
+        assert_eq!(virtual_us(), 0);
+        assert_eq!(scheduler_state().running, 0);
+    }
+
+    /// A running actor is left alone until its HAL-proxy slice fills.
+    #[rstest]
+    fn charge_below_quantum_does_not_park() {
+        let _g = SteppedGuard::enter();
+        let gate = Arc::new(AtomicU64::new(0));
+        let actor_gate = Arc::clone(&gate);
+        let actor = std::thread::spawn(move || {
+            let _registration = register_actor("below-quantum");
+            for _ in 0..(DEFAULT_QUANTUM_US - 1) {
+                charge(1);
+            }
+            while actor_gate.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+        });
+        assert!(
+            spin_until(|| scheduler_state().running == 1),
+            "the actor must register as runnable"
+        );
+        match await_quiescence(Duration::from_millis(50)) {
+            Quiescence::Stalled { actors } => {
+                assert_eq!(actors, vec!["below-quantum".to_string()])
+            }
+            other => panic!("a slice still open must hold the barrier, got {other:?}"),
+        }
+        gate.store(1, Ordering::SeqCst);
+        actor.join().expect("actor must exit once released");
+    }
+
+    /// Exhausting the slice parks the cog so the engine can advance.
+    #[rstest]
+    fn charge_exhausting_quantum_parks() {
+        let _g = SteppedGuard::enter();
+        let actor = std::thread::spawn(|| {
+            let _registration = register_actor("spinner");
+            for _ in 0..DEFAULT_QUANTUM_US {
+                charge(1);
+            }
+        });
+        assert!(
+            spin_until(|| {
+                let s = scheduler_state();
+                s.running == 1 || s.next_deadline_us == Some(DEFAULT_QUANTUM_US)
+            }),
+            "the spinner must register or park"
+        );
+        match await_quiescence(Duration::from_secs(5)) {
+            Quiescence::Reached { next_deadline_us } => {
+                assert_eq!(next_deadline_us, Some(DEFAULT_QUANTUM_US));
+            }
+            other => panic!("exhausting the slice must park, got {other:?}"),
+        }
+        advance_to(DEFAULT_QUANTUM_US).expect("engine can step to the park");
+        actor.join().expect("the cog resumes after the step");
+        assert_eq!(virtual_us(), DEFAULT_QUANTUM_US);
     }
 }
