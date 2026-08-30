@@ -24,6 +24,13 @@ cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 cargo test -p embsim-board --test pulse_bridge --test carriage_seam -- --nocapture
 cargo test -p embsim-board --test pulse_bridge_stepped -- --nocapture
 
+# The isolation parts, promoted from stubs on the real EdgeBoard netlist:
+# levels and a rate-carried step train crossing the barrier, the fail-safe
+# output of an unpowered side, and the end-switch current loop. `--nocapture`
+# prints the measured engine-event cost of a step train at two rates a
+# hundredfold apart.
+cargo test -p embsim-board --test isolation_bridge -- --nocapture
+
 # Re-bless the golden traces after an INTENDED engine/model behavior change.
 # Review the diff: it is the wire behavior of the system.
 EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism
@@ -135,6 +142,7 @@ cargo llvm-cov --workspace --summary-only
 | Runtime | full no-firmware run | missing symbols, ceilings | TooManyChannels per peripheral |
 | Board | drive/sense/stream | contention, facade mismatch | net truth table, drop policies |
 | Pin bridges | exact counts, GPIO both ways, encoder counts | slip, floating input, unbridged channel | polarity matrix, direction mapping, level projection |
+| Interface parts | the datasheet function table, on a real netlist | unpowered side, disabled output, open loop | variant/pinout matrix, fail-safe vs default-high |
 | Stepped clock | N-run + golden identity | wedged actor, held time-release | case matrix × {free-running, stepped} |
 | P2 trampolines | null/neg guards | bind routing | channel index grids |
 | Tools | parse/record/render | empty/unknown | DWARF flag matrices |

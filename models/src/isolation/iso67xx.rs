@@ -847,9 +847,8 @@ impl Iso67xxMonitor {
     pub fn output_level(&self, channel: Channel) -> Option<Level> {
         let state = self.core.state.lock().unwrap();
         let wiring = self.core.wiring.iter().find(|w| w.channel == channel)?;
-        if state.applied[channel.index()].flatten().is_none() {
-            return None;
-        }
+        // A released pin has no level; only a driving one does.
+        state.applied[channel.index()].flatten()?;
         Some(self.core.output_level(&state, wiring))
     }
 
