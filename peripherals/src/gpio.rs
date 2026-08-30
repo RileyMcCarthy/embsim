@@ -92,6 +92,7 @@ impl Gpio {
     pub fn set_active(&self, channel: usize, active: bool) {
         let count = self.count.load(Ordering::Relaxed);
         if channel >= count {
+            crate::access::report("gpio", &format!("set_active channel {channel}"));
             return;
         }
         self.state[channel].store(active, Ordering::Relaxed);
@@ -107,10 +108,16 @@ impl Gpio {
         }
     }
 
+    /// Configured channel count.
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// Get a GPIO channel active state.
     pub fn get_active(&self, channel: usize) -> bool {
         let count = self.count.load(Ordering::Relaxed);
         if channel >= count {
+            crate::access::report("gpio", &format!("get_active channel {channel}"));
             return false;
         }
         self.state[channel].load(Ordering::Relaxed)
@@ -120,6 +127,7 @@ impl Gpio {
     pub fn toggle_active(&self, channel: usize) {
         let count = self.count.load(Ordering::Relaxed);
         if channel >= count {
+            crate::access::report("gpio", &format!("toggle_active channel {channel}"));
             return;
         }
         let current = self.state[channel].load(Ordering::Relaxed);

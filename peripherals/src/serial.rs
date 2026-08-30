@@ -1,23 +1,36 @@
-//! Serial — FD-bridged serial port channels.
+//! Serial — UART byte FIFOs with an optional host-FD backend.
 //!
-//! Bridges firmware serial channels to file descriptors. The peripheral
-//! manages raw FDs and has no knowledge of what's on the other end
-//! (a host PTY, a peer socket, a sensor model, etc). Channel assignment is
-//! done by the project wiring layer via `init_channel_fd()`.
+//! Firmware HAL talks only to per-channel **RX/TX FIFOs**. A PTY, socketpair,
+//! or test harness is a **backend** that fills RX and drains TX (via an
+//! attached FD or [`Serial::write_host_rx`] / [`Serial::take_host_tx`]).
+//! Baud pacing is virtual-time.
 //!
 //! State lives in a per-MCU [`Serial`] bank owned by
 //! `instance::PeripheralInstance`. The module-level free functions route to
 //! the calling thread's instance (see `crate::instance`), so existing
 //! single-MCU consumers are unaffected.
 
+use std::collections::VecDeque;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tracing::{debug, trace};
+
+use crate::access;
 
 /// Maximum serial channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 16;
 
-/// FD-bridged serial channel bank for one MCU instance.
+/// How long [`Serial::receive_data_timeout`] parks between RX FIFO polls.
+const RX_POLL_INTERVAL_US: u64 = 100;
+
+/// Per-channel UART FIFOs (firmware-facing).
+struct SerialFifos {
+    tx: [VecDeque<u8>; MAX_CHANNELS],
+    rx: [VecDeque<u8>; MAX_CHANNELS],
+}
+
+/// UART channel bank for one MCU instance.
 pub struct Serial {
     /// Bits clocked per byte on the wire, for baud pacing. Defaults to 10
     /// (8N1: 1 start + 8 data + 1 stop). Configure via [`Serial::set_frame_bits`]
@@ -25,7 +38,7 @@ pub struct Serial {
     bits_per_byte: AtomicU64,
     /// Configured channel count.
     count: AtomicUsize,
-    /// File descriptors for each channel. -1 = not connected.
+    /// Optional host-FD backend per channel. -1 = FIFO-only (tests / inject).
     fds: [AtomicI32; MAX_CHANNELS],
     /// Configured baud per channel. 0 = unpaced (instant TX/RX, default).
     baud: [AtomicU32; MAX_CHANNELS],
@@ -35,11 +48,12 @@ pub struct Serial {
     /// Next virtual-microsecond at which the firmware may consume the next
     /// byte from the RX line. Independent of TX so the link is full-duplex.
     rx_next_v_us: [AtomicU64; MAX_CHANNELS],
+    fifos: Mutex<SerialFifos>,
 }
 
 impl Serial {
     /// Create a bank with no channels configured and nothing connected.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         // justification: these `const`s are never read as values; they only
         // seed the `[INIT; N]` array-repeat initializers for the fields below.
         // Array-repeat syntax *requires* a `const`, and no interior mutability
@@ -57,6 +71,10 @@ impl Serial {
             baud: [U32_INIT; MAX_CHANNELS],
             tx_next_v_us: [U64_INIT; MAX_CHANNELS],
             rx_next_v_us: [U64_INIT; MAX_CHANNELS],
+            fifos: Mutex::new(SerialFifos {
+                tx: std::array::from_fn(|_| VecDeque::new()),
+                rx: std::array::from_fn(|_| VecDeque::new()),
+            }),
         }
     }
 
@@ -88,10 +106,19 @@ impl Serial {
             self.tx_next_v_us[ch].store(0, Ordering::Relaxed);
             self.rx_next_v_us[ch].store(0, Ordering::Relaxed);
         }
+        {
+            let mut fifos = self.fifos.lock().unwrap();
+            for q in fifos.tx.iter_mut() {
+                q.clear();
+            }
+            for q in fifos.rx.iter_mut() {
+                q.clear();
+            }
+        }
         self.count.store(count, Ordering::Relaxed);
     }
 
-    /// Disconnect all channels and clear baud/pacing state (used by `init` and
+    /// Disconnect all channels and clear baud/pacing/FIFOs (used by `init` and
     /// teardown). Does not close FDs — the owner of the FD (e.g. the PTY) does that.
     pub fn reset(&self) {
         self.count.store(0, Ordering::Relaxed);
@@ -100,6 +127,125 @@ impl Serial {
             self.baud[ch].store(0, Ordering::Relaxed);
             self.tx_next_v_us[ch].store(0, Ordering::Relaxed);
             self.rx_next_v_us[ch].store(0, Ordering::Relaxed);
+        }
+        let mut fifos = self.fifos.lock().unwrap();
+        for q in fifos.tx.iter_mut() {
+            q.clear();
+        }
+        for q in fifos.rx.iter_mut() {
+            q.clear();
+        }
+    }
+
+    fn known(&self, channel: usize) -> bool {
+        channel < self.count.load(Ordering::Relaxed)
+    }
+
+    /// Configured channel count.
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Host backend: bytes the firmware will `receive`.
+    pub fn write_host_rx(&self, channel: usize, data: &[u8]) {
+        if !self.known(channel) {
+            access::report("serial", &format!("write_host_rx channel {channel}"));
+            return;
+        }
+        self.fifos.lock().unwrap().rx[channel].extend(data.iter().copied());
+    }
+
+    /// Host backend: drain bytes the firmware `transmit`ted.
+    pub fn take_host_tx(&self, channel: usize, max: usize) -> Vec<u8> {
+        if !self.known(channel) {
+            access::report("serial", &format!("take_host_tx channel {channel}"));
+            return Vec::new();
+        }
+        let mut tx = self.fifos.lock().unwrap();
+        let n = max.min(tx.tx[channel].len());
+        tx.tx[channel].drain(..n).collect()
+    }
+
+    /// Firmware-facing RX FIFO depth (inspect).
+    pub fn rx_len(&self, channel: usize) -> usize {
+        if !self.known(channel) {
+            return 0;
+        }
+        self.fifos.lock().unwrap().rx[channel].len()
+    }
+
+    /// Firmware-facing TX FIFO depth (inspect).
+    pub fn tx_len(&self, channel: usize) -> usize {
+        if !self.known(channel) {
+            return 0;
+        }
+        self.fifos.lock().unwrap().tx[channel].len()
+    }
+
+    /// Attached backend FD, or -1 if FIFO-only.
+    pub fn backend_fd(&self, channel: usize) -> i32 {
+        if !self.known(channel) {
+            return -1;
+        }
+        self.fds[channel].load(Ordering::Relaxed)
+    }
+
+    pub fn baud(&self, channel: usize) -> u32 {
+        if !self.known(channel) {
+            return 0;
+        }
+        self.baud[channel].load(Ordering::Relaxed)
+    }
+
+    /// Pull available bytes from the optional FD backend into the RX FIFO.
+    fn pull_backend(&self, channel: usize) {
+        let fd = self.fds[channel].load(Ordering::Relaxed);
+        if fd < 0 {
+            return;
+        }
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut buf = [0u8; 256];
+        match nix::unistd::read(borrowed, &mut buf) {
+            Ok(n) if n > 0 => {
+                self.fifos.lock().unwrap().rx[channel].extend(buf[..n].iter().copied());
+            }
+            _ => {}
+        }
+    }
+
+    /// Push TX FIFO bytes to the optional FD backend.
+    fn flush_backend(&self, channel: usize) {
+        let fd = self.fds[channel].load(Ordering::Relaxed);
+        if fd < 0 {
+            return;
+        }
+        let pending: Vec<u8> = {
+            let mut fifos = self.fifos.lock().unwrap();
+            fifos.tx[channel].drain(..).collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut written = 0;
+        while written < pending.len() {
+            match nix::unistd::write(borrowed, &pending[written..]) {
+                Ok(n) => written += n,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // Put the rest back; a later transmit/flush will retry.
+                    self.fifos.lock().unwrap().tx[channel]
+                        .extend(pending[written..].iter().copied());
+                    break;
+                }
+                Err(e) => {
+                    trace!(
+                        "serial flush_backend(channel={}): write error: {}",
+                        channel,
+                        e
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -205,49 +351,19 @@ impl Serial {
         trace!("serial::stop(channel={})", channel);
     }
 
-    /// Transmit data on a serial channel.
+    /// Transmit data on a serial channel (UART TX FIFO, then optional FD backend).
     pub fn transmit_data(&self, channel: usize, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        let count = self.count.load(Ordering::Relaxed);
-        if channel >= count {
-            trace!("serial::transmit_data(channel={}): unknown", channel);
+        if !self.known(channel) {
+            access::report("serial", &format!("transmit channel {channel}"));
             return;
         }
 
-        let fd = self.fds[channel].load(Ordering::Relaxed);
-        if fd < 0 {
-            trace!(
-                "serial::transmit_data(channel={}): not connected, discarding {} bytes",
-                channel,
-                data.len()
-            );
-            return;
-        }
-
-        // Reserve and wait for our slot on the simulated wire before clocking the
-        // bytes out. No-op unless `set_baud` has been called for this channel.
         self.pace_tx(channel, data.len());
-
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let mut written = 0;
-        while written < data.len() {
-            match nix::unistd::write(borrowed, &data[written..]) {
-                Ok(n) => written += n,
-                Err(nix::errno::Errno::EAGAIN) => {
-                    std::thread::yield_now();
-                }
-                Err(e) => {
-                    trace!(
-                        "serial::transmit_data(channel={}): write error: {}",
-                        channel,
-                        e
-                    );
-                    break;
-                }
-            }
-        }
+        self.fifos.lock().unwrap().tx[channel].extend(data.iter().copied());
+        self.flush_backend(channel);
         trace!(
             "serial::transmit_data(channel={}, len={})",
             channel,
@@ -258,54 +374,48 @@ impl Serial {
     /// Receive data with a timeout (virtual microseconds).
     /// Returns true if all `buf.len()` bytes were received before timeout.
     pub fn receive_data_timeout(&self, channel: usize, buf: &mut [u8], timeout_us: u64) -> bool {
-        let count = self.count.load(Ordering::Relaxed);
-        if buf.is_empty() || channel >= count {
-            // Nothing to read from: burn the caller's whole virtual timeout,
-            // exactly as a real UART with no traffic would.
+        if buf.is_empty() {
+            embsim_core::virtual_clock::wait_virtual_us(timeout_us);
+            return false;
+        }
+        if !self.known(channel) {
+            access::report("serial", &format!("receive_timeout channel {channel}"));
             embsim_core::virtual_clock::wait_virtual_us(timeout_us);
             return false;
         }
 
-        let fd = self.fds[channel].load(Ordering::Relaxed);
-        if fd < 0 {
-            embsim_core::virtual_clock::wait_virtual_us(timeout_us);
-            return false;
-        }
-
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(timeout_us);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_micros(wall_us);
+        let deadline_v_us = embsim_core::virtual_clock::virtual_us().saturating_add(timeout_us);
         let mut total_read = 0;
 
-        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
-        // the duration of this call (borrow does not outlive it).
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         while total_read < buf.len() {
-            match nix::unistd::read(borrowed, &mut buf[total_read..]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    total_read += n;
-                    // Throttle consumption to virtual baud. Sleeps wall-time
-                    // equivalent of n*10/baud virtual µs; no-op when unpaced.
-                    self.pace_rx(channel, n);
-                    if total_read >= buf.len() {
-                        break;
+            self.pull_backend(channel);
+            let got = {
+                let mut fifos = self.fifos.lock().unwrap();
+                let mut n = 0;
+                while total_read + n < buf.len() {
+                    match fifos.rx[channel].pop_front() {
+                        Some(b) => {
+                            buf[total_read + n] = b;
+                            n += 1;
+                        }
+                        None => break,
                     }
                 }
-                Err(nix::errno::Errno::EAGAIN) => {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    // Retry cadence for a spin on a REAL file descriptor, so
-                    // it is wall time by nature and stays unscaled (see
-                    // `wait_wall_us`). `DETERMINISM.md` T1 §4 has this whole
-                    // path — `Instant` deadline included — replaced by a
-                    // `QueueTransport` park in Phase D2; until then, scaling
-                    // the retry interval would only change how hard this
-                    // thread spins, not what it observes.
-                    embsim_core::virtual_clock::wait_wall_us(100);
-                }
-                Err(_) => break,
+                n
+            };
+            if got > 0 {
+                total_read += got;
+                self.pace_rx(channel, got);
             }
+            if total_read >= buf.len() {
+                return true;
+            }
+            let now = embsim_core::virtual_clock::virtual_us();
+            if now >= deadline_v_us {
+                break;
+            }
+            let step = RX_POLL_INTERVAL_US.min(deadline_v_us.saturating_sub(now));
+            embsim_core::virtual_clock::wait_virtual_us(step);
         }
 
         total_read == buf.len()
@@ -318,54 +428,46 @@ impl Serial {
     /// baud so the firmware can never consume bytes faster than the wire would
     /// deliver them.
     pub fn receive_bytes(&self, channel: usize, buf: &mut [u8]) -> usize {
-        let count = self.count.load(Ordering::Relaxed);
-        if buf.is_empty() || channel >= count {
+        if buf.is_empty() {
             return 0;
         }
-
-        let fd = self.fds[channel].load(Ordering::Relaxed);
-        if fd < 0 {
+        if !self.known(channel) {
+            access::report("serial", &format!("receive_bytes channel {channel}"));
             return 0;
         }
-
-        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
-        // the duration of this call (borrow does not outlive it).
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match nix::unistd::read(borrowed, buf) {
-            Ok(n) if n > 0 => {
-                // Throttle consumption to virtual baud (no-op when unpaced).
-                self.pace_rx(channel, n);
-                n
+        self.pull_backend(channel);
+        let mut n = 0;
+        {
+            let mut fifos = self.fifos.lock().unwrap();
+            while n < buf.len() {
+                match fifos.rx[channel].pop_front() {
+                    Some(b) => {
+                        buf[n] = b;
+                        n += 1;
+                    }
+                    None => break,
+                }
             }
-            _ => 0,
         }
+        if n > 0 {
+            self.pace_rx(channel, n);
+        }
+        n
     }
 
     /// Receive a single byte (non-blocking).
     /// Returns Some(byte) if a byte was available, None otherwise.
     pub fn receive_byte(&self, channel: usize) -> Option<u8> {
-        let count = self.count.load(Ordering::Relaxed);
-        if channel >= count {
+        if !self.known(channel) {
+            access::report("serial", &format!("receive_byte channel {channel}"));
             return None;
         }
-
-        let fd = self.fds[channel].load(Ordering::Relaxed);
-        if fd < 0 {
-            return None;
+        self.pull_backend(channel);
+        let byte = self.fifos.lock().unwrap().rx[channel].pop_front();
+        if byte.is_some() {
+            self.pace_rx(channel, 1);
         }
-
-        let mut byte = [0u8; 1];
-        // SAFETY: `fd` is the channel FD owned by `self.fds`; it stays open for
-        // the duration of this call (borrow does not outlive it).
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match nix::unistd::read(borrowed, &mut byte) {
-            Ok(1) => {
-                // Throttle consumption to virtual baud (no-op when unpaced).
-                self.pace_rx(channel, 1);
-                Some(byte[0])
-            }
-            _ => None,
-        }
+        byte
     }
 }
 
@@ -401,6 +503,18 @@ pub fn init_channel_fd(channel: usize, fd: RawFd) {
     crate::instance::current()
         .serial
         .init_channel_fd(channel, fd);
+}
+
+/// Host backend: inject bytes the firmware will receive (no FD required).
+pub fn write_host_rx(channel: usize, data: &[u8]) {
+    crate::instance::current()
+        .serial
+        .write_host_rx(channel, data);
+}
+
+/// Host backend: drain bytes the firmware transmitted (no FD required).
+pub fn take_host_tx(channel: usize, max: usize) -> Vec<u8> {
+    crate::instance::current().serial.take_host_tx(channel, max)
 }
 
 /// Configure deterministic baud-rate pacing for a channel (full-duplex).
@@ -609,6 +723,40 @@ mod tests {
         init_channel_fd(0, pair.a);
         transmit_data(0, b"hi");
         assert_eq!(pair.read_far(2), b"hi");
+    }
+
+    #[rstest]
+    fn fifo_host_backend_round_trips_without_an_fd() {
+        let _g = crate::test_support::guard();
+        setup(1);
+        write_host_rx(0, b"ab");
+        assert_eq!(crate::instance::current().serial.rx_len(0), 2);
+        assert_eq!(receive_byte(0), Some(b'a'));
+        assert_eq!(receive_byte(0), Some(b'b'));
+        assert_eq!(receive_byte(0), None);
+
+        transmit_data(0, b"xy");
+        assert_eq!(take_host_tx(0, 8), b"xy");
+        assert_eq!(take_host_tx(0, 8), b"");
+    }
+
+    #[rstest]
+    fn host_tester_byte_is_visible_by_a_virtual_deadline() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        crate::access::take_count();
+        setup(1);
+        let t_inject = embsim_core::virtual_clock::virtual_us() + 1_000;
+        std::thread::spawn(move || {
+            embsim_core::virtual_clock::wait_until(t_inject);
+            write_host_rx(0, b"K");
+        });
+        let mut buf = [0u8; 1];
+        assert!(
+            receive_data_timeout(0, &mut buf, 5_000),
+            "byte must arrive by the virtual deadline"
+        );
+        assert_eq!(buf[0], b'K');
     }
 
     #[rstest]

@@ -55,6 +55,25 @@ the host *after* a jump (`speed <= 0` = instant). A raw `thread::sleep` in a
 trampoline ignores that and can hang or skip an instant. Reach for
 `wait_wall_us` only when the wait genuinely tracks host time.
 
+### Reset, inspect, unimplemented access
+
+A `PeripheralInstance` has **`reset()`** — every peripheral bank returns to
+power-on (FIFOs empty, GPIO inactive, encoders zero). Re-init after reset is a
+real restart, not “hope the last test cleaned up.” The process-wide virtual
+clock is not re-anchored (tests share it).
+
+**Inspect** (`PeripheralInstance::inspect`) dumps UART FIFO depths, GPIO
+levels, encoder counts, and the unimplemented-HAL counter without the trace
+web UI.
+
+UART HAL talks to **byte FIFOs**. A PTY/socket is an optional FD backend
+(`init_channel_fd`) or a test injects with `serial::write_host_rx` /
+`take_host_tx`. Baud pacing is virtual-time.
+
+Out-of-range / negative HAL access is **logged and counted**
+(`embsim_peripherals::access`), not a silent no-op. Tests may assert
+`access::count()`.
+
 ### Threads that can create work must register
 
 A platform or model thread that does simulation work between waits must
