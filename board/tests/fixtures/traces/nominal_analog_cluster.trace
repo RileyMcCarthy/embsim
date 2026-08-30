@@ -1,0 +1,63 @@
+0 v=0 finding FloatingSense { net: "DRV.A", kind: Analog }
+1 v=0 reroute epoch=0
+2 v=0 sense net=2 state=floating
+3 v=0 drive_applied seq=0 endpoint=0 drive=3300000uv@23700mohm
+4 v=0 net_resolved net=0 state=analog:3300000uv
+5 v=0 net_resolved net=1 state=analog:3300000uv
+6 v=0 net_resolved net=2 state=analog:3300000uv
+7 v=0 sense net=2 state=analog:3300000uv
+8 v=0 drive_applied seq=1 endpoint=1 drive=190000uv@31100mohm
+9 v=0 net_resolved net=0 state=analog:1954982uv
+10 v=0 net_resolved net=1 state=analog:1954982uv
+11 v=0 net_resolved net=2 state=analog:1954982uv
+12 v=0 sense net=2 state=analog:1954982uv
+13 v=0 drive_applied seq=2 endpoint=0 drive=3190000uv@24700mohm
+14 v=0 net_resolved net=0 state=analog:1862043uv
+15 v=0 net_resolved net=1 state=analog:1862043uv
+16 v=0 net_resolved net=2 state=analog:1862043uv
+17 v=0 sense net=2 state=analog:1862043uv
+18 v=0 drive_applied seq=3 endpoint=1 drive=260000uv@32100mohm
+19 v=0 net_resolved net=0 state=analog:1915863uv
+20 v=0 net_resolved net=1 state=analog:1915863uv
+21 v=0 net_resolved net=2 state=analog:1915863uv
+22 v=0 sense net=2 state=analog:1915863uv
+23 v=0 drive_applied seq=4 endpoint=0 drive=3080000uv@25700mohm
+24 v=0 net_resolved net=0 state=analog:1826125uv
+25 v=0 net_resolved net=1 state=analog:1826125uv
+26 v=0 net_resolved net=2 state=analog:1826125uv
+27 v=0 sense net=2 state=analog:1826125uv
+28 v=0 drive_applied seq=5 endpoint=1 drive=330000uv@33100mohm
+29 v=0 net_resolved net=0 state=analog:1878044uv
+30 v=0 net_resolved net=1 state=analog:1878044uv
+31 v=0 net_resolved net=2 state=analog:1878044uv
+32 v=0 sense net=2 state=analog:1878044uv
+33 v=0 drive_applied seq=6 endpoint=0 drive=2970000uv@26700mohm
+34 v=0 net_resolved net=0 state=analog:1791271uv
+35 v=0 net_resolved net=1 state=analog:1791271uv
+36 v=0 net_resolved net=2 state=analog:1791271uv
+37 v=0 sense net=2 state=analog:1791271uv
+38 v=0 drive_applied seq=7 endpoint=1 drive=400000uv@34100mohm
+39 v=0 net_resolved net=0 state=analog:1841398uv
+40 v=0 net_resolved net=1 state=analog:1841398uv
+41 v=0 net_resolved net=2 state=analog:1841398uv
+42 v=0 sense net=2 state=analog:1841398uv
+43 v=0 drive_applied seq=8 endpoint=0 drive=2860000uv@27700mohm
+44 v=0 net_resolved net=0 state=analog:1757379uv
+45 v=0 net_resolved net=1 state=analog:1757379uv
+46 v=0 net_resolved net=2 state=analog:1757379uv
+47 v=0 sense net=2 state=analog:1757379uv
+48 v=0 drive_applied seq=9 endpoint=1 drive=470000uv@35100mohm
+49 v=0 net_resolved net=0 state=analog:1805812uv
+50 v=0 net_resolved net=1 state=analog:1805812uv
+51 v=0 net_resolved net=2 state=analog:1805812uv
+52 v=0 sense net=2 state=analog:1805812uv
+53 v=0 drive_applied seq=10 endpoint=0 drive=2750000uv@28700mohm
+54 v=0 net_resolved net=0 state=analog:1724357uv
+55 v=0 net_resolved net=1 state=analog:1724357uv
+56 v=0 net_resolved net=2 state=analog:1724357uv
+57 v=0 sense net=2 state=analog:1724357uv
+58 v=0 drive_applied seq=11 endpoint=1 drive=540000uv@36100mohm
+59 v=0 net_resolved net=0 state=analog:1771188uv
+60 v=0 net_resolved net=1 state=analog:1771188uv
+61 v=0 net_resolved net=2 state=analog:1771188uv
+62 v=0 sense net=2 state=analog:1771188uv

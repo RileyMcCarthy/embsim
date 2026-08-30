@@ -376,7 +376,13 @@ fn poll_loop(fw: &FirmwareInfo) {
     use embsim_memory_inspect::SymbolResolver;
 
     // Give the firmware a moment to initialize before resolving symbols.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Wall time by nature: it waits on the *host* dynamic loader and the
+    // firmware's own startup, neither of which the virtual clock governs — and
+    // scaling it would make symbol resolution race the firmware at high
+    // speeds. `DETERMINISM.md` T1 §4 lists this warm-up among the wall
+    // deadlines Phase D1 must virtualize (by moving this poller onto the
+    // engine wheel), which is a deliberate semantic change, not a rename.
+    embsim_core::virtual_clock::wait_wall_us(500_000);
 
     let resolver = match SymbolResolver::new() {
         Ok(r) => Some(r),
@@ -400,11 +406,10 @@ fn poll_loop(fw: &FirmwareInfo) {
         // Re-record model/peripheral signals so the trace has uniform density.
         resample_all();
 
-        let interval_us = poll_interval_us();
-        let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(interval_us);
-        if wall_us > 0 {
-            std::thread::sleep(std::time::Duration::from_micros(wall_us));
-        }
+        // Sampling cadence is a virtual-time period (`DETERMINISM.md` makes
+        // this poller a wheel entry in Phase D1, so every recorded
+        // `Sample.time_us` is a scheduler-chosen integer).
+        embsim_core::virtual_clock::wait_virtual_us(poll_interval_us());
     }
 }
 

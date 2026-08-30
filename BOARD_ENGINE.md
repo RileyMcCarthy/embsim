@@ -50,10 +50,49 @@ lock-free paths:
   (`io.schedule_at(v_us)` / `io.schedule_every(v_us)`), served by a timer wheel
   on the engine thread keyed to virtual time. Idle components cost nothing.
 
-Note on time: `embsim_core::virtual_clock` is **free-running scaled wall time**
-(no step/pause API, no central tick loop), so wakeup timestamps are sampled,
-not deterministic. Time-sensitive state must be computed at *read time* (as the
-RC closed form is), never integrated per tick.
+Note on time: `embsim_core::virtual_clock` is one microsecond **counter**.
+The engine is the time authority (`advance_to`). `--speed` only paces the
+host after a jump. Time-sensitive state must be computed at *read time*,
+never integrated per tick.
+
+### Determinism of this execution model
+
+The ordering rules above (enqueue-seq for drives, `(deadline, schedule)` for the
+wheel, per-producer FIFO for streams) make the engine's event order
+**consistent** — every observer agrees on one order. Wakeup timestamps are
+integers the engine chose (`advance_to`), so a system whose actors are all
+engine-hosted produces a byte-identical event trace across runs and processes.
+Two actors released at the same instant still race `next_drive_seq`. What
+"quiescent" means with pump threads and real fds in the picture, what extending
+that across the firmware↔engine boundary would cost, and how CI proves it are in
+[`DETERMINISM.md`](DETERMINISM.md).
+
+Practical consequence for component authors: **take your time from the engine.**
+A component that gets its cadence from `io.schedule_at` / `io.schedule_every`
+and does its work in `on_wake` is deterministic for free,
+because it is not a separate actor at all — its callback runs on the engine
+thread. A component that spawns a thread with its own poll loop has to register
+that thread with `virtual_clock::register_actor` and park through the clock, and
+even then it can only be as deterministic as whatever it is polling.
+`embsim_models::ads122u04_component` is the reference conversion in both
+directions: its output pump became a wheel entry, its model's protocol thread
+became a registered actor.
+
+Two engine rules from that document are **in force today** (Phase D0), and both
+are enforced by review rather than by the compiler:
+
+- **No `HashMap`/`HashSet` iteration on an engine path without an explicit
+  sort.** Walk a dense `Vec` and use the map for keyed lookups, or collect and
+  `sort_unstable()`. A set used purely as a membership/dedup gate is fine and
+  carries an inline `// hash-order: …` note saying why order cannot escape. The
+  rule exists because `std`'s hasher is randomly seeded *per map construction*,
+  so an unordered walk that reaches a float accumulation makes the engine
+  irreproducible in a way that looks like a last-bit rounding difference. See
+  `engine.rs`'s module docs for the sanctioned shapes.
+- **The engine's event order is observable**: `System::event_log()` turns on an
+  append-only transcript of drives, resolutions, sense deliveries, wakeups,
+  stream bytes, reroutes, and findings, with a normalization contract for
+  comparing runs (`board/src/event_log.rs`). Off by default.
 
 ## Core abstractions
 
@@ -225,7 +264,25 @@ named error, and the test suite carries one fixture per supported KiCad major.
 
 Parsed per component: `ref`, `value`, `footprint`, `libsource (lib, part)`,
 sheetpath (hierarchical designs), fields/properties; per net: `code`, `name`,
-`(ref, pin, pinfunction?)` nodes.
+`(ref, pin, pinfunction?, pintype?)` nodes. `pintype` is the schematic
+symbol's electrical type (`passive`, `power_in`, `…+no_connect`) — carried for
+diagnostics only; electrical descriptors always come from the component's own
+`PinDecl`, never from the schematic. Everything else a real export contains
+(`design`, `libparts`/`libraries`, datasheet/description/fields, non-`dnp`
+properties, `tstamps` UUID paths) is deliberately ignored — enumerated in the
+`netlist` module docs.
+
+**Net names are canonically the full exported name, sheet path included.** A
+KiCad local label is scoped to its sheet instance and exports as
+`/<sheet>/<label>`; global labels, power symbols, and root-sheet labels export
+bare. The parser never strips the path: two sheets may carry the same leaf
+label, so `/Sheet2/SIGNAL` and `/Sheet3/SIGNAL` are two electrically distinct
+nets whose leaves collide, and stripping would give every name-keyed artifact
+(scenario `net_stuck`, findings, dumps) a silent cross-sheet merge while the
+graph kept them apart. `normalize_net_name` canonicalizes overline syntax on
+the leaf only; `net_short_label` is the display-only shortening, explicitly
+not an identity. The hierarchical reference fixture is the MaD EdgeBoard
+export (3 sheets, 168 components, 243 nets, 53 sheet-scoped names).
 
 Classification is three-tier and **keyed primarily on the libsource *part*
 name** — the lib name is best-effort only (real exports contain empty lib names
@@ -235,7 +292,7 @@ and KiCad `*-rescue` libs; rescue mangling like
 | Tier | Match | Result |
 |---|---|---|
 | auto | part `R*`/`C*`/`L*`/`LED`/`D_*` from `Device` (or rescue thereof) | passive primitive; value parsed (`47R`, `4k7`, `0.1uF`); **pin-count validated** — a 2-terminal class with ≠2 pins is a hard classification error (resistor arrays etc. need a registry expansion entry) |
-| auto | `Conn*`/`Screw_Terminal*` parts | board boundary pins (harness attachment points) |
+| auto | `Conn*`/`Screw_Terminal*` parts, plus any part name the consumer passes to `PartRegistry::register_boundary` | board boundary pins (harness attachment points) |
 | auto | `Jumper*` parts | stateful short; default from name (`_NO`/`_Open` → open, `_NC`/`_Bridged` → closed; 3-pin `Jumper_3_*` variants get a selectable position) |
 | auto | `MountingHole*`/`Logo*`/`TestPoint*` | ignored |
 | registry | anything else, keyed by part name, falling back to `value` | consumer-registered `Component` constructor; the registry API includes an **expansion hook** (one netlist component → N primitives, for arrays/multi-unit symbols) |
@@ -245,6 +302,22 @@ Active parts come from standard *and* custom libraries alike (`74xGxx`,
 `Isolator`, `Interface`, `Transistor_BJT`, `Switch` are all standard-lib
 actives on real boards) — tier 2 is "whatever tier 1 does not match," not
 "custom-library symbols."
+
+**Netlists with no libsource.** Every tier above keys on the part name, which an
+EDA export always carries — but a whole-module netlist transcribed from a vendor
+schematic PDF has no symbol library to name, so every part name is empty and the
+entire board lands in the error tier. `PartRegistry::classify_unnamed_by_reference`
+opts such a board into a narrow fallback: **only** when a component's part name
+is empty, the auto tiers match a class synthesized from its reference-designator
+prefix (`R`/`C`/`L`/`D` → the passive primitives, `J`/`P` → boundary, `TP`/`H`/`MK`
+→ ignored), and the whole leading alphabetic run must match, so `RN7` and `PCB`
+still fall through. Active-silicon prefixes (`U`, `IC`, `Q`, `X`, `S`, …)
+deliberately map to nothing: the fallback classifies what the engine already
+knows how to be, and refuses to guess the rest, which then registers by `value`.
+It is opt-in because an empty part name in a real export means a damaged export,
+not a naming convention. Reference fixture: `board/tests/fixtures/p2_ec32mb.net`
+(Parallax P2-EC32MB module, 114 components, zero part names — 85 passives and 5
+pad/socket symbols classify, 22 active parts register).
 
 DNP: a component with `value == "X"` (consumer convention) or the KiCad `dnp`
 property is absent from the built board. Jumper state and DNP overrides are
@@ -322,23 +395,41 @@ A platform crate (per `CONTRACT.md`) provides the MCU component:
    asserts the tables are present and non-empty before the emulator boots, so
    "table optimized away" is a build failure, not a mystery unwired pin.
 
-Channel behavior stays HAL-granular (byte pipes, GPIO levels); pins are
-topology. Baud and channel parameters come from the same tables — the emulator
-stops inventing its own defaults (consumers may keep explicit pacing overrides
-for tests).
+Channel behavior stays HAL-granular (byte pipes, GPIO levels, pulse rates);
+pins are topology. Baud and channel parameters come from the same tables — the
+emulator stops inventing its own defaults (consumers may keep explicit pacing
+overrides for tests).
 
-> **Slice status (2026-07):** the MCU-as-a-component pattern ships in
-> `board/src/mcu.rs` for the **serial force path**: HAL-table-shaped configs
-> in, `"P{n}"` stream pins out, socketpair bridges into the
-> `embsim-peripherals` serial bank, with baud taken from the table. The
-> entry inversion in point 1 is **delivered**: `McuBuilder::entry` +
-> `Component::start` spawn the firmware on a component-owned instance
-> (facade mode without an entry keeps the `Emulator::run` flow working).
-> Point 3's table read path is
+> **Slice status (2026-08):** the MCU-as-a-component pattern ships in
+> `board/src/mcu.rs` for **all four channel kinds**, each opt-in per channel
+> through `McuBuilder`: serial (socketpair bridges into the peripheral serial
+> bank, baud from the table), GPIO (**bidirectional** — firmware writes drive
+> the net, external drives sense back into the bank, both honouring the
+> table's `active_low`), pulse-out (one STEP pin, below), and encoder (a
+> quadrature pin pair ×4-decoded into the bank as *increments*, so firmware
+> homing re-bases rather than being overwritten). The entry inversion in
+> point 1 is **delivered**: `McuBuilder::entry` + `Component::start` spawn the
+> firmware on a component-owned instance (facade mode without an entry keeps
+> the `Emulator::run` flow working). Point 3's table read path is
 > `embsim-memory-inspect`'s `hal_tables` module (symbol names parameterized;
-> the reference consumer's names are the documented defaults). GPIO channels
-> are declaration-only on the component; encoder/pulse-out channels remain
-> consumer-hand-wired this slice.
+> the reference consumer's names are the documented defaults).
+>
+> **A step clock is a rate on the wire, not edges.** Channel behavior stays
+> HAL-granular everywhere else, but a pulse-out channel is the one signal
+> whose edge count runs orders of magnitude ahead of the rest of the board: at
+> the reference machine's 8192 steps/mm, one mm/s is 8192 edges/s, each of
+> which would be a drive, a cluster resolution and a sense delivery through
+> the single-writer engine. So a `StreamRole::PulseSource` pin carries a
+> `PulseTrain` — frequency, direction, accumulated count and an anchor
+> instant — published **once per rate change** and integrated by
+> `StreamRole::PulseSink` consumers at *read* time, the discipline
+> `DETERMINISM.md` mandates. Counts stay exact: `PulseTrain::emitted_at` is
+> the same integer arithmetic `HAL_pulseOut_run` hands the firmware. Measured:
+> a four-segment motion profile delivering ~150 000 pulses costs **31 engine
+> events**, unchanged as the pulse count moves by tens of thousands
+> (`board/tests/pulse_bridge.rs`). The fidelity this trades away — no edges,
+> no pulse width, no per-edge DIR sampling, and up to one pulse of phase per
+> direction split — is enumerated on `PulseTrain`.
 
 Behavioral fidelity boundary, stated explicitly: **no cycle-accurate silicon
 emulation.** Raising fidelity of one peripheral later (bit-timed serial, PWM
@@ -379,8 +470,22 @@ present-but-undeclared).
   driver, source-free singular cluster) asserted to µV.
 - Streams: routing through series passives, crossed-producer detection, route
   invalidation on jumper/fault changes.
+- Pin bridges: fake firmware driving the peripheral free functions with peer
+  components watching the pins — exact step counts, mid-train direction
+  reversal, GPIO in both directions at the channel's polarity, encoder counts
+  arriving, an asserted engine-event ceiling at a realistic step rate, and a
+  stepped-mode N-run identity over all of it
+  (`board/tests/{pulse_bridge,pulse_bridge_stepped,carriage_seam}.rs`).
 - System: a two-component smoke board (fake MCU pin driver + fake sensor)
   exercising attach/schedule/diagnostics without any consumer firmware.
+- Whole machine: the reference consumer's three real boards — a vendor MCU
+  module (`p2_ec32mb.net`), the carrier (`mad_edge.net`) and a sensor add-on
+  (`ds2_addon.net`) — assembled through harnesses with the machine's motor,
+  encoder and end switches, asserting build findings, the card-edge
+  correspondence, and a command/reply byte exchange along the whole serial path
+  (`board/tests/{ec32mb_module,edgeboard,machine_system}.rs`, with the part
+  library and every classification/harness decision in
+  `board/tests/machine_parts/mod.rs`).
 
 ## Non-goals
 

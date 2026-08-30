@@ -37,6 +37,73 @@ Every trampoline must **null/range-guard its arguments** before delegating to th
 generic peripheral (the peripherals also guard, but the platform layer is the
 ABI boundary). See [`platforms/p2/src/ffi.rs`](platforms/p2/src/ffi.rs) for the reference pattern.
 
+## Waiting: never `thread::sleep`
+
+A trampoline (and the generic peripheral behind it) must **never call
+`std::thread::sleep` directly**. Every wait goes through
+`embsim_core::virtual_clock`:
+
+| call | use for |
+|---|---|
+| `wait_until(deadline_v_us)` | park until the virtual counter reaches the deadline |
+| `wait_virtual_us(d_us)` | park until `now + d_us` |
+| `wait_wall_us(d_us)` | real host sleep (fd retry, warm-up). Unpaced runs trip `stepped_wall_sleep_count` |
+
+`virtual_us` is a **counter**. The engine (or an idle jump when nobody holds
+time authority) is the only writer, via `advance_to`. `--speed` only sleeps
+the host *after* a jump (`speed <= 0` = instant). A raw `thread::sleep` in a
+trampoline ignores that and can hang or skip an instant. Reach for
+`wait_wall_us` only when the wait genuinely tracks host time.
+
+### Reset, inspect, unimplemented access
+
+A `PeripheralInstance` has **`reset()`** — every peripheral bank returns to
+power-on (FIFOs empty, GPIO inactive, encoders zero). Re-init after reset is a
+real restart, not “hope the last test cleaned up.” The process-wide virtual
+clock is not re-anchored (tests share it).
+
+**Inspect** (`PeripheralInstance::inspect`) dumps UART FIFO depths, GPIO
+levels, encoder counts, and the unimplemented-HAL counter without the trace
+web UI.
+
+UART HAL talks to **byte FIFOs**. A PTY/socket is an optional FD backend
+(`init_channel_fd`) or a test injects with `serial::write_host_rx` /
+`take_host_tx`. Baud pacing is virtual-time.
+
+Out-of-range / negative HAL access is **logged and counted**
+(`embsim_peripherals::access`), not a silent no-op. Tests may assert
+`access::count()`.
+
+### Threads that can create work must register
+
+A platform or model thread that does simulation work between waits must
+register itself:
+
+```rust
+let _actor = embsim_core::virtual_clock::register_actor("my-protocol-thread");
+```
+
+The guard is `!Send` (drop it on the thread that took it) and unregisters on
+drop, including on unwind. Register unconditionally: the engine will not
+advance while any registered actor is runnable. Firmware threads spawned
+through `HAL_system_startThread` register as `core-N`.
+
+Native firmware is host machine code, so the emulator cannot preempt it
+except at a HAL trampoline. Every HAL entry **charges** one unit of the
+calling cog's quantum (`virtual_clock::charge`); after a full slice the
+trampoline parks via `wait_virtual_us`. Firmware may spin (`LOCKTRY`,
+UART poll) with no yield macros. A cog that never hits HAL still cannot
+be stopped — that is an ISS problem.
+
+The engine will not advance virtual time while any registered
+actor is runnable, which is what stops a thread executing "later" work at an
+earlier virtual instant. An **unregistered** thread that parks through
+`wait_until` is still released correctly (its deadline is visible to the
+scheduler) but cannot hold time back — it may therefore observe a later `now`
+than it asked for. A thread blocked on a real file descriptor, an OS mutex, or a
+channel is invisible to the barrier entirely; that is the boundary
+`DETERMINISM.md` Phase D2 addresses, not something a platform crate can fix.
+
 ## Required symbol domains
 
 A platform must provide all symbols its firmware references. For the reference
@@ -129,9 +196,9 @@ disconnects.
 state only. A given firmware **image's own C statics** (`.data`/`.bss`) exist
 once per process, so one process can run at most **one instance of a given
 firmware image**; multi-instance means multiple *distinct* images (or
-pure-Rust components). Virtual *time* also remains process-wide
-(`embsim_core::virtual_clock` is free-running scaled wall time); only the
-clock *frequency* used for cycle math is per-instance.
+pure-Rust components). Virtual *time* also remains process-wide — one clock, one
+`ClockMode`, one actor registry for the whole process; only the clock
+*frequency* used for cycle math is per-instance.
 
 ## Init-before-entry ordering (handled by the runtime)
 

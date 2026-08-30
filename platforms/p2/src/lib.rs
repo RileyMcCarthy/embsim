@@ -319,6 +319,44 @@ mod tests {
         }
     }
 
+    /// A registered cog is preempted at HAL after one quantum of work, so
+    /// firmware can free-run (`LOCKTRY` / UART poll) without yield macros.
+    #[rstest]
+    fn hal_work_consumes_a_quantum() {
+        let _g = guard();
+        setup();
+        embsim_core::virtual_clock::init(0.0, P2_CLOCK_FREQ);
+        let _auth = embsim_core::virtual_clock::take_time_authority();
+        let q = embsim_core::virtual_clock::DEFAULT_QUANTUM_US;
+        let actor = std::thread::spawn(move || {
+            let _actor = embsim_core::virtual_clock::register_actor("hal-spinner");
+            unsafe {
+                for _ in 0..q {
+                    let _ = ffi::HAL_GPIO_getActive(0);
+                }
+            }
+        });
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            let s = embsim_core::virtual_clock::scheduler_state();
+            if s.running == 1 || s.next_deadline_us == Some(q) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        match embsim_core::virtual_clock::await_quiescence(std::time::Duration::from_secs(5)) {
+            embsim_core::virtual_clock::Quiescence::Reached { next_deadline_us } => {
+                assert_eq!(next_deadline_us, Some(q));
+            }
+            other => panic!("HAL slice exhaustion must park, got {other:?}"),
+        }
+        embsim_core::virtual_clock::advance_to(q).expect("step to the park");
+        actor.join().expect("cog resumes");
+        assert_eq!(embsim_core::virtual_clock::virtual_us(), q);
+        drop(_auth);
+        embsim_core::virtual_clock::init(0.0, P2_CLOCK_FREQ);
+    }
+
     // ── System trampolines ──
 
     static THREAD_RAN: AtomicU32 = AtomicU32::new(0);

@@ -1,8 +1,7 @@
 //! Timer — Timing functions backed by VirtualClock.
 //!
-//! Virtual *time* is process-wide (free-running scaled wall time in
-//! `embsim_core::virtual_clock`), but the *clock frequency* used for cycle
-//! math is per-MCU: [`get_clock_freq`] and [`get_cycles`] honor the calling
+//! Virtual *time* is process-wide (`embsim_core::virtual_clock` counter), but the
+//! *clock frequency* used for cycle math is per-MCU: [`get_clock_freq`] and [`get_cycles`] honor the calling
 //! thread's `instance::PeripheralInstance` clock-frequency override, falling
 //! back to the virtual clock's process-wide frequency when unset.
 
@@ -20,18 +19,12 @@ pub fn get_us() -> u32 {
 
 /// Blocking wait for specified virtual milliseconds.
 pub fn wait_ms(ms: u32) {
-    let wall_us = virtual_clock::virtual_to_wall_us(ms as u64 * 1000);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    virtual_clock::wait_virtual_us(ms as u64 * 1000);
 }
 
 /// Blocking wait for specified virtual microseconds.
 pub fn wait_us(us: u32) {
-    let wall_us = virtual_clock::virtual_to_wall_us(us as u64);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    virtual_clock::wait_virtual_us(us as u64);
 }
 
 /// Get raw virtual cycle counter value (`virtual_us * clock_freq / 1_000_000`,
@@ -105,22 +98,13 @@ mod tests {
     fn cycles_grow_with_a_positive_frequency() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
-        // With a non-zero freq, cycles is non-decreasing and eventually advances.
         let first = get_cycles();
-        let mut saw_growth = false;
-        let mut last = first;
-        for _ in 0..1000 {
-            let c = get_cycles();
-            assert!(c >= last, "cycles must be non-decreasing");
-            if c > first {
-                saw_growth = true;
-                break;
-            }
-            last = c;
-        }
+        wait_us(1);
+        let after = get_cycles();
+        assert!(after >= first, "cycles must be non-decreasing");
         assert!(
-            saw_growth,
-            "cycles should advance under a positive clock freq"
+            after > first,
+            "cycles should advance after a virtual wait (freq is 180 MHz)"
         );
     }
 

@@ -57,16 +57,12 @@
 //! serial channels to stream pins in their wiring layer.
 
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 use embsim_board::component::StreamTx;
 use embsim_board::{
     AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, StreamRole,
 };
-use embsim_core::virtual_clock;
 use tracing::{debug, trace, warn};
 
 use crate::ads122u04::{Ads122u04, Config};
@@ -245,20 +241,37 @@ fn reset_high(reset: NetState, dvdd: NetState) -> bool {
 ///
 /// Created via [`Ads122u04Component::new`], registered with a
 /// `PartRegistry` under the `ADS122U04` part name. Dropping the component
-/// stops the stream pump thread and closes the firmware-side pipe end.
+/// closes the firmware-side pipe end.
+///
+/// # Timing is engine-owned
+///
+/// The model's output is drained on an **engine wakeup**
+/// (`io.schedule_every(`[`PUMP_POLL_VIRTUAL_US`]`)`), not by a pump thread of
+/// its own — this is `DETERMINISM.md` T1 §4's "move it onto the engine wheel"
+/// for the reference component. Consequences worth knowing:
+///
+/// - The drain runs **on the engine thread**, so it is ordered against every
+///   other engine event and its cadence is exact in stepped clock mode (wakes
+///   land at 250 µs, 500 µs, …, not at sampled wall instants). One thread and
+///   one poll loop are deleted rather than made deterministic.
+/// - The drain is a **non-blocking** read: it never parks the engine thread.
+/// - **What is still not deterministic** (stated here rather than papered
+///   over): the byte path itself is a real `socketpair`, and *whether the
+///   model's protocol thread has written a byte yet* when the engine drains is
+///   an OS scheduling decision. Moving the cadence onto the wheel fixes
+///   *when* the engine looks, not *what the kernel has for it*. Making that
+///   deterministic is the in-process transport of `DETERMINISM.md` Phase D2.
 pub struct Ads122u04Component {
     /// The protocol model (owns the socketpair's model end and the
     /// `protocol_loop` thread).
     model: Arc<Ads122u04>,
-    /// Firmware-side pipe end, owned here: RX bytes are written into it,
-    /// and the pump thread reads the model's output from it.
+    /// Firmware-side pipe end, owned here: RX bytes are written into it, and
+    /// the engine wakeup reads the model's output from it.
     firmware_fd: Arc<OwnedFd>,
     gate: Arc<Gate>,
     /// Last numerically solved AIN0/AIN1 node voltages (V), for the
     /// differential feed.
     ain_volts: Arc<Mutex<[f64; 2]>>,
-    shutdown: Arc<AtomicBool>,
-    pump: Option<JoinHandle<()>>,
 }
 
 impl Ads122u04Component {
@@ -274,8 +287,6 @@ impl Ads122u04Component {
             firmware_fd: Arc::new(firmware_fd),
             gate: Arc::new(Gate::new()),
             ain_volts: Arc::new(Mutex::new([0.0; 2])),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            pump: None,
         }
     }
 }
@@ -342,63 +353,68 @@ impl Component for Ads122u04Component {
                 }
             })?;
         }
-        // Model output → TX pin, via the pump thread below.
+        // Model output → TX pin, drained on an engine wakeup. The whole
+        // callback runs on the engine thread; `drain_model_output` never
+        // blocks (the socketpair is non-blocking), so it cannot stall the
+        // engine, and in stepped mode its cadence is exact.
         let tx = io.stream_tx("TX")?;
-        if self.pump.is_none() {
+        {
             let fd = Arc::clone(&self.firmware_fd);
             let gate = Arc::clone(&self.gate);
-            let shutdown = Arc::clone(&self.shutdown);
-            self.pump = Some(
-                std::thread::Builder::new()
-                    .name("ads122u04-pump".into())
-                    .spawn(move || pump_loop(&fd, &tx, &gate, &shutdown))
-                    .expect("Failed to start ADS122U04 pump thread"),
-            );
+            io.on_wake(move |_now_us| drain_model_output(&fd, &tx, &gate));
         }
+        // A periodic wheel entry rather than a thread: idle components cost
+        // nothing, and the cadence belongs to the engine (`BOARD_ENGINE.md`,
+        // "no broadcast tick(), engine-owned wakeups"). On the inert
+        // build-analysis path this is traced and dropped, which is strictly
+        // better than the pump thread it replaces — that one was spawned by
+        // `System::build` too, and outlived it.
+        io.schedule_every(PUMP_POLL_VIRTUAL_US);
         Ok(())
     }
 }
 
 impl Drop for Ads122u04Component {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(pump) = self.pump.take() {
-            if pump.join().is_err() {
-                warn!("ADS122U04: pump thread panicked");
-            }
-        }
-        // Dropping `firmware_fd` (last Arc here once the pump has joined)
-        // closes the pipe end; the model's protocol thread then reads EOF
-        // and idles, exactly as it does in the hand-wired setup.
+        // Dropping `firmware_fd` closes the pipe end once the engine has
+        // dropped its wake callback (SystemHandle joins the engine *before* it
+        // drops components — the documented drop order). The model's protocol
+        // thread then reads EOF and idles, exactly as in the hand-wired setup.
         debug!("ADS122U04 component shut down");
     }
 }
 
 // ============================================================
-// Stream pump (model output → TX pin)
+// Stream drain (model output → TX pin), on an engine wakeup
 // ============================================================
 
-/// Poll interval (virtual µs) for draining the model's output, following the
+/// Wakeup interval (virtual µs) for draining the model's output, following the
 /// protocol model's own `protocol_loop` pacing rationale: substantially
 /// finer than the fastest configured conversion interval (1 ms at 1000 SPS).
-const PUMP_POLL_VIRTUAL_US: u64 = 250;
+pub const PUMP_POLL_VIRTUAL_US: u64 = 250;
 
-/// Wall-clock poll fallback while the virtual clock is uninitialized (e.g.
-/// the build-time analysis attach, where the inert stream handle drops
-/// writes anyway).
-const PUMP_POLL_FALLBACK_WALL_US: u64 = 1_000;
+/// Maximum bytes drained from the model per wakeup. A bound rather than
+/// "drain to EAGAIN": this runs on the engine thread, and a model that
+/// out-produces the wire must not be able to hold the engine in a read loop.
+/// At 115.2 kbaud, 4 kB is far more than one 250 µs slot can carry, so the
+/// bound is unreachable in normal operation — it is a backstop, not a policy.
+const DRAIN_MAX_BYTES_PER_WAKE: usize = 4096;
 
-/// Pump thread body: bytes the model emits (readable on the firmware-side
-/// pipe end) are `stream_write()`n out the TX pin, gated exactly like RX —
-/// a dead chip's output never reaches the wire, and bytes produced while
-/// gated are discarded (not spooled for a later power-up). Exits when the
-/// owning component drops.
-fn pump_loop(fd: &OwnedFd, tx: &StreamTx, gate: &Gate, shutdown: &AtomicBool) {
+/// Drain whatever the model has emitted (readable on the firmware-side pipe
+/// end) onto the TX pin, gated exactly like RX — a dead chip's output never
+/// reaches the wire, and bytes produced while gated are discarded (not spooled
+/// for a later power-up).
+///
+/// Runs on the **engine thread**. `tx.write` enqueues rather than delivering
+/// inline, so this is re-entrancy-safe by the engine's own contract.
+fn drain_model_output(fd: &OwnedFd, tx: &StreamTx, gate: &Gate) {
     let mut buf = [0u8; 64];
-    while !shutdown.load(Ordering::Relaxed) {
+    let mut drained = 0usize;
+    while drained < DRAIN_MAX_BYTES_PER_WAKE {
         match nix::unistd::read(fd.as_fd(), &mut buf) {
-            Ok(0) => {} // peer end closed; keep idling until shutdown
+            Ok(0) => break, // peer end closed
             Ok(n) => {
+                drained += n;
                 if gate.alive() {
                     tx.write(&buf[..n]);
                 } else {
@@ -407,21 +423,12 @@ fn pump_loop(fd: &OwnedFd, tx: &StreamTx, gate: &Gate, shutdown: &AtomicBool) {
                         "ADS122U04: TX bytes discarded (unpowered or in reset)"
                     );
                 }
-                continue; // keep draining while data is flowing
             }
-            Err(nix::errno::Errno::EAGAIN) => {}
+            Err(nix::errno::Errno::EAGAIN) => break, // nothing pending
             Err(e) => {
-                warn!("ADS122U04: pump read error: {e}");
+                warn!("ADS122U04: model read error: {e}");
                 break;
             }
-        }
-        let wall_us = if virtual_clock::is_initialized() {
-            virtual_clock::virtual_to_wall_us(PUMP_POLL_VIRTUAL_US)
-        } else {
-            PUMP_POLL_FALLBACK_WALL_US
-        };
-        if wall_us > 0 {
-            std::thread::sleep(Duration::from_micros(wall_us));
         }
     }
 }

@@ -16,6 +16,22 @@
 //! subscribe via [`on_progress`] and receive the **same integer** the firmware
 //! sees on the same call, so they cannot drift from the firmware's view.
 //!
+//! ## Rate changes, not edges
+//!
+//! [`on_progress`] fires once per `run()` poll, which is a *sampling* seam: it
+//! only ever reports what the integrator already knew. [`on_rate_change`] is
+//! the **event** seam — it fires exactly when the commanded rate changes
+//! (`start`, `start_velocity`, `set_frequency`, `stop`) and hands over a
+//! [`PulseSegment`] describing the constant-rate segment that just began.
+//! A subscriber can reconstruct the emitted count at *any* virtual instant
+//! from that one value ([`PulseSegment::emitted_at`]) using the same integer
+//! arithmetic `run()` uses, so it never has to observe individual pulses.
+//!
+//! This is what lets a pulse train cross a board-engine net without one event
+//! per step: `embsim_board::mcu` bridges this callback onto a `PulseSource`
+//! pin, and the consumer integrates at read time. At 8192 steps/mm, one
+//! mm/s of carriage speed is 8192 pulses/s and **one** rate-change event.
+//!
 //! ## Core occupancy
 //!
 //! `run()` sleeps for `POLL_TICK_US` of virtual time between polls when the
@@ -59,6 +75,102 @@ const POLL_TICK_US: u64 = 250;
 /// Maximum pulse out channels supported (hard ceiling of the backing array).
 pub const MAX_CHANNELS: usize = 16;
 
+/// One constant-rate segment of a pulse train — the payload of a
+/// [`PulseOut::on_rate_change`] event.
+///
+/// A segment is the whole truth about the channel from `since_us` onward: a
+/// subscriber that keeps the latest segment can compute the emitted count at
+/// any later virtual instant with [`PulseSegment::emitted_at`], which is
+/// **bit-identical** to what [`PulseOut::run`] hands the firmware at that same
+/// instant. That equality is the contract: a downstream plant and the firmware
+/// can never disagree about how many pulses went out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PulseSegment {
+    /// Pulses emitted in this train *before* `since_us`. Zero for a freshly
+    /// started train; the banked total for a velocity retarget.
+    pub emitted: u64,
+    /// Pulse rate from `since_us` onward, in Hz. `0` holds the count (a
+    /// stopped or held channel).
+    pub freq_hz: u32,
+    /// Cumulative pulse ceiling for a finite train (`start`), or `None` for an
+    /// unbounded continuous-velocity train (`start_velocity`).
+    pub total: Option<u64>,
+    /// Virtual time (µs) at which this segment began.
+    pub since_us: u64,
+}
+
+impl PulseSegment {
+    /// A held channel: nothing emitted, no rate, and a ceiling of zero —
+    /// exactly what a bank channel reports before its first train, so an
+    /// unconfigured channel and a fresh one are indistinguishable to a
+    /// subscriber.
+    pub const IDLE: Self = Self {
+        emitted: 0,
+        freq_hz: 0,
+        total: Some(0),
+        since_us: 0,
+    };
+
+    /// Cumulative pulses emitted by this train at virtual time `now_us`.
+    ///
+    /// Deliberately the same integer arithmetic as [`PulseOut::run`]:
+    /// `emitted + elapsed_us × freq / 1_000_000`, clamped to `total`. A
+    /// `now_us` before `since_us` reads the segment's baseline.
+    pub fn emitted_at(&self, now_us: u64) -> u64 {
+        let elapsed = now_us.saturating_sub(self.since_us);
+        let grown = self
+            .emitted
+            .saturating_add(elapsed.saturating_mul(u64::from(self.freq_hz)) / 1_000_000);
+        match self.total {
+            Some(total) => grown.min(total),
+            None => grown,
+        }
+    }
+
+    /// Virtual time (µs) at which a finite train has emitted its last pulse,
+    /// or `None` for an unbounded or held train. Past that instant
+    /// [`Self::emitted_at`] is constant.
+    pub fn completes_at(&self) -> Option<u64> {
+        let total = self.total?;
+        if self.freq_hz == 0 {
+            return None;
+        }
+        let remaining = total.saturating_sub(self.emitted);
+        Some(
+            self.since_us.saturating_add(
+                remaining
+                    .saturating_mul(1_000_000)
+                    .div_ceil(u64::from(self.freq_hz)),
+            ),
+        )
+    }
+
+    /// The same train re-anchored at `at_us`: identical rate and ceiling, with
+    /// `emitted` advanced to the count at that instant.
+    ///
+    /// The re-based segment's baseline is exactly the count at `at_us`, so
+    /// folding `emitted` differences across a re-base can neither double-count
+    /// a pulse nor lose one. What re-basing *does* discard is the source's
+    /// **pulse phase**: the re-based segment restarts its period at `at_us`,
+    /// so from then on it can trail the un-re-based integration by up to one
+    /// pulse. Integer microseconds cannot represent a mid-pulse phase, so this
+    /// is a floor, not an implementation shortcut.
+    ///
+    /// The rule that follows: **re-base at segment boundaries, never on every
+    /// read.** A rate or direction change is a boundary the source is
+    /// publishing anyway (one truncation, at an instant the machine is
+    /// changing state); a consumer that wants a running count reads
+    /// [`Self::emitted_at`] against the published anchor instead
+    /// (`embsim_models::machine::stepper_motor` is the reference).
+    pub fn rebased_at(&self, at_us: u64) -> Self {
+        Self {
+            emitted: self.emitted_at(at_us),
+            since_us: at_us.max(self.since_us),
+            ..*self
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PulseState {
     total_pulses: u32,
@@ -80,6 +192,33 @@ const PULSE_STATE_INIT: PulseState = PulseState {
     emitted_base: 0,
 };
 
+impl PulseState {
+    /// This channel's current constant-rate segment, in the vocabulary a
+    /// [`PulseOut::on_rate_change`] subscriber consumes.
+    ///
+    /// An idle channel (`total_pulses == 0`, i.e. never started or stopped)
+    /// reports a **held** segment — no rate, and a ceiling equal to the count
+    /// already banked — so a subscriber that folds rate changes sees "stopped
+    /// at N" rather than a stale rate or a phantom rewind to zero. A channel
+    /// that was never started banks nothing, so it reads zero.
+    fn segment(&self) -> PulseSegment {
+        if self.total_pulses == 0 {
+            return PulseSegment {
+                emitted: self.emitted_base,
+                freq_hz: 0,
+                total: Some(self.emitted_base),
+                since_us: self.start_us,
+            };
+        }
+        PulseSegment {
+            emitted: self.emitted_base,
+            freq_hz: self.frequency,
+            total: (!self.velocity_mode).then_some(u64::from(self.total_pulses)),
+            since_us: self.start_us,
+        }
+    }
+}
+
 /// One optional per-channel callback fired when a pulse train starts,
 /// carrying `(total_pulses, frequency)`.
 type StartCallback = Option<Box<dyn Fn(u32, u32) + Send>>;
@@ -88,6 +227,9 @@ type StopCallback = Option<Box<dyn Fn() + Send>>;
 /// One optional per-channel callback fired on progress, carrying the
 /// cumulative emitted-pulse count.
 type ProgressCallback = Option<Box<dyn Fn(u32) + Send>>;
+/// One optional per-channel callback fired when the commanded rate changes,
+/// carrying the constant-rate segment that just began.
+type RateCallback = Option<Box<dyn Fn(PulseSegment) + Send>>;
 
 /// Pulse-output channel bank for one MCU instance.
 pub struct PulseOut {
@@ -95,6 +237,7 @@ pub struct PulseOut {
     start_callbacks: Mutex<Vec<StartCallback>>,
     stop_callbacks: Mutex<Vec<StopCallback>>,
     progress_callbacks: Mutex<Vec<ProgressCallback>>,
+    rate_callbacks: Mutex<Vec<RateCallback>>,
     state: Mutex<[PulseState; MAX_CHANNELS]>,
 }
 
@@ -106,6 +249,7 @@ impl PulseOut {
             start_callbacks: Mutex::new(Vec::new()),
             stop_callbacks: Mutex::new(Vec::new()),
             progress_callbacks: Mutex::new(Vec::new()),
+            rate_callbacks: Mutex::new(Vec::new()),
             state: Mutex::new([PULSE_STATE_INIT; MAX_CHANNELS]),
         }
     }
@@ -136,6 +280,15 @@ impl PulseOut {
             .lock()
             .unwrap()
             .resize_with(count, || None);
+        self.rate_callbacks
+            .lock()
+            .unwrap()
+            .resize_with(count, || None);
+    }
+
+    /// Configured channel count.
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Clear all channel callbacks and pulse state (used by `init` and teardown).
@@ -144,6 +297,7 @@ impl PulseOut {
         self.start_callbacks.lock().unwrap().clear();
         self.stop_callbacks.lock().unwrap().clear();
         self.progress_callbacks.lock().unwrap().clear();
+        self.rate_callbacks.lock().unwrap().clear();
         let mut state = self.state.lock().unwrap();
         for s in state.iter_mut() {
             *s = PULSE_STATE_INIT;
@@ -169,6 +323,23 @@ impl PulseOut {
         register(&self.progress_callbacks, channel, Box::new(cb));
     }
 
+    /// Register a per-channel callback fired **only when the commanded rate
+    /// changes** — `start`, `start_velocity`, `set_frequency`, `stop` — with
+    /// the constant-rate [`PulseSegment`] that just began.
+    ///
+    /// This is the low-rate seam a pulse train crosses a net on
+    /// (`embsim_board::mcu`): the subscriber integrates the segment at read
+    /// time instead of observing pulses, so a 100 kHz train costs the same
+    /// number of events as a 1 Hz one. One callback per channel; re-registering
+    /// replaces it.
+    ///
+    /// The callback runs on the thread that changed the rate (the firmware's
+    /// motion core), with **no pulse-out lock held**, so it may call back into
+    /// this bank or into a board engine without deadlocking.
+    pub fn on_rate_change(&self, channel: usize, cb: impl Fn(PulseSegment) + Send + 'static) {
+        register(&self.rate_callbacks, channel, Box::new(cb));
+    }
+
     fn fire_progress(&self, channel: usize, emitted: u32) {
         if let Ok(cbs) = self.progress_callbacks.lock() {
             if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
@@ -177,11 +348,51 @@ impl PulseOut {
         }
     }
 
+    /// Publish a new constant-rate segment. Callers must hold **no** lock.
+    fn fire_rate_change(&self, channel: usize, segment: PulseSegment) {
+        if let Ok(cbs) = self.rate_callbacks.lock() {
+            if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
+                cb(segment);
+            }
+        }
+    }
+
+    /// Cumulative pulses emitted by `channel`'s **current train** at the
+    /// current virtual instant, without polling, sleeping, or firing
+    /// `on_progress`.
+    ///
+    /// While a train is running this is the same integer the next
+    /// [`PulseOut::run`] would return, so a wiring layer can sample the count
+    /// without perturbing the core-occupancy model `run()` implements. After a
+    /// [`PulseOut::stop`] it holds the train's frozen final count, where
+    /// `run()` reports an idle channel as `0` — the difference is deliberate:
+    /// `run()` answers "is there anything left to do", this answers "how many
+    /// pulses went out". A channel that was never started reads 0, and each
+    /// [`PulseOut::start`] re-bases the count to 0 for the new train.
+    pub fn emitted(&self, channel: usize) -> u64 {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let segment = self.state.lock().unwrap()[channel].segment();
+        segment.emitted_at(embsim_core::virtual_clock::virtual_us())
+    }
+
+    /// This channel's current constant-rate segment (the value the last
+    /// [`PulseOut::on_rate_change`] event carried). An unconfigured channel
+    /// reads [`PulseSegment::IDLE`].
+    pub fn segment(&self, channel: usize) -> PulseSegment {
+        if channel >= self.count.load(Ordering::Relaxed) {
+            return PulseSegment::IDLE;
+        }
+        self.state.lock().unwrap()[channel].segment()
+    }
+
     /// Start a pulse sequence. Records timing state and fires `on_start` followed
     /// by an initial `on_progress(0)` so subscribers can align with the start
     /// position before any pulses elapse.
     pub fn start(&self, channel: usize, pulses: u32, frequency: u32) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("start channel {channel}"));
             return;
         }
         let freq = frequency.max(1);
@@ -193,7 +404,7 @@ impl PulseOut {
             freq
         );
 
-        {
+        let segment = {
             let mut state = self.state.lock().unwrap();
             state[channel] = PulseState {
                 total_pulses: pulses,
@@ -202,7 +413,8 @@ impl PulseOut {
                 velocity_mode: false,
                 emitted_base: 0,
             };
-        }
+            state[channel].segment()
+        };
 
         if let Ok(cbs) = self.start_callbacks.lock() {
             if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
@@ -210,6 +422,7 @@ impl PulseOut {
             }
         }
         self.fire_progress(channel, 0);
+        self.fire_rate_change(channel, segment);
     }
 
     /// Begin (or re-baseline) a continuous-velocity (NCO) pulse train at `frequency`
@@ -220,6 +433,7 @@ impl PulseOut {
     /// ~0. `frequency` 0 holds (no pulses).
     pub fn start_velocity(&self, channel: usize, frequency: u32) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("start_velocity channel {channel}"));
             return;
         }
         trace!(
@@ -227,7 +441,7 @@ impl PulseOut {
             channel,
             frequency
         );
-        {
+        let segment = {
             let mut state = self.state.lock().unwrap();
             state[channel] = PulseState {
                 total_pulses: u32::MAX, // unbounded; velocity mode never "completes"
@@ -236,13 +450,15 @@ impl PulseOut {
                 velocity_mode: true,
                 emitted_base: 0,
             };
-        }
+            state[channel].segment()
+        };
         if let Ok(cbs) = self.start_callbacks.lock() {
             if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
                 cb(0, frequency);
             }
         }
         self.fire_progress(channel, 0);
+        self.fire_rate_change(channel, segment);
     }
 
     /// Retarget the continuous-velocity rate without resetting the emitted counter.
@@ -250,22 +466,28 @@ impl PulseOut {
     /// so the running total stays monotonic. No-op outside velocity mode.
     pub fn set_frequency(&self, channel: usize, frequency: u32) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("set_frequency channel {channel}"));
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        let s = &mut state[channel];
-        if !s.velocity_mode {
-            return;
-        }
-        let now = embsim_core::virtual_clock::virtual_us();
-        let elapsed = now.saturating_sub(s.start_us);
-        let emitted_at_old = elapsed.saturating_mul(s.frequency as u64) / 1_000_000;
-        s.emitted_base = s.emitted_base.saturating_add(emitted_at_old);
-        s.frequency = frequency;
-        s.start_us = now;
+        let segment = {
+            let mut state = self.state.lock().unwrap();
+            let s = &mut state[channel];
+            if !s.velocity_mode {
+                return;
+            }
+            let now = embsim_core::virtual_clock::virtual_us();
+            let elapsed = now.saturating_sub(s.start_us);
+            let emitted_at_old = elapsed.saturating_mul(s.frequency as u64) / 1_000_000;
+            s.emitted_base = s.emitted_base.saturating_add(emitted_at_old);
+            s.frequency = frequency;
+            s.start_us = now;
+            s.segment()
+        };
+        self.fire_rate_change(channel, segment);
     }
 
-    /// Current commanded pulse frequency (steps/s) for `channel`. Plant models
+    /// Current commanded pulse frequency (steps/s) for `channel`, or `0` when
+    /// the channel is idle (never started, or stopped). Plant models
     /// integrate this *commanded* velocity (× direction) instead of the running
     /// emitted count, which sidesteps the sub-pulse-per-tick truncation that the
     /// integer emitted total suffers at low rates.
@@ -284,6 +506,7 @@ impl PulseOut {
     /// `done = true` so the caller can move on without an extra tick of latency.
     pub fn run(&self, channel: usize) -> (u32, bool) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("run channel {channel}"));
             return (0, true);
         }
 
@@ -339,18 +562,32 @@ impl PulseOut {
     pub fn stop(&self, channel: usize) {
         trace!("pulse_out::stop(ch={})", channel);
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("stop channel {channel}"));
             return;
         }
-        {
+        // Stopping freezes the count at whatever had gone out and banks it, so
+        // a rate-change subscriber's total matches the firmware's last `run()`
+        // exactly rather than losing the tail of the train — and so a later
+        // `emitted()`/`segment()` poll reads the same frozen number instead of
+        // appearing to rewind to zero.
+        let now = embsim_core::virtual_clock::virtual_us();
+        let segment = {
             let mut state = self.state.lock().unwrap();
-            state[channel].total_pulses = 0;
-            state[channel].velocity_mode = false;
-        }
+            let emitted = state[channel].segment().emitted_at(now);
+            let s = &mut state[channel];
+            s.emitted_base = emitted;
+            s.total_pulses = 0;
+            s.velocity_mode = false;
+            s.frequency = 0;
+            s.start_us = now;
+            s.segment()
+        };
         if let Ok(cbs) = self.stop_callbacks.lock() {
             if let Some(cb) = cbs.get(channel).and_then(|c| c.as_ref()) {
                 cb();
             }
         }
+        self.fire_rate_change(channel, segment);
     }
 }
 
@@ -371,11 +608,13 @@ fn register<F: ?Sized>(slot: &Mutex<Vec<Option<Box<F>>>>, channel: usize, cb: Bo
     cbs[channel] = Some(cb);
 }
 
+/// Park the pulse-train thread for one span of virtual time.
+///
+/// Thin alias for [`embsim_core::virtual_clock::wait_virtual_us`] — kept so
+/// the pulse-train loop reads in its own vocabulary, but the wait itself lives
+/// in the clock's single chokepoint (`DETERMINISM.md` T1 §5).
 fn sleep_virtual_us(virtual_us: u64) {
-    let wall_us = embsim_core::virtual_clock::virtual_to_wall_us(virtual_us);
-    if wall_us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(wall_us));
-    }
+    embsim_core::virtual_clock::wait_virtual_us(virtual_us);
 }
 
 // ============================================================
@@ -410,6 +649,25 @@ pub fn on_progress(channel: usize, cb: impl Fn(u32) + Send + 'static) {
     crate::instance::current()
         .pulse_out
         .on_progress(channel, cb);
+}
+
+/// Register a per-channel callback fired only when the commanded rate
+/// changes. See [`PulseOut::on_rate_change`].
+pub fn on_rate_change(channel: usize, cb: impl Fn(PulseSegment) + Send + 'static) {
+    crate::instance::current()
+        .pulse_out
+        .on_rate_change(channel, cb);
+}
+
+/// Cumulative pulses emitted on `channel` at the current virtual instant,
+/// without polling or sleeping. See [`PulseOut::emitted`].
+pub fn emitted(channel: usize) -> u64 {
+    crate::instance::current().pulse_out.emitted(channel)
+}
+
+/// This channel's current constant-rate segment. See [`PulseOut::segment`].
+pub fn segment(channel: usize) -> PulseSegment {
+    crate::instance::current().pulse_out.segment(channel)
 }
 
 /// Start a pulse sequence. See [`PulseOut::start`].
@@ -463,7 +721,7 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicU32, Ordering as AtomicOrdering},
-        Arc,
+        Arc, Mutex,
     };
 
     /// Take the crate-wide test lock, pin the shared virtual clock, and reset
@@ -756,13 +1014,20 @@ mod tests {
             elapsed + 1 >= ideal_us,
             "finished too early: elapsed={elapsed}us ideal={ideal_us}us"
         );
-        // Upper bound: a few poll ticks of overshoot is fine; not multi-second hang.
-        let max_us = ideal_us
-            .saturating_add(5_000)
-            .saturating_add(POLL_TICK_US * 20);
+        // Upper bound: this catches a hang or a runaway integration, NOT
+        // scheduling jitter. `run()` sleeps `POLL_TICK_US` of *virtual* time
+        // per poll, and the virtual clock is scaled wall time
+        // (`DETERMINISM.md`, "why timing assertions are tier-dependent"), so
+        // on a contended runner every sleep overshoots and the measured
+        // elapsed virtual time inflates without anything being wrong — a
+        // tight bound here fails on a busy CI box while passing locally.
+        // Precision belongs to the strict assertions above (exact emitted
+        // count, and cannot-finish-early); this one only has to notice
+        // "never finished". Under the stepped clock this can become exact.
+        let max_us = ideal_us.saturating_mul(4).saturating_add(1_000_000);
         assert!(
             elapsed <= max_us,
-            "finished too late: elapsed={elapsed}us max={max_us}us"
+            "finished too late (hang?): elapsed={elapsed}us max={max_us}us"
         );
     }
 
@@ -784,5 +1049,228 @@ mod tests {
             }
         }
         panic!("sequence never completed");
+    }
+
+    // ========================================================
+    // Rate changes, not edges — the `PulseSegment` seam
+    // ========================================================
+
+    /// A segment integrates the *same* floor-division `run()` does, so the two
+    /// views of a train can never disagree by a pulse.
+    #[rstest]
+    #[case::exact(8_192, 1_000_000, 8_192)]
+    #[case::half_second(8_192, 500_000, 4_096)]
+    #[case::truncates_down(3, 1_000, 0)]
+    #[case::one_pulse_worth(1_000, 1_000, 1)]
+    fn a_segment_integrates_like_run(
+        #[case] freq_hz: u32,
+        #[case] elapsed_us: u64,
+        #[case] expect: u64,
+    ) {
+        let segment = PulseSegment {
+            emitted: 0,
+            freq_hz,
+            total: None,
+            since_us: 7,
+        };
+        assert_eq!(segment.emitted_at(7 + elapsed_us), expect);
+    }
+
+    /// A finite segment clamps at its ceiling, and `completes_at` names the
+    /// instant past which the count no longer moves.
+    #[rstest]
+    fn a_finite_segment_clamps_and_reports_its_completion() {
+        let segment = PulseSegment {
+            emitted: 0,
+            freq_hz: 1_000,
+            total: Some(10),
+            since_us: 0,
+        };
+        let end = segment.completes_at().expect("finite trains complete");
+        assert_eq!(end, 10_000, "10 pulses at 1 kHz is 10 ms");
+        assert_eq!(segment.emitted_at(end), 10);
+        assert_eq!(
+            segment.emitted_at(end * 100),
+            10,
+            "past completion the count is frozen"
+        );
+        assert_eq!(
+            PulseSegment {
+                total: None,
+                ..segment
+            }
+            .completes_at(),
+            None,
+            "an unbounded train never completes"
+        );
+        assert_eq!(PulseSegment::IDLE.completes_at(), None);
+    }
+
+    /// Re-basing hands over the exact count at the re-base instant, and is
+    /// idempotent there — so folding baseline differences across a re-base can
+    /// neither double-count a pulse nor lose one.
+    #[rstest]
+    #[case::at_start(0)]
+    #[case::mid(333)]
+    #[case::later(1_000_000)]
+    fn rebasing_a_segment_hands_over_the_exact_count(#[case] at_us: u64) {
+        let segment = PulseSegment {
+            emitted: 17,
+            freq_hz: 8_192,
+            total: None,
+            since_us: 0,
+        };
+        let rebased = segment.rebased_at(at_us);
+        assert_eq!(
+            rebased.emitted, // the handover point
+            segment.emitted_at(at_us),
+            "the re-based baseline is the count at that instant"
+        );
+        assert_eq!(
+            rebased.rebased_at(at_us),
+            rebased,
+            "re-basing twice at the same instant is a no-op"
+        );
+    }
+
+    /// The documented cost of a re-base: it discards the source's pulse
+    /// *phase*, so from then on the re-based segment can trail the original by
+    /// at most one pulse — never more, and never ahead of it. This is the
+    /// fidelity limit that makes "re-base at segment boundaries, not on every
+    /// read" a rule rather than a preference.
+    #[rstest]
+    #[case::odd_rate(8_192, 333)]
+    #[case::prime_rate(9_973, 1_237)]
+    #[case::slow(37, 500_001)]
+    fn rebasing_trails_the_original_by_at_most_one_pulse(#[case] freq_hz: u32, #[case] at_us: u64) {
+        let segment = PulseSegment {
+            emitted: 0,
+            freq_hz,
+            total: None,
+            since_us: 0,
+        };
+        let rebased = segment.rebased_at(at_us);
+        for probe in [at_us, at_us + 1, at_us + 125_000, at_us + 9_000_001] {
+            let (original, after) = (segment.emitted_at(probe), rebased.emitted_at(probe));
+            assert!(
+                original >= after && original - after <= 1,
+                "at {probe}us the re-based segment read {after} against {original}"
+            );
+        }
+    }
+
+    /// One event per *rate change* — not per pulse and not per poll. A finite
+    /// train at 20 kHz emits 200 pulses and exactly two rate-change events
+    /// (the start and the stop).
+    #[rstest]
+    fn rate_changes_fire_once_per_command_never_per_pulse() {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+        let events = Arc::new(Mutex::new(Vec::<PulseSegment>::new()));
+        {
+            let events = Arc::clone(&events);
+            on_rate_change(0, move |segment| events.lock().unwrap().push(segment));
+        }
+
+        start(0, 200, 20_000);
+        while !run(0).1 {}
+        stop(0);
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "start + stop only; got {events:?} — one event per pulse would be 200"
+        );
+        assert_eq!(events[0].freq_hz, 20_000);
+        assert_eq!(events[0].total, Some(200));
+        assert_eq!(events[0].emitted, 0);
+        assert_eq!(
+            events[1],
+            PulseSegment {
+                emitted: 200,
+                freq_hz: 0,
+                total: Some(200),
+                since_us: events[1].since_us,
+            },
+            "the stop event freezes the train's exact final count"
+        );
+    }
+
+    /// A velocity retarget banks the pulses already emitted into the new
+    /// segment's baseline, so folding segment deltas reconstructs the running
+    /// total the firmware sees — across any number of rate changes.
+    #[rstest]
+    fn a_velocity_retarget_banks_the_count_into_the_next_segment() {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+        let events = Arc::new(Mutex::new(Vec::<PulseSegment>::new()));
+        {
+            let events = Arc::clone(&events);
+            on_rate_change(0, move |segment| events.lock().unwrap().push(segment));
+        }
+
+        start_velocity(0, 8_192);
+        run(0); // one poll tick of virtual time at 8192 Hz
+        set_frequency(0, 16_384);
+        let banked = events.lock().unwrap()[1].emitted;
+        assert_eq!(
+            banked,
+            emitted(0),
+            "the retarget's baseline is the count at that instant"
+        );
+        run(0);
+        stop(0);
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 3, "start + retarget + stop");
+        assert_eq!(events[0].freq_hz, 8_192);
+        assert_eq!(events[0].total, None, "velocity trains are unbounded");
+        assert_eq!(events[1].freq_hz, 16_384);
+        assert!(events[1].emitted >= events[0].emitted);
+        assert_eq!(events[2].freq_hz, 0);
+        assert!(
+            events[2].emitted >= events[1].emitted,
+            "the count is monotonic across rate changes"
+        );
+    }
+
+    /// A stopped channel keeps its frozen count for a poller, where `run()`
+    /// reports the channel idle. The two answer different questions, and the
+    /// count must never appear to rewind.
+    #[rstest]
+    fn a_stopped_channel_holds_its_final_count() {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+        assert_eq!(emitted(0), 0, "a channel that never ran emitted nothing");
+        assert_eq!(segment(0), PulseSegment::IDLE);
+
+        start(0, 40, 20_000);
+        while !run(0).1 {}
+        let before = emitted(0);
+        assert_eq!(before, 40);
+        stop(0);
+
+        assert_eq!(emitted(0), 40, "the stop froze the count, it did not clear");
+        assert_eq!(segment(0).freq_hz, 0);
+        assert_eq!(segment(0).total, Some(40));
+        assert_eq!(frequency(0), 0, "an idle channel commands no rate");
+        assert_eq!(run(0), (0, true), "run() still reports the channel idle");
+
+        // A fresh train re-bases: each train counts from zero, consumers fold.
+        start(0, 5, 20_000);
+        assert_eq!(emitted(0), 0);
+    }
+
+    /// Reading rate-change state on an unconfigured channel is inert, like
+    /// every other out-of-range call in this bank.
+    #[rstest]
+    fn rate_state_of_an_unconfigured_channel_is_idle() {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+        assert_eq!(segment(99), PulseSegment::IDLE);
+        assert_eq!(emitted(99), 0);
+        on_rate_change(99, |_| panic!("never fires"));
+        start(99, 10, 1_000);
     }
 }

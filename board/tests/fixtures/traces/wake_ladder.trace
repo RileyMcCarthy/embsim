@@ -1,0 +1,43 @@
+0 v=0 finding FloatingSense { net: "LADDER.P", kind: Analog }
+1 v=0 reroute epoch=0
+2 v=0 sense net=1 state=floating
+3 v=1000 wake component=0
+4 v=1000 drive_applied seq=0 endpoint=0 drive=750000uv@18000mohm
+5 v=1000 net_resolved net=0 state=analog:750000uv
+6 v=1000 net_resolved net=1 state=analog:750000uv
+7 v=1000 sense net=1 state=analog:750000uv
+8 v=2000 wake component=0
+9 v=2000 drive_applied seq=1 endpoint=0 drive=1000000uv@19000mohm
+10 v=2000 net_resolved net=0 state=analog:1000000uv
+11 v=2000 net_resolved net=1 state=analog:1000000uv
+12 v=2000 sense net=1 state=analog:1000000uv
+13 v=3000 wake component=0
+14 v=3000 drive_applied seq=2 endpoint=0 drive=1250000uv@20000mohm
+15 v=3000 net_resolved net=0 state=analog:1250000uv
+16 v=3000 net_resolved net=1 state=analog:1250000uv
+17 v=3000 sense net=1 state=analog:1250000uv
+18 v=4000 wake component=0
+19 v=4000 drive_applied seq=3 endpoint=0 drive=1500000uv@21000mohm
+20 v=4000 net_resolved net=0 state=analog:1500000uv
+21 v=4000 net_resolved net=1 state=analog:1500000uv
+22 v=4000 sense net=1 state=analog:1500000uv
+23 v=5000 wake component=0
+24 v=5000 drive_applied seq=4 endpoint=0 drive=1750000uv@22000mohm
+25 v=5000 net_resolved net=0 state=analog:1750000uv
+26 v=5000 net_resolved net=1 state=analog:1750000uv
+27 v=5000 sense net=1 state=analog:1750000uv
+28 v=6000 wake component=0
+29 v=6000 drive_applied seq=5 endpoint=0 drive=2000000uv@23000mohm
+30 v=6000 net_resolved net=0 state=analog:2000000uv
+31 v=6000 net_resolved net=1 state=analog:2000000uv
+32 v=6000 sense net=1 state=analog:2000000uv
+33 v=7000 wake component=0
+34 v=7000 drive_applied seq=6 endpoint=0 drive=2250000uv@24000mohm
+35 v=7000 net_resolved net=0 state=analog:2250000uv
+36 v=7000 net_resolved net=1 state=analog:2250000uv
+37 v=7000 sense net=1 state=analog:2250000uv
+38 v=8000 wake component=0
+39 v=8000 drive_applied seq=7 endpoint=0 drive=2500000uv@25000mohm
+40 v=8000 net_resolved net=0 state=analog:2500000uv
+41 v=8000 net_resolved net=1 state=analog:2500000uv
+42 v=8000 sense net=1 state=analog:2500000uv

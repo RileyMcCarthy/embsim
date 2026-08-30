@@ -100,6 +100,67 @@ impl PeripheralInstance {
             embsim_core::virtual_clock::clock_freq()
         }
     }
+
+    /// Power-on every peripheral bank. Does not close host FDs (their owner
+    /// does) and does not re-init the process-wide virtual clock.
+    pub fn reset(&self) {
+        self.serial.reset();
+        self.gpio.reset();
+        self.encoder.reset();
+        self.pulse_out.reset();
+        self.locks.reset();
+        self.system.reset();
+        self.clock_freq.store(0, Ordering::Relaxed);
+    }
+
+    /// Snapshot for host testers / diagnostics (no trace UI required).
+    pub fn inspect(&self) -> InstanceInspect {
+        let serial_n = self.serial.count();
+        let gpio_n = self.gpio.count();
+        let enc_n = self.encoder.count();
+        InstanceInspect {
+            serial: (0..serial_n)
+                .map(|ch| SerialChannelInspect {
+                    backend_fd: self.serial.backend_fd(ch),
+                    baud: self.serial.baud(ch),
+                    rx_len: self.serial.rx_len(ch),
+                    tx_len: self.serial.tx_len(ch),
+                })
+                .collect(),
+            gpio_active: (0..gpio_n).map(|ch| self.gpio.get_active(ch)).collect(),
+            encoder: (0..enc_n).map(|ch| self.encoder.value(ch)).collect(),
+            pulse_out_channels: self.pulse_out.count(),
+            unimplemented_hal: crate::access::count(),
+        }
+    }
+}
+
+/// Host-visible dump of one MCU instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceInspect {
+    /// One entry per configured UART channel.
+    pub serial: Vec<SerialChannelInspect>,
+    /// GPIO active flags, index = channel.
+    pub gpio_active: Vec<bool>,
+    /// Encoder counts, index = channel.
+    pub encoder: Vec<i32>,
+    /// Configured pulse-out channel count.
+    pub pulse_out_channels: usize,
+    /// Cumulative unimplemented HAL accesses (process-wide counter).
+    pub unimplemented_hal: u64,
+}
+
+/// One UART channel as inspect sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialChannelInspect {
+    /// Host FD backend, or -1 if FIFO-only.
+    pub backend_fd: i32,
+    /// Configured baud (0 = unpaced).
+    pub baud: u32,
+    /// Firmware RX FIFO depth.
+    pub rx_len: usize,
+    /// Firmware TX FIFO depth.
+    pub tx_len: usize,
 }
 
 impl Default for PeripheralInstance {
@@ -613,5 +674,34 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[rstest]
+    fn reset_clears_gpio_and_serial_fifos() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        let inst = PeripheralInstance::new();
+        inst.gpio.init(2, None);
+        inst.gpio.set_active(0, true);
+        inst.serial.init(1);
+        inst.serial.write_host_rx(0, b"xx");
+        assert_eq!(inst.serial.rx_len(0), 2);
+        inst.reset();
+        assert_eq!(inst.inspect().gpio_active.len(), 0);
+        assert_eq!(inst.serial.rx_len(0), 0);
+    }
+
+    #[rstest]
+    fn inspect_reports_fifo_depths_and_encoder() {
+        let _g = crate::test_support::guard();
+        crate::test_support::ensure_clock();
+        let inst = PeripheralInstance::new();
+        inst.serial.init(1);
+        inst.encoder.init(1);
+        inst.serial.write_host_rx(0, b"abc");
+        inst.encoder.set(0, 42);
+        let snap = inst.inspect();
+        assert_eq!(snap.serial[0].rx_len, 3);
+        assert_eq!(snap.encoder[0], 42);
     }
 }

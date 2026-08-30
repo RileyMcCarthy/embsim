@@ -29,6 +29,8 @@ pub enum CallbackKind {
     Wake,
     /// A stream byte delivery.
     StreamByte,
+    /// A pulse-train (rate-change) delivery.
+    Pulse,
     /// A topology-epoch notification.
     Topology,
 }
@@ -131,6 +133,22 @@ pub enum Finding {
         /// The first missing sequence number.
         seq: u64,
     },
+    /// **Stepped clock mode only.** A registered
+    /// `embsim_core::virtual_clock` actor never parked at a virtual deadline,
+    /// so the engine could not reach the quiescence barrier
+    /// (`DETERMINISM.md` T1 §4) within its timeout.
+    ///
+    /// The engine advances anyway rather than hanging — but **this finding
+    /// voids the run's determinism guarantee**, and is the marker a
+    /// golden-trace comparison should fail on rather than mysteriously
+    /// diverge. Common causes: an actor blocked on a real file descriptor or a
+    /// host mutex (neither is visible to the barrier — that is Phase D2's
+    /// transport work), or an actor spinning without ever calling a
+    /// `virtual_clock` wait.
+    QuiescenceTimeout {
+        /// Names of the actors still runnable, in registration order.
+        actors: Vec<String>,
+    },
     /// Pin-facade mismatch between a registered component and the netlist
     /// (both directions are hard build errors; the finding carries the
     /// specifics).
@@ -148,7 +166,18 @@ pub enum Finding {
 // Collector
 // ============================================================
 
-/// Vec-based finding collector; every report is mirrored to `tracing::warn!`.
+/// Finding collector with set semantics: a finding is *standing*, not an
+/// event, so reporting one twice records it once.
+///
+/// **Reporting does not log.** Net resolution runs on every drive — hundreds
+/// of times a second on a live machine — and re-reports every finding that
+/// still holds each pass, so logging inside `report` turned standing facts
+/// into a firehose: a measured 18 405 lines/s, in which one true and
+/// permanent `FloatingSense` on an unconnected crystal pin appeared 139 262
+/// times and starved the simulation it was describing. Logging therefore
+/// belongs where novelty is known — the engine's cumulative merge and
+/// `System::build` — and each of those reports a finding exactly once, when
+/// it first appears.
 #[derive(Debug, Default)]
 pub struct Diagnostics {
     findings: Vec<Finding>,
@@ -162,10 +191,30 @@ impl Diagnostics {
         }
     }
 
-    /// Record a finding and mirror it to `tracing`.
-    pub fn report(&mut self, finding: Finding) {
-        tracing::warn!(finding = ?finding, "board diagnostic finding");
+    /// Record a finding, returning `true` when it was not already present.
+    ///
+    /// Deliberately silent — see the type docs. Callers that know a finding
+    /// is new (the engine's merge, `System::build`) log it via
+    /// [`Diagnostics::log`].
+    pub fn report(&mut self, finding: Finding) -> bool {
+        if self.findings.contains(&finding) {
+            return false;
+        }
         self.findings.push(finding);
+        true
+    }
+
+    /// Mirror one finding to `tracing`. Call only for a finding that has just
+    /// appeared, never per resolution pass.
+    pub fn log(finding: &Finding) {
+        tracing::warn!(finding = ?finding, "board diagnostic finding");
+    }
+
+    /// Log every finding held, once. Used by the one-shot build path.
+    pub fn log_all(&self) {
+        for finding in &self.findings {
+            Self::log(finding);
+        }
     }
 
     /// All findings, in report order.
@@ -194,6 +243,51 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// A finding is standing, not an event: resolution re-reports it on every
+    /// pass, so the collector must record it once and say so. The boolean is
+    /// the novelty test the engine logs on — if `report` ever returns `true`
+    /// for a repeat, the 18 405 lines/s firehose comes back.
+    #[rstest]
+    fn reporting_the_same_finding_twice_records_it_once() {
+        let mut diags = Diagnostics::new();
+        let floating = Finding::FloatingSense {
+            net: "EC32MB.XTAL_XO".to_string(),
+            kind: SenseKind::Digital,
+        };
+
+        assert!(diags.report(floating.clone()), "first report is new");
+        for _ in 0..1_000 {
+            assert!(
+                !diags.report(floating.clone()),
+                "a standing finding is never new again"
+            );
+        }
+
+        assert_eq!(diags.len(), 1, "one standing fact, one record");
+        assert_eq!(diags.findings(), &[floating]);
+    }
+
+    /// Distinct findings stay distinct — deduplication must key on the whole
+    /// finding, not merely its kind, or a second floating net would be hidden
+    /// by the first.
+    #[rstest]
+    fn deduplication_does_not_collapse_distinct_findings() {
+        let mut diags = Diagnostics::new();
+        let a = Finding::FloatingSense {
+            net: "EC32MB.XTAL_XO".to_string(),
+            kind: SenseKind::Digital,
+        };
+        let b = Finding::FloatingSense {
+            net: "EC32MB.XTAL_XI".to_string(),
+            kind: SenseKind::Digital,
+        };
+
+        assert!(diags.report(a.clone()));
+        assert!(diags.report(b.clone()), "a different net is a new finding");
+        assert!(!diags.report(a));
+        assert_eq!(diags.len(), 2);
+    }
 
     #[rstest]
     fn collector_records_in_order_and_answers_contains() {

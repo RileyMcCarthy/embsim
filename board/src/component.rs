@@ -18,12 +18,19 @@
 //! ([`ComponentNetIo::stream_tx`] / [`ComponentNetIo::on_byte`]) whose byte
 //! pipes are derived from and gated by net resolution — see the stream
 //! section of [`crate::engine`].
+//!
+//! Pulse-capable pins get the analogous **pulse I/O surface**
+//! ([`ComponentNetIo::pulse_tx`] / [`ComponentNetIo::on_pulse`]), routed the
+//! same way but carrying a *rate* ([`PulseTrain`]) rather than bytes — see
+//! [`StreamRole::PulseSource`] for why a step clock is not modeled as edges.
 
 use std::collections::HashMap;
 use std::fmt;
 
 use crate::engine::{Command, ComponentId, EndpointId, EngineLink};
 use crate::net::{NetId, NetState, Ohms, TheveninDrive};
+
+pub use embsim_peripherals::pulse_out::PulseSegment;
 
 // ============================================================
 // Pin declarations
@@ -49,8 +56,9 @@ pub enum PinKind {
     Passive,
 }
 
-/// Serial-stream role of a pin. The pin's [`PinKind`] stays digital; byte
-/// pipes are derived from and gated by net resolution, never installed
+/// Channel role of a pin: a **byte stream** (UART) or a **pulse train** (a
+/// step clock). The pin's [`PinKind`] stays digital in both cases; the
+/// channel is derived from and gated by net resolution, never installed
 /// beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamRole {
@@ -64,6 +72,192 @@ pub enum StreamRole {
         /// Byte pacing rate.
         baud_hz: u32,
     },
+    /// Emits a pulse train onto the net **as a rate**, not as edges (a
+    /// step-clock output; see [`PulseTrain`]).
+    ///
+    /// # Why a rate and not edges
+    ///
+    /// A step clock is the one digital signal whose *information* is its
+    /// frequency and whose edge count runs far ahead of anything else on the
+    /// board. On the reference machine — 8192 steps/mm — a single mm/s of
+    /// carriage speed is 8192 edges/s, each of which would be a drive command,
+    /// a resolution pass over the STEP cluster, and a sense delivery through
+    /// the single-writer engine; a realistic 50 mm/s traverse is over 400 k
+    /// engine events per second, for a signal whose consumer only ever
+    /// reconstructs `frequency × time` from them.
+    ///
+    /// So the wire carries the *segment*: one event per **rate change**
+    /// (`start` / retarget / `stop`), and consumers integrate at read time —
+    /// the same read-time discipline `DETERMINISM.md` mandates and
+    /// `embsim_models::machine::stepper_motor` already uses for its plant. The
+    /// engine cost of a move becomes a small constant instead of a function of
+    /// speed, and the count stays **exact**: [`PulseTrain::emitted_at`] is the
+    /// same integer arithmetic the pulse-out peripheral hands the firmware, so
+    /// an encoder fed from it cannot drift from the firmware's own view.
+    ///
+    /// Fidelity limits are stated on [`PulseTrain`].
+    PulseSource,
+    /// Observes a routed pulse train (a step/direction drive's STEP input).
+    ///
+    /// The sink is delivered a [`PulseTrain`] at registration (when a routed
+    /// source already has one) and on every subsequent rate change — never per
+    /// pulse. Between deliveries the sink integrates the train itself.
+    PulseSink,
+}
+
+// ============================================================
+// Pulse trains
+// ============================================================
+
+/// Direction a pulse train advances a downstream counter.
+///
+/// A pulse-out peripheral has no direction of its own (a step clock is one
+/// wire); a source that *does* know its direction — an MCU whose pulse channel
+/// declares a direction GPIO — stamps it here so the train is self-describing
+/// for a sink that has no DIR pin of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PulseDirection {
+    /// Pulses increase the count.
+    #[default]
+    Forward,
+    /// Pulses decrease the count.
+    Reverse,
+}
+
+impl PulseDirection {
+    /// `+1` forward, `-1` reverse.
+    pub fn sign(self) -> i64 {
+        match self {
+            PulseDirection::Forward => 1,
+            PulseDirection::Reverse => -1,
+        }
+    }
+
+    /// The direction implied by a sign: negative is [`Self::Reverse`].
+    pub fn from_sign(sign: i64) -> Self {
+        if sign < 0 {
+            PulseDirection::Reverse
+        } else {
+            PulseDirection::Forward
+        }
+    }
+}
+
+/// One constant-rate segment of a pulse train as it appears on a net:
+/// frequency, direction, and accumulated count.
+///
+/// This is the whole state of the channel from
+/// [`PulseSegment::since_us`] onward, which is what makes one event per rate
+/// change sufficient. A consumer keeps the latest train and evaluates it at
+/// **read time**:
+///
+/// ```
+/// use embsim_board::{PulseDirection, PulseSegment, PulseTrain};
+///
+/// // 8192 steps/s, unbounded, starting at t = 1 000 µs with 0 emitted.
+/// let train = PulseTrain {
+///     pulses: PulseSegment { emitted: 0, freq_hz: 8_192, total: None, since_us: 1_000 },
+///     direction: PulseDirection::Reverse,
+/// };
+/// // One second later, exactly 8192 pulses have gone out, counting down.
+/// assert_eq!(train.emitted_at(1_001_000), 8_192);
+/// assert_eq!(train.delta_at(1_001_000), -8_192);
+/// ```
+///
+/// # How to fold a sequence of segments
+///
+/// A segment is superseded, never continued: when the next one arrives, the
+/// outgoing segment is folded **up to its successor's
+/// [`PulseSegment::since_us`]**, and the successor's own baseline takes over
+/// from there. Folding a superseded segment to *now* instead would keep an
+/// unbounded train integrating forever and double-count every pulse its
+/// successor already carries.
+///
+/// Within one segment, evaluate against the anchor the source published — do
+/// not re-base per read. [`PulseSegment::rebased_at`] explains why (it costs
+/// the source's pulse phase);
+/// `embsim_models::machine::stepper_motor` is the reference consumer.
+///
+/// # Fidelity limits
+///
+/// - **There are no edges.** The source pin's resolved [`NetState`] holds its
+///   idle level for the whole train — it does not toggle. A consumer that
+///   counts `NetState` transitions sees nothing; it must declare
+///   [`StreamRole::PulseSink`]. Pulse width, duty cycle, rise time and jitter
+///   are therefore not modeled, and neither is DIR setup/hold against an
+///   individual step edge (direction applies to a whole segment).
+/// - **Counts are exact at the peripheral's own truncation.** `emitted_at`
+///   floors `elapsed_us × freq / 1_000_000` exactly as
+///   `embsim_peripherals::pulse_out::PulseOut::run` does, so consumer and
+///   firmware agree bit for bit — but both share that truncation, so a
+///   sub-microsecond instant is not resolvable.
+/// - **A direction split costs up to one pulse of phase.** Re-signing a train
+///   mid-flight re-anchors it at the change instant, which discards the
+///   source's pulse phase (integer microseconds cannot carry it). The count
+///   handed over at the split is exact; from there the re-anchored segment can
+///   trail the peripheral by at most one pulse, once per reversal. A rate
+///   change costs nothing extra — the peripheral re-anchors there anyway, so
+///   both sides truncate identically.
+/// - **Delivery is gated at rate-change granularity.** The engine checks that
+///   the route's nets are signal-capable when it delivers a train; a net that
+///   falls into `Contention`/`Floating` *mid-train* does not interrupt a train
+///   already in flight — the next rate change is what notices. Scenarios that
+///   break a step net should assert on the resulting finding rather than on
+///   the carriage stopping.
+/// - **One train per source.** A source publishes its whole channel state each
+///   time; there is no per-pulse ordering against other traffic on the net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PulseTrain {
+    /// Rate, accumulated count, ceiling and start instant — the same segment
+    /// vocabulary the pulse-out peripheral publishes.
+    pub pulses: PulseSegment,
+    /// Which way these pulses move a downstream counter.
+    pub direction: PulseDirection,
+}
+
+impl PulseTrain {
+    /// A held channel: no rate, nothing emitted, forward.
+    pub const IDLE: Self = Self {
+        pulses: PulseSegment::IDLE,
+        direction: PulseDirection::Forward,
+    };
+
+    /// Cumulative (unsigned) pulses emitted by this train at virtual time
+    /// `now_us`.
+    pub fn emitted_at(&self, now_us: u64) -> u64 {
+        self.pulses.emitted_at(now_us)
+    }
+
+    /// **Signed** pulses emitted since this segment began — the amount a
+    /// consumer folds into its own position when it re-bases or replaces the
+    /// train.
+    pub fn delta_at(&self, now_us: u64) -> i64 {
+        let delta = self.emitted_at(now_us).saturating_sub(self.pulses.emitted);
+        self.direction.sign() * i64::try_from(delta).unwrap_or(i64::MAX)
+    }
+
+    /// Virtual time (µs) at which a finite train emits its last pulse, or
+    /// `None` for an unbounded or held train.
+    pub fn completes_at(&self) -> Option<u64> {
+        self.pulses.completes_at()
+    }
+
+    /// The same train re-anchored at `at_us` — identical rate, ceiling and
+    /// direction, with the count advanced to that instant.
+    ///
+    /// Idempotent and exact, so folding `delta_at(t)` into an accumulator and
+    /// then re-basing at `t` never double-counts a pulse.
+    pub fn rebased_at(&self, at_us: u64) -> Self {
+        Self {
+            pulses: self.pulses.rebased_at(at_us),
+            direction: self.direction,
+        }
+    }
+
+    /// Signed rate in pulses/second (negative when reversing).
+    pub fn signed_rate(&self) -> f64 {
+        self.direction.sign() as f64 * f64::from(self.pulses.freq_hz)
+    }
 }
 
 /// One declared pin of a [`Component`]. The set returned by
@@ -254,6 +448,36 @@ impl StreamTx {
     }
 }
 
+/// Write half of a [`StreamRole::PulseSource`] pin (a step clock), obtained
+/// via [`ComponentNetIo::pulse_tx`].
+///
+/// [`PulseTx::set_train`] publishes a whole constant-rate segment; call it
+/// **only when the rate, direction or ceiling changes** — that is the entire
+/// point of the representation (see [`StreamRole::PulseSource`]). Publishing
+/// is non-blocking: the train is enqueued to the engine thread and delivered
+/// to every routed [`StreamRole::PulseSink`] with no lock held.
+///
+/// Cloneable and thread-safe, exactly like [`StreamTx`].
+#[derive(Debug, Clone)]
+pub struct PulseTx {
+    endpoint: Option<EndpointId>,
+    link: EngineLink,
+}
+
+impl PulseTx {
+    /// Publish a new constant-rate segment on this pin.
+    ///
+    /// A train written into a pin with no drive endpoint (detached), or on the
+    /// inert build-time path, is traced and dropped.
+    pub fn set_train(&self, train: PulseTrain) {
+        let Some(endpoint) = self.endpoint else {
+            tracing::debug!("pulse train on a pin without a drive endpoint dropped");
+            return;
+        };
+        self.link.send(Command::PulseUpdate { endpoint, train });
+    }
+}
+
 /// Per-component net I/O passed to [`Component::attach`]: typed pin-handle
 /// lookup, sense subscription, and engine-owned scheduling.
 #[derive(Debug, Clone, Default)]
@@ -378,11 +602,70 @@ impl ComponentNetIo {
         }
     }
 
+    /// Write half of a [`StreamRole::PulseSource`] pin (a step clock). Fails
+    /// loudly when the pin was not declared a pulse source — a component
+    /// asking to pulse on a non-source pin is a facade bug, caught at attach.
+    pub fn pulse_tx(&self, id: &str) -> Result<PulseTx, AttachError> {
+        let pin = self.pin(id)?;
+        match pin.stream {
+            Some(StreamRole::PulseSource) => Ok(PulseTx {
+                endpoint: pin.endpoint,
+                link: pin.link,
+            }),
+            _ => Err(AttachError::Failed {
+                message: format!("pin {id:?} is not a pulse source"),
+            }),
+        }
+    }
+
+    /// Subscribe to the pulse train routed to a [`StreamRole::PulseSink`] pin
+    /// (a step/direction drive's STEP input). The callback runs on the engine
+    /// thread with **no engine lock held**, once per *rate change* — never per
+    /// pulse; between deliveries the subscriber integrates the train itself
+    /// (see [`PulseTrain`]).
+    ///
+    /// A routed source that already has a train delivers it once at
+    /// registration, mirroring [`ComponentNetIo::on_sense`]. Fails loudly when
+    /// the pin was not declared a pulse sink. A detached sink pin registers
+    /// nothing (its route never forms), which is not an attach failure.
+    pub fn on_pulse(
+        &self,
+        id: &str,
+        callback: impl Fn(PulseTrain) + Send + 'static,
+    ) -> Result<(), AttachError> {
+        let pin = self.pin(id)?;
+        match pin.stream {
+            Some(StreamRole::PulseSink) => {
+                let Some(endpoint) = pin.endpoint else {
+                    tracing::debug!(
+                        pin = id,
+                        "on_pulse on a pin without a drive endpoint dropped"
+                    );
+                    return Ok(());
+                };
+                self.link.send(Command::RegisterPulseSink {
+                    endpoint,
+                    callback: Box::new(callback),
+                });
+                Ok(())
+            }
+            _ => Err(AttachError::Failed {
+                message: format!("pin {id:?} is not a pulse sink"),
+            }),
+        }
+    }
+
     /// Register this component's wakeup handler for
     /// [`schedule_at`](Self::schedule_at) /
     /// [`schedule_every`](Self::schedule_every) deliveries (last
     /// registration wins). The callback runs on the engine thread with the
-    /// sampled virtual time (µs) and no engine lock held.
+    /// current virtual time (µs) and no engine lock held.
+    ///
+    /// A component whose time comes from here is **deterministic for free** in
+    /// stepped clock mode: it is not a separate actor at all, so nothing about
+    /// it can race the engine (`DETERMINISM.md` T1 §4). Prefer a wakeup over a
+    /// thread with its own poll loop wherever the work is non-blocking —
+    /// `embsim_models::ads122u04_component` is the reference conversion.
     pub fn on_wake(&self, callback: impl Fn(u64) + Send + 'static) {
         let Some(component) = self.component else {
             tracing::debug!("on_wake on an inert io handle dropped");
@@ -395,9 +678,14 @@ impl ComponentNetIo {
     }
 
     /// Request a one-shot wakeup at the given absolute virtual time (µs),
-    /// served by the engine thread's timer wheel. Timestamps are sampled
-    /// from the free-running scaled clock — a deadline already in the past
-    /// fires immediately, in deadline order. Requires `virtual_clock::init`.
+    /// served by the engine thread's timer wheel. A deadline already in the
+    /// past fires immediately, in deadline order. Requires
+    /// `virtual_clock::init`.
+    ///
+    /// Free-running: the delivered timestamp is *sampled* from the scaled
+    /// clock, so a wake lands at or after its deadline by an unspecified
+    /// margin. Stepped: the engine advances virtual time **to** the deadline,
+    /// so the delivered timestamp is exactly `at_us`.
     pub fn schedule_at(&self, at_us: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_at on an inert io handle dropped");
@@ -410,6 +698,13 @@ impl ComponentNetIo {
     /// deadlines coalesce (one catch-up fire, then back on period) — compute
     /// time-dependent state at read time, never per tick. Requires
     /// `virtual_clock::init`.
+    ///
+    /// The period is anchored at the virtual instant the engine *handles* this
+    /// request. In stepped mode that instant is pinned for the whole system:
+    /// virtual time is held until every component has attached and started, so
+    /// two components' periods are anchored together, run after run.
+    /// Free-running coalescing is unreachable in stepped mode — the engine
+    /// never advances past a deadline it has not fired.
     pub fn schedule_every(&self, period_us: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_every on an inert io handle dropped");
@@ -484,7 +779,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let states = Arc::new(Mutex::new(vec![NetState::Driven(Level::High)]));
-        let link = EngineLink::inert(states);
+        let link = EngineLink::inert(states, Arc::new(Mutex::new(Vec::new())));
         let handle = PinHandle::wired(NetId(0), None, None, link.clone());
         let io = ComponentNetIo::wired([("1".to_string(), handle)], None, link);
 
