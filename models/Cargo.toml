@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reusable hardware component models for embsim (ADC IC, limit switch, edge detector)"
+description = "Reusable hardware component models for embsim (ADC IC, digital isolators, optocoupler, machine parts)"
 keywords = ["embedded", "emulator", "simulation", "sil"]
 categories = ["embedded", "simulation"]
 
