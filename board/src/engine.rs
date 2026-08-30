@@ -1564,10 +1564,14 @@ impl EngineCore {
         }
         let mut cumulative = self.diagnostics.lock().unwrap();
         for finding in pass.findings() {
-            if !cumulative.contains(finding) {
+            // `report` is the novelty test: it returns true only the first
+            // time a finding appears, which is also the only time it is worth
+            // logging. Resolution re-reports every finding that still holds,
+            // so logging unconditionally here is what produced 18 k lines/s.
+            if cumulative.report(finding.clone()) {
                 self.event_log
                     .record(|| EngineEvent::Finding(finding.clone()));
-                cumulative.report(finding.clone());
+                Diagnostics::log(finding);
             }
         }
     }

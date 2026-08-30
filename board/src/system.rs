@@ -534,6 +534,10 @@ impl System {
         }
 
         let roots = resolver.identity_roots(nets.len());
+        // The build path resolves a fixed number of times, so logging the
+        // standing set once here is the whole story (`Diagnostics::report` is
+        // silent by design — see its type docs).
+        diagnostics.log_all();
         Ok(BuiltSystem {
             nets,
             diagnostics,
