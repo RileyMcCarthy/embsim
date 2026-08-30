@@ -21,29 +21,15 @@
 //! Time-driven behavior is engine-owned: components request wakeups via
 //! [`crate::component::ComponentNetIo::schedule_at`] /
 //! [`crate::component::ComponentNetIo::schedule_every`], served by a timer
-//! wheel keyed to `embsim_core::virtual_clock` **virtual time**. Idle
-//! components cost nothing. The engine runs one of two loops, chosen by the
-//! clock's mode (`DETERMINISM.md` T1):
-//!
-//! - **Free-running** (default): the clock is scaled wall time, so wakeup
-//!   timestamps are *sampled*, not deterministic — late wakeups fire
-//!   immediately, in deadline order, and missed periodic deadlines coalesce
-//!   (one catch-up fire, then back on period). The engine parks on its command
-//!   queue (`recv_timeout`) until the next wheel deadline, or indefinitely when
-//!   the wheel is empty.
-//! - **Stepped**: the engine is the **time authority**
-//!   (`EngineCore::run_stepped_iteration`). It waits for every registered
-//!   `virtual_clock` actor to park, drains its queue completely, fires every
-//!   entry due at `now`, loops that to a fixpoint, then advances virtual time
-//!   to `min(wheel head, earliest parked deadline)`. A wake therefore fires
-//!   *exactly* at its deadline and the coalescing branch is unreachable.
-//!   Virtual time is additionally held until `System::start` has attached and
-//!   started every component (`Command::ReleaseTime`), so two components'
-//!   periods are anchored at the same instant run after run.
-//!
-//! Either way, time-dependent component state must be computed at read time,
-//! never integrated per tick: a component that assumes exact wakeups breaks the
-//! moment it runs in the default mode.
+//! wheel keyed to the virtual-clock **counter**. Idle components cost nothing.
+//! The engine is the **time authority** (`EngineCore::run_stepped_iteration`):
+//! it waits for every registered actor to park, drains its queue, fires every
+//! entry due at `now`, then [`advance_to`] `min(wheel head, earliest park)`.
+//! Optional wall pacing after a jump (`init(speed)` with `speed > 0`) is how
+//! a playground feels real-time; tests use `speed <= 0` so jumps are instant.
+//! Time is held until `System::start` has attached every component
+//! (`Command::ReleaseTime`). Time-sensitive state must be computed at
+//! *read time*, never integrated per tick.
 //!
 //! Build-time analysis and live resolution share **one code path**: the
 //! crate-internal `Resolver` in this module is populated by `System`
@@ -114,7 +100,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use embsim_core::virtual_clock;
 
@@ -150,17 +136,6 @@ pub(crate) const DEFAULT_HIGH_LEVEL_VOLTS: Volts = 3.3;
 /// 1 stop), matching the embsim serial peripheral's pacing convention.
 const STREAM_BITS_PER_BYTE: u64 = 10;
 
-/// Maximum queued commands handled per drain batch before control returns
-/// to the engine loop's timer check. Enqueuing a command costs one atomic
-/// increment plus a channel send — orders of magnitude cheaper than
-/// handling one (a `Drive` runs a full resolution pass) — so one busy
-/// producer thread can keep the queue non-empty indefinitely. An unbounded
-/// drain would therefore starve the timer wheel system-wide
-/// (`schedule_at`/`schedule_every` wakes and paced stream delivery would
-/// never fire); time-driven behavior is engine-owned (`BOARD_ENGINE.md`),
-/// so the wheel must be serviced within a bounded amount of queued work.
-const COMMAND_DRAIN_BATCH_MAX: usize = 64;
-
 /// Maximum in-flight (paced, deadline-stamped) bytes per stream route. A
 /// real UART has a finite TX path, not an infinite buffer: a producer that
 /// sustains writes above its declared baud would otherwise grow the queue —
@@ -169,21 +144,6 @@ const COMMAND_DRAIN_BATCH_MAX: usize = 64;
 /// pin (the natural surface for a producer-vs-declared-baud mismatch). At
 /// 115 200 baud this depth is well under a second of backlog.
 const STREAM_ROUTE_QUEUE_MAX: usize = 8192;
-
-/// How long the engine waits on a missing drive enqueue sequence before
-/// skipping the gap. `set_drive` reserves the global sequence and sends the
-/// command as two separate steps, so a thread dying between them leaves a
-/// permanent gap that would otherwise hold EVERY later drive hostage in
-/// `pending_drives` — no timeout, no symptom beyond the board going quiet.
-/// The wait is wall-clock (enqueuing is wall-side) and generous: a live
-/// enqueuer covers the reserve→send window in nanoseconds.
-///
-/// **Free-running only.** In stepped mode the watchdog is disabled: a
-/// wall-clock timeout inside the simulation is exactly the coupling stepped
-/// mode exists to remove, and under actor accounting a dead enqueuer is
-/// detected exactly (its actor never re-parks → [`Finding::QuiescenceTimeout`])
-/// rather than by timeout. `DETERMINISM.md` T1 §3.
-const DRIVE_SEQ_STALL_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Stepped mode: how long the engine waits for every registered actor to park
 /// before declaring the barrier wedged
@@ -741,14 +701,11 @@ impl Resolver {
         // the cluster but cannot enter a numeric solve).
         //
         // **Determinism (load-bearing):** iterate the DENSE drive table, never
-        // `net_drivers` (a `HashMap`). This `Vec`'s order becomes the float
-        // accumulation order of `matrix[c][c] += g` and `rhs[c] += i` in
-        // [`crate::cluster::QuasiStaticMna::solve`], so hash iteration order
-        // would publish last-bit-different `NetState::Analog` voltages from
-        // one *process* to the next — `std`'s hasher is randomly seeded per
-        // process. Slots and `net_drivers`' member lists are both built in
-        // endpoint order, so this is the same multiset in a canonical order.
-        // See `DETERMINISM.md`, "One real hash-order defect".
+        // `net_drivers` (a `HashMap`). This `Vec`'s order is the SPICE card
+        // order [`crate::cluster::QuasiStaticMna::solve`] stamps, so a hash walk would
+        // make the deck (and, for a linear solver, last-bit voltages) depend
+        // on a per-process hasher seed. Slots and `net_drivers`' member lists
+        // are both built in endpoint order. See `DETERMINISM.md`.
         let mut cluster_sources: HashMap<usize, Vec<ClusterSource>> = HashMap::new();
         for slot in &self.slots {
             let Some(drive) = slot.drive else {
@@ -1480,10 +1437,6 @@ struct EngineCore {
     /// in flight); applied strictly in seq order.
     pending_drives: BTreeMap<u64, (EndpointId, Option<TheveninDrive>)>,
     next_drive_seq: u64,
-    /// Gap watchdog: the missing seq currently being waited on and when the
-    /// wait started (wall clock). `None` when no gap is outstanding.
-    /// Free-running only (see [`DRIVE_SEQ_STALL_TIMEOUT`]).
-    drive_stall: Option<(u64, Instant)>,
     /// Stepped mode: has [`Command::ReleaseTime`] arrived? Virtual time is held
     /// at its initial value until it does, so every component's first schedule
     /// is anchored at the same instant.
@@ -1496,10 +1449,9 @@ struct EngineCore {
     /// How long [`Self::await_actor_quiescence`] waits before declaring the
     /// barrier wedged ([`STEPPED_QUIESCENCE_TIMEOUT`] unless overridden).
     quiescence_timeout: Duration,
-    /// Stepped mode: `(missing seq, already reported)` for the drive-seq gap
-    /// the idle diagnostic is watching, so it fires once per gap — and only
-    /// after the gap has survived two consecutive idle polls.
-    stepped_gap_logged: Option<(u64, bool)>,
+    /// Gap seq currently being watched, and how many consecutive idle polls
+    /// have seen it. Skip after ~200 ms of idle (100 polls).
+    stepped_gap_logged: Option<(u64, u32)>,
     /// Determinism Oracle 1 (`crate::event_log`). Disabled by default; every
     /// recording site is closure-guarded, so an off log costs one `Option`
     /// check.
@@ -1909,57 +1861,11 @@ impl EngineCore {
         }
     }
 
-    /// Detect and break a wedged drive queue. A reserved-but-never-sent
-    /// enqueue seq (the enqueuing thread died between `next_drive_seq`'s
-    /// fetch_add and the channel send) would otherwise hold every later
-    /// drive from EVERY component hostage in `pending_drives`, silently.
-    /// After [`DRIVE_SEQ_STALL_TIMEOUT`] on one missing seq the engine
-    /// reports a loud [`Finding::DriveSeqGap`] and skips to the lowest
-    /// buffered seq — ordering against a dead enqueuer is moot. The run
-    /// loop bounds its park time while a gap is outstanding, so detection
-    /// does not depend on further traffic arriving.
-    ///
-    /// **Free-running only.** Stepped mode disables it (`DETERMINISM.md`
-    /// T1 §3): an `Instant`-based timeout inside the simulation is exactly the
-    /// wall-clock coupling stepped mode removes, and a dead enqueuer shows up
-    /// there as an actor that never re-parks — detected exactly, by
-    /// [`Finding::QuiescenceTimeout`], rather than by a guess at a duration.
-    fn check_drive_stall(&mut self) {
-        let Some((&lowest, _)) = self.pending_drives.first_key_value() else {
-            self.drive_stall = None;
-            return;
-        };
-        let missing = self.next_drive_seq;
-        match self.drive_stall {
-            Some((seq, since)) if seq == missing => {
-                if since.elapsed() >= DRIVE_SEQ_STALL_TIMEOUT {
-                    tracing::warn!(
-                        missing_seq = missing,
-                        resuming_at = lowest,
-                        buffered = self.pending_drives.len(),
-                        "drive enqueue seq never arrived (enqueuer died between \
-                         reserve and send?); skipping the gap"
-                    );
-                    self.report_finding(Finding::DriveSeqGap { seq: missing });
-                    self.drive_stall = None;
-                    self.next_drive_seq = lowest;
-                    self.apply_ready_drives();
-                }
-            }
-            // New gap (or the gap moved): restart the wall-clock wait.
-            _ => self.drive_stall = Some((missing, Instant::now())),
-        }
-    }
-
     /// Fire every wheel entry whose deadline has passed, in `(deadline,
     /// schedule)` order; returns how many fired.
     ///
-    /// In free-running mode wake timestamps are *sampled* from the scaled wall
-    /// clock and missed periodic deadlines coalesce to one catch-up fire, then
-    /// re-arm on period. In stepped mode `now` is exactly the instant the
-    /// engine advanced to, so a wake fires at its scheduled deadline and the
-    /// catch-up branch is unreachable: the engine never advances past a
-    /// deadline it has not fired. Stream targets deliver their route's due
+    /// `now` is the instant the engine last advanced to, so a wake fires at
+    /// its scheduled deadline. Stream targets deliver their route's due
     /// bytes instead of a wake callback.
     fn fire_due_timers(&mut self) -> usize {
         let mut fired = 0usize;
@@ -2120,70 +2026,24 @@ impl EngineCore {
         false
     }
 
-    /// Engine thread body. The mode is re-read every iteration (one relaxed
-    /// atomic load), so a consumer that selects stepped mode after spawning the
-    /// system still gets it — and free-running remains byte-for-byte the loop
-    /// it has always been.
+    /// Engine thread body. Virtual time is a counter; this loop is the time
+    /// authority. `--speed` only paces the host after [`advance_to`].
     fn run(mut self, rx: Receiver<Command>) {
         loop {
-            let done = if virtual_clock::is_stepped() {
-                self.run_stepped_iteration(&rx)
-            } else {
-                self.run_free_running_iteration(&rx)
-            };
-            if done {
+            if self.run_stepped_iteration(&rx) {
                 break;
             }
         }
     }
 
-    /// One free-running iteration (unchanged behavior): fire due timers, run
-    /// the drive-gap watchdog, park on the queue until the next wheel deadline
-    /// or stall check (or indefinitely when neither is pending), then handle
-    /// commands in bounded batches ([`COMMAND_DRAIN_BATCH_MAX`]) so due timers
-    /// keep firing under sustained command load. Returns `true` to stop.
-    fn run_free_running_iteration(&mut self, rx: &Receiver<Command>) -> bool {
-        self.fire_due_timers();
-        self.check_drive_stall();
-        let command = match self.next_wall_wait_us() {
-            None => match rx.recv() {
-                Ok(c) => c,
-                Err(_) => return true, // every handle dropped without Shutdown
-            },
-            Some(wait_wall) => match rx.recv_timeout(Duration::from_micros(wait_wall)) {
-                Ok(c) => c,
-                Err(RecvTimeoutError::Timeout) => return false,
-                Err(RecvTimeoutError::Disconnected) => return true,
-            },
-        };
-        if self.handle(command) {
-            return true;
-        }
-        // Bounded drain: a saturated queue must not starve the timer wheel —
-        // control returns to the timer check above after at most
-        // COMMAND_DRAIN_BATCH_MAX further commands. A disconnect observed here
-        // is handled by the blocking receive above.
-        let mut drained = 0;
-        while drained < COMMAND_DRAIN_BATCH_MAX {
-            let Ok(command) = rx.try_recv() else { break };
-            drained += 1;
-            if self.handle(command) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// One stepped iteration — the engine as the **time authority**
+    /// One iteration — the engine as the **time authority**
     /// (`DETERMINISM.md` T1 §3). Returns `true` to stop.
     ///
     /// 1. **Quiesce.** Wait for every registered actor to park. Only then is
     ///    the set of pending work stable enough to reason about.
-    /// 2. **Drain the command queue completely.** [`COMMAND_DRAIN_BATCH_MAX`]
-    ///    exists only to stop a command flood from starving *wall-clock*
-    ///    timers; with time advanced by the engine itself starvation is
-    ///    impossible, and a partial drain would make the applied prefix depend
-    ///    on arrival timing.
+    /// 2. **Drain the command queue completely.** A partial drain would make
+    ///    the applied prefix depend on arrival timing; starvation is
+    ///    impossible because the engine itself advances time.
     /// 3. **Fire every wheel entry due at `now`**, in `(deadline, seq)` order.
     /// 4. Loop 1–3 to a fixpoint: a callback fired in step 3 may have enqueued
     ///    drives, and a released actor may have enqueued anything.
@@ -2250,40 +2110,26 @@ impl EngineCore {
         }
     }
 
-    /// Stepped mode's replacement for the drive-gap *watchdog*: a **name**, not
-    /// a timeout.
-    ///
-    /// [`check_drive_stall`](Self::check_drive_stall) is disabled here
-    /// (`DETERMINISM.md` T1 §3). For a registered actor that is exactly right —
-    /// a dead enqueuer is detected as an actor that never re-parks. But a
-    /// **non-actor** enqueuer that dies between reserving a seq and sending the
-    /// command leaves a gap nothing detects, and the only symptom would be the
-    /// board going quiet. So when the engine is fully idle — nothing to advance
-    /// to, every actor parked — and drives are still buffered, say so.
-    ///
-    /// Deliberately a `tracing::error!` and **not** a [`Finding`]: a finding
-    /// would land in the event log at a wall-dependent moment and make an
-    /// otherwise-reproducible run diverge. Reported once per distinct gap, and
-    /// only after the *same* gap has survived two consecutive idle polls — a
-    /// live enqueuer covers the reserve→send window in nanoseconds, so one
-    /// observation could still be catching a healthy race in flight.
+    /// Skip a reserved-but-never-sent drive seq after it has survived many
+    /// idle polls. A live enqueuer covers reserve→send in nanoseconds; one
+    /// or two idle observations can still be a healthy race, so wait
+    /// [`GAP_IDLE_POLLS`] (~200 ms) before skipping.
     fn warn_on_stepped_drive_gap(&mut self) {
         let Some((&lowest, _)) = self.pending_drives.first_key_value() else {
             self.stepped_gap_logged = None;
             return;
         };
         let missing = self.next_drive_seq;
+        const GAP_IDLE_POLLS: u32 = 100; // ~200 ms at STEPPED_IDLE_POLL
         match self.stepped_gap_logged {
-            // Same gap, already reported (or: first sighting → wait one poll).
-            Some((seq, reported)) if seq == missing => {
-                if reported {
+            Some((seq, n)) if seq == missing => {
+                if n + 1 < GAP_IDLE_POLLS {
+                    self.stepped_gap_logged = Some((missing, n + 1));
                     return;
                 }
-                self.stepped_gap_logged = Some((missing, true));
             }
-            // A new gap (or the gap moved): start over, say nothing yet.
             _ => {
-                self.stepped_gap_logged = Some((missing, false));
+                self.stepped_gap_logged = Some((missing, 1));
                 return;
             }
         }
@@ -2291,12 +2137,12 @@ impl EngineCore {
             missing_seq = missing,
             lowest_buffered = lowest,
             buffered = self.pending_drives.len(),
-            "stepped clock: the engine is idle with drives buffered behind a missing \
-             enqueue seq. The wall-clock stall watchdog is disabled in stepped mode; \
-             an enqueuer that is a registered actor would have been caught by the \
-             quiescence barrier, so this gap belongs to an unregistered thread \
-             (DETERMINISM.md T1 §3)"
+            "idle with drives buffered behind a missing enqueue seq; skipping the gap"
         );
+        self.report_finding(Finding::DriveSeqGap { seq: missing });
+        self.next_drive_seq = lowest;
+        self.apply_ready_drives();
+        self.stepped_gap_logged = None;
     }
 
     /// Stepped mode: block until every registered actor is parked, reporting a
@@ -2338,28 +2184,6 @@ impl EngineCore {
             (a, b) => a.or(b),
         }
     }
-
-    /// Wall-clock park bound (µs) until the engine must wake without a
-    /// command: the earlier of the next wheel deadline and the outstanding
-    /// drive-gap stall check. `None` parks indefinitely (empty wheel, no
-    /// gap). The virtual clock is only read while the wheel is non-empty,
-    /// so a timer-free system never requires `virtual_clock::init`.
-    ///
-    /// Free-running only — stepped mode uses [`Self::next_virtual_deadline`].
-    fn next_wall_wait_us(&self) -> Option<u64> {
-        let wheel_wait = self.wheel.peek().map(|&Reverse(head)| {
-            let now = virtual_clock::virtual_us();
-            virtual_clock::virtual_to_wall_us(head.deadline_us.saturating_sub(now))
-        });
-        let stall_wait = self.drive_stall.map(|(_, since)| {
-            let remaining = DRIVE_SEQ_STALL_TIMEOUT.saturating_sub(since.elapsed());
-            u64::try_from(remaining.as_micros()).unwrap_or(u64::MAX)
-        });
-        match (wheel_wait, stall_wait) {
-            (Some(wheel), Some(stall)) => Some(wheel.min(stall)),
-            (wheel, stall) => wheel.or(stall),
-        }
-    }
 }
 
 // ============================================================
@@ -2378,6 +2202,7 @@ pub struct EngineHandle {
     diagnostics: Arc<Mutex<Diagnostics>>,
     event_log: EventLog,
     join: Option<JoinHandle<()>>,
+    _time: virtual_clock::TimeAuthority,
 }
 
 impl EngineHandle {
@@ -2438,7 +2263,6 @@ impl EngineHandle {
             timer_seq: 0,
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
-            drive_stall: None,
             clock_released: false,
             quiescence_stalled: false,
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
@@ -2450,6 +2274,8 @@ impl EngineHandle {
         // installed beside it: the routing pass runs against the just-resolved
         // nets.
         core.reroute_channels();
+
+        let time_authority = virtual_clock::take_time_authority();
 
         let join = std::thread::Builder::new()
             .name("embsim-board-net-engine".to_string())
@@ -2467,6 +2293,7 @@ impl EngineHandle {
             diagnostics,
             event_log,
             join: Some(join),
+            _time: time_authority,
         }
     }
 
@@ -2475,10 +2302,9 @@ impl EngineHandle {
         self.link.clone()
     }
 
-    /// Tell the engine the system is fully assembled, so a **stepped** clock
-    /// may begin advancing ([`Command::ReleaseTime`]). Called once by
-    /// `System::start` after every component has attached and started; a no-op
-    /// in free-running mode.
+    /// Tell the engine the system is fully assembled, so virtual time may
+    /// begin advancing ([`Command::ReleaseTime`]). Called once by
+    /// `System::start` after every component has attached and started.
     pub(crate) fn release_time(&self) {
         self.link.send(Command::ReleaseTime);
     }
@@ -2887,7 +2713,7 @@ mod tests {
     }
 
     /// A solver that stamps a sentinel state, so escalation wiring is
-    /// asserted independent of the (evolving) MNA implementation.
+    /// asserted independent of the (evolving) analog solver implementation.
     struct RecordingSolver {
         calls: Arc<StdMutex<Vec<Vec<NetId>>>>,
     }
@@ -3059,7 +2885,7 @@ mod tests {
     }
 
     /// The numeric consequence of the ordering fix: a cluster whose sources
-    /// **share one MNA supernode** solves to a **bit-identical** node voltage
+    /// **share one analog supernode** solves to a **bit-identical** node voltage
     /// across many repeated resolutions.
     ///
     /// Two things about this are worth recording, because both correct a
@@ -3271,26 +3097,27 @@ mod tests {
     }
 
     fn empty_engine() -> EngineHandle {
-        EngineHandle::spawn(
+        let handle = EngineHandle::spawn(
             Resolver::new(0, Dsu::new(0)),
             Vec::new(),
             Box::new(QuasiStaticMna),
             EventLog::disabled(),
             None,
-        )
+        );
+        handle.release_time();
+        handle
     }
 
-    /// `schedule_at` fires exactly once, at-or-after its virtual deadline
-    /// (timestamps are sampled from the free-running scaled clock).
+    /// `schedule_at` fires exactly once, at-or-after its virtual deadline.
     #[rstest]
     fn one_shot_timer_fires_once_at_virtual_deadline() {
         let _g = lock_clock();
-        virtual_clock::init(50.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
         let now = virtual_clock::virtual_us();
-        let deadline = now + 100_000; // 100 virtual ms = 2 wall ms at 50x
+        let deadline = now + 100_000;
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(0),
             at_us: deadline,
@@ -3312,13 +3139,13 @@ mod tests {
     #[rstest]
     fn periodic_timer_fires_repeatedly_against_scaled_clock() {
         let _g = lock_clock();
-        virtual_clock::init(50.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
         handle.link().send(Command::ScheduleEvery {
             component: ComponentId(0),
-            period_us: 20_000, // 0.4 wall ms at 50x
+            period_us: 20_000,
         });
         assert!(
             wait_for(|| log.lock().unwrap().len() >= 3, Duration::from_secs(5)),
@@ -3336,8 +3163,7 @@ mod tests {
     #[rstest]
     fn late_wakeups_fire_immediately_in_deadline_order() {
         let _g = lock_clock();
-        virtual_clock::init(1.0, 1_000_000);
-        std::thread::sleep(Duration::from_millis(5)); // let virtual time pass both deadlines
+        virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
 
         let order: Arc<StdMutex<Vec<u32>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -3371,7 +3197,7 @@ mod tests {
     #[rstest]
     fn shutdown_joins_cleanly_with_pending_timers() {
         let _g = lock_clock();
-        virtual_clock::init(1.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let _log = wake_log(&handle, ComponentId(0));
         handle.link().send(Command::ScheduleAt {
@@ -3390,13 +3216,12 @@ mod tests {
 
     /// The timer wheel must not starve under sustained command load: a busy
     /// protocol thread enqueuing drives in a tight loop keeps the channel
-    /// non-empty (enqueuing is far cheaper than the resolution pass each
-    /// `Drive` costs), yet a due wake must still fire — the drain batch is
-    /// bounded ([`COMMAND_DRAIN_BATCH_MAX`]).
+    /// non-empty, yet a due wake must still fire — the engine drains the
+    /// queue completely, then fires timers, every iteration.
     #[rstest]
     fn sustained_drive_flood_does_not_starve_the_timer_wheel() {
         let _g = lock_clock();
-        virtual_clock::init(1.0, 1_000_000);
+        virtual_clock::init(0.0, 1_000_000);
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let handle = EngineHandle::spawn(
@@ -3406,6 +3231,7 @@ mod tests {
             EventLog::disabled(),
             None,
         );
+        handle.release_time();
         let log = wake_log(&handle, ComponentId(0));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -3436,9 +3262,9 @@ mod tests {
 
     /// A reserved-but-never-sent drive seq (the enqueuing thread died
     /// between `next_drive_seq` and the channel send) must not wedge every
-    /// later drive forever: after [`DRIVE_SEQ_STALL_TIMEOUT`] the engine
-    /// reports [`Finding::DriveSeqGap`] naming the missing seq and applies
-    /// the buffered drives.
+    /// later drive forever: after the idle-poll skip the engine reports
+    /// [`Finding::DriveSeqGap`] naming the missing seq and applies the
+    /// buffered drives.
     #[rstest]
     fn missing_drive_seq_is_skipped_after_a_bounded_wait() {
         let mut resolver = Resolver::new(1, Dsu::new(1));

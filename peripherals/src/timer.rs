@@ -1,7 +1,6 @@
 //! Timer — Timing functions backed by VirtualClock.
 //!
-//! Virtual *time* is process-wide (`embsim_core::virtual_clock`: scaled wall
-//! time by default, or engine-stepped under `ClockMode::Stepped`), but the
+//! Virtual *time* is process-wide (`embsim_core::virtual_clock` counter), but the
 //! *clock frequency* used for cycle math is per-MCU: [`get_clock_freq`] and [`get_cycles`] honor the calling
 //! thread's `instance::PeripheralInstance` clock-frequency override, falling
 //! back to the virtual clock's process-wide frequency when unset.
@@ -99,22 +98,13 @@ mod tests {
     fn cycles_grow_with_a_positive_frequency() {
         let _g = crate::test_support::guard();
         crate::test_support::ensure_clock();
-        // With a non-zero freq, cycles is non-decreasing and eventually advances.
         let first = get_cycles();
-        let mut saw_growth = false;
-        let mut last = first;
-        for _ in 0..1000 {
-            let c = get_cycles();
-            assert!(c >= last, "cycles must be non-decreasing");
-            if c > first {
-                saw_growth = true;
-                break;
-            }
-            last = c;
-        }
+        wait_us(1);
+        let after = get_cycles();
+        assert!(after >= first, "cycles must be non-decreasing");
         assert!(
-            saw_growth,
-            "cycles should advance under a positive clock freq"
+            after > first,
+            "cycles should advance after a virtual wait (freq is 180 MHz)"
         );
     }
 

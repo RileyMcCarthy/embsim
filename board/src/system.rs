@@ -609,10 +609,9 @@ impl System {
         }
 
         // The system is assembled. Release the engine's hold on virtual time:
-        // under a **stepped** clock nothing may advance until every component
-        // has registered its schedules, or a second component's period would be
-        // anchored at a different instant from run to run (a no-op in
-        // free-running mode — see `engine::Command::ReleaseTime`).
+        // nothing may advance until every component has registered its
+        // schedules, or a second component's period would be anchored at a
+        // different instant from run to run.
         engine.release_time();
 
         Ok(SystemHandle {

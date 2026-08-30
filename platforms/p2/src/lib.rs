@@ -325,10 +325,8 @@ mod tests {
     fn hal_work_consumes_a_quantum() {
         let _g = guard();
         setup();
-        embsim_core::virtual_clock::init_mode(
-            embsim_core::virtual_clock::ClockMode::Stepped,
-            P2_CLOCK_FREQ,
-        );
+        embsim_core::virtual_clock::init(0.0, P2_CLOCK_FREQ);
+        let _auth = embsim_core::virtual_clock::take_time_authority();
         let q = embsim_core::virtual_clock::DEFAULT_QUANTUM_US;
         let actor = std::thread::spawn(move || {
             let _actor = embsim_core::virtual_clock::register_actor("hal-spinner");
@@ -355,8 +353,8 @@ mod tests {
         embsim_core::virtual_clock::advance_to(q).expect("step to the park");
         actor.join().expect("cog resumes");
         assert_eq!(embsim_core::virtual_clock::virtual_us(), q);
-        // Restore free-running so sibling tests keep the crate's pinned clock.
-        embsim_core::virtual_clock::init(1.0, P2_CLOCK_FREQ);
+        drop(_auth);
+        embsim_core::virtual_clock::init(0.0, P2_CLOCK_FREQ);
     }
 
     // ── System trampolines ──

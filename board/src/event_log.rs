@@ -381,9 +381,8 @@ impl EventLog {
             return;
         };
         let event = event();
-        // Reading virtual time must never panic the engine thread: before
-        // `virtual_clock::init` there is no origin, and a timer-free system
-        // legitimately never initializes one (`EngineCore::next_wall_wait_us`).
+        // Reading virtual time must never panic the engine thread: a
+        // timer-free system may never call `virtual_clock::init`.
         let v_us = if virtual_clock::is_initialized() {
             virtual_clock::virtual_us()
         } else {

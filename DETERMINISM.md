@@ -2,16 +2,20 @@
 
 **Status:** **Phases D0 and D1 implemented.** D0 was hygiene (hash-order fix,
 the `wait_*` chokepoint, the engine event log, the review rule). **D1 is T1 for
-the board and models**: a stepped clock mode in `embsim-core`, the engine as the
-time authority, an actor registry with a quiescence barrier, and the reference
-model component moved onto engine wakeups. A stepped run's engine event log —
-event order **and every virtual timestamp** — is now identical across runs, across
-processes, and against blessed golden traces, and CI gates it. D2 (firmware byte
-I/O) and D3 (T2) remain design only. Companion to
-[`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
+the board and models**: the engine as the time authority, an actor registry with
+a quiescence barrier, and the reference model component moved onto engine
+wakeups. A run's engine event log — event order **and every virtual timestamp**
+— is identical across runs, across processes, and against blessed golden traces,
+and CI gates it. D2 (firmware byte I/O) and D3 (T2) remain design only.
+Companion to [`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
 [`CONTRACT.md`](CONTRACT.md) ("Waiting"). What each phase shipped, and the
 predictions in this document they corrected, are in
 [Recommendation and phasing](#recommendation-and-phasing).
+
+**One-counter clock.** There is no Instant-based free-running mode.
+`virtual_us` is always the counter; `ClockMode::FreeRunning` vs `Stepped` is
+only wall pacing after `advance_to` (`speed > 0` sleeps the host, `speed <= 0`
+is instant). The T0 "sampled timestamps" baseline below is historical.
 
 The requirement this document answers is a consumer's, stated plainly: *"once
 it's all connected the SIL model runs deterministically."* Today it does not,
@@ -84,10 +88,11 @@ is real, but it is not the class of bug this machine's SIL suite is hunting.
   simultaneous and late deadlines fire in schedule order.
 - **Per-producer stream FIFO.** `Command::StreamWrite` carries no seq because
   the channel's own order *is* the wire contract per producer.
-- **The MNA solve** (`board/src/cluster.rs`, `QuasiStaticMna::solve`) is
-  deterministic given identical inputs *in identical order* — dense Gaussian
-  elimination with partial pivoting over `Vec`s, no hashing on the numeric
-  path.
+- **The analog solve** (`board/src/cluster.rs`, `Spice::solve`) is
+  deterministic given identical inputs *in identical order* — the deck is
+  stamped from dense `Vec`s and ngspice `.op` on a linear network does not
+  hash. Last-bit float differences across ngspice builds are tolerated in
+  analog oracles (µV), not bit-compared.
 
 ### One real hash-order defect, worth fixing regardless of tier
 
@@ -104,8 +109,8 @@ for slots in net_drivers.values() {          // <-- HashMap iteration
         cluster_sources.entry(cluster_of[net]).or_default().push(ClusterSource { .. });
 ```
 
-That `Vec` order reaches `QuasiStaticMna::solve`, where it becomes the
-accumulation order of `matrix[c][c] += g` and `rhs[c] += i`. Rust's default
+That `Vec` order reaches `Spice::solve`, where it becomes the SPICE card
+order. Rust's default
 hasher is **randomly seeded per process**, so a cluster with two or more driver
 sources can produce last-bit-different node voltages from one process to the
 next — published as `NetState::Analog(volts)`, delivered to senses, and
