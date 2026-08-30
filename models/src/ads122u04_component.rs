@@ -390,7 +390,6 @@ impl Component for Ads122u04Component {
             let fd = Arc::clone(&self.firmware_fd);
             let gate = Arc::clone(&self.gate);
             let uart = Arc::clone(&uart);
-            let io_wake = io.clone();
             io.on_wake_ns(move |now_ns| {
                 let out = drain_model_output(&fd, &gate);
                 if !out.is_empty() {
@@ -398,11 +397,8 @@ impl Component for Ads122u04Component {
                 }
                 // One handler for both directions: it clocks the next TX bit
                 // and closes any RX frame whose tail carried no transition.
-                let (frames, next) = uart.service(now_ns);
-                deliver_rx(&fd, &gate, frames);
-                if let Some(at) = next {
-                    io_wake.schedule_at_ns(at);
-                }
+                // The bridge arms its own next wake.
+                deliver_rx(&fd, &gate, uart.service(now_ns));
             });
         }
         // A periodic wheel entry rather than a thread: idle components cost

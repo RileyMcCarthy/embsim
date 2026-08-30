@@ -193,14 +193,21 @@ fn state_of(system: &BuiltSystem, net: &str) -> NetState {
 // The build itself
 // ============================================================
 
-/// The whole machine builds, and nothing contends or mis-routes.
+/// The whole machine builds, and nothing fights over a net.
 ///
 /// ~313 netlist components across three boards, four harnesses, four bench
 /// components, and one scenario. Every registered component's pin facade was
 /// validated against its netlist in both directions to get here, so a
 /// classification or facade regression anywhere fails this first.
+///
+/// This used to also assert no `StreamMismatch`. It no longer can: the
+/// assembled machine declares no `StreamRole` anywhere now that the force-gauge
+/// UART is carried as levels, so that finding is unreachable and asserting its
+/// absence would be a guard that can never fail. The link's health is asserted
+/// where it is now observable — the two UART nets resolve to a level rather
+/// than floating or contending, below.
 #[rstest]
-fn the_whole_machine_builds_without_contention_or_stream_mismatch() {
+fn the_whole_machine_builds_without_contention() {
     let system = build_machine();
     let findings = system.diagnostics().findings();
 
@@ -211,14 +218,6 @@ fn the_whole_machine_builds_without_contention_or_stream_mismatch() {
     assert!(
         contention.is_empty(),
         "no two parts may fight over a net; got {contention:?}"
-    );
-    let mismatched: Vec<&Finding> = findings
-        .iter()
-        .filter(|f| matches!(f, Finding::StreamMismatch { .. }))
-        .collect();
-    assert!(
-        mismatched.is_empty(),
-        "every serial route must have one producer per link; got {mismatched:?}"
     );
 }
 
@@ -456,15 +455,25 @@ fn the_force_path_carries_a_command_and_a_conversion_end_to_end() {
 
     let system: SystemHandle = machine_system().start().expect("the machine starts");
 
-    // No routing complaint anywhere in the assembled system.
-    assert!(
-        !system
-            .findings()
-            .iter()
-            .any(|f| matches!(f, Finding::StreamMismatch { .. })),
-        "the machine's serial links must route cleanly; got {:?}",
-        system.findings()
-    );
+    // The link is closed end to end: both UART nets carry a level, not a
+    // float and not a fight. This is what "routes cleanly" means once the
+    // payload is on the net — there is no route to complain about any more,
+    // only a wire that either reaches the other end or does not.
+    for net in [
+        "EdgeBoard.P2",
+        "EdgeBoard./MaD_Edge_Sheet2/IFG_TX",
+        "DS2Addon.Net-(U1-RX)",
+        "DS2Addon.Net-(U1-TX)",
+    ] {
+        let state = system.net_state(net);
+        assert!(
+            matches!(
+                state,
+                Some(NetState::Driven(_) | NetState::Pulled(_, _) | NetState::Analog(_))
+            ),
+            "{net} must carry a level for a byte to cross it; got {state:?}"
+        );
+    }
 
     // SYNC + RDATA (0x55 0x10 — TI SBAS752B §8.5.3.4), written the way the
     // firmware writes it.

@@ -145,13 +145,9 @@ impl Component for UartProbe {
         }
         {
             let handle = self.handle.clone();
-            let io_wake = io.clone();
             io.on_wake_ns(move |now_ns| {
-                let (frames, next) = bridge.service(now_ns);
+                let frames = bridge.service(now_ns);
                 handle.lock().frames.extend(frames);
-                if let Some(at) = next {
-                    io_wake.schedule_at_ns(at);
-                }
             });
         }
         Ok(())

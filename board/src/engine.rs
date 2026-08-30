@@ -719,7 +719,14 @@ impl Resolver {
             }
             cluster_sourced.insert(c);
         }
-        for (net, _volts) in &self.stuck_sources {
+        for (net, volts) in &self.stuck_sources {
+            // An injected `net_stuck` is an *ideal* source, so it counts for
+            // the level heuristic exactly like a rail. Leaving it out let a
+            // 25 Ω driver behind kilohms of series resistance out-vote a 0 Ω
+            // short — the opposite of what fault injection is for.
+            if !volts.is_nan() {
+                cluster_power.entry(cluster_of[*net]).or_insert(*volts);
+            }
             cluster_sourced.insert(cluster_of[*net]);
         }
 
@@ -1333,6 +1340,21 @@ fn same_state(a: &NetState, b: &NetState) -> bool {
 /// real resistance are what the escalated cluster solver exists to arbitrate.
 /// This arm only runs when neither applied, so the honest answer is "no single
 /// level", and the caller's fallback stands.
+///
+/// # What this is not
+///
+/// It is **distance-blind**, like the `Pulled` projection it feeds: every
+/// driver in the conduction cluster votes equally, however much resistance
+/// lies between it and the net being projected. And it is consulted only when
+/// the cluster has no ideal source at all — a cluster that also touches a rail
+/// or an injected fault takes that source's level regardless of what any
+/// driver is doing.
+///
+/// Both are properties of the coarse `Pulled` path, not of this function: that
+/// path reports the *sum* of the cluster's edge resistances as an upper bound
+/// and makes no attempt at a divider. A cluster where the answer genuinely
+/// depends on the ratio is one the impedance-escalation rule should hand to
+/// [`QuasiStaticMna`], and this arm never runs for it.
 fn cluster_driver_level(
     slots: &[DriveSlot],
     cluster_of: &[usize],
@@ -1355,6 +1377,8 @@ fn cluster_driver_level(
     level.unwrap_or(fallback)
 }
 
+/// Digital projection of a source voltage (NaN — an unmodeled rail — never
+/// reaches this: callers skip NaN sources).
 fn level_of_volts(volts: Volts) -> Level {
     if volts >= DIGITAL_LEVEL_THRESHOLD_VOLTS {
         Level::High
@@ -2233,8 +2257,19 @@ impl EngineCore {
         // a few instructions wide. Hold time rather than step over a deadline
         // that is already on its way; that is how a whole UART byte ends up on
         // the wire at a single instant.
+        //
+        // Wait for it rather than spinning: the enqueuer is between its
+        // increment and its `send`, so blocking on the control queue is
+        // exactly the right thing to block on.
         if self.pending_schedules.load(Ordering::Acquire) > 0 {
-            return false;
+            return match control_rx.recv_timeout(STEPPED_IDLE_POLL) {
+                Ok(command) => {
+                    self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                    self.handle(command)
+                }
+                Err(RecvTimeoutError::Timeout) => false,
+                Err(RecvTimeoutError::Disconnected) => true,
+            };
         }
         let now = virtual_clock::virtual_ns();
         let next = match (self.clock_released, self.next_virtual_deadline()) {
@@ -2258,8 +2293,18 @@ impl EngineCore {
             Some(_) => false,
             None => {
                 self.warn_on_stepped_drive_gap();
-                // Poll rather than block: the control queue must be noticed
-                // too, and it has no combined-wait primitive here.
+                // Two queues, no combined wait: block on the data queue for a
+                // short poll, but take a control command first if one is
+                // already there. A control command that arrives mid-park waits
+                // out at most one `STEPPED_IDLE_POLL`, which is the same
+                // latency the data queue has always had while idle.
+                let (control, stop) = self.drain_control(control_rx);
+                if stop {
+                    return true;
+                }
+                if control > 0 {
+                    return false;
+                }
                 match rx.recv_timeout(STEPPED_IDLE_POLL) {
                     Ok(command) => self.handle(command),
                     Err(RecvTimeoutError::Timeout) => false,
@@ -3184,6 +3229,73 @@ mod tests {
             net_table[1].state,
             NetState::Pulled(expect, 47.0),
             "the far side of a series resistor must follow the driver"
+        );
+    }
+
+    #[rstest]
+    #[case::pullup_3v3(3.3, low(), "driver Low, 10k pull-up to 3.3")]
+    #[case::pulldown_gnd(0.0, high(), "driver High, 10k pull-down to GND")]
+    fn zz_probe_rail_vs_driver(
+        #[case] rail: f64,
+        #[case] drive: TheveninDrive,
+        #[case] label: &str,
+    ) {
+        // driver(net0) —47— mid(net1) —10k— rail(net2)
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        let endpoint = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
+        resolver.add_edge(0, 1, 47.0);
+        resolver.add_edge(1, 2, 10_000.0);
+        resolver.add_power_source(2, rail);
+        resolver.add_digital_sense(1);
+        resolver.set_drive(endpoint, Some(drive));
+
+        let mut net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        eprintln!(
+            "PROBE[{label}]: n0={:?} n1={:?} n2={:?} findings={}",
+            net_table[0].state,
+            net_table[1].state,
+            net_table[2].state,
+            diags.findings().len()
+        );
+    }
+
+    /// An injected `net_stuck` fault is an **ideal** source, so it beats a
+    /// driver reached through resistance — the same way a declared rail does.
+    ///
+    /// `cluster_sourced` absorbed stuck faults but threw their voltage away,
+    /// so once the projection learned to fall back to the cluster's drivers, a
+    /// 25 Ω driver behind kilohms of series resistance could out-vote a 0 Ω
+    /// short. Fault injection exists to be observable; losing to a driver is
+    /// the opposite.
+    #[rstest]
+    fn an_injected_short_outvotes_a_driver_reached_through_resistance() {
+        // stuck(3.3 V) —47 Ω— mid —10 kΩ— driver(Low, 25 Ω)
+        let build = |stuck: bool| {
+            let mut resolver = Resolver::new(3, Dsu::new(3));
+            let endpoint = resolver.add_endpoint(2, PinRef::new("U1", "1"), None);
+            resolver.add_edge(0, 1, 47.0);
+            resolver.add_edge(1, 2, 10_000.0);
+            resolver.set_drive(endpoint, Some(low()));
+            if stuck {
+                resolver.add_stuck_source(0, 3.3);
+            }
+            let mut net_table = nets(3);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            net_table[1].state
+        };
+
+        assert!(
+            matches!(build(false), NetState::Pulled(Level::Low, _)),
+            "with no fault the driver is the only source; got {:?}",
+            build(false)
+        );
+        assert!(
+            matches!(build(true), NetState::Pulled(Level::High, _)),
+            "a 0 ohm short must win over a driver behind 10 kohm; got {:?}",
+            build(true)
         );
     }
 

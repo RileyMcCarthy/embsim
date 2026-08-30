@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use embsim_board::event_log::EngineEvent;
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::uart::{FramingError, UartDecoder, UartEncoder, UartFraming};
 use embsim_board::{
@@ -29,6 +30,9 @@ use embsim_board::{
 };
 use embsim_core::virtual_clock;
 use embsim_peripherals::serial;
+
+mod uart_probe;
+use uart_probe::{ProbeHandle, UartProbe};
 
 /// The reference consumer's force-gauge channel: RX on P0, TX on P2,
 /// 115.2 kbaud.
@@ -402,6 +406,67 @@ fn start_system(peer: &Peer, peer_netlist: &str) -> SystemHandle {
         .expect("live system starts")
 }
 
+/// Two [`UartProbe`]s wired TX↔RX through a harness, each on its own board.
+///
+/// Deliberately the *shared* bridge on both ends: this is a cost test, and
+/// what it measures is how many wheel entries one duplex exchange creates.
+fn start_probe_pair(a: &ProbeHandle, b: &ProbeHandle) -> SystemHandle {
+    let framing = UartFraming::new_8n1(FG.baud);
+    let mut registry = PartRegistry::new();
+    {
+        let a = a.clone();
+        registry.register("PEER_UART", move |_decl| {
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                framing,
+                a.clone(),
+            ))
+        });
+    }
+    let board_a = Board::from_netlist(
+        embsim_board::netlist::parse(PEER_NETLIST).expect("peer netlist parses"),
+        &registry,
+    )
+    .expect("board A builds");
+
+    let mut registry_b = PartRegistry::new();
+    {
+        let b = b.clone();
+        registry_b.register("PEER_UART", move |_decl| {
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                framing,
+                b.clone(),
+            ))
+        });
+    }
+    let board_b = Board::from_netlist(
+        embsim_board::netlist::parse(PEER_NETLIST).expect("peer netlist parses"),
+        &registry_b,
+    )
+    .expect("board B builds");
+
+    System::new()
+        .board("A", board_a)
+        .board("B", board_b)
+        .harness(
+            Harness::new()
+                .connect_str("A.J1.1", "B.J1.2")
+                .expect("endpoints parse")
+                .connect_str("B.J1.1", "A.J1.2")
+                .expect("endpoints parse"),
+        )
+        .event_log()
+        .start()
+        .expect("probe pair starts")
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -530,6 +595,60 @@ fn a_peer_waveform_is_readable_as_a_firmware_byte() {
 
     drop(system);
     serial::reset();
+}
+
+/// Duplex traffic must cost a **linear** number of engine wakes.
+///
+/// Both directions arm the wheel and both re-arm from the same handler, and
+/// [`UartDecoder::frame_deadline_ns`] is the same absolute instant for every
+/// transition inside a frame — so an un-deduplicated bridge pushes one wheel
+/// entry per *edge* received, and while the other direction is busy none of
+/// them retire: each duplicate fires, computes the same next instant, and
+/// re-arms. Measured before the fix, a duplex burst cost 4x the wakes for 2x
+/// the payload, and the engine stopped making progress well before a
+/// kilobyte.
+///
+/// Half-duplex bursts with idle gaps — which is every other test here — hide
+/// it completely, because an idle direction's `service` returns nothing to
+/// arm and the duplicates drain away.
+#[rstest]
+fn duplex_traffic_costs_a_linear_number_of_wakes() {
+    let _g = lock_clock();
+    virtual_clock::init(0.0, 1_000_000);
+
+    let wakes = |payload: usize| -> usize {
+        let (a, b) = (ProbeHandle::new(), ProbeHandle::new());
+        let system = start_probe_pair(&a, &b);
+        let bytes: Vec<u8> = (0..payload).map(|i| i as u8).collect();
+        a.send(&bytes);
+        b.send(&bytes);
+        assert!(
+            wait_for(
+                || a.received().len() >= payload && b.received().len() >= payload,
+                Duration::from_secs(20)
+            ),
+            "both directions must complete; a={} b={}",
+            a.received().len(),
+            b.received().len()
+        );
+        let count = system
+            .event_log()
+            .records()
+            .iter()
+            .filter(|r| matches!(r.event, EngineEvent::Wake { .. }))
+            .count();
+        drop(system);
+        count
+    };
+
+    let small = wakes(8);
+    let large = wakes(16);
+    assert!(
+        large < small * 3,
+        "doubling a duplex payload must not multiply the wake count: \
+         8 bytes cost {small} wakes, 16 bytes cost {large} \
+         (quadratic growth is ~4x, linear is ~2x)"
+    );
 }
 
 /// The point of the whole exercise: a second driver on the wire **breaks the

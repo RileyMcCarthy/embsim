@@ -1194,17 +1194,15 @@ impl Component for McuComponent {
         if !level_channels.is_empty() {
             let channels = Arc::new(level_channels);
             let shutdown = Arc::clone(&self.shutdown);
-            let scheduler = io.clone();
             io.on_wake_ns(move |now_ns| {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 for channel in channels.iter() {
-                    let (bytes, next) = channel.level.service(now_ns);
+                    // Each bridge arms its own next wake, so N channels cost N
+                    // wheel entries only when N channels actually have work.
+                    let bytes = channel.level.service(now_ns);
                     deliver_rx(channel.component_fd, channel.channel, bytes);
-                    if let Some(at) = next {
-                        scheduler.schedule_at_ns(at);
-                    }
                 }
             });
         }

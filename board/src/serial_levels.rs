@@ -99,6 +99,17 @@ pub struct SerialLevelBridge {
     rx: Mutex<UartDecoder>,
     /// Scheduling handle; both directions arm wakes through it.
     io: ComponentNetIo,
+    /// The instant this bridge has already asked to be woken at.
+    ///
+    /// Both directions arm, and both re-arm from the same handler, so without
+    /// this they pile duplicates onto the wheel. One received byte alone would
+    /// push one entry per *edge*: [`UartDecoder::frame_deadline_ns`] is the
+    /// same absolute instant for every transition inside a frame, and the
+    /// engine's wheel does not deduplicate. While the other direction is busy
+    /// none of them retire — every duplicate fires, computes the same next
+    /// instant, and re-arms — so a duplex burst grows its own wake count
+    /// quadratically and the engine stops making progress.
+    armed_ns: Mutex<Option<u64>>,
     /// Whether the output driver is powered. Cleared, the pin goes high-Z.
     output_enabled: AtomicBool,
     shutdown: Arc<AtomicBool>,
@@ -123,6 +134,7 @@ impl SerialLevelBridge {
             tx: Mutex::new(TxState::default()),
             rx: Mutex::new(UartDecoder::new(framing)),
             io,
+            armed_ns: Mutex::new(None),
             output_enabled: AtomicBool::new(true),
             shutdown,
         }
@@ -131,6 +143,21 @@ impl SerialLevelBridge {
     /// The framing this bridge encodes and decodes with.
     pub fn framing(&self) -> UartFraming {
         self.framing
+    }
+
+    /// Ask to be woken at `at_ns`, at most once per instant.
+    ///
+    /// Only an *exact* repeat is dropped, so no distinct deadline is ever
+    /// skipped — see [`Self::armed_ns`] for what the repeats cost.
+    fn arm(&self, at_ns: u64) {
+        {
+            let mut armed = self.armed_ns.lock().expect("arm state never poisoned");
+            if *armed == Some(at_ns) {
+                return;
+            }
+            *armed = Some(at_ns);
+        }
+        self.io.schedule_at_ns(at_ns);
     }
 
     /// Hold the line at its idle level.
@@ -193,7 +220,7 @@ impl SerialLevelBridge {
             (bytes.len() - accepted, idle && accepted > 0)
         };
         if kick {
-            self.io.schedule_at_ns(virtual_clock::virtual_ns());
+            self.arm(virtual_clock::virtual_ns());
         }
         shed
     }
@@ -215,14 +242,28 @@ impl SerialLevelBridge {
         let deadline = rx.frame_deadline_ns();
         drop(rx);
         if let Some(at) = deadline {
-            self.io.schedule_at_ns(at);
+            self.arm(at);
         }
         out
     }
 
-    /// Service both directions at `now_ns` (engine thread, on wake). Returns
-    /// the bytes decoded and the next instant this bridge needs a wake at.
-    pub fn service(&self, now_ns: u64) -> (Vec<Result<u8, FramingError>>, Option<u64>) {
+    /// Service both directions at `now_ns` (engine thread, on wake), returning
+    /// whatever the receiver decoded.
+    ///
+    /// The bridge arms its own next wake — the owner does not, and must not.
+    /// A second arm site is a second source of duplicate wheel entries, and
+    /// duplicates do not retire while either direction is busy: each one
+    /// fires, computes the same next instant, and re-arms. That is quadratic
+    /// in the length of a duplex burst.
+    pub fn service(&self, now_ns: u64) -> Vec<Result<u8, FramingError>> {
+        // The wake this call is servicing has been delivered, so the slot is
+        // free for whatever the two directions ask for next.
+        {
+            let mut armed = self.armed_ns.lock().expect("arm state never poisoned");
+            if armed.is_some_and(|at| at <= now_ns) {
+                *armed = None;
+            }
+        }
         let tx_next = self.service_tx(now_ns);
         let mut rx = self.rx.lock().expect("rx state never poisoned");
         let bytes = drain(&mut rx, now_ns);
@@ -232,7 +273,10 @@ impl SerialLevelBridge {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        (bytes, next)
+        if let Some(at) = next {
+            self.arm(at);
+        }
+        bytes
     }
 
     /// Drive whatever bit is due at `now_ns`; returns the next edge instant.
