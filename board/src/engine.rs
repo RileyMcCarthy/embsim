@@ -97,7 +97,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -333,9 +333,37 @@ pub(crate) type IdleDriveLog = Arc<Mutex<Vec<(EndpointId, Option<TheveninDrive>)
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EngineLink {
     /// Command queue into the engine thread; `None` on the inert build path.
+    ///
+    /// The **data plane**: drives, stream writes, registrations. Its drain is
+    /// capped ([`COMMAND_DRAIN_BATCH_MAX`]) so a flood cannot starve the wheel.
     pub(crate) tx: Option<Sender<Command>>,
+    /// The **control plane**: requests that create a deadline
+    /// ([`Command::ScheduleAt`], [`Command::ScheduleEvery`]) and the wake
+    /// registration they depend on.
+    ///
+    /// Separate because the two need opposite treatment. A drive may wait —
+    /// deferring it costs nothing but latency. A scheduling request may not:
+    /// until the engine handles it, the wheel does not know about the deadline
+    /// and virtual time can step straight over it. Sharing one queue means the
+    /// capped drain can strand a schedule behind a drive flood, and raising the
+    /// cap to reach it just re-creates the starvation the cap prevents. So the
+    /// control plane gets its own queue and is drained **in full** every pass;
+    /// only the data plane is capped.
+    pub(crate) control_tx: Option<Sender<Command>>,
     /// Global drive enqueue sequence, shared by every clone of this link.
     pub(crate) drive_seq: Arc<AtomicU64>,
+    /// Scheduling requests sent but not yet handled by the engine.
+    ///
+    /// Virtual time may not advance while this is non-zero: a `ScheduleAt`
+    /// still in the queue is a deadline the engine cannot see, and advancing
+    /// past it delivers the wake late. That is invisible for a component whose
+    /// events are milliseconds apart and fatal for one clocking a UART bit
+    /// every 8.68 µs — the whole byte then lands at a single instant.
+    ///
+    /// Only *scheduling* is counted. Drives may pile up as deep as they like
+    /// without holding time back, which is what keeps the
+    /// [`COMMAND_DRAIN_BATCH_MAX`] anti-starvation cap doing its job.
+    pub(crate) pending_schedules: Arc<AtomicUsize>,
     /// Engine-published resolved state per net (build snapshot when inert).
     pub(crate) states: Arc<Mutex<Vec<NetState>>>,
     /// Inert path only: drives issued during attach, in issue order, for the
@@ -349,9 +377,35 @@ impl EngineLink {
     pub(crate) fn inert(states: Arc<Mutex<Vec<NetState>>>, recorded_drives: IdleDriveLog) -> Self {
         Self {
             tx: None,
+            control_tx: None,
             drive_seq: Arc::new(AtomicU64::new(0)),
+            pending_schedules: Arc::new(AtomicUsize::new(0)),
             states,
             recorded_drives: Some(recorded_drives),
+        }
+    }
+
+    /// Send a control-plane command: one that creates or depends on a
+    /// deadline. Counted in flight from before the send until the engine
+    /// handles it, so virtual time cannot step over a deadline that has been
+    /// requested but not yet armed — a window that is nanoseconds wide from
+    /// the engine's own callbacks and a thread hop wide from anywhere else.
+    pub(crate) fn send_control(&self, command: Command) -> bool {
+        self.pending_schedules.fetch_add(1, Ordering::AcqRel);
+        match &self.control_tx {
+            Some(tx) => {
+                if tx.send(command).is_err() {
+                    self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                    tracing::debug!("net engine has shut down; control command dropped");
+                    return false;
+                }
+                true
+            }
+            None => {
+                self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                tracing::debug!("inert link; control command dropped");
+                false
+            }
         }
     }
 
@@ -973,9 +1027,15 @@ impl Resolver {
                     .filter(|(a, b, _)| cluster_of[*a] == cluster || cluster_of[*b] == cluster)
                     .map(|(_, _, ohms)| ohms)
                     .sum();
+                // "Toward the cluster's source" includes a *driver*, not only a
+                // declared rail. Defaulting to High whenever no rail was
+                // declared makes a driven signal stop arriving the moment it
+                // crosses a series resistor — invisible while bytes bypassed
+                // the net, and fatal once a UART's bits have to get through an
+                // ESD resistor to reach the part on the other side.
                 let level = match cluster_power.get(&cluster) {
-                    Some(v) if *v < DIGITAL_LEVEL_THRESHOLD_VOLTS => Level::Low,
-                    _ => Level::High,
+                    Some(v) => level_of_volts(*v),
+                    None => cluster_driver_level(&self.slots, &cluster_of, cluster, Level::High),
                 };
                 NetState::Pulled(level, total)
             } else {
@@ -1265,6 +1325,36 @@ fn same_state(a: &NetState, b: &NetState) -> bool {
 
 /// Digital projection of a source voltage (NaN — an unmodeled rail — never
 /// reaches this: callers skip NaN sources).
+/// The level every driver in a conduction cluster agrees on, or `fallback`
+/// when the cluster has no drivers or its drivers disagree.
+///
+/// Disagreement is deliberately *not* reported as contention here: drivers on
+/// one identity root are already checked for that, and drivers separated by
+/// real resistance are what the escalated cluster solver exists to arbitrate.
+/// This arm only runs when neither applied, so the honest answer is "no single
+/// level", and the caller's fallback stands.
+fn cluster_driver_level(
+    slots: &[DriveSlot],
+    cluster_of: &[usize],
+    cluster: usize,
+    fallback: Level,
+) -> Level {
+    let mut level: Option<Level> = None;
+    for slot in slots {
+        let Some(drive) = slot.drive else { continue };
+        if cluster_of[slot.net] != cluster {
+            continue;
+        }
+        let this = level_of_volts(drive.volts);
+        match level {
+            None => level = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return fallback, // drivers disagree
+        }
+    }
+    level.unwrap_or(fallback)
+}
+
 fn level_of_volts(volts: Volts) -> Level {
     if volts >= DIGITAL_LEVEL_THRESHOLD_VOLTS {
         Level::High
@@ -1446,6 +1536,10 @@ struct EngineCore {
     /// at its initial value until it does, so every component's first schedule
     /// is anchored at the same instant.
     clock_released: bool,
+    /// Scheduling requests sent but not yet handled — see
+    /// [`EngineLink::pending_schedules`]. Time does not advance while it is
+    /// non-zero.
+    pending_schedules: Arc<AtomicUsize>,
     /// Stepped mode: reported [`Finding::QuiescenceTimeout`] already? The
     /// finding is deduped on the cumulative bus anyway; this keeps the engine
     /// from re-waiting the full timeout on every iteration once an actor is
@@ -2038,10 +2132,30 @@ impl EngineCore {
     /// Engine thread body. Virtual time is a counter; this loop is the time
     /// authority. `--speed` only paces the host after
     /// [`embsim_core::virtual_clock::advance_to`].
-    fn run(mut self, rx: Receiver<Command>) {
+    fn run(mut self, rx: Receiver<Command>, control_rx: Receiver<Command>) {
         loop {
-            if self.run_stepped_iteration(&rx) {
+            if self.run_stepped_iteration(&rx, &control_rx) {
                 break;
+            }
+        }
+    }
+
+    /// Handle every control-plane command waiting, with no cap: a deadline the
+    /// engine has not armed is one it can step over. Returns the number
+    /// handled, and `true` on shutdown.
+    fn drain_control(&mut self, control_rx: &Receiver<Command>) -> (usize, bool) {
+        let mut handled = 0usize;
+        loop {
+            match control_rx.try_recv() {
+                Ok(command) => {
+                    handled += 1;
+                    self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                    if self.handle(command) {
+                        return (handled, true);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return (handled, false),
+                Err(mpsc::TryRecvError::Disconnected) => return (handled, true),
             }
         }
     }
@@ -2051,9 +2165,11 @@ impl EngineCore {
     ///
     /// 1. **Quiesce.** Wait for every registered actor to park. Only then is
     ///    the set of pending work stable enough to reason about.
-    /// 2. **Drain the command queue**, at most [`COMMAND_DRAIN_BATCH_MAX`]
-    ///    per pass. A live flood can keep the queue non-empty forever; the
-    ///    cap lets a future wheel deadline still jump.
+    /// 2. **Drain the control queue in full**, then the data queue, at most
+    ///    [`COMMAND_DRAIN_BATCH_MAX`] per pass. A live flood can keep the data
+    ///    queue non-empty forever; the cap lets a future wheel deadline still
+    ///    jump. Scheduling is never capped — see
+    ///    [`EngineLink::control_tx`] for why the two planes are separate.
     /// 3. **Fire every wheel entry due at `now`**, in `(deadline, seq)` order.
     /// 4. Loop 1–3 to a fixpoint, or break after a full batch when the next
     ///    deadline is in the future so time can move.
@@ -2067,11 +2183,20 @@ impl EngineCore {
     /// next park first, then the engine drains and fires. What is *not* fixed
     /// is the interleaving of two actors released at the same instant — they
     /// race `next_drive_seq`, exactly as `DETERMINISM.md` says T1 does not fix.
-    fn run_stepped_iteration(&mut self, rx: &Receiver<Command>) -> bool {
+    fn run_stepped_iteration(
+        &mut self,
+        rx: &Receiver<Command>,
+        control_rx: &Receiver<Command>,
+    ) -> bool {
         loop {
             self.await_actor_quiescence();
             let mut work = 0usize;
             let mut drained = 0usize;
+            let (control, stop) = self.drain_control(control_rx);
+            if stop {
+                return true;
+            }
+            work += control;
             loop {
                 if drained >= COMMAND_DRAIN_BATCH_MAX {
                     break;
@@ -2103,6 +2228,14 @@ impl EngineCore {
             }
         }
 
+        // The control queue is drained in full above, so anything still
+        // counted here is a request whose send has not landed yet — a window
+        // a few instructions wide. Hold time rather than step over a deadline
+        // that is already on its way; that is how a whole UART byte ends up on
+        // the wire at a single instant.
+        if self.pending_schedules.load(Ordering::Acquire) > 0 {
+            return false;
+        }
         let now = virtual_clock::virtual_ns();
         let next = match (self.clock_released, self.next_virtual_deadline()) {
             // Time is held until the system has finished assembling.
@@ -2125,6 +2258,8 @@ impl EngineCore {
             Some(_) => false,
             None => {
                 self.warn_on_stepped_drive_gap();
+                // Poll rather than block: the control queue must be noticed
+                // too, and it has no combined-wait primitive here.
                 match rx.recv_timeout(STEPPED_IDLE_POLL) {
                     Ok(command) => self.handle(command),
                     Err(RecvTimeoutError::Timeout) => false,
@@ -2250,7 +2385,9 @@ impl EngineHandle {
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
         let diagnostics = Arc::new(Mutex::new(Diagnostics::new()));
+        let pending_schedules: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel();
 
         // Scenario byte-loss state, keyed by endpoint (last policy wins).
         let drop_state: HashMap<usize, DropState> = resolver
@@ -2288,6 +2425,7 @@ impl EngineHandle {
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
             clock_released: false,
+            pending_schedules: Arc::clone(&pending_schedules),
             quiescence_stalled: false,
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
             stepped_gap_logged: None,
@@ -2303,13 +2441,15 @@ impl EngineHandle {
 
         let join = std::thread::Builder::new()
             .name("embsim-board-net-engine".to_string())
-            .spawn(move || core.run(rx))
+            .spawn(move || core.run(rx, control_rx))
             .expect("failed to spawn the net-engine thread");
 
         Self {
             link: EngineLink {
                 tx: Some(tx),
+                control_tx: Some(control_tx),
                 drive_seq: Arc::new(AtomicU64::new(0)),
+                pending_schedules,
                 states,
                 // Live path: drives go to the engine, never to a log.
                 recorded_drives: None,
@@ -3013,6 +3153,40 @@ mod tests {
         }
     }
 
+    /// A net reached only through a series resistor carries the **driver's**
+    /// level, not a default.
+    ///
+    /// The projection used to take its level from the cluster's *power* source
+    /// alone, so a cluster fed by a signal driver — which has none — read
+    /// `Pulled(High)` whichever way the driver was pointing. Nothing noticed
+    /// while UART bytes were routed around the resolution entirely; the moment
+    /// a UART's *bits* had to cross the DS2Addon's 47 ohm series resistors to
+    /// reach the ADC, every frame arrived as 0xFF.
+    #[rstest]
+    #[case::low(low(), Level::Low)]
+    #[case::high(high(), Level::High)]
+    fn a_driven_level_crosses_a_series_resistor(
+        #[case] drive: TheveninDrive,
+        #[case] expect: Level,
+    ) {
+        // driver —47 ohm— far
+        let mut resolver = Resolver::new(2, Dsu::new(2));
+        let endpoint = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
+        resolver.add_edge(0, 1, 47.0);
+        resolver.set_drive(endpoint, Some(drive));
+
+        let mut net_table = nets(2);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+
+        assert_eq!(net_table[0].state, NetState::Driven(expect));
+        assert_eq!(
+            net_table[1].state,
+            NetState::Pulled(expect, 47.0),
+            "the far side of a series resistor must follow the driver"
+        );
+    }
+
     /// A `net_stuck` fault fighting a power rail on the SAME root is two
     /// disagreeing ideal sources: the root projects Contention with a
     /// finding — never a silent first-source-wins `Analog(3.3)` (fault
@@ -3113,7 +3287,7 @@ mod tests {
     fn wake_log(handle: &EngineHandle, component: ComponentId) -> Arc<StdMutex<Vec<u64>>> {
         let log: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&log);
-        handle.link().send(Command::RegisterWake {
+        handle.link().send_control(Command::RegisterWake {
             component,
             callback: Box::new(move |now_ns| sink.lock().unwrap().push(now_ns)),
         });
@@ -3149,7 +3323,7 @@ mod tests {
         let start = virtual_clock::virtual_ns();
         let deadlines: Vec<u64> = (1..=8).map(|i| start + i * BIT_NS).collect();
         for &at_ns in &deadlines {
-            handle.link().send(Command::ScheduleAt {
+            handle.link().send_control(Command::ScheduleAt {
                 component: ComponentId(0),
                 at_ns,
             });
@@ -3174,7 +3348,7 @@ mod tests {
 
         let now = virtual_clock::virtual_ns();
         let deadline = now + 100_000_000; // 100 virtual ms
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
             at_ns: deadline,
         });
@@ -3199,7 +3373,7 @@ mod tests {
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
-        handle.link().send(Command::ScheduleEvery {
+        handle.link().send_control(Command::ScheduleEvery {
             component: ComponentId(0),
             period_ns: 20_000_000,
         });
@@ -3225,18 +3399,18 @@ mod tests {
         let order: Arc<StdMutex<Vec<u32>>> = Arc::new(StdMutex::new(Vec::new()));
         for (component, tag) in [(ComponentId(0), 0u32), (ComponentId(1), 1u32)] {
             let sink = Arc::clone(&order);
-            handle.link().send(Command::RegisterWake {
+            handle.link().send_control(Command::RegisterWake {
                 component,
                 callback: Box::new(move |_| sink.lock().unwrap().push(tag)),
             });
         }
         // Schedule the LATER deadline first; firing order must follow the
         // deadlines, not the schedule order.
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(1),
             at_ns: 2_000,
         });
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
             at_ns: 1_000,
         });
@@ -3256,7 +3430,7 @@ mod tests {
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let _log = wake_log(&handle, ComponentId(0));
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
             at_ns: virtual_clock::virtual_ns() + 60_000_000_000, // one virtual minute out
         });
@@ -3267,6 +3441,94 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "drop must not wait for the pending timer"
+        );
+    }
+
+    /// Virtual time must not run past a wake that has been *requested* but not
+    /// yet handled.
+    ///
+    /// The command drain is capped ([`COMMAND_DRAIN_BATCH_MAX`]) so a drive
+    /// flood cannot starve the wheel — but a `ScheduleAt` still sitting in that
+    /// queue is a deadline the wheel cannot see, and advancing past it delivers
+    /// the wake late. For a component whose events are milliseconds apart that
+    /// is invisible. For one clocking a UART bit every 8.68 µs it is fatal: the
+    /// remaining bits are all overdue at the new instant, so the rest of the
+    /// byte goes onto the wire at a single point in time and arrives as
+    /// garbage. That is exactly how the whole-machine force path failed.
+    ///
+    /// Here a component re-arms itself one bit period ahead from inside its own
+    /// wake handler while a flood keeps the command queue non-empty. The
+    /// delivered timestamps must stay on the 500 ns grid.
+    #[rstest]
+    fn time_does_not_run_past_a_schedule_still_in_flight() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let mut resolver = Resolver::new(1, Dsu::new(1));
+        let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
+        handle.release_time();
+
+        const BIT_NS: u64 = 500; // 2,000,000 baud
+        const BITS: usize = 20;
+        let log: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&log);
+            let link = handle.link();
+            handle.link().send_control(Command::RegisterWake {
+                component: ComponentId(0),
+                callback: Box::new(move |now_ns| {
+                    let mut seen = sink.lock().unwrap();
+                    if seen.len() >= BITS {
+                        return;
+                    }
+                    seen.push(now_ns);
+                    let next = now_ns + BIT_NS;
+                    drop(seen);
+                    link.send_control(Command::ScheduleAt {
+                        component: ComponentId(0),
+                        at_ns: next,
+                    });
+                }),
+            });
+        }
+
+        // A flood that keeps the drain loop hitting its cap the whole time.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flood = {
+            let stop = Arc::clone(&stop);
+            let pin = crate::component::PinHandle::wired(NetId(0), Some(e0), None, handle.link());
+            std::thread::spawn(move || {
+                let mut level = false;
+                while !stop.load(Ordering::Relaxed) {
+                    level = !level;
+                    pin.set_drive(Some(if level { high() } else { low() }));
+                }
+            })
+        };
+
+        handle.link().send_control(Command::ScheduleAt {
+            component: ComponentId(0),
+            at_ns: virtual_clock::virtual_ns() + BIT_NS,
+        });
+        let done = wait_for(
+            || log.lock().unwrap().len() >= BITS,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(done, "the bit clock must keep ticking under a drive flood");
+
+        let stamps = log.lock().unwrap().clone();
+        let gaps: Vec<u64> = stamps.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.iter().all(|&gap| gap == BIT_NS),
+            "every wake must land one bit period after the last; got gaps {gaps:?}"
         );
     }
 
@@ -3303,7 +3565,7 @@ mod tests {
             })
         };
 
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
             at_ns: virtual_clock::virtual_ns() + 10_000_000, // 10 virtual ms
         });

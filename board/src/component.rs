@@ -681,7 +681,10 @@ impl ComponentNetIo {
             tracing::debug!("on_wake on an inert io handle dropped");
             return;
         };
-        self.link.send(Command::RegisterWake {
+        // Control plane, so it is ordered ahead of the schedules that
+        // depend on it: a wake armed before its handler is registered fires
+        // into nothing.
+        self.link.send_control(Command::RegisterWake {
             component,
             callback: Box::new(callback),
         });
@@ -706,7 +709,8 @@ impl ComponentNetIo {
             tracing::debug!("schedule_at on an inert io handle dropped");
             return;
         };
-        self.link.send(Command::ScheduleAt { component, at_ns });
+        self.link
+            .send_control(Command::ScheduleAt { component, at_ns });
     }
 
     /// Request a periodic wakeup every `period_us` of virtual time. Missed
@@ -730,7 +734,7 @@ impl ComponentNetIo {
             tracing::debug!("schedule_every on an inert io handle dropped");
             return;
         };
-        self.link.send(Command::ScheduleEvery {
+        self.link.send_control(Command::ScheduleEvery {
             component,
             period_ns,
         });

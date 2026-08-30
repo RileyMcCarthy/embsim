@@ -172,7 +172,7 @@ use crate::component::{
     AttachError, Component, ComponentNetIo, PinDecl, PinKind, PulseDirection, PulseTrain, PulseTx,
     StreamRole,
 };
-use crate::net::{Level, NetState, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
+use crate::net::Level;
 use crate::serial_levels::SerialLevelBridge;
 use crate::uart::{FramingError, UartFraming};
 
@@ -254,41 +254,11 @@ pub enum GpioDirection {
 // ============================================================
 
 /// Open-circuit voltage a bridged GPIO output drives for a logic high.
-/// Matches the engine's own idle-high default; a consumer that needs another
-/// rail models the level shifter as a component rather than retuning this.
-const MCU_OUTPUT_HIGH_VOLTS: Volts = 3.3;
-
-/// Logic threshold applied to an [`NetState::Analog`] net when a bridged input
-/// (GPIO or encoder phase) projects it to a level. Matches the engine's own
-/// digital projection threshold.
-pub(crate) const MCU_INPUT_THRESHOLD_VOLTS: Volts = 1.5;
-
-/// Project a resolved net state to a logic level, or `None` when the engine
-/// refuses to give one (floating / contended). The engine never invents a
-/// level, and neither does the bridge: an input with no level holds the last
-/// value the firmware saw rather than inventing a released state.
-pub(crate) fn level_of(state: NetState) -> Option<Level> {
-    match state {
-        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
-        NetState::Analog(volts) => Some(if volts >= MCU_INPUT_THRESHOLD_VOLTS {
-            Level::High
-        } else {
-            Level::Low
-        }),
-        NetState::Floating | NetState::Contention => None,
-    }
-}
-
-/// The Thevenin contribution of a bridged output at `level`.
-pub(crate) fn output_drive(level: Level) -> TheveninDrive {
-    TheveninDrive {
-        volts: match level {
-            Level::High => MCU_OUTPUT_HIGH_VOLTS,
-            Level::Low => 0.0,
-        },
-        impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
-    }
-}
+// The digital projection a bridged pin uses in both directions lives in
+// [`crate::net`]: it is the engine's own, not the MCU's, and the serial level
+// bridge needs the same one. An input with no level holds the last value the
+// firmware saw rather than inventing a released state.
+use crate::net::{digital_drive as output_drive, level_of};
 
 /// The pin level a GPIO channel's `active` state drives, honoring
 /// `active_low`.
@@ -1991,23 +1961,6 @@ mod tests {
     ) {
         assert_eq!(level_of_active(active, active_low), expect);
         assert_eq!(active_of_level(expect, active_low), active);
-    }
-
-    /// The bridge projects exactly what the engine will commit to, and refuses
-    /// to invent a level where the engine gave none.
-    #[rstest]
-    #[case::driven_high(NetState::Driven(Level::High), Some(Level::High))]
-    #[case::driven_low(NetState::Driven(Level::Low), Some(Level::Low))]
-    #[case::pulled(NetState::Pulled(Level::High, 10_000.0), Some(Level::High))]
-    #[case::analog_above(NetState::Analog(3.0), Some(Level::High))]
-    #[case::analog_below(NetState::Analog(0.4), Some(Level::Low))]
-    #[case::floating(NetState::Floating, None)]
-    #[case::contention(NetState::Contention, None)]
-    fn input_projection_never_invents_a_level(
-        #[case] state: NetState,
-        #[case] expect: Option<Level>,
-    ) {
-        assert_eq!(level_of(state), expect);
     }
 
     /// A direction GPIO's active state maps to the declared direction and its

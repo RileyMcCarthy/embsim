@@ -469,7 +469,6 @@ fn the_force_path_carries_a_command_and_a_conversion_end_to_end() {
     // SYNC + RDATA (0x55 0x10 — TI SBAS752B §8.5.3.4), written the way the
     // firmware writes it.
     serial::transmit_data(0, &[0x55, 0x10]);
-
     let mut reply: Vec<u8> = Vec::new();
     let arrived = wait_for(
         || {
