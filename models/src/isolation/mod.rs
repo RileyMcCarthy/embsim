@@ -66,6 +66,57 @@
 //! closed?* — answered electrically rather than by fiat. What it costs is
 //! stated per part: the modeled branch current is the one the resistive
 //! equivalent carries, not the one the regulator would hold.
+//!
+//! # Promoting a stub
+//!
+//! A consumer that registers these parts as topology-only stubs replaces each
+//! `register_stub` line with a `register` line and changes nothing else — the
+//! pin facades here *are* the datasheet pin tables, so the build validates
+//! against the same netlist it always did:
+//!
+//! ```rust
+//! use embsim_board::{PartRegistry, registry::normalize_part};
+//! use embsim_models::isolation::{iso67xx, npn_switch, nsi50010, vo2631};
+//! use embsim_models::isolation::{Channel, Iso67xx, NpnSwitch, Nsi50010, Vo2631};
+//!
+//! let mut registry = PartRegistry::new();
+//!
+//! // One arm covers the whole isolator family: the orderable part number
+//! // carries the variant and the fail-safe option.
+//! for part in ["ISO6742DWR", "ISO6741DWR", "ISO6740FDWR", "ISO6721BDR"] {
+//!     registry.register(part, |decl| {
+//!         let name = normalize_part(decl);
+//!         let mut config = iso67xx::Config::from_part_name(&name).expect("an ISO67xx");
+//!         // Opt a channel into carrying a step clock as a rate, not edges.
+//!         if decl.reference == "IC14" {
+//!             config = config.with_pulse_channel(Channel::A);
+//!         }
+//!         Box::new(Iso67xx::new(config).expect("a valid isolator"))
+//!     });
+//! }
+//! registry.register("VO2631", |_| {
+//!     Box::new(Vo2631::new(vo2631::Config::new()).expect("valid"))
+//! });
+//! registry.register("NSI50010YT1G_1", |_| {
+//!     Box::new(Nsi50010::new(nsi50010::Config::new()).expect("valid"))
+//! });
+//! registry.register("2N3904", |_| {
+//!     Box::new(NpnSwitch::new(npn_switch::Config::new()).expect("valid"))
+//! });
+//! ```
+//!
+//! Two things the *system description* must then supply, because a promoted
+//! part gates on them where a stub did not:
+//!
+//! 1. **Both sides of every isolator need a rail.** A supply the engine leaves
+//!    floating is a down supply, so a barrier with only one strapped side
+//!    passes nothing — correctly, and loudly.
+//! 2. **A current loop needs a source.** An optocoupler driven from a
+//!    dry-contact loop stays dark until the loop has an EMF in it; on the
+//!    reference board the end-switch loop is drawn closed and unpowered, so the
+//!    harness has to say what a working machine provides.
+//!
+//! `board/tests/isolation_bridge.rs` is the worked example of all of it.
 
 pub mod iso67xx;
 pub mod npn_switch;
