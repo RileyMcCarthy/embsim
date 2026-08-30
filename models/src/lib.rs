@@ -5,6 +5,9 @@
 //! - [`ads122u04`] — TI ADS122U04 UART ADC IC protocol model
 //! - [`ads122u04_component`] — that model as a live `embsim-board` component
 //!   (pin facade, power/reset gate, stream pump)
+//! - [`isolation`] — the parts between an MCU pin and the machine: the TI
+//!   ISO67xx digital isolator family, a dual optocoupler, a constant-current
+//!   LED driver, and a small NPN switch
 //! - [`limit_switch`] — position-threshold limit switch
 //! - [`edge`] — edge-detection primitive shared by threshold models
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
@@ -21,5 +24,6 @@
 pub mod ads122u04;
 pub mod ads122u04_component;
 pub mod edge;
+pub mod isolation;
 pub mod limit_switch;
 pub mod machine;
