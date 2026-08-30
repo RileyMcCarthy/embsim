@@ -2,8 +2,12 @@
 //!
 //! libngspice is process-global and not re-entrant, so every call takes one
 //! mutex. The board engine is already a single writer; cargo-test parallelism
-//! is serialized here. This crate runs **operating-point** (`.op`) analysis:
-//! a deck in, node voltages out. Transient windows are a later slice.
+//! is serialized here.
+//!
+//! - [`operating_point`] — DC (`.op`): a deck in, node voltages out.
+//! - [`transient`] — time window (`.tran`): deck + `tstop`, node voltages at
+//!   the end of the window. The engine chooses the window; this crate does
+//!   not own virtual time.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -96,7 +100,7 @@ pub enum SpiceError {
         /// Offending card.
         card: String,
     },
-    /// ngspice rejected the circuit or `.op` failed.
+    /// ngspice rejected the circuit or the analysis failed.
     Analysis {
         /// Lines captured from ngspice's error callbacks.
         messages: Vec<String>,
@@ -108,7 +112,7 @@ impl std::fmt::Display for SpiceError {
         match self {
             SpiceError::NulInDeck { card } => write!(f, "NUL byte in SPICE card {card:?}"),
             SpiceError::Analysis { messages } => {
-                write!(f, "ngspice .op failed: {}", messages.join("; "))
+                write!(f, "ngspice analysis failed: {}", messages.join("; "))
             }
         }
     }
@@ -160,6 +164,31 @@ fn command(cmd: &str) -> i32 {
 /// Returns a map of **node name → voltage**. Internal source nodes (`vs*`)
 /// and branch currents are omitted. Ground (`0`) is not in the map (it is 0 V).
 pub fn operating_point(cards: &[&str]) -> Result<HashMap<String, f64>, SpiceError> {
+    analyse(cards, "op")
+}
+
+/// Run a transient analysis on `cards` from t = 0 to `tstop_s` seconds.
+///
+/// `tstep_s` is ngspice's printing/step hint, not embsim virtual time.
+/// Returns node voltages at **tstop** (last sample). Include `.ic v(n)=…`
+/// cards to continue a capacitor from a previous window.
+///
+/// The engine (or a test) chooses the window. This is not a free-running
+/// analog clock.
+pub fn transient(
+    cards: &[&str],
+    tstop_s: f64,
+    tstep_s: f64,
+) -> Result<HashMap<String, f64>, SpiceError> {
+    if !(tstop_s.is_finite() && tstop_s > 0.0 && tstep_s.is_finite() && tstep_s > 0.0) {
+        return Err(SpiceError::Analysis {
+            messages: vec!["transient window must be positive and finite".into()],
+        });
+    }
+    analyse(cards, &format!("tran {tstep_s} {tstop_s} uic"))
+}
+
+fn analyse(cards: &[&str], analysis: &str) -> Result<HashMap<String, f64>, SpiceError> {
     let _guard = lock_session();
     ensure_init();
     take_errors();
@@ -187,11 +216,11 @@ pub fn operating_point(cards: &[&str]) -> Result<HashMap<String, f64>, SpiceErro
         return Err(SpiceError::Analysis { messages: errors });
     }
 
-    let op_rc = command("op");
+    let rc = command(analysis);
     errors = take_errors();
-    if op_rc != 0 {
+    if rc != 0 {
         if errors.is_empty() {
-            errors.push(format!("ngSpice_Command(\"op\") returned {op_rc}"));
+            errors.push(format!("ngSpice_Command({analysis:?}) returned {rc}"));
         }
         return Err(SpiceError::Analysis { messages: errors });
     }
@@ -311,5 +340,33 @@ mod tests {
     fn nul_card_is_a_named_error() {
         let err = operating_point(&["R1 n1 n2 1k\0oops"]).unwrap_err();
         assert!(matches!(err, SpiceError::NulInDeck { .. }));
+    }
+
+    /// Series R = 1 kΩ, C = 1 µF to ground (τ = 1 ms). Step 1 V at t = 0
+    /// from a discharged cap: v(t) = 1 − e^{−t/τ}. At t = τ, v ≈ 0.632.
+    #[rstest]
+    fn rc_step_at_one_tau_matches_exponential() {
+        let v = transient(
+            &["R1 n1 n2 1k", "C1 n2 0 1u", "V1 n1 0 1.0", ".ic v(n2)=0"],
+            1e-3,
+            1e-6,
+        )
+        .unwrap();
+        let mid = v
+            .get("n2")
+            .copied()
+            .or_else(|| v.get("v(n2)").copied())
+            .unwrap_or_else(|| panic!("n2 missing from {v:?}"));
+        let expected = 1.0 - (-1.0f64).exp();
+        assert!(
+            (mid - expected).abs() < 1e-3,
+            "n2={mid} expected={expected}, all={v:?}"
+        );
+    }
+
+    #[rstest]
+    fn transient_rejects_non_positive_window() {
+        let err = transient(&["R1 n1 0 1k", "V1 n1 0 1"], 0.0, 1e-6).unwrap_err();
+        assert!(matches!(err, SpiceError::Analysis { .. }));
     }
 }

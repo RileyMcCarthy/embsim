@@ -41,7 +41,11 @@
 //! semantics. Escalation is part of that shared path: when the digital fast
 //! path detects a competing source within
 //! [`crate::net::ESCALATION_IMPEDANCE_RATIO`] of the strongest driver, the
-//! whole conduction cluster goes through the [`ClusterSolver`].
+//! whole conduction cluster goes through the [`ClusterSolver`]. Capacitors
+//! are analog-only: they never join digital conduction or stream-collapse. A
+//! windowed `.tran` solver may ask the engine to re-resolve on a period
+//! (`ClusterSolver::analog_window_us`) so C keeps integrating between
+//! digital events.
 //!
 //! **Stream routing** (`BOARD_ENGINE.md`, "Stream endpoints (serial over
 //! pins)") is engine-owned and **derived from net resolution, never
@@ -106,7 +110,8 @@ use std::time::Duration;
 use embsim_core::virtual_clock;
 
 use crate::cluster::{
-    Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource,
+    Cluster, ClusterCapacitor, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver,
+    ClusterSource,
 };
 use crate::component::{PulseTrain, StreamRole};
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
@@ -491,6 +496,9 @@ pub(crate) struct Resolver {
     identity: Dsu,
     /// Conduction edges (resistors, inductors, closed jumpers): (a, b, ohms).
     edges: Vec<(usize, usize, f64)>,
+    /// Analog-only capacitors: (a, b, farads). Never join digital conduction
+    /// or stream-collapse — a decoupling cap must not analog-union the board.
+    capacitors: Vec<(usize, usize, f64)>,
     /// Drive-capable endpoints, indexed by [`EndpointId`].
     slots: Vec<DriveSlot>,
     power_sources: Vec<(usize, Volts)>,
@@ -511,6 +519,7 @@ impl Resolver {
         Self {
             identity,
             edges: Vec::new(),
+            capacitors: Vec::new(),
             slots: Vec::new(),
             power_sources: Vec::new(),
             stuck_sources: Vec::new(),
@@ -526,6 +535,11 @@ impl Resolver {
     /// Add a conduction edge between two nets.
     pub(crate) fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
         self.edges.push((a, b, ohms));
+    }
+
+    /// Add an analog-only capacitor. Does not join digital conduction.
+    pub(crate) fn add_capacitor(&mut self, a: usize, b: usize, farads: f64) {
+        self.capacitors.push((a, b, farads));
     }
 
     /// Register a drive-capable endpoint with its initial contribution
@@ -799,8 +813,19 @@ impl Resolver {
         // Roots contended through collapsed resistance still escalate their
         // cluster, so the mid-rail voltage stays available to the solve —
         // but their own projection below is Contention.
+        // Numeric power/stuck roots: a capacitor may attach to one of these
+        // as the "other end" without pulling the rest of the rail's island
+        // into this cluster (no recurse through rails).
+        // hash-order: membership only.
+        let mut power_roots: HashSet<usize> = HashSet::new();
+        for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
+            if volts.is_finite() && !volts.is_nan() {
+                power_roots.insert(root_of[*net]);
+            }
+        }
+
         let solve_cluster = |cluster: usize| -> ClusterSolution {
-            let nodes: Vec<NetId> = (0..n)
+            let mut nodes: Vec<NetId> = (0..n)
                 .filter(|&i| root_of[i] == i && cluster_of[i] == cluster)
                 .map(NetId)
                 .collect();
@@ -813,10 +838,32 @@ impl Resolver {
                     ohms: *ohms,
                 })
                 .collect();
-            let inputs = ClusterInputs {
-                sources: cluster_sources.get(&cluster).cloned().unwrap_or_default(),
-            };
-            solver.solve(&Cluster { nodes, resistors }, &inputs)
+            let (extra_nodes, extra_sources, capacitors) = attach_cluster_capacitors(
+                &self.capacitors,
+                cluster,
+                &root_of,
+                &cluster_of,
+                &power_roots,
+                &direct_volts,
+            );
+            for extra in extra_nodes {
+                if !nodes.contains(&extra) {
+                    nodes.push(extra);
+                }
+            }
+            let mut sources = cluster_sources.get(&cluster).cloned().unwrap_or_default();
+            sources.extend(extra_sources);
+            solver.solve(
+                &Cluster {
+                    nodes,
+                    resistors,
+                    capacitors,
+                },
+                &ClusterInputs {
+                    sources,
+                    window_us: None,
+                },
+            )
         };
         // hash-order: `escalated` is keyed access only (`contains_key`, `get`,
         // `entry`) and never iterated. `driver_roots` is shape 2 — the escalation
@@ -1303,6 +1350,76 @@ fn min_path_ohms(root_edges: &[(usize, usize, f64)], from: usize) -> HashMap<usi
     dist
 }
 
+/// Capacitors that belong on one analog cluster deck.
+///
+/// C never joins digital conduction. Stamp a cap when:
+/// - both terminals already sit in this conduction cluster, or
+/// - one terminal is in the cluster and the mate is a power/stuck net
+///   (the mate is added as an extra node — we do **not** recurse through
+///   that rail and pull in every other analog island on it).
+///
+/// Walks `capacitors` in registration order. Extra nodes are sorted so the
+/// appended node list is hasher-independent.
+fn attach_cluster_capacitors(
+    capacitors: &[(usize, usize, f64)],
+    cluster: usize,
+    root_of: &[usize],
+    cluster_of: &[usize],
+    power_roots: &HashSet<usize>,
+    direct_volts: &HashMap<usize, Volts>,
+) -> (Vec<NetId>, Vec<ClusterSource>, Vec<ClusterCapacitor>) {
+    let mut extra_nodes = Vec::new();
+    let mut caps = Vec::new();
+    for &(a, b, farads) in capacitors {
+        if !farads.is_finite() || farads <= 0.0 {
+            continue;
+        }
+        if a >= root_of.len() || b >= root_of.len() {
+            continue;
+        }
+        let ra = root_of[a];
+        let rb = root_of[b];
+        if ra == rb {
+            continue;
+        }
+        let a_in = cluster_of[a] == cluster;
+        let b_in = cluster_of[b] == cluster;
+        let attach = match (a_in, b_in) {
+            (true, true) => true,
+            (true, false) if power_roots.contains(&rb) => {
+                extra_nodes.push(NetId(rb));
+                true
+            }
+            (false, true) if power_roots.contains(&ra) => {
+                extra_nodes.push(NetId(ra));
+                true
+            }
+            _ => false,
+        };
+        if attach {
+            caps.push(ClusterCapacitor {
+                a: NetId(ra),
+                b: NetId(rb),
+                farads,
+            });
+        }
+    }
+    extra_nodes.sort_by_key(|n| n.0);
+    extra_nodes.dedup();
+    let extra_sources: Vec<ClusterSource> = extra_nodes
+        .iter()
+        .filter_map(|&NetId(root)| {
+            let volts = *direct_volts.get(&root)?;
+            Some(ClusterSource {
+                node: NetId(root),
+                volts,
+                impedance: 0.0,
+            })
+        })
+        .collect();
+    (extra_nodes, extra_sources, caps)
+}
+
 // ============================================================
 // Timer wheel
 // ============================================================
@@ -1314,6 +1431,9 @@ enum TimerTarget {
     Wake(ComponentId),
     /// Paced byte delivery on one stream producer's route.
     Stream(EndpointId),
+    /// Windowed analog `.tran`: re-resolve so capacitors keep integrating
+    /// between digital events. Period is the solver's `analog_window_us`.
+    Analog,
 }
 
 /// One armed wakeup. Ordered by `(deadline_us, seq)` so simultaneous and
@@ -1900,14 +2020,16 @@ impl EngineCore {
                         );
                     }
                     if let Some(period) = head.period_us {
-                        let mut next = head.deadline_us.saturating_add(period);
-                        if next <= now {
-                            next = now.saturating_add(period);
-                        }
-                        self.arm(next, head.target, Some(period));
+                        self.rearm_periodic(head.target, head.deadline_us, period, now);
                     }
                 }
                 TimerTarget::Stream(endpoint) => self.deliver_due_stream(endpoint, now),
+                TimerTarget::Analog => {
+                    self.resolve_and_publish();
+                    if let Some(period) = head.period_us {
+                        self.rearm_periodic(head.target, head.deadline_us, period, now);
+                    }
+                }
             }
         }
         fired
@@ -1923,6 +2045,34 @@ impl EngineCore {
             target,
             period_us,
         }));
+    }
+
+    fn rearm_periodic(&mut self, target: TimerTarget, deadline_us: u64, period: u64, now: u64) {
+        let mut next = deadline_us.saturating_add(period);
+        if next <= now {
+            next = now.saturating_add(period);
+        }
+        self.arm(next, target, Some(period));
+    }
+
+    /// Arm the windowed-`.tran` tick once time is released. No-op for `.op`
+    /// solvers, analog-off, or a board with no capacitors.
+    fn arm_analog_window(&mut self) {
+        let Some(period) = self.solver.analog_window_us() else {
+            return;
+        };
+        if self.resolver.capacitors.is_empty() {
+            return;
+        }
+        if !self.clock_ready("analog window") {
+            return;
+        }
+        let now = virtual_clock::virtual_us();
+        self.arm(
+            now.saturating_add(period),
+            TimerTarget::Analog,
+            Some(period),
+        );
     }
 
     /// Handle one command; returns `true` on shutdown.
@@ -2029,6 +2179,7 @@ impl EngineCore {
             }
             Command::ReleaseTime => {
                 self.clock_released = true;
+                self.arm_analog_window();
             }
             Command::Shutdown => return true,
         }
@@ -3122,6 +3273,67 @@ mod tests {
         let mut diags = Diagnostics::new();
         resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert_eq!(net_table[1].state, NetState::Pulled(Level::High, 4_700.0));
+    }
+
+    /// Capacitors never join digital conduction / stream-collapse: two analog
+    /// islands tied to a rail only through C stay floating, they do not
+    /// analog-union onto the rail (the decoupling-cap explosion).
+    #[rstest]
+    fn capacitor_does_not_join_digital_conduction() {
+        // 3.3 V rail, AIN_A and AIN_B each with a cap to the rail and no R.
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        resolver.add_power_source(0, 3.3);
+        resolver.add_capacitor(1, 0, 1e-6);
+        resolver.add_capacitor(2, 0, 1e-6);
+        resolver.add_analog_sense(1);
+        resolver.add_analog_sense(2);
+        let mut net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
+        assert_eq!(net_table[1].state, NetState::Floating);
+        assert_eq!(net_table[2].state, NetState::Floating);
+        assert_eq!(net_table[0].state, NetState::Analog(3.3));
+    }
+
+    /// An RC to a power net attaches C on the analog deck (mate is a power
+    /// node — added, not recursed through). `.op` still treats C as open.
+    #[rstest]
+    fn rc_to_ground_stamps_capacitor_and_op_sits_at_source() {
+        struct Recording {
+            seen: StdMutex<Vec<Cluster>>,
+        }
+        impl ClusterSolver for Recording {
+            fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
+                self.seen.lock().unwrap().push(cluster.clone());
+                test_solver().solve(cluster, inputs)
+            }
+        }
+        // 3.3 V —1 kΩ— AIN —1 µF— 0 V, analog sense on AIN.
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        resolver.add_power_source(0, 3.3);
+        resolver.add_power_source(2, 0.0);
+        resolver.add_edge(0, 1, 1_000.0);
+        resolver.add_capacitor(1, 2, 1e-6);
+        resolver.add_analog_sense(1);
+        let solver = Recording {
+            seen: StdMutex::new(Vec::new()),
+        };
+        let mut net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &solver);
+        let seen = solver.seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|c| c
+                .capacitors
+                .iter()
+                .any(|cap| (cap.farads - 1e-6).abs() < 1e-18)),
+            "RC capacitor must be stamped on the analog cluster: {seen:?}"
+        );
+        assert!(
+            matches!(net_table[1].state, NetState::Analog(v) if (v - 3.3).abs() < 1e-6),
+            ".op treats C as open so AIN sits at the source; got {:?}",
+            net_table[1].state
+        );
     }
 
     /// Register a wake callback appending virtual timestamps to a log.

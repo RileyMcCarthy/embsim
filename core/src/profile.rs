@@ -16,7 +16,8 @@
 //! not the API.
 //!
 //! A digital-only consumer never depends on `embsim-board`'s `spice` feature
-//! and never constructs [`AnalogBackend::SpiceOp`].
+//! and never constructs [`AnalogBackend::SpiceOp`] or
+//! [`AnalogBackend::SpiceTran`].
 
 use crate::virtual_clock::ClockMode;
 use std::fmt;
@@ -38,8 +39,9 @@ pub enum AnalogBackend {
     /// ngspice DC operating point. Cheap enough for the playground.
     #[default]
     SpiceOp,
-    /// Event-driven ngspice `.tran` from `now` to the next engine deadline.
-    /// Not implemented yet; `System::start` fails loudly if this is selected.
+    /// Windowed ngspice `.tran`: each analog window is
+    /// `min(elapsed virtual time, max_step_us)`. Capacitor voltages carry
+    /// across windows via `.ic`. Resistive clusters still use `.op`.
     SpiceTran {
         /// Maximum analog window (virtual µs) if the next digital event is later.
         max_step_us: u64,
@@ -76,7 +78,8 @@ impl SimProfile {
     };
 
     /// Full simulation: ISS + spice `.op` + stepped. ISS construction fails
-    /// until the ISS crate exists; analog still runs `.op`.
+    /// until the ISS crate exists; analog still runs `.op` (windowed `.tran`
+    /// is `AnalogBackend::SpiceTran`, not this preset).
     pub const FULLSIM: Self = Self {
         clock: ClockMode::Stepped,
         cpu: CpuBackend::Iss,

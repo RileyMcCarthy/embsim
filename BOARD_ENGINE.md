@@ -205,10 +205,23 @@ pub struct PowerState { pub volts: f64, pub ok: bool }
 ### Analog clusters
 
 Connected subgraphs of `Passive`/`Analog` pins form **clusters**, extracted at
-build time. Solved by ngspice **DC operating point** (`.op`): Thevenin sources
-+ resistors (and, later, C/L/D/`.subckt`) → node voltages, recomputed only
-when a boundary input changes. Digital nets still take the Thevenin fast path;
-only escalated analog clusters enter SPICE.
+build time. Solved by ngspice: Thevenin sources + resistors + capacitors →
+node voltages. Digital nets still take the Thevenin fast path; only escalated
+analog clusters enter SPICE.
+
+- **`.op`** (`AnalogBackend::SpiceOp`, the playground default): DC operating
+  point. Capacitors are open. Recomputed when a boundary input changes.
+- **Windowed `.tran`** (`AnalogBackend::SpiceTran { max_step_us }`): each
+  analog window is `min(elapsed virtual time, max_step_us)`. Capacitor
+  voltages carry across windows via `.ic`. The engine remains the time
+  authority — a periodic analog tick on the timer wheel keeps C integrating
+  between digital events. Resistive clusters (no C) still use `.op`.
+
+Capacitors **do not join digital conduction or stream-collapse**. A cap is
+stamped on an analog cluster only when both ends already sit in that cluster,
+or one end is in the cluster and the mate is a power net (the mate is added
+as a node; we do not recurse through the rail). Decoupling caps therefore
+cannot analog-union the whole board.
 
 - A cluster with **no source** solves to `Floating` for all its nodes
   (reachability is decided structurally, before a deck is built — ngspice is
@@ -225,11 +238,10 @@ pub trait ClusterSolver: Send + Sync {
 }
 ```
 
-The trait is the test seam (recording doubles). The only production
-implementation is `Spice` (`embsim-spice`, libngspice). Event-driven `.tran`
-windows in stepped clock mode are a later slice; continuous transient is out
-of scope. KiCad remains the topology source — SPICE does not replace
-netlists, stream routing, or harness/fault algebra.
+The trait is the test seam (recording doubles). Production impls: `Spice`
+(`.op`) and `SpiceTransient` (windowed `.tran`) in `embsim-spice`
+(libngspice), plus `AnalogOff`. KiCad remains the topology source — SPICE
+does not replace netlists, stream routing, or harness/fault algebra.
 
 ### Stream endpoints (serial over pins)
 
@@ -467,8 +479,9 @@ present-but-undeclared).
   minimal + one real exported board) with golden component/net graphs.
 - Net resolution: truth-table tests per rule (driver combinations × expected
   `NetState`), including the impedance-escalation boundary.
-- Analog `.op`: hand-computed reference circuits (bridge, divider ladder, pull-up vs
-  driver, source-free singular cluster) asserted to µV against ngspice.
+- Analog `.op` / windowed `.tran`: hand-computed reference circuits (bridge, divider ladder, pull-up vs
+  driver, source-free singular cluster, RC step at one τ) asserted to µV
+  (`.op`) / mV (`.tran`) against ngspice.
 - Streams: routing through series passives, crossed-producer detection, route
   invalidation on jumper/fault changes.
 - Pin bridges: fake firmware driving the peripheral free functions with peer
@@ -490,8 +503,10 @@ present-but-undeclared).
 
 ## Non-goals
 
-- Continuous SPICE transient (event-driven `.tran` windows in stepped mode
-  are the intended follow-up; the engine remains the time authority).
+- Free-running analog time (a `.tran` that is not windowed by the engine).
+  Windowed `.tran` (`AnalogBackend::SpiceTran`) is in-scope; the engine
+  remains the time authority.
+- Diodes, inductors as analog cards, vendor `.subckt` instances.
 - Cycle-accurate MCU peripheral timing; emergent byte-loss on serial pipes
   (fault injection covers loss-handling code paths).
 - PCB physical effects (parasitics, thermal, EMC).

@@ -24,7 +24,7 @@
 //! - [`registry`] — [`PartRegistry`]: identity → constructor; auto-classification tiers
 //! - [`engine`] — the live single-writer net engine: drive queue, resolution, timer wheel, stream routing
 //! - [`net`] — net state model ([`NetState`]) and shared net/pin identity types
-//! - [`cluster`] — analog cluster types + [`ClusterSolver`] (optional spice `.op`)
+//! - [`cluster`] — analog cluster types + [`ClusterSolver`] (optional spice `.op` / windowed `.tran`)
 //! - [`board`] — [`Board::from_netlist`]: netlist + registry → components + nets
 //! - [`system`] — [`System`]: boards + harnesses + scenario overrides + fault algebra
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
@@ -46,12 +46,12 @@ pub mod registry;
 pub mod system;
 
 pub use board::{Board, BoardError};
-#[cfg(feature = "spice")]
-pub use cluster::Spice;
 pub use cluster::{
-    AnalogOff, Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver,
-    ClusterSource,
+    AnalogOff, Cluster, ClusterCapacitor, ClusterInputs, ClusterResistor, ClusterSolution,
+    ClusterSolver, ClusterSource,
 };
+#[cfg(feature = "spice")]
+pub use cluster::{Spice, SpiceTransient};
 pub use component::{
     AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, PulseDirection,
     PulseSegment, PulseTrain, PulseTx, StreamRole, StreamTx,

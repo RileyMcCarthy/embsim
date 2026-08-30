@@ -34,7 +34,7 @@ use embsim_core::profile::{AnalogBackend, SimProfile};
 use crate::board::{Board, BoardError, PartClass};
 use crate::cluster::ClusterSolver;
 #[cfg(feature = "spice")]
-use crate::cluster::Spice;
+use crate::cluster::{Spice, SpiceTransient};
 use crate::component::{Component, ComponentNetIo, PinDecl, PinHandle, PinKind, StreamRole};
 use crate::diagnostics::{Diagnostics, Finding};
 use crate::engine::{
@@ -897,7 +897,8 @@ impl System {
                             PassiveKind::Resistor => value.is_some(),
                             // DC short (documented simplification).
                             PassiveKind::Inductor => true,
-                            // DC open in the build-time pass.
+                            // Capacitors are analog-only (stamped below);
+                            // diodes and LEDs stay DC-open.
                             PassiveKind::Capacitor | PassiveKind::Diode | PassiveKind::Led => false,
                         };
                         if conducts && record.pins.len() == 2 {
@@ -913,6 +914,20 @@ impl System {
                                 &detached,
                                 &mut resolver,
                             );
+                        }
+                        if *kind == PassiveKind::Capacitor {
+                            if let Some(farads) = value {
+                                if record.pins.len() == 2 {
+                                    self.passive_capacitor(
+                                        bi,
+                                        record,
+                                        *farads,
+                                        &net_of_pin,
+                                        &detached,
+                                        &mut resolver,
+                                    );
+                                }
+                            }
                         }
                     }
                     PartClass::Jumper { state } => {
@@ -1169,6 +1184,33 @@ impl System {
         }
         if let (Some(&a), Some(&b)) = (net_of_pin.get(&a_key), net_of_pin.get(&b_key)) {
             resolver.add_edge(a, b, ohms);
+        }
+    }
+
+    /// Analog-only capacitor. Same pin/detach lookup as [`Self::passive_edge`]
+    /// — does not join digital conduction.
+    fn passive_capacitor(
+        &self,
+        bi: usize,
+        record: &crate::board::PartRecord,
+        farads: f64,
+        net_of_pin: &HashMap<(usize, PinRef), usize>,
+        detached: &HashSet<(usize, PinRef)>,
+        resolver: &mut Resolver,
+    ) {
+        let a_key = (
+            bi,
+            PinRef::new(record.reference.clone(), record.pins[0].clone()),
+        );
+        let b_key = (
+            bi,
+            PinRef::new(record.reference.clone(), record.pins[1].clone()),
+        );
+        if detached.contains(&a_key) || detached.contains(&b_key) {
+            return;
+        }
+        if let (Some(&a), Some(&b)) = (net_of_pin.get(&a_key), net_of_pin.get(&b_key)) {
+            resolver.add_capacitor(a, b, farads);
         }
     }
 }
@@ -1493,11 +1535,7 @@ impl System {
 fn analog_solver(backend: AnalogBackend) -> Result<Box<dyn ClusterSolver>, SystemError> {
     match backend {
         AnalogBackend::SpiceOp => spice_op_solver(backend),
-        AnalogBackend::SpiceTran { .. } => Err(SystemError::AnalogUnavailable {
-            backend,
-            reason:
-                "event-driven spice .tran is not implemented; inject a ClusterSolver or use SpiceOp",
-        }),
+        AnalogBackend::SpiceTran { max_step_us } => spice_tran_solver(backend, max_step_us),
         AnalogBackend::Off => Ok(Box::new(crate::cluster::AnalogOff)),
     }
 }
@@ -1509,6 +1547,25 @@ fn spice_op_solver(_backend: AnalogBackend) -> Result<Box<dyn ClusterSolver>, Sy
 
 #[cfg(not(feature = "spice"))]
 fn spice_op_solver(backend: AnalogBackend) -> Result<Box<dyn ClusterSolver>, SystemError> {
+    Err(SystemError::AnalogUnavailable {
+        backend,
+        reason: "embsim-board was built without the `spice` cargo feature",
+    })
+}
+
+#[cfg(feature = "spice")]
+fn spice_tran_solver(
+    _backend: AnalogBackend,
+    max_step_us: u64,
+) -> Result<Box<dyn ClusterSolver>, SystemError> {
+    Ok(Box::new(SpiceTransient::new(max_step_us)))
+}
+
+#[cfg(not(feature = "spice"))]
+fn spice_tran_solver(
+    backend: AnalogBackend,
+    _max_step_us: u64,
+) -> Result<Box<dyn ClusterSolver>, SystemError> {
     Err(SystemError::AnalogUnavailable {
         backend,
         reason: "embsim-board was built without the `spice` cargo feature",
@@ -1654,8 +1711,18 @@ mod tests {
             .expect("injected solver is enough even when analog is Off");
     }
 
+    #[cfg(feature = "spice")]
     #[rstest]
-    fn spice_tran_fails_until_implemented() {
+    fn spice_tran_builds_with_the_windowed_solver() {
+        System::new()
+            .analog(AnalogBackend::SpiceTran { max_step_us: 1_000 })
+            .build()
+            .expect("SpiceTran is implemented");
+    }
+
+    #[cfg(not(feature = "spice"))]
+    #[rstest]
+    fn spice_tran_unavailable_without_the_spice_feature() {
         let err = System::new()
             .analog(AnalogBackend::SpiceTran { max_step_us: 1_000 })
             .build()
@@ -1664,6 +1731,5 @@ mod tests {
             matches!(err, SystemError::AnalogUnavailable { .. }),
             "got {err:?}"
         );
-        assert!(err.to_string().contains("tran"));
     }
 }

@@ -2,14 +2,16 @@
 //! conventions": hand-computed reference circuits asserted to µV).
 //!
 //! Each test states its closed-form hand calculation next to the assertion;
-//! tolerances are 1e-6 V unless a comment says otherwise. Component values
-//! come from the MaD reference consumer: the DS2Addon 47 Ω series resistors,
-//! the 350 Ω strain-gauge bridge (`SIL/models/src/strain_gauge.rs`), and the
-//! 25 Ω default push-pull drive impedance.
+//! tolerances are 1e-6 V unless a comment says otherwise. The solver is
+//! generic (R, C, Thevenin sources → ngspice). A few component values are
+//! taken from the MaD reference consumer so the resistive circuits match
+//! the machine that exercises this engine (DS2Addon 47 Ω series resistors,
+//! 350 Ω strain-gauge bridge, 25 Ω default push-pull). The RC low-pass is
+//! a textbook 1 kΩ / 1 µF.
 
 use embsim_board::{
-    Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource, NetId,
-    NetState, Spice, Volts,
+    Cluster, ClusterCapacitor, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver,
+    ClusterSource, NetId, NetState, Spice, SpiceTransient, Volts,
 };
 use rstest::rstest;
 
@@ -48,9 +50,11 @@ fn divider_47r_over_4k7_matches_closed_form() {
     let cluster = Cluster {
         nodes: vec![NetId(0), NetId(1), NetId(2)], // rail, mid, gnd
         resistors: vec![resistor(0, 1, 47.0), resistor(1, 2, 4_700.0)],
+        ..Default::default()
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 0.0), source(2, 0.0, 0.0)],
+        ..Default::default()
     };
     let solution = Spice.solve(&cluster, &inputs);
     let expected_mid = 3.3 * 4_700.0 / 4_747.0;
@@ -87,9 +91,11 @@ fn wheatstone_bridge_mad_strain_gauge_matches_bridge_equation() {
             resistor(0, 3, r_arm),                 // EXC — SIG−
             resistor(3, 1, r_arm),                 // SIG− — GND
         ],
+        ..Default::default()
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, v_exc, 0.0), source(1, 0.0, 0.0)],
+        ..Default::default()
     };
     let solution = Spice.solve(&cluster, &inputs);
 
@@ -121,9 +127,11 @@ fn stiff_sources_fighting_through_series_resistor_sit_between_rails() {
     let cluster = Cluster {
         nodes: vec![NetId(0), NetId(1)],
         resistors: vec![resistor(0, 1, 47.0)],
+        ..Default::default()
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 25.0), source(1, 0.0, 25.0)],
+        ..Default::default()
     };
     let solution = Spice.solve(&cluster, &inputs);
 
@@ -149,9 +157,11 @@ fn disconnected_island_reports_floating_only_for_unsourced_nodes() {
     let cluster = Cluster {
         nodes: vec![NetId(0), NetId(1), NetId(2), NetId(3)],
         resistors: vec![resistor(0, 1, 1_000.0), resistor(2, 3, 1_000.0)],
+        ..Default::default()
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 25.0)],
+        ..Default::default()
     };
     let solution = Spice.solve(&cluster, &inputs);
 
@@ -159,4 +169,48 @@ fn disconnected_island_reports_floating_only_for_unsourced_nodes() {
     assert!((analog_volts(&solution, NetId(1)) - 3.3).abs() < 1e-6);
     assert_eq!(solution.state_of(NetId(2)), Some(NetState::Floating));
     assert_eq!(solution.state_of(NetId(3)), Some(NetState::Floating));
+}
+
+// ============================================================
+// (5) RC step — windowed `.tran`, 1 kΩ / 1 µF, τ = 1 ms
+// ============================================================
+
+fn rc_lowpass() -> Cluster {
+    Cluster {
+        nodes: vec![NetId(0), NetId(1), NetId(2)],
+        resistors: vec![resistor(0, 1, 1_000.0)],
+        capacitors: vec![ClusterCapacitor {
+            a: NetId(1),
+            b: NetId(2),
+            farads: 1e-6,
+        }],
+    }
+}
+
+#[rstest]
+fn rc_lowpass_op_sits_at_dc() {
+    // `.op`: C is open, so the cap top is the source OCV.
+    let inputs = ClusterInputs {
+        sources: vec![source(0, 1.0, 0.0), source(2, 0.0, 0.0)],
+        ..Default::default()
+    };
+    let solution = Spice.solve(&rc_lowpass(), &inputs);
+    assert!((analog_volts(&solution, NetId(1)) - 1.0).abs() < 1e-6);
+}
+
+#[rstest]
+fn rc_lowpass_one_tau_matches_exponential() {
+    // Hand check: v(t) = 1 − e^{−t/τ}. At t = τ = 1 ms, v ≈ 0.6321205588 V.
+    let solver = SpiceTransient::new(10_000);
+    let inputs = ClusterInputs {
+        sources: vec![source(0, 1.0, 0.0), source(2, 0.0, 0.0)],
+        window_us: Some(1_000),
+    };
+    let solution = solver.solve(&rc_lowpass(), &inputs);
+    let expected = 1.0 - (-1.0f64).exp();
+    assert!(
+        (analog_volts(&solution, NetId(1)) - expected).abs() < 1e-3,
+        "got {} expected {expected}",
+        analog_volts(&solution, NetId(1))
+    );
 }
