@@ -73,7 +73,7 @@
 //! every asserted value was recorded at a fixed virtual instant before it.
 
 use rstest::rstest;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -271,9 +271,7 @@ impl Component for Script {
         // started (`engine::Command::ReleaseTime`).
         let anchor = virtual_clock::virtual_us();
         let step = Arc::new(AtomicUsize::new(0));
-        let cursor = Arc::new(AtomicU64::new(anchor));
         let schedule = Arc::clone(&step);
-        let next_us = Arc::clone(&cursor);
 
         io.on_wake(move |now_us| {
             let index = schedule.load(Ordering::SeqCst);
@@ -332,13 +330,22 @@ impl Component for Script {
             // `schedule_every` keeps the wheel turning, so virtual time does
             // not stop here as it does in `pulse_bridge_stepped.rs` — which is
             // exactly why every fact above was captured rather than polled.
-            if let Some(gap) = GAPS_US.get(next) {
-                rearm.schedule_at(next_us.fetch_add(*gap, Ordering::SeqCst) + gap);
+            if next < SCRIPT_STEPS {
+                rearm.schedule_at(anchor + offset_of_step(next));
             }
         });
-        io.schedule_at(cursor.fetch_add(GAPS_US[0], Ordering::SeqCst) + GAPS_US[0]);
+        io.schedule_at(anchor + offset_of_step(0));
         Ok(())
     }
+}
+
+/// Virtual-time offset from the anchor at which script step `index` fires.
+///
+/// Absolute rather than `now_us + gap`, so every step lands at a fixed instant
+/// no matter how the engine got there — which is what makes the reported
+/// capture instants identical run to run.
+fn offset_of_step(index: usize) -> u64 {
+    GAPS_US[..=index].iter().sum()
 }
 
 /// A high-impedance probe pin: it senses a net without loading it.
