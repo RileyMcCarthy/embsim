@@ -1,49 +1,36 @@
-//! Virtual Clock — provides scalable time for the emulator.
+//! Virtual clock — one monotonic microsecond **counter**.
 //!
-//! Two modes, selected at [`init_mode`] ([`ClockMode`]):
-//!
-//! - **[`ClockMode::FreeRunning`]** (the default, and unchanged): virtual time
-//!   is *scaled wall time*. At 1x virtual time == wall time; at 5x virtual time
-//!   advances 5x faster (waits are 5x shorter); at 0.5x it advances half as
-//!   fast (waits take twice as long).
-//! - **[`ClockMode::Stepped`]**: virtual time is a value a *scheduler* sets
-//!   with [`advance_to`]. Nothing samples wall time, so every timestamp is an
-//!   integer the scheduler chose. This is `DETERMINISM.md` Phase D1.
+//! `virtual_us` is never wall time. The engine (or an idle jump when nobody
+//! holds [`TimeAuthority`]) is the only thing that increases it, via
+//! [`advance_to`]. Optional **wall pacing** sleeps *after* a jump so a
+//! playground at `--speed 1` still feels real-time; tests use `speed <= 0`
+//! so jumps are instant and deterministic.
 //!
 //! # Waiting
 //!
 //! Nothing outside this module may call [`std::thread::sleep`] to serve a
-//! *simulated* wait. Every wait in the workspace goes through one of three
-//! functions here, and one private `park_wall_us` is the only place that
-//! actually sleeps:
+//! *simulated* wait. Every wait goes through one of three functions here,
+//! and one private `park_wall_us` is the only place that actually sleeps:
 //!
-//! | call | free-running | stepped |
-//! |---|---|---|
-//! | [`wait_until`] | `sleep(scaled remaining)` | park until the scheduler advances to the deadline |
-//! | [`wait_virtual_us`] | `sleep(scaled span)` | park until the scheduler advances to `now + span` |
-//! | [`wait_wall_us`] | `sleep(span)` | `sleep(span)` — **and trips the wall-sleep tripwire** |
+//! | call | effect |
+//! |---|---|
+//! | [`wait_until`] | park until `now` reaches the deadline |
+//! | [`wait_virtual_us`] | park until `now + span` |
+//! | [`wait_wall_us`] | real host sleep (fd retry, warm-up). Unpaced runs trip [`stepped_wall_sleep_count`] |
 //!
-//! The first two were the migration lever `DETERMINISM.md` Phase D0 installed;
-//! D1 swapped their bodies without touching one of the 12 call sites.
-//! [`wait_wall_us`] marks the waits that are wall-clock *by nature* — fd-poll
-//! retry cadence, a startup warm-up. In stepped mode those are invisible to the
-//! barrier below, so each one increments [`stepped_wall_sleep_count`] and logs
-//! at error level: they are the grep-able list Phase D2 has to virtualize (see
-//! `DETERMINISM.md`, "Wall-clock deadlines inside the simulation").
+//! [`wait_until`] / [`wait_virtual_us`] never sample `Instant`. If a
+//! [`TimeAuthority`] is held (the net engine, or a test that will call
+//! [`advance_to`]), waiters stay parked until that authority advances. With
+//! no authority and no running actor, the waiter **idle-jumps** `now` to the
+//! earliest deadline (and paces, if `speed > 0`).
 //!
-//! # Stepped mode: actors, quiescence, and what it cannot determine
-//!
-//! In stepped mode nothing advances virtual time except a call to
-//! [`advance_to`], and by convention exactly one component makes that call: the
-//! **board engine**, which owns the only ordered event queue and the only timer
-//! wheel (`DETERMINISM.md` T1 §3, "The engine is the time authority").
+//! # Actors and quiescence
 //!
 //! A thread that can create simulation work registers with [`register_actor`].
-//! Time may only advance when **every registered actor is parked** — the
-//! quiescence barrier of `DETERMINISM.md` T1 §4 — which the scheduler waits for
-//! with [`await_quiescence`]. `register_actor` binds the calling thread, so
-//! [`wait_until`] knows the parking thread's actor identity without the caller
-//! passing it around.
+//! Time should only jump when **every registered actor is parked** — the
+//! quiescence barrier — which the engine waits for with [`await_quiescence`].
+//! `register_actor` binds the calling thread, so [`wait_until`] knows the
+//! parking thread's actor identity without the caller passing it around.
 //!
 //! **What the barrier can and cannot see** (stated at the API, per
 //! `DETERMINISM.md` T1 §4, because it is a real limit and not an implementation
@@ -64,7 +51,7 @@
 //!   classify it. That is why `DETERMINISM.md` scopes D1 to systems whose I/O
 //!   is engine-side and defers the byte transports to D2.
 //! - **Not seen:** whether an actor *will* register. New actors start runnable,
-//!   so registering one while the scheduler is mid-advance is a race the
+//!   so registering one while time is mid-advance is a race the
 //!   scheduler cannot arbitrate. Register before the system starts.
 //!
 //! # Native firmware: preemption at HAL
@@ -84,17 +71,11 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Global virtual clock state.
-static SCALE_NUMER: AtomicU64 = AtomicU64::new(1);
+///
+/// Pacing: wall_sleep = dt_virtual * denom / numer. `numer == 0` means
+/// **unpaced** (tests / CI): jumps are instant.
+static SCALE_NUMER: AtomicU64 = AtomicU64::new(0);
 static SCALE_DENOM: AtomicU64 = AtomicU64::new(1);
-
-/// Immovable process time origin (set once, the first time `init` runs).
-static PROCESS_ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
-/// Real microseconds (from `PROCESS_ORIGIN`) at which the virtual clock was
-/// last (re)anchored. Re-anchored on every `init`, so re-initializing the
-/// emulator in-process restarts virtual time at 0 without the lock-free hot
-/// path ever taking a mutex.
-static BOOT_OFFSET_US: AtomicU64 = AtomicU64::new(0);
 
 /// Simulated clock frequency in Hz, supplied per-MCU by `init`.
 ///
@@ -104,87 +85,47 @@ static BOOT_OFFSET_US: AtomicU64 = AtomicU64::new(0);
 /// crates (e.g. `embsim-p2`) own their real frequency.
 static CLOCK_FREQ: AtomicU32 = AtomicU32::new(0);
 
-/// Current [`ClockMode`] discriminant: `MODE_FREE_RUNNING` or `MODE_STEPPED`.
-/// Free-running is the default so a consumer that never calls [`init_mode`]
-/// behaves exactly as it did before Phase D1.
-static MODE: AtomicU8 = AtomicU8::new(MODE_FREE_RUNNING);
-const MODE_FREE_RUNNING: u8 = 0;
-const MODE_STEPPED: u8 = 1;
+/// 1 once [`init`] has run.
+static INITIALIZED: AtomicU8 = AtomicU8::new(0);
 
-/// Stepped mode's "now", in virtual µs. Mirrors `Sched::now_us` so
-/// [`virtual_us`] stays one relaxed load with no mutex on the hot path.
+/// Virtual "now" in µs. Mirrors `Sched::now_us` so [`virtual_us`] stays one
+/// relaxed load with no mutex on the hot path.
 static NOW_US: AtomicU64 = AtomicU64::new(0);
+
+/// Held while the net engine (or a test) is the time authority. Waiters must
+/// not idle-jump while this is 1.
+static TIME_AUTHORITY: AtomicU32 = AtomicU32::new(0);
 
 /// How many real sleeps were served while the clock was stepped — the
 /// wall-sleep tripwire (`DETERMINISM.md`, "Proving it" → Tests). Read with
 /// [`stepped_wall_sleep_count`].
 static STEPPED_WALL_SLEEPS: AtomicU64 = AtomicU64::new(0);
 
-/// How virtual time advances (`DETERMINISM.md` T1 §1).
+/// Compatibility tags for callers that still say "stepped" vs "free-running".
+/// Both are the **same counter**; the difference is only wall pacing.
 ///
-/// A **runtime enum, not a Cargo feature**, per T1 §2: the clock is already a
-/// process-global configured by one call, features are additive and would let
-/// `--all-features` or two dependents silently pick a winner, and consumers
-/// need both modes in one binary (`--deterministic` scenario regressions vs. an
-/// interactive playground with a human at the PTY).
+/// - [`ClockMode::Stepped`] — `init(0.0, freq)`: unpaced jumps.
+/// - [`ClockMode::FreeRunning`] — `init(speed, freq)` with `speed > 0`: jump,
+///   then sleep `dt / speed` of wall time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClockMode {
-    /// Virtual time is scaled wall time — the historical behavior, and the
-    /// default.
+    /// Paced counter (`speed` is the playground scale, 1.0 = real-time feel).
     FreeRunning {
         /// Time scale (1.0 = real time, 5.0 = five times faster).
         speed: f64,
     },
-    /// Virtual time is a value the scheduler sets with [`advance_to`]; it
-    /// advances only when every registered actor is parked.
+    /// Unpaced counter (tests / CI).
     Stepped,
 }
 
-/// Initialize the virtual clock with the given speed scale and clock frequency,
-/// in **free-running** mode. Must be called before any time functions. Calling
-/// it again re-anchors virtual time to 0 (an in-process restart) and updates the
-/// scale/frequency.
+/// Initialize the virtual clock: `now = 0`, frequency `freq`, pacing from
+/// `speed`. `speed <= 0` is **unpaced** (instant jumps). `speed > 0` sleeps
+/// after each [`advance_to`] so an interactive playground still feels scaled
+/// real-time.
 ///
-/// Exactly `init_mode(ClockMode::FreeRunning { speed }, freq)`.
 pub fn init(speed: f64, freq: u32) {
-    init_mode(ClockMode::FreeRunning { speed }, freq);
-}
-
-/// Initialize the virtual clock in an explicit [`ClockMode`], re-anchoring
-/// virtual time to 0 and setting the simulated clock frequency.
-///
-/// `DETERMINISM.md` T1 §1 specifies the mode as immutable after `init_mode`.
-/// That is enforced *for the lifetime of a run* rather than for the lifetime of
-/// the process: re-`init` has always meant "in-process restart", and a mode
-/// change is only sound at exactly that point. So this call may change the mode
-/// — but entering [`ClockMode::Stepped`] with actors still registered is a
-/// **panic**, because a leaked actor thread from a previous run is precisely
-/// what would make the next run's barrier lie. See "Deviations from the design
-/// doc" in `DETERMINISM.md`.
-///
-/// # Panics
-/// Panics when entering stepped mode while any [`Actor`] is still registered,
-/// naming them.
-pub fn init_mode(mode: ClockMode, freq: u32) {
-    if mode == ClockMode::Stepped {
-        let leaked = registered_actor_names();
-        assert!(
-            leaked.is_empty(),
-            "cannot enter stepped clock mode with {} actor(s) still registered: {leaked:?} — \
-             a leaked actor thread from a previous run makes the quiescence barrier lie \
-             (DETERMINISM.md T1 §4)",
-            leaked.len()
-        );
-    }
-    let origin = PROCESS_ORIGIN.get_or_init(Instant::now);
-    BOOT_OFFSET_US.store(origin.elapsed().as_micros() as u64, Ordering::Relaxed);
     CLOCK_FREQ.store(freq, Ordering::Relaxed);
     {
-        // Re-anchor stepped "now" to 0 under the scheduler lock so a concurrent
-        // `advance_to` cannot interleave with the reset. Bumping the epoch
-        // releases anything parked against the OLD timeline: its deadline is
-        // now unreachable (time just went back to 0), so waiting for it would
-        // be waiting forever.
         let mut sched = lock_sched();
         sched.now_us = 0;
         sched.waits.clear();
@@ -199,91 +140,66 @@ pub fn init_mode(mode: ClockMode, freq: u32) {
         sched.running += released;
         NOW_US.store(0, Ordering::Relaxed);
     }
+    INITIALIZED.store(1, Ordering::Relaxed);
     ADVANCED.notify_all();
+    set_scale(speed);
+}
+
+/// Compatibility wrapper: [`ClockMode::Stepped`] is `init(0.0, freq)`;
+/// [`ClockMode::FreeRunning`] is `init(speed, freq)`.
+pub fn init_mode(mode: ClockMode, freq: u32) {
     match mode {
-        ClockMode::FreeRunning { speed } => {
-            MODE.store(MODE_FREE_RUNNING, Ordering::Relaxed);
-            set_scale(speed);
-        }
-        ClockMode::Stepped => {
-            // A stepped clock has no scale; pin the ratio at 1:1 so any stray
-            // `virtual_to_wall_us` reader gets an identity mapping rather than
-            // whatever the previous run left behind.
-            SCALE_NUMER.store(1000, Ordering::Relaxed);
-            SCALE_DENOM.store(1000, Ordering::Relaxed);
-            MODE.store(MODE_STEPPED, Ordering::Relaxed);
-        }
+        ClockMode::Stepped => init(0.0, freq),
+        ClockMode::FreeRunning { speed } => init(speed, freq),
     }
 }
 
-/// The current clock mode.
+/// Pacing tag matching the last [`init`] / [`set_scale`].
 pub fn mode() -> ClockMode {
-    if is_stepped() {
+    let numer = SCALE_NUMER.load(Ordering::Relaxed);
+    if numer == 0 {
         ClockMode::Stepped
     } else {
-        let numer = SCALE_NUMER.load(Ordering::Relaxed) as f64;
         let denom = SCALE_DENOM.load(Ordering::Relaxed).max(1) as f64;
         ClockMode::FreeRunning {
-            speed: numer / denom,
+            speed: numer as f64 / denom,
         }
     }
 }
 
-/// True when the clock is stepped — one relaxed load, cheap enough for the
-/// engine loop and every [`virtual_us`] call.
+/// Always `true`: there is only the counter. Kept so existing engine/tests
+/// that branched on mode keep compiling while they switch to the single loop.
 pub fn is_stepped() -> bool {
-    MODE.load(Ordering::Relaxed) == MODE_STEPPED
+    true
 }
 
-/// Change the time scale at runtime.
-/// Uses integer numerator/denominator to avoid floating point in the hot path.
-///
-/// **Loud no-op in stepped mode** (`DETERMINISM.md` T1 §1): scaling a clock the
-/// scheduler sets by hand is meaningless, and silently accepting it would make
-/// the caller believe time behaves differently than it does.
+/// True when jumps do not sleep (`speed <= 0`).
+pub fn is_unpaced() -> bool {
+    SCALE_NUMER.load(Ordering::Relaxed) == 0
+}
+
+/// Change wall-pacing scale. `scale <= 0` disables pacing.
 pub fn set_scale(scale: f64) {
-    if is_stepped() {
-        tracing::warn!(
-            scale,
-            "set_scale ignored: the clock is stepped, so virtual time is set by \
-             advance_to and has no wall-clock ratio to scale"
-        );
+    if scale <= 0.0 {
+        SCALE_NUMER.store(0, Ordering::Relaxed);
+        SCALE_DENOM.store(1, Ordering::Relaxed);
         return;
     }
     let precision = 1000u64;
     let numer = (scale * precision as f64) as u64;
-    let denom = precision;
-    SCALE_NUMER.store(numer, Ordering::Relaxed);
-    SCALE_DENOM.store(denom, Ordering::Relaxed);
+    SCALE_NUMER.store(numer.max(1), Ordering::Relaxed);
+    SCALE_DENOM.store(precision, Ordering::Relaxed);
 }
 
-/// True once `init` has run in this process. Time functions such as
-/// [`virtual_us`] panic before `init`; callers that must stay alive (e.g. a
-/// long-running engine thread validating a schedule request) check this
-/// first and fail the request loudly instead.
+/// True once `init` has run in this process.
 pub fn is_initialized() -> bool {
-    PROCESS_ORIGIN.get().is_some()
+    INITIALIZED.load(Ordering::Relaxed) != 0
 }
 
-/// Get virtual microseconds elapsed since the last `init`.
-///
-/// In [`ClockMode::Stepped`] this is one relaxed load of the value the
-/// scheduler last set with [`advance_to`] — no wall clock is sampled, which is
-/// the whole point.
-///
-/// # Panics
-/// In free-running mode, panics if [`init`] has not run (there is no origin to
-/// measure from). Stepped mode has no origin to need.
+/// Virtual microseconds since the last [`init`]. One relaxed load of the
+/// counter — never wall time.
 pub fn virtual_us() -> u64 {
-    if is_stepped() {
-        return NOW_US.load(Ordering::Relaxed);
-    }
-    let origin = PROCESS_ORIGIN.get().expect("Virtual clock not initialized");
-    let wall_us = (origin.elapsed().as_micros() as u64)
-        .saturating_sub(BOOT_OFFSET_US.load(Ordering::Relaxed));
-    let numer = SCALE_NUMER.load(Ordering::Relaxed);
-    let denom = SCALE_DENOM.load(Ordering::Relaxed);
-    wall_us * numer / denom
+    NOW_US.load(Ordering::Relaxed)
 }
 
 /// Get virtual milliseconds elapsed since boot.
@@ -291,12 +207,15 @@ pub fn virtual_ms() -> u64 {
     virtual_us() / 1000
 }
 
-/// Convert a virtual wait duration to a wall-clock sleep duration.
-/// If speed is 5x, a 1000us virtual wait becomes a 200us real sleep.
+/// Convert a virtual duration to a wall sleep for **pacing only**.
+/// Unpaced clocks (`speed <= 0`) return 0.
 pub fn virtual_to_wall_us(virtual_wait_us: u64) -> u64 {
     let numer = SCALE_NUMER.load(Ordering::Relaxed);
+    if numer == 0 {
+        return 0;
+    }
     let denom = SCALE_DENOM.load(Ordering::Relaxed);
-    virtual_wait_us * denom / numer.max(1)
+    virtual_wait_us * denom / numer
 }
 
 /// Get the simulated clock frequency.
@@ -322,16 +241,11 @@ fn park_wall_us(wall_us: u64) {
     if wall_us == 0 {
         return;
     }
-    if is_stepped() {
-        STEPPED_WALL_SLEEPS.fetch_add(1, Ordering::Relaxed);
-        tracing::error!(
-            wall_us,
-            "wall sleep while the clock is STEPPED: this wait is invisible to the \
-             quiescence barrier, so the scheduler may step past it \
-             (DETERMINISM.md T1 §4, 'Wall-clock deadlines inside the simulation')"
-        );
-    }
     std::thread::sleep(Duration::from_micros(wall_us));
+}
+
+fn apply_pace(dt_virtual_us: u64) {
+    park_wall_us(virtual_to_wall_us(dt_virtual_us));
 }
 
 /// How many real sleeps have been served while the clock was stepped — the
@@ -341,55 +255,21 @@ pub fn stepped_wall_sleep_count() -> u64 {
     STEPPED_WALL_SLEEPS.load(Ordering::Relaxed)
 }
 
-/// Park the caller for `d_us` of **virtual** time (a relative wait).
-///
-/// Free-running: the scaled wall equivalent, i.e. exactly
-/// `sleep(virtual_to_wall_us(d_us))`. Needs no clock origin, so it is safe
-/// before [`init`] — a wait span is pure scale arithmetic, unlike
-/// [`wait_until`], which must read the current time.
-///
-/// Stepped: exactly `wait_until(virtual_us() + d_us)`.
-///
-/// This is the sibling of [`wait_until`] for the many call sites that know how
-/// long to wait but not *when* they started (`HAL_time_waitUs`, a poll
-/// cadence, a receive timeout).
+/// Park until `virtual_us() + d_us`. `d_us == 0` returns immediately.
 pub fn wait_virtual_us(d_us: u64) {
     SLICE_USED_US.set(0);
-    if is_stepped() {
-        park_until_virtual(NOW_US.load(Ordering::Relaxed).saturating_add(d_us));
+    if d_us == 0 {
         return;
     }
-    park_wall_us(virtual_to_wall_us(d_us));
+    park_until_virtual(virtual_us().saturating_add(d_us));
 }
 
-/// Park the caller until virtual time reaches the absolute deadline
-/// `deadline_v_us`. Returns immediately when the deadline has already passed.
-///
-/// This is the form `DETERMINISM.md` Phase D1 swapped out: in stepped mode it
-/// registers a pending deadline, marks the caller parked (when the caller is a
-/// registered [`Actor`]), and blocks until the scheduler advances virtual time
-/// to it. Prefer it wherever the call site genuinely holds a deadline (a
-/// reserved wire slot, a scheduled edge) rather than a duration — an absolute
-/// deadline cannot drift, and it is the only form a discrete-event scheduler
-/// can serve.
-///
-/// **Stepped-mode liveness:** the park is released only by [`advance_to`]. A
-/// caller that parks in a process where nothing advances time never wakes. The
-/// deadline is published in [`SchedulerState::next_deadline_us`] precisely so a
-/// scheduler can guarantee it does.
-///
-/// # Panics
-/// In free-running mode, panics if [`init`] has not run — reading "now"
-/// requires the clock origin. Callers that must survive an uninitialized clock
-/// check [`is_initialized`] first, or use [`wait_virtual_us`].
+/// Park until virtual time reaches `deadline_v_us`. Returns immediately when
+/// the deadline has already passed. With a [`TimeAuthority`] held, only
+/// [`advance_to`] releases the park; without one, an idle jump moves `now`.
 pub fn wait_until(deadline_v_us: u64) {
     SLICE_USED_US.set(0);
-    if is_stepped() {
-        park_until_virtual(deadline_v_us);
-        return;
-    }
-    let now = virtual_us();
-    wait_virtual_us(deadline_v_us.saturating_sub(now));
+    park_until_virtual(deadline_v_us);
 }
 
 /// Park the caller for `d_us` of **real** time, bypassing the virtual clock.
@@ -405,7 +285,46 @@ pub fn wait_until(deadline_v_us: u64) {
 /// for this for anything the simulation's timing depends on; use [`wait_until`]
 /// or [`wait_virtual_us`].
 pub fn wait_wall_us(d_us: u64) {
+    if d_us == 0 {
+        return;
+    }
+    if is_unpaced() {
+        STEPPED_WALL_SLEEPS.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            wall_us = d_us,
+            "wall sleep while the clock is unpaced: this wait is invisible to the \
+             quiescence barrier, so the scheduler may jump past it \
+             (DETERMINISM.md T1 §4, 'Wall-clock deadlines inside the simulation')"
+        );
+    }
     park_wall_us(d_us);
+}
+
+/// RAII: while held, waiters must not idle-jump — someone (the net engine,
+/// or a test) will call [`advance_to`].
+///
+/// `Send` on purpose: this is a process-global refcount, not a thread binding.
+/// The engine handle carries one across `System::start`.
+#[derive(Debug)]
+pub struct TimeAuthority {
+    _priv: (),
+}
+
+impl Drop for TimeAuthority {
+    fn drop(&mut self) {
+        TIME_AUTHORITY.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Claim time authority so waiters do not idle-jump. Nested holds are counted
+/// (parallel engine tests, engine + test guard).
+pub fn take_time_authority() -> TimeAuthority {
+    TIME_AUTHORITY.fetch_add(1, Ordering::AcqRel);
+    TimeAuthority { _priv: () }
+}
+
+fn has_time_authority() -> bool {
+    TIME_AUTHORITY.load(Ordering::Acquire) != 0
 }
 
 /// Account for guest work on this thread (one HAL call ≈ 1 µs of slice).
@@ -498,15 +417,6 @@ fn lock_sched() -> MutexGuard<'static, Sched> {
     })
 }
 
-/// Names of every registered actor, in registration order.
-fn registered_actor_names() -> Vec<String> {
-    lock_sched()
-        .actors
-        .values()
-        .map(|state| state.name.clone())
-        .collect()
-}
-
 /// Registration handle for a thread that can create simulation work.
 ///
 /// Held for as long as the thread may do work; dropping it unregisters (so a
@@ -560,17 +470,16 @@ impl Drop for Actor {
 /// simulation work, and that the stepped scheduler must therefore wait for
 /// before advancing time (`DETERMINISM.md` T1 §4).
 ///
-/// Registration is free in free-running mode — nothing consults the registry
-/// there — so a model may register unconditionally and behave identically in
-/// both modes.
+/// Register unconditionally: the engine will not advance while any registered
+/// actor is runnable, and idle-jump is suppressed whenever a [`TimeAuthority`]
+/// is held.
 ///
 /// # Panics
 /// Panics if this thread is already registered. One thread is one actor; a
 /// nested registration means two owners disagree about who parks it.
 pub fn register_actor(name: &str) -> Actor {
     // Reject a double registration BEFORE touching the registry: a rejected
-    // call must leave no trace, or the panic itself leaks the actor it refused
-    // to create and every later `init_mode(Stepped)` fails.
+    // call must leave no trace.
     assert!(
         THREAD_ACTOR.with(|slot| slot.get().is_none()),
         "thread is already registered as a virtual-clock actor; \
@@ -603,12 +512,12 @@ pub fn registered_actors() -> usize {
     lock_sched().actors.len()
 }
 
-/// Park the calling thread until stepped "now" reaches `deadline_v_us`.
+/// Park the calling thread until "now" reaches `deadline_v_us`.
 fn park_until_virtual(deadline_v_us: u64) {
     let actor = THREAD_ACTOR.with(|slot| slot.get());
     let mut sched = lock_sched();
     if sched.now_us >= deadline_v_us {
-        return; // already due: never park, never yield
+        return;
     }
     let token = sched.next_token;
     sched.next_token += 1;
@@ -627,31 +536,35 @@ fn park_until_virtual(deadline_v_us: u64) {
     if quiescent {
         QUIESCENT.notify_all();
     }
+    let idle_to = if sched.running == 0 && !has_time_authority() {
+        sched.waits.keys().next().map(|&(t, _)| t)
+    } else {
+        None
+    };
+    if let Some(t) = idle_to {
+        drop(sched);
+        let _ = advance_to(t);
+        let mut sched = lock_sched();
+        while sched.now_us < deadline_v_us && sched.epoch == epoch {
+            sched = ADVANCED
+                .wait(sched)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        return;
+    }
     while sched.now_us < deadline_v_us && sched.epoch == epoch {
         sched = ADVANCED
             .wait(sched)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
-    // On the normal path `advance_to` already removed the wait entry and
-    // restored this actor's runnable accounting before releasing the lock — see
-    // its docs for why that ordering is load-bearing. An epoch bump
-    // (`init_mode`, an in-process restart) does the same wholesale, so there is
-    // nothing left to clean up either way.
 }
 
 /// Failure of [`advance_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvanceError {
-    /// The clock is free-running: nothing may set "now" by hand.
-    ///
-    /// (`DETERMINISM.md` T1 §1 sketches this as a single `TimeWentBackwards`
-    /// error; a one-variant error cannot express "you called this in the wrong
-    /// mode", which the implementation has to reject — see "Deviations from the
-    /// design doc".)
-    NotStepped,
     /// Virtual time may only move forward.
     WentBackwards {
-        /// Stepped "now" at the time of the call.
+        /// "now" at the time of the call.
         now_us: u64,
         /// The requested (earlier) time.
         requested_us: u64,
@@ -661,9 +574,6 @@ pub enum AdvanceError {
 impl std::fmt::Display for AdvanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AdvanceError::NotStepped => {
-                write!(f, "advance_to requires ClockMode::Stepped")
-            }
             AdvanceError::WentBackwards {
                 now_us,
                 requested_us,
@@ -686,9 +596,6 @@ impl std::error::Error for AdvanceError {}
 /// the window between "notified" and "actually rescheduled by the OS" and step
 /// straight past the instant it just woke someone for.
 pub fn advance_to(v_us: u64) -> Result<(), AdvanceError> {
-    if !is_stepped() {
-        return Err(AdvanceError::NotStepped);
-    }
     let mut sched = lock_sched();
     if v_us < sched.now_us {
         return Err(AdvanceError::WentBackwards {
@@ -696,6 +603,7 @@ pub fn advance_to(v_us: u64) -> Result<(), AdvanceError> {
             requested_us: v_us,
         });
     }
+    let dt = v_us - sched.now_us;
     sched.now_us = v_us;
     NOW_US.store(v_us, Ordering::Relaxed);
 
@@ -720,6 +628,7 @@ pub fn advance_to(v_us: u64) -> Result<(), AdvanceError> {
     }
     drop(sched);
     ADVANCED.notify_all();
+    apply_pace(dt);
     Ok(())
 }
 
@@ -863,18 +772,15 @@ mod tests {
         set_scale(1.0);
     }
 
-    /// A scale of 0.0 truncates the numerator to 0; `virtual_to_wall_us` must
-    /// clamp the divisor via `numer.max(1)` so it never divides by zero. The
-    /// result is therefore `wait * denom` (denom == 1000 internally).
+    /// `speed <= 0` is unpaced: jumps do not sleep.
     #[rstest]
-    fn scale_zero_is_clamped_no_divide_by_zero() {
+    fn scale_zero_is_unpaced() {
         let _g = lock_or_recover();
         set_scale(0.0);
-        // numer == 0 → clamped to 1 → wait * denom(1000) / 1.
-        assert_eq!(virtual_to_wall_us(1), 1000);
-        assert_eq!(virtual_to_wall_us(7), 7000);
-        // Restore a sane scale for any sibling that races on re-init.
+        assert_eq!(virtual_to_wall_us(1), 0);
+        assert_eq!(virtual_to_wall_us(7), 0);
         set_scale(1.0);
+        assert_eq!(virtual_to_wall_us(1000), 1000);
     }
 
     /// `virtual_to_wall_us(0)` is always 0 regardless of scale (no wait → no
@@ -966,30 +872,14 @@ mod tests {
         assert_eq!(virtual_cycles(), 0);
     }
 
-    /// With a non-zero frequency and advancing virtual time, `virtual_cycles`
-    /// is monotonic non-decreasing and eventually grows above zero. The exact
-    /// cycle count is wall-clock dependent and is deliberately NOT asserted.
+    /// With a non-zero frequency, cycles track `now * freq / 1e6`.
     #[rstest]
     fn virtual_cycles_grow_with_time_when_freq_nonzero() {
         let _g = lock_or_recover();
-        init(1.0, 180_000_000);
-        let mut last = virtual_cycles();
-        let mut grew = false;
-        for _ in 0..200_000 {
-            let now = virtual_cycles();
-            assert!(now >= last, "cycles went backwards");
-            if now > 0 {
-                grew = true;
-            }
-            last = now;
-            if grew {
-                break;
-            }
-        }
-        assert!(
-            grew,
-            "cycles should rise above zero as virtual time advances"
-        );
+        init(0.0, 1_000_000);
+        assert_eq!(virtual_cycles(), 0);
+        wait_virtual_us(10);
+        assert_eq!(virtual_cycles(), 10);
     }
 
     /// [`wait_virtual_us`] is exactly the old inline
@@ -1087,37 +977,41 @@ mod tests {
     /// Enter stepped mode for the duration of a test and restore free-running
     /// on the way out, panic or not. Takes the shared clock lock, so stepped
     /// and free-running cases in this binary can never overlap.
-    struct SteppedGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    struct SteppedGuard {
+        #[allow(dead_code)]
+        lock: std::sync::MutexGuard<'static, ()>,
+        #[allow(dead_code)]
+        auth: TimeAuthority,
+    }
 
     impl SteppedGuard {
         fn enter() -> Self {
-            let guard = lock_or_recover();
-            init_mode(ClockMode::Stepped, 1_000_000);
-            Self(guard)
+            let lock = lock_or_recover();
+            init(0.0, 1_000_000);
+            let auth = take_time_authority();
+            Self { lock, auth }
         }
     }
 
     impl Drop for SteppedGuard {
         fn drop(&mut self) {
-            init(1.0, 1_000_000);
+            init(0.0, 1_000_000);
         }
     }
 
-    /// The mode discriminant round-trips, and free-running is the default a
-    /// plain [`init`] selects — nothing about an existing consumer changes.
+    /// `init(speed)` is paced; `init(0)` / `init_mode(Stepped)` is unpaced.
     #[rstest]
-    fn init_selects_free_running_and_init_mode_selects_stepped() {
+    fn init_speed_selects_pacing() {
         let _g = lock_or_recover();
         init(2.0, 1_000_000);
-        assert!(!is_stepped());
         assert_eq!(mode(), ClockMode::FreeRunning { speed: 2.0 });
+        assert!(!is_unpaced());
+        assert_eq!(virtual_to_wall_us(1000), 500);
 
         init_mode(ClockMode::Stepped, 1_000_000);
-        assert!(is_stepped());
         assert_eq!(mode(), ClockMode::Stepped);
-
-        init(1.0, 1_000_000);
-        assert!(!is_stepped());
+        assert!(is_unpaced());
+        assert_eq!(virtual_to_wall_us(1000), 0);
     }
 
     /// The defining property of stepped mode: `virtual_us` is *only* what the
@@ -1142,41 +1036,32 @@ mod tests {
         assert_eq!(virtual_cycles(), 2_500_000, "1 MHz × 2.5 s");
     }
 
-    /// `advance_to` is monotonic, and rejected outright in free-running mode —
-    /// only a stepped clock has a "now" anyone may set.
+    /// `advance_to` is monotonic. Pacing does not change that.
     #[rstest]
-    fn advance_to_rejects_backwards_and_free_running() {
-        {
-            let _g = SteppedGuard::enter();
-            advance_to(500).expect("forward");
-            assert_eq!(
-                advance_to(499),
-                Err(AdvanceError::WentBackwards {
-                    now_us: 500,
-                    requested_us: 499
-                })
-            );
-            assert_eq!(virtual_us(), 500, "a rejected advance changes nothing");
-        }
-        let _g = lock_or_recover();
-        init(1.0, 1_000_000);
-        assert_eq!(advance_to(1), Err(AdvanceError::NotStepped));
+    fn advance_to_rejects_backwards() {
+        let _g = SteppedGuard::enter();
+        advance_to(500).expect("forward");
+        assert_eq!(
+            advance_to(499),
+            Err(AdvanceError::WentBackwards {
+                now_us: 500,
+                requested_us: 499
+            })
+        );
+        assert_eq!(virtual_us(), 500, "a rejected advance changes nothing");
     }
 
-    /// `set_scale` is a loud no-op while stepped: scaling a clock the scheduler
-    /// sets by hand is meaningless (`DETERMINISM.md` T1 §1).
+    /// `set_scale` changes pacing only, not `now`.
     #[rstest]
-    fn set_scale_is_a_no_op_in_stepped_mode() {
+    fn set_scale_changes_pacing_not_now() {
         let _g = SteppedGuard::enter();
         advance_to(1_000).expect("forward");
         set_scale(50.0);
-        assert_eq!(mode(), ClockMode::Stepped, "mode is unchanged");
         assert_eq!(virtual_us(), 1_000, "time is unchanged");
-        assert_eq!(
-            virtual_to_wall_us(1_000),
-            1_000,
-            "the scale ratio stays 1:1 in stepped mode"
-        );
+        assert_eq!(virtual_to_wall_us(1_000), 20, "50x compresses wall sleep");
+        set_scale(0.0);
+        assert!(is_unpaced());
+        assert_eq!(virtual_to_wall_us(1_000), 0);
     }
 
     /// A `wait_until` in stepped mode parks until the scheduler advances — it
@@ -1343,16 +1228,15 @@ mod tests {
         assert_eq!(stepped_wall_sleep_count(), before + 1);
     }
 
-    /// Entering stepped mode with an actor left over from a previous run is a
-    /// panic, not a warning: a leaked actor thread is exactly what would make
-    /// the next run's barrier lie.
+    /// Re-init with a still-registered actor is allowed (in-process restart);
+    /// the actor stays registered.
     #[rstest]
-    #[should_panic(expected = "still registered")]
-    fn entering_stepped_mode_with_a_leaked_actor_panics() {
+    fn reinit_with_a_live_actor_does_not_panic() {
         let _g = lock_or_recover();
-        init(1.0, 1_000_000);
-        let _leaked = register_actor("leaked-from-a-previous-run");
-        init_mode(ClockMode::Stepped, 1_000_000);
+        init(0.0, 1_000_000);
+        let _leaked = register_actor("still-running");
+        init(0.0, 1_000_000);
+        assert_eq!(registered_actors(), 1);
     }
 
     /// One thread is one actor: a nested registration means two owners

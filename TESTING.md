@@ -86,14 +86,12 @@ cargo llvm-cov --workspace --summary-only
    `virtual_clock::init` before every run of its N-run matrix, so it must not
    share a process with cases that assume a monotonically accumulating clock.
 
-   **Clock *mode* is process-global too, and stricter.** A binary that enters
-   `ClockMode::Stepped` must serialize every case behind one suite mutex
-   (`determinism.rs` and `stepped_clock.rs` both do) — two cases in different
-   modes at once measure each other. And `init_mode(Stepped)` **panics** if any
-   `virtual_clock` actor is still registered, so a binary whose cases create
-   components that spawn long-lived actor threads (the ADS122U04 model does)
-   must enter stepped mode before the first one exists. That is why
-   `ads122u04_stepped.rs` is its own binary with a single case.
+   **The clock is process-global.** A binary that re-`init`s (paced vs unpaced,
+   or a fresh `now = 0`) must serialize every case behind one suite mutex
+   (`determinism.rs` and `stepped_clock.rs` both do). Re-`init` with a live
+   actor is allowed — the actor stays registered — so a binary whose cases
+   spawn long-lived actor threads (the ADS122U04 model does) still belongs in
+   its own test binary so leftover actors cannot hold a later case's barrier.
 
    **The process-default peripheral banks are the same kind of global.** A case
    that plays firmware through the `embsim-peripherals` free functions
@@ -105,7 +103,7 @@ cargo llvm-cov --workspace --summary-only
    pure board components, and a global bank underneath them would make an
    unrelated failure look like a determinism regression.
 
-6. **Property tests (`proptest`)** only for continuous domains (e.g. MNA
+6. **Property tests (`proptest`)** only for continuous domains (e.g. analog
    resistor ladders). Use fixed seeds when non-determinism would flake CI.
 
 7. **Strengthen, don't weaken.** Rewrites and refactors must keep or tighten

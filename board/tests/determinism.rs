@@ -2,25 +2,14 @@
 //! event logs, and compare them (`DETERMINISM.md`, "Proving it: determinism
 //! testing" → "Tests").
 //!
-//! **Phase D1 turned the D0 measurement into an assertion.** The binary now
-//! runs every case in *both* clock modes and holds each to what its mode can
-//! actually promise:
+//! **One counter.** Every case is a discrete-event run: `virtual_us` is the
+//! value the engine set. The full projection ([`EventLog::normalized`]),
+//! `v_us` included, must be **identical across N runs**, in-process *and*
+//! across separate processes, and must match a blessed golden trace.
 //!
-//! - **Stepped** ([`virtual_clock::ClockMode::Stepped`]) — the full projection
-//!   ([`EventLog::normalized`]), `v_us` included, must be **identical across N
-//!   runs**, in-process *and* across separate processes, and must match a
-//!   blessed golden trace. Virtual timestamps are integers the engine chose, so
-//!   any drift is a regression, not noise.
-//! - **Free-running** — the timestamp-free projection
-//!   ([`EventLog::normalized_shape`]) is asserted, and the timestamped
-//!   divergence is **reported with numbers**, exactly as at D0. This is the
-//!   negative control `DETERMINISM.md` asks for: asserting timestamps here
-//!   would freeze the clock in the wrong mode and quietly stop the suite from
-//!   testing determinism at all.
-//!
-//! The contrast between those two is the point of the slice, and
-//! [`wake_ladder_timestamps_differ_free_running_but_not_stepped`] asserts it
-//! directly: the same scenario, one mode identical and the other not.
+//! Pacing (`init(speed > 0)`) only sleeps the host after a jump; it must not
+//! change virtual timestamps. [`wake_ladder_timestamps_match_paced_and_unpaced`]
+//! asserts that.
 //!
 //! Its own test binary per `TESTING.md` rule 5, and every case here takes
 //! [`suite_lock`]: the cases pin the process-global virtual clock *and its
@@ -66,8 +55,8 @@ fn suite_lock() -> MutexGuard<'static, ()> {
     })
 }
 
-/// Puts the process-global clock in stepped mode for the lifetime of the guard
-/// and restores free-running on the way out, panic or not.
+/// Puts the process-global clock in unpaced mode for the lifetime of the guard
+/// and restores paced `init(1.0)` on the way out, panic or not.
 struct Stepped;
 
 impl Stepped {
@@ -684,54 +673,36 @@ fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
     stepped_matrix(case);
 }
 
-/// The free-running baseline, still observational: order is asserted, the
-/// timestamp divergence is printed. `DETERMINISM.md` calls this the negative
-/// control — without it, someone "fixes" a flake by freezing the clock in the
-/// wrong mode and the suite quietly stops testing anything.
+/// Paced (`init(speed > 0)`) runs must match on **order**. Virtual timestamps
+/// are still the counter, so they should match too; the printout stays as a
+/// measurement if a future regression reintroduces wall coupling.
 #[rstest]
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::paced_stream("paced_stream")]
 #[case::stream_drop("stream_drop_every_nth")]
 #[case::wake_ladder("wake_ladder")]
-fn free_running_order_is_reproducible_but_timestamps_are_not_asserted(#[case] case: &str) {
+fn paced_order_is_reproducible(#[case] case: &str) {
     let _suite = suite_lock();
     free_running_matrix(case);
 }
 
-/// **The contrast that is the point of the slice.** One scenario, two modes:
-/// free-running produces timestamped logs that differ, stepped produces
-/// timestamped logs that are byte-identical.
-///
-/// The wake ladder is the case that can show this, because its events are
-/// stamped at instants the *clock* chooses rather than at whatever instant a
-/// scripted drive happened to be enqueued. If free-running ever stopped
-/// diverging here, this test would fail — and it should: it would mean the
-/// comparison had gone vacuous, not that free-running had become
-/// deterministic.
+/// One counter: paced (`init(1.0)`) and unpaced (`init(0.0)`) produce the
+/// same virtual timestamps. Pacing only sleeps the host after a jump.
 #[rstest]
-fn wake_ladder_timestamps_differ_free_running_but_not_stepped() {
+fn wake_ladder_timestamps_match_paced_and_unpaced() {
     let _suite = suite_lock();
 
-    // Free-running: same order, different timestamps.
     virtual_clock::init(1.0, 1_000_000);
-    let free_a = run_case("wake_ladder");
-    virtual_clock::init(1.0, 1_000_000);
-    let free_b = run_case("wake_ladder");
+    let paced = run_case("wake_ladder").normalized();
+    virtual_clock::init(0.0, 1_000_000);
+    let unpaced = run_case("wake_ladder").normalized();
     assert_identical(
-        "wake_ladder (free-running)",
-        "ORDER (timestamp-free projection)",
-        &[free_a.normalized_shape(), free_b.normalized_shape()],
-    );
-    let free = diverge(&free_a.normalized(), &free_b.normalized());
-    assert!(
-        free.first_index.is_some(),
-        "free-running timestamps were identical across two runs — either the host \
-         is impossibly quiet or the clock is no longer sampling wall time, and in \
-         both cases the stepped comparison below has stopped proving anything"
+        "wake_ladder (paced vs unpaced)",
+        "FULL timestamped projection",
+        &[paced, unpaced],
     );
 
-    // Stepped: identical, timestamps included.
     let stepped_a = {
         let _stepped = Stepped::enter();
         run_case("wake_ladder").normalized()
@@ -741,14 +712,12 @@ fn wake_ladder_timestamps_differ_free_running_but_not_stepped() {
         run_case("wake_ladder").normalized()
     };
     assert_identical(
-        "wake_ladder (stepped)",
+        "wake_ladder (unpaced repeat)",
         "FULL timestamped projection",
         &[stepped_a.clone(), stepped_b],
     );
 
-    // And the timestamps are the ladder's arithmetic, not merely equal: the
-    // k-th wake lands at exactly k · period, which is the property free-running
-    // cannot have.
+    // The k-th wake lands at exactly k · period — integers the engine chose.
     let wake_stamps: Vec<u64> = stepped_a
         .iter()
         .filter(|line| line.contains(" wake component="))
@@ -764,14 +733,10 @@ fn wake_ladder_timestamps_differ_free_running_but_not_stepped() {
         .collect();
     assert_eq!(
         wake_stamps, expected,
-        "stepped wakeups must land exactly on their scheduled deadlines"
+        "wakeups must land exactly on their scheduled deadlines"
     );
 
-    println!(
-        "[contrast] wake_ladder: free-running diverges at record {:?}; \
-         stepped is byte-identical with wakes at {expected:?} µs",
-        free.first_index
-    );
+    println!("[one-counter] wake_ladder wakes at {expected:?} µs paced and unpaced");
 }
 
 // ============================================================

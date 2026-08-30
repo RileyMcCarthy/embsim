@@ -528,9 +528,7 @@ fn a_step_train_reaches_the_drive_as_a_rate_with_an_exact_count() {
 #[rstest]
 fn a_mid_train_reversal_splits_the_count_at_the_instant_dir_changed() {
     let _suite = suite_lock();
-    // 100x so a few milliseconds of wall time is a few hundred thousand
-    // pulses of virtual time; the assertions below are exact regardless.
-    virtual_clock::init(100.0, 1_000_000);
+    virtual_clock::init(0.0, 1_000_000);
     let rig = rig(false);
     rig.await_trains(1);
 
@@ -540,8 +538,8 @@ fn a_mid_train_reversal_splits_the_count_at_the_instant_dir_changed() {
     assert_eq!(forward.direction, PulseDirection::Forward);
     assert_eq!(forward.pulses.total, None, "a velocity train is unbounded");
 
-    // Let real pulses accumulate, then reverse.
-    std::thread::sleep(Duration::from_millis(5));
+    // Jump virtual time so pulses accumulate, then reverse.
+    virtual_clock::wait_virtual_us(5_000);
     gpio::set_active(DIR_CHANNEL, true);
     let reverse = rig.await_trains(3)[2];
 
@@ -568,7 +566,7 @@ fn a_mid_train_reversal_splits_the_count_at_the_instant_dir_changed() {
     // re-anchors against the peripheral's own live count, so the handover is
     // exact to within the one pulse of phase a re-anchor costs — the fidelity
     // limit `PulseTrain` documents, asserted here rather than assumed.
-    std::thread::sleep(Duration::from_millis(5));
+    virtual_clock::wait_virtual_us(5_000);
     gpio::set_active(DIR_CHANNEL, false);
     let again = rig.await_trains(4)[3];
     assert_eq!(again.direction, PulseDirection::Forward);
@@ -755,21 +753,21 @@ const ENGINE_EVENT_CEILING: usize = 64;
 #[rstest]
 fn a_realistic_step_rate_costs_a_bounded_number_of_engine_events() {
     let _suite = suite_lock();
-    // 200x: a few milliseconds of wall time is seconds of virtual time, so
-    // the pulse count below is large while the event count is not.
-    virtual_clock::init(200.0, 1_000_000);
+    virtual_clock::init(0.0, 1_000_000);
     let rig = rig(true);
     let log = rig.system.event_log();
     rig.await_trains(1);
 
     // A four-segment profile at 1 mm/s, 2 mm/s, 1 mm/s, stop.
+    // Each segment lasts 1 virtual second so the pulse count is realistic
+    // while the engine-event count stays a handful of rate changes.
     gpio::set_active(ENA_CHANNEL, true);
     pulse_out::start_velocity(0, STEPS_PER_MM as u32);
-    std::thread::sleep(Duration::from_millis(10));
+    virtual_clock::wait_virtual_us(1_000_000);
     pulse_out::set_frequency(0, 2 * STEPS_PER_MM as u32);
-    std::thread::sleep(Duration::from_millis(10));
+    virtual_clock::wait_virtual_us(1_000_000);
     pulse_out::set_frequency(0, STEPS_PER_MM as u32);
-    std::thread::sleep(Duration::from_millis(10));
+    virtual_clock::wait_virtual_us(1_000_000);
     pulse_out::stop(0);
 
     // IDLE + start + two retargets + stop.

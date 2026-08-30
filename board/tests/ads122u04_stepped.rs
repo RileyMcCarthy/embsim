@@ -15,11 +15,10 @@
 //! carries the right value; it deliberately does not assert an identical event
 //! log. Making that hold is `DETERMINISM.md` Phase D2's in-process transport.
 //!
-//! Its own test binary per `TESTING.md` rule 5, and necessarily so: creating an
+//! Its own test binary per `TESTING.md` rule 5: creating an
 //! [`Ads122u04Component`] starts a protocol thread that lives for the rest of
-//! the process, and `virtual_clock::init_mode(Stepped)` refuses to run with a
-//! leftover actor registered. Stepped mode must therefore be entered before any
-//! such component exists, which only a dedicated binary can guarantee.
+//! the process, and a leftover actor would hold a later case's quiescence
+//! barrier.
 
 use rstest::rstest;
 use std::sync::{Arc, Mutex};

@@ -45,21 +45,15 @@ A trampoline (and the generic peripheral behind it) must **never call
 
 | call | use for |
 |---|---|
-| `wait_until(deadline_v_us)` | an absolute virtual deadline the caller already holds (a reserved wire slot) |
-| `wait_virtual_us(d_us)` | a relative span of virtual time (`HAL_time_waitMs`/`waitUs`, a receive timeout, a poll cadence) |
-| `wait_wall_us(d_us)` | a wait that is real time **by nature** — the retry interval of a spin on a host fd, a startup warm-up |
+| `wait_until(deadline_v_us)` | park until the virtual counter reaches the deadline |
+| `wait_virtual_us(d_us)` | park until `now + d_us` |
+| `wait_wall_us(d_us)` | real host sleep (fd retry, warm-up). Unpaced runs trip `stepped_wall_sleep_count` |
 
-Two reasons this is a contract and not a style preference. A raw sleep ignores
-the emulator's time scale, so `--speed 50` silently stops applying to whatever
-the trampoline waits on. And the virtual forms are the seam
-[`DETERMINISM.md`](DETERMINISM.md) Phase D1 **already** replaced: in
-`ClockMode::Stepped` they park the caller until the engine advances virtual time
-to the deadline. A direct sleep is invisible to that — it neither holds time
-back nor gets released by it — so under a stepped clock it becomes a hang or a
-skipped instant. Reach for `wait_wall_us` only when the wait genuinely tracks
-host time, and say so in a comment: in stepped mode every such call is counted
-by `virtual_clock::stepped_wall_sleep_count()` and logged at error level, and
-the determinism suite asserts that count stays at zero.
+`virtual_us` is a **counter**. The engine (or an idle jump when nobody holds
+time authority) is the only writer, via `advance_to`. `--speed` only sleeps
+the host *after* a jump (`speed <= 0` = instant). A raw `thread::sleep` in a
+trampoline ignores that and can hang or skip an instant. Reach for
+`wait_wall_us` only when the wait genuinely tracks host time.
 
 ### Threads that can create work must register
 
@@ -71,9 +65,9 @@ let _actor = embsim_core::virtual_clock::register_actor("my-protocol-thread");
 ```
 
 The guard is `!Send` (drop it on the thread that took it) and unregisters on
-drop, including on unwind. Registration is free in free-running mode — nothing
-consults the registry there — so register unconditionally. Firmware threads
-spawned through `HAL_system_startThread` register as `core-N`.
+drop, including on unwind. Register unconditionally: the engine will not
+advance while any registered actor is runnable. Firmware threads spawned
+through `HAL_system_startThread` register as `core-N`.
 
 Native firmware is host machine code, so the emulator cannot preempt it
 except at a HAL trampoline. Every HAL entry **charges** one unit of the
@@ -82,7 +76,7 @@ trampoline parks via `wait_virtual_us`. Firmware may spin (`LOCKTRY`,
 UART poll) with no yield macros. A cog that never hits HAL still cannot
 be stopped — that is an ISS problem.
 
-In stepped mode the engine will not advance virtual time while any registered
+The engine will not advance virtual time while any registered
 actor is runnable, which is what stops a thread executing "later" work at an
 earlier virtual instant. An **unregistered** thread that parks through
 `wait_until` is still released correctly (its deadline is visible to the

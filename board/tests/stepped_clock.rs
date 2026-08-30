@@ -40,7 +40,7 @@ fn suite_lock() -> MutexGuard<'static, ()> {
     })
 }
 
-/// Stepped mode for the lifetime of the guard; free-running afterwards.
+/// Unpaced mode for the lifetime of the guard; paced `init(1.0)` afterwards.
 struct Stepped;
 
 impl Stepped {
