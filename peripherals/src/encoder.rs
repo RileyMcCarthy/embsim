@@ -63,11 +63,17 @@ impl Encoder {
         trace!("encoder::start(channel={})", channel);
     }
 
+    /// Configured channel count.
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// Get the current encoder value.
     pub fn value(&self, channel: usize) -> i32 {
         if channel < self.count.load(Ordering::Relaxed) {
             self.values[channel].load(Ordering::Relaxed)
         } else {
+            crate::access::report("encoder", &format!("value channel {channel}"));
             0
         }
     }
@@ -77,6 +83,8 @@ impl Encoder {
         if channel < self.count.load(Ordering::Relaxed) {
             self.values[channel].store(val, Ordering::Relaxed);
             trace!("encoder::set(channel={}, value={})", channel, val);
+        } else {
+            crate::access::report("encoder", &format!("set channel {channel}"));
         }
     }
 }

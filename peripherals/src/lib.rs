@@ -13,6 +13,7 @@
 //! exactly as before, while multi-MCU consumers create one instance per MCU
 //! and bind the threads that run its firmware (see `crate::instance`).
 
+pub mod access;
 pub mod encoder;
 pub mod filesystem;
 pub mod gpio;
