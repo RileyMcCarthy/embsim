@@ -45,6 +45,7 @@ pub mod mcu;
 pub mod net;
 pub mod netlist;
 pub mod registry;
+mod serial_levels;
 pub mod system;
 pub mod uart;
 

@@ -185,6 +185,22 @@ impl UartDecoder {
         }
     }
 
+    /// The instant the in-progress frame completes, if one is open.
+    ///
+    /// An owner that only hears about *transitions* has to arm a timer for
+    /// this, or a frame whose tail is silent never closes — `0xFF` ends with
+    /// its stop bit at the same level as its last data bit, so nothing more
+    /// arrives to prompt a [`Self::poll`].
+    pub fn frame_deadline_ns(&self) -> Option<u64> {
+        self.frame_start_ns
+            .map(|start| start + self.framing.frame_ns())
+    }
+
+    /// Whether a decoded frame is waiting, without advancing time.
+    pub fn has_pending(&self) -> bool {
+        !self.done.is_empty()
+    }
+
     /// Advance virtual time and take the next decoded frame, if any.
     pub fn poll(&mut self, now_ns: u64) -> Option<Result<u8, FramingError>> {
         if let Some(start) = self.frame_start_ns {
@@ -366,6 +382,23 @@ mod tests {
             got.push(frame);
         }
         assert_eq!(got, vec![Ok(0x55), Ok(0xAA), Ok(0x00), Ok(0xFF), Ok(0x01)]);
+    }
+
+    #[test]
+    fn the_frame_deadline_is_how_a_silent_tail_gets_closed() {
+        let framing = UartFraming::new_8n1(115_200);
+        let mut dec = UartDecoder::new(framing);
+        assert_eq!(dec.frame_deadline_ns(), None, "no frame, no deadline");
+
+        dec.on_level(Level::Low, 7_000);
+        assert_eq!(dec.frame_deadline_ns(), Some(7_000 + framing.frame_ns()));
+
+        // 0xFF: the start bit is the only transition in the whole frame, so
+        // the deadline is the only thing that can close it.
+        dec.on_level(Level::High, 7_000 + framing.bit_period_ns);
+        assert_eq!(dec.frame_deadline_ns(), Some(7_000 + framing.frame_ns()));
+        assert_eq!(dec.poll(dec.frame_deadline_ns().unwrap()), Some(Ok(0xFF)));
+        assert_eq!(dec.frame_deadline_ns(), None);
     }
 
     #[test]
