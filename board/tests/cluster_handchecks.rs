@@ -1,4 +1,4 @@
-//! MNA hand-checked reference circuits (`BOARD_ENGINE.md` "Testing
+//! SPICE `.op` hand-checked reference circuits (`BOARD_ENGINE.md` "Testing
 //! conventions": hand-computed reference circuits asserted to µV).
 //!
 //! Each test states its closed-form hand calculation next to the assertion;
@@ -9,7 +9,7 @@
 
 use embsim_board::{
     Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource, NetId,
-    NetState, QuasiStaticMna, Volts,
+    NetState, Spice, Volts,
 };
 use rstest::rstest;
 
@@ -52,7 +52,7 @@ fn divider_47r_over_4k7_matches_closed_form() {
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 0.0), source(2, 0.0, 0.0)],
     };
-    let solution = QuasiStaticMna.solve(&cluster, &inputs);
+    let solution = Spice.solve(&cluster, &inputs);
     let expected_mid = 3.3 * 4_700.0 / 4_747.0;
     assert!((analog_volts(&solution, NetId(1)) - expected_mid).abs() < 1e-6);
     assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-6);
@@ -91,7 +91,7 @@ fn wheatstone_bridge_mad_strain_gauge_matches_bridge_equation() {
     let inputs = ClusterInputs {
         sources: vec![source(0, v_exc, 0.0), source(1, 0.0, 0.0)],
     };
-    let solution = QuasiStaticMna.solve(&cluster, &inputs);
+    let solution = Spice.solve(&cluster, &inputs);
 
     let v_sig_p = analog_volts(&solution, NetId(2));
     let v_sig_n = analog_volts(&solution, NetId(3));
@@ -125,7 +125,7 @@ fn stiff_sources_fighting_through_series_resistor_sit_between_rails() {
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 25.0), source(1, 0.0, 25.0)],
     };
-    let solution = QuasiStaticMna.solve(&cluster, &inputs);
+    let solution = Spice.solve(&cluster, &inputs);
 
     let v_a = analog_volts(&solution, NetId(0));
     let v_b = analog_volts(&solution, NetId(1));
@@ -153,7 +153,7 @@ fn disconnected_island_reports_floating_only_for_unsourced_nodes() {
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 25.0)],
     };
-    let solution = QuasiStaticMna.solve(&cluster, &inputs);
+    let solution = Spice.solve(&cluster, &inputs);
 
     assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-6);
     assert!((analog_volts(&solution, NetId(1)) - 3.3).abs() < 1e-6);

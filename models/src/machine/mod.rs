@@ -28,11 +28,9 @@
 //!   (`schedule_at` / `schedule_every`). Idle components cost nothing
 //!   (`BOARD_ENGINE.md`, "Execution model").
 //! - **State is computed at read time**, in closed form, from the virtual
-//!   clock — never integrated per tick. In the default (free-running) clock
-//!   mode `embsim_core::virtual_clock` is scaled wall time, so a per-tick
-//!   integrator's answer would depend on how often anyone looked; a closed
-//!   form is immune, and is also what makes these parts correct unchanged
-//!   under the stepped clock of `DETERMINISM.md` Phase D1.
+//!   clock — never integrated per tick. `virtual_us` is a counter the engine
+//!   advances; a per-tick integrator's answer would depend on how often
+//!   anyone looked, while a closed form does not.
 //! - **Split into a `Component` and a cheap handle.** The `Component` is
 //!   moved into the [`embsim_board::System`]; the handle
 //!   ([`stepper_motor::MotorShaft`], [`quadrature_encoder::EncoderInput`],

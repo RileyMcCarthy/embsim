@@ -35,6 +35,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use tracing::info;
 
+pub use embsim_core::profile::{AnalogBackend, CpuBackend, ParseProfileError, SimProfile};
+
 /// MCU/platform constants. Implemented by a platform crate (e.g. `embsim-p2`).
 pub trait Platform {
     /// System clock frequency in Hz (drives `virtual_clock` cycle math).
@@ -114,6 +116,8 @@ pub enum EmulatorError {
     },
     /// Host serial PTY could not be created.
     Pty(std::io::Error),
+    /// [`CpuBackend::Iss`] was requested and no ISS MCU is linked.
+    IssUnavailable,
 }
 
 impl fmt::Display for EmulatorError {
@@ -145,6 +149,11 @@ impl fmt::Display for EmulatorError {
                 "{peripheral} channel count {requested} exceeds the maximum {max}"
             ),
             EmulatorError::Pty(e) => write!(f, "failed to create host serial PTY: {e}"),
+            EmulatorError::IssUnavailable => write!(
+                f,
+                "CpuBackend::Iss was requested, but no ISS MCU implementation \
+                 is registered (embsim-p2-iss is not implemented yet)"
+            ),
         }
     }
 }
@@ -180,6 +189,7 @@ pub struct EmulatorBuilder {
     entry: Option<EntryFn>,
     on_wired: Option<WiredHook>,
     clock_speed: f64,
+    profile: SimProfile,
     host_pty: String,
     sd_path: String,
     host_serial_baud: u32,
@@ -219,8 +229,23 @@ impl EmulatorBuilder {
     }
 
     /// Time scale (1.0 = real-time, 5.0 = 5× faster). Default 1.0.
+    ///
+    /// Only applied when the profile's clock is free-running ([`SimProfile::LIVE`]).
+    /// Stepped profiles ignore it.
     pub fn clock_speed(mut self, speed: f64) -> Self {
         self.clock_speed = speed;
+        self
+    }
+
+    /// Apply a simulation profile. This builder uses **clock** and **cpu**;
+    /// analog is applied by `embsim-board` `System::profile` (or
+    /// `System::cluster_solver`) — thread the same value through both, or
+    /// set the axes independently.
+    ///
+    /// [`CpuBackend::Iss`] fails at [`Emulator::run`] until an ISS MCU is
+    /// registered. Analog is not applied here.
+    pub fn profile(mut self, profile: SimProfile) -> Self {
+        self.profile = profile;
         self
     }
 
@@ -267,6 +292,7 @@ impl EmulatorBuilder {
             entry,
             on_wired: self.on_wired,
             clock_speed: self.clock_speed,
+            profile: self.profile,
             sd_path: self.sd_path,
             host_serial_baud: self.host_serial_baud,
             pty,
@@ -282,6 +308,7 @@ pub struct Emulator {
     entry: EntryFn,
     on_wired: Option<WiredHook>,
     clock_speed: f64,
+    profile: SimProfile,
     sd_path: String,
     host_serial_baud: u32,
     pty: Pty,
@@ -298,6 +325,7 @@ impl Emulator {
             entry: None,
             on_wired: None,
             clock_speed: 1.0,
+            profile: SimProfile::LIVE,
             host_pty: "/tmp/tty.sim_client".to_string(),
             sd_path: "./sd".to_string(),
             host_serial_baud: 0,
@@ -323,10 +351,16 @@ impl Emulator {
             entry,
             on_wired,
             clock_speed,
+            profile,
             sd_path,
             host_serial_baud,
             pty,
         } = self;
+
+        info!(profile = %profile, "simulation profile");
+        if profile.cpu == CpuBackend::Iss {
+            return Err(EmulatorError::IssUnavailable);
+        }
 
         // 0. Preflight: probe every symbol the machine needs and report ALL
         //    missing ones at once, before any lookup can panic mid-startup.
@@ -341,7 +375,11 @@ impl Emulator {
         }
 
         // 1. Virtual clock first — every timer/serial call depends on it.
-        virtual_clock::init(clock_speed, platform.clock_freq_hz());
+        //    Stepped profiles ignore `clock_speed`; live uses it as the scale.
+        virtual_clock::init_mode(
+            profile.with_speed(clock_speed).clock,
+            platform.clock_freq_hz(),
+        );
 
         // 2. Size peripherals from the machine's firmware-derived counts,
         //    validating each against its backing array's hard ceiling.

@@ -65,6 +65,11 @@ const ENCODER_TABLE: [EncoderChannelConfig; 1] = [EncoderChannelConfig {
 const MOVE_STEPS: u32 = 100;
 /// Step rate of each leg.
 const STEP_HZ: u32 = 20_000;
+/// Virtual duration of one `MOVE_STEPS` train at [`STEP_HZ`].
+const TRAIN_US: u64 = MOVE_STEPS as u64 * 1_000_000 / STEP_HZ as u64;
+/// Coast after the last pulse so the first-order lag (`tau_s = 0.5 ms`)
+/// settles. ~20 τ.
+const SETTLE_US: u64 = 10_000;
 
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
@@ -117,7 +122,7 @@ fn home_encoder(system: &SystemHandle) {
 /// The whole axis, wired by description alone.
 #[rstest]
 fn the_carriage_seam_closes_through_real_pins() {
-    virtual_clock::init(1.0, 1_000_000);
+    virtual_clock::init(0.0, 1_000_000);
     gpio::init(GPIO_TABLE.len(), None);
     pulse_out::init(PULSE_TABLE.len());
     encoder::init(ENCODER_TABLE.len());
@@ -135,10 +140,11 @@ fn the_carriage_seam_closes_through_real_pins() {
 
     // One count per step and no load, so the assertions are about the loop
     // rather than about the plant's own parameters (which are unit-tested in
-    // `embsim-models`). A lag well under the step interval, and an observation
-    // cadence fine enough that the encoder walks every count.
+    // `embsim-models`). Lag is well under the 50 µs step interval so the
+    // encoder tracks commanded counts; observe cadence is fine enough that
+    // the Gray walk hits every count.
     let motor = StepperMotor::new(stepper_motor::Config {
-        tau_s: 0.000_5,
+        tau_s: 1e-6,
         load_loss: 0.0,
         // The machine's convention, stated on the drive: DIR high = reverse.
         dir_forward_level: Level::Low,
@@ -191,6 +197,10 @@ fn the_carriage_seam_closes_through_real_pins() {
 
     // --- forward leg ----------------------------------------------------
     pulse_out::start(0, MOVE_STEPS, STEP_HZ);
+    // Jump virtual time through the train and the lag; wall sleep does not
+    // move the counter (and an unpaced run would otherwise race years ahead
+    // while the plant was still mid-train).
+    virtual_clock::wait_virtual_us(TRAIN_US + SETTLE_US);
     assert!(
         wait_for(
             || shaft.commanded_steps() == i64::from(MOVE_STEPS),
@@ -209,8 +219,11 @@ fn the_carriage_seam_closes_through_real_pins() {
             || encoder::value(0) == MOVE_STEPS as i32,
             Duration::from_secs(5)
         ),
-        "the firmware's encoder bank must reach {MOVE_STEPS} counts, got {}",
-        encoder::value(0)
+        "the firmware's encoder bank must reach {MOVE_STEPS} counts, got {} \
+         (commanded={} pos={:.3})",
+        encoder::value(0),
+        shaft.commanded_steps(),
+        shaft.position_counts(),
     );
     assert_eq!(
         input.snapped_updates(),
@@ -232,6 +245,7 @@ fn the_carriage_seam_closes_through_real_pins() {
     );
 
     pulse_out::start(0, MOVE_STEPS, STEP_HZ);
+    virtual_clock::wait_virtual_us(TRAIN_US + SETTLE_US);
     assert!(
         wait_for(|| shaft.commanded_steps() == 0, Duration::from_secs(5)),
         "{MOVE_STEPS} forward then {MOVE_STEPS} reverse is zero commanded \

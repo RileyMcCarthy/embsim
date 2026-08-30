@@ -29,8 +29,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use embsim_core::profile::{AnalogBackend, SimProfile};
+
 use crate::board::{Board, BoardError, PartClass};
-use crate::cluster::QuasiStaticMna;
+use crate::cluster::ClusterSolver;
+#[cfg(feature = "spice")]
+use crate::cluster::Spice;
 use crate::component::{Component, ComponentNetIo, PinDecl, PinHandle, PinKind, StreamRole};
 use crate::diagnostics::{Diagnostics, Finding};
 use crate::engine::{
@@ -331,7 +335,7 @@ impl Scenario {
 // ============================================================
 
 /// System builder: named boards + bench components + harnesses + scenario.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct System {
     boards: Vec<(String, Board)>,
     bench: Vec<BenchComponent>,
@@ -343,6 +347,20 @@ pub struct System {
     /// Stepped-clock quiescence timeout override; `None` uses the engine
     /// default. See [`System::quiescence_timeout`].
     quiescence_timeout: Option<Duration>,
+    /// Bundled analog backend. Ignored when [`System::cluster_solver`] was set.
+    analog: AnalogBackend,
+    /// Custom solver injected by the consumer. Wins over [`Self::analog`].
+    solver: Option<Box<dyn ClusterSolver>>,
+}
+
+impl fmt::Debug for System {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("System")
+            .field("boards", &self.boards)
+            .field("analog", &self.analog)
+            .field("custom_solver", &self.solver.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A bench component: a bare [`Component`] added to the system without a
@@ -441,14 +459,38 @@ impl System {
     /// `embsim_core::virtual_clock` actor to park before reporting
     /// [`Finding::QuiescenceTimeout`] and advancing anyway.
     ///
-    /// **Stepped clock mode only**; ignored while free-running. The default
-    /// ([`crate::engine::STEPPED_QUIESCENCE_TIMEOUT`]) is deliberately
-    /// generous — reaching it means a defect, and the finding says the run is
-    /// no longer reproducible. Raise it for a consumer whose actors do heavy
-    /// work between parks; lower it in a test that means to provoke the
-    /// stall.
+    /// The default ([`crate::engine::STEPPED_QUIESCENCE_TIMEOUT`]) is
+    /// deliberately generous — reaching it means a defect, and the finding
+    /// says the run is no longer reproducible. Raise it for a consumer whose
+    /// actors do heavy work between parks; lower it in a test that means to
+    /// provoke the stall.
     pub fn quiescence_timeout(mut self, timeout: Duration) -> Self {
         self.quiescence_timeout = Some(timeout);
+        self
+    }
+
+    /// Apply a simulation profile's **analog** axis only.
+    ///
+    /// Clock and CPU belong to the emulator builder. Thread the same
+    /// [`SimProfile`] value through both, or set axes independently.
+    pub fn profile(mut self, profile: SimProfile) -> Self {
+        self.analog = profile.analog;
+        self
+    }
+
+    /// Set the bundled analog backend (`SpiceOp` / `SpiceTran` / `Off`).
+    pub fn analog(mut self, analog: AnalogBackend) -> Self {
+        self.analog = analog;
+        self
+    }
+
+    /// Inject any [`ClusterSolver`]. Wins over [`System::analog`].
+    ///
+    /// This is the generic analog seam: a consumer that is not using ngspice
+    /// (or is using a different analog engine) never has to extend
+    /// [`AnalogBackend`].
+    pub fn cluster_solver(mut self, solver: Box<dyn ClusterSolver>) -> Self {
+        self.solver = Some(solver);
         self
     }
 
@@ -471,7 +513,8 @@ impl System {
     /// sensing components immediately, before any traffic. Components are
     /// attached with inert I/O handles for facade validation and dropped —
     /// use [`System::start`] to keep them running against the live engine.
-    pub fn build(self) -> Result<BuiltSystem, SystemError> {
+    pub fn build(mut self) -> Result<BuiltSystem, SystemError> {
+        let solver = self.take_solver()?;
         let Assembly {
             mut nets,
             mut resolver,
@@ -479,7 +522,7 @@ impl System {
         } = self.assemble()?;
 
         let mut diagnostics = Diagnostics::new();
-        resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
+        resolver.resolve(&mut nets, &mut diagnostics, solver.as_ref());
         // Stream routing runs at build too: byte pipes are derived from and
         // gated by net resolution, and the routing findings
         // (`StreamMismatch`) are build-time analysis output. The derived
@@ -528,7 +571,7 @@ impl System {
                 resolver.set_drive(endpoint, drive);
             }
             diagnostics = Diagnostics::new();
-            resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
+            resolver.resolve(&mut nets, &mut diagnostics, solver.as_ref());
             let _ = resolver.route_streams(&nets, &mut diagnostics);
             *states.lock().expect("never poisoned") = nets.iter().map(|n| n.state).collect();
         }
@@ -555,7 +598,8 @@ impl System {
     /// dropping it shuts the engine down cleanly (shutdown message + join —
     /// see [`crate::engine`] for why joining cannot deadlock with in-flight
     /// senses).
-    pub fn start(self) -> Result<SystemHandle, SystemError> {
+    pub fn start(mut self) -> Result<SystemHandle, SystemError> {
+        let solver = self.take_solver()?;
         let event_log = self.event_log.clone();
         let quiescence_timeout = self.quiescence_timeout;
         let Assembly {
@@ -565,13 +609,7 @@ impl System {
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
-        let engine = EngineHandle::spawn(
-            resolver,
-            nets,
-            Box::new(QuasiStaticMna),
-            event_log,
-            quiescence_timeout,
-        );
+        let engine = EngineHandle::spawn(resolver, nets, solver, event_log, quiescence_timeout);
         let link = engine.link();
 
         let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
@@ -615,7 +653,7 @@ impl System {
         // The system is assembled. Release the engine's hold on virtual time:
         // nothing may advance until every component has registered its
         // schedules, or a second component's period would be anchored at a
-        // different instant from run to run.
+        // different instant from run to run (`engine::Command::ReleaseTime`).
         engine.release_time();
 
         Ok(SystemHandle {
@@ -1405,6 +1443,13 @@ pub enum SystemError {
         /// The underlying board error.
         error: BoardError,
     },
+    /// The selected analog backend cannot run this system.
+    AnalogUnavailable {
+        /// Backend the profile asked for.
+        backend: AnalogBackend,
+        /// Why it cannot be constructed.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for SystemError {
@@ -1419,6 +1464,9 @@ impl fmt::Display for SystemError {
             }
             SystemError::Harness(e) => write!(f, "harness: {e}"),
             SystemError::Board { name, error } => write!(f, "board {name:?}: {error}"),
+            SystemError::AnalogUnavailable { backend, reason } => {
+                write!(f, "analog backend {backend} unavailable: {reason}")
+            }
         }
     }
 }
@@ -1431,6 +1479,40 @@ impl std::error::Error for SystemError {
             _ => None,
         }
     }
+}
+
+impl System {
+    fn take_solver(&mut self) -> Result<Box<dyn ClusterSolver>, SystemError> {
+        if let Some(solver) = self.solver.take() {
+            return Ok(solver);
+        }
+        analog_solver(self.analog)
+    }
+}
+
+fn analog_solver(backend: AnalogBackend) -> Result<Box<dyn ClusterSolver>, SystemError> {
+    match backend {
+        AnalogBackend::SpiceOp => spice_op_solver(backend),
+        AnalogBackend::SpiceTran { .. } => Err(SystemError::AnalogUnavailable {
+            backend,
+            reason:
+                "event-driven spice .tran is not implemented; inject a ClusterSolver or use SpiceOp",
+        }),
+        AnalogBackend::Off => Ok(Box::new(crate::cluster::AnalogOff)),
+    }
+}
+
+#[cfg(feature = "spice")]
+fn spice_op_solver(_backend: AnalogBackend) -> Result<Box<dyn ClusterSolver>, SystemError> {
+    Ok(Box::new(Spice))
+}
+
+#[cfg(not(feature = "spice"))]
+fn spice_op_solver(backend: AnalogBackend) -> Result<Box<dyn ClusterSolver>, SystemError> {
+    Err(SystemError::AnalogUnavailable {
+        backend,
+        reason: "embsim-board was built without the `spice` cargo feature",
+    })
 }
 
 impl From<HarnessError> for SystemError {
@@ -1536,5 +1618,52 @@ mod tests {
         #[case] expected: &str,
     ) {
         assert_eq!(normalize_qualified_net_name(input), expected);
+    }
+
+    #[rstest]
+    fn analog_off_builds_with_the_floating_solver() {
+        let built = System::new()
+            .analog(AnalogBackend::Off)
+            .build()
+            .expect("Off is a valid analog axis");
+        assert!(built.nets().is_empty());
+    }
+
+    #[rstest]
+    fn custom_cluster_solver_wins_over_the_analog_backend() {
+        struct ConstSolver;
+        impl ClusterSolver for ConstSolver {
+            fn solve(
+                &self,
+                cluster: &crate::cluster::Cluster,
+                _inputs: &crate::cluster::ClusterInputs,
+            ) -> crate::cluster::ClusterSolution {
+                crate::cluster::ClusterSolution {
+                    node_states: cluster
+                        .nodes
+                        .iter()
+                        .map(|&id| (id, crate::net::NetState::Analog(1.25)))
+                        .collect(),
+                }
+            }
+        }
+        System::new()
+            .analog(AnalogBackend::Off)
+            .cluster_solver(Box::new(ConstSolver))
+            .build()
+            .expect("injected solver is enough even when analog is Off");
+    }
+
+    #[rstest]
+    fn spice_tran_fails_until_implemented() {
+        let err = System::new()
+            .analog(AnalogBackend::SpiceTran { max_step_us: 1_000 })
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, SystemError::AnalogUnavailable { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("tran"));
     }
 }

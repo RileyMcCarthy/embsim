@@ -1,0 +1,19 @@
+[package]
+name = "embsim-spice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process ngspice shared-library wrapper for embsim analog cluster solves"
+keywords = ["embedded", "emulator", "simulation", "spice", "sil"]
+categories = ["simulation"]
+
+[dependencies]
+# none: the shared library is linked by build.rs via pkg-config
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+rstest.workspace = true

@@ -1,0 +1,16 @@
+name: Setup ngspice
+description: Install libngspice (shared library) and pkg-config
+runs:
+  using: composite
+  steps:
+    - name: Install libngspice
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          sudo apt-get update
+          sudo apt-get install -y libngspice0-dev pkg-config
+        else
+          brew install libngspice pkg-config
+        fi
+        pkg-config --modversion ngspice

@@ -1,73 +1,51 @@
-//! Analog cluster extraction types + quasi-static MNA solver.
+//! Analog cluster extraction types + [`ClusterSolver`] seam.
 //!
 //! Connected subgraphs of `Passive`/`Analog` pins form **clusters**, extracted
-//! at build time and solved by quasi-static modified nodal analysis (MNA):
-//! Thevenin sources + resistors → node voltages, recomputed only when a
-//! boundary input changes.
+//! at build time. Every driver in the net model is a Thevenin source (see
+//! `BOARD_ENGINE.md` "Net state model": voltage and impedance). A
+//! [`ClusterSolver`] turns that network into node voltages. Digital projection
+//! (rails, contention, thresholds) remains the resolver's job; this module
+//! only publishes [`NetState::Analog`] or [`NetState::Floating`].
 //!
-//! # Method (provenance)
-//!
-//! Governing method: quasi-static **modified nodal analysis** (Ho, Ruehli,
-//! Brennan 1975, "The Modified Nodal Approach to Network Analysis"), reduced
-//! to pure nodal form. Every driver in the net model is a Thevenin source
-//! (voltage + impedance — see `BOARD_ENGINE.md` "Net state model"), so each
-//! source is **Norton-converted** — a current injection `V/Z` plus a shunt
-//! conductance `1/Z` stamped at its node — which eliminates the branch-current
-//! unknowns full MNA would otherwise add. The nodal system `G · V = I` is then
-//! solved by dense Gaussian elimination with partial pivoting; clusters are
-//! small (a handful of nets), so dense elimination is the right tool.
-//!
-//! Singularity is handled **structurally, before assembly**: the nodes with no
-//! conductive path to any source are exactly the MNA-singular ones, so the
-//! solver finds the source-reachable supernode set first, assembles and solves
-//! only that subgraph, and reports [`NetState::Floating`] for the rest. Every
-//! solved block contains at least one Norton shunt conductance on its
-//! diagonal, making it strictly diagonally dominant on the sourced rows and
-//! nonsingular. The solver never invents a voltage and never panics on
-//! singular input.
+//! Singularity is handled **structurally, before the deck is built**: nodes
+//! with no conductive path to any source are reported [`NetState::Floating`]
+//! and never sent to ngspice. The solver never invents a voltage and never
+//! panics on singular input.
 //!
 //! Numerical policy (each choice documented at its constant/field):
 //! - **Zero-ohm edges** are a hard merge (supernode via union-find), never a
-//!   `1/0` conductance.
-//! - **Ideal sources** (0 Ω impedance) are Norton-converted through the
-//!   [`IDEAL_SOURCE_FLOOR_OHMS`] clamp rather than node elimination.
+//!   `1/0` resistance card.
+//! - **Ideal sources** (0 Ω impedance) are stamped as `V` + series `R` of
+//!   [`IDEAL_SOURCE_FLOOR_OHMS`]. Two disagreeing ideal sources on one
+//!   supernode then divide instead of forming a SPICE voltage-source loop;
+//!   flagging the fight as [`NetState::Contention`] remains the resolver's
+//!   projection job.
 //! - **Non-finite or negative** resistances and source impedances are guarded:
-//!   such edges are open, such sources absent — never `1/0`, never NaN in the
-//!   matrix.
+//!   such edges are open, such sources absent.
 //!
-//! Output states stay [`NetState::Analog`] — digital projection (rails,
-//! contention, thresholds) remains the resolver's job.
-//!
-//! The [`ClusterSolver`] trait is the deliberate seam: the default is
-//! [`QuasiStaticMna`]; a transient SPICE-backed solver is a possible future
-//! implementation and is intentionally NOT part of this design.
+//! [`ClusterSolver`] is the analog seam: inject any impl, or use the bundled
+//! [`AnalogOff`] / (feature `spice`) ngspice `.op` solver.
 
 use crate::net::{NetId, NetState, Ohms, Volts};
+#[cfg(feature = "spice")]
 use std::collections::HashMap;
+#[cfg(feature = "spice")]
+use std::fmt::Write as _;
 
 // ============================================================
 // Solver constants
 // ============================================================
 
-/// Impedance floor applied to Thevenin sources during Norton conversion.
+/// Impedance floor applied to Thevenin sources when stamping a SPICE `V`+`R`.
 ///
-/// An ideal source (declared impedance 0 Ω) has no finite Norton equivalent,
-/// so the solver clamps every source impedance up to this floor (1 µΩ)
-/// instead of eliminating the node. The alternative — Dirichlet node
-/// elimination — was rejected because two disagreeing ideal sources on one
-/// supernode would leave no consistent constraint; with a finite floor they
-/// resolve to the divided mid-value, and flagging that fight as
-/// [`NetState::Contention`] remains the resolver's projection job. The floor
-/// keeps solved voltages within a microvolt of ideal for any realistic
-/// cluster load (1 A of load current drops 1 µV) while keeping the
-/// conductance matrix finite and well-pivoted at cluster sizes.
+/// An ideal source (declared impedance 0 Ω) would be a voltage source tied
+/// straight to ground. Two disagreeing ideals on one supernode are then a
+/// topology error in ngspice; with this floor they resolve to the divided
+/// mid-value, and flagging that fight as [`NetState::Contention`] remains the
+/// resolver's projection job. The floor keeps solved voltages within a
+/// microvolt of ideal for any realistic cluster load (1 A of load current
+/// drops 1 µV).
 pub const IDEAL_SOURCE_FLOOR_OHMS: Ohms = 1e-6;
-
-/// Pivot magnitude below which elimination reports the matrix singular.
-/// Defensive only: reachability filtering guarantees every assembled block is
-/// sourced and therefore nonsingular — tripping this returns Floating for the
-/// block's nodes, never garbage.
-const SINGULAR_PIVOT: f64 = 1e-30;
 
 // ============================================================
 // Cluster topology
@@ -97,16 +75,16 @@ pub struct ClusterSource {
     pub node: NetId,
     /// Open-circuit source voltage.
     pub volts: Volts,
-    /// Source impedance. `0.0` is an ideal source, Norton-converted through
-    /// the [`IDEAL_SOURCE_FLOOR_OHMS`] clamp; non-finite or negative
+    /// Source impedance. `0.0` is an ideal source, stamped through the
+    /// [`IDEAL_SOURCE_FLOOR_OHMS`] series resistor; non-finite or negative
     /// impedance (or non-finite volts) disqualifies the source entirely.
     pub impedance: Ohms,
 }
 
 /// Build-time-extracted analog cluster: the node set and its resistive edges.
 ///
-/// TODO(board-engine): single-pole RC closed form (time constant annotated on
-/// the cluster; senses read the exponential at read time) is a later slice.
+/// TODO(board-engine): capacitors, diodes, and vendor `.subckt` instances
+/// stamp as additional SPICE cards; the solver already is ngspice.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Cluster {
     /// Member nodes (nets participating in this cluster).
@@ -145,55 +123,67 @@ impl ClusterSolution {
 // Solver seam
 // ============================================================
 
-/// Solves one cluster from its boundary inputs. Deliberate seam for future
-/// higher-fidelity solvers; [`QuasiStaticMna`] is the default.
+/// Solves one cluster from its boundary inputs.
+///
+/// Bundled impls: [`AnalogOff`], and ngspice `.op` when feature `spice` is on.
+/// Tests and consumers may install any other impl — the engine only sees this trait.
 pub trait ClusterSolver: Send + Sync {
     /// Solve the cluster; must never return garbage — a source-free
-    /// (MNA-singular) cluster solves to [`NetState::Floating`] for all nodes.
+    /// cluster solves to [`NetState::Floating`] for all nodes.
     fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution;
 }
 
-/// Default quasi-static MNA solver.
+/// Analog solver that publishes [`NetState::Floating`] for every node.
 ///
-/// Pipeline (see the module docs for the governing method and numerical
-/// policy):
+/// Used when analog is compiled out or the run profile selects
+/// [`crate::AnalogBackend::Off`]. Digital resolution is unaffected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AnalogOff;
+
+impl ClusterSolver for AnalogOff {
+    fn solve(&self, cluster: &Cluster, _inputs: &ClusterInputs) -> ClusterSolution {
+        ClusterSolution {
+            node_states: cluster
+                .nodes
+                .iter()
+                .map(|&id| (id, NetState::Floating))
+                .collect(),
+        }
+    }
+}
+
+/// Default analog solver: stamp the cluster as a SPICE deck and run ngspice
+/// `.op`.
+///
+/// Requires the `spice` cargo feature (on by default).
+///
+/// Pipeline:
 /// 1. collapse zero-ohm edges into supernodes (union-find);
-/// 2. Norton-convert valid Thevenin sources (impedance clamped to
+/// 2. find the source-reachable supernodes — the complement reports
+///    [`NetState::Floating`];
+/// 3. stamp `R` cards and Thevenin `V`+`R` sources (impedance clamped to
 ///    [`IDEAL_SOURCE_FLOOR_OHMS`]);
-/// 3. find the source-reachable supernodes — the complement is exactly the
-///    MNA-singular set and reports [`NetState::Floating`];
-/// 4. stamp conductances and Norton injections into `G · V = I` over the
-///    reachable subgraph and solve by Gaussian elimination with partial
-///    pivoting;
+/// 4. [`embsim_spice::operating_point`];
 /// 5. map supernode voltages back to every member node as
 ///    [`NetState::Analog`].
+#[cfg(feature = "spice")]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct QuasiStaticMna;
+pub struct Spice;
 
-impl ClusterSolver for QuasiStaticMna {
+#[cfg(feature = "spice")]
+impl ClusterSolver for Spice {
     fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
         let n = cluster.nodes.len();
 
         // Cluster-local dense index per node (first occurrence wins).
         //
-        // hash-order: `node_index` is keyed access only (`get`, `entry`, index)
-        // and is never iterated. Everything downstream — `dsu`, `edges`,
-        // `sources`, `reachable`, `compact`, and the returned `node_states` —
-        // is built by walking `cluster.nodes` / `cluster.resistors` /
-        // `inputs.sources`, all `Vec`s, so the whole solve is a pure function of
-        // those slices *in their given order*. That last clause is why the
-        // resolver must hand `inputs.sources` over in a canonical order: the
-        // `matrix[c][c] += g` / `rhs[c] += i` accumulation below is where source
-        // order becomes float rounding (`DETERMINISM.md`, "One real hash-order
-        // defect").
+        // hash-order: `node_index` is keyed access only (`get`, `entry`, index
+        // by dense `i`).
         let mut node_index: HashMap<NetId, usize> = HashMap::with_capacity(n);
         for (i, &id) in cluster.nodes.iter().enumerate() {
             node_index.entry(id).or_insert(i);
         }
 
-        // Zero-ohm edges are a hard merge: union the terminals into one
-        // supernode rather than stamping a 1/0 conductance. Edges naming a
-        // node outside the cluster are ignored (defensive — never panic).
         let mut dsu = Dsu::new(n);
         for r in &cluster.resistors {
             let (Some(&a), Some(&b)) = (node_index.get(&r.a), node_index.get(&r.b)) else {
@@ -205,30 +195,21 @@ impl ClusterSolver for QuasiStaticMna {
         }
         let root_of: Vec<usize> = (0..n).map(|i| dsu.find(i)).collect();
 
-        // Conductive edges between distinct supernodes. Non-finite or
-        // negative ohms are guarded as open circuit (an infinite resistance
-        // conducts nothing; NaN/negative are defect inputs treated the same
-        // way rather than poisoning the matrix).
         let mut edges: Vec<(usize, usize, f64)> = Vec::new();
         for r in &cluster.resistors {
             let (Some(&a), Some(&b)) = (node_index.get(&r.a), node_index.get(&r.b)) else {
                 continue;
             };
             if !r.ohms.is_finite() || r.ohms <= 0.0 {
-                continue; // 0.0 already merged above; the rest are open
+                continue;
             }
             let (ra, rb) = (root_of[a], root_of[b]);
             if ra != rb {
-                edges.push((ra, rb, 1.0 / r.ohms));
+                edges.push((ra, rb, r.ohms));
             }
         }
 
-        // Norton conversion of the valid Thevenin sources:
-        // (V, Z) → current injection V/Z with shunt conductance 1/Z, with Z
-        // clamped to IDEAL_SOURCE_FLOOR_OHMS so ideal sources stay finite.
-        // Invalid sources (non-finite volts/impedance, negative impedance,
-        // node outside the cluster) contribute nothing.
-        let mut sources: Vec<(usize, f64, f64)> = Vec::new(); // (supernode, G, I)
+        let mut sources: Vec<(usize, f64, f64)> = Vec::new(); // (supernode, V, Z)
         for s in &inputs.sources {
             let Some(&node) = node_index.get(&s.node) else {
                 continue;
@@ -236,13 +217,13 @@ impl ClusterSolver for QuasiStaticMna {
             if !s.volts.is_finite() || !s.impedance.is_finite() || s.impedance < 0.0 {
                 continue;
             }
-            let g = 1.0 / s.impedance.max(IDEAL_SOURCE_FLOOR_OHMS);
-            sources.push((root_of[node], g, s.volts * g));
+            sources.push((
+                root_of[node],
+                s.volts,
+                s.impedance.max(IDEAL_SOURCE_FLOOR_OHMS),
+            ));
         }
 
-        // Source reachability over the supernode graph: the unreachable
-        // supernodes are exactly the MNA-singular ones — they solve to
-        // Floating and are excluded from the matrix.
         let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); n];
         for &(a, b, _) in &edges {
             adjacency[a].push(b);
@@ -265,51 +246,30 @@ impl ClusterSolver for QuasiStaticMna {
             }
         }
 
-        // Compact matrix index over the reachable supernodes.
-        let mut compact: Vec<Option<usize>> = vec![None; n];
-        let mut m = 0usize;
-        for (slot, &is_reachable) in compact.iter_mut().zip(reachable.iter()) {
-            if is_reachable {
-                *slot = Some(m);
-                m += 1;
-            }
+        if sources.is_empty() {
+            return floating_all(cluster);
         }
 
-        // Assemble G · V = I. Resistor stamp: +g on both diagonals, −g on
-        // both off-diagonals. Norton source stamp: +G on the diagonal, +I on
-        // the right-hand side.
-        let mut matrix = vec![vec![0.0f64; m]; m];
-        let mut rhs = vec![0.0f64; m];
-        for &(a, b, g) in &edges {
-            let (Some(ca), Some(cb)) = (compact[a], compact[b]) else {
-                continue; // unreachable block — solved as Floating instead
-            };
-            matrix[ca][ca] += g;
-            matrix[cb][cb] += g;
-            matrix[ca][cb] -= g;
-            matrix[cb][ca] -= g;
-        }
-        for &(root, g, i) in &sources {
-            let Some(c) = compact[root] else {
-                continue; // source roots are always reachable; defensive
-            };
-            matrix[c][c] += g;
-            rhs[c] += i;
-        }
+        let cards = stamp_deck(&edges, &sources, &reachable);
+        let voltages = match embsim_spice::operating_point(
+            &cards.iter().map(String::as_str).collect::<Vec<_>>(),
+        ) {
+            Ok(v) => v,
+            Err(_) => return floating_all(cluster),
+        };
 
-        let voltages = solve_dense(matrix, rhs);
-
-        // Map supernode voltages back per member node; unreachable nodes (and
-        // the defensive singular-solve fallback) report Floating — a voltage
-        // is never invented.
         let node_states = cluster
             .nodes
             .iter()
             .map(|&id| {
                 let root = root_of[node_index[&id]];
-                let state = match (&voltages, compact[root]) {
-                    (Some(v), Some(c)) => NetState::Analog(v[c]),
-                    _ => NetState::Floating,
+                let state = if reachable[root] {
+                    match spice_volts(&voltages, root) {
+                        Some(v) => NetState::Analog(v),
+                        None => NetState::Floating,
+                    }
+                } else {
+                    NetState::Floating
                 };
                 (id, state)
             })
@@ -318,16 +278,63 @@ impl ClusterSolver for QuasiStaticMna {
     }
 }
 
+#[cfg(feature = "spice")]
+fn floating_all(cluster: &Cluster) -> ClusterSolution {
+    ClusterSolution {
+        node_states: cluster
+            .nodes
+            .iter()
+            .map(|&id| (id, NetState::Floating))
+            .collect(),
+    }
+}
+
+#[cfg(feature = "spice")]
+fn stamp_deck(
+    edges: &[(usize, usize, f64)],
+    sources: &[(usize, f64, f64)],
+    reachable: &[bool],
+) -> Vec<String> {
+    let mut cards = Vec::new();
+    for (i, &(a, b, ohms)) in edges.iter().enumerate() {
+        if !reachable[a] || !reachable[b] {
+            continue;
+        }
+        cards.push(format!("R{i} n{a} n{b} {ohms}"));
+    }
+    for (i, &(root, volts, z)) in sources.iter().enumerate() {
+        if !reachable[root] {
+            continue;
+        }
+        // Thevenin vs ground: V on an internal node, series R into the net.
+        let mut card = String::new();
+        let _ = write!(card, "V{i} vs{i} 0 {volts}");
+        cards.push(card);
+        cards.push(format!("Rs{i} vs{i} n{root} {z}"));
+    }
+    cards
+}
+
+#[cfg(feature = "spice")]
+fn spice_volts(map: &HashMap<String, f64>, root: usize) -> Option<Volts> {
+    let key = format!("n{root}");
+    map.get(&key)
+        .copied()
+        .or_else(|| map.get(&format!("v({key})")).copied())
+}
+
 // ============================================================
 // Solver internals
 // ============================================================
 
 /// Union-find over cluster-local node indices (zero-ohm supernode merges).
 /// Mirrors the resolver's build-time `Dsu` in `system.rs`.
+#[cfg(feature = "spice")]
 struct Dsu {
     parent: Vec<usize>,
 }
 
+#[cfg(feature = "spice")]
 impl Dsu {
     fn new(n: usize) -> Self {
         Self {
@@ -349,57 +356,32 @@ impl Dsu {
     }
 }
 
-/// Dense Gaussian elimination with partial pivoting on `matrix · v = rhs`.
-///
-/// Returns `None` if a pivot collapses below [`SINGULAR_PIVOT`] or the
-/// solution is non-finite — defensive only: reachability filtering guarantees
-/// every assembled block carries at least one Norton shunt conductance on its
-/// diagonal, which keeps the block nonsingular.
-fn solve_dense(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<Volts>> {
-    let n = rhs.len();
-    for col in 0..n {
-        // Partial pivot: bring the largest |entry| in this column up.
-        let pivot_row =
-            (col..n).max_by(|&r1, &r2| matrix[r1][col].abs().total_cmp(&matrix[r2][col].abs()))?;
-        let pivot_abs = matrix[pivot_row][col].abs();
-        if pivot_abs.is_nan() || pivot_abs < SINGULAR_PIVOT {
-            return None;
-        }
-        matrix.swap(col, pivot_row);
-        rhs.swap(col, pivot_row);
+#[cfg(test)]
+mod off_tests {
+    use super::*;
 
-        // Eliminate the column below the pivot.
-        let pivot_vals = matrix[col].clone();
-        let pivot_rhs = rhs[col];
-        for (row_vals, row_rhs) in matrix.iter_mut().zip(rhs.iter_mut()).skip(col + 1) {
-            let factor = row_vals[col] / pivot_vals[col];
-            if factor == 0.0 {
-                continue;
-            }
-            for (rv, pv) in row_vals.iter_mut().zip(pivot_vals.iter()).skip(col) {
-                *rv -= factor * pv;
-            }
-            *row_rhs -= factor * pivot_rhs;
-        }
-    }
-
-    // Back-substitution on the upper triangle.
-    let mut v = vec![0.0f64; n];
-    for row in (0..n).rev() {
-        let mut acc = rhs[row];
-        for (coeff, solved) in matrix[row].iter().zip(v.iter()).skip(row + 1) {
-            acc -= coeff * solved;
-        }
-        v[row] = acc / matrix[row][row];
-    }
-    if v.iter().all(|x| x.is_finite()) {
-        Some(v)
-    } else {
-        None
+    #[test]
+    fn analog_off_floats_every_node() {
+        let cluster = Cluster {
+            nodes: vec![NetId(0), NetId(1)],
+            resistors: vec![],
+        };
+        let solution = AnalogOff.solve(
+            &cluster,
+            &ClusterInputs {
+                sources: vec![ClusterSource {
+                    node: NetId(0),
+                    volts: 3.3,
+                    impedance: 25.0,
+                }],
+            },
+        );
+        assert_eq!(solution.state_of(NetId(0)), Some(NetState::Floating));
+        assert_eq!(solution.state_of(NetId(1)), Some(NetState::Floating));
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "spice"))]
 mod tests {
     use rstest::rstest;
 
@@ -432,7 +414,7 @@ mod tests {
 
     #[rstest]
     fn source_free_cluster_solves_floating_for_all_nodes() {
-        let solution = QuasiStaticMna.solve(&three_node_cluster(), &ClusterInputs::default());
+        let solution = Spice.solve(&three_node_cluster(), &ClusterInputs::default());
         assert_eq!(solution.node_states.len(), 3);
         for (_, state) in &solution.node_states {
             assert_eq!(*state, NetState::Floating);
@@ -450,7 +432,7 @@ mod tests {
                 impedance: 25.0,
             }],
         };
-        let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
+        let solution = Spice.solve(&three_node_cluster(), &inputs);
         for (_, state) in &solution.node_states {
             assert_ne!(*state, NetState::Floating);
         }
@@ -467,7 +449,7 @@ mod tests {
                 impedance: 25.0,
             }],
         };
-        let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
+        let solution = Spice.solve(&three_node_cluster(), &inputs);
         for node in [NetId(0), NetId(1), NetId(2)] {
             assert!((analog_volts(&solution, node) - 3.3).abs() < 1e-9);
         }
@@ -512,7 +494,7 @@ mod tests {
                 },
             ],
         };
-        let solution = QuasiStaticMna.solve(&cluster, &inputs);
+        let solution = Spice.solve(&cluster, &inputs);
         assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-6);
         assert!((analog_volts(&solution, NetId(1)) - 3.3).abs() < 1e-6);
         assert!((analog_volts(&solution, NetId(2)) - 1.65).abs() < 1e-6);
@@ -550,7 +532,7 @@ mod tests {
                 impedance: 25.0,
             }],
         };
-        let solution = QuasiStaticMna.solve(&cluster, &inputs);
+        let solution = Spice.solve(&cluster, &inputs);
         assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-9);
         for node in [NetId(1), NetId(2), NetId(3)] {
             assert_eq!(solution.state_of(node), Some(NetState::Floating));
@@ -585,7 +567,7 @@ mod tests {
                 },
             ],
         };
-        let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
+        let solution = Spice.solve(&three_node_cluster(), &inputs);
         for (_, state) in &solution.node_states {
             assert_eq!(*state, NetState::Floating);
         }
@@ -604,7 +586,7 @@ mod tests {
                 impedance: 0.0,
             }],
         };
-        let solution = QuasiStaticMna.solve(&cluster, &inputs);
+        let solution = Spice.solve(&cluster, &inputs);
         assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-9);
     }
 }

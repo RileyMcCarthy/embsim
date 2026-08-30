@@ -101,20 +101,17 @@ static TIME_AUTHORITY: AtomicU32 = AtomicU32::new(0);
 /// [`stepped_wall_sleep_count`].
 static STEPPED_WALL_SLEEPS: AtomicU64 = AtomicU64::new(0);
 
-/// Compatibility tags for callers that still say "stepped" vs "free-running".
-/// Both are the **same counter**; the difference is only wall pacing.
-///
-/// - [`ClockMode::Stepped`] — `init(0.0, freq)`: unpaced jumps.
-/// - [`ClockMode::FreeRunning`] — `init(speed, freq)` with `speed > 0`: jump,
-///   then sleep `dt / speed` of wall time.
+/// How virtual time relates to wall time. **There is only one time model:**
+/// a monotonic µs counter advanced by [`advance_to`]. This enum is pacing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClockMode {
-    /// Paced counter (`speed` is the playground scale, 1.0 = real-time feel).
+    /// After each [`advance_to`], sleep `dt / speed` of wall time so a
+    /// playground at `speed = 1.0` feels real-time.
     FreeRunning {
-        /// Time scale (1.0 = real time, 5.0 = five times faster).
+        /// Wall pace (1.0 = real time, 5.0 = five times faster).
         speed: f64,
     },
-    /// Unpaced counter (tests / CI).
+    /// Jumps are instant. Tests, CI, `--profile sil`.
     Stepped,
 }
 
@@ -145,8 +142,8 @@ pub fn init(speed: f64, freq: u32) {
     set_scale(speed);
 }
 
-/// Compatibility wrapper: [`ClockMode::Stepped`] is `init(0.0, freq)`;
-/// [`ClockMode::FreeRunning`] is `init(speed, freq)`.
+/// Initialize from a [`ClockMode`]. [`ClockMode::Stepped`] is unpaced;
+/// [`ClockMode::FreeRunning`] uses `speed` as wall pace.
 pub fn init_mode(mode: ClockMode, freq: u32) {
     match mode {
         ClockMode::Stepped => init(0.0, freq),
@@ -167,13 +164,7 @@ pub fn mode() -> ClockMode {
     }
 }
 
-/// Always `true`: there is only the counter. Kept so existing engine/tests
-/// that branched on mode keep compiling while they switch to the single loop.
-pub fn is_stepped() -> bool {
-    true
-}
-
-/// True when jumps do not sleep (`speed <= 0`).
+/// True when jumps do not sleep (`ClockMode::Stepped` / `speed <= 0`).
 pub fn is_unpaced() -> bool {
     SCALE_NUMER.load(Ordering::Relaxed) == 0
 }
@@ -736,10 +727,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
-    /// The virtual clock mutates process-global mode / scale / frequency /
-    /// boot-offset / scheduler state, so every test that touches it must run
-    /// serially. Recover from any panic-induced poisoning exactly like the
-    /// `pulse_out` reference suite.
+    /// The virtual clock mutates process-global scale / frequency / scheduler
+    /// state, so every test that touches it must run serially. Recover from
+    /// any panic-induced poisoning exactly like the `pulse_out` reference suite.
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn lock_or_recover() -> std::sync::MutexGuard<'static, ()> {
@@ -821,38 +811,31 @@ mod tests {
         init(1.0, 1_000_000);
     }
 
-    /// `virtual_us` is monotonic non-decreasing across repeated reads — virtual
-    /// time never runs backwards (timing magnitude is machine-dependent and not
-    /// asserted, only ordering).
+    /// `virtual_us` is monotonic non-decreasing: `advance_to` may stay or go
+    /// forward, never backwards.
     #[rstest]
     fn virtual_us_is_monotonic() {
         let _g = lock_or_recover();
-        init(1.0, 180_000_000);
+        init(0.0, 180_000_000);
         let mut last = virtual_us();
-        for _ in 0..1000 {
+        for t in [0, 1, 10, 100, 100] {
+            advance_to(t).expect("forward or same");
             let now = virtual_us();
             assert!(now >= last, "virtual_us went backwards: {now} < {last}");
             last = now;
         }
+        assert_eq!(virtual_us(), 100);
     }
 
-    /// `virtual_ms` is monotonic and is exactly `virtual_us / 1000` ordering —
-    /// ms can never exceed the µs reading divided by 1000.
+    /// `virtual_ms` is exactly `virtual_us / 1000`.
     #[rstest]
     fn virtual_ms_tracks_virtual_us() {
         let _g = lock_or_recover();
-        init(1.0, 180_000_000);
-        let mut last_ms = virtual_ms();
-        for _ in 0..1000 {
-            let us = virtual_us();
-            let ms = virtual_ms();
-            assert!(ms >= last_ms, "virtual_ms went backwards");
-            // ms reading taken after us can only have advanced, so ms*1000 may
-            // exceed the earlier us; but ms must never exceed us/1000 + slack.
-            assert!(ms <= virtual_us() / 1000, "ms must not lead the us clock");
-            last_ms = ms;
-            let _ = us;
-        }
+        init(0.0, 1_000_000);
+        advance_to(2_500).expect("forward");
+        assert_eq!(virtual_us(), 2_500);
+        assert_eq!(virtual_ms(), 2);
+        assert_eq!(virtual_ms(), virtual_us() / 1000);
     }
 
     /// `virtual_cycles` is 0 whenever the configured frequency is 0 (the
@@ -862,14 +845,11 @@ mod tests {
     fn virtual_cycles_zero_when_freq_zero() {
         let _g = lock_or_recover();
         // Re-anchor with an explicit zero frequency.
-        init(1.0, 0);
+        init(0.0, 0);
         assert_eq!(clock_freq(), 0);
         assert_eq!(virtual_cycles(), 0, "no freq → no cycles");
-        // Even after advancing virtual time it stays zero.
-        for _ in 0..500 {
-            let _ = virtual_us();
-        }
-        assert_eq!(virtual_cycles(), 0);
+        advance_to(500).expect("forward");
+        assert_eq!(virtual_cycles(), 0, "zero freq stays zero after a jump");
     }
 
     /// With a non-zero frequency, cycles track `now * freq / 1e6`.
@@ -974,9 +954,8 @@ mod tests {
     // Stepped mode (DETERMINISM.md Phase D1)
     // ========================================================
 
-    /// Enter stepped mode for the duration of a test and restore free-running
-    /// on the way out, panic or not. Takes the shared clock lock, so stepped
-    /// and free-running cases in this binary can never overlap.
+    /// Unpaced clock plus time authority for the duration of a test. Takes the
+    /// shared clock lock so cases in this binary cannot overlap.
     struct SteppedGuard {
         #[allow(dead_code)]
         lock: std::sync::MutexGuard<'static, ()>,
@@ -1285,29 +1264,15 @@ mod tests {
         pred()
     }
 
-    /// Re-`init` re-anchors the boot offset, so virtual time restarts near zero.
-    /// We can't assert an exact value (wall time keeps moving), but immediately
-    /// after a re-init the reading must be small relative to a coarse ceiling.
+    /// Re-`init` re-anchors the counter to 0.
     #[rstest]
     fn reinit_reanchors_virtual_time() {
         let _g = lock_or_recover();
-        init(1.0, 180_000_000);
-        // Burn some virtual time.
-        for _ in 0..50_000 {
-            let _ = virtual_us();
-        }
-        let before = virtual_us();
-        // Re-init should drop the reading back toward zero.
-        init(1.0, 180_000_000);
-        let after = virtual_us();
-        // The re-anchored reading must be far below the accumulated `before`
-        // (or `before` itself was tiny on a very fast machine — either way the
-        // post-init value cannot exceed a generous 1-second ceiling).
-        assert!(
-            after < 1_000_000,
-            "re-anchored virtual_us should be small, got {after}"
-        );
-        let _ = before;
+        init(0.0, 1_000_000);
+        advance_to(50_000).expect("forward");
+        assert_eq!(virtual_us(), 50_000);
+        init(0.0, 1_000_000);
+        assert_eq!(virtual_us(), 0, "re-init re-anchors the counter to 0");
     }
 
     /// Host threads that are not actors must not be preempted.

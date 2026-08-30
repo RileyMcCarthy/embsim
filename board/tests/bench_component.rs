@@ -156,7 +156,7 @@ const fn analog_pin(number: &'static str) -> PinDecl {
 /// both directions — the bench-MCU serial path with no board netlist at all.
 #[rstest]
 fn bench_uarts_roundtrip_over_bare_endpoints() {
-    // Stream pacing samples the free-running virtual clock; 50x scale keeps
+    // Stream pacing is against the virtual counter; 50x scale keeps
     // the 115.2 kbaud pacing sub-millisecond in wall time. This is the only
     // test in this binary that touches the process-global clock.
     virtual_clock::init(50.0, 1_000_000);
