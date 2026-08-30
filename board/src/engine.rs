@@ -24,7 +24,8 @@
 //! wheel keyed to the virtual-clock **counter**. Idle components cost nothing.
 //! The engine is the **time authority** (`EngineCore::run_stepped_iteration`):
 //! it waits for every registered actor to park, drains its queue, fires every
-//! entry due at `now`, then [`advance_to`] `min(wheel head, earliest park)`.
+//! entry due at `now`, then [`embsim_core::virtual_clock::advance_to`]
+//! `min(wheel head, earliest park)`.
 //! Optional wall pacing after a jump (`init(speed)` with `speed > 0`) is how
 //! a playground feels real-time; tests use `speed <= 0` so jumps are instant.
 //! Time is held until `System::start` has attached every component
@@ -2027,7 +2028,8 @@ impl EngineCore {
     }
 
     /// Engine thread body. Virtual time is a counter; this loop is the time
-    /// authority. `--speed` only paces the host after [`advance_to`].
+    /// authority. `--speed` only paces the host after
+    /// [`embsim_core::virtual_clock::advance_to`].
     fn run(mut self, rx: Receiver<Command>) {
         loop {
             if self.run_stepped_iteration(&rx) {
