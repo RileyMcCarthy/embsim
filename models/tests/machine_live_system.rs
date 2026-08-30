@@ -13,7 +13,7 @@
 //! injected timestamps inside `embsim-models` itself.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
 use rstest::rstest;
@@ -38,6 +38,18 @@ use embsim_models::machine::{
 fn ensure_clock() {
     static CLOCK: Once = Once::new();
     CLOCK.call_once(|| embsim_core::virtual_clock::init(1.0, 1_000_000));
+}
+
+/// The virtual clock and libngspice session are process-global. Parallel
+/// live `System`s in this binary steal time-authority from each other
+/// (TESTING.md rule 5). Hold this for the whole test, including `System` drop.
+static CLOCK_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_clock() -> MutexGuard<'static, ()> {
+    CLOCK_LOCK.lock().unwrap_or_else(|p| {
+        CLOCK_LOCK.clear_poison();
+        p.into_inner()
+    })
 }
 
 const HIGH: TheveninDrive = TheveninDrive {
@@ -252,6 +264,7 @@ fn channel_sequence(log: &SenseLog) -> Vec<(&'static str, Level)> {
 /// a hardware quadrature counter decodes.
 #[rstest]
 fn encoder_walks_gray_code_in_order_and_reverses_with_direction() {
+    let _clock = lock_clock();
     let axis = build_axis();
     settle_encoder(&axis);
 
@@ -309,6 +322,7 @@ fn encoder_walks_gray_code_in_order_and_reverses_with_direction() {
 /// phase table.
 #[rstest]
 fn peer_never_observes_two_channels_changing_at_once() {
+    let _clock = lock_clock();
     let axis = build_axis();
     settle_encoder(&axis);
 
@@ -338,6 +352,7 @@ fn peer_never_observes_two_channels_changing_at_once() {
 /// timestamps, not against test-thread sleeps).
 #[rstest]
 fn step_pulses_move_the_axis_and_dir_reverses_it() {
+    let _clock = lock_clock();
     let axis = build_axis();
     settle_encoder(&axis);
     let step = handle(&axis.handles, "STEP");
@@ -397,6 +412,7 @@ fn step_pulses_move_the_axis_and_dir_reverses_it() {
 /// safe-machine reading.
 #[rstest]
 fn an_unwired_enable_leaves_the_drive_disabled() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let mcu = FakeMcu::new(&["STEP"], &[]);
@@ -474,6 +490,7 @@ fn upper_switch() -> end_switch::Config {
 /// of a dry contact with no bias.
 #[rstest]
 fn an_open_contact_with_no_pull_up_leaves_the_net_floating() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let mcu = FakeMcu::new(&[], &["END"]);
@@ -546,6 +563,7 @@ fn an_open_contact_with_no_pull_up_leaves_the_net_floating() {
 /// pull-up by four orders of magnitude.
 #[rstest]
 fn a_pull_up_decides_the_idle_level_and_the_contact_wins_when_closed() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let board = Board::from_netlist(
@@ -619,6 +637,7 @@ fn a_pull_up_decides_the_idle_level_and_the_contact_wins_when_closed() {
 /// target, so this is chatter as the *MCU* would see it.
 #[rstest]
 fn hysteresis_keeps_a_wobbling_carriage_from_chattering_the_net() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let mcu = FakeMcu::new(&[], &["END"]);
@@ -678,6 +697,7 @@ fn hysteresis_keeps_a_wobbling_carriage_from_chattering_the_net() {
 /// debounce).
 #[rstest]
 fn contact_bounce_chatters_the_net_and_settles_closed() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let mcu = FakeMcu::new(&[], &["END"]);
@@ -725,6 +745,13 @@ fn contact_bounce_chatters_the_net_and_settles_closed() {
         "and settle closed, saw {:?}",
         system.net_state("SW.NO")
     );
+    // `pending_bounce` drops when the wake pops the burst, which is *before*
+    // the engine drains the resulting drives. Wait for the sense log too.
+    assert!(
+        wait_for(|| log.lock().unwrap().len() == 5, SETTLE),
+        "five sense deliveries after drives drain, saw {:?}",
+        log.lock().unwrap().clone()
+    );
 
     // The immediate actuation edge plus four bounce changes: five deliveries,
     // strictly alternating between driven-low and floating.
@@ -757,6 +784,7 @@ fn contact_bounce_chatters_the_net_and_settles_closed() {
 #[case::motor(&["MOTOR.STEP", "MOTOR.DIR", "MOTOR.ENA"])]
 #[case::encoder(&["ENC.A", "ENC.B"])]
 fn bench_pins_are_addressable_by_signal_name(#[case] names: &[&str]) {
+    let _clock = lock_clock();
     let axis = build_axis();
     for name in names {
         assert!(
@@ -774,6 +802,7 @@ fn bench_pins_are_addressable_by_signal_name(#[case] names: &[&str]) {
 /// encoder output.
 #[rstest]
 fn a_declared_index_channel_reaches_the_harness() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let mcu = FakeMcu::new(&[], &["A", "B", "Z"]);
@@ -841,6 +870,7 @@ fn a_declared_index_channel_reaches_the_harness() {
 /// consumer's system description wires it: no polling, no timer of its own.
 #[rstest]
 fn a_motor_shaft_can_actuate_an_end_switch_directly() {
+    let _clock = lock_clock();
     ensure_clock();
 
     let switch = EndSwitch::new(upper_switch()).expect("valid config");
@@ -867,6 +897,7 @@ fn a_motor_shaft_can_actuate_an_end_switch_directly() {
 /// prevent.
 #[rstest]
 fn machine_components_attach_on_the_build_time_analysis_path() {
+    let _clock = lock_clock();
     let motor = StepperMotor::new(stepper_motor::Config::new(8_192.0)).expect("valid config");
     let encoder =
         QuadratureEncoder::new(quadrature_encoder::Config::new(8_192.0)).expect("valid config");
