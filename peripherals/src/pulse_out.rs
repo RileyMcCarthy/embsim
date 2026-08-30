@@ -286,6 +286,11 @@ impl PulseOut {
             .resize_with(count, || None);
     }
 
+    /// Configured channel count.
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// Clear all channel callbacks and pulse state (used by `init` and teardown).
     pub fn reset(&self) {
         self.count.store(0, Ordering::Relaxed);
@@ -387,6 +392,7 @@ impl PulseOut {
     /// position before any pulses elapse.
     pub fn start(&self, channel: usize, pulses: u32, frequency: u32) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("start channel {channel}"));
             return;
         }
         let freq = frequency.max(1);
@@ -427,6 +433,7 @@ impl PulseOut {
     /// ~0. `frequency` 0 holds (no pulses).
     pub fn start_velocity(&self, channel: usize, frequency: u32) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("start_velocity channel {channel}"));
             return;
         }
         trace!(
@@ -459,6 +466,7 @@ impl PulseOut {
     /// so the running total stays monotonic. No-op outside velocity mode.
     pub fn set_frequency(&self, channel: usize, frequency: u32) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("set_frequency channel {channel}"));
             return;
         }
         let segment = {
@@ -498,6 +506,7 @@ impl PulseOut {
     /// `done = true` so the caller can move on without an extra tick of latency.
     pub fn run(&self, channel: usize) -> (u32, bool) {
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("run channel {channel}"));
             return (0, true);
         }
 
@@ -553,6 +562,7 @@ impl PulseOut {
     pub fn stop(&self, channel: usize) {
         trace!("pulse_out::stop(ch={})", channel);
         if channel >= self.count.load(Ordering::Relaxed) {
+            crate::access::report("pulse_out", &format!("stop channel {channel}"));
             return;
         }
         // Stopping freezes the count at whatever had gone out and banks it, so
