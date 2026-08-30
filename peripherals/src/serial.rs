@@ -856,6 +856,73 @@ mod tests {
         assert_eq!(&buf[..2], b"ab");
     }
 
+    /// A blocking receive must PARK the virtual clock while it waits, not spin
+    /// on wall time.
+    ///
+    /// The caller is a registered actor (firmware cogs are), and virtual time
+    /// only advances once every actor is parked. A wall-clock wait therefore
+    /// stops the clock for its whole duration — so a peer that answers from its
+    /// own virtual deadline can never run, and the read waits for a reply that
+    /// the waiting itself prevents. This models exactly that: the peer writes
+    /// only after `wait_virtual_us`, which is what every device-model protocol
+    /// thread in the workspace does between poll iterations.
+    ///
+    /// This is a deadlock by construction, and it hid for a long time because
+    /// it resolved by race — where the peer happened to still be mid-iteration
+    /// when the request landed, it answered before parking. On a host that
+    /// scheduled the caller first it failed every time: every ADS122U04
+    /// register read-back timed out on macOS while passing on Linux CI, from
+    /// identical code.
+    #[rstest]
+    fn receive_data_timeout_lets_a_parked_peer_answer() {
+        let _g = crate::test_support::guard();
+        let pair = Pair::new();
+        setup(1);
+        init_channel_fd(0, pair.a);
+
+        // This is what makes the wait load-bearing: while this thread counts as
+        // running, the scheduler may not advance.
+        let reader_actor = embsim_core::virtual_clock::register_actor("reader-cog");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer_stop = std::sync::Arc::clone(&stop);
+        let far = pair.b;
+        let peer = std::thread::spawn(move || {
+            let _actor = embsim_core::virtual_clock::register_actor("device-model");
+            embsim_core::virtual_clock::wait_virtual_us(250);
+            let fd = unsafe { BorrowedFd::borrow_raw(far) };
+            let _ = nix::unistd::write(fd, b"R");
+            // Keep parking rather than returning. The idle jump is performed by
+            // a thread on its way *into* a park, so an actor that exits while it
+            // is the last one running leaves nobody to advance the clock to the
+            // reader's next deadline. Device-model threads loop forever; this
+            // mimics that until the test releases it.
+            while !peer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                embsim_core::virtual_clock::wait_virtual_us(1_000);
+            }
+        });
+
+        let mut buf = [0u8; 1];
+        let got = receive_data_timeout(0, &mut buf, 5_000);
+
+        // Teardown has to terminate on the regression path too, or the suite
+        // hangs in join() instead of reporting the assertion. Three steps, in
+        // this order: ask the peer to stop; stop counting as a running actor so
+        // its future parks can self-advance (park_until_virtual idle-jumps when
+        // it is the last one running); then bump the clock epoch, which releases
+        // a peer that is *already* parked and waiting.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(reader_actor);
+        embsim_core::virtual_clock::init(1.0, 180_000_000);
+        peer.join().expect("peer thread");
+
+        assert!(
+            got,
+            "receive timed out: the peer could not run while the reader waited"
+        );
+        assert_eq!(&buf, b"R");
+    }
+
     #[rstest]
     fn receive_data_timeout_empty_buf_or_unknown_channel_is_false() {
         let _g = crate::test_support::guard();
