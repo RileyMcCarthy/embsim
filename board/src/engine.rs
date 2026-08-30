@@ -137,6 +137,10 @@ pub(crate) const DEFAULT_HIGH_LEVEL_VOLTS: Volts = 3.3;
 /// 1 stop), matching the embsim serial peripheral's pacing convention.
 const STREAM_BITS_PER_BYTE: u64 = 10;
 
+/// Max commands handled before returning to the timer wheel. A live flood
+/// can keep `try_recv` non-empty forever; without a cap, time never jumps.
+const COMMAND_DRAIN_BATCH_MAX: usize = 64;
+
 /// Maximum in-flight (paced, deadline-stamped) bytes per stream route. A
 /// real UART has a finite TX path, not an infinite buffer: a producer that
 /// sustains writes above its declared baud would otherwise grow the queue —
@@ -2043,12 +2047,12 @@ impl EngineCore {
     ///
     /// 1. **Quiesce.** Wait for every registered actor to park. Only then is
     ///    the set of pending work stable enough to reason about.
-    /// 2. **Drain the command queue completely.** A partial drain would make
-    ///    the applied prefix depend on arrival timing; starvation is
-    ///    impossible because the engine itself advances time.
+    /// 2. **Drain the command queue**, at most [`COMMAND_DRAIN_BATCH_MAX`]
+    ///    per pass. A live flood can keep the queue non-empty forever; the
+    ///    cap lets a future wheel deadline still jump.
     /// 3. **Fire every wheel entry due at `now`**, in `(deadline, seq)` order.
-    /// 4. Loop 1–3 to a fixpoint: a callback fired in step 3 may have enqueued
-    ///    drives, and a released actor may have enqueued anything.
+    /// 4. Loop 1–3 to a fixpoint, or break after a full batch when the next
+    ///    deadline is in the future so time can move.
     /// 5. **Advance** to `min(wheel head, earliest pending park deadline)`.
     ///    With nothing to advance to, park on the command queue — a scripted
     ///    stimulus thread is not an actor, and waiting for it is the normal
@@ -2063,10 +2067,15 @@ impl EngineCore {
         loop {
             self.await_actor_quiescence();
             let mut work = 0usize;
+            let mut drained = 0usize;
             loop {
+                if drained >= COMMAND_DRAIN_BATCH_MAX {
+                    break;
+                }
                 match rx.try_recv() {
                     Ok(command) => {
                         work += 1;
+                        drained += 1;
                         if self.handle(command) {
                             return true;
                         }
@@ -2078,6 +2087,15 @@ impl EngineCore {
             work += self.fire_due_timers();
             if work == 0 {
                 break;
+            }
+            if drained >= COMMAND_DRAIN_BATCH_MAX {
+                let now = virtual_clock::virtual_us();
+                if self
+                    .next_virtual_deadline()
+                    .is_some_and(|deadline| deadline > now)
+                {
+                    break;
+                }
             }
         }
 
@@ -3218,8 +3236,8 @@ mod tests {
 
     /// The timer wheel must not starve under sustained command load: a busy
     /// protocol thread enqueuing drives in a tight loop keeps the channel
-    /// non-empty, yet a due wake must still fire — the engine drains the
-    /// queue completely, then fires timers, every iteration.
+    /// non-empty, yet a due wake must still fire — drain is capped at
+    /// [`COMMAND_DRAIN_BATCH_MAX`] so time can jump.
     #[rstest]
     fn sustained_drive_flood_does_not_starve_the_timer_wheel() {
         let _g = lock_clock();
