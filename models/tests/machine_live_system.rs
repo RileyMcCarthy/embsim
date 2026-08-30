@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, Level, NetState,
-    PartRegistry, PinDecl, PinHandle, PinKind, SenseKind, System, SystemHandle, TheveninDrive,
+    AnalogBackend, AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness,
+    Level, NetState, PartRegistry, PinDecl, PinHandle, PinKind, SenseKind, System, SystemHandle,
+    TheveninDrive,
 };
 use embsim_models::machine::{end_switch, quadrature_encoder, stepper_motor};
 use embsim_models::machine::{
@@ -50,6 +51,12 @@ fn lock_clock() -> MutexGuard<'static, ()> {
         CLOCK_LOCK.clear_poison();
         p.into_inner()
     })
+}
+
+/// These cases are digital (Gray code, bounce, step/dir). Analog Off keeps
+/// them off the process-global ngspice session.
+fn digital_system() -> System {
+    System::new().analog(AnalogBackend::Off)
 }
 
 const HIGH: TheveninDrive = TheveninDrive {
@@ -214,7 +221,7 @@ fn build_axis() -> Axis {
         .connect_str("ENC.B", "MCU.B")
         .expect("endpoint");
 
-    let system = System::new()
+    let system = digital_system()
         .component("MCU", Box::new(mcu))
         .component("MOTOR", Box::new(motor))
         .component("ENC", Box::new(encoder))
@@ -422,7 +429,7 @@ fn an_unwired_enable_leaves_the_drive_disabled() {
 
     // STEP is wired; DIR and ENA are left unconnected, so their bench nets
     // have no source at all.
-    let system = System::new()
+    let system = digital_system()
         .component("MCU", Box::new(mcu))
         .component("MOTOR", Box::new(motor))
         .harness(
@@ -497,7 +504,7 @@ fn an_open_contact_with_no_pull_up_leaves_the_net_floating() {
     let switch = EndSwitch::new(upper_switch()).expect("valid config");
     let actuator = switch.actuator();
 
-    let system = System::new()
+    let system = digital_system()
         .component("MCU", Box::new(mcu))
         .component("SW", Box::new(switch))
         .harness(
@@ -594,7 +601,7 @@ fn a_pull_up_decides_the_idle_level_and_the_contact_wins_when_closed() {
             0.0,
         );
 
-    let system = System::new()
+    let system = digital_system()
         .board("Pullup", board)
         .component("MCU", Box::new(mcu))
         .component("SW", Box::new(switch))
@@ -645,7 +652,7 @@ fn hysteresis_keeps_a_wobbling_carriage_from_chattering_the_net() {
     let switch = EndSwitch::new(upper_switch()).expect("valid config");
     let actuator = switch.actuator();
 
-    let system = System::new()
+    let system = digital_system()
         .component("MCU", Box::new(mcu))
         .component("SW", Box::new(switch))
         .harness(
@@ -709,7 +716,7 @@ fn contact_bounce_chatters_the_net_and_settles_closed() {
     .expect("valid config");
     let actuator = switch.actuator();
 
-    let system = System::new()
+    let system = digital_system()
         .component("MCU", Box::new(mcu))
         .component("SW", Box::new(switch))
         .harness(
@@ -820,7 +827,7 @@ fn a_declared_index_channel_reaches_the_harness() {
     .expect("valid config");
     let input = encoder.input();
 
-    let system = System::new()
+    let system = digital_system()
         .component("MCU", Box::new(mcu))
         .component("ENC", Box::new(encoder))
         .harness(
@@ -903,7 +910,7 @@ fn machine_components_attach_on_the_build_time_analysis_path() {
         QuadratureEncoder::new(quadrature_encoder::Config::new(8_192.0)).expect("valid config");
     let switch = EndSwitch::new(upper_switch()).expect("valid config");
 
-    let built = System::new()
+    let built = digital_system()
         .component("MCU", Box::new(FakeMcu::new(&[], &["END"])))
         .component("MOTOR", Box::new(motor))
         .component("ENC", Box::new(encoder))
