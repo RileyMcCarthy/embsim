@@ -22,15 +22,14 @@
 //! repeatable.
 
 use rstest::rstest;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use embsim_board::component::StreamTx;
+use embsim_board::uart::{UartDecoder, UartFraming};
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, EventLog, Harness, PartRegistry, PinDecl,
-    PinHandle, PinKind, Scenario, StreamDropPolicy, StreamRole, System, SystemHandle,
-    TheveninDrive,
+    PinHandle, PinKind, Scenario, SerialLevelBridge, System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -87,7 +86,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 type PinSlot = Arc<Mutex<Option<PinHandle>>>;
-type TxSlot = Arc<Mutex<Option<StreamTx>>>;
+type BridgeSlot = Arc<Mutex<Option<Arc<SerialLevelBridge>>>>;
 type ByteLog = Arc<Mutex<Vec<u8>>>;
 
 // ============================================================
@@ -213,12 +212,7 @@ impl Component for WakeLadder {
     }
 }
 
-/// A one-net producer→consumer serial link on a *netlist* board.
-///
-/// A netlist board rather than bench components on purpose: `stream_drop`
-/// endpoints resolve through `split_board_pin`, which only knows board names,
-/// so the byte-loss case below needs `Rig.MCU.1` rather than a bare bench
-/// endpoint.
+/// A one-net transmitter→receiver serial link on a *netlist* board.
 const LINK_NETLIST: &str = r#"(export (version "E")
   (components
     (comp (ref "MCU")
@@ -232,23 +226,28 @@ const LINK_NETLIST: &str = r#"(export (version "E")
       (node (ref "MCU") (pin "1") (pinfunction "TX") (pintype "output"))
       (node (ref "SNS") (pin "1") (pinfunction "RX") (pintype "input")))))"#;
 
-/// Single-pin stream producer.
+/// Framing for the link: 8N1 at 115.2 kbaud, so one bit is 8680 ns.
+fn link_framing() -> UartFraming {
+    UartFraming::new_8n1(115_200)
+}
+
+/// Single-pin transmitter: frames bytes onto its pin as edges.
 struct LinkTx {
     pins: [PinDecl; 1],
-    tx: TxSlot,
+    bridge: BridgeSlot,
 }
 
 impl LinkTx {
-    fn new(baud_hz: u32, tx: TxSlot) -> Self {
+    fn new(bridge: BridgeSlot) -> Self {
         Self {
             pins: [PinDecl {
                 number: "1",
                 name: Some("TX"),
                 kind: PinKind::DigitalOut,
-                stream: Some(StreamRole::Producer { baud_hz }),
+                stream: None,
                 drive_impedance: None,
             }],
-            tx,
+            bridge,
         }
     }
 }
@@ -259,25 +258,38 @@ impl Component for LinkTx {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        *self.tx.lock().unwrap() = Some(io.stream_tx("TX")?);
+        let bridge = Arc::new(SerialLevelBridge::new(
+            link_framing(),
+            io.pin("TX")?,
+            io.clone(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        bridge.idle();
+        {
+            let bridge = Arc::clone(&bridge);
+            io.on_wake_ns(move |now_ns| {
+                let _ = bridge.service(now_ns);
+            });
+        }
+        *self.bridge.lock().unwrap() = Some(bridge);
         Ok(())
     }
 }
 
-/// Single-pin stream consumer.
+/// Single-pin receiver: deframes the edges back into bytes.
 struct LinkRx {
     pins: [PinDecl; 1],
     rx: ByteLog,
 }
 
 impl LinkRx {
-    fn new(baud_hz: u32, rx: ByteLog) -> Self {
+    fn new(rx: ByteLog) -> Self {
         Self {
             pins: [PinDecl {
                 number: "1",
                 name: Some("RX"),
                 kind: PinKind::DigitalIn,
-                stream: Some(StreamRole::Consumer { baud_hz }),
+                stream: None,
                 drive_impedance: None,
             }],
             rx,
@@ -291,8 +303,32 @@ impl Component for LinkRx {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        let log = Arc::clone(&self.rx);
-        io.on_byte("RX", move |byte| log.lock().unwrap().push(byte))?;
+        let decoder = Arc::new(Mutex::new(UartDecoder::new(link_framing())));
+        {
+            let (log, decoder, io_arm) = (Arc::clone(&self.rx), Arc::clone(&decoder), io.clone());
+            io.on_sense("RX", move |state| {
+                let now = virtual_clock::virtual_ns();
+                let mut rx = decoder.lock().unwrap();
+                if let Some(level) = embsim_board::level_of(state) {
+                    rx.on_level(level, now);
+                }
+                while let Some(Ok(byte)) = rx.poll(now) {
+                    log.lock().unwrap().push(byte);
+                }
+                if let Some(at) = rx.frame_deadline_ns() {
+                    io_arm.schedule_at_ns(at);
+                }
+            })?;
+        }
+        {
+            let log = Arc::clone(&self.rx);
+            io.on_wake_ns(move |now_ns| {
+                let mut rx = decoder.lock().unwrap();
+                while let Some(Ok(byte)) = rx.poll(now_ns) {
+                    log.lock().unwrap().push(byte);
+                }
+            });
+        }
         Ok(())
     }
 }
@@ -377,20 +413,20 @@ fn analog_scenario(scenario: Scenario) -> EventLog {
 /// Build the one-net serial link, write a fixed payload, and return the event
 /// log once every surviving byte has been delivered.
 fn stream_scenario(scenario: Scenario, payload: &[u8], expected_bytes: usize) -> EventLog {
-    let tx: TxSlot = Arc::new(Mutex::new(None));
+    let tx: BridgeSlot = Arc::new(Mutex::new(None));
     let rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
 
     let mut registry = PartRegistry::new();
     {
         let tx = Arc::clone(&tx);
         registry.register("LINK_TX", move |_decl| {
-            Box::new(LinkTx::new(115_200, Arc::clone(&tx)))
+            Box::new(LinkTx::new(Arc::clone(&tx)))
         });
     }
     {
         let rx = Arc::clone(&rx);
         registry.register("LINK_RX", move |_decl| {
-            Box::new(LinkRx::new(115_200, Arc::clone(&rx)))
+            Box::new(LinkRx::new(Arc::clone(&rx)))
         });
     }
     let board = Board::from_netlist(
@@ -411,7 +447,7 @@ fn stream_scenario(scenario: Scenario, payload: &[u8], expected_bytes: usize) ->
         .unwrap()
         .as_ref()
         .expect("MCU.TX attached")
-        .write(payload);
+        .transmit(payload);
 
     assert!(
         wait_for(
@@ -497,8 +533,7 @@ fn wake_ladder_scenario() -> EventLog {
 const CASES: &[&str] = &[
     "nominal_analog_cluster",
     "net_stuck_shared_node",
-    "paced_stream",
-    "stream_drop_every_nth",
+    "serial_levels",
     "wake_ladder",
 ];
 
@@ -508,31 +543,24 @@ fn run_case(name: &str) -> EventLog {
     match name {
         "nominal_analog_cluster" => analog_scenario(Scenario::default()),
         "net_stuck_shared_node" => analog_scenario(Scenario::default().net_stuck("DRV.A", 0.0)),
-        "paced_stream" => {
-            let payload: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(17)).collect();
+        "serial_levels" => {
+            // Four bytes, framed onto the net one bit at a time. This is the
+            // case that pins the *bit clock*: every edge is a drive, a
+            // resolution and a sense, and every bit boundary is a wheel entry.
+            let payload = [0x00u8, 0x5A, 0xFF, 0xA5];
             stream_scenario(Scenario::default(), &payload, payload.len())
-        }
-        "stream_drop_every_nth" => {
-            let payload: Vec<u8> = (0..15u8).map(|i| i.wrapping_mul(17)).collect();
-            // EveryNth(3) drops bytes 3, 6, 9, 12, 15 of 15 → 10 survive.
-            let survivors = payload.len() - payload.len() / 3;
-            stream_scenario(
-                Scenario::default().stream_drop("Rig.MCU.1", StreamDropPolicy::EveryNth(3)),
-                &payload,
-                survivors,
-            )
         }
         "wake_ladder" => wake_ladder_scenario(),
         other => panic!("unknown determinism case {other:?}"),
     }
 }
 
-/// Free-running speed scale for a case. 50x keeps 115.2 kbaud pacing of a
-/// 16-byte payload sub-millisecond in wall time (the convention
-/// `bench_component.rs` documents); everything else runs at real time.
+/// Free-running speed scale for a case. 50x keeps the 115.2 kbaud bit clock
+/// of a four-byte payload sub-millisecond in wall time; everything else runs
+/// at real time.
 fn free_running_scale(name: &str) -> f64 {
     match name {
-        "paced_stream" | "stream_drop_every_nth" => 50.0,
+        "serial_levels" => 50.0,
         _ => 1.0,
     }
 }
@@ -665,8 +693,7 @@ fn free_running_matrix(case: &str) {
 #[rstest]
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
-#[case::paced_stream("paced_stream")]
-#[case::stream_drop("stream_drop_every_nth")]
+#[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
 fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
     let _suite = suite_lock();
@@ -679,8 +706,7 @@ fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
 #[rstest]
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
-#[case::paced_stream("paced_stream")]
-#[case::stream_drop("stream_drop_every_nth")]
+#[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
 fn paced_order_is_reproducible(#[case] case: &str) {
     let _suite = suite_lock();
@@ -763,8 +789,7 @@ fn golden_path(case: &str) -> std::path::PathBuf {
 #[rstest]
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
-#[case::paced_stream("paced_stream")]
-#[case::stream_drop("stream_drop_every_nth")]
+#[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
 fn stepped_logs_match_their_golden_trace(#[case] case: &str) {
     let _suite = suite_lock();
@@ -895,7 +920,7 @@ fn dump_via_subprocess(case: &str) -> Vec<String> {
 /// map (`DETERMINISM.md`, "Multi-process identity").
 #[rstest]
 #[case::nominal("nominal_analog_cluster")]
-#[case::paced_stream("paced_stream")]
+#[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
 fn stepped_logs_are_identical_across_processes(#[case] case: &str) {
     let logs: Vec<Vec<String>> = (0..PROCESS_RUNS)
@@ -994,7 +1019,7 @@ fn a_stepped_run_serves_no_wall_sleeps() {
     {
         let _stepped = Stepped::enter();
         let _ = run_case("wake_ladder");
-        let _ = run_case("paced_stream");
+        let _ = run_case("serial_levels");
     }
     assert_eq!(
         virtual_clock::stepped_wall_sleep_count(),

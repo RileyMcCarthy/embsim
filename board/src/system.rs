@@ -197,17 +197,6 @@ pub enum DnpState {
     Absent,
 }
 
-/// Byte-loss injection policy for a serial route (the supported way to
-/// exercise loss-handling code — byte loss is not emergent at pipe
-/// granularity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StreamDropPolicy {
-    /// Drop every byte (broken wire while the route stays valid).
-    All,
-    /// Drop every Nth byte.
-    EveryNth(u32),
-}
-
 /// One injected fault, defined in terms of graph primitives the netlist
 /// actually has.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,13 +220,6 @@ pub enum Fault {
         net: String,
         /// Rail voltage of the injected source.
         volts: Volts,
-    },
-    /// Byte-loss injection on a serial route.
-    StreamDrop {
-        /// Dotted stream-endpoint pin.
-        endpoint: String,
-        /// Drop policy.
-        policy: StreamDropPolicy,
     },
 }
 
@@ -293,15 +275,6 @@ impl Scenario {
     /// Override a component's DNP state.
     pub fn dnp_override(mut self, reference: &str, state: DnpState) -> Self {
         self.dnp_overrides.push((reference.to_string(), state));
-        self
-    }
-
-    /// Inject byte loss on a serial route.
-    pub fn stream_drop(mut self, endpoint: &str, policy: StreamDropPolicy) -> Self {
-        self.faults.push(Fault::StreamDrop {
-            endpoint: endpoint.to_string(),
-            policy,
-        });
         self
     }
 
@@ -480,11 +453,11 @@ impl System {
 
         let mut diagnostics = Diagnostics::new();
         resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
-        // Stream routing runs at build too: byte pipes are derived from and
-        // gated by net resolution, and the routing findings
+        // Pulse routing runs at build too: a step clock's route is derived
+        // from and gated by net resolution, and its routing findings
         // (`StreamMismatch`) are build-time analysis output. The derived
         // routes themselves only come alive on the `System::start` path.
-        let _ = resolver.route_streams(&nets, &mut diagnostics);
+        let _ = resolver.route_pulses(&nets, &mut diagnostics);
 
         // Inert attach: sense() reads this build-resolved snapshot; drives
         // and schedules are traced and dropped.
@@ -529,7 +502,7 @@ impl System {
             }
             diagnostics = Diagnostics::new();
             resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
-            let _ = resolver.route_streams(&nets, &mut diagnostics);
+            let _ = resolver.route_pulses(&nets, &mut diagnostics);
             *states.lock().expect("never poisoned") = nets.iter().map(|n| n.state).collect();
         }
 
@@ -810,9 +783,6 @@ impl System {
         }
 
         // -- scenario: fault algebra ---------------------------------------
-        // Stream drops resolve to endpoints only after the electrical
-        // descriptors are registered below; collect them here.
-        let mut stream_drops: Vec<(String, StreamDropPolicy)> = Vec::new();
         for fault in self.scenario.faults().to_vec() {
             match fault {
                 Fault::PinDetach { endpoint } => {
@@ -831,9 +801,6 @@ impl System {
                 Fault::NetStuck { net, volts } => {
                     let idx = self.named_net(&net, &nets)?;
                     stuck_sources.push((idx, volts));
-                }
-                Fault::StreamDrop { endpoint, policy } => {
-                    stream_drops.push((endpoint, policy));
                 }
             }
         }
@@ -946,23 +913,6 @@ impl System {
                 eps.push(endpoint);
             }
             bench_endpoints.push(eps);
-        }
-
-        // -- stream-drop faults (need the endpoint table) --------------------
-        for (path, policy) in stream_drops {
-            let (bi, pin) = split_board_pin(&path, &board_index).ok_or_else(|| {
-                SystemError::UnknownEndpoint {
-                    endpoint: path.clone(),
-                }
-            })?;
-            let endpoint =
-                endpoints
-                    .get(&(bi, pin))
-                    .copied()
-                    .ok_or_else(|| SystemError::UnknownEndpoint {
-                        endpoint: path.clone(),
-                    })?;
-            resolver.add_stream_drop(endpoint, policy);
         }
 
         // -- prepare registered components for attach ------------------------
@@ -1494,14 +1444,13 @@ mod tests {
             .pin_short("DS2Addon.A0", "DS2Addon.A1")
             .net_stuck("DS2Addon.AIN0", 3.3)
             .value_override("DS2Addon.R5", "4k7")
-            .dnp_override("DS2Addon.C7", DnpState::Populated)
-            .stream_drop("DS2Addon.U1.2", StreamDropPolicy::EveryNth(3));
+            .dnp_override("DS2Addon.C7", DnpState::Populated);
 
         assert_eq!(
             scenario.jumpers(),
             &[("DS2Addon.JP1".to_string(), JumperState::Closed)]
         );
-        assert_eq!(scenario.faults().len(), 4);
+        assert_eq!(scenario.faults().len(), 3);
         assert_eq!(
             scenario.faults()[0],
             Fault::PinDetach {

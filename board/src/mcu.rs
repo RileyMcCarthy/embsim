@@ -10,7 +10,7 @@
 //!
 //! | Channel | Builder | Pins | Direction |
 //! |---|---|---|---|
-//! | serial | [`McuBuilder::bridge_serial`] | TX + RX, stream roles (or plain digital, with [`McuBuilder::serial_on_levels`]) | both |
+//! | serial | [`McuBuilder::bridge_serial`] | TX + RX, plain digital | both |
 //! | GPIO | [`McuBuilder::bridge_gpio`] | one, per declared direction | firmware → net **and** net → firmware |
 //! | pulse-out | [`McuBuilder::bridge_pulse_out`] | one STEP pin, [`StreamRole::PulseSource`] | firmware → net |
 //! | encoder | [`McuBuilder::bridge_encoder`] | A + B phase pins | net → firmware |
@@ -105,46 +105,43 @@
 //!
 //! ```text
 //!  firmware HAL serial ──fd──┐                      ┌── net engine ──┐
-//!    transmit_data ──────────┤ socketpair ├─ pump ──► StreamTx "P{tx}"
-//!    receive_*     ◄─────────┤            ├◄─ on_byte("P{rx}") ◄─────┘
+//!    transmit_data ──────────┤ socketpair ├─ pump ──► framer → "P{tx}"
+//!    receive_*     ◄─────────┤            ├◄─ deframer ← "P{rx}" ◄───┘
 //! ```
 //!
 //! - **MCU → net**: a small named thread (`"mcu-{name}-ch{n}"`) polls the
-//!   component-side FD and `StreamTx::write`s whatever the firmware
-//!   transmitted out the TX pin. A dedicated thread (rather than an engine
-//!   `schedule_every` poll) keeps FD I/O off the net-engine thread — nothing
-//!   on a net-resolution path may block — and matches the models crate's
-//!   existing `protocol_loop` reader-thread pattern.
-//! - **Net → MCU**: bytes delivered to the RX pin's `on_byte` (engine
-//!   thread) are written non-blockingly to the component-side FD; the
-//!   firmware reads them from its end. A full pipe drops the byte with a
-//!   trace — the engine thread never blocks on a slow firmware.
-//! - **Baud comes from the table**: the TX/RX pins declare
-//!   `Producer`/`Consumer { baud_hz }` from [`SerialChannelConfig::baud`],
-//!   so the net engine paces the wire from the firmware's own config — the
-//!   emulator invents no default. The peripheral bank's own `set_baud`
-//!   pacing is deliberately left untouched (unpaced unless the consumer
-//!   overrides it, e.g. MaD's `MAD_SIM_BAUD` test override): the wire is
-//!   paced in exactly one place.
+//!   component-side FD and hands whatever the firmware transmitted to the
+//!   channel's framer, which clocks it out the TX pin one bit at a time. A
+//!   dedicated thread (rather than an engine `schedule_every` poll) keeps FD
+//!   I/O off the net-engine thread — nothing on a net-resolution path may
+//!   block — and matches the models crate's existing `protocol_loop`
+//!   reader-thread pattern.
+//! - **Net → MCU**: the RX pin's resolved state feeds a deframer on the engine
+//!   thread, and whatever it decodes is written non-blockingly to the
+//!   component-side FD; the firmware reads it from its end. A full pipe drops
+//!   the byte with a trace — the engine thread never blocks on a slow
+//!   firmware.
+//! - **Baud comes from the table**: the framing is 8N1 at
+//!   [`SerialChannelConfig::baud`], so the wire clocks at the firmware's own
+//!   config — the emulator invents no default. The peripheral bank's own
+//!   `set_baud` pacing is deliberately left untouched (unpaced unless the
+//!   consumer overrides it, e.g. MaD's `MAD_SIM_BAUD` test override): the wire
+//!   is paced in exactly one place.
 //!
-//! ## Or as levels, which is the point of the net
+//! ## The bits are on the net
 //!
-//! [`McuBuilder::serial_on_levels`] replaces that byte route with edges. The
-//! TX/RX pins become plain [`PinKind::DigitalOut`] / [`PinKind::DigitalIn`]
+//! The TX/RX pins are plain [`PinKind::DigitalOut`] / [`PinKind::DigitalIn`]
 //! with no [`StreamRole`] at all, and a byte becomes a start bit, eight data
 //! bits and a stop bit at the table baud — driven by
-//! `serial_levels::SerialLevelBridge` out of the component's wake handler, and
+//! [`crate::SerialLevelBridge`] out of the component's wake handler, and
 //! decoded on the way back from the RX pin's resolved state.
 //!
-//! It matters because the byte route lets the net decide *reachability* and
-//! nothing else: a byte crossing it cannot be corrupted by a driver fighting
-//! it, cannot notice the line was floating, and cannot break. On levels it can,
-//! and `board/tests/serial_levels.rs` shows exactly that — the same byte, the
-//! same code, one wire with a second driver on it, and only the contended one
-//! fails.
-//!
-//! The two encodings do not interoperate (a `Producer` has nothing to say to a
-//! `DigitalIn`), which is why this is a flag rather than the only path.
+//! It used to be a byte *route*, which let the net decide reachability and
+//! nothing else: a byte crossing it could not be corrupted by a driver
+//! fighting it, could not notice the line was floating, and could not break.
+//! On levels it can, and `board/tests/serial_levels.rs` shows exactly that —
+//! the same byte, the same code, one wire with a second driver on it, and only
+//! the contended one fails.
 //! - **Shutdown**: dropping the component flags every pump, joins its
 //!   thread (bounded by the poll timeout), disconnects the channel from the
 //!   peripheral bank, and closes both FDs — no detached-thread leak.
@@ -323,7 +320,6 @@ pub struct McuBuilder {
     name: String,
     serial_table: Vec<SerialChannelConfig>,
     bridged_serial: Vec<usize>,
-    serial_on_levels: bool,
     gpio: Vec<(GpioChannelConfig, GpioDirection)>,
     gpio_table: Vec<GpioChannelConfig>,
     bridged_gpio: Vec<(usize, GpioDirection)>,
@@ -341,7 +337,6 @@ impl std::fmt::Debug for McuBuilder {
             .field("name", &self.name)
             .field("serial_table", &self.serial_table)
             .field("bridged_serial", &self.bridged_serial)
-            .field("serial_on_levels", &self.serial_on_levels)
             .field("gpio", &self.gpio)
             .field("gpio_table", &self.gpio_table)
             .field("bridged_gpio", &self.bridged_gpio)
@@ -378,31 +373,6 @@ impl McuBuilder {
     /// bank at attach. Channels not bridged are not declared at all.
     pub fn bridge_serial(mut self, channel: usize) -> Self {
         self.bridged_serial.push(channel);
-        self
-    }
-
-    /// Carry every bridged serial channel as **levels** rather than as bytes.
-    ///
-    /// The default routes a firmware TX byte to a
-    /// [`StreamRole::Producer`] pin, which delivers it to a reachable
-    /// consumer as a byte: the net decides *who is connected*, but the payload
-    /// never becomes a level, so it cannot be corrupted by a fighting driver
-    /// and cannot notice the line was floating. With this set, the TX and RX
-    /// pins are plain [`PinKind::DigitalOut`] / [`PinKind::DigitalIn`], the
-    /// byte becomes a start bit, eight data bits and a stop bit at the table
-    /// baud, and the peer decodes the edges back.
-    ///
-    /// Two consequences worth expecting:
-    ///
-    /// - **A byte now takes a byte's worth of virtual time to arrive.** It did
-    ///   before too (the byte route paces at the same baud), but the *first*
-    ///   edge is now visible a bit period before the byte lands.
-    /// - **The peer must also speak levels.** A [`StreamRole::Producer`] on
-    ///   the other end of the wire has nothing to say to a `DigitalIn`; the
-    ///   two encodings do not interoperate, which is why this is a flag and
-    ///   not yet the only path.
-    pub fn serial_on_levels(mut self) -> Self {
-        self.serial_on_levels = true;
         self
     }
 
@@ -594,33 +564,20 @@ impl McuBuilder {
                         channel,
                         table_len: self.serial_table.len(),
                     })?;
-            // UART TX transmits onto the net; RX takes what reaches it. On
-            // levels both are plain digital pins with no stream role at all —
-            // the framing lives in the component, not in the route.
-            let (tx_stream, rx_stream) = if self.serial_on_levels {
-                (None, None)
-            } else {
-                (
-                    Some(StreamRole::Producer {
-                        baud_hz: config.baud,
-                    }),
-                    Some(StreamRole::Consumer {
-                        baud_hz: config.baud,
-                    }),
-                )
-            };
+            // Two plain digital pins: the UART is framed onto the net as
+            // levels, so there is no byte route to declare.
             pins.push(PinDecl {
                 number: claim(config.tx_pin)?,
                 name: None,
                 kind: PinKind::DigitalOut,
-                stream: tx_stream,
+                stream: None,
                 drive_impedance: None,
             });
             pins.push(PinDecl {
                 number: claim(config.rx_pin)?,
                 name: None,
                 kind: PinKind::DigitalIn,
-                stream: rx_stream,
+                stream: None,
                 drive_impedance: None,
             });
             bridges.push(SerialBridge { channel, config });
@@ -743,7 +700,6 @@ impl McuBuilder {
             name: self.name,
             pins,
             bridges,
-            serial_on_levels: self.serial_on_levels,
             gpio_bridges,
             pulse_bridges,
             encoder_bridges,
@@ -999,9 +955,6 @@ pub struct McuComponent {
     name: String,
     pins: Vec<PinDecl>,
     bridges: Vec<SerialBridge>,
-    /// Carry serial as levels rather than as routed bytes
-    /// ([`McuBuilder::serial_on_levels`]).
-    serial_on_levels: bool,
     gpio_bridges: Vec<GpioBridge>,
     pulse_bridges: Vec<PulseBridge>,
     encoder_bridges: Vec<EncoderBridge>,
@@ -1033,7 +986,6 @@ impl std::fmt::Debug for McuComponent {
             .field("name", &self.name)
             .field("pins", &self.pins)
             .field("bridges", &self.bridges)
-            .field("serial_on_levels", &self.serial_on_levels)
             .field("gpio_bridges", &self.gpio_bridges)
             .field("pulse_bridges", &self.pulse_bridges)
             .field("encoder_bridges", &self.encoder_bridges)
@@ -1107,61 +1059,46 @@ impl Component for McuComponent {
 
             instance.serial.init_channel_fd(bridge.channel, firmware_fd);
 
-            // Net → MCU. On the byte path the route hands over whole bytes; on
-            // levels the pin's resolved state is fed to a framer and whatever
-            // it decodes lands on the firmware's read side. Both run on the
-            // engine thread, so the write must never block: a full pipe drops
-            // the byte with a trace.
+            // Net → MCU: the RX pin's resolved state is fed to a framer, and
+            // whatever it decodes lands on the firmware's read side. Runs on
+            // the engine thread, so the write must never block: a full pipe
+            // drops the byte with a trace.
             let channel = bridge.channel;
-            let tx_sink: TxSink = if self.serial_on_levels {
-                let level = Arc::new(SerialLevelBridge::new(
-                    UartFraming::new_8n1(bridge.config.baud),
-                    io.pin(tx_name)?,
-                    io.clone(),
-                    Arc::clone(&shutdown),
-                ));
-                // Hold the line at idle before the firmware runs: a peer that
-                // saw it floating would have no reference for the first start
-                // bit's falling edge.
-                level.idle();
-                {
-                    let level = Arc::clone(&level);
-                    let shutdown = Arc::clone(&shutdown);
-                    io.on_sense(rx_name, move |state| {
-                        if shutdown.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        deliver_rx(component_fd, channel, level.receive_sense(state));
-                    })?;
-                }
-                level_channels.push(LevelChannel {
-                    channel,
-                    component_fd,
-                    level: Arc::clone(&level),
-                });
-                Box::new(move |bytes: &[u8]| {
-                    let shed = level.transmit(bytes);
-                    if shed > 0 {
-                        tracing::trace!(channel, shed, "TX bytes shed: the line is behind");
+            let level = Arc::new(SerialLevelBridge::new(
+                UartFraming::new_8n1(bridge.config.baud),
+                io.pin(tx_name)?,
+                io.clone(),
+                Arc::clone(&shutdown),
+            ));
+            // Hold the line at idle before the firmware runs: a peer that saw
+            // it floating would have no reference for the first start bit's
+            // falling edge.
+            level.idle();
+            {
+                let level = Arc::clone(&level);
+                let shutdown = Arc::clone(&shutdown);
+                io.on_sense(rx_name, move |state| {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
                     }
-                })
-            } else {
-                let tx = io.stream_tx(tx_name)?;
-                {
-                    let shutdown = Arc::clone(&shutdown);
-                    io.on_byte(rx_name, move |byte| {
-                        if shutdown.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        deliver_rx(component_fd, channel, [Ok(byte)]);
-                    })?;
+                    deliver_rx(component_fd, channel, level.receive_sense(state));
+                })?;
+            }
+            level_channels.push(LevelChannel {
+                channel,
+                component_fd,
+                level: Arc::clone(&level),
+            });
+            let tx_sink: TxSink = Box::new(move |bytes: &[u8]| {
+                let shed = level.transmit(bytes);
+                if shed > 0 {
+                    tracing::trace!(channel, shed, "TX bytes shed: the line is behind");
                 }
-                Box::new(move |bytes: &[u8]| tx.write(bytes))
-            };
+            });
 
-            // MCU → net: a named pump thread moves firmware TX bytes into
-            // whichever sink this channel uses (see the module docs for why a
-            // thread and not an engine poll).
+            // MCU → net: a named pump thread moves firmware TX bytes into the
+            // framer (see the module docs for why a thread and not an engine
+            // poll).
             let thread = std::thread::Builder::new()
                 .name(format!("mcu-{}-ch{}", self.name, bridge.channel))
                 .spawn({
@@ -1182,7 +1119,6 @@ impl Component for McuComponent {
                 tx = tx_name,
                 rx = rx_name,
                 baud = bridge.config.baud,
-                on_levels = self.serial_on_levels,
                 "serial channel bridged"
             );
         }
@@ -1657,7 +1593,7 @@ mod tests {
             .find(|p| p.number == "P2")
             .expect("TX pin declared");
         assert_eq!(tx.kind, PinKind::DigitalOut);
-        assert_eq!(tx.stream, Some(StreamRole::Producer { baud_hz: 115_200 }));
+        assert_eq!(tx.stream, None, "TX clocks out edges, not a byte route");
 
         let rx = mcu
             .pins()
@@ -1665,7 +1601,7 @@ mod tests {
             .find(|p| p.number == "P0")
             .expect("RX pin declared");
         assert_eq!(rx.kind, PinKind::DigitalIn);
-        assert_eq!(rx.stream, Some(StreamRole::Consumer { baud_hz: 115_200 }));
+        assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
     }
 
     /// Channels that are not bridged are not declared at all — the facade

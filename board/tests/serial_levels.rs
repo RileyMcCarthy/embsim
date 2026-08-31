@@ -26,7 +26,7 @@ use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::uart::{FramingError, UartDecoder, UartEncoder, UartFraming};
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, Harness, Level, McuComponent, NetState,
-    PartRegistry, PinDecl, PinHandle, PinKind, StreamRole, System, SystemHandle, TheveninDrive,
+    PartRegistry, PinDecl, PinHandle, PinKind, Scenario, System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock;
 use embsim_peripherals::serial;
@@ -362,13 +362,16 @@ impl Component for StuckLow {
 // ============================================================
 
 fn start_system(peer: &Peer, peer_netlist: &str) -> SystemHandle {
+    start_system_with(peer, peer_netlist, Scenario::default())
+}
+
+fn start_system_with(peer: &Peer, peer_netlist: &str, scenario: Scenario) -> SystemHandle {
     let mut registry = PartRegistry::new();
     registry.register("MCU_P2", |_decl| {
         Box::new(
             McuComponent::builder("p2")
                 .serial_table(vec![FG])
                 .bridge_serial(0)
-                .serial_on_levels()
                 .build()
                 .expect("MCU builds from the FG table"),
         )
@@ -402,6 +405,7 @@ fn start_system(peer: &Peer, peer_netlist: &str) -> SystemHandle {
                 .connect_str("PeerBoard.J1.1", "McuBoard.J1.2")
                 .expect("endpoints parse"),
         )
+        .scenario(scenario)
         .start()
         .expect("live system starts")
 }
@@ -471,14 +475,13 @@ fn start_probe_pair(a: &ProbeHandle, b: &ProbeHandle) -> SystemHandle {
 // Tests
 // ============================================================
 
-/// On levels a serial pin carries no stream role at all: the framing lives in
-/// the component, not in the route.
+/// A serial pin carries no stream role at all: the framing lives in the
+/// component, and what is on the net is edges.
 #[rstest]
-fn a_level_carried_channel_declares_plain_digital_pins() {
+fn a_serial_channel_declares_plain_digital_pins() {
     let mcu = McuComponent::builder("p2")
         .serial_table(vec![FG])
         .bridge_serial(0)
-        .serial_on_levels()
         .build()
         .expect("builds");
 
@@ -490,22 +493,45 @@ fn a_level_carried_channel_declares_plain_digital_pins() {
     let rx = pins.iter().find(|p| p.number == "P0").expect("P0 declared");
     assert_eq!(rx.kind, PinKind::DigitalIn);
     assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
+}
 
-    // The byte path is unchanged when the flag is off.
-    let bytes = McuComponent::builder("p2")
-        .serial_table(vec![FG])
-        .bridge_serial(0)
-        .build()
-        .expect("builds");
-    assert_eq!(
-        bytes
-            .pins()
-            .iter()
-            .find(|p| p.number == "P2")
-            .expect("P2")
-            .stream,
-        Some(StreamRole::Producer { baud_hz: 115_200 })
+/// A detached transmit pin leaves the line floating, and a floating line
+/// spells nothing.
+///
+/// The byte route had its own version of this — a producer with no route
+/// dropped its writes. On levels the fault needs no special case: the pin is
+/// not on the net, so nothing drives it, so the receiver's decoder is handed
+/// no level to work with and never sees a start bit.
+#[rstest]
+fn a_detached_transmit_pin_leaves_the_line_floating() {
+    let _g = lock_clock();
+    virtual_clock::init(0.0, 1_000_000);
+    serial::init(1);
+
+    let peer = Peer::new();
+    let system = start_system_with(
+        &peer,
+        PEER_NETLIST,
+        Scenario::default().pin_detach("McuBoard.U1.P2"),
     );
+
+    serial::transmit_data(0, b"lost");
+    assert!(
+        wait_for(
+            || system.net_state("PeerBoard.PEER_RX") == Some(NetState::Floating),
+            Duration::from_secs(5)
+        ),
+        "a detached driver must leave the line floating; got {:?}",
+        system.net_state("PeerBoard.PEER_RX")
+    );
+    assert!(
+        peer.lock().frames.is_empty(),
+        "a floating line must not decode; got {:?}",
+        peer.lock().frames
+    );
+
+    drop(system);
+    serial::reset();
 }
 
 /// A firmware byte becomes a real waveform: the peer sees the edges, at the

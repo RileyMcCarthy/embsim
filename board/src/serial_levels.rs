@@ -1,11 +1,13 @@
 //! The serial byte↔level bridge: a UART that actually puts its bits on a net.
 //!
-//! A [`crate::StreamRole::Producer`] pin routes a UART byte as a *byte*. The
-//! net decides who is connected, but the payload never becomes a level — so it
-//! cannot experience contention, cannot be corrupted by a fighting driver, and
-//! cannot notice the line was floating. This module is the other path: the
-//! byte becomes ten timed edges on a plain [`crate::PinKind::DigitalOut`], and
-//! the peer reads it back off a plain [`crate::PinKind::DigitalIn`].
+//! A byte becomes ten timed edges on a plain [`crate::PinKind::DigitalOut`],
+//! and the peer reads it back off a plain [`crate::PinKind::DigitalIn`].
+//!
+//! There used to be a byte *route* instead: a `StreamRole::Producer` pin
+//! handed whole bytes to reachable consumers. The net decided who was
+//! connected, but the payload never became a level — so it could not
+//! experience contention, could not be corrupted by a fighting driver, and
+//! could not notice the line was floating.
 //!
 //! **One implementation, shared.** [`crate::mcu::McuComponent`] uses it for a
 //! bridged firmware channel; `embsim_models::ads122u04_component` uses it for

@@ -67,7 +67,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, EndpointRef, Harness, JumperState, Level,
-    McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, PinKind, Scenario, StreamRole,
+    McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, PinKind, Scenario,
     TheveninDrive, Volts,
 };
 
@@ -151,28 +151,6 @@ pub const fn passive(number: &'static str) -> PinDecl {
 /// declaring it passive keeps a deliberately dangling pad out of the findings.
 pub const fn nc(number: &'static str) -> PinDecl {
     passive(number)
-}
-
-/// A UART transmit pin: drives the net and paces bytes onto the derived route.
-pub const fn stream_out(number: &'static str, baud_hz: u32) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: Some(StreamRole::Producer { baud_hz }),
-        drive_impedance: None,
-    }
-}
-
-/// A UART receive pin: senses the net and consumes routed bytes.
-pub const fn stream_in(number: &'static str, baud_hz: u32) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: Some(StreamRole::Consumer { baud_hz }),
-        drive_impedance: None,
-    }
 }
 
 // ============================================================
@@ -958,11 +936,6 @@ impl P2EdgeModule {
         let mcu = McuComponent::builder(name)
             .serial_table(vec![channel])
             .bridge_serial(0)
-            // The UART crosses the card edge, an isolation barrier, a cable and
-            // two 47 ohm series resistors to reach the ADC — every one of them
-            // a thing that can only affect a signal that is actually on the
-            // net. So the channel carries levels, like the part at the far end.
-            .serial_on_levels()
             .build()
             .expect("the force-gauge channel is in the table and inside P63");
 

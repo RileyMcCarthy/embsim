@@ -27,8 +27,6 @@ pub enum CallbackKind {
     Sense,
     /// A timer-wheel wakeup delivery.
     Wake,
-    /// A stream byte delivery.
-    StreamByte,
     /// A pulse-train (rate-change) delivery.
     Pulse,
     /// A topology-epoch notification.
@@ -77,12 +75,13 @@ pub enum Finding {
         /// Net name.
         net: String,
     },
-    /// A serial route with two `Producer`s facing each other (the crossed
-    /// TX/RX harness).
+    /// Two [`crate::StreamRole::PulseSource`] pins facing each other: two
+    /// step clocks on one line. The underlying net resolves `Contention` on
+    /// its own; this names the pins.
     StreamMismatch {
         /// Name of the net carrying the invalid route.
         net: String,
-        /// The producer pins facing each other.
+        /// The source pins facing each other.
         producers: Vec<PinRef>,
     },
     /// A netlist component could not be classified (no auto tier match, no
@@ -114,15 +113,6 @@ pub enum Finding {
     VirtualClockUninitialized {
         /// What needed the clock.
         context: String,
-    },
-    /// A paced stream route's in-flight queue overflowed: the producer
-    /// sustained writes above its declared baud for longer than the queue
-    /// absorbs (a producer-vs-declared-baud mismatch — exactly the class
-    /// of disagreement the framework exists to surface). Overflow bytes
-    /// are shed; the trace carries the counts.
-    StreamOverrun {
-        /// The producer pin whose route overflowed.
-        producer: PinRef,
     },
     /// A reserved drive enqueue sequence number never arrived (the
     /// enqueuing thread died between reserving the seq and sending the

@@ -1,11 +1,9 @@
 //! Asynchronous serial framing, so bytes can travel as levels on a net.
 //!
-//! Today a UART byte crosses a [`crate::StreamRole::Producer`] pin as a byte:
-//! the net decides who is connected, but the payload never becomes a level, so
-//! it cannot experience contention, a fighting driver, or a floating line. This
-//! is the codec that lets those bytes become levels instead — one shared
-//! implementation, so every byte-oriented peripheral frames identically rather
-//! than growing its own.
+//! One shared implementation, so every byte-oriented peripheral frames
+//! identically rather than growing its own — and so a byte on a wire is a
+//! waveform that can experience contention, a fighting driver, or a floating
+//! line, rather than a payload routed past the net that carries it.
 //!
 //! ```text
 //!   idle   start  d0    d1    d2 …            stop   idle

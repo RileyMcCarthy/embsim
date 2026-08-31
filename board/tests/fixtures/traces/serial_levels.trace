@@ -1,0 +1,146 @@
+0 v=0 net_resolved net=0 state=driven:high
+1 v=0 reroute epoch=0
+2 v=0 drive_applied seq=0 endpoint=0 drive=3300000uv@25000mohm
+3 v=0 sense net=0 state=driven:high
+4 v=0 wake component=0
+5 v=0 drive_applied seq=1 endpoint=0 drive=0uv@25000mohm
+6 v=0 net_resolved net=0 state=driven:low
+7 v=0 sense net=0 state=driven:low
+8 v=8 wake component=0
+9 v=8 drive_applied seq=2 endpoint=0 drive=0uv@25000mohm
+10 v=17 wake component=0
+11 v=17 drive_applied seq=3 endpoint=0 drive=0uv@25000mohm
+12 v=26 wake component=0
+13 v=26 drive_applied seq=4 endpoint=0 drive=0uv@25000mohm
+14 v=34 wake component=0
+15 v=34 drive_applied seq=5 endpoint=0 drive=0uv@25000mohm
+16 v=43 wake component=0
+17 v=43 drive_applied seq=6 endpoint=0 drive=0uv@25000mohm
+18 v=52 wake component=0
+19 v=52 drive_applied seq=7 endpoint=0 drive=0uv@25000mohm
+20 v=60 wake component=0
+21 v=60 drive_applied seq=8 endpoint=0 drive=0uv@25000mohm
+22 v=69 wake component=0
+23 v=69 drive_applied seq=9 endpoint=0 drive=0uv@25000mohm
+24 v=78 wake component=0
+25 v=78 drive_applied seq=10 endpoint=0 drive=3300000uv@25000mohm
+26 v=78 net_resolved net=0 state=driven:high
+27 v=78 sense net=0 state=driven:high
+28 v=86 wake component=1
+29 v=86 wake component=0
+30 v=86 wake component=1
+31 v=86 drive_applied seq=11 endpoint=0 drive=0uv@25000mohm
+32 v=86 net_resolved net=0 state=driven:low
+33 v=86 sense net=0 state=driven:low
+34 v=95 wake component=0
+35 v=95 drive_applied seq=12 endpoint=0 drive=0uv@25000mohm
+36 v=104 wake component=0
+37 v=104 drive_applied seq=13 endpoint=0 drive=3300000uv@25000mohm
+38 v=104 net_resolved net=0 state=driven:high
+39 v=104 sense net=0 state=driven:high
+40 v=112 wake component=0
+41 v=112 drive_applied seq=14 endpoint=0 drive=0uv@25000mohm
+42 v=112 net_resolved net=0 state=driven:low
+43 v=112 sense net=0 state=driven:low
+44 v=121 wake component=0
+45 v=121 drive_applied seq=15 endpoint=0 drive=3300000uv@25000mohm
+46 v=121 net_resolved net=0 state=driven:high
+47 v=121 sense net=0 state=driven:high
+48 v=130 wake component=0
+49 v=130 drive_applied seq=16 endpoint=0 drive=3300000uv@25000mohm
+50 v=138 wake component=0
+51 v=138 drive_applied seq=17 endpoint=0 drive=0uv@25000mohm
+52 v=138 net_resolved net=0 state=driven:low
+53 v=138 sense net=0 state=driven:low
+54 v=147 wake component=0
+55 v=147 drive_applied seq=18 endpoint=0 drive=3300000uv@25000mohm
+56 v=147 net_resolved net=0 state=driven:high
+57 v=147 sense net=0 state=driven:high
+58 v=156 wake component=0
+59 v=156 drive_applied seq=19 endpoint=0 drive=0uv@25000mohm
+60 v=156 net_resolved net=0 state=driven:low
+61 v=156 sense net=0 state=driven:low
+62 v=164 wake component=0
+63 v=164 drive_applied seq=20 endpoint=0 drive=3300000uv@25000mohm
+64 v=164 net_resolved net=0 state=driven:high
+65 v=164 sense net=0 state=driven:high
+66 v=173 wake component=1
+67 v=173 wake component=1
+68 v=173 wake component=1
+69 v=173 wake component=1
+70 v=173 wake component=1
+71 v=173 wake component=1
+72 v=173 wake component=1
+73 v=173 wake component=0
+74 v=173 wake component=1
+75 v=173 drive_applied seq=21 endpoint=0 drive=0uv@25000mohm
+76 v=173 net_resolved net=0 state=driven:low
+77 v=173 sense net=0 state=driven:low
+78 v=182 wake component=0
+79 v=182 drive_applied seq=22 endpoint=0 drive=3300000uv@25000mohm
+80 v=182 net_resolved net=0 state=driven:high
+81 v=182 sense net=0 state=driven:high
+82 v=190 wake component=0
+83 v=190 drive_applied seq=23 endpoint=0 drive=3300000uv@25000mohm
+84 v=199 wake component=0
+85 v=199 drive_applied seq=24 endpoint=0 drive=3300000uv@25000mohm
+86 v=208 wake component=0
+87 v=208 drive_applied seq=25 endpoint=0 drive=3300000uv@25000mohm
+88 v=217 wake component=0
+89 v=217 drive_applied seq=26 endpoint=0 drive=3300000uv@25000mohm
+90 v=225 wake component=0
+91 v=225 drive_applied seq=27 endpoint=0 drive=3300000uv@25000mohm
+92 v=234 wake component=0
+93 v=234 drive_applied seq=28 endpoint=0 drive=3300000uv@25000mohm
+94 v=243 wake component=0
+95 v=243 drive_applied seq=29 endpoint=0 drive=3300000uv@25000mohm
+96 v=251 wake component=0
+97 v=251 drive_applied seq=30 endpoint=0 drive=3300000uv@25000mohm
+98 v=260 wake component=1
+99 v=260 wake component=1
+100 v=260 wake component=0
+101 v=260 drive_applied seq=31 endpoint=0 drive=0uv@25000mohm
+102 v=260 net_resolved net=0 state=driven:low
+103 v=260 sense net=0 state=driven:low
+104 v=269 wake component=0
+105 v=269 drive_applied seq=32 endpoint=0 drive=3300000uv@25000mohm
+106 v=269 net_resolved net=0 state=driven:high
+107 v=269 sense net=0 state=driven:high
+108 v=277 wake component=0
+109 v=277 drive_applied seq=33 endpoint=0 drive=0uv@25000mohm
+110 v=277 net_resolved net=0 state=driven:low
+111 v=277 sense net=0 state=driven:low
+112 v=286 wake component=0
+113 v=286 drive_applied seq=34 endpoint=0 drive=3300000uv@25000mohm
+114 v=286 net_resolved net=0 state=driven:high
+115 v=286 sense net=0 state=driven:high
+116 v=295 wake component=0
+117 v=295 drive_applied seq=35 endpoint=0 drive=0uv@25000mohm
+118 v=295 net_resolved net=0 state=driven:low
+119 v=295 sense net=0 state=driven:low
+120 v=303 wake component=0
+121 v=303 drive_applied seq=36 endpoint=0 drive=0uv@25000mohm
+122 v=312 wake component=0
+123 v=312 drive_applied seq=37 endpoint=0 drive=3300000uv@25000mohm
+124 v=312 net_resolved net=0 state=driven:high
+125 v=312 sense net=0 state=driven:high
+126 v=321 wake component=0
+127 v=321 drive_applied seq=38 endpoint=0 drive=0uv@25000mohm
+128 v=321 net_resolved net=0 state=driven:low
+129 v=321 sense net=0 state=driven:low
+130 v=329 wake component=0
+131 v=329 drive_applied seq=39 endpoint=0 drive=3300000uv@25000mohm
+132 v=329 net_resolved net=0 state=driven:high
+133 v=329 sense net=0 state=driven:high
+134 v=338 wake component=0
+135 v=338 drive_applied seq=40 endpoint=0 drive=3300000uv@25000mohm
+136 v=347 wake component=1
+137 v=347 wake component=1
+138 v=347 wake component=1
+139 v=347 wake component=1
+140 v=347 wake component=1
+141 v=347 wake component=1
+142 v=347 wake component=1
+143 v=347 wake component=1
+144 v=347 wake component=0
+145 v=347 drive_applied seq=41 endpoint=0 drive=3300000uv@25000mohm

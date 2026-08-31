@@ -58,7 +58,7 @@ pub use cluster::{
 };
 pub use component::{
     AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, PulseDirection,
-    PulseSegment, PulseTrain, PulseTx, StreamRole, StreamTx,
+    PulseSegment, PulseTrain, PulseTx, StreamRole,
 };
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
@@ -75,6 +75,6 @@ pub use registry::{
 pub use serial_levels::SerialLevelBridge;
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
-    HarnessError, Scenario, StreamDropPolicy, System, SystemError, SystemHandle,
+    HarnessError, Scenario, System, SystemError, SystemHandle,
 };
 pub use uart::{FramingError, UartDecoder, UartEncoder, UartFraming};

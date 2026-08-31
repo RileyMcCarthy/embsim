@@ -14,15 +14,11 @@
 //! inert handles whose `sense` reads the build-resolved snapshot and whose
 //! drives/schedules are traced and dropped.
 //!
-//! Serial-capable pins additionally get a **stream I/O surface**
-//! ([`ComponentNetIo::stream_tx`] / [`ComponentNetIo::on_byte`]) whose byte
-//! pipes are derived from and gated by net resolution — see the stream
-//! section of [`crate::engine`].
-//!
-//! Pulse-capable pins get the analogous **pulse I/O surface**
-//! ([`ComponentNetIo::pulse_tx`] / [`ComponentNetIo::on_pulse`]), routed the
-//! same way but carrying a *rate* ([`PulseTrain`]) rather than bytes — see
-//! [`StreamRole::PulseSource`] for why a step clock is not modeled as edges.
+//! Pulse-capable pins get a **pulse I/O surface**
+//! ([`ComponentNetIo::pulse_tx`] / [`ComponentNetIo::on_pulse`]), derived from
+//! and gated by net resolution, carrying a *rate* ([`PulseTrain`]) — see
+//! [`StreamRole::PulseSource`] for why a step clock is not modeled as edges,
+//! and why a UART now is.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -56,22 +52,18 @@ pub enum PinKind {
     Passive,
 }
 
-/// Channel role of a pin: a **byte stream** (UART) or a **pulse train** (a
-/// step clock). The pin's [`PinKind`] stays digital in both cases; the
-/// channel is derived from and gated by net resolution, never installed
-/// beside it.
+/// Channel role of a pin: a **pulse train** (a step clock), carried as a rate.
+/// The pin's [`PinKind`] stays digital; the channel is derived from and gated
+/// by net resolution, never installed beside it.
+///
+/// There used to be `Producer`/`Consumer` variants here, carrying UART bytes.
+/// They are gone: a byte is not a thing a net can hold, and routing one past
+/// the resolution meant a UART could not experience contention, a fighting
+/// driver, or a floating line. Bytes are now framed onto the net as levels by
+/// [`crate::SerialLevelBridge`], and the only signal left that is *not* carried
+/// as its own waveform is the one for which a rate is exactly lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamRole {
-    /// Transmits bytes onto the net (UART TX; idles `Driven(High)`).
-    Producer {
-        /// Byte pacing rate.
-        baud_hz: u32,
-    },
-    /// Receives bytes routed from a reachable producer (UART RX).
-    Consumer {
-        /// Byte pacing rate.
-        baud_hz: u32,
-    },
     /// Emits a pulse train onto the net **as a rate**, not as edges (a
     /// step-clock output; see [`PulseTrain`]).
     ///
@@ -409,44 +401,8 @@ impl PinHandle {
 }
 
 // ============================================================
-// Stream write handle
+// Pulse write handle
 // ============================================================
-
-/// Write half of a stream producer pin (UART TX), obtained via
-/// [`ComponentNetIo::stream_tx`].
-///
-/// Bytes written here flow on the route **derived from net resolution** —
-/// through the producer's net and any collapsed series passives — paced at
-/// the producer's declared baud against virtual time. Writes never block:
-/// bytes are enqueued to the engine thread, and bytes written into a broken
-/// route (no routed consumer topology, an inert build-time handle, or a
-/// link whose nets resolve `Contention`/`Floating`) are dropped with a
-/// trace, never queued forever.
-///
-/// Cloneable and thread-safe: components hand clones to their protocol
-/// threads, exactly like [`PinHandle`].
-#[derive(Debug, Clone)]
-pub struct StreamTx {
-    endpoint: Option<EndpointId>,
-    link: EngineLink,
-}
-
-impl StreamTx {
-    /// Enqueue bytes onto the producer's derived route, in wire order.
-    pub fn write(&self, bytes: &[u8]) {
-        let Some(endpoint) = self.endpoint else {
-            tracing::debug!("stream write on a pin without a drive endpoint dropped");
-            return;
-        };
-        if bytes.is_empty() {
-            return;
-        }
-        self.link.send(Command::StreamWrite {
-            endpoint,
-            bytes: bytes.to_vec(),
-        });
-    }
-}
 
 /// Write half of a [`StreamRole::PulseSource`] pin (a step clock), obtained
 /// via [`ComponentNetIo::pulse_tx`].
@@ -457,7 +413,7 @@ impl StreamTx {
 /// is non-blocking: the train is enqueued to the engine thread and delivered
 /// to every routed [`StreamRole::PulseSink`] with no lock held.
 ///
-/// Cloneable and thread-safe, exactly like [`StreamTx`].
+/// Cloneable and thread-safe, exactly like [`PinHandle`].
 #[derive(Debug, Clone)]
 pub struct PulseTx {
     endpoint: Option<EndpointId>,
@@ -551,55 +507,6 @@ impl ComponentNetIo {
             callback: Box::new(callback),
         });
         Ok(())
-    }
-
-    /// Write half of a stream producer pin (UART TX). Fails loudly when the
-    /// pin was not declared [`StreamRole::Producer`] — a component asking to
-    /// transmit on a non-producer pin is a facade bug, caught at attach.
-    pub fn stream_tx(&self, id: &str) -> Result<StreamTx, AttachError> {
-        let pin = self.pin(id)?;
-        match pin.stream {
-            Some(StreamRole::Producer { .. }) => Ok(StreamTx {
-                endpoint: pin.endpoint,
-                link: pin.link,
-            }),
-            _ => Err(AttachError::Failed {
-                message: format!("pin {id:?} is not a stream producer"),
-            }),
-        }
-    }
-
-    /// Subscribe to bytes routed to a stream consumer pin (UART RX). The
-    /// callback runs on the engine thread with **no engine lock held**, one
-    /// call per delivered byte, paced at the routed producer's declared
-    /// baud. Fails loudly when the pin was not declared
-    /// [`StreamRole::Consumer`]. A detached consumer pin registers nothing
-    /// (its route never forms), which is not an attach failure.
-    pub fn on_byte(
-        &self,
-        id: &str,
-        callback: impl Fn(u8) + Send + 'static,
-    ) -> Result<(), AttachError> {
-        let pin = self.pin(id)?;
-        match pin.stream {
-            Some(StreamRole::Consumer { .. }) => {
-                let Some(endpoint) = pin.endpoint else {
-                    tracing::debug!(
-                        pin = id,
-                        "on_byte on a pin without a drive endpoint dropped"
-                    );
-                    return Ok(());
-                };
-                self.link.send(Command::RegisterStreamConsumer {
-                    endpoint,
-                    callback: Box::new(callback),
-                });
-                Ok(())
-            }
-            _ => Err(AttachError::Failed {
-                message: format!("pin {id:?} is not a stream consumer"),
-            }),
-        }
     }
 
     /// Write half of a [`StreamRole::PulseSource`] pin (a step clock). Fails
