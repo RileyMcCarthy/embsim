@@ -1,6 +1,15 @@
-//! Virtual clock — one monotonic microsecond **counter**.
+//! Virtual clock — one monotonic **nanosecond** counter.
 //!
-//! `virtual_us` is never wall time. The engine (or an idle jump when nobody
+//! Nanoseconds, not microseconds, because a microsecond is not fine enough to
+//! hold a bit: at the reference machine's 2 Mbaud a UART bit is 500 ns, so a
+//! µs-resolution counter cannot place one edge of it, let alone two drivers
+//! contending mid-bit. Bytes fit in µs; bits do not.
+//!
+//! Every microsecond-denominated API here is kept, exactly, as a wrapper over
+//! the nanosecond one — [`virtual_us`] is still `now / 1000` and still the
+//! right call for anything whose events are microseconds apart.
+//!
+//! `virtual_ns` is never wall time. The engine (or an idle jump when nobody
 //! holds [`TimeAuthority`]) is the only thing that increases it, via
 //! [`advance_to`]. Optional **wall pacing** sleeps *after* a jump so a
 //! playground at `--speed 1` still feels real-time; tests use `speed <= 0`
@@ -14,8 +23,8 @@
 //!
 //! | call | effect |
 //! |---|---|
-//! | [`wait_until`] | park until `now` reaches the deadline |
-//! | [`wait_virtual_us`] | park until `now + span` |
+//! | [`wait_until`] / [`wait_until_ns`] | park until `now` reaches the deadline |
+//! | [`wait_virtual_us`] / [`wait_virtual_ns`] | park until `now + span` |
 //! | [`wait_wall_us`] | real host sleep (fd retry, warm-up). Unpaced runs trip [`stepped_wall_sleep_count`] |
 //!
 //! [`wait_until`] / [`wait_virtual_us`] never sample `Instant`. If a
@@ -41,7 +50,7 @@
 //!   accounting* before it returns — so a scheduler can never step past an
 //!   actor's wake instant while the actor is still catching up.
 //! - **Seen:** an unregistered thread parked at a virtual deadline. Its
-//!   deadline joins [`SchedulerState::next_deadline_us`] (so it is always
+//!   deadline joins [`SchedulerState::next_deadline_ns`] (so it is always
 //!   released eventually), but it does **not** hold time back — it cannot,
 //!   since the scheduler has no way to know when such a thread is between
 //!   waits.
@@ -88,9 +97,9 @@ static CLOCK_FREQ: AtomicU32 = AtomicU32::new(0);
 /// 1 once [`init`] has run.
 static INITIALIZED: AtomicU8 = AtomicU8::new(0);
 
-/// Virtual "now" in µs. Mirrors `Sched::now_us` so [`virtual_us`] stays one
+/// Virtual "now" in ns. Mirrors `Sched::now_ns` so [`virtual_ns`] stays one
 /// relaxed load with no mutex on the hot path.
-static NOW_US: AtomicU64 = AtomicU64::new(0);
+static NOW_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Held while the net engine (or a test) is the time authority. Waiters must
 /// not idle-jump while this is 1.
@@ -127,7 +136,7 @@ pub fn init(speed: f64, freq: u32) {
     CLOCK_FREQ.store(freq, Ordering::Relaxed);
     {
         let mut sched = lock_sched();
-        sched.now_us = 0;
+        sched.now_ns = 0;
         sched.waits.clear();
         sched.epoch += 1;
         let mut released = 0usize;
@@ -138,7 +147,7 @@ pub fn init(speed: f64, freq: u32) {
             }
         }
         sched.running += released;
-        NOW_US.store(0, Ordering::Relaxed);
+        NOW_NS.store(0, Ordering::Relaxed);
     }
     INITIALIZED.store(1, Ordering::Relaxed);
     ADVANCED.notify_all();
@@ -196,10 +205,17 @@ pub fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::Relaxed) != 0
 }
 
-/// Virtual microseconds since the last [`init`]. One relaxed load of the
+/// Virtual nanoseconds since the last [`init`]. One relaxed load of the
 /// counter — never wall time.
+pub fn virtual_ns() -> u64 {
+    NOW_NS.load(Ordering::Relaxed)
+}
+
+/// Virtual microseconds since the last [`init`], truncated from
+/// [`virtual_ns`]. Unchanged for every caller whose events are microseconds
+/// apart; reach for `virtual_ns` only when sub-microsecond structure matters.
 pub fn virtual_us() -> u64 {
-    NOW_US.load(Ordering::Relaxed)
+    virtual_ns() / 1_000
 }
 
 /// Get virtual milliseconds elapsed since boot.
@@ -218,6 +234,20 @@ pub fn virtual_to_wall_us(virtual_wait_us: u64) -> u64 {
     virtual_wait_us * denom / numer
 }
 
+/// Convert a virtual nanosecond duration to a wall sleep for **pacing only**.
+///
+/// Computed in `u128`: a paced run scaled slower than real time multiplies
+/// before it divides, and nanoseconds overflow `u64` an awful lot sooner than
+/// microseconds did.
+fn virtual_to_wall_ns(virtual_wait_ns: u64) -> u64 {
+    let numer = SCALE_NUMER.load(Ordering::Relaxed);
+    if numer == 0 {
+        return 0;
+    }
+    let denom = SCALE_DENOM.load(Ordering::Relaxed) as u128;
+    ((virtual_wait_ns as u128) * denom / numer as u128) as u64
+}
+
 /// Get the simulated clock frequency.
 pub fn clock_freq() -> u32 {
     CLOCK_FREQ.load(Ordering::Relaxed)
@@ -231,21 +261,26 @@ pub const DEFAULT_QUANTUM_US: u64 = 1_000;
 // Waiting — the single chokepoint between virtual and wall time
 // ============================================================
 
-/// Park the caller for `wall_us` of **real** time. The only `thread::sleep`
+/// Park the caller for `wall_ns` of **real** time. The only `thread::sleep`
 /// serving a simulated wait in the workspace; a zero wait never sleeps.
 ///
 /// In stepped mode a real sleep is a defect by construction — the scheduler
 /// cannot see it — so each one trips the wall-sleep tripwire
 /// ([`stepped_wall_sleep_count`]) and logs at error level.
-fn park_wall_us(wall_us: u64) {
-    if wall_us == 0 {
+fn park_wall_ns(wall_ns: u64) {
+    if wall_ns == 0 {
         return;
     }
-    std::thread::sleep(Duration::from_micros(wall_us));
+    std::thread::sleep(Duration::from_nanos(wall_ns));
 }
 
-fn apply_pace(dt_virtual_us: u64) {
-    park_wall_us(virtual_to_wall_us(dt_virtual_us));
+/// Microsecond form of [`park_wall_ns`].
+fn park_wall_us(wall_us: u64) {
+    park_wall_ns(wall_us.saturating_mul(1_000));
+}
+
+fn apply_pace(dt_virtual_ns: u64) {
+    park_wall_ns(virtual_to_wall_ns(dt_virtual_ns));
 }
 
 /// How many real sleeps have been served while the clock was stepped — the
@@ -257,19 +292,30 @@ pub fn stepped_wall_sleep_count() -> u64 {
 
 /// Park until `virtual_us() + d_us`. `d_us == 0` returns immediately.
 pub fn wait_virtual_us(d_us: u64) {
+    wait_virtual_ns(d_us.saturating_mul(1_000));
+}
+
+/// Park until `virtual_ns() + d_ns`. `d_ns == 0` returns immediately.
+pub fn wait_virtual_ns(d_ns: u64) {
     SLICE_USED_US.set(0);
-    if d_us == 0 {
+    if d_ns == 0 {
         return;
     }
-    park_until_virtual(virtual_us().saturating_add(d_us));
+    park_until_virtual(virtual_ns().saturating_add(d_ns));
 }
 
 /// Park until virtual time reaches `deadline_v_us`. Returns immediately when
 /// the deadline has already passed. With a [`TimeAuthority`] held, only
 /// [`advance_to`] releases the park; without one, an idle jump moves `now`.
 pub fn wait_until(deadline_v_us: u64) {
+    wait_until_ns(deadline_v_us.saturating_mul(1_000));
+}
+
+/// Park until virtual time reaches `deadline_v_ns`. Nanosecond form of
+/// [`wait_until`], with the same authority and idle-jump rules.
+pub fn wait_until_ns(deadline_v_ns: u64) {
     SLICE_USED_US.set(0);
-    park_until_virtual(deadline_v_us);
+    park_until_virtual(deadline_v_ns);
 }
 
 /// Park the caller for `d_us` of **real** time, bypassing the virtual clock.
@@ -363,15 +409,15 @@ struct ActorState {
 /// Everything the stepped scheduler owns. One mutex; the hot read path
 /// ([`virtual_us`]) never takes it.
 struct Sched {
-    /// Authoritative stepped "now" (µs). [`NOW_US`] mirrors it.
-    now_us: u64,
+    /// Authoritative stepped "now" (ns). [`NOW_NS`] mirrors it.
+    now_ns: u64,
     /// Registered actors by dense id — a `BTreeMap`, so every diagnostic list
     /// this produces is in registration order rather than hash order (the
     /// engine review rule in `DETERMINISM.md` applies to the clock too).
     actors: BTreeMap<u64, ActorState>,
     /// Registered actors that are **not** parked. Time may advance only at 0.
     running: usize,
-    /// Pending park deadlines: `(deadline_us, token) -> actor id (if any)`.
+    /// Pending park deadlines: `(deadline_ns, token) -> actor id (if any)`.
     /// The token disambiguates identical deadlines so two parks never collide.
     waits: BTreeMap<(u64, u64), Option<u64>>,
     next_token: u64,
@@ -383,7 +429,7 @@ struct Sched {
 }
 
 static SCHED: Mutex<Sched> = Mutex::new(Sched {
-    now_us: 0,
+    now_ns: 0,
     actors: BTreeMap::new(),
     running: 0,
     waits: BTreeMap::new(),
@@ -512,17 +558,17 @@ pub fn registered_actors() -> usize {
     lock_sched().actors.len()
 }
 
-/// Park the calling thread until "now" reaches `deadline_v_us`.
-fn park_until_virtual(deadline_v_us: u64) {
+/// Park the calling thread until "now" reaches `deadline_v_ns`.
+fn park_until_virtual(deadline_v_ns: u64) {
     let actor = THREAD_ACTOR.with(|slot| slot.get());
     let mut sched = lock_sched();
-    if sched.now_us >= deadline_v_us {
+    if sched.now_ns >= deadline_v_ns {
         return;
     }
     let token = sched.next_token;
     sched.next_token += 1;
     let epoch = sched.epoch;
-    sched.waits.insert((deadline_v_us, token), actor);
+    sched.waits.insert((deadline_v_ns, token), actor);
     let mut quiescent = false;
     if let Some(id) = actor {
         if let Some(state) = sched.actors.get_mut(&id) {
@@ -543,16 +589,16 @@ fn park_until_virtual(deadline_v_us: u64) {
     };
     if let Some(t) = idle_to {
         drop(sched);
-        let _ = advance_to(t);
+        let _ = advance_to_ns(t);
         let mut sched = lock_sched();
-        while sched.now_us < deadline_v_us && sched.epoch == epoch {
+        while sched.now_ns < deadline_v_ns && sched.epoch == epoch {
             sched = ADVANCED
                 .wait(sched)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         return;
     }
-    while sched.now_us < deadline_v_us && sched.epoch == epoch {
+    while sched.now_ns < deadline_v_ns && sched.epoch == epoch {
         sched = ADVANCED
             .wait(sched)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -564,10 +610,10 @@ fn park_until_virtual(deadline_v_us: u64) {
 pub enum AdvanceError {
     /// Virtual time may only move forward.
     WentBackwards {
-        /// "now" at the time of the call.
-        now_us: u64,
-        /// The requested (earlier) time.
-        requested_us: u64,
+        /// "now" (ns) at the time of the call.
+        now_ns: u64,
+        /// The requested (earlier) time, in ns.
+        requested_ns: u64,
     },
 }
 
@@ -575,11 +621,11 @@ impl std::fmt::Display for AdvanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AdvanceError::WentBackwards {
-                now_us,
-                requested_us,
+                now_ns,
+                requested_ns,
             } => write!(
                 f,
-                "advance_to({requested_us}) would move virtual time backwards from {now_us}"
+                "advance_to_ns({requested_ns}) would move virtual time backwards from {now_ns}"
             ),
         }
     }
@@ -590,29 +636,39 @@ impl std::error::Error for AdvanceError {}
 /// **Scheduler only.** Advance stepped virtual time to `v_us` and release every
 /// wait whose deadline has now passed. Monotonic; going backwards is rejected.
 ///
+/// A scheduler that only speaks microseconds cannot release a wait parked at a
+/// sub-microsecond deadline: use [`advance_to_ns`], and take its next deadline
+/// from [`SchedulerState::next_deadline_ns`].
+///
 /// Releasing is done *here*, under the scheduler lock: every released actor is
 /// marked runnable again **before this returns**. That ordering is what makes
 /// the barrier sound — otherwise a scheduler could observe `running == 0` in
 /// the window between "notified" and "actually rescheduled by the OS" and step
 /// straight past the instant it just woke someone for.
 pub fn advance_to(v_us: u64) -> Result<(), AdvanceError> {
+    advance_to_ns(v_us.saturating_mul(1_000))
+}
+
+/// **Scheduler only.** Nanosecond form of [`advance_to`] — the real one; the
+/// microsecond entry point multiplies and calls this.
+pub fn advance_to_ns(v_ns: u64) -> Result<(), AdvanceError> {
     let mut sched = lock_sched();
-    if v_us < sched.now_us {
+    if v_ns < sched.now_ns {
         return Err(AdvanceError::WentBackwards {
-            now_us: sched.now_us,
-            requested_us: v_us,
+            now_ns: sched.now_ns,
+            requested_ns: v_ns,
         });
     }
-    let dt = v_us - sched.now_us;
-    sched.now_us = v_us;
-    NOW_US.store(v_us, Ordering::Relaxed);
+    let dt = v_ns - sched.now_ns;
+    sched.now_ns = v_ns;
+    NOW_NS.store(v_ns, Ordering::Relaxed);
 
     // Every wait now due, in `(deadline, token)` order. The map is keyed by
     // that pair, so the range is exactly the due set — no scan of the pending
-    // tail, and no reliance on `v_us + 1` (which would misbehave at `u64::MAX`).
+    // tail, and no reliance on `v_ns + 1` (which would misbehave at `u64::MAX`).
     let due: Vec<(u64, u64)> = sched
         .waits
-        .range(..=(v_us, u64::MAX))
+        .range(..=(v_ns, u64::MAX))
         .map(|(&key, _)| key)
         .collect();
     for key in due {
@@ -635,23 +691,42 @@ pub fn advance_to(v_us: u64) -> Result<(), AdvanceError> {
 /// What the stepped scheduler needs to decide its next move.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerState {
-    /// Stepped "now" (µs).
-    pub now_us: u64,
+    /// Stepped "now" (ns).
+    pub now_ns: u64,
     /// Registered actors that are not parked. Time may advance only at 0.
     pub running: usize,
     /// Earliest pending park deadline across **all** waiters, registered or
     /// not — the scheduler must not advance past it, and must eventually
     /// advance *to* it or the waiter never wakes.
-    pub next_deadline_us: Option<u64>,
+    pub next_deadline_ns: Option<u64>,
+}
+
+impl SchedulerState {
+    /// Stepped "now" in µs, truncated.
+    pub fn now_us(&self) -> u64 {
+        self.now_ns / 1_000
+    }
+
+    /// The next deadline in µs, rounded **up**.
+    ///
+    /// Up, not down: a microsecond-only scheduler advances *to* this value, and
+    /// truncating a deadline of 1500 ns to 1 µs would advance to an instant
+    /// that does not release the waiter — a spin, not a step. Rounding up
+    /// overshoots by under a microsecond instead, which is the best a caller
+    /// that cannot express the deadline can do. A caller that can should use
+    /// [`Self::next_deadline_ns`].
+    pub fn next_deadline_us(&self) -> Option<u64> {
+        self.next_deadline_ns.map(|ns| ns.div_ceil(1_000))
+    }
 }
 
 /// Snapshot of the stepped scheduler's state.
 pub fn scheduler_state() -> SchedulerState {
     let sched = lock_sched();
     SchedulerState {
-        now_us: sched.now_us,
+        now_ns: sched.now_ns,
         running: sched.running,
-        next_deadline_us: sched.waits.keys().next().map(|&(deadline, _)| deadline),
+        next_deadline_ns: sched.waits.keys().next().map(|&(deadline, _)| deadline),
     }
 }
 
@@ -660,8 +735,8 @@ pub fn scheduler_state() -> SchedulerState {
 pub enum Quiescence {
     /// Every registered actor is parked; time may advance.
     Reached {
-        /// Earliest pending park deadline, if any.
-        next_deadline_us: Option<u64>,
+        /// Earliest pending park deadline (ns), if any.
+        next_deadline_ns: Option<u64>,
     },
     /// Some actor stayed runnable for the whole timeout. Virtual time cannot
     /// advance without breaking the barrier, so the scheduler must report this
@@ -699,7 +774,7 @@ pub fn await_quiescence(timeout: Duration) -> Quiescence {
         }
     }
     Quiescence::Reached {
-        next_deadline_us: sched.waits.keys().next().map(|&(deadline, _)| deadline),
+        next_deadline_ns: sched.waits.keys().next().map(|&(deadline, _)| deadline),
     }
 }
 
@@ -713,15 +788,17 @@ fn running_actor_names(sched: &Sched) -> Vec<String> {
         .collect()
 }
 
-/// Get virtual cycle count (`virtual_us * clock_freq / 1_000_000`).
+/// Get virtual cycle count (`virtual_ns * clock_freq / 1_000_000_000`).
 ///
 /// Computed in `u128` and divided last so frequencies that are not a whole
 /// number of MHz keep full precision (the old `freq / 1_000_000` pre-divide
-/// silently truncated sub-MHz and fractional-MHz parts).
+/// silently truncated sub-MHz and fractional-MHz parts). Taking the source
+/// from nanoseconds rather than microseconds also means a cycle count no
+/// longer quantises to whole thousands of cycles at 1 GHz-class frequencies.
 pub fn virtual_cycles() -> u64 {
-    let us = virtual_us() as u128;
+    let ns = virtual_ns() as u128;
     let freq = CLOCK_FREQ.load(Ordering::Relaxed) as u128;
-    (us * freq / 1_000_000) as u64
+    (ns * freq / 1_000_000_000) as u64
 }
 
 // ============================================================
@@ -1036,6 +1113,53 @@ mod tests {
         assert_eq!(virtual_cycles(), 2_500_000, "1 MHz × 2.5 s");
     }
 
+    /// Time resolves below a microsecond, and the µs views round the way
+    /// their callers need: `virtual_us` truncates (it reports elapsed time),
+    /// `next_deadline_us` ceils (its caller advances *to* it, and an instant
+    /// short of the deadline would release nobody).
+    #[rstest]
+    fn time_resolves_below_a_microsecond() {
+        let _g = SteppedGuard::enter();
+        advance_to_ns(1_500).expect("forward");
+        assert_eq!(virtual_ns(), 1_500);
+        assert_eq!(virtual_us(), 1, "elapsed time truncates");
+
+        // Eight 500 ns bits inside one microsecond, each its own instant.
+        for bit in 1..=8u64 {
+            advance_to_ns(1_500 + bit * 500).expect("forward");
+            assert_eq!(virtual_ns(), 1_500 + bit * 500);
+        }
+        assert_eq!(virtual_us(), 5);
+    }
+
+    /// A microsecond-only scheduler must still be able to release a waiter
+    /// parked at a sub-microsecond deadline, so the µs view rounds up.
+    #[rstest]
+    fn a_sub_microsecond_deadline_rounds_up_for_a_microsecond_scheduler() {
+        let _g = SteppedGuard::enter();
+        let _authority = take_time_authority();
+        let done = Arc::new(AtomicU64::new(0));
+        let waiter = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                wait_until_ns(1_500);
+                done.store(1, Ordering::SeqCst);
+            })
+        };
+        assert!(
+            spin_until(|| scheduler_state().next_deadline_ns == Some(1_500)),
+            "the waiter must park at its nanosecond deadline"
+        );
+        assert_eq!(
+            scheduler_state().next_deadline_us(),
+            Some(2),
+            "1500 ns rounds up: advancing to 1 µs would release nobody"
+        );
+        advance_to(2).expect("forward");
+        waiter.join().expect("waiter joins");
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+    }
+
     /// `advance_to` is monotonic. Pacing does not change that.
     #[rstest]
     fn advance_to_rejects_backwards() {
@@ -1044,8 +1168,8 @@ mod tests {
         assert_eq!(
             advance_to(499),
             Err(AdvanceError::WentBackwards {
-                now_us: 500,
-                requested_us: 499
+                now_ns: 500_000,
+                requested_ns: 499_000
             })
         );
         assert_eq!(virtual_us(), 500, "a rejected advance changes nothing");
@@ -1080,7 +1204,7 @@ mod tests {
 
         // The waiter's deadline becomes visible; virtual time stays put.
         assert!(
-            spin_until(|| scheduler_state().next_deadline_us == Some(5_000)),
+            spin_until(|| scheduler_state().next_deadline_us() == Some(5_000)),
             "the park deadline must be published to the scheduler"
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -1094,7 +1218,7 @@ mod tests {
         waiter.join().expect("waiter joins");
         assert_eq!(woke.load(Ordering::SeqCst), 5_000);
         assert_eq!(
-            scheduler_state().next_deadline_us,
+            scheduler_state().next_deadline_us(),
             None,
             "a released park leaves no pending deadline behind"
         );
@@ -1153,8 +1277,8 @@ mod tests {
         gate.store(1, Ordering::SeqCst);
         for step in 1..=3u64 {
             match await_quiescence(Duration::from_secs(5)) {
-                Quiescence::Reached { next_deadline_us } => {
-                    assert_eq!(next_deadline_us, Some(step * 100));
+                Quiescence::Reached { next_deadline_ns } => {
+                    assert_eq!(next_deadline_ns, Some(step * 100_000));
                 }
                 other => panic!("step {step}: actor should have parked, got {other:?}"),
             }
@@ -1189,7 +1313,7 @@ mod tests {
             sink.store(1, Ordering::SeqCst);
         });
         assert!(
-            spin_until(|| scheduler_state().next_deadline_us == Some(300)),
+            spin_until(|| scheduler_state().next_deadline_us() == Some(300)),
             "an unregistered park still publishes its deadline"
         );
         assert_eq!(
@@ -1200,7 +1324,7 @@ mod tests {
         assert!(matches!(
             await_quiescence(Duration::from_millis(50)),
             Quiescence::Reached {
-                next_deadline_us: Some(300)
+                next_deadline_ns: Some(300_000)
             }
         ));
         advance_to(300).expect("forward");
@@ -1262,7 +1386,7 @@ mod tests {
             sink.store(1, Ordering::SeqCst);
         });
         assert!(
-            spin_until(|| scheduler_state().next_deadline_us == Some(1_000_000)),
+            spin_until(|| scheduler_state().next_deadline_us() == Some(1_000_000)),
             "the park must be registered before the restart"
         );
         // A restart, without ever advancing to that deadline.
@@ -1363,13 +1487,13 @@ mod tests {
         assert!(
             spin_until(|| {
                 let s = scheduler_state();
-                s.running == 1 || s.next_deadline_us == Some(DEFAULT_QUANTUM_US)
+                s.running == 1 || s.next_deadline_us() == Some(DEFAULT_QUANTUM_US)
             }),
             "the spinner must register or park"
         );
         match await_quiescence(Duration::from_secs(5)) {
-            Quiescence::Reached { next_deadline_us } => {
-                assert_eq!(next_deadline_us, Some(DEFAULT_QUANTUM_US));
+            Quiescence::Reached { next_deadline_ns } => {
+                assert_eq!(next_deadline_ns, Some(DEFAULT_QUANTUM_US * 1_000));
             }
             other => panic!("exhausting the slice must park, got {other:?}"),
         }

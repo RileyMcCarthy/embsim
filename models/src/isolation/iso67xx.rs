@@ -81,11 +81,13 @@
 //!   a step clock cross the barrier: the segment carries its own anchor and
 //!   count, so relaying it costs **one engine event per rate change**, not one
 //!   per edge, and the downstream count stays bit-identical to the firmware's.
-//! - [`ChannelRole::Serial`] — the input pin is a stream
-//!   [`StreamRole::Consumer`], the output a [`StreamRole::Producer`], and
-//!   bytes are relayed one for one. A serial channel does **not** drive the
-//!   output pin's level: the pacer owns that pin, and the producer's idle
-//!   drive is the engine's.
+//!
+//! A UART needs no role of its own. It used to have one — the input pin a
+//! stream `Consumer`, the output a `Producer`, bytes relayed one for one and
+//! the output pin's *level* left to the byte pacer — because a byte crossing
+//! the barrier was routed rather than carried. Now that a UART's bits are on
+//! the net, a serial channel is a level channel: the isolator repeats edges
+//! and never learns what they spell.
 //!
 //! # Deliberate simplifications (not modeled)
 //!
@@ -481,11 +483,6 @@ pub enum ChannelRole {
     Level,
     /// A rate-carried pulse train (a step clock). See the module docs.
     Pulse,
-    /// A UART byte stream at `baud_hz`.
-    Serial {
-        /// Byte pacing rate declared on both stream pins.
-        baud_hz: u32,
-    },
 }
 
 /// Isolator configuration. Build with [`Config::new`] and relax the fields a
@@ -554,12 +551,6 @@ impl Config {
     /// Carry `channel` as a rate-carried pulse train instead of a level.
     pub fn with_pulse_channel(mut self, channel: Channel) -> Self {
         self.roles[channel.index()] = ChannelRole::Pulse;
-        self
-    }
-
-    /// Carry `channel` as a UART byte stream instead of a level.
-    pub fn with_serial_channel(mut self, channel: Channel, baud_hz: u32) -> Self {
-        self.roles[channel.index()] = ChannelRole::Serial { baud_hz };
         self
     }
 
@@ -756,12 +747,6 @@ impl Core {
     /// every delivery would multiply engine resolutions by its channel count
     /// and by every unrelated supply wobble.
     fn apply_level(&self, state: &mut CoreState, wiring: &Wiring) {
-        // A serial channel's output pin belongs to the byte pacer; the
-        // producer's idle drive is the engine's and this model does not fight
-        // it (see the module docs).
-        if matches!(wiring.role, ChannelRole::Serial { .. }) {
-            return;
-        }
         let index = wiring.channel.index();
         let desired = self.desired_drive(state, wiring);
         if state.applied[index] == Some(desired) {
@@ -996,7 +981,6 @@ fn declare(spec: &PinSpec, config: &Config) -> PinDecl {
             match config.role(channel) {
                 ChannelRole::Level => None,
                 ChannelRole::Pulse => Some(StreamRole::PulseSink),
-                ChannelRole::Serial { baud_hz } => Some(StreamRole::Consumer { baud_hz }),
             },
         ),
         Role::Output(channel, _) => (
@@ -1004,7 +988,6 @@ fn declare(spec: &PinSpec, config: &Config) -> PinDecl {
             match config.role(channel) {
                 ChannelRole::Level => None,
                 ChannelRole::Pulse => Some(StreamRole::PulseSource),
-                ChannelRole::Serial { baud_hz } => Some(StreamRole::Producer { baud_hz }),
             },
         ),
     };
@@ -1089,21 +1072,6 @@ impl Component for Iso67xx {
                         let mut state = core.state.lock().unwrap();
                         state.train_in[index] = Some(train);
                         core.apply_train(&mut state, &wiring);
-                    })?;
-                }
-                ChannelRole::Serial { .. } => {
-                    let tx = io.stream_tx(wiring.output_pin)?;
-                    let core = Arc::clone(&self.core);
-                    io.on_byte(wiring.input_pin, move |byte| {
-                        if core.passing(&core.state.lock().unwrap(), &wiring) {
-                            tx.write(&[byte]);
-                        } else {
-                            tracing::trace!(
-                                byte,
-                                channel = wiring.channel.label(),
-                                "iso67xx: byte dropped (a side is unpowered or disabled)"
-                            );
-                        }
                     })?;
                 }
             }
@@ -1628,13 +1596,12 @@ mod tests {
         assert_eq!(monitor.train_count(), held, "already held; no second event");
     }
 
-    /// A pulse channel declares the stream roles that make the route form,
-    /// and a level channel declares none.
+    /// A pulse channel declares the stream roles that make the route form; a
+    /// level channel declares none, and a channel carrying a UART is a level
+    /// channel like any other.
     #[rstest]
     fn channel_roles_shape_the_stream_declarations() {
-        let config = Config::new(Variant::Iso6741)
-            .with_pulse_channel(Channel::A)
-            .with_serial_channel(Channel::B, 115_200);
+        let config = Config::new(Variant::Iso6741).with_pulse_channel(Channel::A);
         let (iso, _) = isolator(config);
         let stream = |number: &str| {
             iso.pins()
@@ -1645,28 +1612,9 @@ mod tests {
         };
         assert_eq!(stream("3"), Some(StreamRole::PulseSink)); // INA
         assert_eq!(stream("14"), Some(StreamRole::PulseSource)); // OUTA
-        assert_eq!(stream("4"), Some(StreamRole::Consumer { baud_hz: 115_200 })); // INB
-        assert_eq!(
-            stream("13"),
-            Some(StreamRole::Producer { baud_hz: 115_200 })
-        ); // OUTB
-        assert_eq!(stream("5"), None); // INC, a level channel
+        assert_eq!(stream("4"), None); // INB, a level channel
+        assert_eq!(stream("13"), None); // OUTB
+        assert_eq!(stream("5"), None); // INC
         assert_eq!(stream("12"), None); // OUTC
-    }
-
-    /// A serial channel leaves its output pin's level to the byte pacer.
-    #[rstest]
-    fn a_serial_channel_never_drives_its_output_level() {
-        let config = Config::new(Variant::Iso6741).with_serial_channel(Channel::A, 115_200);
-        let (iso, monitor) = isolator(config);
-        power_up(&iso);
-        let settled = monitor.drive_count();
-        set_input(&iso, Channel::A, DOWN);
-        assert_eq!(
-            monitor.drive_count(),
-            settled,
-            "a serial channel's output pin belongs to the byte pacer"
-        );
-        assert_eq!(monitor.output_drive(Channel::A), None);
     }
 }
