@@ -18,7 +18,7 @@ use embsim_board::{
     System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock;
-use embsim_models::ads122u04_component::ADS122U04_PINS;
+use embsim_models::ads122u04_component::{ADS122U04_BAUD_HZ, ADS122U04_PINS};
 
 // ============================================================
 // Shared probe plumbing
@@ -138,17 +138,41 @@ impl Component for FakeMcu {
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
 // ============================================================
 
-/// Stream-capturing ADS122U04 facade (the pin table is the shared truth
-/// exported by the live component in `embsim-models`; routing is what this
-/// facade exercises).
+/// Stream-capturing ADS122U04 facade: the shared pinout from `embsim-models`,
+/// with **byte routes put back** on TX/RX.
+///
+/// The live component carries its UART as levels now, so its own table
+/// declares no stream role at all. This suite is about the byte route itself,
+/// so it re-declares one here rather than borrowing a part that no longer uses
+/// it — the pinout stays the shared truth, the roles are this test's own.
 struct Ads122u04Facade {
+    pins: Vec<PinDecl>,
     tx: TxSlot,
     rx: ByteLog,
 }
 
+/// The shared pinout with `StreamRole`s on pin 15 (TX) and pin 16 (RX).
+fn ads122u04_stream_pins() -> Vec<PinDecl> {
+    ADS122U04_PINS
+        .iter()
+        .map(|decl| PinDecl {
+            stream: match decl.number {
+                "15" => Some(StreamRole::Producer {
+                    baud_hz: ADS122U04_BAUD_HZ,
+                }),
+                "16" => Some(StreamRole::Consumer {
+                    baud_hz: ADS122U04_BAUD_HZ,
+                }),
+                _ => None,
+            },
+            ..*decl
+        })
+        .collect()
+}
+
 impl Component for Ads122u04Facade {
     fn pins(&self) -> &[PinDecl] {
-        &ADS122U04_PINS
+        &self.pins
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
@@ -218,6 +242,7 @@ fn serial_boards(mcu: &Probe, ads: &Probe) -> (Board, Board) {
         let (tx, rx) = (Arc::clone(&ads.tx), Arc::clone(&ads.rx));
         registry.register("ADS122U04", move |_decl| {
             Box::new(Ads122u04Facade {
+                pins: ads122u04_stream_pins(),
                 tx: Arc::clone(&tx),
                 rx: Arc::clone(&rx),
             })

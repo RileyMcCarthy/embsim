@@ -32,6 +32,10 @@
 //!   (determinism Oracle 1, `DETERMINISM.md`) with its normalization contract
 //! - [`mcu`] — [`McuComponent`]: the MCU as a component — serial, GPIO,
 //!   pulse-out and encoder channels bridged to physical pins
+//! - [`uart`] — asynchronous serial framing, so a byte-oriented peripheral
+//!   can put its bits on a net instead of bypassing it
+//! - [`serial_levels`] — [`SerialLevelBridge`]: that codec wired to a pin, with
+//!   the bit clock and frame deadlines a live UART needs
 
 pub mod board;
 pub mod cluster;
@@ -43,7 +47,9 @@ pub mod mcu;
 pub mod net;
 pub mod netlist;
 pub mod registry;
+pub mod serial_levels;
 pub mod system;
+pub mod uart;
 
 pub use board::{Board, BoardError};
 pub use cluster::{
@@ -58,13 +64,17 @@ pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, 
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};
-pub use net::{Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts};
+pub use net::{
+    digital_drive, level_of, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
+};
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use registry::{
     reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind,
     RegistryError,
 };
+pub use serial_levels::SerialLevelBridge;
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
     HarnessError, Scenario, StreamDropPolicy, System, SystemError, SystemHandle,
 };
+pub use uart::{FramingError, UartDecoder, UartEncoder, UartFraming};

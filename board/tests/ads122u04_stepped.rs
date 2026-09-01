@@ -21,17 +21,15 @@
 //! barrier.
 
 use rstest::rstest;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use embsim_board::component::StreamTx;
-use embsim_board::{
-    AttachError, Component, ComponentNetIo, EndpointRef, Harness, PinDecl, PinKind, StreamRole,
-    System,
-};
+use embsim_board::{EndpointRef, Harness, System};
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::ads122u04::Config;
-use embsim_models::ads122u04_component::{Ads122u04Component, ADS122U04_BAUD_HZ};
+use embsim_models::ads122u04_component::{ads122u04_framing, Ads122u04Component};
+
+mod uart_probe;
+use uart_probe::{ProbeHandle, UartProbe};
 
 /// Bridge terminal voltages: a 256 mV differential into AIN0/AIN1.
 const AIN0_VOLTS: f64 = 1.778;
@@ -54,58 +52,6 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(1));
     }
     pred()
-}
-
-type TxSlot = Arc<Mutex<Option<StreamTx>>>;
-type ByteLog = Arc<Mutex<Vec<u8>>>;
-
-/// The "firmware" side of the UART: a TX producer and an RX consumer.
-struct HostProbe {
-    pins: [PinDecl; 2],
-    tx: TxSlot,
-    rx: ByteLog,
-}
-
-impl HostProbe {
-    fn new(tx: TxSlot, rx: ByteLog) -> Self {
-        Self {
-            pins: [
-                PinDecl {
-                    number: "TX",
-                    name: None,
-                    kind: PinKind::DigitalOut,
-                    stream: Some(StreamRole::Producer {
-                        baud_hz: ADS122U04_BAUD_HZ,
-                    }),
-                    drive_impedance: None,
-                },
-                PinDecl {
-                    number: "RX",
-                    name: None,
-                    kind: PinKind::DigitalIn,
-                    stream: Some(StreamRole::Consumer {
-                        baud_hz: ADS122U04_BAUD_HZ,
-                    }),
-                    drive_impedance: None,
-                },
-            ],
-            tx,
-            rx,
-        }
-    }
-}
-
-impl Component for HostProbe {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        *self.tx.lock().unwrap() = Some(io.stream_tx("TX")?);
-        let log = Arc::clone(&self.rx);
-        io.on_byte("RX", move |byte| log.lock().unwrap().push(byte))?;
-        Ok(())
-    }
 }
 
 /// Expected 24-bit code for a differential, per SBAS752B §8.5.2.
@@ -137,8 +83,7 @@ fn rdata_round_trip_completes_under_a_stepped_clock() {
     // exists — see the module docs.
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
 
-    let tx: TxSlot = Arc::new(Mutex::new(None));
-    let rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
+    let host = ProbeHandle::new();
 
     let harness = Harness::new()
         // UART: host TX → ADC RX, ADC TX → host RX.
@@ -166,28 +111,31 @@ fn rdata_round_trip_completes_under_a_stepped_clock() {
         )
         .component(
             "HOST",
-            Box::new(HostProbe::new(Arc::clone(&tx), Arc::clone(&rx))),
+            Box::new(UartProbe::new(
+                "TX",
+                None,
+                "RX",
+                None,
+                ads122u04_framing(),
+                host.clone(),
+            )),
         )
         .harness(harness)
         .start()
         .expect("stepped ADS system starts");
 
-    tx.lock()
-        .unwrap()
-        .as_ref()
-        .expect("HOST.TX attached")
-        .write(&[0x55, 0x10]);
+    host.send(&[0x55, 0x10]);
 
     assert!(
-        wait_for(|| rx.lock().unwrap().len() >= 3, Duration::from_secs(20)),
+        wait_for(|| host.received().len() >= 3, Duration::from_secs(20)),
         "RDATA must answer with a 3-byte conversion under a stepped clock; got {:?}. \
          A hang here means some wait in this path is still on wall time — the engine \
          advances virtual time only when every registered actor is parked, so a \
          non-virtual wait stalls the whole system rather than merely drifting.",
-        rx.lock().unwrap()
+        host.frames()
     );
 
-    let frame = rx.lock().unwrap()[..3].to_vec();
+    let frame = host.received()[..3].to_vec();
     let expected = expected_code((AIN0_VOLTS - AIN1_VOLTS) * 1_000.0);
     assert_eq!(
         code_from_le3(&frame),
