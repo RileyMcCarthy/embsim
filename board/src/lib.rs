@@ -32,6 +32,8 @@
 //!   (determinism Oracle 1, `DETERMINISM.md`) with its normalization contract
 //! - [`mcu`] — [`McuComponent`]: the MCU as a component — serial, GPIO,
 //!   pulse-out and encoder channels bridged to physical pins
+//! - [`uart`] — asynchronous serial framing, so a byte-oriented peripheral
+//!   can put its bits on a net instead of bypassing it
 
 pub mod board;
 pub mod cluster;
@@ -43,7 +45,9 @@ pub mod mcu;
 pub mod net;
 pub mod netlist;
 pub mod registry;
+mod serial_levels;
 pub mod system;
+pub mod uart;
 
 pub use board::{Board, BoardError};
 pub use cluster::{
@@ -68,3 +72,4 @@ pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
     HarnessError, Scenario, StreamDropPolicy, System, SystemError, SystemHandle,
 };
+pub use uart::{FramingError, UartDecoder, UartEncoder, UartFraming};

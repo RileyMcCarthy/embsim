@@ -339,14 +339,14 @@ mod tests {
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_secs(5) {
             let s = embsim_core::virtual_clock::scheduler_state();
-            if s.running == 1 || s.next_deadline_us == Some(q) {
+            if s.running == 1 || s.next_deadline_us() == Some(q) {
                 break;
             }
             std::thread::yield_now();
         }
         match embsim_core::virtual_clock::await_quiescence(std::time::Duration::from_secs(5)) {
-            embsim_core::virtual_clock::Quiescence::Reached { next_deadline_us } => {
-                assert_eq!(next_deadline_us, Some(q));
+            embsim_core::virtual_clock::Quiescence::Reached { next_deadline_ns } => {
+                assert_eq!(next_deadline_ns, Some(q * 1_000));
             }
             other => panic!("HAL slice exhaustion must park, got {other:?}"),
         }
