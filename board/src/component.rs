@@ -667,6 +667,16 @@ impl ComponentNetIo {
     /// thread with its own poll loop wherever the work is non-blocking —
     /// `embsim_models::ads122u04_component` is the reference conversion.
     pub fn on_wake(&self, callback: impl Fn(u64) + Send + 'static) {
+        self.on_wake_ns(move |ns| callback(ns / 1_000));
+    }
+
+    /// [`on_wake`](Self::on_wake) with the timestamp in **nanoseconds**.
+    ///
+    /// One wake handler per component either way — registering one replaces
+    /// the other. Take this form when the component's own events are closer
+    /// together than a microsecond (a UART bit at 2 Mbaud is 500 ns), and the
+    /// microsecond form everywhere else.
+    pub fn on_wake_ns(&self, callback: impl Fn(u64) + Send + 'static) {
         let Some(component) = self.component else {
             tracing::debug!("on_wake on an inert io handle dropped");
             return;
@@ -687,11 +697,16 @@ impl ComponentNetIo {
     /// margin. Stepped: the engine advances virtual time **to** the deadline,
     /// so the delivered timestamp is exactly `at_us`.
     pub fn schedule_at(&self, at_us: u64) {
+        self.schedule_at_ns(at_us.saturating_mul(1_000));
+    }
+
+    /// [`schedule_at`](Self::schedule_at) with a **nanosecond** deadline.
+    pub fn schedule_at_ns(&self, at_ns: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_at on an inert io handle dropped");
             return;
         };
-        self.link.send(Command::ScheduleAt { component, at_us });
+        self.link.send(Command::ScheduleAt { component, at_ns });
     }
 
     /// Request a periodic wakeup every `period_us` of virtual time. Missed
@@ -706,13 +721,18 @@ impl ComponentNetIo {
     /// Free-running coalescing is unreachable in stepped mode — the engine
     /// never advances past a deadline it has not fired.
     pub fn schedule_every(&self, period_us: u64) {
+        self.schedule_every_ns(period_us.saturating_mul(1_000));
+    }
+
+    /// [`schedule_every`](Self::schedule_every) with a **nanosecond** period.
+    pub fn schedule_every_ns(&self, period_ns: u64) {
         let Some(component) = self.component else {
             tracing::debug!("schedule_every on an inert io handle dropped");
             return;
         };
         self.link.send(Command::ScheduleEvery {
             component,
-            period_us,
+            period_ns,
         });
     }
 }

@@ -245,19 +245,19 @@ pub(crate) enum Command {
         /// Wakeup callback.
         callback: WakeCallback,
     },
-    /// One-shot wakeup at an absolute virtual time (µs).
+    /// One-shot wakeup at an absolute virtual time (ns).
     ScheduleAt {
         /// Component whose wake handler fires.
         component: ComponentId,
-        /// Absolute virtual deadline (µs). Past deadlines fire immediately.
-        at_us: u64,
+        /// Absolute virtual deadline (ns). Past deadlines fire immediately.
+        at_ns: u64,
     },
-    /// Periodic wakeup every `period_us` of virtual time.
+    /// Periodic wakeup every `period_ns` of virtual time.
     ScheduleEvery {
         /// Component whose wake handler fires.
         component: ComponentId,
-        /// Virtual period (µs); zero is rejected with a warning.
-        period_us: u64,
+        /// Virtual period (ns); zero is rejected with a warning.
+        period_ns: u64,
     },
     /// Subscribe to net-graph topology changes (stream-routing seam). The
     /// current epoch is delivered once at registration.
@@ -1317,16 +1317,16 @@ enum TimerTarget {
     Stream(EndpointId),
 }
 
-/// One armed wakeup. Ordered by `(deadline_us, seq)` so simultaneous and
+/// One armed wakeup. Ordered by `(deadline_ns, seq)` so simultaneous and
 /// late deadlines fire in schedule order.
 #[derive(Debug, Clone, Copy, Eq)]
 struct TimerEntry {
-    deadline_us: u64,
+    deadline_ns: u64,
     seq: u64,
     target: TimerTarget,
     /// `Some(period)` re-arms after firing (periodic wakes only); `None`
     /// is one-shot.
-    period_us: Option<u64>,
+    period_ns: Option<u64>,
 }
 
 impl PartialEq for TimerEntry {
@@ -1337,7 +1337,7 @@ impl PartialEq for TimerEntry {
 
 impl Ord for TimerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.deadline_us, self.seq).cmp(&(other.deadline_us, other.seq))
+        (self.deadline_ns, self.seq).cmp(&(other.deadline_ns, other.seq))
     }
 }
 
@@ -1363,9 +1363,9 @@ struct LiveRoute {
     /// Bytes clocked onto the link, stamped with the virtual deadline at
     /// which their frame finishes.
     queue: VecDeque<(u64, u8)>,
-    /// Virtual time at which the line is next free — the pacing slot,
+    /// Virtual time (ns) at which the line is next free — the pacing slot,
     /// mirroring the embsim serial peripheral's `tx_next_v_us` convention.
-    line_next_v_us: u64,
+    line_next_v_ns: u64,
 }
 
 /// Live per-source pulse route: the derived sinks and the delivery gate.
@@ -1601,7 +1601,7 @@ impl EngineCore {
                         consumers: spec.consumers,
                         path_roots: spec.path_roots,
                         queue: VecDeque::new(),
-                        line_next_v_us: 0,
+                        line_next_v_ns: 0,
                     },
                 )
             })
@@ -1706,13 +1706,13 @@ impl EngineCore {
         if bytes.is_empty() {
             return;
         }
-        let cost_v_us = if route.baud_hz == 0 {
+        let cost_v_ns = if route.baud_hz == 0 {
             0
         } else {
-            STREAM_BITS_PER_BYTE.saturating_mul(1_000_000) / u64::from(route.baud_hz)
+            STREAM_BITS_PER_BYTE.saturating_mul(1_000_000_000) / u64::from(route.baud_hz)
         };
-        if cost_v_us == 0 {
-            // Unpaced (baud 0, or faster than a byte per µs): deliver now,
+        if cost_v_ns == 0 {
+            // Unpaced (baud 0, or faster than a byte per ns): deliver now,
             // in write order, without ever touching the virtual clock.
             let consumers = route.consumers.clone();
             let path_roots = route.path_roots.clone();
@@ -1729,7 +1729,7 @@ impl EngineCore {
             );
             return;
         }
-        let now = virtual_clock::virtual_us();
+        let now = virtual_clock::virtual_ns();
         let route = self
             .routes
             .get_mut(&endpoint.0)
@@ -1740,14 +1740,14 @@ impl EngineCore {
         let room = STREAM_ROUTE_QUEUE_MAX.saturating_sub(route.queue.len());
         let accepted = bytes.len().min(room);
         let shed = bytes.len() - accepted;
-        let start = route.line_next_v_us.max(now);
-        let first_deadline = start.saturating_add(cost_v_us);
+        let start = route.line_next_v_ns.max(now);
+        let first_deadline = start.saturating_add(cost_v_ns);
         let mut deadline = start;
         for &byte in &bytes[..accepted] {
-            deadline = deadline.saturating_add(cost_v_us);
+            deadline = deadline.saturating_add(cost_v_ns);
             route.queue.push_back((deadline, byte));
         }
-        route.line_next_v_us = deadline;
+        route.line_next_v_ns = deadline;
         if accepted > 0 {
             self.arm(first_deadline, TimerTarget::Stream(endpoint), None);
         }
@@ -1879,8 +1879,8 @@ impl EngineCore {
     fn fire_due_timers(&mut self) -> usize {
         let mut fired = 0usize;
         while let Some(&Reverse(head)) = self.wheel.peek() {
-            let now = virtual_clock::virtual_us();
-            if head.deadline_us > now {
+            let now = virtual_clock::virtual_ns();
+            if head.deadline_ns > now {
                 break;
             }
             self.wheel.pop();
@@ -1899,8 +1899,8 @@ impl EngineCore {
                             "timer fired for a component with no wake handler"
                         );
                     }
-                    if let Some(period) = head.period_us {
-                        let mut next = head.deadline_us.saturating_add(period);
+                    if let Some(period) = head.period_ns {
+                        let mut next = head.deadline_ns.saturating_add(period);
                         if next <= now {
                             next = now.saturating_add(period);
                         }
@@ -1914,14 +1914,14 @@ impl EngineCore {
     }
 
     /// Push a wheel entry.
-    fn arm(&mut self, deadline_us: u64, target: TimerTarget, period_us: Option<u64>) {
+    fn arm(&mut self, deadline_ns: u64, target: TimerTarget, period_ns: Option<u64>) {
         let seq = self.timer_seq;
         self.timer_seq += 1;
         self.wheel.push(Reverse(TimerEntry {
-            deadline_us,
+            deadline_ns,
             seq,
             target,
-            period_us,
+            period_ns,
         }));
     }
 
@@ -1960,26 +1960,26 @@ impl EngineCore {
             } => {
                 self.wake_subs.insert(component.0, callback);
             }
-            Command::ScheduleAt { component, at_us } => {
+            Command::ScheduleAt { component, at_ns } => {
                 // Wheel entries make the run loop read the virtual clock;
                 // gate here (and at every other arm entry point) so a
                 // missing init fails the request, never the engine thread.
                 if self.clock_ready("schedule_at") {
-                    self.arm(at_us, TimerTarget::Wake(component), None);
+                    self.arm(at_ns, TimerTarget::Wake(component), None);
                 }
             }
             Command::ScheduleEvery {
                 component,
-                period_us,
+                period_ns,
             } => {
-                if period_us == 0 {
+                if period_ns == 0 {
                     tracing::warn!(component = component.0, "schedule_every(0) ignored");
                 } else if self.clock_ready("schedule_every") {
-                    let now = virtual_clock::virtual_us();
+                    let now = virtual_clock::virtual_ns();
                     self.arm(
-                        now.saturating_add(period_us),
+                        now.saturating_add(period_ns),
                         TimerTarget::Wake(component),
-                        Some(period_us),
+                        Some(period_ns),
                     );
                 }
             }
@@ -2093,7 +2093,7 @@ impl EngineCore {
                 break;
             }
             if drained >= COMMAND_DRAIN_BATCH_MAX {
-                let now = virtual_clock::virtual_us();
+                let now = virtual_clock::virtual_ns();
                 if self
                     .next_virtual_deadline()
                     .is_some_and(|deadline| deadline > now)
@@ -2103,7 +2103,7 @@ impl EngineCore {
             }
         }
 
-        let now = virtual_clock::virtual_us();
+        let now = virtual_clock::virtual_ns();
         let next = match (self.clock_released, self.next_virtual_deadline()) {
             // Time is held until the system has finished assembling.
             (false, _) => None,
@@ -2111,7 +2111,7 @@ impl EngineCore {
         };
         match next {
             Some(deadline) if deadline > now => {
-                if let Err(error) = virtual_clock::advance_to(deadline) {
+                if let Err(error) = virtual_clock::advance_to_ns(deadline) {
                     // Unreachable while this engine is the only scheduler:
                     // `next_virtual_deadline` is >= now by construction and the
                     // mode was stepped one instruction ago. Report rather than
@@ -2196,13 +2196,13 @@ impl EngineCore {
         }
     }
 
-    /// Stepped mode: the next virtual instant anything is waiting for — the
+    /// Stepped mode: the next virtual instant (ns) anything is waiting for — the
     /// earlier of the wheel head and the earliest pending park deadline across
     /// every waiter (registered actor or not; an unregistered waiter cannot
     /// hold time back, but it must still be released).
     fn next_virtual_deadline(&self) -> Option<u64> {
-        let wheel = self.wheel.peek().map(|&Reverse(head)| head.deadline_us);
-        let parked = virtual_clock::scheduler_state().next_deadline_us;
+        let wheel = self.wheel.peek().map(|&Reverse(head)| head.deadline_ns);
+        let parked = virtual_clock::scheduler_state().next_deadline_ns;
         match (wheel, parked) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3115,7 +3115,7 @@ mod tests {
         let sink = Arc::clone(&log);
         handle.link().send(Command::RegisterWake {
             component,
-            callback: Box::new(move |now_us| sink.lock().unwrap().push(now_us)),
+            callback: Box::new(move |now_ns| sink.lock().unwrap().push(now_ns)),
         });
         log
     }
@@ -3132,6 +3132,38 @@ mod tests {
         handle
     }
 
+    /// The wheel resolves deadlines a *bit period* apart, not a microsecond.
+    ///
+    /// This is why the timebase is nanoseconds: at 2 Mbaud a UART bit is 500 ns,
+    /// so eight of them fit inside a single microsecond. With a µs wheel all
+    /// eight of these deadlines would be the same instant, and a synthesized
+    /// waveform would collapse to one edge.
+    #[rstest]
+    fn the_wheel_separates_sub_microsecond_deadlines() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let handle = empty_engine();
+        let log = wake_log(&handle, ComponentId(0));
+
+        const BIT_NS: u64 = 500; // one bit at 2,000,000 baud
+        let start = virtual_clock::virtual_ns();
+        let deadlines: Vec<u64> = (1..=8).map(|i| start + i * BIT_NS).collect();
+        for &at_ns in &deadlines {
+            handle.link().send(Command::ScheduleAt {
+                component: ComponentId(0),
+                at_ns,
+            });
+        }
+
+        assert!(
+            wait_for(|| log.lock().unwrap().len() == 8, Duration::from_secs(5)),
+            "every bit deadline must fire; got {:?}",
+            log.lock().unwrap()
+        );
+        // Stepped time advances *to* each deadline, so the stamps are exact.
+        assert_eq!(*log.lock().unwrap(), deadlines);
+    }
+
     /// `schedule_at` fires exactly once, at-or-after its virtual deadline.
     #[rstest]
     fn one_shot_timer_fires_once_at_virtual_deadline() {
@@ -3140,11 +3172,11 @@ mod tests {
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
-        let now = virtual_clock::virtual_us();
-        let deadline = now + 100_000;
+        let now = virtual_clock::virtual_ns();
+        let deadline = now + 100_000_000; // 100 virtual ms
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: deadline,
+            at_ns: deadline,
         });
 
         assert!(
@@ -3169,7 +3201,7 @@ mod tests {
 
         handle.link().send(Command::ScheduleEvery {
             component: ComponentId(0),
-            period_us: 20_000,
+            period_ns: 20_000_000,
         });
         assert!(
             wait_for(|| log.lock().unwrap().len() >= 3, Duration::from_secs(5)),
@@ -3202,11 +3234,11 @@ mod tests {
         // deadlines, not the schedule order.
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(1),
-            at_us: 2_000,
+            at_ns: 2_000,
         });
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: 1_000,
+            at_ns: 1_000,
         });
 
         assert!(
@@ -3226,7 +3258,7 @@ mod tests {
         let _log = wake_log(&handle, ComponentId(0));
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: virtual_clock::virtual_us() + 60_000_000, // one virtual minute out
+            at_ns: virtual_clock::virtual_ns() + 60_000_000_000, // one virtual minute out
         });
         std::thread::sleep(Duration::from_millis(10)); // let the engine park on the deadline
 
@@ -3273,7 +3305,7 @@ mod tests {
 
         handle.link().send(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: virtual_clock::virtual_us() + 10_000, // 10 virtual ms
+            at_ns: virtual_clock::virtual_ns() + 10_000_000, // 10 virtual ms
         });
         let fired = wait_for(|| !log.lock().unwrap().is_empty(), Duration::from_secs(5));
         stop.store(true, Ordering::Relaxed);
