@@ -12,7 +12,8 @@ descriptions*.
 This document specifies the generic engine. Consumer-side specifics (part
 registry entries, harness files, plant models) live in the consuming repo — see
 MaD's `docs/dev/sil-board-simulation-design.md` for the reference consumer and
-the decision record for why this is netlist-structural rather than SPICE.
+the decision record for why topology stays netlist-structural, with analog
+solved by ngspice.
 
 ## Crate layout
 
@@ -23,11 +24,11 @@ board/                    # new workspace member: embsim-board
 ├── src/registry.rs       # PartRegistry: identity → constructor; auto-classification tiers
 ├── src/engine.rs         # net-engine thread: drive queue, resolution, timer wheel, diagnostics
 ├── src/net.rs            # net state model, Thevenin drive resolution, digital projection
-├── src/cluster.rs        # analog cluster extraction + quasi-static MNA solver (trait)
+├── src/cluster.rs        # analog cluster extraction + ngspice `.op` solver (trait)
 ├── src/stream.rs         # stream endpoints (serial byte pipes) derived from net routes
 ├── src/board.rs          # Board::from_netlist(netlist, registry) → components + nets
 ├── src/system.rs         # System: boards + harnesses + scenario overrides + fault algebra
-└── tests/                # parser fixtures (per KiCad version), net truth tables, MNA hand-checks
+└── tests/                # parser fixtures (per KiCad version), net truth tables, SPICE `.op` hand-checks
 ```
 
 ## Execution model (single-writer net engine)
@@ -149,7 +150,7 @@ ambiguity):
 
 ```rust
 pub enum NetState {
-    Floating,          // no source reaches this node (MNA singular for the node)
+    Floating,          // no source reaches this node
     Driven(Level),     // solved V within V_OL/V_OH of a rail, dominated by one push-pull source
     Pulled(Level, Ohms), // rail-adjacent V dominated by a resistive path
     Analog(Volts),     // none of the above projections apply — raw node voltage
@@ -187,8 +188,8 @@ pub struct PowerState { pub volts: f64, pub ok: bool }
 ```
 
 - `PowerOut` pins source their net at a declared voltage; those rails enter
-  cluster solves as real sources (the MNA needs values, and chip models need
-  the numeric AVDD for range checks like PGA common-mode).
+  cluster solves as real sources (the analog solver needs values, and chip
+  models need the numeric AVDD for range checks like PGA common-mode).
 - A power net with **no `PowerOut` source anywhere** (board or harness) raises
   a **`PowerNetUnsourced`** finding and presents as down — this is precisely
   the "AVDD unstrapped" failure mode.
@@ -204,19 +205,31 @@ pub struct PowerState { pub volts: f64, pub ok: bool }
 ### Analog clusters
 
 Connected subgraphs of `Passive`/`Analog` pins form **clusters**, extracted at
-build time. Solved by quasi-static modified nodal analysis (MNA): Thevenin
-sources + resistors → node voltages, recomputed only when a boundary input
-changes. Single-pole RC behavior is closed-form (time constant annotated on the
-cluster; senses read the exponential at read time — no fixed-timestep
-integration).
+build time. Solved by ngspice: Thevenin sources + resistors + capacitors →
+node voltages. Digital nets still take the Thevenin fast path; only escalated
+analog clusters enter SPICE.
 
-- A cluster with **no source** solves to `Floating` for all its nodes (the MNA
-  detects singularity — it never returns garbage), reported to senses like the
-  digital floating clause.
+- **`.op`** (`AnalogBackend::SpiceOp`, the playground default): DC operating
+  point. Capacitors are open. Recomputed when a boundary input changes.
+- **Windowed `.tran`** (`AnalogBackend::SpiceTran { max_step_us }`): each
+  analog window is `min(elapsed virtual time, max_step_us)`. Capacitor
+  voltages carry across windows via `.ic`. The engine remains the time
+  authority — a periodic analog tick on the timer wheel keeps C integrating
+  between digital events. Resistive clusters (no C) still use `.op`.
+
+Capacitors **do not join digital conduction or stream-collapse**. A cap is
+stamped on an analog cluster only when both ends already sit in that cluster,
+or one end is in the cluster and the mate is a power net (the mate is added
+as a node; we do not recurse through the rail). Decoupling caps therefore
+cannot analog-union the whole board.
+
+- A cluster with **no source** solves to `Floating` for all its nodes
+  (reachability is decided structurally, before a deck is built — ngspice is
+  never asked to invent a voltage).
 - **Transducer components** may contribute *parameterized primitives* to a
   cluster — e.g. a load-cell component contributes four bridge-leg resistors
   whose values are driven by the consumer's physics plant. Common-mode and
-  differential voltages then fall out of the same MNA as everything else,
+  differential voltages then fall out of the same solve as everything else,
   rather than being hand-computed inside a model.
 
 ```rust
@@ -225,10 +238,10 @@ pub trait ClusterSolver: Send + Sync {
 }
 ```
 
-The trait is the deliberate seam: the default is `QuasiStaticMna`; a transient
-SPICE-backed solver is a possible future implementation and is intentionally
-**not** part of this design (no ngspice dependency, no cluster-marking syntax —
-see the consumer decision record for the rationale and revisit trigger).
+The trait is the test seam (recording doubles). Production impls: `Spice`
+(`.op`) and `SpiceTransient` (windowed `.tran`) in `embsim-spice`
+(libngspice), plus `AnalogOff`. KiCad remains the topology source — SPICE
+does not replace netlists, stream routing, or harness/fault algebra.
 
 ### Stream endpoints (serial over pins)
 
@@ -466,8 +479,9 @@ present-but-undeclared).
   minimal + one real exported board) with golden component/net graphs.
 - Net resolution: truth-table tests per rule (driver combinations × expected
   `NetState`), including the impedance-escalation boundary.
-- MNA: hand-computed reference circuits (bridge, divider ladder, pull-up vs
-  driver, source-free singular cluster) asserted to µV.
+- Analog `.op` / windowed `.tran`: hand-computed reference circuits (bridge, divider ladder, pull-up vs
+  driver, source-free singular cluster, RC step at one τ) asserted to µV
+  (`.op`) / mV (`.tran`) against ngspice.
 - Streams: routing through series passives, crossed-producer detection, route
   invalidation on jumper/fault changes.
 - Pin bridges: fake firmware driving the peripheral free functions with peer
@@ -489,7 +503,10 @@ present-but-undeclared).
 
 ## Non-goals
 
-- SPICE/transient analog simulation (trait seam reserved; not built).
+- Free-running analog time (a `.tran` that is not windowed by the engine).
+  Windowed `.tran` (`AnalogBackend::SpiceTran`) is in-scope; the engine
+  remains the time authority.
+- Diodes, inductors as analog cards, vendor `.subckt` instances.
 - Cycle-accurate MCU peripheral timing; emergent byte-loss on serial pipes
   (fault injection covers loss-handling code paths).
 - PCB physical effects (parasitics, thermal, EMC).

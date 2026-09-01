@@ -276,7 +276,7 @@ fn net_stuck_fighting_the_powered_rail_is_observable() {
 }
 
 // ============================================================
-// Bridge-fed analog inputs through the MNA (no push-pull driver)
+// Bridge-fed analog inputs through SPICE .op (no push-pull driver)
 // ============================================================
 
 /// The board's measurement path: the external bridge presents its output at
@@ -285,10 +285,10 @@ fn net_stuck_fighting_the_powered_rail_is_observable() {
 /// driver anywhere**. The analog inputs must resolve through the cluster
 /// solver to the solved node voltage, never the `Pulled` upper-bound
 /// fallback. Shorting the ADC input pair (fault algebra) then turns the two
-/// filter legs into a genuine two-source divider: the MNA reports the
+/// filter legs into a genuine two-source divider: SPICE `.op` reports the
 /// 1.65 V midpoint.
 #[rstest]
-fn bridge_fed_analog_inputs_solve_through_the_mna() {
+fn bridge_fed_analog_inputs_solve_through_spice() {
     let bridge_fed = powered_bench_harness()
         .power(ep("BENCH.A0"), ep("DS2Addon.J2.3"), 3.3)
         .power(ep("BENCH.A1"), ep("DS2Addon.J2.4"), 0.0);

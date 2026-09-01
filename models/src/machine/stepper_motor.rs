@@ -90,10 +90,10 @@
 //! `ServoPlant` advances with the Euler update `v += (v_cmd − v)·min(Δ/τ, 1)`
 //! on every pulse-out progress tick. That is the first-order Taylor expansion
 //! of the exponential above, and its answer depends on the tick cadence. The
-//! board engine has no broadcast tick and `embsim_core::virtual_clock` is
-//! free-running *sampled* scaled wall time (`BOARD_ENGINE.md`, "Execution
-//! model"), so this model uses the closed form and evaluates it at **read
-//! time**: the position you read does not depend on how often anyone looked.
+//! board engine has no broadcast tick and `embsim_core::virtual_clock` is a
+//! counter (`BOARD_ENGINE.md`, "Execution model"), so this model uses the
+//! closed form and evaluates it at **read time**: the position you read does
+//! not depend on how often anyone looked.
 //!
 //! ## Electrical reality of the reference machine
 //!
@@ -563,14 +563,31 @@ impl MotorCore {
     /// their own rate and sign — which is what makes a reversal exact.
     fn set_train(&self, train: PulseTrain) {
         let mut plant = self.plant.lock().unwrap();
-        // The engine may deliver later than the source acted (free-running);
-        // never rewind the plant to match.
-        let at = train.pulses.since_us.max(plant.now_us);
+        // The engine delivers PulseUpdate one turn after the source stamped
+        // `since_us`. Never rewind the plant; catch up the skipped span so
+        // position matches pulses folded from `since_us`.
+        let since = train.pulses.since_us;
+        let at = since.max(plant.now_us);
+        let old_cmd = plant.cmd;
         self.advance(&mut plant, at);
         // `advance` is a no-op when `at == now_us`, so fold explicitly. It is
         // idempotent, so doing both is safe.
         self.fold(&mut plant, at);
-        plant.cmd = self.train_rate(&plant, &train);
+        let rate = self.train_rate(&plant, &train);
+        if since < plant.now_us {
+            let end = train.completes_at();
+            let until = end.unwrap_or(plant.now_us).min(plant.now_us);
+            if until > since {
+                let dt = (until - since) as f64 / 1_000_000.0;
+                plant.pos += (rate - old_cmd) * dt * (1.0 - self.config.load_loss);
+            }
+            plant.vel = if end.is_some_and(|e| e <= plant.now_us) {
+                0.0
+            } else {
+                rate
+            };
+        }
+        plant.cmd = rate;
         plant.train = Some(train);
         plant.train_folded = 0;
         // A rate-carried train supplies its own rate, so the edge path's
@@ -1673,6 +1690,27 @@ mod tests {
         assert!(
             core.plant.lock().unwrap().cmd > 0.0,
             "the train is still commanding after a minute of no events"
+        );
+    }
+
+    /// A PulseUpdate delivered after the plant has already advanced past
+    /// `since_us` must still move the carriage for the skipped span — that is
+    /// the net-engine's one-turn delivery latency, not lost motion.
+    #[rstest]
+    fn a_late_train_delivery_still_moves_the_carriage() {
+        let core = enabled_core(quasi_static());
+        read_at(&core, 200);
+        core.set_train(train(20_000, 0, Some(100)));
+        read_at(&core, 5_000);
+        assert_eq!(
+            train_steps(&core),
+            100,
+            "fold counts every pulse from since_us"
+        );
+        let pos = pos(&core);
+        assert!(
+            (pos - 100.0).abs() < 0.5,
+            "late delivery must not drop the first tick of travel, pos={pos}"
         );
     }
 

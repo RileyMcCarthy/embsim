@@ -116,21 +116,18 @@ cargo llvm-cov --workspace --summary-only
 7. **Strengthen, don't weaken.** Rewrites and refactors must keep or tighten
    existing assertions.
 
-8. **Determinism suites assert what their mode can promise, and report the
-   rest.** `determinism.rs` compares N normalized engine event logs in *both*
-   clock modes. **Stepped**: the full timestamped projection must be identical
-   across runs, across processes, and against a golden trace — a drift is a
-   regression. **Free-running**: the event *order* is asserted and the timestamp
-   divergence is **printed**, never failed on, because wall-clock jitter is the
-   thing that mode has. Never "fix" a free-running flake by asserting timestamps
-   there; move the case to stepped mode.
+8. **Determinism suites assert the counter.** `determinism.rs` compares N
+   normalized engine event logs. The full timestamped projection must be
+   identical across runs, across processes, and against a golden trace — a
+   drift is a regression. Pacing (`init(speed > 0)`) only sleeps the host after
+   a jump; virtual timestamps must still match. The timestamp-free projection
+   is kept as an order-only view.
 
    A suite that reports must still be unable to pass vacuously.
    `determinism.rs` fails on an empty log, checks its own comparator against
    reordered/truncated/mutated synthetic logs, asserts that the full and
-   shape projections really do differ on a 1 µs timestamp change, asserts that
-   free-running *does* diverge where stepped does not, and requires every named
-   case to have a golden.
+   shape projections really do differ on a 1 µs timestamp change, and requires
+   every named case to have a golden.
 
 ## What each layer should cover
 
@@ -143,7 +140,7 @@ cargo llvm-cov --workspace --summary-only
 | Board | drive/sense/stream | contention, facade mismatch | net truth table, drop policies |
 | Pin bridges | exact counts, GPIO both ways, encoder counts | slip, floating input, unbridged channel | polarity matrix, direction mapping, level projection |
 | Interface parts | the datasheet function table, on a real netlist | unpowered side, disabled output, open loop | variant/pinout matrix, fail-safe vs default-high |
-| Stepped clock | N-run + golden identity | wedged actor, held time-release | case matrix × {free-running, stepped} |
+| Virtual clock | N-run + golden identity | wedged actor, held time-release | case matrix × {paced, unpaced} |
 | P2 trampolines | null/neg guards | bind routing | channel index grids |
 | Tools | parse/record/render | empty/unknown | DWARF flag matrices |
 
