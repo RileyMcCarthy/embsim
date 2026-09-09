@@ -45,11 +45,17 @@ A trampoline (and the generic peripheral behind it) must **never call
 
 | call | use for |
 |---|---|
-| `wait_until(deadline_v_us)` | park until the virtual counter reaches the deadline |
-| `wait_virtual_us(d_us)` | park until `now + d_us` |
+| `wait_until(deadline_v_us)` / `wait_until_ns` | park until the virtual counter reaches the deadline |
+| `wait_virtual_us(d_us)` / `wait_virtual_ns` | park until `now + d` |
 | `wait_wall_us(d_us)` | real host sleep (fd retry, warm-up). Unpaced runs trip `stepped_wall_sleep_count` |
 
-`virtual_us` is a **counter**. The engine (or an idle jump when nobody holds
+The counter is **nanoseconds** (`virtual_ns`); every `_us` call above is an
+exact wrapper over the `_ns` one, and `virtual_us` is `virtual_ns() / 1000`.
+Use the microsecond form unless your events are closer together than a
+microsecond — a UART bit at 2 Mbaud is 500 ns, which is the reason the counter
+is not microseconds.
+
+`virtual_ns` is a **counter**. The engine (or an idle jump when nobody holds
 time authority) is the only writer, via `advance_to`. `--speed` only sleeps
 the host *after* a jump (`speed <= 0` = instant). A raw `thread::sleep` in a
 trampoline ignores that and can hang or skip an instant. Reach for

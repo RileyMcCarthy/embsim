@@ -47,10 +47,12 @@ lock-free paths:
   and deadlock-free by construction.
 - **Time-driven behavior** is engine-owned: components do not get a broadcast
   `tick()`. They request wakeups via their I/O handle
-  (`io.schedule_at(v_us)` / `io.schedule_every(v_us)`), served by a timer wheel
-  on the engine thread keyed to virtual time. Idle components cost nothing.
+  (`io.schedule_at(v_us)` / `io.schedule_every(v_us)`, or their `_ns` forms),
+  served by a timer wheel on the engine thread keyed to virtual time. Idle
+  components cost nothing.
 
-Note on time: `embsim_core::virtual_clock` is one microsecond **counter**.
+Note on time: `embsim_core::virtual_clock` is one nanosecond **counter**
+(nanoseconds because a microsecond cannot hold a bit: 500 ns at 2 Mbaud).
 The engine is the time authority (`advance_to`). `--speed` only paces the
 host after a jump. Time-sensitive state must be computed at *read time*,
 never integrated per tick.

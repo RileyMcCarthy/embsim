@@ -12,8 +12,10 @@ Companion to [`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
 predictions in this document they corrected, are in
 [Recommendation and phasing](#recommendation-and-phasing).
 
-**One-counter clock.** There is no Instant-based free-running mode.
-`virtual_us` is always the counter; `ClockMode::FreeRunning` vs `Stepped` is
+**One-counter clock.** There is no Instant-based free-running mode. The
+counter is nanoseconds (`virtual_ns`); `virtual_us` is a truncating view of it
+and every microsecond wait/schedule call is an exact wrapper over the
+nanosecond one. `virtual_ns` is always the counter; `ClockMode::FreeRunning` vs `Stepped` is
 only wall pacing after `advance_to` (`speed > 0` sleeps the host, `speed <= 0`
 is instant). The T0 "sampled timestamps" baseline below is historical.
 
