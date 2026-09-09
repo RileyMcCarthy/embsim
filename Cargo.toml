@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "board",
+    "spice",
     "core",
     "peripherals",
     "platforms/p2",
@@ -44,6 +45,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros",
 # See TESTING.md. All workspace crates that ship tests take this as a
 # dev-dependency so failure names and filters stay consistent.
 rstest = "0.26"
-# Property testing for continuous domains only (MNA ladders, buffer clamps).
+# Property testing for continuous domains only (analog ladders, buffer clamps).
 # Prefer rstest for enums / channel indices / OOR grids.
 proptest = "1"

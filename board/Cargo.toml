@@ -9,8 +9,15 @@ description = "Component-centric board/system simulation engine for embsim (netl
 keywords = ["embedded", "emulator", "simulation", "sil"]
 categories = ["embedded", "simulation"]
 
+[features]
+default = ["spice"]
+# Analog cluster solver. Digital-only consumers can disable this and avoid
+# linking libngspice: `embsim-board = { ..., default-features = false }`.
+spice = ["dep:embsim-spice"]
+
 [dependencies]
 embsim-core = { path = "../core" }
+embsim-spice = { path = "../spice", optional = true }
 # The MCU component bridges serial channels into the peripheral banks
 # (peripherals never depends back on board — no cycle).
 embsim-peripherals = { path = "../peripherals" }
@@ -23,4 +30,8 @@ rstest.workspace = true
 # Dev-only cycle (allowed by Cargo): the DS2Addon integration tests exercise
 # the live ADS122U04 component and share its pin-facade table, so the board
 # tests import the models crate that depends on this one.
-embsim-models = { path = "../models" }
+embsim-models = { path = "../models", default-features = false }
+
+[[test]]
+name = "cluster_handchecks"
+required-features = ["spice"]

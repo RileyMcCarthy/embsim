@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_memory_inspect::FirmwareInfo;
 use embsim_peripherals::gpio;
-use embsim_runtime::{Emulator, EmulatorError, Machine, PeripheralCounts, Platform};
+use embsim_runtime::{Emulator, EmulatorError, Machine, PeripheralCounts, Platform, SimProfile};
 
 // ============================================================
 // Serialization for the global-touching full-run tests
@@ -186,6 +186,11 @@ fn emulator_error_display_strings() {
     let msg = pty.to_string();
     assert!(msg.contains("PTY"));
     assert!(msg.contains("boom"));
+
+    let iss = EmulatorError::IssUnavailable;
+    let msg = iss.to_string();
+    assert!(msg.contains("ISS"));
+    assert!(msg.contains("CpuBackend"));
 }
 
 /// `MissingSymbols` with an empty list still renders cleanly (count 0).
@@ -342,6 +347,27 @@ fn full_run_succeeds_and_wires() {
     assert!(result.is_ok(), "run() should be Ok: {result:?}");
     assert_eq!(wire_flag.load(Ordering::Relaxed), 1, "wire() must have run");
     assert_eq!(entry_ran.load(Ordering::Relaxed), 1, "entry must have run");
+}
+
+/// `FULLSIM` selects ISS, which is not linked — fail before peripherals init.
+#[rstest]
+fn fullsim_profile_fails_with_iss_unavailable() {
+    let _g = lock_or_recover();
+    let pty = unique_pty_path("fullsim");
+    let sd = unique_sd_path("fullsim");
+
+    let err = Emulator::builder(MiniPlatform)
+        .firmware(FirmwareInfo::new())
+        .machine(Box::new(MiniMachine::new()))
+        .profile(SimProfile::FULLSIM)
+        .host_pty(pty.to_str().unwrap())
+        .sd_path(sd.to_str().unwrap())
+        .entry(|| {})
+        .build()
+        .expect("build should succeed")
+        .run()
+        .expect_err("ISS is not implemented");
+    assert!(matches!(err, EmulatorError::IssUnavailable), "got {err:?}");
 }
 
 /// `Emulator::firmware()` borrows the parsed info after a successful build.

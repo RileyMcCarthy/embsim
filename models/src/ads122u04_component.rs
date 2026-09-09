@@ -251,8 +251,8 @@ fn reset_high(reset: NetState, dvdd: NetState) -> bool {
 /// for the reference component. Consequences worth knowing:
 ///
 /// - The drain runs **on the engine thread**, so it is ordered against every
-///   other engine event and its cadence is exact in stepped clock mode (wakes
-///   land at 250 µs, 500 µs, …, not at sampled wall instants). One thread and
+///   other engine event and its cadence is exact (wakes land at 250 µs,
+///   500 µs, …). One thread and
 ///   one poll loop are deleted rather than made deterministic.
 /// - The drain is a **non-blocking** read: it never parks the engine thread.
 /// - **What is still not deterministic** (stated here rather than papered

@@ -22,15 +22,16 @@
 //! [`crate::component::ComponentNetIo::schedule_at`] /
 //! [`crate::component::ComponentNetIo::schedule_every`], served by a timer
 //! wheel keyed to the virtual-clock **counter**. Idle components cost nothing.
-//! The engine is the **time authority** (`EngineCore::run_stepped_iteration`):
-//! it waits for every registered actor to park, drains its queue, fires every
-//! entry due at `now`, then [`embsim_core::virtual_clock::advance_to`]
-//! `min(wheel head, earliest park)`.
+//! The engine is the **time authority**: it waits for every registered actor
+//! to park, drains a bounded batch of commands, fires every entry due at
+//! `now`, then [`virtual_clock::advance_to`] `min(wheel head, earliest park)`.
 //! Optional wall pacing after a jump (`init(speed)` with `speed > 0`) is how
 //! a playground feels real-time; tests use `speed <= 0` so jumps are instant.
-//! Time is held until `System::start` has attached every component
-//! (`Command::ReleaseTime`). Time-sensitive state must be computed at
-//! *read time*, never integrated per tick.
+//! Time is held until `System::start` has attached and started every
+//! component (`Command::ReleaseTime`).
+//!
+//! Time-dependent component state must be computed at read time, never
+//! integrated per tick.
 //!
 //! Build-time analysis and live resolution share **one code path**: the
 //! crate-internal `Resolver` in this module is populated by `System`
@@ -40,8 +41,11 @@
 //! semantics. Escalation is part of that shared path: when the digital fast
 //! path detects a competing source within
 //! [`crate::net::ESCALATION_IMPEDANCE_RATIO`] of the strongest driver, the
-//! whole conduction cluster goes through the [`ClusterSolver`]
-//! ([`crate::cluster::QuasiStaticMna`] by default).
+//! whole conduction cluster goes through the [`ClusterSolver`]. Capacitors
+//! are analog-only: they never join digital conduction or stream-collapse. A
+//! windowed `.tran` solver may ask the engine to re-resolve on a period
+//! (`ClusterSolver::analog_window_us`) so C keeps integrating between
+//! digital events.
 //!
 //! **Stream routing** (`BOARD_ENGINE.md`, "Stream endpoints (serial over
 //! pins)") is engine-owned and **derived from net resolution, never
@@ -106,7 +110,8 @@ use std::time::Duration;
 use embsim_core::virtual_clock;
 
 use crate::cluster::{
-    Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource,
+    Cluster, ClusterCapacitor, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver,
+    ClusterSource,
 };
 use crate::component::{PulseTrain, StreamRole};
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
@@ -198,7 +203,7 @@ pub struct ComponentId(pub usize);
 pub(crate) type SenseCallback = Box<dyn Fn(NetState) + Send>;
 
 /// Timer-wheel wakeup callback: called from the engine thread with the
-/// sampled virtual time (µs); no engine lock held.
+/// virtual time (µs) at the wake; no engine lock held.
 pub(crate) type WakeCallback = Box<dyn Fn(u64) + Send>;
 
 /// Topology-change callback (stream-routing seam): called from the engine
@@ -303,15 +308,14 @@ pub(crate) enum Command {
         /// Delivery callback.
         callback: PulseCallback,
     },
-    /// Stepped mode only: the system is fully assembled — every component has
-    /// attached and started — so the engine may begin advancing virtual time.
+    /// The system is fully assembled — every component has attached and
+    /// started — so the engine may begin advancing virtual time.
     ///
     /// Without this barrier a two-component system is not reproducible: the
     /// engine could advance between one component's `schedule_every` and the
     /// next's, so the second component's period would be anchored at a
     /// different instant from run to run. Sent once by `System::start` after
-    /// the `Component::start` loop; a no-op in free-running mode, where time
-    /// runs regardless.
+    /// the `Component::start` loop.
     ReleaseTime,
     /// Stop the engine loop; pending drives and timers are discarded.
     Shutdown,
@@ -492,6 +496,9 @@ pub(crate) struct Resolver {
     identity: Dsu,
     /// Conduction edges (resistors, inductors, closed jumpers): (a, b, ohms).
     edges: Vec<(usize, usize, f64)>,
+    /// Analog-only capacitors: (a, b, farads). Never join digital conduction
+    /// or stream-collapse — a decoupling cap must not analog-union the board.
+    capacitors: Vec<(usize, usize, f64)>,
     /// Drive-capable endpoints, indexed by [`EndpointId`].
     slots: Vec<DriveSlot>,
     power_sources: Vec<(usize, Volts)>,
@@ -512,6 +519,7 @@ impl Resolver {
         Self {
             identity,
             edges: Vec::new(),
+            capacitors: Vec::new(),
             slots: Vec::new(),
             power_sources: Vec::new(),
             stuck_sources: Vec::new(),
@@ -527,6 +535,11 @@ impl Resolver {
     /// Add a conduction edge between two nets.
     pub(crate) fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
         self.edges.push((a, b, ohms));
+    }
+
+    /// Add an analog-only capacitor. Does not join digital conduction.
+    pub(crate) fn add_capacitor(&mut self, a: usize, b: usize, farads: f64) {
+        self.capacitors.push((a, b, farads));
     }
 
     /// Register a drive-capable endpoint with its initial contribution
@@ -707,7 +720,7 @@ impl Resolver {
         //
         // **Determinism (load-bearing):** iterate the DENSE drive table, never
         // `net_drivers` (a `HashMap`). This `Vec`'s order is the SPICE card
-        // order [`crate::cluster::QuasiStaticMna::solve`] stamps, so a hash walk would
+        // order [`crate::cluster::Spice::solve`] stamps, so a hash walk would
         // make the deck (and, for a linear solver, last-bit voltages) depend
         // on a per-process hasher seed. Slots and `net_drivers`' member lists
         // are both built in endpoint order. See `DETERMINISM.md`.
@@ -800,8 +813,19 @@ impl Resolver {
         // Roots contended through collapsed resistance still escalate their
         // cluster, so the mid-rail voltage stays available to the solve —
         // but their own projection below is Contention.
+        // Numeric power/stuck roots: a capacitor may attach to one of these
+        // as the "other end" without pulling the rest of the rail's island
+        // into this cluster (no recurse through rails).
+        // hash-order: membership only.
+        let mut power_roots: HashSet<usize> = HashSet::new();
+        for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
+            if volts.is_finite() && !volts.is_nan() {
+                power_roots.insert(root_of[*net]);
+            }
+        }
+
         let solve_cluster = |cluster: usize| -> ClusterSolution {
-            let nodes: Vec<NetId> = (0..n)
+            let mut nodes: Vec<NetId> = (0..n)
                 .filter(|&i| root_of[i] == i && cluster_of[i] == cluster)
                 .map(NetId)
                 .collect();
@@ -814,10 +838,32 @@ impl Resolver {
                     ohms: *ohms,
                 })
                 .collect();
-            let inputs = ClusterInputs {
-                sources: cluster_sources.get(&cluster).cloned().unwrap_or_default(),
-            };
-            solver.solve(&Cluster { nodes, resistors }, &inputs)
+            let (extra_nodes, extra_sources, capacitors) = attach_cluster_capacitors(
+                &self.capacitors,
+                cluster,
+                &root_of,
+                &cluster_of,
+                &power_roots,
+                &direct_volts,
+            );
+            for extra in extra_nodes {
+                if !nodes.contains(&extra) {
+                    nodes.push(extra);
+                }
+            }
+            let mut sources = cluster_sources.get(&cluster).cloned().unwrap_or_default();
+            sources.extend(extra_sources);
+            solver.solve(
+                &Cluster {
+                    nodes,
+                    resistors,
+                    capacitors,
+                },
+                &ClusterInputs {
+                    sources,
+                    window_us: None,
+                },
+            )
         };
         // hash-order: `escalated` is keyed access only (`contains_key`, `get`,
         // `entry`) and never iterated. `driver_roots` is shape 2 — the escalation
@@ -859,8 +905,8 @@ impl Resolver {
             let dist = min_path_ohms(&root_edges, root);
             // Order-independent by arithmetic: `f64::min` over a set of
             // finite values gives the same result in any order, so this
-            // consumer of `cluster_sources` is safe regardless. The MNA
-            // accumulation is the one that is not — see its assembly above.
+            // consumer of `cluster_sources` is safe regardless. The analog
+            // solve is the one that is not — see its assembly above.
             if let Some(sources) = cluster_sources.get(&cluster) {
                 for source in sources {
                     if source.node.0 == root || level_of_volts(source.volts) == level {
@@ -1304,6 +1350,76 @@ fn min_path_ohms(root_edges: &[(usize, usize, f64)], from: usize) -> HashMap<usi
     dist
 }
 
+/// Capacitors that belong on one analog cluster deck.
+///
+/// C never joins digital conduction. Stamp a cap when:
+/// - both terminals already sit in this conduction cluster, or
+/// - one terminal is in the cluster and the mate is a power/stuck net
+///   (the mate is added as an extra node — we do **not** recurse through
+///   that rail and pull in every other analog island on it).
+///
+/// Walks `capacitors` in registration order. Extra nodes are sorted so the
+/// appended node list is hasher-independent.
+fn attach_cluster_capacitors(
+    capacitors: &[(usize, usize, f64)],
+    cluster: usize,
+    root_of: &[usize],
+    cluster_of: &[usize],
+    power_roots: &HashSet<usize>,
+    direct_volts: &HashMap<usize, Volts>,
+) -> (Vec<NetId>, Vec<ClusterSource>, Vec<ClusterCapacitor>) {
+    let mut extra_nodes = Vec::new();
+    let mut caps = Vec::new();
+    for &(a, b, farads) in capacitors {
+        if !farads.is_finite() || farads <= 0.0 {
+            continue;
+        }
+        if a >= root_of.len() || b >= root_of.len() {
+            continue;
+        }
+        let ra = root_of[a];
+        let rb = root_of[b];
+        if ra == rb {
+            continue;
+        }
+        let a_in = cluster_of[a] == cluster;
+        let b_in = cluster_of[b] == cluster;
+        let attach = match (a_in, b_in) {
+            (true, true) => true,
+            (true, false) if power_roots.contains(&rb) => {
+                extra_nodes.push(NetId(rb));
+                true
+            }
+            (false, true) if power_roots.contains(&ra) => {
+                extra_nodes.push(NetId(ra));
+                true
+            }
+            _ => false,
+        };
+        if attach {
+            caps.push(ClusterCapacitor {
+                a: NetId(ra),
+                b: NetId(rb),
+                farads,
+            });
+        }
+    }
+    extra_nodes.sort_by_key(|n| n.0);
+    extra_nodes.dedup();
+    let extra_sources: Vec<ClusterSource> = extra_nodes
+        .iter()
+        .filter_map(|&NetId(root)| {
+            let volts = *direct_volts.get(&root)?;
+            Some(ClusterSource {
+                node: NetId(root),
+                volts,
+                impedance: 0.0,
+            })
+        })
+        .collect();
+    (extra_nodes, extra_sources, caps)
+}
+
 // ============================================================
 // Timer wheel
 // ============================================================
@@ -1315,6 +1431,9 @@ enum TimerTarget {
     Wake(ComponentId),
     /// Paced byte delivery on one stream producer's route.
     Stream(EndpointId),
+    /// Windowed analog `.tran`: re-resolve so capacitors keep integrating
+    /// between digital events. Period is the solver's `analog_window_us`.
+    Analog,
 }
 
 /// One armed wakeup. Ordered by `(deadline_us, seq)` so simultaneous and
@@ -1442,21 +1561,22 @@ struct EngineCore {
     /// in flight); applied strictly in seq order.
     pending_drives: BTreeMap<u64, (EndpointId, Option<TheveninDrive>)>,
     next_drive_seq: u64,
-    /// Stepped mode: has [`Command::ReleaseTime`] arrived? Virtual time is held
-    /// at its initial value until it does, so every component's first schedule
-    /// is anchored at the same instant.
+    /// Has [`Command::ReleaseTime`] arrived? Virtual time is held at its
+    /// initial value until it does, so every component's first schedule is
+    /// anchored at the same instant.
     clock_released: bool,
-    /// Stepped mode: reported [`Finding::QuiescenceTimeout`] already? The
-    /// finding is deduped on the cumulative bus anyway; this keeps the engine
-    /// from re-waiting the full timeout on every iteration once an actor is
-    /// known to be wedged.
+    /// Reported [`Finding::QuiescenceTimeout`] already? The finding is
+    /// deduped on the cumulative bus anyway; this keeps the engine from
+    /// re-waiting the full timeout on every iteration once an actor is known
+    /// to be wedged.
     quiescence_stalled: bool,
     /// How long [`Self::await_actor_quiescence`] waits before declaring the
     /// barrier wedged ([`STEPPED_QUIESCENCE_TIMEOUT`] unless overridden).
     quiescence_timeout: Duration,
-    /// Gap seq currently being watched, and how many consecutive idle polls
-    /// have seen it. Skip after ~200 ms of idle (100 polls).
-    stepped_gap_logged: Option<(u64, u32)>,
+    /// `(missing seq, idle polls seen)` for the drive-seq gap the idle
+    /// diagnostic is watching. Skip only after the same gap survives many
+    /// consecutive idle polls (~200 ms).
+    drive_gap_logged: Option<(u64, u32)>,
     /// Determinism Oracle 1 (`crate::event_log`). Disabled by default; every
     /// recording site is closure-guarded, so an off log costs one `Option`
     /// check.
@@ -1873,9 +1993,9 @@ impl EngineCore {
     /// Fire every wheel entry whose deadline has passed, in `(deadline,
     /// schedule)` order; returns how many fired.
     ///
-    /// `now` is the instant the engine last advanced to, so a wake fires at
-    /// its scheduled deadline. Stream targets deliver their route's due
-    /// bytes instead of a wake callback.
+    /// `now` is the counter the engine last advanced to, so a wake fires at
+    /// its scheduled deadline. Stream targets deliver their route's due bytes
+    /// instead of a wake callback.
     fn fire_due_timers(&mut self) -> usize {
         let mut fired = 0usize;
         while let Some(&Reverse(head)) = self.wheel.peek() {
@@ -1900,14 +2020,16 @@ impl EngineCore {
                         );
                     }
                     if let Some(period) = head.period_us {
-                        let mut next = head.deadline_us.saturating_add(period);
-                        if next <= now {
-                            next = now.saturating_add(period);
-                        }
-                        self.arm(next, head.target, Some(period));
+                        self.rearm_periodic(head.target, head.deadline_us, period, now);
                     }
                 }
                 TimerTarget::Stream(endpoint) => self.deliver_due_stream(endpoint, now),
+                TimerTarget::Analog => {
+                    self.resolve_and_publish();
+                    if let Some(period) = head.period_us {
+                        self.rearm_periodic(head.target, head.deadline_us, period, now);
+                    }
+                }
             }
         }
         fired
@@ -1923,6 +2045,34 @@ impl EngineCore {
             target,
             period_us,
         }));
+    }
+
+    fn rearm_periodic(&mut self, target: TimerTarget, deadline_us: u64, period: u64, now: u64) {
+        let mut next = deadline_us.saturating_add(period);
+        if next <= now {
+            next = now.saturating_add(period);
+        }
+        self.arm(next, target, Some(period));
+    }
+
+    /// Arm the windowed-`.tran` tick once time is released. No-op for `.op`
+    /// solvers, analog-off, or a board with no capacitors.
+    fn arm_analog_window(&mut self) {
+        let Some(period) = self.solver.analog_window_us() else {
+            return;
+        };
+        if self.resolver.capacitors.is_empty() {
+            return;
+        }
+        if !self.clock_ready("analog window") {
+            return;
+        }
+        let now = virtual_clock::virtual_us();
+        self.arm(
+            now.saturating_add(period),
+            TimerTarget::Analog,
+            Some(period),
+        );
     }
 
     /// Handle one command; returns `true` on shutdown.
@@ -2029,6 +2179,7 @@ impl EngineCore {
             }
             Command::ReleaseTime => {
                 self.clock_released = true;
+                self.arm_analog_window();
             }
             Command::Shutdown => return true,
         }
@@ -2037,10 +2188,10 @@ impl EngineCore {
 
     /// Engine thread body. Virtual time is a counter; this loop is the time
     /// authority. `--speed` only paces the host after
-    /// [`embsim_core::virtual_clock::advance_to`].
+    /// [`virtual_clock::advance_to`].
     fn run(mut self, rx: Receiver<Command>) {
         loop {
-            if self.run_stepped_iteration(&rx) {
+            if self.run_iteration(&rx) {
                 break;
             }
         }
@@ -2067,7 +2218,7 @@ impl EngineCore {
     /// next park first, then the engine drains and fires. What is *not* fixed
     /// is the interleaving of two actors released at the same instant — they
     /// race `next_drive_seq`, exactly as `DETERMINISM.md` says T1 does not fix.
-    fn run_stepped_iteration(&mut self, rx: &Receiver<Command>) -> bool {
+    fn run_iteration(&mut self, rx: &Receiver<Command>) -> bool {
         loop {
             self.await_actor_quiescence();
             let mut work = 0usize;
@@ -2113,10 +2264,10 @@ impl EngineCore {
             Some(deadline) if deadline > now => {
                 if let Err(error) = virtual_clock::advance_to(deadline) {
                     // Unreachable while this engine is the only scheduler:
-                    // `next_virtual_deadline` is >= now by construction and the
-                    // mode was stepped one instruction ago. Report rather than
-                    // panic — an engine thread that dies is a silent zombie.
-                    tracing::error!(?error, deadline, now, "stepped clock advance rejected");
+                    // `next_virtual_deadline` is >= now by construction.
+                    // Report rather than panic — an engine thread that dies
+                    // is a silent zombie.
+                    tracing::error!(?error, deadline, now, "clock advance rejected");
                 }
                 false
             }
@@ -2124,7 +2275,7 @@ impl EngineCore {
             // fire it on the next pass.
             Some(_) => false,
             None => {
-                self.warn_on_stepped_drive_gap();
+                self.warn_on_drive_gap();
                 match rx.recv_timeout(STEPPED_IDLE_POLL) {
                     Ok(command) => self.handle(command),
                     Err(RecvTimeoutError::Timeout) => false,
@@ -2137,23 +2288,23 @@ impl EngineCore {
     /// Skip a reserved-but-never-sent drive seq after it has survived many
     /// idle polls. A live enqueuer covers reserve→send in nanoseconds; one
     /// or two idle observations can still be a healthy race, so wait
-    /// [`GAP_IDLE_POLLS`] (~200 ms) before skipping.
-    fn warn_on_stepped_drive_gap(&mut self) {
+    /// ~200 ms of idle polls before skipping.
+    fn warn_on_drive_gap(&mut self) {
         let Some((&lowest, _)) = self.pending_drives.first_key_value() else {
-            self.stepped_gap_logged = None;
+            self.drive_gap_logged = None;
             return;
         };
         let missing = self.next_drive_seq;
         const GAP_IDLE_POLLS: u32 = 100; // ~200 ms at STEPPED_IDLE_POLL
-        match self.stepped_gap_logged {
+        match self.drive_gap_logged {
             Some((seq, n)) if seq == missing => {
                 if n + 1 < GAP_IDLE_POLLS {
-                    self.stepped_gap_logged = Some((missing, n + 1));
+                    self.drive_gap_logged = Some((missing, n + 1));
                     return;
                 }
             }
             _ => {
-                self.stepped_gap_logged = Some((missing, 1));
+                self.drive_gap_logged = Some((missing, 1));
                 return;
             }
         }
@@ -2166,10 +2317,10 @@ impl EngineCore {
         self.report_finding(Finding::DriveSeqGap { seq: missing });
         self.next_drive_seq = lowest;
         self.apply_ready_drives();
-        self.stepped_gap_logged = None;
+        self.drive_gap_logged = None;
     }
 
-    /// Stepped mode: block until every registered actor is parked, reporting a
+    /// Block until every registered actor is parked, reporting a
     /// [`Finding::QuiescenceTimeout`] if one never does.
     ///
     /// An actor that never parks cannot be waited out — it would hang the
@@ -2196,7 +2347,7 @@ impl EngineCore {
         }
     }
 
-    /// Stepped mode: the next virtual instant anything is waiting for — the
+    /// The next virtual instant anything is waiting for — the
     /// earlier of the wheel head and the earliest pending park deadline across
     /// every waiter (registered actor or not; an unregistered waiter cannot
     /// hold time back, but it must still be released).
@@ -2226,6 +2377,8 @@ pub struct EngineHandle {
     diagnostics: Arc<Mutex<Diagnostics>>,
     event_log: EventLog,
     join: Option<JoinHandle<()>>,
+    /// Held from spawn until drop so waiters cannot idle-jump in the window
+    /// before the engine thread claims the loop.
     _time: virtual_clock::TimeAuthority,
 }
 
@@ -2290,7 +2443,7 @@ impl EngineHandle {
             clock_released: false,
             quiescence_stalled: false,
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
-            stepped_gap_logged: None,
+            drive_gap_logged: None,
             event_log: event_log.clone(),
         };
         core.resolve_and_publish();
@@ -2395,7 +2548,20 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::cluster::QuasiStaticMna;
+    #[cfg(not(feature = "spice"))]
+    use crate::cluster::AnalogOff;
+    use crate::cluster::ClusterSolver;
+    #[cfg(feature = "spice")]
+    use crate::cluster::Spice;
+
+    #[cfg(feature = "spice")]
+    fn test_solver() -> Spice {
+        Spice
+    }
+    #[cfg(not(feature = "spice"))]
+    fn test_solver() -> AnalogOff {
+        AnalogOff
+    }
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex as StdMutex;
     use std::time::Instant;
@@ -2468,7 +2634,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(1),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -2522,7 +2688,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(1),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -2565,7 +2731,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(2),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -2650,7 +2816,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(2),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -2697,7 +2863,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(2),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -2833,7 +2999,7 @@ mod tests {
                     .map(|s| (s.volts, s.impedance))
                     .collect(),
             );
-            QuasiStaticMna.solve(cluster, inputs)
+            test_solver().solve(cluster, inputs)
         }
     }
 
@@ -2872,7 +3038,7 @@ mod tests {
     /// drive table, so its order is endpoint order and nothing else. It used
     /// to be built by iterating `net_drivers.values()` — a `HashMap` — and
     /// that `Vec` order is the float accumulation order inside
-    /// [`QuasiStaticMna::solve`] (`DETERMINISM.md`, "One real hash-order
+    /// [`Spice::solve`] (`DETERMINISM.md`, "One real hash-order
     /// defect").
     ///
     /// This is the *direct* regression gate for the fix: it asserts the exact
@@ -2918,7 +3084,7 @@ mod tests {
     /// 1. **The defect needed sources on the same supernode**, not merely two
     ///    sources in a cluster. Order only reaches a float through the
     ///    accumulations `matrix[c][c] += g` / `rhs[c] += i`
-    ///    ([`QuasiStaticMna::solve`]), so it takes ≥ 2 sources on distinct
+    ///    ([`Spice::solve`]), so it takes ≥ 2 sources on distinct
     ///    identity roots that a **0 Ω conduction edge** merges into one
     ///    supernode — which is exactly this topology. Sources on separate
     ///    supernodes each stamp their own diagonal and cannot disagree.
@@ -3024,7 +3190,7 @@ mod tests {
         resolver.add_stuck_source(0, 0.0);
         let mut net_table = nets(1);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert_eq!(net_table[0].state, NetState::Contention);
         assert!(
             diags
@@ -3041,7 +3207,7 @@ mod tests {
         resolver.add_stuck_source(0, 3.3);
         let mut net_table = nets(1);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert_eq!(net_table[0].state, NetState::Analog(3.3));
         assert!(diags.is_empty(), "agreeing ideal sources must not contend");
     }
@@ -3060,7 +3226,7 @@ mod tests {
         resolver.add_edge(1, 2, 4_700.0);
         let mut net_table = nets(3);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         let NetState::Analog(v_mid) = net_table[1].state else {
             panic!(
                 "midpoint must solve numerically, got {:?}",
@@ -3091,7 +3257,7 @@ mod tests {
         resolver.add_analog_sense(1);
         let mut net_table = nets(2);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert!(
             matches!(net_table[1].state, NetState::Analog(v) if (v - 3.3).abs() < 1e-6),
             "analog sense must read the solved voltage; got {:?}",
@@ -3105,11 +3271,72 @@ mod tests {
         resolver.add_digital_sense(1);
         let mut net_table = nets(2);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert_eq!(net_table[1].state, NetState::Pulled(Level::High, 4_700.0));
     }
 
-    /// Register a wake callback appending sampled timestamps to a log.
+    /// Capacitors never join digital conduction / stream-collapse: two analog
+    /// islands tied to a rail only through C stay floating, they do not
+    /// analog-union onto the rail (the decoupling-cap explosion).
+    #[rstest]
+    fn capacitor_does_not_join_digital_conduction() {
+        // 3.3 V rail, AIN_A and AIN_B each with a cap to the rail and no R.
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        resolver.add_power_source(0, 3.3);
+        resolver.add_capacitor(1, 0, 1e-6);
+        resolver.add_capacitor(2, 0, 1e-6);
+        resolver.add_analog_sense(1);
+        resolver.add_analog_sense(2);
+        let mut net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
+        assert_eq!(net_table[1].state, NetState::Floating);
+        assert_eq!(net_table[2].state, NetState::Floating);
+        assert_eq!(net_table[0].state, NetState::Analog(3.3));
+    }
+
+    /// An RC to a power net attaches C on the analog deck (mate is a power
+    /// node — added, not recursed through). `.op` still treats C as open.
+    #[rstest]
+    fn rc_to_ground_stamps_capacitor_and_op_sits_at_source() {
+        struct Recording {
+            seen: StdMutex<Vec<Cluster>>,
+        }
+        impl ClusterSolver for Recording {
+            fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
+                self.seen.lock().unwrap().push(cluster.clone());
+                test_solver().solve(cluster, inputs)
+            }
+        }
+        // 3.3 V —1 kΩ— AIN —1 µF— 0 V, analog sense on AIN.
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        resolver.add_power_source(0, 3.3);
+        resolver.add_power_source(2, 0.0);
+        resolver.add_edge(0, 1, 1_000.0);
+        resolver.add_capacitor(1, 2, 1e-6);
+        resolver.add_analog_sense(1);
+        let solver = Recording {
+            seen: StdMutex::new(Vec::new()),
+        };
+        let mut net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &solver);
+        let seen = solver.seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|c| c
+                .capacitors
+                .iter()
+                .any(|cap| (cap.farads - 1e-6).abs() < 1e-18)),
+            "RC capacitor must be stamped on the analog cluster: {seen:?}"
+        );
+        assert!(
+            matches!(net_table[1].state, NetState::Analog(v) if (v - 3.3).abs() < 1e-6),
+            ".op treats C as open so AIN sits at the source; got {:?}",
+            net_table[1].state
+        );
+    }
+
+    /// Register a wake callback appending virtual timestamps to a log.
     fn wake_log(handle: &EngineHandle, component: ComponentId) -> Arc<StdMutex<Vec<u64>>> {
         let log: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&log);
@@ -3124,7 +3351,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             Resolver::new(0, Dsu::new(0)),
             Vec::new(),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -3153,13 +3380,13 @@ mod tests {
         );
         assert!(
             log.lock().unwrap()[0] >= deadline,
-            "sampled wake time must be at/after the deadline"
+            "wake time must be at/after the deadline"
         );
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(log.lock().unwrap().len(), 1, "one-shot fires exactly once");
     }
 
-    /// `schedule_every` keeps firing with non-decreasing sampled timestamps.
+    /// `schedule_every` keeps firing with non-decreasing timestamps.
     #[rstest]
     fn periodic_timer_fires_repeatedly_against_scaled_clock() {
         let _g = lock_clock();
@@ -3179,7 +3406,7 @@ mod tests {
         let stamps = log.lock().unwrap().clone();
         assert!(
             stamps.windows(2).all(|w| w[0] <= w[1]),
-            "sampled timestamps must be non-decreasing: {stamps:?}"
+            "timestamps must be non-decreasing: {stamps:?}"
         );
     }
 
@@ -3251,7 +3478,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(1),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -3286,9 +3513,8 @@ mod tests {
 
     /// A reserved-but-never-sent drive seq (the enqueuing thread died
     /// between `next_drive_seq` and the channel send) must not wedge every
-    /// later drive forever: after the idle-poll skip the engine reports
-    /// [`Finding::DriveSeqGap`] naming the missing seq and applies the
-    /// buffered drives.
+    /// later drive forever: once idle with a gap, the engine reports
+    /// [`Finding::DriveSeqGap`] and applies the buffered drives.
     #[rstest]
     fn missing_drive_seq_is_skipped_after_a_bounded_wait() {
         let mut resolver = Resolver::new(1, Dsu::new(1));
@@ -3296,7 +3522,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(1),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -3339,7 +3565,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(1),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );
@@ -3401,7 +3627,7 @@ mod tests {
         resolver.add_edge(0, 1, 47.0);
         let mut net_table = nets(2);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert_eq!(net_table[0].state, NetState::Contention);
         assert_eq!(net_table[1].state, NetState::Contention);
         assert!(
@@ -3423,7 +3649,7 @@ mod tests {
         resolver.add_edge(0, 1, STREAM_COLLAPSE_THRESHOLD);
         let mut net_table = nets(2);
         let mut diags = Diagnostics::new();
-        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        resolver.resolve(&mut net_table, &mut diags, &test_solver());
         assert_ne!(net_table[0].state, NetState::Contention);
         assert_ne!(net_table[1].state, NetState::Contention);
     }
@@ -3609,7 +3835,7 @@ mod tests {
         let handle = EngineHandle::spawn(
             resolver,
             nets(2),
-            Box::new(QuasiStaticMna),
+            Box::new(test_solver()),
             EventLog::disabled(),
             None,
         );

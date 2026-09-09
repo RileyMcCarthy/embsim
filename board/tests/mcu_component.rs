@@ -145,7 +145,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 /// the system joins the engine and the pump threads cleanly.
 #[rstest]
 fn bridged_serial_channel_roundtrips_to_a_peer_board() {
-    // Stream pacing samples the free-running virtual clock; 50x scale keeps
+    // Stream pacing is against the virtual counter; 50x scale keeps
     // the 115.2 kbaud pacing sub-millisecond in wall time.
     virtual_clock::init(50.0, 1_000_000);
 

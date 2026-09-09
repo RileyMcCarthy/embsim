@@ -114,7 +114,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 
 #[rstest]
 fn live_system_routes_schedule_drive_and_sense_through_the_engine() {
-    // The timer wheel samples the free-running virtual clock.
+    // Paced counter so the engine can jump and the playground-scale still applies.
     embsim_core::virtual_clock::init(1.0, 1_000_000);
 
     let driver_handle: Arc<Mutex<Option<PinHandle>>> = Arc::new(Mutex::new(None));

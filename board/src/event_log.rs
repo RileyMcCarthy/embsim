@@ -30,11 +30,10 @@
 //!   sequence and a *virtual* timestamp. There is no `Instant` anywhere in
 //!   this module.
 //! - **Virtual timestamps kept exactly.** `v_us` is never rounded or bucketed.
-//!   In free-running mode it is sampled wall time and so *will* differ run to
-//!   run — that is a fact to be measured, not smoothed over
-//!   ([`EventLog::normalized_shape`] is the projection that drops it).
+//!   It is the counter the engine set (`advance_to`). [`EventLog::normalized_shape`]
+//!   drops it when comparing event *order* only.
 //! - **Floats quantized:** voltages to 1 µV, resistances to 1 mΩ — matching
-//!   `BOARD_ENGINE.md`'s MNA hand-check tolerance. Unnecessary *within* one
+//!   `BOARD_ENGINE.md`'s analog hand-check tolerance. Unnecessary *within* one
 //!   host and one binary (identical inputs in identical order give
 //!   bit-identical IEEE-754 results); required the moment goldens are shared
 //!   across architectures.
@@ -173,12 +172,9 @@ impl EngineEventRecord {
         format!("{} v={} {}", self.seq, self.v_us, self.event_form())
     }
 
-    /// The normalized line **without** `v_us` — the run-to-run invariant that
-    /// free-running mode can actually be held to (`DETERMINISM.md`: virtual
-    /// timestamps are sampled wall time until the stepped clock of Phase D1,
-    /// but the drive/apply order and net-state sequence are already
-    /// determined). The append sequence is kept: it is the position in the
-    /// order, not a timestamp.
+    /// The normalized line **without** `v_us` — event order without timestamps.
+    /// The append sequence is kept: it is the position in the order, not a
+    /// timestamp.
     pub fn normalized_shape(&self) -> String {
         format!("{} {}", self.seq, self.event_form())
     }
@@ -419,8 +415,8 @@ impl EventLog {
         self.records().iter().map(|r| r.normalized()).collect()
     }
 
-    /// Every record as its canonical normalized line **without** `v_us` — the
-    /// projection free-running mode can be held to run-to-run.
+    /// Every record as its canonical normalized line **without** `v_us` —
+    /// event order only.
     pub fn normalized_shape(&self) -> Vec<String> {
         self.records()
             .iter()
@@ -542,7 +538,7 @@ mod tests {
     }
 
     /// `normalized_shape` drops `v_us` and keeps everything else, so two runs
-    /// that agree on order but not on sampled wall time still compare equal.
+    /// that agree on order but not on `v_us` still compare equal.
     #[rstest]
     fn shape_projection_drops_only_the_virtual_timestamp() {
         let event = EngineEvent::Wake {

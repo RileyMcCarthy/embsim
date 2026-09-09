@@ -56,7 +56,7 @@ fn suite_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Puts the process-global clock in unpaced mode for the lifetime of the guard
-/// and restores paced `init(1.0)` on the way out, panic or not.
+/// and restores paced 1.0× on the way out, panic or not.
 struct Stepped;
 
 impl Stepped {
@@ -131,7 +131,7 @@ impl Component for ScriptedDriver {
 }
 
 /// An analog sense terminal — present so every drive produces a sense
-/// delivery, and so the cluster escalates to the MNA solver (the float path
+/// delivery, and so the cluster escalates to the analog solver (the float path
 /// the `cluster_sources` ordering fix protects).
 struct Probe {
     pins: [PinDecl; 1],
@@ -164,14 +164,11 @@ const fn analog_pin(name: &'static str) -> PinDecl {
 /// ladder of `TICKS` one-shot wakeups exactly `PERIOD_US` apart and drives its
 /// pin to a fresh voltage on each.
 ///
-/// This is the case that makes the D1 contrast visible. The *deadline* sequence
-/// is fixed arithmetic in both modes, so both produce the same records in the
-/// same order; what differs is the `v_us` each record is stamped with. In
-/// free-running that is sampled wall time (it drifts every run); in stepped it
-/// is the instant the engine advanced to, so it is `anchor + k · PERIOD_US`
-/// exactly. A one-shot ladder rather than `schedule_every` on purpose: a
-/// periodic entry never empties the wheel, and a stepped engine would then
-/// advance virtual time forever instead of terminating.
+/// The *deadline* sequence is fixed arithmetic, so paced and unpaced produce
+/// the same records in the same order with the same `v_us`:
+/// `anchor + k · PERIOD_US`. A one-shot ladder rather than `schedule_every`
+/// on purpose: a periodic entry never empties the wheel, and the engine would
+/// then advance virtual time forever instead of terminating.
 struct WakeLadder {
     pins: [PinDecl; 1],
     ticks: usize,
@@ -189,9 +186,9 @@ impl Component for WakeLadder {
         let fired = Arc::clone(&self.fired);
         let ticks = self.ticks;
         let period = self.period_us;
-        // Anchor the ladder at the virtual instant of attach. In stepped mode
-        // that is 0 for every run: the engine holds time until the whole system
-        // has attached and started (`engine::Command::ReleaseTime`).
+        // Anchor the ladder at the virtual instant of attach. That is 0 for
+        // every run: the engine holds time until the whole system has attached
+        // and started (`engine::Command::ReleaseTime`).
         let anchor = virtual_clock::virtual_us();
         let next = Arc::new(AtomicU64::new(anchor + period));
         let rearm = io.clone();
@@ -311,7 +308,7 @@ fn analog_scenario(scenario: Scenario) -> EventLog {
     let harness = Harness::new()
         // Both driver terminals and the probe land on ONE node, so every
         // drive changes a solved voltage and the sources accumulate into the
-        // same MNA supernode.
+        // same analog supernode.
         .connect_str("DRV.A", "PROBE.P")
         .expect("endpoints parse")
         .connect_str("DRV.B", "PROBE.P")
@@ -589,8 +586,9 @@ fn assert_identical(case: &str, projection: &str, logs: &[Vec<String>]) {
     }
 }
 
-/// Report — never assert — how far the *timestamped* projections drift. This is
-/// the measured free-running baseline; stepped mode is what drives it to zero.
+/// Report how far the *timestamped* projections drift under pacing. With one
+/// counter they should match; the printout is a measurement if a regression
+/// reintroduces wall coupling.
 fn report_timestamp_divergence(case: &str, full: &[Vec<String>], stamps: &[Vec<u64>]) {
     let baseline = &full[0];
     let mut identical = 0usize;
@@ -610,7 +608,7 @@ fn report_timestamp_divergence(case: &str, full: &[Vec<String>], stamps: &[Vec<u
         spans.iter().copied().max().unwrap_or(0),
     );
     println!(
-        "[free-running] {case}: {} records/run; {}/{} timestamped logs identical to run 0; \
+        "[paced] {case}: {} records/run; {}/{} timestamped logs identical to run 0; \
          first divergence at record {:?}; final v_us across runs {lo}..{hi} (spread {} µs)",
         baseline.len(),
         identical,
@@ -638,8 +636,8 @@ fn stepped_matrix(case: &str) -> Vec<String> {
     full.remove(0)
 }
 
-/// One case, `RUNS` times, in **free-running** mode: assert the timestamp-free
-/// projection, report the timestamped one.
+/// One case, `RUNS` times, paced (`init(speed > 0)`): assert order; print
+/// timestamps as a measurement in case a regression reintroduces wall coupling.
 fn free_running_matrix(case: &str) {
     let scale = free_running_scale(case);
     let mut shapes: Vec<Vec<String>> = Vec::new();
@@ -947,7 +945,7 @@ fn the_comparison_rejects_a_perturbed_log(#[case] perturbation: usize) {
 
 /// A one-µs timestamp difference must fail the *full* comparison and pass the
 /// *shape* one — the exact distinction the two projections exist to draw, and
-/// the reason stepped mode can assert something free-running cannot.
+/// the reason the full projection is stricter than the shape one.
 #[rstest]
 fn the_full_comparison_catches_a_timestamp_difference_the_shape_one_ignores() {
     let a = vec!["0 v=1000 wake component=0".to_string()];
@@ -968,7 +966,7 @@ fn an_empty_log_fails_rather_than_passing_vacuously() {
     assert!(result.is_err(), "an empty log must not pass");
 }
 
-/// Every case in [`CASES`] is covered by the stepped matrix, the free-running
+/// Every case in [`CASES`] is covered by the unpaced matrix, the paced
 /// matrix, and a golden — a new case added to the dispatch without wiring it
 /// into the `#[case]` lists would otherwise be silently untested.
 #[rstest]

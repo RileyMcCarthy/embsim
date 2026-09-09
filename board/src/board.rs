@@ -25,9 +25,9 @@ use crate::registry::{Classification, JumperState, PartRegistry, PassiveKind, Re
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PartClass {
     /// Two-terminal passive. Only resistors (known value), inductors
-    /// (DC short), and closed jumpers conduct in the build-time DC pass;
-    /// capacitors, diodes, and LEDs are DC-open (documented simplification —
-    /// full behavior is the cluster-solver slice).
+    /// (DC short), and closed jumpers conduct in the digital path;
+    /// capacitors stamp analog-only (never join stream-collapse);
+    /// diodes and LEDs stay DC-open.
     Passive {
         /// Primitive kind.
         kind: PassiveKind,

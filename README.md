@@ -55,6 +55,7 @@ reference consumer.
 | Crate | Path | What it is |
 |-------|------|------------|
 | `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
+| `embsim-spice` | [`spice/`](spice) | In-process ngspice `.op` (analog cluster solver) |
 | `embsim-peripherals` | [`peripherals/`](peripherals) | GPIO, serial, encoder, pulse trains, timer, locks, threads, I2C, filesystem |
 | `embsim-models` | [`models/`](models) | Generic device/IC models (ADS122U04 ADC, limit switch, edge detector) |
 | `embsim-runtime` | [`runtime/`](runtime) | `Emulator` builder, `Platform`/`Machine` traits, init ordering |
@@ -180,7 +181,34 @@ and may be reset between runs.)
 
 ## Building & testing
 
+Simulation backends are **three independent axes**. A consumer may link all of
+them or only one.
+
+| Axis | Runtime type | Compile-time |
+|---|---|---|
+| Clock | `ClockMode::{FreeRunning, Stepped}` | always in `embsim-core` |
+| CPU | `CpuBackend::{Native, Iss}` | native is `embsim-p2`; ISS is a future crate |
+| Analog | `AnalogBackend` or any `ClusterSolver` | `embsim-board` feature `spice` (default) |
+
+`SimProfile::{LIVE, SIL, FULLSIM}` are optional named bundles for a CLI. They
+are not required; construct `SimProfile { clock, cpu, analog }` or call
+`System::cluster_solver(...)` / `EmulatorBuilder::profile` with any mix.
+
+```toml
+# Digital-only: no libngspice
+embsim-board = { path = "...", default-features = false }
+```
+
 Every crate is testable **without any firmware**:
+
+Analog clusters require **libngspice** (shared library) at build and run:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install -y libngspice0-dev pkg-config
+# macOS
+brew install libngspice pkg-config
+```
 
 ```bash
 cargo build --workspace            # build everything
@@ -191,7 +219,8 @@ cargo run -p embsim-minimal-example  # the firmware-free template end-to-end
 Per-crate, if you want to iterate on one area:
 
 ```bash
-cargo test -p embsim-core           # virtual clock, observers, serial PTY
+cargo test -p embsim-spice          # ngspice `.op` wrapper
+cargo test -p embsim-core           # virtual clock, profiles, observers, serial PTY
 cargo test -p embsim-peripherals    # gpio/serial/encoder/pulse_out/timer/lock/system/i2c/fs
 cargo test -p embsim-models         # ADS122U04, limit switch, edge detector
 cargo test -p embsim-runtime        # Emulator builder + full no-firmware run

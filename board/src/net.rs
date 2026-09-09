@@ -78,7 +78,7 @@ pub enum Level {
 /// solved node voltage, never a parallel mechanism.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NetState {
-    /// No source reaches this node (MNA singular for the node).
+    /// No source reaches this node (structurally singular — omitted from the SPICE deck).
     Floating,
     /// Solved V within `V_OL`/`V_OH` of a rail, dominated by one push-pull source.
     Driven(Level),

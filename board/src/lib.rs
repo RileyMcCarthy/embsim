@@ -10,7 +10,7 @@
 //! implements the **build-time analysis slice** (netlist → board → system →
 //! resolution pass → findings) and the **live net-engine slice**
 //! (`System::start`): the single-writer engine thread with its drive queue
-//! and timer wheel, the quasi-static MNA cluster solver ([`QuasiStaticMna`]),
+//! and timer wheel, analog clusters via [`ClusterSolver`],
 //! stream byte pipes (routing, baud pacing, drop policies) derived from
 //! net resolution, and rate-carried pulse trains ([`PulseTrain`]) on the same
 //! derived routes. Both paths drive one shared resolution code path. Still
@@ -24,7 +24,7 @@
 //! - [`registry`] — [`PartRegistry`]: identity → constructor; auto-classification tiers
 //! - [`engine`] — the live single-writer net engine: drive queue, resolution, timer wheel, stream routing
 //! - [`net`] — net state model ([`NetState`]) and shared net/pin identity types
-//! - [`cluster`] — analog cluster types + [`ClusterSolver`] trait ([`QuasiStaticMna`] default)
+//! - [`cluster`] — analog cluster types + [`ClusterSolver`] (optional spice `.op` / windowed `.tran`)
 //! - [`board`] — [`Board::from_netlist`]: netlist + registry → components + nets
 //! - [`system`] — [`System`]: boards + harnesses + scenario overrides + fault algebra
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
@@ -47,14 +47,17 @@ pub mod system;
 
 pub use board::{Board, BoardError};
 pub use cluster::{
-    Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource,
-    QuasiStaticMna,
+    AnalogOff, Cluster, ClusterCapacitor, ClusterInputs, ClusterResistor, ClusterSolution,
+    ClusterSolver, ClusterSource,
 };
+#[cfg(feature = "spice")]
+pub use cluster::{Spice, SpiceTransient};
 pub use component::{
     AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, PulseDirection,
     PulseSegment, PulseTrain, PulseTx, StreamRole, StreamTx,
 };
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
+pub use embsim_core::profile::{AnalogBackend, CpuBackend, ParseProfileError, SimProfile};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};

@@ -9,8 +9,12 @@ description = "Reusable hardware component models for embsim (ADC IC, digital is
 keywords = ["embedded", "emulator", "simulation", "sil"]
 categories = ["embedded", "simulation"]
 
+[features]
+default = ["spice"]
+spice = ["embsim-board/spice"]
+
 [dependencies]
-embsim-board = { path = "../board" }
+embsim-board = { path = "../board", default-features = false }
 embsim-core = { path = "../core" }
 nix.workspace = true
 libc.workspace = true
