@@ -37,12 +37,11 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    Board, Finding, JumperState, Level, NetState, PinRef, Scenario, SenseKind, StreamRole, System,
+    Board, Finding, JumperState, Level, NetState, PinKind, PinRef, Scenario, SenseKind, System,
     SystemHandle,
 };
 use machine_parts::{
     bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed, iso6731_pins,
-    FORCE_GAUGE_BAUD_HZ,
 };
 
 /// Registered (non-passive, non-boundary, non-ignored) component count: the 16
@@ -330,33 +329,28 @@ fn the_force_gauge_uart_crosses_the_isolator_between_socket_and_connector() {
     assert_eq!(net_named(&map, "J3", "39"), "P1");
 }
 
-/// The isolator's two UART channels are declared as a stream *hop*: the input
-/// pin consumes routed bytes and the output pin produces them, both at the
-/// force-gauge baud. That declaration is what keeps a byte route derivable
-/// across the barrier instead of dying at it.
+/// All three of the isolator's channels are plain level repeaters, the UART
+/// pair included.
+///
+/// They used to be a stream *hop* — input pin a byte `Consumer`, output pin a
+/// `Producer` — so the engine could derive a byte route across the barrier.
+/// The part has no idea a UART is on two of its channels, and now it does not
+/// have to: the UART is on the net as levels, so an isolator is an isolator.
 #[rstest]
-fn the_isolator_declares_its_uart_channels_as_stream_hops() {
-    let pins = iso6731_pins(FORCE_GAUGE_BAUD_HZ);
-    let role = |number: &str| {
+fn every_isolator_channel_is_a_plain_level_repeater() {
+    let pins = iso6731_pins();
+    let pin = |number: &str| {
         pins.iter()
             .find(|p| p.number == number)
             .unwrap_or_else(|| panic!("pin {number} declared"))
-            .stream
     };
-    let consumer = Some(StreamRole::Consumer {
-        baud_hz: FORCE_GAUGE_BAUD_HZ,
-    });
-    let producer = Some(StreamRole::Producer {
-        baud_hz: FORCE_GAUGE_BAUD_HZ,
-    });
 
-    assert_eq!(role("12"), consumer, "INC consumes the MCU's transmit");
-    assert_eq!(role("5"), producer, "OUTC reproduces it isolated-side");
-    assert_eq!(role("3"), consumer, "INA consumes the gauge's transmit");
-    assert_eq!(role("14"), producer, "OUTA reproduces it MCU-side");
-    // The ~DRDY channel is levels, not bytes.
-    assert_eq!(role("4"), None);
-    assert_eq!(role("13"), None);
+    for (input, output) in [("12", "5"), ("3", "14"), ("4", "13")] {
+        assert_eq!(pin(input).kind, PinKind::DigitalIn, "{input} senses");
+        assert_eq!(pin(output).kind, PinKind::DigitalOut, "{output} drives");
+        assert_eq!(pin(input).stream, None, "{input} carries no byte route");
+        assert_eq!(pin(output).stream, None, "{output} carries no byte route");
+    }
     assert_eq!(pins.len(), 16);
 }
 

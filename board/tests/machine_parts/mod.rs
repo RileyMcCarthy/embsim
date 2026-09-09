@@ -701,15 +701,15 @@ impl Component for Rs422Receiver {
 //                 IFG_INT → INB → OUTB → P1 (the ADC's ~DRDY)
 //
 // Behavior modeled
-//   A transparent repeater, at the granularity each channel carries:
-//   * the two UART channels repeat **bytes** — the input pin is a stream
-//     `Consumer`, the output pin a stream `Producer`, so the isolator is a
-//     hop on the engine's derived byte route rather than an opaque break in
-//     it (which is what makes the whole force path routable end to end);
-//   * the ~DRDY channel repeats **levels** through an ordinary sense/drive
-//     pair.
+//   A transparent repeater: three identical level channels, each sensing its
+//   input net and driving its output net. That is what the part is — it has no
+//   idea a UART is on two of its channels, and it used to be told, because the
+//   force-gauge channels repeated *bytes* over stream pins so the isolator
+//   could be a hop on the engine's derived byte route. Now that the UART is on
+//   the net as levels, the special case is gone and all three channels are the
+//   same three lines of code.
 //   Repeating requires both sides powered. With either rail down the channel
-//   is dead: bytes are dropped and the level output is released.
+//   is dead and its output is released.
 //
 // Deliberately NOT modeled
 //   * Propagation delay (nanoseconds for this family) and pulse-width
@@ -727,29 +727,32 @@ impl Component for Rs422Receiver {
 //
 
 /// Pin facade of the `ISO6731DWR` (SOIC-16 wide), pin numbers as the
-/// EdgeBoard netlist names them. `baud_hz` parameterizes the two UART
-/// channels' pacing.
+/// EdgeBoard netlist names them.
 #[rustfmt::skip]
-pub fn iso6731_pins(baud_hz: u32) -> Vec<PinDecl> {
+pub fn iso6731_pins() -> Vec<PinDecl> {
     vec![
-        pwr_in("1"),               // VCC1   — isolated side
-        pwr_in("2"),               // GND1_1
-        stream_in("3", baud_hz),   // INA    — gauge transmit in
-        dig_in("4"),               // INB    — gauge ~DRDY in
-        stream_out("5", baud_hz),  // OUTC   — MCU transmit out (isolated side)
-        nc("6"),                   // NC_1
-        nc("7"),                   // EN1
-        pwr_in("8"),               // GND1_2
-        pwr_in("9"),               // GND2_1
-        nc("10"),                  // EN2
-        nc("11"),                  // NC_2
-        stream_in("12", baud_hz),  // INC    — MCU transmit in
-        dig_out("13"),             // OUTB   — ~DRDY out
-        stream_out("14", baud_hz), // OUTA   — gauge transmit out
-        pwr_in("15"),              // GND2_2
-        pwr_in("16"),              // VCC2   — MCU side
+        pwr_in("1"),    // VCC1   — isolated side
+        pwr_in("2"),    // GND1_1
+        dig_in("3"),    // INA    — gauge transmit in
+        dig_in("4"),    // INB    — gauge ~DRDY in
+        dig_out("5"),   // OUTC   — MCU transmit out (isolated side)
+        nc("6"),        // NC_1
+        nc("7"),        // EN1
+        pwr_in("8"),    // GND1_2
+        pwr_in("9"),    // GND2_1
+        nc("10"),       // EN2
+        nc("11"),       // NC_2
+        dig_in("12"),   // INC    — MCU transmit in
+        dig_out("13"),  // OUTB   — ~DRDY out
+        dig_out("14"),  // OUTA   — gauge transmit out
+        pwr_in("15"),   // GND2_2
+        pwr_in("16"),   // VCC2   — MCU side
     ]
 }
+
+/// The three repeated channels, `(input pin, output pin)`, as the EdgeBoard
+/// wires them: MCU transmit, gauge transmit, and the ADC's `~DRDY`.
+const ISO6731_CHANNELS: [(&str, &str); 3] = [("12", "5"), ("3", "14"), ("4", "13")];
 
 struct IsolatorCore {
     rail_volts: Volts,
@@ -760,8 +763,9 @@ struct IsolatorCore {
 struct IsolatorState {
     side1_powered: bool,
     side2_powered: bool,
-    level_in: Option<Level>,
-    level_out: Option<PinHandle>,
+    /// Per channel: the level last sensed on its input, and its output pin.
+    level_in: [Option<Level>; 3],
+    level_out: [Option<PinHandle>; 3],
 }
 
 impl IsolatorCore {
@@ -769,13 +773,21 @@ impl IsolatorCore {
         state.side1_powered && state.side2_powered
     }
 
-    fn apply(&self, state: &mut IsolatorState) {
-        let Some(out) = state.level_out.clone() else {
+    /// Re-drive one channel's output from its input.
+    fn apply(&self, state: &mut IsolatorState, channel: usize) {
+        let Some(out) = state.level_out[channel].clone() else {
             return;
         };
-        match (Self::live(state), state.level_in) {
+        match (Self::live(state), state.level_in[channel]) {
             (true, Some(level)) => out.set_drive(Some(drive(level, self.rail_volts))),
             _ => out.set_drive(None),
+        }
+    }
+
+    /// Re-drive every channel — for a supply change, which affects all three.
+    fn apply_all(&self, state: &mut IsolatorState) {
+        for channel in 0..ISO6731_CHANNELS.len() {
+            self.apply(state, channel);
         }
     }
 }
@@ -788,11 +800,10 @@ pub struct SerialIsolator {
 }
 
 impl SerialIsolator {
-    /// An isolator whose UART channels are paced at `baud_hz` and whose level
-    /// channel drives `rail_volts`.
-    pub fn new(baud_hz: u32, rail_volts: Volts) -> Self {
+    /// An isolator whose repeated outputs drive `rail_volts`.
+    pub fn new(rail_volts: Volts) -> Self {
         Self {
-            pins: iso6731_pins(baud_hz),
+            pins: iso6731_pins(),
             core: Arc::new(IsolatorCore {
                 rail_volts,
                 state: Mutex::new(IsolatorState::default()),
@@ -815,9 +826,14 @@ impl Component for SerialIsolator {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        self.core.state.lock().unwrap().level_out = Some(io.pin("13")?);
+        {
+            let mut state = self.core.state.lock().unwrap();
+            for (channel, (_, output)) in ISO6731_CHANNELS.iter().enumerate() {
+                state.level_out[channel] = Some(io.pin(output)?);
+            }
+        }
 
-        // Rail senses first: a byte delivered before the rails are known must
+        // Rail senses first: a level delivered before the rails are known must
         // not slip through the power gate.
         for (pin, is_side1) in [("1", true), ("16", false)] {
             let core = Arc::clone(&self.core);
@@ -829,28 +845,20 @@ impl Component for SerialIsolator {
                 } else {
                     state.side2_powered = up;
                 }
-                core.apply(&mut state);
+                core.apply_all(&mut state);
             })?;
         }
 
-        // The two byte channels: consumer pin in, producer pin out.
-        for (input, output) in [("3", "14"), ("12", "5")] {
-            let tx = io.stream_tx(output)?;
+        // Each channel subscribes only to its own input, so one transition
+        // costs one drive rather than one per channel.
+        for (channel, (input, _)) in ISO6731_CHANNELS.iter().enumerate() {
             let core = Arc::clone(&self.core);
-            io.on_byte(input, move |byte| {
-                if IsolatorCore::live(&core.state.lock().unwrap()) {
-                    tx.write(&[byte]);
-                }
+            io.on_sense(input, move |sensed| {
+                let mut state = core.state.lock().unwrap();
+                state.level_in[channel] = level_of(sensed, LOGIC_THRESHOLD_VOLTS);
+                core.apply(&mut state, channel);
             })?;
         }
-
-        // The level channel (~DRDY).
-        let core = Arc::clone(&self.core);
-        io.on_sense("4", move |sensed| {
-            let mut state = core.state.lock().unwrap();
-            state.level_in = level_of(sensed, LOGIC_THRESHOLD_VOLTS);
-            core.apply(&mut state);
-        })?;
         Ok(())
     }
 }
@@ -903,10 +911,11 @@ const P2_VIO_NAMES: [&str; 16] = [
 /// netlist has nodes for and all of which the build validates in both
 /// directions. So this component declares the package and delegates behavior:
 ///
-/// - [`Component::pins`] is the union — the MCU's two bridged stream pins with
-///   their roles and baud taken from [`FORCE_GAUGE_CHANNEL`], every other I/O
-///   pin as a sense (a P2 pin is high-Z out of reset, and nothing in this
-///   slice drives it), the supplies as [`PinKind::PowerIn`];
+/// - [`Component::pins`] is the union — the MCU's two bridged UART pins (plain
+///   digital: the channel carries levels, so there is no byte route to
+///   declare), every other I/O pin as a sense (a P2 pin is high-Z out of reset,
+///   and nothing in this slice drives it), the supplies as
+///   [`PinKind::PowerIn`];
 /// - [`Component::attach`] and [`Component::start`] hand straight through to
 ///   the `McuComponent`, which finds `"P2"` and `"P0"` in the handle table it
 ///   is given and bridges them exactly as it would on a board of its own.
@@ -927,10 +936,10 @@ impl P2EdgeModule {
         let mut pins = Vec::with_capacity(86);
         for (index, number) in P2_IO_NAMES.into_iter().enumerate() {
             let index = index as u32;
+            // The UART's TX pin is the only one this slice drives; the RX pin
+            // reads levels like every other I/O.
             if index == channel.tx_pin {
-                pins.push(stream_out(number, channel.baud));
-            } else if index == channel.rx_pin {
-                pins.push(stream_in(number, channel.baud));
+                pins.push(dig_out(number));
             } else {
                 pins.push(dig_in(number));
             }
@@ -949,6 +958,11 @@ impl P2EdgeModule {
         let mcu = McuComponent::builder(name)
             .serial_table(vec![channel])
             .bridge_serial(0)
+            // The UART crosses the card edge, an isolation barrier, a cable and
+            // two 47 ohm series resistors to reach the ADC — every one of them
+            // a thing that can only affect a signal that is actually on the
+            // net. So the channel carries levels, like the part at the far end.
+            .serial_on_levels()
             .build()
             .expect("the force-gauge channel is in the table and inside P63");
 
@@ -1400,7 +1414,7 @@ pub fn edge_registry_without_socket() -> PartRegistry {
         Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
     });
     registry.register("ISO6731DWR", |_decl| {
-        Box::new(SerialIsolator::new(FORCE_GAUGE_BAUD_HZ, LOGIC_RAIL_VOLTS))
+        Box::new(SerialIsolator::new(LOGIC_RAIL_VOLTS))
     });
 
     // Topology-only stubs.

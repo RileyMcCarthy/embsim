@@ -9,11 +9,28 @@
 //! ```text
 //!  net engine                        adapter                     protocol model
 //!  ──────────                        ───────                     ──────────────
-//!  RX pin 16  on_byte ──gate──► write(firmware_fd) ──► read(model_fd) protocol_loop
-//!  TX pin 15  stream_tx ◄─gate── pump thread ◄── read(firmware_fd) ◄── write(model_fd)
+//!  RX pin 16  on_sense ──deframe──► write(firmware_fd) ──► read(model_fd) loop
+//!  TX pin 15  bit clock ◄──frame─── engine wake ◄── read(firmware_fd) ◄── write
 //!  AIN0/AIN1  on_sense ──► V(AIN0) − V(AIN1) [mV] ──► set_voltage()
 //!  ~RESET / DVDD / AVDD  on_sense ──► power/reset gate (adapter-level)
 //! ```
+//!
+//! # The UART is on the net, not beside it
+//!
+//! Pins 15/16 carry **levels**, through the shared
+//! [`embsim_board::SerialLevelBridge`]: a byte leaves as a
+//! start bit, eight data bits and a stop bit at [`ADS122U04_BAUD_HZ`], and
+//! arrives the same way. They used to carry `StreamRole::Producer`/`Consumer`,
+//! where the net decided *reachability* and the payload never became a level —
+//! so a command could not be corrupted by a driver fighting it, and the chip's
+//! answer could not break on a wire that was also being driven by something
+//! else. On the DS2Addon, where `~RESET` ships on a one-pin net and the fix is
+//! a bodge wire, that distinction is the difference between modelling the
+//! bench and modelling a tidier board than the one that exists.
+//!
+//! It also lets the gate be **electrical**: an unpowered or held-in-reset chip
+//! releases TX to high-Z ([`SerialLevelBridge::set_output_enabled`]) instead of
+//! politely discarding bytes behind a line it is still driving.
 //!
 //! # Datasheet provenance
 //!
@@ -43,9 +60,10 @@
 //!   thread is untouched, per the adapter contract.
 //! - Floating/unsolvable analog inputs hold the last fed differential; the
 //!   datasheet floating-input noise policy is a later slice.
-//! - Baud-rate auto-detection is unmodeled in the protocol model, so the
-//!   stream pins declare the fixed rate the consuming firmware uses
-//!   ([`ADS122U04_BAUD_HZ`]).
+//! - Baud-rate auto-detection is unmodeled in the protocol model, so the UART
+//!   pins frame at the fixed rate the consuming firmware uses
+//!   ([`ADS122U04_BAUD_HZ`]). A peer at another rate now produces *framing
+//!   errors* rather than silently working, which is what real hardware does.
 //!
 //! # Slice note (deferred inversion)
 //!
@@ -57,11 +75,12 @@
 //! serial channels to stream pins in their wiring layer.
 
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use embsim_board::component::StreamTx;
+use embsim_board::uart::{FramingError, UartFraming};
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, StreamRole,
+    AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, SerialLevelBridge,
 };
 use tracing::{debug, trace, warn};
 
@@ -71,24 +90,19 @@ use crate::ads122u04::{Ads122u04, Config};
 // Pin facade (single source of truth)
 // ============================================================
 
-/// UART rate of the stream pins. The protocol model has no baud-rate
+/// UART rate of the TX/RX pins. The protocol model has no baud-rate
 /// auto-detection (a byte pipe has no sync-word timing to measure), so the
 /// facade pins the rate the consuming firmware runs the interface at.
 pub const ADS122U04_BAUD_HZ: u32 = 115_200;
 
-const NONE: Option<StreamRole> = None;
-
-const fn pin(
-    number: &'static str,
-    name: Option<&'static str>,
-    kind: PinKind,
-    stream: Option<StreamRole>,
-) -> PinDecl {
+const fn pin(number: &'static str, name: Option<&'static str>, kind: PinKind) -> PinDecl {
     PinDecl {
         number,
         name,
         kind,
-        stream,
+        // No stream role on any pin, TX and RX included: the UART is framed
+        // onto the net as levels, so there is no byte route to declare.
+        stream: None,
         drive_impedance: None,
     }
 }
@@ -101,37 +115,28 @@ const fn pin(
 /// build-time facades in the `embsim-board` regression tests — one table, so
 /// the analysis pass and the live component can never disagree on the pinout.
 pub const ADS122U04_PINS: [PinDecl; 16] = [
-    pin("1", Some("GPIO1"), PinKind::DigitalIn, NONE),
-    pin("2", Some("GPIO0"), PinKind::DigitalIn, NONE),
-    pin("3", Some("~RESET"), PinKind::DigitalIn, NONE),
-    pin("4", Some("DGND"), PinKind::PowerIn, NONE),
-    pin("5", Some("AVSS"), PinKind::PowerIn, NONE),
-    pin("6", Some("AIN3"), PinKind::Analog, NONE),
-    pin("7", Some("AIN2"), PinKind::Analog, NONE),
-    pin("8", Some("REFN"), PinKind::Analog, NONE),
-    pin("9", Some("REFP"), PinKind::Analog, NONE),
-    pin("10", Some("AIN1"), PinKind::Analog, NONE),
-    pin("11", Some("AIN0"), PinKind::Analog, NONE),
-    pin("12", Some("AVDD"), PinKind::PowerIn, NONE),
-    pin("13", Some("DVDD"), PinKind::PowerIn, NONE),
-    pin("14", Some("DRDY"), PinKind::DigitalIn, NONE),
-    pin(
-        "15",
-        Some("TX"),
-        PinKind::DigitalOut,
-        Some(StreamRole::Producer {
-            baud_hz: ADS122U04_BAUD_HZ,
-        }),
-    ),
-    pin(
-        "16",
-        Some("RX"),
-        PinKind::DigitalIn,
-        Some(StreamRole::Consumer {
-            baud_hz: ADS122U04_BAUD_HZ,
-        }),
-    ),
+    pin("1", Some("GPIO1"), PinKind::DigitalIn),
+    pin("2", Some("GPIO0"), PinKind::DigitalIn),
+    pin("3", Some("~RESET"), PinKind::DigitalIn),
+    pin("4", Some("DGND"), PinKind::PowerIn),
+    pin("5", Some("AVSS"), PinKind::PowerIn),
+    pin("6", Some("AIN3"), PinKind::Analog),
+    pin("7", Some("AIN2"), PinKind::Analog),
+    pin("8", Some("REFN"), PinKind::Analog),
+    pin("9", Some("REFP"), PinKind::Analog),
+    pin("10", Some("AIN1"), PinKind::Analog),
+    pin("11", Some("AIN0"), PinKind::Analog),
+    pin("12", Some("AVDD"), PinKind::PowerIn),
+    pin("13", Some("DVDD"), PinKind::PowerIn),
+    pin("14", Some("DRDY"), PinKind::DigitalIn),
+    pin("15", Some("TX"), PinKind::DigitalOut),
+    pin("16", Some("RX"), PinKind::DigitalIn),
 ];
+
+/// The framing the chip's UART uses: 8N1 at [`ADS122U04_BAUD_HZ`].
+pub fn ads122u04_framing() -> UartFraming {
+    UartFraming::new_8n1(ADS122U04_BAUD_HZ)
+}
 
 // ============================================================
 // Power/reset gate
@@ -200,6 +205,12 @@ impl Gate {
         let inputs = *self.inputs.lock().unwrap();
         supply_ok(inputs.dvdd) && supply_ok(inputs.avdd) && reset_high(inputs.reset, inputs.dvdd)
     }
+}
+
+/// Apply the gate to the chip's output driver: a dead part does not drive its
+/// TX pin, it releases it.
+fn regate_output(gate: &Gate, uart: &SerialLevelBridge) {
+    uart.set_output_enabled(gate.alive());
 }
 
 /// A supply rail counts as up when it is sourced at an operating voltage.
@@ -272,6 +283,8 @@ pub struct Ads122u04Component {
     /// Last numerically solved AIN0/AIN1 node voltages (V), for the
     /// differential feed.
     ain_volts: Arc<Mutex<[f64; 2]>>,
+    /// Set on drop, so a callback that outlives the component stops driving.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Ads122u04Component {
@@ -287,6 +300,7 @@ impl Ads122u04Component {
             firmware_fd: Arc::new(firmware_fd),
             gate: Arc::new(Gate::new()),
             ain_volts: Arc::new(Mutex::new([0.0; 2])),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -297,18 +311,33 @@ impl Component for Ads122u04Component {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        // -- the chip's UART, framed onto the net ----------------------
+        // Built first: the gate's sense callbacks fire at registration, and a
+        // gate transition has to be able to release the output driver.
+        let uart = Arc::new(SerialLevelBridge::new(
+            ads122u04_framing(),
+            io.pin("TX")?,
+            io.clone(),
+            Arc::clone(&self.shutdown),
+        ));
+        // Dead until the engine says otherwise: the chip is not driving TX
+        // before its supplies resolve, and a peer must see high-Z rather than
+        // an idle line it can mistake for a powered part.
+        uart.set_output_enabled(false);
+        uart.idle();
+
         // -- power/reset gate ------------------------------------------
-        {
+        for (pin, set) in [
+            ("~RESET", Gate::set_reset as fn(&Gate, NetState)),
+            ("DVDD", Gate::set_dvdd),
+            ("AVDD", Gate::set_avdd),
+        ] {
             let gate = Arc::clone(&self.gate);
-            io.on_sense("~RESET", move |state| gate.set_reset(state))?;
-        }
-        {
-            let gate = Arc::clone(&self.gate);
-            io.on_sense("DVDD", move |state| gate.set_dvdd(state))?;
-        }
-        {
-            let gate = Arc::clone(&self.gate);
-            io.on_sense("AVDD", move |state| gate.set_avdd(state))?;
+            let uart = Arc::clone(&uart);
+            io.on_sense(pin, move |state| {
+                set(&gate, state);
+                regate_output(&gate, &uart);
+            })?;
         }
 
         // -- differential analog input ---------------------------------
@@ -338,30 +367,39 @@ impl Component for Ads122u04Component {
             })?;
         }
 
-        // -- streams ----------------------------------------------------
-        // RX pin → firmware-side pipe end (the protocol thread reads the
-        // other end); gated so an unpowered / held-in-reset chip never sees
-        // the command stream.
+        // -- RX: edges on pin 16 → bytes → firmware-side pipe end -------
+        // Gated so an unpowered / held-in-reset chip never sees the command
+        // stream. The deframer keeps running either way: a command that
+        // arrives while the part is dead is *lost*, not queued, which is the
+        // bench symptom (perfect commands in, silence out).
         {
             let gate = Arc::clone(&self.gate);
             let fd = Arc::clone(&self.firmware_fd);
-            io.on_byte("RX", move |byte| {
-                if gate.alive() {
-                    write_all(fd.as_fd(), &[byte]);
-                } else {
-                    trace!(byte, "ADS122U04: RX byte ignored (unpowered or in reset)");
-                }
+            let uart = Arc::clone(&uart);
+            io.on_sense("RX", move |state| {
+                deliver_rx(&fd, &gate, uart.receive_sense(state));
             })?;
         }
-        // Model output → TX pin, drained on an engine wakeup. The whole
-        // callback runs on the engine thread; `drain_model_output` never
-        // blocks (the socketpair is non-blocking), so it cannot stall the
-        // engine, and in stepped mode its cadence is exact.
-        let tx = io.stream_tx("TX")?;
+
+        // -- TX: model output → bytes → edges on pin 15 -----------------
+        // Drained on an engine wakeup. The whole callback runs on the engine
+        // thread; `drain_model_output` never blocks (the socketpair is
+        // non-blocking), so it cannot stall the engine, and in stepped mode
+        // its cadence is exact.
         {
             let fd = Arc::clone(&self.firmware_fd);
             let gate = Arc::clone(&self.gate);
-            io.on_wake(move |_now_us| drain_model_output(&fd, &tx, &gate));
+            let uart = Arc::clone(&uart);
+            io.on_wake_ns(move |now_ns| {
+                let out = drain_model_output(&fd, &gate);
+                if !out.is_empty() {
+                    uart.transmit(&out);
+                }
+                // One handler for both directions: it clocks the next TX bit
+                // and closes any RX frame whose tail carried no transition.
+                // The bridge arms its own next wake.
+                deliver_rx(&fd, &gate, uart.service(now_ns));
+            });
         }
         // A periodic wheel entry rather than a thread: idle components cost
         // nothing, and the cadence belongs to the engine (`BOARD_ENGINE.md`,
@@ -369,13 +407,20 @@ impl Component for Ads122u04Component {
         // build-analysis path this is traced and dropped, which is strictly
         // better than the pump thread it replaces — that one was spawned by
         // `System::build` too, and outlived it.
-        io.schedule_every(PUMP_POLL_VIRTUAL_US);
+        //
+        // The bit clock rides the *same* handler on its own one-shot wakes, so
+        // this cadence only has to be fine enough to notice new model output;
+        // it does not have to resolve a bit.
+        io.schedule_every_ns(PUMP_POLL_VIRTUAL_US * 1_000);
         Ok(())
     }
 }
 
 impl Drop for Ads122u04Component {
     fn drop(&mut self) {
+        // Stop the UART bridge before the FDs go: a wake callback the engine
+        // has not yet dropped must be inert, not driving a dead pin.
+        self.shutdown.store(true, Ordering::Relaxed);
         // Dropping `firmware_fd` closes the pipe end once the engine has
         // dropped its wake callback (SystemHandle joins the engine *before* it
         // drops components — the documented drop order). The model's protocol
@@ -401,13 +446,14 @@ pub const PUMP_POLL_VIRTUAL_US: u64 = 250;
 const DRAIN_MAX_BYTES_PER_WAKE: usize = 4096;
 
 /// Drain whatever the model has emitted (readable on the firmware-side pipe
-/// end) onto the TX pin, gated exactly like RX — a dead chip's output never
-/// reaches the wire, and bytes produced while gated are discarded (not spooled
-/// for a later power-up).
+/// end), gated exactly like RX — a dead chip's output never reaches the wire,
+/// and bytes produced while gated are discarded, not spooled for a later
+/// power-up.
 ///
-/// Runs on the **engine thread**. `tx.write` enqueues rather than delivering
-/// inline, so this is re-entrancy-safe by the engine's own contract.
-fn drain_model_output(fd: &OwnedFd, tx: &StreamTx, gate: &Gate) {
+/// Runs on the **engine thread**, and never blocks: the socketpair is
+/// non-blocking, so this cannot stall the engine.
+fn drain_model_output(fd: &OwnedFd, gate: &Gate) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut buf = [0u8; 64];
     let mut drained = 0usize;
     while drained < DRAIN_MAX_BYTES_PER_WAKE {
@@ -416,7 +462,7 @@ fn drain_model_output(fd: &OwnedFd, tx: &StreamTx, gate: &Gate) {
             Ok(n) => {
                 drained += n;
                 if gate.alive() {
-                    tx.write(&buf[..n]);
+                    out.extend_from_slice(&buf[..n]);
                 } else {
                     trace!(
                         discarded = n,
@@ -429,6 +475,30 @@ fn drain_model_output(fd: &OwnedFd, tx: &StreamTx, gate: &Gate) {
                 warn!("ADS122U04: model read error: {e}");
                 break;
             }
+        }
+    }
+    out
+}
+
+/// Hand deframed commands to the model, gated.
+///
+/// A frame that did not decode is dropped with a trace rather than passed on:
+/// the chip's shift register hands its command decoder bytes, not framing
+/// errors. A run of them means the wire was contended or the peer's baud rate
+/// disagrees — which is exactly what this path exists to be able to say.
+fn deliver_rx(
+    fd: &OwnedFd,
+    gate: &Gate,
+    frames: impl IntoIterator<Item = Result<u8, FramingError>>,
+) {
+    for frame in frames {
+        match frame {
+            Ok(byte) if gate.alive() => write_all(fd.as_fd(), &[byte]),
+            Ok(byte) => trace!(byte, "ADS122U04: RX byte ignored (unpowered or in reset)"),
+            Err(error) => trace!(
+                ?error,
+                "ADS122U04: RX frame dropped (bad framing on the wire)"
+            ),
         }
     }
 }
@@ -533,27 +603,41 @@ mod tests {
         assert!(!gate_with(NetState::Analog(2.3), ANALOG_3V3, ANALOG_3V3).alive());
     }
 
-    /// The shared pin table stays the SBAS752B p.3 truth: 16 pins, UART
-    /// stream roles on TX (15, producer) and RX (16, consumer) only.
+    /// The shared pin table stays the SBAS752B p.3 truth: 16 pins, and the
+    /// UART is a pair of plain digital pins. No pin declares a byte route —
+    /// TX and RX carry levels, so there is nothing for the engine to route.
     #[rstest]
-    fn pin_table_declares_the_uart_stream_pins() {
+    fn the_uart_pins_are_plain_digital_pins() {
         assert_eq!(ADS122U04_PINS.len(), 16);
         for decl in &ADS122U04_PINS {
-            match decl.number {
-                "15" => assert_eq!(
-                    decl.stream,
-                    Some(StreamRole::Producer {
-                        baud_hz: ADS122U04_BAUD_HZ
-                    })
-                ),
-                "16" => assert_eq!(
-                    decl.stream,
-                    Some(StreamRole::Consumer {
-                        baud_hz: ADS122U04_BAUD_HZ
-                    })
-                ),
-                _ => assert_eq!(decl.stream, None, "pin {} must not stream", decl.number),
-            }
+            assert_eq!(
+                decl.stream, None,
+                "pin {} must not declare a byte route",
+                decl.number
+            );
         }
+        let tx = ADS122U04_PINS
+            .iter()
+            .find(|p| p.number == "15")
+            .expect("TX declared");
+        assert_eq!(tx.kind, PinKind::DigitalOut);
+        let rx = ADS122U04_PINS
+            .iter()
+            .find(|p| p.number == "16")
+            .expect("RX declared");
+        assert_eq!(rx.kind, PinKind::DigitalIn);
+    }
+
+    /// The framing is 8N1 at the rate the firmware runs the interface at.
+    #[rstest]
+    fn the_framing_matches_the_declared_baud() {
+        let framing = ads122u04_framing();
+        assert_eq!(framing.data_bits, 8);
+        assert_eq!(framing.stop_bits, 1);
+        assert!(framing.lsb_first);
+        assert_eq!(
+            framing.bit_period_ns,
+            1_000_000_000 / u64::from(ADS122U04_BAUD_HZ)
+        );
     }
 }
