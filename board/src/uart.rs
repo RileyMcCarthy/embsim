@@ -66,6 +66,27 @@ impl UartFraming {
     pub fn frame_ns(&self) -> u64 {
         self.frame_bits() as u64 * self.bit_period_ns
     }
+
+    /// When a receiver may consider the frame complete and start looking for
+    /// the next start bit: the **midpoint of the stop bit**.
+    ///
+    /// Not the end of the frame. A receiver that waits for the full nominal
+    /// frame before accepting another start bit cannot talk to a sender that
+    /// is even marginally fast — the next start bit arrives *before* the
+    /// deadline, gets absorbed into the frame in progress, and the stream
+    /// desynchronizes permanently with no way back.
+    ///
+    /// This is not a hypothetical. A P2 smart pin programmed for 115'200 baud
+    /// at `clkfreq = 160 MHz` actually clocks 115'273 — 0.06 % fast, a rate
+    /// any real UART accepts without noticing. Against a full-frame deadline
+    /// its second byte was swallowed by its first, and the ADS122U04 model
+    /// read the protocol's `0x55` sync byte as register data.
+    ///
+    /// Sampling mid-stop-bit is what real hardware does, and it buys the
+    /// standard half-bit of tolerance in both directions.
+    pub fn stop_sampled_ns(&self) -> u64 {
+        self.frame_ns() - self.bit_period_ns / 2
+    }
 }
 
 /// A frame that did not decode.
@@ -163,7 +184,8 @@ impl UartDecoder {
             return;
         }
         if let Some(start) = self.frame_start_ns {
-            if at_ns >= start + self.framing.frame_ns() {
+            // Mid-stop-bit, not end-of-frame: see `stop_sampled_ns`.
+            if at_ns >= start + self.framing.stop_sampled_ns() {
                 self.close_frame(start);
             } else {
                 self.absorb_until(at_ns);
@@ -202,6 +224,8 @@ impl UartDecoder {
     /// Advance virtual time and take the next decoded frame, if any.
     pub fn poll(&mut self, now_ns: u64) -> Option<Result<u8, FramingError>> {
         if let Some(start) = self.frame_start_ns {
+            // The idle-tail case: no transition is coming, so wait out the
+            // whole frame rather than closing half a bit early.
             if now_ns.saturating_sub(start) >= self.framing.frame_ns() {
                 self.close_frame(start);
             }
@@ -268,6 +292,16 @@ impl UartDecoder {
         if stops_ok {
             Ok(byte)
         } else {
+            // The owner drops the frame, and the driver waiting for that byte
+            // sees a *timeout* rather than a corruption — so without the bits
+            // here there is nothing to diagnose from. This only fires on a
+            // frame that is already lost.
+            tracing::warn!(
+                bits = ?self.bits,
+                want_bits = self.framing.frame_bits() - 1,
+                bit_period_ns = self.framing.bit_period_ns,
+                "uart: stop bit low, frame dropped"
+            );
             Err(FramingError::BadStopBit)
         }
     }
@@ -285,6 +319,61 @@ mod tests {
             t += hold;
         }
         t
+    }
+
+    /// A sender a fraction fast, talking to a receiver at the nominal rate,
+    /// with no gap between bytes.
+    ///
+    /// This is the real case: a P2 smart pin asked for 115'200 baud at
+    /// `clkfreq = 160 MHz` clocks **115'273**. Integer bit periods make the
+    /// sender's frame 86'750 ns against the receiver's 86'800 — so the second
+    /// byte's start bit lands 50 ns *before* a full-frame deadline would
+    /// expire. A receiver that waits that long swallows it, and never
+    /// resynchronizes: the ADS122U04 model read the `0x55` sync byte as
+    /// register data and the force gauge never came up.
+    #[test]
+    fn a_marginally_fast_sender_still_frames_back_to_back_bytes() {
+        let fast = UartFraming::new_8n1(115_273);
+        let nominal = UartFraming::new_8n1(115_200);
+        assert!(
+            fast.frame_ns() < nominal.frame_ns(),
+            "the premise: the sender's frame is shorter ({} < {})",
+            fast.frame_ns(),
+            nominal.frame_ns()
+        );
+
+        let mut dec = UartDecoder::new(nominal);
+        let mut t = 1_000_000;
+        // Back to back, exactly as a burst arrives — no idle between them.
+        for byte in [0x55u8, 0x40, 0x0E] {
+            t = play(&mut dec, fast, byte, t);
+        }
+        let mut got = Vec::new();
+        while let Some(frame) = dec.poll(t + nominal.frame_ns()) {
+            got.push(frame.expect("every byte must frame cleanly"));
+        }
+        assert_eq!(
+            got,
+            vec![0x55, 0x40, 0x0E],
+            "a 0.06% fast sender is well inside any real UART's tolerance"
+        );
+    }
+
+    /// The tolerance is symmetric: a marginally *slow* sender must also frame.
+    #[test]
+    fn a_marginally_slow_sender_still_frames_back_to_back_bytes() {
+        let slow = UartFraming::new_8n1(115_000);
+        let nominal = UartFraming::new_8n1(115_200);
+        let mut dec = UartDecoder::new(nominal);
+        let mut t = 1_000_000;
+        for byte in [0xA5u8, 0x3C] {
+            t = play(&mut dec, slow, byte, t);
+        }
+        let mut got = Vec::new();
+        while let Some(frame) = dec.poll(t + nominal.frame_ns()) {
+            got.push(frame.expect("every byte must frame cleanly"));
+        }
+        assert_eq!(got, vec![0xA5, 0x3C]);
     }
 
     fn round_trip(framing: UartFraming, byte: u8) -> Option<Result<u8, FramingError>> {

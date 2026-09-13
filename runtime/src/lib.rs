@@ -342,6 +342,15 @@ impl Emulator {
 
         // 1. Virtual clock first — every timer/serial call depends on it.
         virtual_clock::init(clock_speed, platform.clock_freq_hz());
+        // ...and claim time with it. Models spawn clock actors in their own
+        // constructors (the ADS122U04's protocol loop is spawned by
+        // `Ads122u04::new`), and a parked actor with nobody in authority
+        // advances the clock itself to its own deadline — 250 µs a turn, for
+        // as long as the rest of assembly takes on the WALL clock. The run's
+        // time origin then depended on how long startup happened to take,
+        // which is not a property a deterministic simulation may have. The
+        // hold is a counter, so the engine's own hold nests inside it.
+        let _time = virtual_clock::take_time_authority();
 
         // 2. Size peripherals from the machine's firmware-derived counts,
         //    validating each against its backing array's hard ceiling.

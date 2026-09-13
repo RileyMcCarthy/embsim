@@ -227,6 +227,14 @@ impl SerialLevelBridge {
         shed
     }
 
+    /// Bytes [`transmit`](Self::transmit) would accept right now without
+    /// shedding. A caller that reads from a socket can read no more than
+    /// this and leave the rest where the peer's flow control will see it.
+    pub fn tx_room(&self) -> usize {
+        let tx = self.tx.lock().expect("tx state never poisoned");
+        TX_QUEUE_MAX.saturating_sub(tx.pending.len())
+    }
+
     /// Feed one observed net state to the receiver and arm the frame deadline.
     ///
     /// A state with no logic level ([`NetState::Floating`] /
@@ -315,6 +323,21 @@ impl SerialLevelBridge {
         // Advance on the frame's own grid, not from `now`: a wake delivered
         // late must not stretch the bit period, or the byte arrives as a
         // different byte at the far end.
+        //
+        // Keeping the *schedule* on the grid is not enough on its own, though:
+        // the receiver measures the intervals it actually observes, so a bit
+        // driven late is a bit the far end times wrongly however the next one
+        // is scheduled. A whole bit period of lateness shifts the frame, and
+        // the receiver locks onto the following bit as its start — which
+        // decodes an all-zero byte as `$80` with a low stop bit. Say so; on a
+        // punctual engine this never fires.
+        if now_ns > due + self.framing.bit_period_ns {
+            tracing::warn!(
+                late_ns = now_ns - due,
+                bit_period_ns = self.framing.bit_period_ns,
+                "uart tx: bit wake delivered over a bit period late"
+            );
+        }
         let next = due + self.framing.bit_period_ns;
         tx.next_edge_ns = Some(next);
         drop(tx);

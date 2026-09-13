@@ -747,7 +747,7 @@ mod tests {
         crate::access::take_count();
         setup(1);
         let t_inject = embsim_core::virtual_clock::virtual_us() + 1_000;
-        std::thread::spawn(move || {
+        let injector = std::thread::spawn(move || {
             embsim_core::virtual_clock::wait_until(t_inject);
             write_host_rx(0, b"K");
         });
@@ -757,6 +757,10 @@ mod tests {
             "byte must arrive by the virtual deadline"
         );
         assert_eq!(buf[0], b'K');
+        // Join before releasing the suite lock. The clock is process-global
+        // and so is channel 0: a straggler still parked on `wait_until` wakes
+        // inside whichever test runs next and writes `K` into *its* FIFO.
+        injector.join().expect("the injector thread finishes");
     }
 
     #[rstest]
@@ -1007,12 +1011,16 @@ mod tests {
         assert_eq!(pair.read_far(1), b"x");
     }
 
-    /// Paced TX of `N` bytes at baud `B` with `F` frame bits must block for
-    /// approximately `N * F * 1e6 / B` virtual microseconds (scale 1.0 ⇒ wall).
+    /// Paced TX of `N` bytes at baud `B` with `F` frame bits must charge
+    /// `N * F * 1e6 / B` **virtual** microseconds to the clock.
     ///
-    /// We assert a lower bound of 50% of the theoretical cost (scheduler slack
-    /// can only make sleeps shorter under load, never invent free time) and a
-    /// generous upper bound so CI hosts with jitter still pass.
+    /// Virtual, not wall: what a consumer depends on is that a byte costs its
+    /// wire time on the simulated clock. Wall pacing is a separate, run-level
+    /// property — the pacer holds a *run* to `scale`, and sleeps nothing when
+    /// the run is already behind — so a single call's wall duration says
+    /// nothing (this test used to assert it, and passed only because the old
+    /// pacer slept after every jump regardless of how far behind it was).
+    /// The wall bound kept here is an upper one: pacing must not *add* time.
     #[rstest]
     #[case::ten_kbaud_2b(10_000, 10, 2, 2_000)]
     #[case::twenty_kbaud_5b(20_000, 10, 5, 2_500)]
@@ -1031,15 +1039,17 @@ mod tests {
         set_baud(0, baud);
 
         let payload = vec![0xA5u8; nbytes];
+        let v0 = embsim_core::virtual_clock::virtual_us();
         let t0 = std::time::Instant::now();
         transmit_data(0, &payload);
+        let virtual_us = embsim_core::virtual_clock::virtual_us() - v0;
         let wall_us = t0.elapsed().as_micros() as u64;
 
         assert_eq!(pair.read_far(nbytes), payload.as_slice());
         assert!(
-            wall_us >= expected_v_us / 2,
-            "paced TX too fast: wall={wall_us}us expected≥{}us (baud={baud} F={frame_bits} N={nbytes})",
-            expected_v_us / 2
+            virtual_us >= expected_v_us,
+            "paced TX charged too little: virtual={virtual_us}us expected≥{expected_v_us}us \
+             (baud={baud} F={frame_bits} N={nbytes})"
         );
         assert!(
             wall_us <= expected_v_us.saturating_mul(8).saturating_add(20_000),
@@ -1049,7 +1059,9 @@ mod tests {
     }
 
     /// RX pacing is independent of TX (full duplex): a paced receive after a
-    /// paced transmit still delivers the byte and incurs its own schedule cost.
+    /// paced transmit still delivers the byte and charges its own wire time to
+    /// the clock (virtual, not wall — see
+    /// [`paced_tx_blocks_for_expected_virtual_us`]).
     #[rstest]
     fn paced_rx_is_independent_full_duplex() {
         let _g = crate::test_support::guard();
@@ -1060,18 +1072,18 @@ mod tests {
         set_baud(0, 50_000); // 200 us/byte — measurable but snappy
 
         // TX half: one byte.
-        let t_tx = std::time::Instant::now();
+        let v_tx = embsim_core::virtual_clock::virtual_us();
         transmit_data(0, b"T");
-        let tx_us = t_tx.elapsed().as_micros() as u64;
+        let tx_us = embsim_core::virtual_clock::virtual_us() - v_tx;
         assert_eq!(pair.read_far(1), b"T");
-        assert!(tx_us >= 100, "TX half should sleep ~200us, got {tx_us}");
+        assert!(tx_us >= 200, "TX half should charge ~200us, got {tx_us}");
 
         // RX half: one byte from the far end.
         pair.write_far(b"R");
-        let t_rx = std::time::Instant::now();
+        let v_rx = embsim_core::virtual_clock::virtual_us();
         assert_eq!(receive_byte(0), Some(b'R'));
-        let rx_us = t_rx.elapsed().as_micros() as u64;
-        assert!(rx_us >= 100, "RX half should sleep ~200us, got {rx_us}");
+        let rx_us = embsim_core::virtual_clock::virtual_us() - v_rx;
+        assert!(rx_us >= 200, "RX half should charge ~200us, got {rx_us}");
     }
 
     /// Frame-bits / baud matrix: bytes always land intact under pacing.

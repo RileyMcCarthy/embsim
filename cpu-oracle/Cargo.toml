@@ -1,0 +1,15 @@
+[package]
+name = "embsim-cpu-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ISS-vs-silicon golden records: parse, diff, and replay helpers"
+keywords = ["embedded", "emulator", "isa", "sil"]
+categories = ["embedded", "simulation"]
+
+[dependencies]
+
+[dev-dependencies]
+rstest.workspace = true

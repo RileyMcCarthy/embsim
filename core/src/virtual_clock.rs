@@ -11,9 +11,12 @@
 //!
 //! `virtual_ns` is never wall time. The engine (or an idle jump when nobody
 //! holds [`TimeAuthority`]) is the only thing that increases it, via
-//! [`advance_to`]. Optional **wall pacing** sleeps *after* a jump so a
-//! playground at `--speed 1` still feels real-time; tests use `speed <= 0`
-//! so jumps are instant and deterministic.
+//! [`advance_to`]. Optional **wall pacing** holds a jump back so a playground
+//! at `--speed 1` still feels real-time; tests use `speed <= 0` so jumps are
+//! instant and deterministic. Pacing is a *deadline*, not a sleep per jump:
+//! it sleeps only while the run is ahead of the wall time its virtual span
+//! is worth, so a run made of nanosecond-scale jumps (a 20 MHz bus clock)
+//! does not pay the kernel's sleep granularity on every edge.
 //!
 //! # Waiting
 //!
@@ -85,6 +88,21 @@ use std::time::{Duration, Instant};
 /// **unpaced** (tests / CI): jumps are instant.
 static SCALE_NUMER: AtomicU64 = AtomicU64::new(0);
 static SCALE_DENOM: AtomicU64 = AtomicU64::new(1);
+/// Wall pacing anchor: a wall instant paired with the virtual instant it was
+/// taken at. A paced advance sleeps only until `wall + (now - v) / scale`,
+/// never a fixed amount per jump: sleeping `dt / scale` after *every* jump
+/// charged the kernel's sleep granularity (tens of µs) to each nanosecond-
+/// scale jump, and kept charging it while the run was already far behind --
+/// an SD burst clocked at 20 MHz spent 70% of the engine thread asleep.
+/// Reset by [`set_scale`]; re-anchored when the run falls more than
+/// [`PACE_SLACK`] behind, so a slow stretch does not bank a deficit the run
+/// would then repay by sprinting past `scale`.
+static PACE_ANCHOR: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+/// How far behind its wall deadline a paced run may fall before the anchor
+/// moves up to it.
+const PACE_SLACK: Duration = Duration::from_millis(100);
+/// Being ahead by less than this is not worth a sleep syscall.
+const PACE_MIN_SLEEP: Duration = Duration::from_micros(50);
 
 /// Simulated clock frequency in Hz, supplied per-MCU by `init`.
 ///
@@ -192,12 +210,22 @@ pub fn set_scale(scale: f64) {
     if scale <= 0.0 {
         SCALE_NUMER.store(0, Ordering::Relaxed);
         SCALE_DENOM.store(1, Ordering::Relaxed);
+        *PACE_ANCHOR
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         return;
     }
     let precision = 1000u64;
     let numer = (scale * precision as f64) as u64;
     SCALE_NUMER.store(numer.max(1), Ordering::Relaxed);
     SCALE_DENOM.store(precision, Ordering::Relaxed);
+    // Anchor here, not on the first advance: the first jump after `init` is
+    // already paced against this instant, so a wait issued right afterwards
+    // parks for its whole scaled span rather than returning at once.
+    *PACE_ANCHOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Instant::now(), NOW_NS.load(Ordering::Relaxed)));
 }
 
 /// True once `init` has run in this process.
@@ -279,8 +307,37 @@ fn park_wall_us(wall_us: u64) {
     park_wall_ns(wall_us.saturating_mul(1_000));
 }
 
-fn apply_pace(dt_virtual_ns: u64) {
-    park_wall_ns(virtual_to_wall_ns(dt_virtual_ns));
+/// Pace a paced run against the wall clock after an advance: sleep only for
+/// as long as the run is *ahead* of `anchor + elapsed_virtual / scale` (see
+/// [`PACE_ANCHOR`]). A run that is behind never sleeps; one that has fallen
+/// more than [`PACE_SLACK`] behind is re-anchored to that distance.
+fn apply_pace() {
+    if is_unpaced() {
+        return;
+    }
+    let now_v = NOW_NS.load(Ordering::Relaxed);
+    let now_w = Instant::now();
+    let mut anchor = PACE_ANCHOR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some((wall0, v0)) = *anchor else {
+        *anchor = Some((now_w, now_v));
+        return;
+    };
+    let target = wall0 + Duration::from_nanos(virtual_to_wall_ns(now_v.saturating_sub(v0)));
+    match target.checked_duration_since(now_w) {
+        Some(ahead) => {
+            if ahead >= PACE_MIN_SLEEP {
+                drop(anchor);
+                park_wall_ns(ahead.as_nanos() as u64);
+            }
+        }
+        None => {
+            if now_w.duration_since(target) > PACE_SLACK {
+                *anchor = Some((now_w - PACE_SLACK, now_v));
+            }
+        }
+    }
 }
 
 /// How many real sleeps have been served while the clock was stepped — the
@@ -659,7 +716,6 @@ pub fn advance_to_ns(v_ns: u64) -> Result<(), AdvanceError> {
             requested_ns: v_ns,
         });
     }
-    let dt = v_ns - sched.now_ns;
     sched.now_ns = v_ns;
     NOW_NS.store(v_ns, Ordering::Relaxed);
 
@@ -683,8 +739,17 @@ pub fn advance_to_ns(v_ns: u64) -> Result<(), AdvanceError> {
         }
     }
     drop(sched);
+    // Unconditionally, even though most advances release nobody: a bus clock
+    // stops virtual time at every edge, so this broadcast wakes every parked
+    // actor thread twice per bit to do nothing, and skipping it when `due` is
+    // empty is an obvious-looking optimisation. It was measured: no
+    // throughput change at all (the co-simulation SD phase held 0.021x both
+    // ways), and the full embsim suite went from 4/4 green to flaking one
+    // timing-sensitive test per run or two. Some waiter depends on a
+    // broadcast it is not the registered owner of; until that is understood,
+    // the broadcast stays.
     ADVANCED.notify_all();
-    apply_pace(dt);
+    apply_pace();
     Ok(())
 }
 
@@ -858,6 +923,45 @@ mod tests {
         assert_eq!(virtual_to_wall_us(7), 0);
         set_scale(1.0);
         assert_eq!(virtual_to_wall_us(1000), 1000);
+    }
+
+    /// Pacing is a deadline, not a sleep per jump: a run that is behind the
+    /// wall clock never sleeps, however many tiny jumps it makes. (Per-jump
+    /// sleeping charged the kernel's sleep granularity to every 25 ns edge.)
+    #[rstest]
+    fn paced_run_that_is_behind_never_sleeps() {
+        let _g = lock_or_recover();
+        init(1.0, 1_000_000);
+        let start = Instant::now();
+        // Burn more wall time than the virtual span so the run is behind.
+        std::thread::sleep(Duration::from_millis(5));
+        let mut now = 0u64;
+        for _ in 0..5_000 {
+            now += 25;
+            advance_to_ns(now).expect("forward");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(60),
+            "5000 paced 25 ns jumps while behind took {elapsed:?}"
+        );
+        set_scale(0.0);
+    }
+
+    /// ...and a run that is ahead does sleep, to the scale.
+    #[rstest]
+    fn paced_run_that_is_ahead_sleeps_to_the_scale() {
+        let _g = lock_or_recover();
+        init(1.0, 1_000_000);
+        advance_to_ns(1).expect("anchor");
+        let start = Instant::now();
+        advance_to_ns(60_000_000).expect("forward"); // 60 virtual ms
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "a 60 ms virtual jump at 1x paced only {elapsed:?}"
+        );
+        set_scale(0.0);
     }
 
     /// `virtual_to_wall_us(0)` is always 0 regardless of scale (no wait → no

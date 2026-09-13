@@ -42,6 +42,7 @@ Per-crate iteration:
 cargo test -p embsim-core
 cargo test -p embsim-peripherals
 cargo test -p embsim-models
+cargo test -p embsim-qemu            # QEMU node; the real-QEMU case skips loudly without qemu-system-aarch64
 cargo test -p embsim-runtime
 cargo test -p embsim-board
 cargo test -p embsim-p2
@@ -50,6 +51,7 @@ cargo test -p embsim-trace
 cargo test -p embsim-ui
 cargo test -p embsim-build
 cargo test -p embsim-minimal-example
+cargo test -p embsim-cpu-oracle          # ISS-vs-silicon golden parse/diff
 ```
 
 Coverage (requires `cargo-llvm-cov`):

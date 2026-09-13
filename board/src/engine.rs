@@ -135,6 +135,26 @@ pub(crate) const DEFAULT_HIGH_LEVEL_VOLTS: Volts = 3.3;
 /// can keep `try_recv` non-empty forever; without a cap, time never jumps.
 const COMMAND_DRAIN_BATCH_MAX: usize = 64;
 
+/// How many consecutive *capped* drain passes may happen at one instant before
+/// the engine gives up and lets time advance with commands still queued.
+///
+/// The cap above bounds work per pass, which is what keeps the wheel
+/// responsive. Letting time advance the moment a single pass fills up is a
+/// different thing, and it is wrong: the commands left behind were issued for
+/// the instant being abandoned, and they get applied at the next one instead.
+/// A drive that lands a whole bit period late reframes a UART byte — the
+/// receiver locks onto the following bit as its start, an all-zero byte
+/// decodes as `$80` with a low stop bit, and the driver waiting for it reports
+/// a timeout rather than a corruption. That is what a quadrature encoder does
+/// to a force-gauge link on the same engine: at 8192 counts/mm and 38 mm/s it
+/// walks ~311 counts per millisecond observe and publishes a drive per changed
+/// channel, so every burst is many times the cap.
+///
+/// So drain the burst out at the instant it belongs to, and keep the escape
+/// hatch for a producer that really never stops: 64 passes is ~4096 commands,
+/// comfortably past any one instant's burst here and still a bound.
+const COMMAND_DRAIN_CAPPED_PASSES_MAX: usize = 64;
+
 /// Stepped mode: how long the engine waits for every registered actor to park
 /// before declaring the barrier wedged
 /// ([`virtual_clock::await_quiescence`] → [`Finding::QuiescenceTimeout`]).
@@ -503,6 +523,95 @@ pub(crate) struct Resolver {
     streams: Vec<StreamPin>,
     /// Scenario `stream_drop` byte-loss policies per endpoint.
     net_count: usize,
+    /// Everything about the board that does not change between drives —
+    /// clusters, roots, path resistances — derived once per topology and
+    /// reused by every pass. `None` until the first pass builds it.
+    topology: Option<Topology>,
+    /// Bumped by every topology-changing input, so a cache built against an
+    /// older board is never trusted.
+    topology_version: u64,
+    /// Dense cluster ids whose drive table changed since the last pass.
+    dirty: Vec<usize>,
+}
+
+/// Drive-independent structure of a board, derived once per topology.
+struct Topology {
+    /// [`Resolver::topology_version`] this was built against.
+    version: u64,
+    /// Net count it was built for.
+    n: usize,
+    /// Identity root of every net.
+    root_of: Vec<usize>,
+    /// Dense conduction-cluster id of every net.
+    cluster_index: Vec<usize>,
+    /// Clusters in ascending cluster-root order.
+    clusters: Vec<ClusterTopo>,
+}
+
+/// One conduction cluster's members, in the orders the pass iterates them.
+struct ClusterTopo {
+    /// Member nets, ascending.
+    nets: Vec<usize>,
+    /// Member identity roots (nets that are their own root), ascending.
+    roots: Vec<usize>,
+    /// Identity-collapsed conduction edges within the cluster, in
+    /// declaration order.
+    edges: Vec<(usize, usize, f64)>,
+    /// Sum of the cluster's declared edge resistances (the `Pulled` bound).
+    edge_total_ohms: f64,
+    /// Drive-capable endpoints in the cluster, ascending.
+    slots: Vec<usize>,
+    /// Power-rail sources in the cluster as `(root, volts)`, in declaration order.
+    power: Vec<(usize, Volts)>,
+    /// `net_stuck` sources in the cluster as `(root, volts)`, in declaration order.
+    stuck: Vec<(usize, Volts)>,
+    /// Digital sense pins in the cluster as `(registration position, net)`.
+    digital_senses: Vec<(usize, usize)>,
+    /// Analog sense pins in the cluster as `(registration position, net)`.
+    analog_senses: Vec<(usize, usize)>,
+    /// Power sense pins in the cluster as `(registration position, net)`.
+    power_senses: Vec<(usize, usize)>,
+    /// Minimum series resistance between roots, `roots.len()` square,
+    /// row-major by position in `roots`; `INFINITY` where no path exists.
+    dist: Vec<f64>,
+}
+
+/// Findings of one pass, each with the key that orders it the way a full
+/// walk of the board would have reported it (contention by first net index,
+/// floating senses by kind then registration, power senses by
+/// registration), so a pass over any subset of clusters reports in the same
+/// relative order as a pass over all of them.
+#[derive(Default)]
+struct PassFindings {
+    contention: Vec<(usize, Finding)>,
+    floating: Vec<((usize, usize), Finding)>,
+    power: Vec<(usize, Finding)>,
+}
+
+impl PassFindings {
+    fn emit(mut self, diagnostics: &mut Diagnostics) {
+        self.contention.sort_by_key(|(key, _)| *key);
+        self.floating.sort_by_key(|(key, _)| *key);
+        self.power.sort_by_key(|(key, _)| *key);
+        let contention = self.contention.into_iter().map(|(_, f)| f);
+        let floating = self.floating.into_iter().map(|(_, f)| f);
+        let power = self.power.into_iter().map(|(_, f)| f);
+        for finding in contention.chain(floating).chain(power) {
+            diagnostics.report(finding);
+        }
+    }
+}
+
+/// Whether two drive contributions are the same (bitwise on the voltages,
+/// so `NaN` compares equal to itself and a re-driven rail is a no-op).
+fn same_drive(a: &Option<TheveninDrive>, b: &Option<TheveninDrive>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.volts.total_cmp(&y.volts).is_eq() && x.impedance.total_cmp(&y.impedance).is_eq()
+        }
+        _ => false,
+    }
 }
 
 impl Resolver {
@@ -519,11 +628,15 @@ impl Resolver {
             power_senses: Vec::new(),
             streams: Vec::new(),
             net_count,
+            topology: None,
+            topology_version: 0,
+            dirty: Vec::new(),
         }
     }
 
     /// Add a conduction edge between two nets.
     pub(crate) fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
+        self.topology_version += 1;
         self.edges.push((a, b, ohms));
     }
 
@@ -535,6 +648,7 @@ impl Resolver {
         pin: PinRef,
         initial: Option<TheveninDrive>,
     ) -> EndpointId {
+        self.topology_version += 1;
         self.slots.push(DriveSlot {
             net,
             pin,
@@ -544,37 +658,62 @@ impl Resolver {
     }
 
     /// Replace an endpoint's drive contribution (`None` releases to high-Z).
-    /// Live path only; the next `resolve` sees the new table.
-    pub(crate) fn set_drive(&mut self, endpoint: EndpointId, drive: Option<TheveninDrive>) {
-        if let Some(slot) = self.slots.get_mut(endpoint.0) {
-            slot.drive = drive;
-        } else {
+    /// Live path only; the next pass sees the new table.
+    ///
+    /// Returns whether the table changed. An identical drive is a no-op that
+    /// marks nothing dirty — a card re-asserting the level it already holds,
+    /// or a pin re-driven high on every clock edge, costs no resolution.
+    pub(crate) fn set_drive(&mut self, endpoint: EndpointId, drive: Option<TheveninDrive>) -> bool {
+        let Some(slot) = self.slots.get_mut(endpoint.0) else {
             tracing::warn!(endpoint = endpoint.0, "drive for unknown endpoint dropped");
+            return false;
+        };
+        if same_drive(&slot.drive, &drive) {
+            return false;
         }
+        slot.drive = drive;
+        let net = slot.net;
+        if let Some(topology) = self
+            .topology
+            .as_ref()
+            .filter(|t| t.version == self.topology_version && net < t.cluster_index.len())
+        {
+            let cluster = topology.cluster_index[net];
+            if !self.dirty.contains(&cluster) {
+                self.dirty.push(cluster);
+            }
+        }
+        // With no usable cache the next pass is a full one anyway.
+        true
     }
 
     /// Add a power-rail source (harness power endpoint or `PowerOut` pin).
     pub(crate) fn add_power_source(&mut self, net: usize, volts: Volts) {
+        self.topology_version += 1;
         self.power_sources.push((net, volts));
     }
 
     /// Add a `net_stuck` fault source.
     pub(crate) fn add_stuck_source(&mut self, net: usize, volts: Volts) {
+        self.topology_version += 1;
         self.stuck_sources.push((net, volts));
     }
 
     /// Register a digital sense pin (floating-sense findings).
     pub(crate) fn add_digital_sense(&mut self, net: usize) {
+        self.topology_version += 1;
         self.digital_senses.push(net);
     }
 
     /// Register an analog sense pin (floating-sense findings).
     pub(crate) fn add_analog_sense(&mut self, net: usize) {
+        self.topology_version += 1;
         self.analog_senses.push(net);
     }
 
     /// Register a power sense pin (`PowerNetUnsourced` findings).
     pub(crate) fn add_power_sense(&mut self, net: usize) {
+        self.topology_version += 1;
         self.power_senses.push(net);
     }
 
@@ -594,11 +733,6 @@ impl Resolver {
         });
     }
 
-    /// Run one full resolution pass: assign every net a [`NetState`] from the
-    /// current drive table and report findings. Identity-merged nets share
-    /// state; conduction clusters share sourced-ness. Clusters where a
-    /// competing source sits within [`ESCALATION_IMPEDANCE_RATIO`] of the
-    /// strongest driver escalate to `solver`.
     /// The identity root of every net, after harness/pin-short merges:
     /// two nets are electrically the same node iff their roots are equal.
     ///
@@ -610,7 +744,568 @@ impl Resolver {
         (0..net_count).map(|i| self.identity.find(i)).collect()
     }
 
+    /// Whether the cached topology describes the current inputs and `n` nets.
+    fn topology_is_current(&self, n: usize) -> bool {
+        self.topology
+            .as_ref()
+            .is_some_and(|t| t.version == self.topology_version && t.n == n)
+    }
+
+    /// Rebuild the topology cache if the inputs changed since it was built.
+    fn ensure_topology(&mut self, n: usize) {
+        if self.topology_is_current(n) {
+            return;
+        }
+        self.identity.grow(self.net_count.max(n));
+        let topology = self.build_topology(n);
+        self.topology = Some(topology);
+        self.dirty.clear();
+    }
+
+    /// Derive every drive-independent structure of the board once: identity
+    /// roots, conduction clusters (dense ids in ascending cluster-root
+    /// order), each cluster's nets, roots, edges, endpoints, sources and
+    /// senses, and the minimum series resistance between each pair of its
+    /// roots. Resolution passes are pure lookups over this afterwards.
+    fn build_topology(&mut self, n: usize) -> Topology {
+        let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
+
+        // Conduction clusters: identity merges are 0-ohm, conduction edges
+        // connect within a cluster without merging identity.
+        let mut conduction = Dsu::new(n);
+        for (i, &root) in root_of.iter().enumerate() {
+            conduction.union(root, i);
+        }
+        for (a, b, _ohms) in &self.edges {
+            conduction.union(root_of[*a], root_of[*b]);
+        }
+        let cluster_of: Vec<usize> = (0..n).map(|i| conduction.find(i)).collect();
+        let mut cluster_roots: Vec<usize> = cluster_of.clone();
+        cluster_roots.sort_unstable();
+        cluster_roots.dedup();
+        let cluster_index: Vec<usize> = cluster_of
+            .iter()
+            .map(|c| {
+                cluster_roots
+                    .binary_search(c)
+                    .expect("every net has a cluster")
+            })
+            .collect();
+
+        // Identity-collapsed conduction edges (self-loops dropped) for path
+        // impedance and escalated-cluster extraction.
+        let root_edges: Vec<(usize, usize, f64)> = self
+            .edges
+            .iter()
+            .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
+            .filter(|(a, b, _)| a != b)
+            .collect();
+
+        let clusters = (0..cluster_roots.len())
+            .map(|cid| {
+                let nets: Vec<usize> = (0..n).filter(|&i| cluster_index[i] == cid).collect();
+                let roots: Vec<usize> = nets.iter().copied().filter(|&i| root_of[i] == i).collect();
+                let edges: Vec<(usize, usize, f64)> = root_edges
+                    .iter()
+                    .filter(|(a, _, _)| cluster_index[*a] == cid)
+                    .copied()
+                    .collect();
+                // The sum of the cluster's edge resistances, self-loops
+                // included: the upper bound the `Pulled` projection reports.
+                let edge_total_ohms: f64 = self
+                    .edges
+                    .iter()
+                    .filter(|(a, b, _)| cluster_index[*a] == cid || cluster_index[*b] == cid)
+                    .map(|(_, _, ohms)| ohms)
+                    .sum();
+                let slots: Vec<usize> = (0..self.slots.len())
+                    .filter(|&si| cluster_index[self.slots[si].net] == cid)
+                    .collect();
+                let sources_in = |list: &[(usize, Volts)]| -> Vec<(usize, Volts)> {
+                    list.iter()
+                        .filter(|(net, _)| cluster_index[*net] == cid)
+                        .map(|(net, volts)| (root_of[*net], *volts))
+                        .collect()
+                };
+                let senses_in = |list: &[usize]| -> Vec<(usize, usize)> {
+                    list.iter()
+                        .enumerate()
+                        .filter(|(_, net)| cluster_index[**net] == cid)
+                        .map(|(pos, net)| (pos, *net))
+                        .collect()
+                };
+                // Minimum series resistance between every pair of the
+                // cluster's roots; INFINITY where no resistive path exists.
+                let k = roots.len();
+                let mut dist = vec![f64::INFINITY; k * k];
+                for (ia, &ra) in roots.iter().enumerate() {
+                    let from = min_path_ohms(&edges, ra);
+                    for (ib, rb) in roots.iter().enumerate() {
+                        if let Some(&ohms) = from.get(rb) {
+                            dist[ia * k + ib] = ohms;
+                        }
+                    }
+                }
+                ClusterTopo {
+                    nets,
+                    roots,
+                    edges,
+                    edge_total_ohms,
+                    slots,
+                    power: sources_in(&self.power_sources),
+                    stuck: sources_in(&self.stuck_sources),
+                    digital_senses: senses_in(&self.digital_senses),
+                    analog_senses: senses_in(&self.analog_senses),
+                    power_senses: senses_in(&self.power_senses),
+                    dist,
+                }
+            })
+            .collect();
+
+        Topology {
+            version: self.topology_version,
+            n,
+            root_of,
+            cluster_index,
+            clusters,
+        }
+    }
+
+    /// Run one full resolution pass: assign every net a [`NetState`] from the
+    /// current drive table and report findings. Identity-merged nets share
+    /// state; conduction clusters share sourced-ness. Clusters where a
+    /// competing source sits within [`ESCALATION_IMPEDANCE_RATIO`] of the
+    /// strongest driver escalate to `solver`.
+    ///
+    /// Clusters are electrically independent, so the pass is the union of
+    /// one [`Self::resolve_cluster`] per cluster — the same routine the live
+    /// path runs on just the clusters a drive touched
+    /// ([`Self::resolve_dirty`]). One code path, two scopes.
     pub(crate) fn resolve(
+        &mut self,
+        nets: &mut [Net],
+        diagnostics: &mut Diagnostics,
+        solver: &dyn ClusterSolver,
+    ) {
+        let n = nets.len();
+        self.ensure_topology(n);
+        let topology = self.topology.take().expect("ensure_topology built it");
+        let mut findings = PassFindings::default();
+        for cid in 0..topology.clusters.len() {
+            self.resolve_cluster(&topology, cid, nets, &mut findings, solver);
+        }
+        findings.emit(diagnostics);
+        self.topology = Some(topology);
+        self.dirty.clear();
+    }
+
+    /// The nets the next [`Self::resolve_dirty`] will touch, ascending: the
+    /// members of every cluster whose drive table changed — or every net,
+    /// when the topology changed and the next pass must be a full one.
+    pub(crate) fn dirty_scope(&self, n: usize) -> Vec<usize> {
+        if !self.topology_is_current(n) {
+            return (0..n).collect();
+        }
+        let topology = self.topology.as_ref().expect("current");
+        let mut scope: Vec<usize> = self
+            .dirty
+            .iter()
+            .flat_map(|&cid| topology.clusters[cid].nets.iter().copied())
+            .collect();
+        scope.sort_unstable();
+        scope.dedup();
+        scope
+    }
+
+    /// Resolve only the clusters a drive changed since the last pass (the
+    /// scope [`Self::dirty_scope`] announced), reporting their findings.
+    /// Every other net keeps its state, which is exactly what the full pass
+    /// would have recomputed for it. Falls back to a full pass when the
+    /// topology changed underneath.
+    pub(crate) fn resolve_dirty(
+        &mut self,
+        nets: &mut [Net],
+        diagnostics: &mut Diagnostics,
+        solver: &dyn ClusterSolver,
+    ) {
+        if !self.topology_is_current(nets.len()) {
+            self.resolve(nets, diagnostics, solver);
+            return;
+        }
+        if self.dirty.is_empty() {
+            return;
+        }
+        let topology = self.topology.take().expect("current");
+        let mut dirty = std::mem::take(&mut self.dirty);
+        dirty.sort_unstable();
+        dirty.dedup();
+        let mut findings = PassFindings::default();
+        for &cid in &dirty {
+            self.resolve_cluster(&topology, cid, nets, &mut findings, solver);
+        }
+        findings.emit(diagnostics);
+        self.topology = Some(topology);
+    }
+
+    /// Resolve one conduction cluster from the current drive table: the
+    /// digital fast path, contention through collapsed series resistance,
+    /// escalation to the cluster solver, state assignment for the cluster's
+    /// nets, and the cluster's findings.
+    ///
+    /// Everything here is cluster-local by construction — every cross-net
+    /// rule walks conduction edges or identity roots, and neither crosses a
+    /// cluster boundary — which is what makes resolving a subset exact.
+    /// Iteration is over dense, ascending indices throughout (never a hash
+    /// walk), so a pass is bit-for-bit reproducible; see `DETERMINISM.md`.
+    fn resolve_cluster(
+        &self,
+        topology: &Topology,
+        cid: usize,
+        nets: &mut [Net],
+        findings: &mut PassFindings,
+        solver: &dyn ClusterSolver,
+    ) {
+        let c = &topology.clusters[cid];
+        let root_of = &topology.root_of;
+        let k = c.roots.len();
+        let pos_of_root = |root: usize| -> usize {
+            c.roots
+                .iter()
+                .position(|&r| r == root)
+                .expect("a cluster's sources sit on its own roots")
+        };
+
+        // Sources per conduction cluster. NaN ("sourced at an unmodeled
+        // voltage") rails mark the cluster sourced but carry no numeric
+        // level: an unmodeled rail must not mask a real 0 V rail on the same
+        // cluster. An injected `net_stuck` is an *ideal* source and counts
+        // for the level heuristic exactly like a rail.
+        let mut cluster_power: Option<Volts> = None;
+        let mut cluster_sourced = false;
+        for (_, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if !volts.is_nan() && cluster_power.is_none() {
+                cluster_power = Some(*volts);
+            }
+            cluster_sourced = true;
+        }
+
+        // Driving endpoints per identity root, in endpoint order; drivers
+        // also source their cluster.
+        let mut net_drivers: Vec<(usize, Vec<usize>)> = Vec::new();
+        for &si in &c.slots {
+            let slot = &self.slots[si];
+            if slot.drive.is_none() {
+                continue;
+            }
+            let root = root_of[slot.net];
+            match net_drivers.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, slots)) => slots.push(si),
+                None => net_drivers.push((root, vec![si])),
+            }
+            cluster_sourced = true;
+        }
+        let drivers_of = |root: usize| -> Option<&[usize]> {
+            net_drivers
+                .iter()
+                .find(|(r, _)| *r == root)
+                .map(|(_, slots)| slots.as_slice())
+        };
+        let drive_of = |si: usize| {
+            self.slots[si]
+                .drive
+                .expect("net_drivers only holds driving slots")
+        };
+        // (has a High driver, has a Low driver) on a root: the two facts the
+        // fast path asks of a driver set.
+        let levels_of = |root: usize| -> (bool, bool) {
+            let mut high = false;
+            let mut low = false;
+            for &si in drivers_of(root).unwrap_or(&[]) {
+                match level_of_volts(drive_of(si).volts) {
+                    Level::High => high = true,
+                    Level::Low => low = true,
+                }
+            }
+            (high, low)
+        };
+
+        // Direct source levels per identity root (power/stuck beat drivers
+        // for the fast-path state projection); NaN rails skipped.
+        let mut direct_volts: Vec<(usize, Volts)> = Vec::new();
+        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if volts.is_nan() || direct_volts.iter().any(|(r, _)| r == root) {
+                continue;
+            }
+            direct_volts.push((*root, *volts));
+        }
+        let direct_of = |root: usize| -> Option<Volts> {
+            direct_volts
+                .iter()
+                .find(|(r, _)| *r == root)
+                .map(|(_, v)| *v)
+        };
+
+        // Every Thevenin source in the cluster: drivers in endpoint order,
+        // then rails and stuck faults as ideal 0-ohm sources. This order is
+        // the SPICE card order the cluster solver stamps (determinism).
+        let mut sources: Vec<ClusterSource> = Vec::new();
+        for &si in &c.slots {
+            let slot = &self.slots[si];
+            if let Some(drive) = slot.drive {
+                sources.push(ClusterSource {
+                    node: NetId(root_of[slot.net]),
+                    volts: drive.volts,
+                    impedance: drive.impedance,
+                });
+            }
+        }
+        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if volts.is_nan() {
+                continue;
+            }
+            sources.push(ClusterSource {
+                node: NetId(*root),
+                volts: *volts,
+                impedance: 0.0,
+            });
+        }
+
+        let mut driver_roots: Vec<usize> = net_drivers.iter().map(|(r, _)| *r).collect();
+        driver_roots.sort_unstable();
+
+        // -- contention through collapsed series resistance ------------------
+        // Disagreeing push-pull sources coupled through series resistance
+        // below STREAM_COLLAPSE_THRESHOLD resolve to Contention, not to a
+        // divided voltage: for signaling purposes the collapsed link is one
+        // node. Rails and stuck faults through the same resistance still
+        // escalate to the divided-voltage solve below.
+        let mut contended: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, &ra) in driver_roots.iter().enumerate() {
+            let pa = pos_of_root(ra);
+            for &rb in &driver_roots[i + 1..] {
+                let ohms = c.dist[pa * k + pos_of_root(rb)];
+                // `INFINITY` (no resistive path) is never coupled.
+                if ohms >= STREAM_COLLAPSE_THRESHOLD {
+                    continue;
+                }
+                let (ha, la) = levels_of(ra);
+                let (hb, lb) = levels_of(rb);
+                if (ha || hb) && (la || lb) {
+                    for root in [ra, rb] {
+                        let fighting = match contended.iter_mut().find(|(r, _)| *r == root) {
+                            Some((_, fighting)) => fighting,
+                            None => {
+                                contended.push((root, Vec::new()));
+                                &mut contended.last_mut().expect("just pushed").1
+                            }
+                        };
+                        fighting.extend_from_slice(drivers_of(ra).unwrap_or(&[]));
+                        fighting.extend_from_slice(drivers_of(rb).unwrap_or(&[]));
+                    }
+                }
+            }
+        }
+        for (_, fighting) in &mut contended {
+            fighting.sort_unstable();
+            fighting.dedup();
+        }
+        let contended_drivers = |root: usize| -> Option<&[usize]> {
+            contended
+                .iter()
+                .find(|(r, _)| *r == root)
+                .map(|(_, fighting)| fighting.as_slice())
+        };
+
+        // -- escalation: digital fast path vs cluster solver ---------------
+        // A driver-bearing root escalates the cluster when a source at a
+        // DIFFERENT level is reachable with Thevenin impedance within
+        // ESCALATION_IMPEDANCE_RATIO of the strongest driver. Disagreeing
+        // push-pull drivers on one node stay on the Contention fast path.
+        let solve = || -> ClusterSolution {
+            let nodes: Vec<NetId> = c.roots.iter().map(|&r| NetId(r)).collect();
+            let resistors: Vec<ClusterResistor> = c
+                .edges
+                .iter()
+                .map(|(a, b, ohms)| ClusterResistor {
+                    a: NetId(*a),
+                    b: NetId(*b),
+                    ohms: *ohms,
+                })
+                .collect();
+            let inputs = ClusterInputs {
+                sources: sources.clone(),
+            };
+            solver.solve(&Cluster { nodes, resistors }, &inputs)
+        };
+        let mut escalated: Option<ClusterSolution> = None;
+        for &root in &driver_roots {
+            let slots = drivers_of(root).expect("driver root has drivers");
+            let (high, low) = levels_of(root);
+            if high && low {
+                continue; // direct push-pull fight: Contention fast path
+            }
+            let level = if high { Level::High } else { Level::Low };
+            let strongest: Ohms = slots
+                .iter()
+                .map(|&si| drive_of(si).impedance)
+                .fold(f64::INFINITY, f64::min);
+
+            let mut competing = f64::INFINITY;
+            // Ideal sources directly on this node (net_stuck / power rail).
+            if let Some(v) = direct_of(root) {
+                if !v.is_nan() && level_of_volts(v) != level {
+                    competing = 0.0;
+                }
+            }
+            // Sources reachable through conduction edges within the cluster.
+            let pr = pos_of_root(root);
+            for source in &sources {
+                if source.node.0 == root || level_of_volts(source.volts) == level {
+                    continue;
+                }
+                let path = c.dist[pr * k + pos_of_root(source.node.0)];
+                if path.is_finite() {
+                    competing = competing.min(path + source.impedance);
+                }
+            }
+            if competing <= strongest * ESCALATION_IMPEDANCE_RATIO {
+                escalated = Some(solve());
+                break;
+            }
+        }
+
+        // -- escalation beyond driver roots ---------------------------------
+        // Ideal sources fighting (rails and stuck faults are 0 Ω, so no
+        // impedance gate): disagreeing levels on one root project Contention
+        // there; disagreeing levels anywhere in the cluster escalate so
+        // intermediate nodes get their divided voltage. Analog senses: a
+        // cluster with a registered analog sense and any numeric source
+        // escalates, so an ADC input always reads the solved voltage.
+        let mut ideal_roots: Vec<(usize, bool, bool)> = Vec::new();
+        let (mut cluster_high, mut cluster_low) = (false, false);
+        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if volts.is_nan() {
+                continue;
+            }
+            let high = level_of_volts(*volts) == Level::High;
+            match ideal_roots.iter_mut().find(|(r, _, _)| r == root) {
+                Some((_, h, l)) => {
+                    *h |= high;
+                    *l |= !high;
+                }
+                None => ideal_roots.push((*root, high, !high)),
+            }
+            cluster_high |= high;
+            cluster_low |= !high;
+        }
+        let ideal_contended =
+            |root: usize| ideal_roots.iter().any(|(r, h, l)| *r == root && *h && *l);
+        let needs_solve =
+            (cluster_high && cluster_low) || (!c.analog_senses.is_empty() && !sources.is_empty());
+        if needs_solve && escalated.is_none() {
+            escalated = Some(solve());
+        }
+
+        // -- state assignment -----------------------------------------------
+        for &i in &c.nets {
+            let root = root_of[i];
+            let state = if contended_drivers(root).is_some() || ideal_contended(root) {
+                NetState::Contention
+            } else if let Some(solution) = &escalated {
+                solution.state_of(NetId(root)).unwrap_or_else(|| {
+                    tracing::warn!(net = %nets[i].name, "cluster solver omitted a node; reporting Floating");
+                    NetState::Floating
+                })
+            } else if let Some(v) = direct_of(root) {
+                NetState::Analog(v)
+            } else if let Some(slots) = drivers_of(root) {
+                let (high, low) = levels_of(root);
+                if high && low {
+                    NetState::Contention
+                } else {
+                    NetState::Driven(level_of_volts(drive_of(slots[0]).volts))
+                }
+            } else if cluster_sourced {
+                // Reached only through conduction edges: project as pulled
+                // toward the cluster's source — a *driver* counts, not only a
+                // declared rail, or a driven signal would stop arriving the
+                // moment it crossed a series resistor.
+                let level = match cluster_power {
+                    Some(v) => level_of_volts(v),
+                    None => cluster_driver_level(&self.slots, &c.slots, Level::High),
+                };
+                NetState::Pulled(level, c.edge_total_ohms)
+            } else {
+                NetState::Floating
+            };
+            nets[i].state = state;
+        }
+
+        // -- findings ---------------------------------------------------------
+        // Contention per identity root (deduped), keyed by the first net
+        // index that reports it; cross-root fights name every fighting
+        // driver, direct fights the root's own, ideal-source fights the net.
+        let mut reported_contention: Vec<usize> = Vec::new();
+        for &i in &c.nets {
+            let root = root_of[i];
+            if nets[i].state == NetState::Contention && !reported_contention.contains(&root) {
+                reported_contention.push(root);
+                let drivers = contended_drivers(root)
+                    .or_else(|| drivers_of(root))
+                    .map(|slots| slots.iter().map(|&si| self.slots[si].pin.clone()).collect())
+                    .unwrap_or_default();
+                findings.contention.push((
+                    i,
+                    Finding::Contention {
+                        net: nets[root.min(i)].name.clone(),
+                        drivers,
+                    },
+                ));
+            }
+        }
+        // Floating senses (deduped per (identity root, kind)), keyed by
+        // registration order within the kind.
+        let mut reported_floating: Vec<(usize, SenseKind)> = Vec::new();
+        for (senses, kind, kind_order) in [
+            (&c.digital_senses, SenseKind::Digital, 0usize),
+            (&c.analog_senses, SenseKind::Analog, 1usize),
+        ] {
+            for &(pos, net) in senses {
+                let root = root_of[net];
+                if nets[net].state == NetState::Floating
+                    && !reported_floating.contains(&(root, kind))
+                {
+                    reported_floating.push((root, kind));
+                    findings.floating.push((
+                        (kind_order, pos),
+                        Finding::FloatingSense {
+                            net: nets[net].name.clone(),
+                            kind,
+                        },
+                    ));
+                }
+            }
+        }
+        // Power senses on an unsourced cluster (deduped per identity root).
+        let mut reported_power: Vec<usize> = Vec::new();
+        for &(pos, net) in &c.power_senses {
+            let root = root_of[net];
+            if !cluster_sourced && !reported_power.contains(&root) {
+                reported_power.push(root);
+                findings.power.push((
+                    pos,
+                    Finding::PowerNetUnsourced {
+                        net: nets[net].name.clone(),
+                    },
+                ));
+            }
+        }
+    }
+
+    /// The resolver as it was before the per-cluster rewrite: one global pass.
+    /// Kept, test-only, as the reference the new pass is checked against.
+    #[cfg(test)]
+    pub(crate) fn resolve_reference(
         &mut self,
         nets: &mut [Net],
         diagnostics: &mut Diagnostics,
@@ -979,7 +1674,9 @@ impl Resolver {
                 // ESD resistor to reach the part on the other side.
                 let level = match cluster_power.get(&cluster) {
                     Some(v) => level_of_volts(*v),
-                    None => cluster_driver_level(&self.slots, &cluster_of, cluster, Level::High),
+                    None => {
+                        cluster_driver_level_ref(&self.slots, &cluster_of, cluster, Level::High)
+                    }
                 };
                 NetState::Pulled(level, total)
             } else {
@@ -1155,6 +1852,29 @@ fn same_state(a: &NetState, b: &NetState) -> bool {
     }
 }
 
+#[cfg(test)]
+fn cluster_driver_level_ref(
+    slots: &[DriveSlot],
+    cluster_of: &[usize],
+    cluster: usize,
+    fallback: Level,
+) -> Level {
+    let mut level: Option<Level> = None;
+    for slot in slots {
+        let Some(drive) = slot.drive else { continue };
+        if cluster_of[slot.net] != cluster {
+            continue;
+        }
+        let this = level_of_volts(drive.volts);
+        match level {
+            None => level = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return fallback, // drivers disagree
+        }
+    }
+    level.unwrap_or(fallback)
+}
+
 /// Digital projection of a source voltage (NaN — an unmodeled rail — never
 /// reaches this: callers skip NaN sources).
 /// The level every driver in a conduction cluster agrees on, or `fallback`
@@ -1180,18 +1900,12 @@ fn same_state(a: &NetState, b: &NetState) -> bool {
 /// and makes no attempt at a divider. A cluster where the answer genuinely
 /// depends on the ratio is one the impedance-escalation rule should hand to
 /// [`QuasiStaticMna`], and this arm never runs for it.
-fn cluster_driver_level(
-    slots: &[DriveSlot],
-    cluster_of: &[usize],
-    cluster: usize,
-    fallback: Level,
-) -> Level {
+fn cluster_driver_level(slots: &[DriveSlot], cluster_slots: &[usize], fallback: Level) -> Level {
     let mut level: Option<Level> = None;
-    for slot in slots {
-        let Some(drive) = slot.drive else { continue };
-        if cluster_of[slot.net] != cluster {
+    for &si in cluster_slots {
+        let Some(drive) = slots[si].drive else {
             continue;
-        }
+        };
         let this = level_of_volts(drive.volts);
         match level {
             None => level = Some(this),
@@ -1330,6 +2044,17 @@ struct EngineCore {
     topology_observers: Vec<TopologyCallback>,
     topology_epoch: u64,
     wheel: BinaryHeap<Reverse<TimerEntry>>,
+    /// `(component, deadline)` of every wake entry on the wheel that has not
+    /// fired yet. A wake carries only its instant, so two entries for the
+    /// same component at the same instant are one wake delivered twice --
+    /// pure cost, and a compounding one: a callback that re-requests a
+    /// deadline on every wake (a pulse train's next edge, a bus clock's next
+    /// half period) then fires once per *previous* wake at that instant,
+    /// each of which re-requests again. Measured before this set: ~500 wheel
+    /// entries per stepper edge during an SD burst, a quarter of the engine
+    /// thread in `BinaryHeap::pop`, and virtual time at 0.0001x.
+    /// hash-order: keyed access only (`insert`, `remove`), never iterated.
+    armed_wakes: HashSet<(usize, u64)>,
     timer_seq: u64,
     /// Drives received but not yet applicable (a lower enqueue seq is still
     /// in flight); applied strictly in seq order.
@@ -1567,6 +2292,10 @@ impl EngineCore {
 
     /// Apply buffered drives strictly in enqueue-seq order, resolving after
     /// each so senses observe the authoritative event order.
+    ///
+    /// Only the cluster the drive belongs to is re-resolved (every other
+    /// net's state is provably unchanged), and a drive identical to the one
+    /// already held resolves nothing at all.
     fn apply_ready_drives(&mut self) {
         while let Some((endpoint, drive)) = self.pending_drives.remove(&self.next_drive_seq) {
             let seq = self.next_drive_seq;
@@ -1576,8 +2305,60 @@ impl EngineCore {
                 endpoint,
                 drive,
             });
-            self.resolver.set_drive(endpoint, drive);
-            self.resolve_and_publish();
+            if self.resolver.set_drive(endpoint, drive) {
+                self.resolve_and_publish_dirty();
+            }
+        }
+    }
+
+    /// [`Self::resolve_and_publish`] scoped to the clusters the drives since
+    /// the last pass touched: the same resolution, publication and delivery,
+    /// over the nets that can have changed.
+    fn resolve_and_publish_dirty(&mut self) {
+        let scope = self.resolver.dirty_scope(self.nets.len());
+        if scope.is_empty() {
+            return;
+        }
+        let old: Vec<NetState> = scope.iter().map(|&i| self.nets[i].state).collect();
+        let mut pass = Diagnostics::new();
+        self.resolver
+            .resolve_dirty(&mut self.nets, &mut pass, self.solver.as_ref());
+
+        {
+            let mut shared = self.states.lock().unwrap();
+            if shared.len() == self.nets.len() {
+                for &i in &scope {
+                    shared[i] = self.nets[i].state;
+                }
+            } else {
+                shared.clear();
+                shared.extend(self.nets.iter().map(|n| n.state));
+            }
+        }
+        self.merge_findings(&pass);
+
+        // Changed nets in ascending index order, per-net callbacks in
+        // registration order — the sequence the full pass records.
+        for (k, &i) in scope.iter().enumerate() {
+            let net = &self.nets[i];
+            if same_state(&old[k], &net.state) {
+                continue;
+            }
+            self.event_log.record(|| EngineEvent::NetResolved {
+                net: NetId(i),
+                state: net.state,
+            });
+            if let Some(subs) = self.sense_subs.get(&i) {
+                for callback in subs {
+                    self.event_log.record(|| EngineEvent::SenseDelivered {
+                        net: NetId(i),
+                        state: net.state,
+                    });
+                    self.deliver_contained(CallbackKind::Sense, &net.name, || {
+                        callback(net.state);
+                    });
+                }
+            }
         }
     }
 
@@ -1598,7 +2379,16 @@ impl EngineCore {
             fired += 1;
             match head.target {
                 TimerTarget::Wake(component) => {
-                    if let Some(callback) = self.wake_subs.get(&component.0) {
+                    // Cleared before delivery: a callback asking to be woken
+                    // again at this same instant is asking for a *new* wake.
+                    // A second entry for the same instant (a periodic one
+                    // pushed beside a one-shot, or a re-request delivered
+                    // under an earlier entry) finds the key gone and is not
+                    // delivered; its period, if any, still re-arms below.
+                    let deliver = self.armed_wakes.remove(&(component.0, head.deadline_ns));
+                    if !deliver {
+                        // fall through to the periodic re-arm
+                    } else if let Some(callback) = self.wake_subs.get(&component.0) {
                         self.event_log.record(|| EngineEvent::Wake { component });
                         let subscriber = format!("component {}", component.0);
                         self.deliver_contained(CallbackKind::Wake, &subscriber, || {
@@ -1625,6 +2415,14 @@ impl EngineCore {
 
     /// Push a wheel entry.
     fn arm(&mut self, deadline_ns: u64, target: TimerTarget, period_ns: Option<u64>) {
+        // One wake per component per instant (see `armed_wakes`). A periodic
+        // entry is always pushed: it carries the period the chain continues
+        // on, which a one-shot already armed at the same instant does not.
+        let TimerTarget::Wake(component) = target;
+        let fresh = self.armed_wakes.insert((component.0, deadline_ns));
+        if !fresh && period_ns.is_none() {
+            return;
+        }
         let seq = self.timer_seq;
         self.timer_seq += 1;
         self.wheel.push(Reverse(TimerEntry {
@@ -1795,6 +2593,7 @@ impl EngineCore {
         rx: &Receiver<Command>,
         control_rx: &Receiver<Command>,
     ) -> bool {
+        let mut capped_passes = 0usize;
         loop {
             self.await_actor_quiescence();
             let mut work = 0usize;
@@ -1825,13 +2624,18 @@ impl EngineCore {
                 break;
             }
             if drained >= COMMAND_DRAIN_BATCH_MAX {
-                let now = virtual_clock::virtual_ns();
-                if self
-                    .next_virtual_deadline()
-                    .is_some_and(|deadline| deadline > now)
-                {
-                    break;
+                capped_passes += 1;
+                if capped_passes >= COMMAND_DRAIN_CAPPED_PASSES_MAX {
+                    let now = virtual_clock::virtual_ns();
+                    if self
+                        .next_virtual_deadline()
+                        .is_some_and(|deadline| deadline > now)
+                    {
+                        break;
+                    }
                 }
+            } else {
+                capped_passes = 0;
             }
         }
 
@@ -2031,6 +2835,7 @@ impl EngineHandle {
             topology_observers: Vec::new(),
             topology_epoch: 0,
             wheel: BinaryHeap::new(),
+            armed_wakes: HashSet::new(),
             timer_seq: 0,
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
@@ -2972,15 +3777,24 @@ mod tests {
     }
 
     fn empty_engine() -> EngineHandle {
-        let handle = EngineHandle::spawn(
+        let handle = empty_engine_held();
+        handle.release_time();
+        handle
+    }
+
+    /// An empty engine with virtual time **held**: it drains and arms, but
+    /// nothing fires until [`EngineHandle::release_time`]. A test that must
+    /// get several requests in before any of them is served needs this —
+    /// otherwise it races the engine, which is free to serve the first
+    /// request while the rest are still in flight.
+    fn empty_engine_held() -> EngineHandle {
+        EngineHandle::spawn(
             Resolver::new(0, Dsu::new(0)),
             Vec::new(),
             Box::new(QuasiStaticMna),
             EventLog::disabled(),
             None,
-        );
-        handle.release_time();
-        handle
+        )
     }
 
     /// The wheel resolves deadlines a *bit period* apart, not a microsecond.
@@ -3013,6 +3827,81 @@ mod tests {
         );
         // Stepped time advances *to* each deadline, so the stamps are exact.
         assert_eq!(*log.lock().unwrap(), deadlines);
+    }
+
+    /// Re-requesting a deadline already armed for the same component is a
+    /// no-op: the wake is delivered once, not once per request. A callback
+    /// that re-arms its next edge on every wake would otherwise fire once
+    /// per previous wake at that instant, and compound.
+    #[rstest]
+    fn a_deadline_armed_repeatedly_wakes_once() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        // Time held while the requests go in: a delivered wake frees its
+        // instant to be armed again (that is the contract), so a test that
+        // let the engine run would be asserting on a race, not on dedupe.
+        let handle = empty_engine_held();
+        let log = wake_log(&handle, ComponentId(0));
+
+        let now = virtual_clock::virtual_ns();
+        let first = now + 1_000_000;
+        let second = now + 2_000_000;
+        for _ in 0..50 {
+            handle.link().send_control(Command::ScheduleAt {
+                component: ComponentId(0),
+                at_ns: first,
+            });
+        }
+        handle.link().send_control(Command::ScheduleAt {
+            component: ComponentId(0),
+            at_ns: second,
+        });
+        // Every request is now queued ahead of the release, so all 50 are
+        // deduped against one armed entry.
+        handle.release_time();
+
+        assert!(
+            wait_for(|| log.lock().unwrap().len() >= 2, Duration::from_secs(5)),
+            "both distinct deadlines must fire; got {:?}",
+            log.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(*log.lock().unwrap(), vec![first, second]);
+    }
+
+    /// A one-shot armed at the instant a periodic entry is due does not eat
+    /// the periodic chain: both fire there (one wake), and the period goes on.
+    #[rstest]
+    fn a_periodic_chain_survives_a_one_shot_at_its_instant() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        // Held, so the one-shot and the periodic entry land on the same
+        // instant by construction rather than by winning a race.
+        let handle = empty_engine_held();
+        let log = wake_log(&handle, ComponentId(0));
+
+        let now = virtual_clock::virtual_ns();
+        let period = 1_000_000u64;
+        handle.link().send_control(Command::ScheduleAt {
+            component: ComponentId(0),
+            at_ns: now + period,
+        });
+        handle.link().send_control(Command::ScheduleEvery {
+            component: ComponentId(0),
+            period_ns: period,
+        });
+        handle.release_time();
+
+        assert!(
+            wait_for(|| log.lock().unwrap().len() >= 3, Duration::from_secs(5)),
+            "the chain must continue past the shared instant; got {:?}",
+            log.lock().unwrap()
+        );
+        let stamps = log.lock().unwrap().clone();
+        assert_eq!(
+            &stamps[..3],
+            &[now + period, now + 2 * period, now + 3 * period]
+        );
     }
 
     /// `schedule_at` fires exactly once, at-or-after its virtual deadline.
@@ -3486,5 +4375,198 @@ mod tests {
             "and nothing is wrong: {:?}",
             diags.findings()
         );
+    }
+
+    // ============================================================
+    // Incremental resolve oracle
+    // ============================================================
+    //
+    // The live path resolves only the cluster a drive touched. The claim
+    // that this equals a full pass rests on clusters being electrically
+    // independent; this pins it on random boards — merges, resistive edges,
+    // drivers at every impedance, rails, stuck faults, senses — under random
+    // drive sequences, comparing every net's state and the cumulative
+    // findings against a resolver that recomputes the whole board each time.
+    mod incremental_oracle {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        struct Spec {
+            n: usize,
+            merges: Vec<(usize, usize)>,
+            edges: Vec<(usize, usize, f64)>,
+            endpoints: Vec<(usize, Option<TheveninDrive>)>,
+            power: Vec<(usize, Volts)>,
+            stuck: Vec<(usize, Volts)>,
+            digital_senses: Vec<usize>,
+            analog_senses: Vec<usize>,
+            power_senses: Vec<usize>,
+        }
+
+        fn drive_strategy() -> impl Strategy<Value = Option<TheveninDrive>> {
+            prop_oneof![
+                Just(None),
+                (
+                    prop_oneof![Just(0.0f64), Just(3.3), Just(5.0)],
+                    prop_oneof![Just(25.0f64), Just(470.0), Just(15_000.0), Just(100_000.0)],
+                )
+                    .prop_map(|(volts, impedance)| Some(TheveninDrive { volts, impedance })),
+            ]
+        }
+
+        fn spec_strategy() -> impl Strategy<Value = Spec> {
+            (2usize..10).prop_flat_map(|n| {
+                (
+                    prop::collection::vec((0..n, 0..n), 0..3),
+                    prop::collection::vec(
+                        (
+                            0..n,
+                            0..n,
+                            prop_oneof![
+                                Just(0.0f64),
+                                Just(47.0),
+                                Just(470.0),
+                                Just(4_700.0),
+                                Just(15_000.0)
+                            ],
+                        ),
+                        0..4,
+                    ),
+                    prop::collection::vec((0..n, drive_strategy()), 1..8),
+                    prop::collection::vec(
+                        (0..n, prop_oneof![Just(0.0f64), Just(3.3), Just(f64::NAN)]),
+                        0..3,
+                    ),
+                    prop::collection::vec((0..n, prop_oneof![Just(0.0f64), Just(3.3)]), 0..2),
+                    prop::collection::vec(0..n, 0..3),
+                    prop::collection::vec(0..n, 0..3),
+                    prop::collection::vec(0..n, 0..2),
+                )
+                    .prop_map(
+                        move |(
+                            merges,
+                            edges,
+                            endpoints,
+                            power,
+                            stuck,
+                            digital_senses,
+                            analog_senses,
+                            power_senses,
+                        )| Spec {
+                            n,
+                            merges,
+                            edges,
+                            endpoints,
+                            power,
+                            stuck,
+                            digital_senses,
+                            analog_senses,
+                            power_senses,
+                        },
+                    )
+            })
+        }
+
+        fn build(spec: &Spec) -> (Resolver, Vec<EndpointId>) {
+            let mut identity = Dsu::new(spec.n);
+            for &(a, b) in &spec.merges {
+                identity.union(a, b);
+            }
+            let mut resolver = Resolver::new(spec.n, identity);
+            for &(a, b, ohms) in &spec.edges {
+                resolver.add_edge(a, b, ohms);
+            }
+            let ids: Vec<EndpointId> = spec
+                .endpoints
+                .iter()
+                .enumerate()
+                .map(|(i, (net, drive))| {
+                    resolver.add_endpoint(*net, PinRef::new("U", format!("{i}")), *drive)
+                })
+                .collect();
+            for &(net, volts) in &spec.power {
+                resolver.add_power_source(net, volts);
+            }
+            for &(net, volts) in &spec.stuck {
+                resolver.add_stuck_source(net, volts);
+            }
+            for &net in &spec.digital_senses {
+                resolver.add_digital_sense(net);
+            }
+            for &net in &spec.analog_senses {
+                resolver.add_analog_sense(net);
+            }
+            for &net in &spec.power_senses {
+                resolver.add_power_sense(net);
+            }
+            (resolver, ids)
+        }
+
+        fn bus_of(bus: &Diagnostics) -> Vec<String> {
+            let mut found: Vec<String> = bus.findings().iter().map(|f| format!("{f:?}")).collect();
+            found.sort();
+            found
+        }
+
+        fn merge_into(bus: &mut Diagnostics, pass: &Diagnostics) {
+            for finding in pass.findings() {
+                bus.report(finding.clone());
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
+            #[test]
+            fn resolving_only_the_touched_cluster_matches_a_full_pass(
+                spec in spec_strategy(),
+                ops in prop::collection::vec((0usize..8, drive_strategy()), 1..12),
+            ) {
+                let (mut incremental, ids) = build(&spec);
+                let (mut full, _) = build(&spec); // the OLD algorithm, one global pass
+                let mut nets_inc = nets(spec.n);
+                let mut nets_full = nets(spec.n);
+                let mut bus_inc = Diagnostics::new();
+                let mut bus_full = Diagnostics::new();
+
+                let mut pass = Diagnostics::new();
+                incremental.resolve(&mut nets_inc, &mut pass, &QuasiStaticMna);
+                merge_into(&mut bus_inc, &pass);
+                let mut pass = Diagnostics::new();
+                full.resolve_reference(&mut nets_full, &mut pass, &QuasiStaticMna);
+                merge_into(&mut bus_full, &pass);
+                for i in 0..spec.n {
+                    prop_assert!(
+                        same_state(&nets_inc[i].state, &nets_full[i].state),
+                        "initial pass, net {i}: new {:?}, reference {:?}",
+                        nets_inc[i].state,
+                        nets_full[i].state
+                    );
+                }
+
+                for (step, (slot, drive)) in ops.into_iter().enumerate() {
+                    let endpoint = ids[slot % ids.len()];
+                    let changed = incremental.set_drive(endpoint, drive);
+                    let _ = full.set_drive(endpoint, drive);
+
+                    let mut pass = Diagnostics::new();
+                    incremental.resolve_dirty(&mut nets_inc, &mut pass, &QuasiStaticMna);
+                    merge_into(&mut bus_inc, &pass);
+                    let mut pass = Diagnostics::new();
+                    full.resolve_reference(&mut nets_full, &mut pass, &QuasiStaticMna);
+                    merge_into(&mut bus_full, &pass);
+
+                    for i in 0..spec.n {
+                        prop_assert!(
+                            same_state(&nets_inc[i].state, &nets_full[i].state),
+                            "step {step} (changed={changed}) net {i}: incremental {:?}, reference {:?}",
+                            nets_inc[i].state,
+                            nets_full[i].state
+                        );
+                    }
+                    prop_assert_eq!(bus_of(&bus_inc), bus_of(&bus_full), "findings after step {}", step);
+                }
+            }
+        }
     }
 }
