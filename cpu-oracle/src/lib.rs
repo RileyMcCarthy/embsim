@@ -6,8 +6,39 @@
 //! (one-instruction probe goldens).
 //!
 //! This crate is ISA-agnostic: it does not know GETBYTE or loadp2. A CPU
-//! adapter supplies the binary, the loader, and the ISS. The format is the
-//! shared piece.
+//! adapter supplies the binary, the loader, and the ISS. Everything that is
+//! the same whatever the instruction set lives here:
+//!
+//! * [`buckets`] — which instructions a one-instruction probe can observe at
+//!   all, and which need their own program. Getting this wrong hangs the
+//!   target rather than merely missing a test.
+//! * [`sweep`] — the operand and flag vectors. This decides whether the corpus
+//!   can tell a correct implementation from a wrong one, and is the easiest
+//!   part to get quietly, expensively wrong.
+//! * [`capture`] — driving a real chip through thousands of cases, including
+//!   what to do when one of them wedges the worker.
+//! * [`gate`] — a conformance gate with a burn-down baseline, so it can go
+//!   green while the debt is still real and still fail on a regression.
+//! * [`coverage`] — what the corpus never asked, including the instructions
+//!   whose records cannot discriminate anything and therefore report a
+//!   misleading green.
+//!
+//! The format itself — [`Record`], [`parse_records`], [`diff_records`] — is
+//! the shared piece it all hangs off.
+
+pub mod buckets;
+pub mod capture;
+pub mod coverage;
+pub mod gate;
+pub mod sweep;
+
+pub use buckets::Observability;
+pub use capture::{capture, Capture, Progress, SiliconTarget};
+pub use coverage::{never_captured, undiscriminated, Undiscriminated};
+pub use gate::{evaluate, Baseline, Verdict};
+pub use sweep::{
+    plan_cases, CasePlan, Encoding, OperandPair, DEFAULT_FLAG_STATES, DEFAULT_OPERANDS,
+};
 
 use std::collections::BTreeMap;
 use std::fmt;
