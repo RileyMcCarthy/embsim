@@ -102,6 +102,118 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 // ============================================================
+// The pump's place on the virtual clock
+// ============================================================
+
+/// The bridged channel's pump thread is a registered virtual-clock actor.
+///
+/// This is a structural assertion on purpose. The defect it guards is not a
+/// slow path but an **unaccounted** one, and its only symptom is timing — so a
+/// timing test for it is exactly as sharp as the host it runs on, and this
+/// defect's whole nature is that it hides on a fast host (reproduced on a
+/// contended 4-vCPU CI runner; never once on an idle 8-core developer
+/// machine). Asking the scheduler who it is accounting for is the same
+/// question with a deterministic answer.
+///
+/// Every other thread on a firmware↔model byte path already registers: the
+/// firmware cogs (`system::start_thread`), the device models
+/// (`ads122u04-protocol`), the serial reader, and the engine via its time
+/// authority. The pump did not, so the quiescence barrier advanced virtual
+/// time while this thread had not yet been scheduled by the OS to forward a
+/// byte the firmware had already written. On a contended runner the reference
+/// consumer's 1-second ADC read timeout — one **virtual** second, which
+/// unpaced passes in a sliver of wall time — expired against bytes still
+/// sitting in a socketpair; its force gauge was declared unresponsive, and the
+/// recorded sample stream thinned from ~1 kHz to ~100 Hz with its span
+/// stretched.
+#[rstest]
+fn the_serial_pump_is_a_registered_clock_actor() {
+    let _g = lock_clock();
+    // Unpaced — the mode CI runs, and the only one in which this can go wrong:
+    // paced, wall latency and virtual latency are locked together anyway.
+    virtual_clock::init(0.0, 1_000_000);
+    serial::init(1);
+
+    assert!(
+        !virtual_clock::registered_actor_names()
+            .iter()
+            .any(|n| n.contains("ch0")),
+        "no pump actor before the system starts"
+    );
+
+    let peer = ProbeHandle::new();
+
+    let mut registry = PartRegistry::new();
+    registry.register("MCU_P2", |_decl| {
+        Box::new(
+            McuComponent::builder("p2")
+                .serial_table(vec![FG])
+                .bridge_serial(0)
+                .build()
+                .expect("MCU builds from the FG table"),
+        )
+    });
+    {
+        let peer = peer.clone();
+        registry.register("PEER_UART", move |_decl| {
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                UartFraming::new_8n1(FG.baud),
+                peer.clone(),
+            ))
+        });
+    }
+
+    let mcu_board = Board::from_netlist(
+        embsim_board::netlist::parse(MCU_NETLIST).expect("MCU netlist parses"),
+        &registry,
+    )
+    .expect("MCU board builds");
+    let peer_board = Board::from_netlist(
+        embsim_board::netlist::parse(PEER_NETLIST).expect("peer netlist parses"),
+        &registry,
+    )
+    .expect("peer board builds");
+
+    let harness = Harness::new()
+        .connect_str("McuBoard.J1.1", "PeerBoard.J1.2")
+        .expect("endpoints parse")
+        .connect_str("PeerBoard.J1.1", "McuBoard.J1.2")
+        .expect("endpoints parse");
+
+    let system = System::new()
+        .board("McuBoard", mcu_board)
+        .board("PeerBoard", peer_board)
+        .harness(harness)
+        .start()
+        .expect("live system starts");
+
+    // Wall time deliberately: the harness is waiting for a spawned thread to
+    // reach its first park, which is not part of the simulation.
+    assert!(
+        wait_for(
+            || virtual_clock::registered_actor_names()
+                .iter()
+                .any(|n| n.contains("ch0")),
+            Duration::from_secs(10),
+        ),
+        "the bridged channel's pump must register as a virtual-clock actor, so the \
+         quiescence barrier cannot advance virtual time past a byte it is still \
+         carrying (DETERMINISM.md T1 §4). Registered actors: {:?}",
+        virtual_clock::registered_actor_names(),
+    );
+
+    // Dropping the system joins the engine — releasing the time authority —
+    // before it joins this pump. A pump parked on the virtual clock can only
+    // be woken after that by `TimeAuthority::drop` handing idle-jumping back,
+    // so this drop returning at all is the other half of the fix.
+    drop(system);
+}
+
+// ============================================================
 // The end-to-end bridge test
 // ============================================================
 

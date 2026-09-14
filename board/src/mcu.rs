@@ -1099,11 +1099,13 @@ impl Component for McuComponent {
             // MCU → net: a named pump thread moves firmware TX bytes into the
             // framer (see the module docs for why a thread and not an engine
             // poll).
+            let pump_thread_name = format!("mcu-{}-ch{}", self.name, bridge.channel);
+            let pump_actor_name = pump_thread_name.clone();
             let thread = std::thread::Builder::new()
-                .name(format!("mcu-{}-ch{}", self.name, bridge.channel))
+                .name(pump_thread_name)
                 .spawn({
                     let shutdown = Arc::clone(&shutdown);
-                    move || pump_loop(component_fd, &*tx_sink, &shutdown)
+                    move || pump_loop(&pump_actor_name, component_fd, &*tx_sink, &shutdown)
                 })
                 .map_err(|e| AttachError::Failed {
                     message: format!(
@@ -1379,44 +1381,56 @@ impl Drop for McuComponent {
 // Pump internals
 // ============================================================
 
-/// Poll timeout for the pump thread: the upper bound on shutdown latency,
-/// comfortably finer than any protocol timeout the firmware runs.
-const PUMP_POLL_TIMEOUT_MS: i32 = 10;
+/// How often the pump drains the firmware's TX FD, in **virtual** microseconds.
+///
+/// This was a 10 ms wall-clock `poll(2)` timeout, justified as "comfortably
+/// finer than any protocol timeout the firmware runs". That comparison does not
+/// hold: the firmware's protocol timeouts are counted in VIRTUAL microseconds,
+/// and the two clocks are not related by any fixed ratio. Unpaced
+/// (`--speed 0`), virtual time advances as fast as the host can spin the parked
+/// actors, so 10 ms of wall latency here is an unbounded amount of virtual time
+/// — enough to blow through a 1 s firmware timeout while this thread is simply
+/// waiting for a timeslice.
+///
+/// 100 µs matches `Serial::receive_data_timeout`'s own RX poll interval, so the
+/// pump never becomes the slower half of a firmware round trip.
+const PUMP_POLL_INTERVAL_US: u64 = 100;
 
 /// Read chunk for draining firmware TX bytes.
 const PUMP_READ_CHUNK: usize = 256;
 
-/// Pump thread body: wait (bounded) for the component-side FD to become
-/// readable, drain it, and hand the bytes to `sink` — the TX pin's byte route,
-/// or the level bridge that frames them into edges. Exits when the shutdown
-/// flag is set, the peer end closes, or the FD errors.
-fn pump_loop(component_fd: RawFd, sink: &dyn Fn(&[u8]), shutdown: &AtomicBool) {
+/// Pump thread body: drain the component-side FD and hand the bytes to `sink` —
+/// the TX pin's byte route, or the level bridge that frames them into edges.
+/// Exits when the shutdown flag is set, the peer end closes, or the FD errors.
+///
+/// # Why this thread is a virtual-clock actor
+///
+/// This is the MCU→net half of the firmware's serial bridge, and it is the only
+/// hop on a firmware↔model byte path that is not the firmware, the engine or a
+/// device model — each of which already registers (`ads122u04-protocol`,
+/// `reader-cog`, the cogs via `system::start_thread`, and the engine's time
+/// authority). Left unregistered, it was invisible to the quiescence barrier:
+/// the scheduler would advance virtual time while this thread had not yet been
+/// scheduled by the OS to forward a byte the firmware had already written.
+///
+/// On a contended host that is not a small error. The firmware asks its ADC for
+/// a conversion and waits 1 **virtual** second for the reply; unpaced, that
+/// second can pass in a sliver of wall time, so the gauge is declared
+/// unresponsive, `dev_forceGauge` drops into its error state, and the recorded
+/// sample stream thins out and stretches — a measurement of the runner rather
+/// than of the machine.
+///
+/// Registering makes the barrier wait for this hop like any other: virtual time
+/// cannot pass this thread's deadline while it has bytes to move.
+fn pump_loop(name: &str, component_fd: RawFd, sink: &dyn Fn(&[u8]), shutdown: &AtomicBool) {
+    let _actor = embsim_core::virtual_clock::register_actor(name);
     let mut buf = [0u8; PUMP_READ_CHUNK];
+    // SAFETY: `component_fd` stays open until the owning component joins this
+    // thread.
+    let fd = unsafe { BorrowedFd::borrow_raw(component_fd) };
     while !shutdown.load(Ordering::Relaxed) {
-        let mut pollfd = libc::pollfd {
-            fd: component_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pollfd` is a valid, exclusively borrowed array of one.
-        let rc = unsafe { libc::poll(&mut pollfd, 1, PUMP_POLL_TIMEOUT_MS) };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            tracing::debug!(error = %err, "serial pump poll failed; stopping");
-            return;
-        }
-        if rc == 0 {
-            continue; // timeout — re-check the shutdown flag
-        }
-
-        // Drain everything available. The FD is non-blocking, so the inner
-        // loop always terminates at EAGAIN.
-        // SAFETY: `component_fd` stays open until the owning component joins
-        // this thread.
-        let fd = unsafe { BorrowedFd::borrow_raw(component_fd) };
+        // Drain everything available. The FD is non-blocking, so this always
+        // terminates at EAGAIN.
         loop {
             match nix::unistd::read(fd, &mut buf) {
                 Ok(0) => return, // peer end closed
@@ -1429,6 +1443,11 @@ fn pump_loop(component_fd: RawFd, sink: &dyn Fn(&[u8]), shutdown: &AtomicBool) {
                 }
             }
         }
+        // Park on the virtual clock rather than blocking on the FD: parking is
+        // what publishes this thread's deadline to the quiescence barrier, and
+        // a `poll(2)` wall-clock block publishes nothing. Also bounds shutdown
+        // latency, as the old poll timeout did.
+        embsim_core::virtual_clock::wait_virtual_us(PUMP_POLL_INTERVAL_US);
     }
 }
 
