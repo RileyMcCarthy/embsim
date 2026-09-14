@@ -465,13 +465,22 @@ fn the_force_path_carries_a_command_and_a_conversion_end_to_end() {
         "DS2Addon.Net-(U1-RX)",
         "DS2Addon.Net-(U1-TX)",
     ] {
-        let state = system.net_state(net);
-        assert!(
+        // Wait for the level rather than sampling for it. `start()` returning
+        // means the system has assembled, not that the engine has already
+        // resolved and published every net — that is the engine's own first
+        // pass, on its own thread. Reading straight through raced it, and lost
+        // on a loaded runner: this is the idiom the rest of the file uses for
+        // exactly this reason (see `settled_at`).
+        let carries_a_level = || {
             matches!(
-                state,
+                system.net_state(net),
                 Some(NetState::Driven(_) | NetState::Pulled(_, _) | NetState::Analog(_))
-            ),
-            "{net} must carry a level for a byte to cross it; got {state:?}"
+            )
+        };
+        assert!(
+            wait_for(carries_a_level, Duration::from_secs(5)),
+            "{net} must carry a level for a byte to cross it; got {:?}",
+            system.net_state(net)
         );
     }
 
