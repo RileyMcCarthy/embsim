@@ -84,22 +84,39 @@ fn settle_once() -> (NetState, Vec<String>) {
     (got, log)
 }
 
-/// KNOWN FAILING, roughly one process in ten. Kept as a runnable reproduction
-/// rather than deleted, because it is the only thing that catches the residual bug
-/// and it catches it *inside one process*, which is what rules out hash order.
+/// A reproduction for a real but ELUSIVE nondeterminism. `#[ignore]`d because
+/// it does not fire reliably, not because it is unimportant.
 ///
-/// Two distinct causes were found here. The first is fixed: sense callbacks
-/// dirty clusters after the pass that delivered them had already resolved, so
-/// the incremental resolver never gave them a second lap — see
-/// `resolve_and_publish_dirty`. That alone took the `edgeboard` RS422 case
-/// from ~50% failure to 15 clean runs in 15.
+/// What is established:
 ///
-/// The second is still open. The event log shows a `drive_applied seq=9
-/// endpoint=90 drive=release` landing at a different point relative to a
-/// `sense`, and three extra events in the failing trace — a command drain
-/// interleaving with resolution differently between runs. Run this with
-/// `--ignored` to reproduce; it prints the first diverging event.
-#[ignore = "reproduces an open engine nondeterminism: drive-release ordering vs resolve"]
+/// * The bug is real. CI has hit it, and it was observed many times across a
+///   day — the receiver output resting at `Floating` where the same declared
+///   scenario usually gives `Driven(High)`.
+/// * It is not hash order. This test runs the scenario twelve times in ONE
+///   process, so all twelve share a hasher seed, and it has caught runs
+///   disagreeing with each other inside that one process.
+/// * The engine event log names the divergence: a `drive_applied seq=..
+///   drive=release` landing at a different point relative to a `sense`, with
+///   extra events in the failing trace. That is a command drain interleaving
+///   with resolution differently between runs.
+///
+/// What is NOT established, and was wrongly claimed once:
+///
+/// * A first attempt looped `resolve_and_publish_dirty` to a fixpoint, on the
+///   theory that a sense callback's `set_drive` dirtied a cluster after its
+///   pass had resolved. That theory is WRONG: `PinHandle::set_drive` enqueues
+///   a `Command::Drive` and never touches the resolver inline (see its doc in
+///   `component.rs`), so a sense callback cannot mark anything dirty during
+///   the pass. Instrumenting the loop proved it never ran a second lap. The
+///   apparent "~50% to 15/15" improvement was a confounded measurement: the
+///   before-numbers were taken while the machine was saturated by other work.
+/// * The failure rate is strongly timing-dependent and has ranged from ~50%
+///   to zero across sessions on the same commit. Synthetic CPU load does not
+///   reproduce it on demand.
+///
+/// So whoever picks this up: the mechanism is still open, this test is the
+/// sharpest instrument available for it, and the honest first step is a
+/// reproduction that fires on demand rather than another plausible story.
 #[test]
 fn the_rs422_receiver_settles_the_same_way_every_time() {
     const RUNS: usize = 12;
