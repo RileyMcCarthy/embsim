@@ -902,6 +902,15 @@ impl Resolver {
     /// The nets the next [`Self::resolve_dirty`] will touch, ascending: the
     /// members of every cluster whose drive table changed — or every net,
     /// when the topology changed and the next pass must be a full one.
+    /// Whether any cluster still needs resolving.
+    ///
+    /// A sense callback may drive a pin, which dirties the cluster that pin
+    /// sits in — after the pass that delivered the sense has already resolved.
+    /// The caller uses this to keep going until nothing is left.
+    pub(crate) fn has_dirty(&self) -> bool {
+        !self.dirty.is_empty()
+    }
+
     pub(crate) fn dirty_scope(&self, n: usize) -> Vec<usize> {
         if !self.topology_is_current(n) {
             return (0..n).collect();
@@ -2314,7 +2323,43 @@ impl EngineCore {
     /// [`Self::resolve_and_publish`] scoped to the clusters the drives since
     /// the last pass touched: the same resolution, publication and delivery,
     /// over the nets that can have changed.
+    /// Resolve the dirty clusters, publish them, and deliver their senses --
+    /// repeatedly, until nothing is dirty.
+    ///
+    /// The loop is the whole point. A sense callback is a component deciding
+    /// what to do about a net it watches, and what it usually does is drive
+    /// another pin: the RS422 receiver watches `A+`/`A-` and drives its output
+    /// accordingly. That `set_drive` lands in a DIFFERENT cluster and marks it
+    /// dirty — but by then this pass has already resolved and published, so
+    /// without a second lap the receiver's output keeps whatever state it had.
+    ///
+    /// Nothing forced a second lap. Whether one happened depended on some
+    /// unrelated event waking the engine again before the test looked, which
+    /// is why the same declared scenario settled two different ways about half
+    /// the time, and why it settled STABLY wrong when no such event arrived.
+    /// A full resolve never had the problem because it recomputes every net
+    /// each pass.
     fn resolve_and_publish_dirty(&mut self) {
+        // Bounded: a circuit that oscillates (a ring of inverters, a latch
+        // fighting itself) would otherwise spin here forever. Reaching the cap
+        // means the network did not settle, which is a finding about the
+        // circuit, not a reason to hang.
+        const MAX_LAPS: usize = 64;
+        for lap in 0..MAX_LAPS {
+            if !self.resolver.has_dirty() {
+                return;
+            }
+            self.resolve_and_publish_dirty_once();
+            if lap + 1 == MAX_LAPS && self.resolver.has_dirty() {
+                tracing::warn!(
+                    laps = MAX_LAPS,
+                    "net resolution did not settle; the circuit may be oscillating"
+                );
+            }
+        }
+    }
+
+    fn resolve_and_publish_dirty_once(&mut self) {
         let scope = self.resolver.dirty_scope(self.nets.len());
         if scope.is_empty() {
             return;
