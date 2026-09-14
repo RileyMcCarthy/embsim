@@ -10,7 +10,7 @@
 //!
 //! | Channel | Builder | Pins | Direction |
 //! |---|---|---|---|
-//! | serial | [`McuBuilder::bridge_serial`] | TX + RX, stream roles | both |
+//! | serial | [`McuBuilder::bridge_serial`] | TX + RX, plain digital | both |
 //! | GPIO | [`McuBuilder::bridge_gpio`] | one, per declared direction | firmware → net **and** net → firmware |
 //! | pulse-out | [`McuBuilder::bridge_pulse_out`] | one STEP pin, [`StreamRole::PulseSource`] | firmware → net |
 //! | encoder | [`McuBuilder::bridge_encoder`] | A + B phase pins | net → firmware |
@@ -105,27 +105,43 @@
 //!
 //! ```text
 //!  firmware HAL serial ──fd──┐                      ┌── net engine ──┐
-//!    transmit_data ──────────┤ socketpair ├─ pump ──► StreamTx "P{tx}"
-//!    receive_*     ◄─────────┤            ├◄─ on_byte("P{rx}") ◄─────┘
+//!    transmit_data ──────────┤ socketpair ├─ pump ──► framer → "P{tx}"
+//!    receive_*     ◄─────────┤            ├◄─ deframer ← "P{rx}" ◄───┘
 //! ```
 //!
 //! - **MCU → net**: a small named thread (`"mcu-{name}-ch{n}"`) polls the
-//!   component-side FD and `StreamTx::write`s whatever the firmware
-//!   transmitted out the TX pin. A dedicated thread (rather than an engine
-//!   `schedule_every` poll) keeps FD I/O off the net-engine thread — nothing
-//!   on a net-resolution path may block — and matches the models crate's
-//!   existing `protocol_loop` reader-thread pattern.
-//! - **Net → MCU**: bytes delivered to the RX pin's `on_byte` (engine
-//!   thread) are written non-blockingly to the component-side FD; the
-//!   firmware reads them from its end. A full pipe drops the byte with a
-//!   trace — the engine thread never blocks on a slow firmware.
-//! - **Baud comes from the table**: the TX/RX pins declare
-//!   `Producer`/`Consumer { baud_hz }` from [`SerialChannelConfig::baud`],
-//!   so the net engine paces the wire from the firmware's own config — the
-//!   emulator invents no default. The peripheral bank's own `set_baud`
-//!   pacing is deliberately left untouched (unpaced unless the consumer
-//!   overrides it, e.g. MaD's `MAD_SIM_BAUD` test override): the wire is
-//!   paced in exactly one place.
+//!   component-side FD and hands whatever the firmware transmitted to the
+//!   channel's framer, which clocks it out the TX pin one bit at a time. A
+//!   dedicated thread (rather than an engine `schedule_every` poll) keeps FD
+//!   I/O off the net-engine thread — nothing on a net-resolution path may
+//!   block — and matches the models crate's existing `protocol_loop`
+//!   reader-thread pattern.
+//! - **Net → MCU**: the RX pin's resolved state feeds a deframer on the engine
+//!   thread, and whatever it decodes is written non-blockingly to the
+//!   component-side FD; the firmware reads it from its end. A full pipe drops
+//!   the byte with a trace — the engine thread never blocks on a slow
+//!   firmware.
+//! - **Baud comes from the table**: the framing is 8N1 at
+//!   [`SerialChannelConfig::baud`], so the wire clocks at the firmware's own
+//!   config — the emulator invents no default. The peripheral bank's own
+//!   `set_baud` pacing is deliberately left untouched (unpaced unless the
+//!   consumer overrides it, e.g. MaD's `MAD_SIM_BAUD` test override): the wire
+//!   is paced in exactly one place.
+//!
+//! ## The bits are on the net
+//!
+//! The TX/RX pins are plain [`PinKind::DigitalOut`] / [`PinKind::DigitalIn`]
+//! with no [`StreamRole`] at all, and a byte becomes a start bit, eight data
+//! bits and a stop bit at the table baud — driven by
+//! [`crate::SerialLevelBridge`] out of the component's wake handler, and
+//! decoded on the way back from the RX pin's resolved state.
+//!
+//! It used to be a byte *route*, which let the net decide reachability and
+//! nothing else: a byte crossing it could not be corrupted by a driver
+//! fighting it, could not notice the line was floating, and could not break.
+//! On levels it can, and `board/tests/serial_levels.rs` shows exactly that —
+//! the same byte, the same code, one wire with a second driver on it, and only
+//! the contended one fails.
 //! - **Shutdown**: dropping the component flags every pump, joins its
 //!   thread (bounded by the poll timeout), disconnects the channel from the
 //!   peripheral bank, and closes both FDs — no detached-thread leak.
@@ -151,9 +167,11 @@ use embsim_peripherals::pulse_out::PulseSegment;
 
 use crate::component::{
     AttachError, Component, ComponentNetIo, PinDecl, PinKind, PulseDirection, PulseTrain, PulseTx,
-    StreamRole, StreamTx,
+    StreamRole,
 };
-use crate::net::{Level, NetState, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
+use crate::net::Level;
+use crate::serial_levels::SerialLevelBridge;
+use crate::uart::{FramingError, UartFraming};
 
 // ============================================================
 // Config structs (duplicated from memory-inspect on purpose)
@@ -233,41 +251,11 @@ pub enum GpioDirection {
 // ============================================================
 
 /// Open-circuit voltage a bridged GPIO output drives for a logic high.
-/// Matches the engine's own idle-high default; a consumer that needs another
-/// rail models the level shifter as a component rather than retuning this.
-const MCU_OUTPUT_HIGH_VOLTS: Volts = 3.3;
-
-/// Logic threshold applied to an [`NetState::Analog`] net when a bridged input
-/// (GPIO or encoder phase) projects it to a level. Matches the engine's own
-/// digital projection threshold.
-const MCU_INPUT_THRESHOLD_VOLTS: Volts = 1.5;
-
-/// Project a resolved net state to a logic level, or `None` when the engine
-/// refuses to give one (floating / contended). The engine never invents a
-/// level, and neither does the bridge: an input with no level holds the last
-/// value the firmware saw rather than inventing a released state.
-fn level_of(state: NetState) -> Option<Level> {
-    match state {
-        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
-        NetState::Analog(volts) => Some(if volts >= MCU_INPUT_THRESHOLD_VOLTS {
-            Level::High
-        } else {
-            Level::Low
-        }),
-        NetState::Floating | NetState::Contention => None,
-    }
-}
-
-/// The Thevenin contribution of a bridged output at `level`.
-fn output_drive(level: Level) -> TheveninDrive {
-    TheveninDrive {
-        volts: match level {
-            Level::High => MCU_OUTPUT_HIGH_VOLTS,
-            Level::Low => 0.0,
-        },
-        impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
-    }
-}
+// The digital projection a bridged pin uses in both directions lives in
+// [`crate::net`]: it is the engine's own, not the MCU's, and the serial level
+// bridge needs the same one. An input with no level holds the last value the
+// firmware saw rather than inventing a released state.
+use crate::net::{digital_drive as output_drive, level_of};
 
 /// The pin level a GPIO channel's `active` state drives, honoring
 /// `active_low`.
@@ -576,23 +564,20 @@ impl McuBuilder {
                         channel,
                         table_len: self.serial_table.len(),
                     })?;
-            // UART TX transmits onto the net; RX consumes routed bytes.
+            // Two plain digital pins: the UART is framed onto the net as
+            // levels, so there is no byte route to declare.
             pins.push(PinDecl {
                 number: claim(config.tx_pin)?,
                 name: None,
                 kind: PinKind::DigitalOut,
-                stream: Some(StreamRole::Producer {
-                    baud_hz: config.baud,
-                }),
+                stream: None,
                 drive_impedance: None,
             });
             pins.push(PinDecl {
                 number: claim(config.rx_pin)?,
                 name: None,
                 kind: PinKind::DigitalIn,
-                stream: Some(StreamRole::Consumer {
-                    baud_hz: config.baud,
-                }),
+                stream: None,
                 drive_impedance: None,
             });
             bridges.push(SerialBridge { channel, config });
@@ -739,6 +724,55 @@ struct SerialBridge {
     channel: usize,
     /// The channel's wiring/baud from the firmware table.
     config: SerialChannelConfig,
+}
+
+/// Where a channel's firmware TX bytes go: the pin's byte route, or the level
+/// bridge that frames them into edges.
+type TxSink = Box<dyn Fn(&[u8]) + Send>;
+
+/// One live level-carried serial channel: the framer, and where its decoded
+/// bytes go.
+struct LevelChannel {
+    /// HAL serial channel index (diagnostics).
+    channel: usize,
+    /// Component side of the firmware's pipe pair.
+    component_fd: RawFd,
+    /// The framer driving TX bits and decoding RX edges.
+    level: Arc<SerialLevelBridge>,
+}
+
+/// Hand decoded frames to the firmware's read side.
+///
+/// Runs on the engine thread, so the write must never block: a full pipe drops
+/// the byte with a trace, exactly like a UART overrun on hardware. A frame
+/// that did not decode is *not* delivered — a receiver hands its driver bytes,
+/// not framing errors — but it is logged, because a stop-bit failure means the
+/// line was contended or the baud rates disagree.
+fn deliver_rx(
+    component_fd: RawFd,
+    channel: usize,
+    frames: impl IntoIterator<Item = Result<u8, FramingError>>,
+) {
+    for frame in frames {
+        let byte = match frame {
+            Ok(byte) => byte,
+            Err(error) => {
+                tracing::debug!(channel, ?error, "RX frame dropped: bad framing on the wire");
+                continue;
+            }
+        };
+        // SAFETY: `component_fd` stays open until the owning component drops,
+        // which happens only after the engine (and with it this callback) has
+        // shut down — see `SystemHandle`'s documented drop order.
+        let fd = unsafe { BorrowedFd::borrow_raw(component_fd) };
+        if let Err(e) = nix::unistd::write(fd, &[byte]) {
+            tracing::trace!(
+                channel,
+                error = %e,
+                "RX byte dropped (firmware-side pipe not writable)"
+            );
+        }
+    }
 }
 
 /// One bridged GPIO channel, prepared at build.
@@ -999,12 +1033,12 @@ impl Component for McuComponent {
             None => embsim_peripherals::instance::current(),
         };
 
+        let mut level_channels: Vec<LevelChannel> = Vec::new();
         for bridge in &self.bridges {
             // Validated at build: both pins are <= P63.
             let tx_name = pin_name(bridge.config.tx_pin).expect("validated at build");
             let rx_name = pin_name(bridge.config.rx_pin).expect("validated at build");
 
-            let tx = io.stream_tx(tx_name)?;
             let (component_fd, firmware_fd) =
                 create_pipe_pair().map_err(|detail| AttachError::Failed {
                     message: format!(
@@ -1025,39 +1059,51 @@ impl Component for McuComponent {
 
             instance.serial.init_channel_fd(bridge.channel, firmware_fd);
 
-            // Net → MCU: routed bytes land on the firmware's read side.
-            // Runs on the engine thread — the write must never block, so a
-            // full pipe drops the byte with a trace.
+            // Net → MCU: the RX pin's resolved state is fed to a framer, and
+            // whatever it decodes lands on the firmware's read side. Runs on
+            // the engine thread, so the write must never block: a full pipe
+            // drops the byte with a trace.
+            let channel = bridge.channel;
+            let level = Arc::new(SerialLevelBridge::new(
+                UartFraming::new_8n1(bridge.config.baud),
+                io.pin(tx_name)?,
+                io.clone(),
+                Arc::clone(&shutdown),
+            ));
+            // Hold the line at idle before the firmware runs: a peer that saw
+            // it floating would have no reference for the first start bit's
+            // falling edge.
+            level.idle();
             {
+                let level = Arc::clone(&level);
                 let shutdown = Arc::clone(&shutdown);
-                let channel = bridge.channel;
-                io.on_byte(rx_name, move |byte| {
+                io.on_sense(rx_name, move |state| {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    // SAFETY: `component_fd` stays open until the owning
-                    // component drops, which happens only after the engine
-                    // (and with it this callback) has shut down — see
-                    // `SystemHandle`'s documented drop order.
-                    let fd = unsafe { BorrowedFd::borrow_raw(component_fd) };
-                    if let Err(e) = nix::unistd::write(fd, &[byte]) {
-                        tracing::trace!(
-                            channel,
-                            error = %e,
-                            "RX byte dropped (firmware-side pipe not writable)"
-                        );
-                    }
+                    deliver_rx(component_fd, channel, level.receive_sense(state));
                 })?;
             }
+            level_channels.push(LevelChannel {
+                channel,
+                component_fd,
+                level: Arc::clone(&level),
+            });
+            let tx_sink: TxSink = Box::new(move |bytes: &[u8]| {
+                let shed = level.transmit(bytes);
+                if shed > 0 {
+                    tracing::trace!(channel, shed, "TX bytes shed: the line is behind");
+                }
+            });
 
-            // MCU → net: a named pump thread moves firmware TX bytes onto
-            // the stream route (see the module docs for why a thread and
-            // not an engine poll).
+            // MCU → net: a named pump thread moves firmware TX bytes into the
+            // framer (see the module docs for why a thread and not an engine
+            // poll).
             let thread = std::thread::Builder::new()
                 .name(format!("mcu-{}-ch{}", self.name, bridge.channel))
                 .spawn({
                     let shutdown = Arc::clone(&shutdown);
-                    move || pump_loop(component_fd, &tx, &shutdown)
+                    move || pump_loop(component_fd, &*tx_sink, &shutdown)
                 })
                 .map_err(|e| AttachError::Failed {
                     message: format!(
@@ -1073,8 +1119,28 @@ impl Component for McuComponent {
                 tx = tx_name,
                 rx = rx_name,
                 baud = bridge.config.baud,
-                "serial channel bridged to stream pins"
+                "serial channel bridged"
             );
+        }
+
+        // One wake handler drives every level channel's bit clock and closes
+        // any receive frame whose tail carried no transition. It is registered
+        // once for the whole component (the engine keeps one per component),
+        // so each channel re-arms the shared timer for its own next instant.
+        if !level_channels.is_empty() {
+            let channels = Arc::new(level_channels);
+            let shutdown = Arc::clone(&self.shutdown);
+            io.on_wake_ns(move |now_ns| {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                for channel in channels.iter() {
+                    // Each bridge arms its own next wake, so N channels cost N
+                    // wheel entries only when N channels actually have work.
+                    let bytes = channel.level.service(now_ns);
+                    deliver_rx(channel.component_fd, channel.channel, bytes);
+                }
+            });
         }
 
         // Pulse bridges first: a GPIO channel that supplies a train's
@@ -1321,9 +1387,10 @@ const PUMP_POLL_TIMEOUT_MS: i32 = 10;
 const PUMP_READ_CHUNK: usize = 256;
 
 /// Pump thread body: wait (bounded) for the component-side FD to become
-/// readable, drain it, and stream the bytes out the TX pin. Exits when the
-/// shutdown flag is set, the peer end closes, or the FD errors.
-fn pump_loop(component_fd: RawFd, tx: &StreamTx, shutdown: &AtomicBool) {
+/// readable, drain it, and hand the bytes to `sink` — the TX pin's byte route,
+/// or the level bridge that frames them into edges. Exits when the shutdown
+/// flag is set, the peer end closes, or the FD errors.
+fn pump_loop(component_fd: RawFd, sink: &dyn Fn(&[u8]), shutdown: &AtomicBool) {
     let mut buf = [0u8; PUMP_READ_CHUNK];
     while !shutdown.load(Ordering::Relaxed) {
         let mut pollfd = libc::pollfd {
@@ -1353,7 +1420,7 @@ fn pump_loop(component_fd: RawFd, tx: &StreamTx, shutdown: &AtomicBool) {
         loop {
             match nix::unistd::read(fd, &mut buf) {
                 Ok(0) => return, // peer end closed
-                Ok(n) => tx.write(&buf[..n]),
+                Ok(n) => sink(&buf[..n]),
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
@@ -1526,7 +1593,7 @@ mod tests {
             .find(|p| p.number == "P2")
             .expect("TX pin declared");
         assert_eq!(tx.kind, PinKind::DigitalOut);
-        assert_eq!(tx.stream, Some(StreamRole::Producer { baud_hz: 115_200 }));
+        assert_eq!(tx.stream, None, "TX clocks out edges, not a byte route");
 
         let rx = mcu
             .pins()
@@ -1534,7 +1601,7 @@ mod tests {
             .find(|p| p.number == "P0")
             .expect("RX pin declared");
         assert_eq!(rx.kind, PinKind::DigitalIn);
-        assert_eq!(rx.stream, Some(StreamRole::Consumer { baud_hz: 115_200 }));
+        assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
     }
 
     /// Channels that are not bridged are not declared at all — the facade
@@ -1828,23 +1895,6 @@ mod tests {
     ) {
         assert_eq!(level_of_active(active, active_low), expect);
         assert_eq!(active_of_level(expect, active_low), active);
-    }
-
-    /// The bridge projects exactly what the engine will commit to, and refuses
-    /// to invent a level where the engine gave none.
-    #[rstest]
-    #[case::driven_high(NetState::Driven(Level::High), Some(Level::High))]
-    #[case::driven_low(NetState::Driven(Level::Low), Some(Level::Low))]
-    #[case::pulled(NetState::Pulled(Level::High, 10_000.0), Some(Level::High))]
-    #[case::analog_above(NetState::Analog(3.0), Some(Level::High))]
-    #[case::analog_below(NetState::Analog(0.4), Some(Level::Low))]
-    #[case::floating(NetState::Floating, None)]
-    #[case::contention(NetState::Contention, None)]
-    fn input_projection_never_invents_a_level(
-        #[case] state: NetState,
-        #[case] expect: Option<Level>,
-    ) {
-        assert_eq!(level_of(state), expect);
     }
 
     /// A direction GPIO's active state maps to the declared direction and its

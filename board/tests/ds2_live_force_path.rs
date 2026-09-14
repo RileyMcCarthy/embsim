@@ -12,25 +12,23 @@
 //!   `FloatingSense` finding naming the cause. The bench bug, live.
 
 use rstest::rstest;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use embsim_board::component::StreamTx;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, JumperState,
-    NetState, PartRegistry, PinDecl, PinKind, Scenario, SenseKind, StreamRole, System,
-    SystemHandle,
+    Board, EndpointRef, Finding, Harness, JumperState, NetState, PartRegistry, Scenario, SenseKind,
+    System, SystemHandle,
 };
 use embsim_core::virtual_clock;
 use embsim_models::ads122u04::Config;
-use embsim_models::ads122u04_component::{Ads122u04Component, ADS122U04_BAUD_HZ};
+use embsim_models::ads122u04_component::{ads122u04_framing, Ads122u04Component};
+
+mod uart_probe;
+use uart_probe::{ProbeHandle, UartProbe};
 
 // ============================================================
 // Shared plumbing
 // ============================================================
-
-type TxSlot = Arc<Mutex<Option<StreamTx>>>;
-type ByteLog = Arc<Mutex<Vec<u8>>>;
 
 /// Paced tests re-anchor the process-global virtual clock; serialize them
 /// (poison-recovering, like the stream-routing suite).
@@ -105,76 +103,17 @@ const HOST_NETLIST: &str = r#"(export (version "E")
       (node (ref "MCU") (pin "2") (pinfunction "RX") (pintype "input"))
       (node (ref "J1") (pin "2") (pintype "passive")))))"#;
 
-/// Host UART: shares its stream-write half and logs every received byte.
-struct FakeHost {
-    pins: [PinDecl; 2],
-    tx: TxSlot,
-    rx: ByteLog,
-}
-
-impl FakeHost {
-    fn new(tx: TxSlot, rx: ByteLog) -> Self {
-        Self {
-            pins: [
-                PinDecl {
-                    number: "1",
-                    name: Some("TX"),
-                    kind: PinKind::DigitalOut,
-                    stream: Some(StreamRole::Producer {
-                        baud_hz: ADS122U04_BAUD_HZ,
-                    }),
-                    drive_impedance: None,
-                },
-                PinDecl {
-                    number: "2",
-                    name: Some("RX"),
-                    kind: PinKind::DigitalIn,
-                    stream: Some(StreamRole::Consumer {
-                        baud_hz: ADS122U04_BAUD_HZ,
-                    }),
-                    drive_impedance: None,
-                },
-            ],
-            tx,
-            rx,
-        }
-    }
-}
-
-impl Component for FakeHost {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        *self.tx.lock().unwrap() = Some(io.stream_tx("TX")?);
-        let log = Arc::clone(&self.rx);
-        io.on_byte("RX", move |byte| log.lock().unwrap().push(byte))?;
-        Ok(())
-    }
-}
-
-/// Probe bundle for the host UART end.
-struct HostProbe {
-    tx: TxSlot,
-    rx: ByteLog,
-}
-
-impl HostProbe {
-    fn new() -> Self {
-        Self {
-            tx: Arc::new(Mutex::new(None)),
-            rx: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn tx(&self) -> StreamTx {
-        self.tx.lock().unwrap().clone().expect("host attached")
-    }
-
-    fn rx(&self) -> Vec<u8> {
-        self.rx.lock().unwrap().clone()
-    }
+/// Host UART: the level-speaking probe standing in for the MCU's serial
+/// channel. `J1.1`/`J1.2` on the netlist are its TX and RX.
+fn fake_host(handle: ProbeHandle) -> UartProbe {
+    UartProbe::new(
+        "1",
+        Some("TX"),
+        "2",
+        Some("RX"),
+        ads122u04_framing(),
+        handle,
+    )
 }
 
 // ============================================================
@@ -186,13 +125,11 @@ impl HostProbe {
 /// two bridge sources at 1.65 V ± `diff_volts`/2 into J2.3/J2.4, the input
 /// jumpers closed, and — when `reset_bodge` — the bench fix (`pin_short`
 /// U1.3 → U1.13) that ties `~RESET` to the DVDD rail.
-fn ds2_live_system(reset_bodge: bool, diff_volts: f64, host: &HostProbe) -> SystemHandle {
+fn ds2_live_system(reset_bodge: bool, diff_volts: f64, host: &ProbeHandle) -> SystemHandle {
     let mut registry = PartRegistry::new();
     {
-        let (tx, rx) = (Arc::clone(&host.tx), Arc::clone(&host.rx));
-        registry.register("FAKE_HOST", move |_decl| {
-            Box::new(FakeHost::new(Arc::clone(&tx), Arc::clone(&rx)))
-        });
+        let host = host.clone();
+        registry.register("FAKE_HOST", move |_decl| Box::new(fake_host(host.clone())));
     }
     registry.register("ADS122U04", |_decl| {
         Box::new(Ads122u04Component::new(Config {
@@ -267,7 +204,7 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000); // 115.2 kbaud pacing samples the clock
 
-    let host = HostProbe::new();
+    let host = ProbeHandle::new();
     // 256 mV differential: 1.778 V / 1.522 V at the bridge terminals.
     let system = ds2_live_system(true, 0.256, &host);
 
@@ -303,13 +240,13 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
     );
 
     // SYNC + RDATA into the ADS RX endpoint (via the host TX producer).
-    host.tx().write(&[0x55, 0x10]);
+    host.send(&[0x55, 0x10]);
     assert!(
-        wait_for(|| host.rx().len() >= 3, Duration::from_secs(10)),
+        wait_for(|| host.received().len() >= 3, Duration::from_secs(10)),
         "RDATA must answer with a 3-byte conversion; got {:?}",
-        host.rx()
+        host.received()
     );
-    let rx = host.rx();
+    let rx = host.received();
     assert_eq!(rx.len(), 3, "exactly one conversion frame; got {rx:?}");
 
     // The returned code matches the model transfer function applied to the
@@ -345,7 +282,7 @@ fn without_the_reset_bodge_the_chip_stays_silent() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000);
 
-    let host = HostProbe::new();
+    let host = ProbeHandle::new();
     let system = ds2_live_system(false, 0.256, &host);
 
     // The engine names the cause before any traffic.
@@ -360,12 +297,12 @@ fn without_the_reset_bodge_the_chip_stays_silent() {
 
     // Perfect SYNC + RDATA in — and nothing out. 400 wall ms at 50× is
     // 20 virtual seconds: any response would long since have arrived.
-    host.tx().write(&[0x55, 0x10]);
+    host.send(&[0x55, 0x10]);
     std::thread::sleep(Duration::from_millis(400));
     assert!(
-        host.rx().is_empty(),
+        host.received().is_empty(),
         "a chip held in reset must never answer; got {:?}",
-        host.rx()
+        host.received()
     );
     assert!(
         system.engine_is_alive(),

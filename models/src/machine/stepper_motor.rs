@@ -1468,13 +1468,6 @@ mod tests {
             .expect("declared pin");
         assert_eq!(decl.kind, PinKind::DigitalIn);
         assert_eq!(decl.stream, role);
-        assert!(
-            !matches!(
-                decl.stream,
-                Some(StreamRole::Producer { .. } | StreamRole::Consumer { .. })
-            ),
-            "a motor drive is not a serial endpoint"
-        );
     }
 
     /// The shaft is a handle onto the same plant, not a copy of it.

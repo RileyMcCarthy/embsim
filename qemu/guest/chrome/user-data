@@ -1,0 +1,178 @@
+#cloud-config
+# The Chrome guest: a Debian that boots straight into a headless Chromium a
+# host harness can drive over DevTools, with the embsim agent and a policy
+# that hands the host's web app the board's serial port. Provisioned once by
+# build.sh (which substitutes __KERNEL_ARCH__); the result is frozen into an
+# image and never provisioned again.
+hostname: embsim-chrome
+disable_root: false
+ssh_pwauth: false
+chpasswd:
+  expire: false
+  users:
+    # Console login for debugging a guest by hand; the guest has no network
+    # reachable from anywhere but the host's user-mode NAT.
+    - name: root
+      password: embsim
+      type: text
+users:
+  - name: embsim
+    gecos: embsim browser user
+    shell: /bin/bash
+    lock_passwd: true
+    groups: [dialout, plugdev]
+
+package_update: true
+package_upgrade: false
+packages:
+  - chromium
+  - python3
+  # The cloud kernel has no USB stack; the serial port arrives over USB.
+  - linux-image-__KERNEL_ARCH__
+
+write_files:
+  # Web Serial without a picker, and a secure-context waiver for the host's
+  # dev server: 10.0.2.2 is the host under QEMU user-mode networking. Both
+  # policies match EXPLICIT origins only — a bare host or a `:*` port is
+  # silently ignored (measured) — so the usual dev-server ports are listed.
+  - path: /etc/chromium/policies/managed/embsim.json
+    permissions: "0644"
+    content: |
+      {
+        "SerialAllowAllPortsForUrls": [
+          "http://10.0.2.2:5174", "http://10.0.2.2:4173", "http://10.0.2.2:5173",
+          "http://10.0.2.2:3000", "http://10.0.2.2:8000", "http://10.0.2.2:8080"
+        ],
+        "OverrideSecurityRestrictionsOnInsecureOrigin": [
+          "http://10.0.2.2:5174", "http://10.0.2.2:4173", "http://10.0.2.2:5173",
+          "http://10.0.2.2:3000", "http://10.0.2.2:8000", "http://10.0.2.2:8080"
+        ]
+      }
+
+  # The agent: answers `t <seq>` with `<seq> <CLOCK_MONOTONIC ns>` on the
+  # virtio-serial port the host attaches (embsim_qemu::AGENT_PORT_NAME).
+  - path: /usr/local/bin/embsim-agent
+    permissions: "0755"
+    content: |
+      #!/usr/bin/python3 -u
+      import glob, os, time
+      NAME = "embsim.agent"
+      def find_port():
+          # No udev rule makes /dev/virtio-ports/<name> here; ask sysfs which
+          # vport carries our name.
+          for p in glob.glob("/sys/class/virtio-ports/*/name"):
+              try:
+                  if open(p).read().strip() == NAME:
+                      return "/dev/" + p.split("/")[-2]
+              except OSError:
+                  pass
+          return None
+      while True:
+          port = find_port()
+          if port is None:
+              time.sleep(1)      # no agent device on this machine (yet)
+              continue
+          try:
+              fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
+          except OSError:
+              time.sleep(1)
+              continue
+          buf = b""
+          try:
+              while True:
+                  chunk = os.read(fd, 256)
+                  if not chunk:
+                      time.sleep(0.05)   # host end not connected
+                      continue
+                  buf += chunk
+                  while b"\n" in buf:
+                      line, buf = buf.split(b"\n", 1)
+                      parts = line.split()
+                      if len(parts) == 2 and parts[0] == b"t":
+                          os.write(fd, b"%s %d\n" % (parts[1], time.monotonic_ns()))
+          except OSError:
+              os.close(fd)
+              time.sleep(0.2)
+
+  # Chromium binds DevTools to loopback only; the host reaches it through
+  # this relay on all interfaces (port-forwarded by the launcher).
+  - path: /usr/local/bin/embsim-devtools-relay
+    permissions: "0755"
+    content: |
+      #!/usr/bin/python3
+      import asyncio
+      async def pipe(r, w):
+          try:
+              while (d := await r.read(65536)):
+                  w.write(d); await w.drain()
+          except Exception:
+              pass
+          finally:
+              w.close()
+      async def handle(cr, cw):
+          try:
+              ur, uw = await asyncio.open_connection("127.0.0.1", 9222)
+          except OSError:
+              cw.close(); return
+          await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+      async def main():
+          srv = await asyncio.start_server(handle, "0.0.0.0", 9223)
+          await srv.serve_forever()
+      asyncio.run(main())
+
+  - path: /etc/systemd/system/embsim-agent.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=embsim guest agent (clock queries over virtio-serial)
+      [Service]
+      ExecStart=/usr/local/bin/embsim-agent
+      Restart=always
+      RestartSec=1
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/embsim-devtools-relay.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=embsim DevTools relay (0.0.0.0:9223 -> 127.0.0.1:9222)
+      After=network.target
+      [Service]
+      ExecStart=/usr/local/bin/embsim-devtools-relay
+      Restart=always
+      RestartSec=1
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/embsim-chromium.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=embsim headless Chromium with DevTools on 127.0.0.1:9222
+      After=network.target
+      [Service]
+      User=embsim
+      Environment=HOME=/var/lib/embsim
+      ExecStart=/usr/bin/chromium --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir=/var/lib/embsim/chromium about:blank
+      Restart=always
+      RestartSec=1
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Nothing in the guest may learn wall time from outside, and nothing may
+  # phone home: this machine lives on the board's clock.
+  - [ sh, -c, "systemctl disable --now systemd-timesyncd.service apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service 2>/dev/null || true" ]
+  # Leave grub only the full kernel to boot.
+  - [ sh, -c, "DEBIAN_FRONTEND=noninteractive apt-get purge -y -q 'linux-image-*cloud*'" ]
+  - [ sh, -c, "mkdir -p /var/lib/embsim && chown embsim:embsim /var/lib/embsim" ]
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, embsim-agent.service, embsim-devtools-relay.service, embsim-chromium.service ]
+  - [ sh, -c, "echo EMBSIM-PROVISIONED > /dev/console" ]
+
+power_state:
+  mode: poweroff
+  message: provisioned
+  timeout: 60
+  condition: true

@@ -17,17 +17,17 @@
 //! process-global virtual clock; the fixture-shape tests stay pure.
 
 use rstest::rstest;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use embsim_board::component::StreamTx;
 use embsim_board::mcu::SerialChannelConfig;
-use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, Harness, McuComponent, PartRegistry,
-    PinDecl, PinKind, StreamRole, System,
-};
+use embsim_board::uart::UartFraming;
+use embsim_board::{Board, Harness, McuComponent, PartRegistry, PinKind, System};
 use embsim_core::virtual_clock;
 use embsim_peripherals::serial;
+
+mod uart_probe;
+use uart_probe::{ProbeHandle, UartProbe};
 
 // ============================================================
 // Fixture: MCU board + peer board + straight harness
@@ -77,53 +77,17 @@ const PEER_NETLIST: &str = r#"(export (version "E")
       (node (ref "U1") (pin "2") (pinfunction "RX") (pintype "input"))
       (node (ref "J1") (pin "2") (pintype "passive")))))"#;
 
-type TxSlot = Arc<Mutex<Option<StreamTx>>>;
-type ByteLog = Arc<Mutex<Vec<u8>>>;
+/// The process-default peripheral bank and the virtual clock are global, so
+/// the live tests in this file run one at a time. (The header's "only one
+/// test" note predates there being three of them; the lock is what makes that
+/// true in practice.)
+static CLOCK_LOCK: Mutex<()> = Mutex::new(());
 
-/// Peer UART component: shares its stream-write half and logs received
-/// bytes (the same probe shape the stream-routing suite uses).
-struct PeerUart {
-    pins: [PinDecl; 2],
-    tx: TxSlot,
-    rx: ByteLog,
-}
-
-impl PeerUart {
-    fn new(baud_hz: u32, tx: TxSlot, rx: ByteLog) -> Self {
-        Self {
-            pins: [
-                PinDecl {
-                    number: "1",
-                    name: Some("TX"),
-                    kind: PinKind::DigitalOut,
-                    stream: Some(StreamRole::Producer { baud_hz }),
-                    drive_impedance: None,
-                },
-                PinDecl {
-                    number: "2",
-                    name: Some("RX"),
-                    kind: PinKind::DigitalIn,
-                    stream: Some(StreamRole::Consumer { baud_hz }),
-                    drive_impedance: None,
-                },
-            ],
-            tx,
-            rx,
-        }
-    }
-}
-
-impl Component for PeerUart {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        *self.tx.lock().unwrap() = Some(io.stream_tx("TX")?);
-        let log = Arc::clone(&self.rx);
-        io.on_byte("RX", move |byte| log.lock().unwrap().push(byte))?;
-        Ok(())
-    }
+fn lock_clock() -> MutexGuard<'static, ()> {
+    CLOCK_LOCK.lock().unwrap_or_else(|poisoned| {
+        CLOCK_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
 }
 
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
@@ -145,16 +109,15 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 /// the system joins the engine and the pump threads cleanly.
 #[rstest]
 fn bridged_serial_channel_roundtrips_to_a_peer_board() {
-    // Stream pacing samples the free-running virtual clock; 50x scale keeps
-    // the 115.2 kbaud pacing sub-millisecond in wall time.
+    let _g = lock_clock();
+    // 50x scale keeps the 115.2 kbaud bit clock sub-millisecond in wall time.
     virtual_clock::init(50.0, 1_000_000);
 
     // The runtime's role: size the default instance's serial bank before
     // wiring (Emulator::run step 2). Channel 0 is the bridged FG channel.
     serial::init(1);
 
-    let peer_tx: TxSlot = Arc::new(Mutex::new(None));
-    let peer_rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
+    let peer = ProbeHandle::new();
 
     let mut registry = PartRegistry::new();
     registry.register("MCU_P2", |_decl| {
@@ -167,9 +130,16 @@ fn bridged_serial_channel_roundtrips_to_a_peer_board() {
         )
     });
     {
-        let (tx, rx) = (Arc::clone(&peer_tx), Arc::clone(&peer_rx));
+        let peer = peer.clone();
         registry.register("PEER_UART", move |_decl| {
-            Box::new(PeerUart::new(115_200, Arc::clone(&tx), Arc::clone(&rx)))
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                UartFraming::new_8n1(FG.baud),
+                peer.clone(),
+            ))
         });
     }
 
@@ -198,37 +168,22 @@ fn bridged_serial_channel_roundtrips_to_a_peer_board() {
         .start()
         .expect("live system starts");
 
-    // A correctly-wired bridge raises no stream mismatch.
-    assert!(
-        !system
-            .findings()
-            .iter()
-            .any(|f| matches!(f, Finding::StreamMismatch { .. })),
-        "straight harness must route cleanly; got {:?}",
-        system.findings()
-    );
-
     // Firmware → peer: transmit through the peripheral bank exactly as the
-    // HAL trampoline would; the pump moves it out the P2 producer pin,
-    // through the harness, into the peer's on_byte.
+    // HAL trampoline would; the pump frames it onto the P2 TX pin, the edges
+    // cross the harness, and the peer's decoder puts the byte back together.
     serial::transmit_data(0, &[0x55, 0x08, 0x02]);
     assert!(
         wait_for(
-            || peer_rx.lock().unwrap().as_slice() == [0x55, 0x08, 0x02],
+            || peer.received() == [0x55, 0x08, 0x02],
             Duration::from_secs(5)
         ),
         "firmware TX bytes must reach the peer; got {:?}",
-        peer_rx.lock().unwrap()
+        peer.frames()
     );
 
-    // Peer → firmware: bytes the peer streams arrive readable on the
-    // firmware side of the bridged channel, in wire order.
-    peer_tx
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("peer attached")
-        .write(b"OK");
+    // Peer → firmware: edges the peer drives arrive readable on the firmware
+    // side of the bridged channel, in wire order.
+    peer.send(b"OK");
     let mut got: Vec<u8> = Vec::new();
     assert!(
         wait_for(
@@ -263,9 +218,9 @@ fn bridged_serial_channel_roundtrips_to_a_peer_board() {
 // Pin-table correctness from a sample config
 // ============================================================
 
-/// The FG channel's pin table: P0 is the Consumer-side (MCU RX) pin and P2
-/// the Producer-side (MCU TX) pin, both paced at the table's 115.2 kbaud —
-/// the emulator invents no baud of its own.
+/// The FG channel's pin table: P0 is the MCU's RX pin and P2 its TX pin, both
+/// plain digital — the UART is framed onto the net, so there is no byte route
+/// to declare.
 #[rstest]
 fn fg_channel_pin_table_matches_the_hal_config() {
     let mcu = McuComponent::builder("p2")
@@ -274,16 +229,16 @@ fn fg_channel_pin_table_matches_the_hal_config() {
         .build()
         .expect("builds");
 
-    let pins = mcu.pins();
+    let pins = embsim_board::Component::pins(&mcu);
     assert_eq!(pins.len(), 2, "one bridged channel declares two pins");
 
     let tx = pins.iter().find(|p| p.number == "P2").expect("P2 declared");
     assert_eq!(tx.kind, PinKind::DigitalOut);
-    assert_eq!(tx.stream, Some(StreamRole::Producer { baud_hz: 115_200 }));
+    assert_eq!(tx.stream, None, "TX clocks out edges, not a byte route");
 
     let rx = pins.iter().find(|p| p.number == "P0").expect("P0 declared");
     assert_eq!(rx.kind, PinKind::DigitalIn);
-    assert_eq!(rx.stream, Some(StreamRole::Consumer { baud_hz: 115_200 }));
+    assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
 }
 
 // ============================================================
@@ -301,10 +256,10 @@ fn fg_channel_pin_table_matches_the_hal_config() {
 fn entry_runs_on_the_component_instance_and_reaches_the_peer() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000);
 
-    let peer_tx: TxSlot = Arc::new(Mutex::new(None));
-    let peer_rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
+    let peer = ProbeHandle::new();
 
     // Set by the entry thread; read by the test.
     static ROUTED_OFF_DEFAULT: AtomicBool = AtomicBool::new(false);
@@ -340,9 +295,16 @@ fn entry_runs_on_the_component_instance_and_reaches_the_peer() {
         )
     });
     {
-        let (tx, rx) = (Arc::clone(&peer_tx), Arc::clone(&peer_rx));
+        let peer = peer.clone();
         registry.register("PEER_UART", move |_decl| {
-            Box::new(PeerUart::new(115_200, Arc::clone(&tx), Arc::clone(&rx)))
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                UartFraming::new_8n1(FG.baud),
+                peer.clone(),
+            ))
         });
     }
 
@@ -373,12 +335,9 @@ fn entry_runs_on_the_component_instance_and_reaches_the_peer() {
     // The entry's boot bytes cross the bridge: proof its HAL calls landed
     // on the attached (component-owned) instance with the bridge intact.
     assert!(
-        wait_for(
-            || peer_rx.lock().unwrap().as_slice() == b"BOOT",
-            Duration::from_secs(5)
-        ),
+        wait_for(|| peer.received() == b"BOOT", Duration::from_secs(5)),
         "entry bytes must reach the peer; got {:?}",
-        peer_rx.lock().unwrap()
+        peer.frames()
     );
     assert!(
         ROUTED_OFF_DEFAULT.load(Ordering::Relaxed),

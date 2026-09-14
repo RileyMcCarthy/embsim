@@ -1,0 +1,20 @@
+[package]
+name = "embsim-qemu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedded MCU simulator — a QEMU virtual machine as a board component: guest time metered by the virtual clock, its serial port on a net"
+keywords = ["embedded", "emulator", "simulation", "sil", "qemu"]
+categories = ["embedded", "simulation"]
+
+[dependencies]
+embsim-core = { path = "../core" }
+embsim-board = { path = "../board" }
+libc.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

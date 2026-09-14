@@ -201,21 +201,15 @@ fn every_p2_io_pin_is_reachable() {
         .iter()
         .find(|p| p.number == "P2")
         .expect("P2 declared");
-    assert!(
-        matches!(
-            rx.stream,
-            Some(embsim_board::StreamRole::Consumer { baud_hz: 115_200 })
-        ),
-        "P0 is the force-gauge RX pin at the table baud; got {:?}",
-        rx.stream
-    );
-    assert!(
-        matches!(
-            tx.stream,
-            Some(embsim_board::StreamRole::Producer { baud_hz: 115_200 })
-        ),
-        "P2 is the force-gauge TX pin at the table baud; got {:?}",
-        tx.stream
+    // The channel carries levels, so neither pin declares a byte route: the
+    // framing lives in the MCU component, and what is on the net is edges.
+    assert_eq!(rx.stream, None, "P0 reads edges, not routed bytes");
+    assert_eq!(rx.kind, embsim_board::PinKind::DigitalIn);
+    assert_eq!(tx.stream, None, "P2 clocks out edges, not a byte route");
+    assert_eq!(
+        tx.kind,
+        embsim_board::PinKind::DigitalOut,
+        "P2 is the force-gauge TX pin, and the only one this slice drives"
     );
 }
 

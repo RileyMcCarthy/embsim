@@ -12,10 +12,14 @@ Companion to [`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
 predictions in this document they corrected, are in
 [Recommendation and phasing](#recommendation-and-phasing).
 
-**One-counter clock.** There is no Instant-based free-running mode.
-`virtual_us` is always the counter; `ClockMode::FreeRunning` vs `Stepped` is
-only wall pacing after `advance_to` (`speed > 0` sleeps the host, `speed <= 0`
-is instant). The T0 "sampled timestamps" baseline below is historical.
+**One-counter clock.** There is no Instant-based free-running mode. The
+counter is nanoseconds (`virtual_ns`); `virtual_us` is a truncating view of it
+and every microsecond wait/schedule call is an exact wrapper over the
+nanosecond one. `virtual_ns` is always the counter; `ClockMode::FreeRunning` vs `Stepped` is
+only wall pacing after `advance_to` (`speed > 0` holds the host back to a
+wall deadline derived from the virtual span — never a sleep per jump, which
+charged the kernel's sleep granularity to every nanosecond-scale edge —
+`speed <= 0` is instant). The T0 "sampled timestamps" baseline below is historical.
 
 The requirement this document answers is a consumer's, stated plainly: *"once
 it's all connected the SIL model runs deterministically."* Today it does not,
@@ -442,6 +446,18 @@ that answer it:
   **UI-driven E2E stays T0/T1-with-host-io**. The fully deterministic scenarios
   are the ones scripted inside the emulator process — which is what the
   bench-bug suite wants anyway.
+
+- **A computer node (`embsim-qemu`) is host I/O with a metered clock.** The
+  `QemuNode` runs a real OS and a real browser inside a VM, so its
+  scheduling, its network stack and its JIT are as non-reproducible as a
+  human at a terminal — a run with one in it is T1-with-host-io like the PTY
+  above, not T1. What it adds over the PTY is a *bound*: the node is a
+  registered actor that parks at every slice boundary and lets the guest run
+  only while it is awake, so the guest's clock and the virtual clock never
+  drift apart by more than one slice (`QemuNode::with_slice`, default 10 ms)
+  and a host-side timeout counts simulated time. That is the property to
+  assert about such a run — `NodeStats::skew_ns` bounded, `shed` zero — not
+  a golden trace.
 
 - **Wall-clock deadlines inside the simulation** must become virtual:
   `Serial::receive_data_timeout`'s `Instant` deadline and its EAGAIN sleep,

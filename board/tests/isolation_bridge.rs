@@ -578,20 +578,19 @@ fn an_unpowered_isolated_side_stops_the_step_path() {
 /// the switch's "short to the emitter, not to ground" rule against a real
 /// netlist.
 ///
-/// # A pinned engine limitation
+/// # The base network carries the driver's level
 ///
-/// Driving `P6` **low** does reach `OUTC`, and this test asserts that — but it
-/// does not reach `Q1`'s base. `Net-(Q1-B)` is reached only through `R24`
-/// (43 kΩ), and the resolver's projection for a net reached solely through
-/// conduction edges takes its *level* from the cluster's **power** source
-/// (`engine.rs`, "Reached only through conduction edges"); a cluster fed by a
-/// signal driver rather than a rail has none, so the projection defaults to
-/// `Pulled(High)` whichever way the driver is pointing. The assertion below
-/// pins that: it is the truth about the engine today, not about the
-/// transistor. `Q1` turning **off** is asserted where the engine can express
-/// it — on a released `OUTC`, in
-/// [`an_unpowered_isolated_side_stops_the_step_path`] — and exhaustively in
-/// the model's own unit tests.
+/// `Net-(Q1-B)` is reached only through `R24` (43 kΩ). The resolver's
+/// projection for such a net used to take its level from the cluster's
+/// **power** source alone, so a cluster fed by a signal driver rather than a
+/// rail projected `Pulled(High)` whichever way the driver was pointing — and
+/// an earlier revision of this test pinned that, saying "the day the
+/// projection learns to carry a driver's level, this test fails and says so".
+///
+/// It did. `engine.rs`'s "Reached only through conduction edges" arm now falls
+/// back to the level the cluster's drivers agree on, so releasing `P6` reaches
+/// the base and turns `Q1` off — which is what the transistor does on the
+/// bench, and what this test now asserts.
 #[rstest]
 fn the_enable_path_crosses_the_isolator_and_the_transistor() {
     let rig = start(true, false, &[]);
@@ -625,17 +624,19 @@ fn the_enable_path_crosses_the_isolator_and_the_transistor() {
         NetState::Driven(Level::Low),
         "and back down again — the channel is a repeater, not a latch"
     );
-    // ...but the pinned limitation above means the base network does not
-    // carry the low, so Q1 stays on. Asserted so the day the projection
-    // learns to carry a driver's level, this test fails and says so.
+    // ...and the low reaches the base through R24, so the transistor lets go.
+    let base = format!("{EDGE}.Net-(Q1-B)");
     assert!(
         matches!(
-            rig.system.net_state(&format!("{EDGE}.Net-(Q1-B)")),
-            Some(NetState::Pulled(Level::High, _))
+            settled_state(&rig.system, &base, NetState::Pulled(Level::Low, 43_000.0)),
+            NetState::Pulled(Level::Low, _)
         ),
-        "pinned: a net reached only through a signal-driven resistor projects \
-         high regardless of the driver; got {:?}",
-        rig.system.net_state(&format!("{EDGE}.Net-(Q1-B)"))
+        "a 43 kOhm base resistor carries the driver's level, not a default; got {:?}",
+        rig.system.net_state(&base)
+    );
+    assert!(
+        wait_for(|| !switch.is_on(), SETTLE),
+        "Q1 must come out of saturation once its base goes low"
     );
     rig.system.shutdown();
 }
