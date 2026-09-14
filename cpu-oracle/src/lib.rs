@@ -33,7 +33,10 @@ pub mod gate;
 pub mod sweep;
 
 pub use buckets::Observability;
-pub use capture::{capture, Capture, Progress, SiliconTarget};
+// Note the function is NOT re-exported here: a crate-root `capture` that is
+// both this module and its `capture()` function is ambiguous to rustdoc, and
+// `cargo doc -D warnings` rejects it. Call it as `capture::capture(..)`.
+pub use capture::{Capture, Progress, SiliconTarget};
 pub use coverage::{never_captured, undiscriminated, Undiscriminated};
 pub use gate::{evaluate, Baseline, Verdict};
 pub use sweep::{
