@@ -23,6 +23,17 @@ pub type Volts = f64;
 /// [`crate::component::PinDecl::drive_impedance`]).
 pub const DEFAULT_PUSH_PULL_IMPEDANCE: Ohms = 25.0;
 
+/// Rail a push-pull digital output drives High at.
+///
+/// One value for the whole crate rather than a per-part knob: a component on
+/// another rail models the level shifter *as a component*, which is the same
+/// answer `mcu` has always given for its GPIO outputs.
+pub const LOGIC_HIGH_VOLTS: Volts = 3.3;
+
+/// Threshold a digital input applies to a numerically solved net. Matches the
+/// engine's own digital projection.
+pub const LOGIC_THRESHOLD_VOLTS: Volts = 1.5;
+
 /// Series-resistance collapse threshold: series passives whose accumulated
 /// resistance stays below this value collapse into a serial link route, and
 /// disagreeing push-pull drivers coupled below it resolve to
@@ -120,6 +131,40 @@ pub struct Net {
     pub state: NetState,
 }
 
+// ============================================================
+// Digital projection
+// ============================================================
+
+/// The logic level a resolved net presents, or `None` when the engine refuses
+/// to give one.
+///
+/// A floating or contended net has no level, and nothing downstream may invent
+/// one: an input with no level holds whatever value its owner last saw. That
+/// refusal is the whole reason `Floating` and `Contention` are states rather
+/// than a defaulted `Low`.
+pub fn level_of(state: NetState) -> Option<Level> {
+    match state {
+        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
+        NetState::Analog(volts) => Some(if volts >= LOGIC_THRESHOLD_VOLTS {
+            Level::High
+        } else {
+            Level::Low
+        }),
+        NetState::Floating | NetState::Contention => None,
+    }
+}
+
+/// The Thevenin contribution of a push-pull digital output at `level`.
+pub fn digital_drive(level: Level) -> TheveninDrive {
+    TheveninDrive {
+        volts: match level {
+            Level::High => LOGIC_HIGH_VOLTS,
+            Level::Low => 0.0,
+        },
+        impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -169,6 +214,42 @@ mod tests {
     #[case::analog_vs_driven(NetState::Analog(3.3), NetState::Driven(Level::High))]
     fn net_state_projections_are_distinct(#[case] a: NetState, #[case] b: NetState) {
         assert_ne!(a, b);
+    }
+
+    /// A digital input projects exactly what the engine will commit to, and
+    /// refuses to invent a level where the engine gave none.
+    #[rstest]
+    #[case::driven_high(NetState::Driven(Level::High), Some(Level::High))]
+    #[case::driven_low(NetState::Driven(Level::Low), Some(Level::Low))]
+    #[case::pulled(NetState::Pulled(Level::High, 10_000.0), Some(Level::High))]
+    #[case::analog_above(NetState::Analog(3.0), Some(Level::High))]
+    #[case::analog_below(NetState::Analog(0.4), Some(Level::Low))]
+    #[case::floating(NetState::Floating, None)]
+    #[case::contention(NetState::Contention, None)]
+    fn input_projection_never_invents_a_level(
+        #[case] state: NetState,
+        #[case] expect: Option<Level>,
+    ) {
+        assert_eq!(level_of(state), expect);
+    }
+
+    /// A push-pull output drives the rail, or ground, at the default strength.
+    #[rstest]
+    fn a_digital_output_drives_the_rail() {
+        assert_eq!(
+            digital_drive(Level::High),
+            TheveninDrive {
+                volts: LOGIC_HIGH_VOLTS,
+                impedance: DEFAULT_PUSH_PULL_IMPEDANCE
+            }
+        );
+        assert_eq!(
+            digital_drive(Level::Low),
+            TheveninDrive {
+                volts: 0.0,
+                impedance: DEFAULT_PUSH_PULL_IMPEDANCE
+            }
+        );
     }
 
     #[rstest]

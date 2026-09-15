@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 env:
@@ -220,3 +221,26 @@ jobs:
             exit 1
           fi
           echo "CI Gate passed — every required job succeeded."
+
+  # Tag-driven GitHub Release (vX.Y.Z). Same gate as branch protection: only
+  # publishes after CI Gate succeeds on the tagged commit. No crates.io publish.
+  release:
+    name: GitHub Release
+    needs: ci-gate
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.ci-gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Version from tag
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: embsim ${{ steps.ver.outputs.VERSION }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -5,12 +5,14 @@ members = [
     "peripherals",
     "platforms/p2",
     "models",
+    "qemu",
     "runtime",
     "build-support",
     "tools/memory-inspect",
     "tools/ui",
     "tools/trace",
     "examples/minimal",
+    "cpu-oracle",
 ]
 resolver = "2"
 

@@ -43,27 +43,26 @@
 //! whole conduction cluster goes through the [`ClusterSolver`]
 //! ([`crate::cluster::QuasiStaticMna`] by default).
 //!
-//! **Stream routing** (`BOARD_ENGINE.md`, "Stream endpoints (serial over
-//! pins)") is engine-owned and **derived from net resolution, never
-//! installed beside it**: the shared `Resolver` routes each stream
-//! `Producer` to the `Consumer`s reachable through its net and through
-//! series passives whose accumulated resistance stays below
-//! [`STREAM_COLLAPSE_THRESHOLD`] (the DS2Addon's 47 Ω series resistors
-//! collapse into the link). The routing pass runs at build, at engine spawn,
-//! and on any topology-affecting change; two producers reachable from each
-//! other raise [`Finding::StreamMismatch`] and neither routes. Producer
-//! bytes are enqueued (`Command::StreamWrite`), paced at the producer's
-//! declared baud against virtual time (10 bits/byte, the embsim 8N1 serial
-//! convention — paced streams therefore require `virtual_clock::init`), and
-//! delivered from the engine thread with no lock held. Delivery is gated by
-//! the live state of the nets the link spans: bytes written into a broken
-//! route — or one resolving `Contention`/`Floating` — are dropped with a
-//! trace, never queued forever. Paced routes cap their in-flight queue
-//! (`STREAM_ROUTE_QUEUE_MAX`) and shed the overflow with a
-//! [`Finding::StreamOverrun`].
+//! **Pulse routing** is engine-owned and **derived from net resolution, never
+//! installed beside it**: the shared `Resolver` routes each
+//! [`crate::StreamRole::PulseSource`] to the sinks reachable through its net
+//! and through series passives whose accumulated resistance stays below
+//! [`STREAM_COLLAPSE_THRESHOLD`]. The routing pass runs at build, at engine
+//! spawn, and on any topology-affecting change; two sources reachable from
+//! each other raise [`Finding::StreamMismatch`] and neither routes.
+//!
+//! There used to be a **byte** route beside it, carrying UART traffic from a
+//! `Producer` pin to reachable `Consumer`s. It is gone. The net decided who
+//! was connected and then the payload went around the resolution, so a byte
+//! could not be corrupted by a fighting driver or notice a floating line —
+//! and every mechanism it bypassed (a level crossing a series resistor, a
+//! wake delivered on time) turned out to be broken in ways nothing could see.
+//! Bytes are framed onto the net as levels now, by
+//! [`crate::SerialLevelBridge`]. A rate is the one encoding left that is
+//! exactly lossless without being a waveform.
 //!
 //! **Failure containment**: component-provided callbacks (sense, wake,
-//! stream-byte, topology) are panic-contained — a panic is reported as a
+//! pulse, topology) are panic-contained — a panic is reported as a
 //! [`Finding::CallbackPanic`] and the engine stays alive, so one
 //! misbehaving component never silently ends net service for the rest of
 //! the system. Requests that need the virtual clock before
@@ -95,9 +94,9 @@
 //! this rule; `BOARD_ENGINE.md` cross-references it.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -115,7 +114,6 @@ use crate::net::{
     Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, ESCALATION_IMPEDANCE_RATIO,
     STREAM_COLLAPSE_THRESHOLD,
 };
-use crate::system::StreamDropPolicy;
 
 // ============================================================
 // Constants
@@ -133,22 +131,29 @@ const DIGITAL_LEVEL_THRESHOLD_VOLTS: Volts = 1.5;
 /// of this value, so the exact figure only reaches escalated cluster solves.
 pub(crate) const DEFAULT_HIGH_LEVEL_VOLTS: Volts = 3.3;
 
-/// Bits clocked per byte for stream baud pacing (8N1: 1 start + 8 data +
-/// 1 stop), matching the embsim serial peripheral's pacing convention.
-const STREAM_BITS_PER_BYTE: u64 = 10;
-
 /// Max commands handled before returning to the timer wheel. A live flood
 /// can keep `try_recv` non-empty forever; without a cap, time never jumps.
 const COMMAND_DRAIN_BATCH_MAX: usize = 64;
 
-/// Maximum in-flight (paced, deadline-stamped) bytes per stream route. A
-/// real UART has a finite TX path, not an infinite buffer: a producer that
-/// sustains writes above its declared baud would otherwise grow the queue —
-/// and its virtual delivery horizon — without bound. Overflow bytes are
-/// shed with a trace and a [`Finding::StreamOverrun`] naming the producer
-/// pin (the natural surface for a producer-vs-declared-baud mismatch). At
-/// 115 200 baud this depth is well under a second of backlog.
-const STREAM_ROUTE_QUEUE_MAX: usize = 8192;
+/// How many consecutive *capped* drain passes may happen at one instant before
+/// the engine gives up and lets time advance with commands still queued.
+///
+/// The cap above bounds work per pass, which is what keeps the wheel
+/// responsive. Letting time advance the moment a single pass fills up is a
+/// different thing, and it is wrong: the commands left behind were issued for
+/// the instant being abandoned, and they get applied at the next one instead.
+/// A drive that lands a whole bit period late reframes a UART byte — the
+/// receiver locks onto the following bit as its start, an all-zero byte
+/// decodes as `$80` with a low stop bit, and the driver waiting for it reports
+/// a timeout rather than a corruption. That is what a quadrature encoder does
+/// to a force-gauge link on the same engine: at 8192 counts/mm and 38 mm/s it
+/// walks ~311 counts per millisecond observe and publishes a drive per changed
+/// channel, so every burst is many times the cap.
+///
+/// So drain the burst out at the instant it belongs to, and keep the escape
+/// hatch for a producer that really never stops: 64 passes is ~4096 commands,
+/// comfortably past any one instant's burst here and still a bound.
+const COMMAND_DRAIN_CAPPED_PASSES_MAX: usize = 64;
 
 /// Stepped mode: how long the engine waits for every registered actor to park
 /// before declaring the barrier wedged
@@ -205,12 +210,6 @@ pub(crate) type WakeCallback = Box<dyn Fn(u64) + Send>;
 /// thread with the new topology epoch; no engine lock held.
 pub(crate) type TopologyCallback = Box<dyn Fn(u64) + Send>;
 
-/// Stream byte-delivery callback: called from the engine thread once per
-/// byte routed to a consumer endpoint; no engine lock held. A callback MAY
-/// drive pins or write stream bytes — both enqueue, per the re-entrancy
-/// contract.
-pub(crate) type StreamCallback = Box<dyn Fn(u8) + Send>;
-
 /// Pulse-train delivery callback: called from the engine thread once per
 /// **rate change** routed to a pulse sink; no engine lock held. Never once
 /// per pulse — that is the whole point of the representation
@@ -245,44 +244,25 @@ pub(crate) enum Command {
         /// Wakeup callback.
         callback: WakeCallback,
     },
-    /// One-shot wakeup at an absolute virtual time (µs).
+    /// One-shot wakeup at an absolute virtual time (ns).
     ScheduleAt {
         /// Component whose wake handler fires.
         component: ComponentId,
-        /// Absolute virtual deadline (µs). Past deadlines fire immediately.
-        at_us: u64,
+        /// Absolute virtual deadline (ns). Past deadlines fire immediately.
+        at_ns: u64,
     },
-    /// Periodic wakeup every `period_us` of virtual time.
+    /// Periodic wakeup every `period_ns` of virtual time.
     ScheduleEvery {
         /// Component whose wake handler fires.
         component: ComponentId,
-        /// Virtual period (µs); zero is rejected with a warning.
-        period_us: u64,
+        /// Virtual period (ns); zero is rejected with a warning.
+        period_ns: u64,
     },
     /// Subscribe to net-graph topology changes (stream-routing seam). The
     /// current epoch is delivered once at registration.
     RegisterTopologyObserver {
         /// Notification callback.
         callback: TopologyCallback,
-    },
-    /// Bytes written by a stream producer endpoint. Bytes flow on the route
-    /// derived at the last routing pass, paced at the producer's declared
-    /// baud; bytes written into a broken/missing route are dropped with a
-    /// trace, never queued forever. Unlike drives, writes carry no enqueue
-    /// sequence: per-producer FIFO order (this channel's order) is the wire
-    /// contract, and cross-endpoint byte ordering is not meaningful.
-    StreamWrite {
-        /// Producer endpoint.
-        endpoint: EndpointId,
-        /// Payload bytes, in wire order.
-        bytes: Vec<u8>,
-    },
-    /// Subscribe a byte callback to a stream consumer endpoint.
-    RegisterStreamConsumer {
-        /// Consumer endpoint.
-        endpoint: EndpointId,
-        /// Delivery callback.
-        callback: StreamCallback,
     },
     /// A pulse source published a new constant-rate segment. Delivered to the
     /// sinks on the source's derived route (gated by net resolution, like
@@ -333,9 +313,37 @@ pub(crate) type IdleDriveLog = Arc<Mutex<Vec<(EndpointId, Option<TheveninDrive>)
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EngineLink {
     /// Command queue into the engine thread; `None` on the inert build path.
+    ///
+    /// The **data plane**: drives, stream writes, registrations. Its drain is
+    /// capped ([`COMMAND_DRAIN_BATCH_MAX`]) so a flood cannot starve the wheel.
     pub(crate) tx: Option<Sender<Command>>,
+    /// The **control plane**: requests that create a deadline
+    /// ([`Command::ScheduleAt`], [`Command::ScheduleEvery`]) and the wake
+    /// registration they depend on.
+    ///
+    /// Separate because the two need opposite treatment. A drive may wait —
+    /// deferring it costs nothing but latency. A scheduling request may not:
+    /// until the engine handles it, the wheel does not know about the deadline
+    /// and virtual time can step straight over it. Sharing one queue means the
+    /// capped drain can strand a schedule behind a drive flood, and raising the
+    /// cap to reach it just re-creates the starvation the cap prevents. So the
+    /// control plane gets its own queue and is drained **in full** every pass;
+    /// only the data plane is capped.
+    pub(crate) control_tx: Option<Sender<Command>>,
     /// Global drive enqueue sequence, shared by every clone of this link.
     pub(crate) drive_seq: Arc<AtomicU64>,
+    /// Scheduling requests sent but not yet handled by the engine.
+    ///
+    /// Virtual time may not advance while this is non-zero: a `ScheduleAt`
+    /// still in the queue is a deadline the engine cannot see, and advancing
+    /// past it delivers the wake late. That is invisible for a component whose
+    /// events are milliseconds apart and fatal for one clocking a UART bit
+    /// every 8.68 µs — the whole byte then lands at a single instant.
+    ///
+    /// Only *scheduling* is counted. Drives may pile up as deep as they like
+    /// without holding time back, which is what keeps the
+    /// [`COMMAND_DRAIN_BATCH_MAX`] anti-starvation cap doing its job.
+    pub(crate) pending_schedules: Arc<AtomicUsize>,
     /// Engine-published resolved state per net (build snapshot when inert).
     pub(crate) states: Arc<Mutex<Vec<NetState>>>,
     /// Inert path only: drives issued during attach, in issue order, for the
@@ -349,9 +357,35 @@ impl EngineLink {
     pub(crate) fn inert(states: Arc<Mutex<Vec<NetState>>>, recorded_drives: IdleDriveLog) -> Self {
         Self {
             tx: None,
+            control_tx: None,
             drive_seq: Arc::new(AtomicU64::new(0)),
+            pending_schedules: Arc::new(AtomicUsize::new(0)),
             states,
             recorded_drives: Some(recorded_drives),
+        }
+    }
+
+    /// Send a control-plane command: one that creates or depends on a
+    /// deadline. Counted in flight from before the send until the engine
+    /// handles it, so virtual time cannot step over a deadline that has been
+    /// requested but not yet armed — a window that is nanoseconds wide from
+    /// the engine's own callbacks and a thread hop wide from anywhere else.
+    pub(crate) fn send_control(&self, command: Command) -> bool {
+        self.pending_schedules.fetch_add(1, Ordering::AcqRel);
+        match &self.control_tx {
+            Some(tx) => {
+                if tx.send(command).is_err() {
+                    self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                    tracing::debug!("net engine has shut down; control command dropped");
+                    return false;
+                }
+                true
+            }
+            None => {
+                self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                tracing::debug!("inert link; control command dropped");
+                false
+            }
         }
     }
 
@@ -468,20 +502,6 @@ pub(crate) struct PulseRouteSpec {
     pub(crate) path_roots: Vec<usize>,
 }
 
-/// One derived producer→consumers serial route (see
-/// [`Resolver::route_streams`]).
-pub(crate) struct StreamRouteSpec {
-    /// Producer endpoint the route originates at.
-    pub(crate) producer: EndpointId,
-    /// Producer's declared byte pacing rate (0 = unpaced).
-    pub(crate) baud_hz: u32,
-    /// Consumer endpoints reachable through the collapsed link.
-    pub(crate) consumers: Vec<EndpointId>,
-    /// Identity roots of every net the collapsed link spans — live delivery
-    /// is gated on their resolved state.
-    pub(crate) path_roots: Vec<usize>,
-}
-
 /// Resolution state shared by the build-time pass and the live engine:
 /// topology (identity merges, conduction edges, static sources, senses) plus
 /// the per-endpoint drive table the live path mutates. `resolve` recomputes
@@ -502,8 +522,96 @@ pub(crate) struct Resolver {
     /// Serial-capable pins, in registration order (stream routing).
     streams: Vec<StreamPin>,
     /// Scenario `stream_drop` byte-loss policies per endpoint.
-    stream_drops: Vec<(EndpointId, StreamDropPolicy)>,
     net_count: usize,
+    /// Everything about the board that does not change between drives —
+    /// clusters, roots, path resistances — derived once per topology and
+    /// reused by every pass. `None` until the first pass builds it.
+    topology: Option<Topology>,
+    /// Bumped by every topology-changing input, so a cache built against an
+    /// older board is never trusted.
+    topology_version: u64,
+    /// Dense cluster ids whose drive table changed since the last pass.
+    dirty: Vec<usize>,
+}
+
+/// Drive-independent structure of a board, derived once per topology.
+struct Topology {
+    /// [`Resolver::topology_version`] this was built against.
+    version: u64,
+    /// Net count it was built for.
+    n: usize,
+    /// Identity root of every net.
+    root_of: Vec<usize>,
+    /// Dense conduction-cluster id of every net.
+    cluster_index: Vec<usize>,
+    /// Clusters in ascending cluster-root order.
+    clusters: Vec<ClusterTopo>,
+}
+
+/// One conduction cluster's members, in the orders the pass iterates them.
+struct ClusterTopo {
+    /// Member nets, ascending.
+    nets: Vec<usize>,
+    /// Member identity roots (nets that are their own root), ascending.
+    roots: Vec<usize>,
+    /// Identity-collapsed conduction edges within the cluster, in
+    /// declaration order.
+    edges: Vec<(usize, usize, f64)>,
+    /// Sum of the cluster's declared edge resistances (the `Pulled` bound).
+    edge_total_ohms: f64,
+    /// Drive-capable endpoints in the cluster, ascending.
+    slots: Vec<usize>,
+    /// Power-rail sources in the cluster as `(root, volts)`, in declaration order.
+    power: Vec<(usize, Volts)>,
+    /// `net_stuck` sources in the cluster as `(root, volts)`, in declaration order.
+    stuck: Vec<(usize, Volts)>,
+    /// Digital sense pins in the cluster as `(registration position, net)`.
+    digital_senses: Vec<(usize, usize)>,
+    /// Analog sense pins in the cluster as `(registration position, net)`.
+    analog_senses: Vec<(usize, usize)>,
+    /// Power sense pins in the cluster as `(registration position, net)`.
+    power_senses: Vec<(usize, usize)>,
+    /// Minimum series resistance between roots, `roots.len()` square,
+    /// row-major by position in `roots`; `INFINITY` where no path exists.
+    dist: Vec<f64>,
+}
+
+/// Findings of one pass, each with the key that orders it the way a full
+/// walk of the board would have reported it (contention by first net index,
+/// floating senses by kind then registration, power senses by
+/// registration), so a pass over any subset of clusters reports in the same
+/// relative order as a pass over all of them.
+#[derive(Default)]
+struct PassFindings {
+    contention: Vec<(usize, Finding)>,
+    floating: Vec<((usize, usize), Finding)>,
+    power: Vec<(usize, Finding)>,
+}
+
+impl PassFindings {
+    fn emit(mut self, diagnostics: &mut Diagnostics) {
+        self.contention.sort_by_key(|(key, _)| *key);
+        self.floating.sort_by_key(|(key, _)| *key);
+        self.power.sort_by_key(|(key, _)| *key);
+        let contention = self.contention.into_iter().map(|(_, f)| f);
+        let floating = self.floating.into_iter().map(|(_, f)| f);
+        let power = self.power.into_iter().map(|(_, f)| f);
+        for finding in contention.chain(floating).chain(power) {
+            diagnostics.report(finding);
+        }
+    }
+}
+
+/// Whether two drive contributions are the same (bitwise on the voltages,
+/// so `NaN` compares equal to itself and a re-driven rail is a no-op).
+fn same_drive(a: &Option<TheveninDrive>, b: &Option<TheveninDrive>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.volts.total_cmp(&y.volts).is_eq() && x.impedance.total_cmp(&y.impedance).is_eq()
+        }
+        _ => false,
+    }
 }
 
 impl Resolver {
@@ -519,13 +627,16 @@ impl Resolver {
             analog_senses: Vec::new(),
             power_senses: Vec::new(),
             streams: Vec::new(),
-            stream_drops: Vec::new(),
             net_count,
+            topology: None,
+            topology_version: 0,
+            dirty: Vec::new(),
         }
     }
 
     /// Add a conduction edge between two nets.
     pub(crate) fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
+        self.topology_version += 1;
         self.edges.push((a, b, ohms));
     }
 
@@ -537,6 +648,7 @@ impl Resolver {
         pin: PinRef,
         initial: Option<TheveninDrive>,
     ) -> EndpointId {
+        self.topology_version += 1;
         self.slots.push(DriveSlot {
             net,
             pin,
@@ -546,37 +658,62 @@ impl Resolver {
     }
 
     /// Replace an endpoint's drive contribution (`None` releases to high-Z).
-    /// Live path only; the next `resolve` sees the new table.
-    pub(crate) fn set_drive(&mut self, endpoint: EndpointId, drive: Option<TheveninDrive>) {
-        if let Some(slot) = self.slots.get_mut(endpoint.0) {
-            slot.drive = drive;
-        } else {
+    /// Live path only; the next pass sees the new table.
+    ///
+    /// Returns whether the table changed. An identical drive is a no-op that
+    /// marks nothing dirty — a card re-asserting the level it already holds,
+    /// or a pin re-driven high on every clock edge, costs no resolution.
+    pub(crate) fn set_drive(&mut self, endpoint: EndpointId, drive: Option<TheveninDrive>) -> bool {
+        let Some(slot) = self.slots.get_mut(endpoint.0) else {
             tracing::warn!(endpoint = endpoint.0, "drive for unknown endpoint dropped");
+            return false;
+        };
+        if same_drive(&slot.drive, &drive) {
+            return false;
         }
+        slot.drive = drive;
+        let net = slot.net;
+        if let Some(topology) = self
+            .topology
+            .as_ref()
+            .filter(|t| t.version == self.topology_version && net < t.cluster_index.len())
+        {
+            let cluster = topology.cluster_index[net];
+            if !self.dirty.contains(&cluster) {
+                self.dirty.push(cluster);
+            }
+        }
+        // With no usable cache the next pass is a full one anyway.
+        true
     }
 
     /// Add a power-rail source (harness power endpoint or `PowerOut` pin).
     pub(crate) fn add_power_source(&mut self, net: usize, volts: Volts) {
+        self.topology_version += 1;
         self.power_sources.push((net, volts));
     }
 
     /// Add a `net_stuck` fault source.
     pub(crate) fn add_stuck_source(&mut self, net: usize, volts: Volts) {
+        self.topology_version += 1;
         self.stuck_sources.push((net, volts));
     }
 
     /// Register a digital sense pin (floating-sense findings).
     pub(crate) fn add_digital_sense(&mut self, net: usize) {
+        self.topology_version += 1;
         self.digital_senses.push(net);
     }
 
     /// Register an analog sense pin (floating-sense findings).
     pub(crate) fn add_analog_sense(&mut self, net: usize) {
+        self.topology_version += 1;
         self.analog_senses.push(net);
     }
 
     /// Register a power sense pin (`PowerNetUnsourced` findings).
     pub(crate) fn add_power_sense(&mut self, net: usize) {
+        self.topology_version += 1;
         self.power_senses.push(net);
     }
 
@@ -596,18 +733,6 @@ impl Resolver {
         });
     }
 
-    /// Register a scenario `stream_drop` byte-loss policy on one stream
-    /// endpoint (producer side drops before pacing; consumer side drops at
-    /// delivery).
-    pub(crate) fn add_stream_drop(&mut self, endpoint: EndpointId, policy: StreamDropPolicy) {
-        self.stream_drops.push((endpoint, policy));
-    }
-
-    /// Run one full resolution pass: assign every net a [`NetState`] from the
-    /// current drive table and report findings. Identity-merged nets share
-    /// state; conduction clusters share sourced-ness. Clusters where a
-    /// competing source sits within [`ESCALATION_IMPEDANCE_RATIO`] of the
-    /// strongest driver escalate to `solver`.
     /// The identity root of every net, after harness/pin-short merges:
     /// two nets are electrically the same node iff their roots are equal.
     ///
@@ -619,7 +744,568 @@ impl Resolver {
         (0..net_count).map(|i| self.identity.find(i)).collect()
     }
 
+    /// Whether the cached topology describes the current inputs and `n` nets.
+    fn topology_is_current(&self, n: usize) -> bool {
+        self.topology
+            .as_ref()
+            .is_some_and(|t| t.version == self.topology_version && t.n == n)
+    }
+
+    /// Rebuild the topology cache if the inputs changed since it was built.
+    fn ensure_topology(&mut self, n: usize) {
+        if self.topology_is_current(n) {
+            return;
+        }
+        self.identity.grow(self.net_count.max(n));
+        let topology = self.build_topology(n);
+        self.topology = Some(topology);
+        self.dirty.clear();
+    }
+
+    /// Derive every drive-independent structure of the board once: identity
+    /// roots, conduction clusters (dense ids in ascending cluster-root
+    /// order), each cluster's nets, roots, edges, endpoints, sources and
+    /// senses, and the minimum series resistance between each pair of its
+    /// roots. Resolution passes are pure lookups over this afterwards.
+    fn build_topology(&mut self, n: usize) -> Topology {
+        let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
+
+        // Conduction clusters: identity merges are 0-ohm, conduction edges
+        // connect within a cluster without merging identity.
+        let mut conduction = Dsu::new(n);
+        for (i, &root) in root_of.iter().enumerate() {
+            conduction.union(root, i);
+        }
+        for (a, b, _ohms) in &self.edges {
+            conduction.union(root_of[*a], root_of[*b]);
+        }
+        let cluster_of: Vec<usize> = (0..n).map(|i| conduction.find(i)).collect();
+        let mut cluster_roots: Vec<usize> = cluster_of.clone();
+        cluster_roots.sort_unstable();
+        cluster_roots.dedup();
+        let cluster_index: Vec<usize> = cluster_of
+            .iter()
+            .map(|c| {
+                cluster_roots
+                    .binary_search(c)
+                    .expect("every net has a cluster")
+            })
+            .collect();
+
+        // Identity-collapsed conduction edges (self-loops dropped) for path
+        // impedance and escalated-cluster extraction.
+        let root_edges: Vec<(usize, usize, f64)> = self
+            .edges
+            .iter()
+            .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
+            .filter(|(a, b, _)| a != b)
+            .collect();
+
+        let clusters = (0..cluster_roots.len())
+            .map(|cid| {
+                let nets: Vec<usize> = (0..n).filter(|&i| cluster_index[i] == cid).collect();
+                let roots: Vec<usize> = nets.iter().copied().filter(|&i| root_of[i] == i).collect();
+                let edges: Vec<(usize, usize, f64)> = root_edges
+                    .iter()
+                    .filter(|(a, _, _)| cluster_index[*a] == cid)
+                    .copied()
+                    .collect();
+                // The sum of the cluster's edge resistances, self-loops
+                // included: the upper bound the `Pulled` projection reports.
+                let edge_total_ohms: f64 = self
+                    .edges
+                    .iter()
+                    .filter(|(a, b, _)| cluster_index[*a] == cid || cluster_index[*b] == cid)
+                    .map(|(_, _, ohms)| ohms)
+                    .sum();
+                let slots: Vec<usize> = (0..self.slots.len())
+                    .filter(|&si| cluster_index[self.slots[si].net] == cid)
+                    .collect();
+                let sources_in = |list: &[(usize, Volts)]| -> Vec<(usize, Volts)> {
+                    list.iter()
+                        .filter(|(net, _)| cluster_index[*net] == cid)
+                        .map(|(net, volts)| (root_of[*net], *volts))
+                        .collect()
+                };
+                let senses_in = |list: &[usize]| -> Vec<(usize, usize)> {
+                    list.iter()
+                        .enumerate()
+                        .filter(|(_, net)| cluster_index[**net] == cid)
+                        .map(|(pos, net)| (pos, *net))
+                        .collect()
+                };
+                // Minimum series resistance between every pair of the
+                // cluster's roots; INFINITY where no resistive path exists.
+                let k = roots.len();
+                let mut dist = vec![f64::INFINITY; k * k];
+                for (ia, &ra) in roots.iter().enumerate() {
+                    let from = min_path_ohms(&edges, ra);
+                    for (ib, rb) in roots.iter().enumerate() {
+                        if let Some(&ohms) = from.get(rb) {
+                            dist[ia * k + ib] = ohms;
+                        }
+                    }
+                }
+                ClusterTopo {
+                    nets,
+                    roots,
+                    edges,
+                    edge_total_ohms,
+                    slots,
+                    power: sources_in(&self.power_sources),
+                    stuck: sources_in(&self.stuck_sources),
+                    digital_senses: senses_in(&self.digital_senses),
+                    analog_senses: senses_in(&self.analog_senses),
+                    power_senses: senses_in(&self.power_senses),
+                    dist,
+                }
+            })
+            .collect();
+
+        Topology {
+            version: self.topology_version,
+            n,
+            root_of,
+            cluster_index,
+            clusters,
+        }
+    }
+
+    /// Run one full resolution pass: assign every net a [`NetState`] from the
+    /// current drive table and report findings. Identity-merged nets share
+    /// state; conduction clusters share sourced-ness. Clusters where a
+    /// competing source sits within [`ESCALATION_IMPEDANCE_RATIO`] of the
+    /// strongest driver escalate to `solver`.
+    ///
+    /// Clusters are electrically independent, so the pass is the union of
+    /// one [`Self::resolve_cluster`] per cluster — the same routine the live
+    /// path runs on just the clusters a drive touched
+    /// ([`Self::resolve_dirty`]). One code path, two scopes.
     pub(crate) fn resolve(
+        &mut self,
+        nets: &mut [Net],
+        diagnostics: &mut Diagnostics,
+        solver: &dyn ClusterSolver,
+    ) {
+        let n = nets.len();
+        self.ensure_topology(n);
+        let topology = self.topology.take().expect("ensure_topology built it");
+        let mut findings = PassFindings::default();
+        for cid in 0..topology.clusters.len() {
+            self.resolve_cluster(&topology, cid, nets, &mut findings, solver);
+        }
+        findings.emit(diagnostics);
+        self.topology = Some(topology);
+        self.dirty.clear();
+    }
+
+    /// The nets the next [`Self::resolve_dirty`] will touch, ascending: the
+    /// members of every cluster whose drive table changed — or every net,
+    /// when the topology changed and the next pass must be a full one.
+    pub(crate) fn dirty_scope(&self, n: usize) -> Vec<usize> {
+        if !self.topology_is_current(n) {
+            return (0..n).collect();
+        }
+        let topology = self.topology.as_ref().expect("current");
+        let mut scope: Vec<usize> = self
+            .dirty
+            .iter()
+            .flat_map(|&cid| topology.clusters[cid].nets.iter().copied())
+            .collect();
+        scope.sort_unstable();
+        scope.dedup();
+        scope
+    }
+
+    /// Resolve only the clusters a drive changed since the last pass (the
+    /// scope [`Self::dirty_scope`] announced), reporting their findings.
+    /// Every other net keeps its state, which is exactly what the full pass
+    /// would have recomputed for it. Falls back to a full pass when the
+    /// topology changed underneath.
+    pub(crate) fn resolve_dirty(
+        &mut self,
+        nets: &mut [Net],
+        diagnostics: &mut Diagnostics,
+        solver: &dyn ClusterSolver,
+    ) {
+        if !self.topology_is_current(nets.len()) {
+            self.resolve(nets, diagnostics, solver);
+            return;
+        }
+        if self.dirty.is_empty() {
+            return;
+        }
+        let topology = self.topology.take().expect("current");
+        let mut dirty = std::mem::take(&mut self.dirty);
+        dirty.sort_unstable();
+        dirty.dedup();
+        let mut findings = PassFindings::default();
+        for &cid in &dirty {
+            self.resolve_cluster(&topology, cid, nets, &mut findings, solver);
+        }
+        findings.emit(diagnostics);
+        self.topology = Some(topology);
+    }
+
+    /// Resolve one conduction cluster from the current drive table: the
+    /// digital fast path, contention through collapsed series resistance,
+    /// escalation to the cluster solver, state assignment for the cluster's
+    /// nets, and the cluster's findings.
+    ///
+    /// Everything here is cluster-local by construction — every cross-net
+    /// rule walks conduction edges or identity roots, and neither crosses a
+    /// cluster boundary — which is what makes resolving a subset exact.
+    /// Iteration is over dense, ascending indices throughout (never a hash
+    /// walk), so a pass is bit-for-bit reproducible; see `DETERMINISM.md`.
+    fn resolve_cluster(
+        &self,
+        topology: &Topology,
+        cid: usize,
+        nets: &mut [Net],
+        findings: &mut PassFindings,
+        solver: &dyn ClusterSolver,
+    ) {
+        let c = &topology.clusters[cid];
+        let root_of = &topology.root_of;
+        let k = c.roots.len();
+        let pos_of_root = |root: usize| -> usize {
+            c.roots
+                .iter()
+                .position(|&r| r == root)
+                .expect("a cluster's sources sit on its own roots")
+        };
+
+        // Sources per conduction cluster. NaN ("sourced at an unmodeled
+        // voltage") rails mark the cluster sourced but carry no numeric
+        // level: an unmodeled rail must not mask a real 0 V rail on the same
+        // cluster. An injected `net_stuck` is an *ideal* source and counts
+        // for the level heuristic exactly like a rail.
+        let mut cluster_power: Option<Volts> = None;
+        let mut cluster_sourced = false;
+        for (_, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if !volts.is_nan() && cluster_power.is_none() {
+                cluster_power = Some(*volts);
+            }
+            cluster_sourced = true;
+        }
+
+        // Driving endpoints per identity root, in endpoint order; drivers
+        // also source their cluster.
+        let mut net_drivers: Vec<(usize, Vec<usize>)> = Vec::new();
+        for &si in &c.slots {
+            let slot = &self.slots[si];
+            if slot.drive.is_none() {
+                continue;
+            }
+            let root = root_of[slot.net];
+            match net_drivers.iter_mut().find(|(r, _)| *r == root) {
+                Some((_, slots)) => slots.push(si),
+                None => net_drivers.push((root, vec![si])),
+            }
+            cluster_sourced = true;
+        }
+        let drivers_of = |root: usize| -> Option<&[usize]> {
+            net_drivers
+                .iter()
+                .find(|(r, _)| *r == root)
+                .map(|(_, slots)| slots.as_slice())
+        };
+        let drive_of = |si: usize| {
+            self.slots[si]
+                .drive
+                .expect("net_drivers only holds driving slots")
+        };
+        // (has a High driver, has a Low driver) on a root: the two facts the
+        // fast path asks of a driver set.
+        let levels_of = |root: usize| -> (bool, bool) {
+            let mut high = false;
+            let mut low = false;
+            for &si in drivers_of(root).unwrap_or(&[]) {
+                match level_of_volts(drive_of(si).volts) {
+                    Level::High => high = true,
+                    Level::Low => low = true,
+                }
+            }
+            (high, low)
+        };
+
+        // Direct source levels per identity root (power/stuck beat drivers
+        // for the fast-path state projection); NaN rails skipped.
+        let mut direct_volts: Vec<(usize, Volts)> = Vec::new();
+        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if volts.is_nan() || direct_volts.iter().any(|(r, _)| r == root) {
+                continue;
+            }
+            direct_volts.push((*root, *volts));
+        }
+        let direct_of = |root: usize| -> Option<Volts> {
+            direct_volts
+                .iter()
+                .find(|(r, _)| *r == root)
+                .map(|(_, v)| *v)
+        };
+
+        // Every Thevenin source in the cluster: drivers in endpoint order,
+        // then rails and stuck faults as ideal 0-ohm sources. This order is
+        // the SPICE card order the cluster solver stamps (determinism).
+        let mut sources: Vec<ClusterSource> = Vec::new();
+        for &si in &c.slots {
+            let slot = &self.slots[si];
+            if let Some(drive) = slot.drive {
+                sources.push(ClusterSource {
+                    node: NetId(root_of[slot.net]),
+                    volts: drive.volts,
+                    impedance: drive.impedance,
+                });
+            }
+        }
+        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if volts.is_nan() {
+                continue;
+            }
+            sources.push(ClusterSource {
+                node: NetId(*root),
+                volts: *volts,
+                impedance: 0.0,
+            });
+        }
+
+        let mut driver_roots: Vec<usize> = net_drivers.iter().map(|(r, _)| *r).collect();
+        driver_roots.sort_unstable();
+
+        // -- contention through collapsed series resistance ------------------
+        // Disagreeing push-pull sources coupled through series resistance
+        // below STREAM_COLLAPSE_THRESHOLD resolve to Contention, not to a
+        // divided voltage: for signaling purposes the collapsed link is one
+        // node. Rails and stuck faults through the same resistance still
+        // escalate to the divided-voltage solve below.
+        let mut contended: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, &ra) in driver_roots.iter().enumerate() {
+            let pa = pos_of_root(ra);
+            for &rb in &driver_roots[i + 1..] {
+                let ohms = c.dist[pa * k + pos_of_root(rb)];
+                // `INFINITY` (no resistive path) is never coupled.
+                if ohms >= STREAM_COLLAPSE_THRESHOLD {
+                    continue;
+                }
+                let (ha, la) = levels_of(ra);
+                let (hb, lb) = levels_of(rb);
+                if (ha || hb) && (la || lb) {
+                    for root in [ra, rb] {
+                        let fighting = match contended.iter_mut().find(|(r, _)| *r == root) {
+                            Some((_, fighting)) => fighting,
+                            None => {
+                                contended.push((root, Vec::new()));
+                                &mut contended.last_mut().expect("just pushed").1
+                            }
+                        };
+                        fighting.extend_from_slice(drivers_of(ra).unwrap_or(&[]));
+                        fighting.extend_from_slice(drivers_of(rb).unwrap_or(&[]));
+                    }
+                }
+            }
+        }
+        for (_, fighting) in &mut contended {
+            fighting.sort_unstable();
+            fighting.dedup();
+        }
+        let contended_drivers = |root: usize| -> Option<&[usize]> {
+            contended
+                .iter()
+                .find(|(r, _)| *r == root)
+                .map(|(_, fighting)| fighting.as_slice())
+        };
+
+        // -- escalation: digital fast path vs cluster solver ---------------
+        // A driver-bearing root escalates the cluster when a source at a
+        // DIFFERENT level is reachable with Thevenin impedance within
+        // ESCALATION_IMPEDANCE_RATIO of the strongest driver. Disagreeing
+        // push-pull drivers on one node stay on the Contention fast path.
+        let solve = || -> ClusterSolution {
+            let nodes: Vec<NetId> = c.roots.iter().map(|&r| NetId(r)).collect();
+            let resistors: Vec<ClusterResistor> = c
+                .edges
+                .iter()
+                .map(|(a, b, ohms)| ClusterResistor {
+                    a: NetId(*a),
+                    b: NetId(*b),
+                    ohms: *ohms,
+                })
+                .collect();
+            let inputs = ClusterInputs {
+                sources: sources.clone(),
+            };
+            solver.solve(&Cluster { nodes, resistors }, &inputs)
+        };
+        let mut escalated: Option<ClusterSolution> = None;
+        for &root in &driver_roots {
+            let slots = drivers_of(root).expect("driver root has drivers");
+            let (high, low) = levels_of(root);
+            if high && low {
+                continue; // direct push-pull fight: Contention fast path
+            }
+            let level = if high { Level::High } else { Level::Low };
+            let strongest: Ohms = slots
+                .iter()
+                .map(|&si| drive_of(si).impedance)
+                .fold(f64::INFINITY, f64::min);
+
+            let mut competing = f64::INFINITY;
+            // Ideal sources directly on this node (net_stuck / power rail).
+            if let Some(v) = direct_of(root) {
+                if !v.is_nan() && level_of_volts(v) != level {
+                    competing = 0.0;
+                }
+            }
+            // Sources reachable through conduction edges within the cluster.
+            let pr = pos_of_root(root);
+            for source in &sources {
+                if source.node.0 == root || level_of_volts(source.volts) == level {
+                    continue;
+                }
+                let path = c.dist[pr * k + pos_of_root(source.node.0)];
+                if path.is_finite() {
+                    competing = competing.min(path + source.impedance);
+                }
+            }
+            if competing <= strongest * ESCALATION_IMPEDANCE_RATIO {
+                escalated = Some(solve());
+                break;
+            }
+        }
+
+        // -- escalation beyond driver roots ---------------------------------
+        // Ideal sources fighting (rails and stuck faults are 0 Ω, so no
+        // impedance gate): disagreeing levels on one root project Contention
+        // there; disagreeing levels anywhere in the cluster escalate so
+        // intermediate nodes get their divided voltage. Analog senses: a
+        // cluster with a registered analog sense and any numeric source
+        // escalates, so an ADC input always reads the solved voltage.
+        let mut ideal_roots: Vec<(usize, bool, bool)> = Vec::new();
+        let (mut cluster_high, mut cluster_low) = (false, false);
+        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+            if volts.is_nan() {
+                continue;
+            }
+            let high = level_of_volts(*volts) == Level::High;
+            match ideal_roots.iter_mut().find(|(r, _, _)| r == root) {
+                Some((_, h, l)) => {
+                    *h |= high;
+                    *l |= !high;
+                }
+                None => ideal_roots.push((*root, high, !high)),
+            }
+            cluster_high |= high;
+            cluster_low |= !high;
+        }
+        let ideal_contended =
+            |root: usize| ideal_roots.iter().any(|(r, h, l)| *r == root && *h && *l);
+        let needs_solve =
+            (cluster_high && cluster_low) || (!c.analog_senses.is_empty() && !sources.is_empty());
+        if needs_solve && escalated.is_none() {
+            escalated = Some(solve());
+        }
+
+        // -- state assignment -----------------------------------------------
+        for &i in &c.nets {
+            let root = root_of[i];
+            let state = if contended_drivers(root).is_some() || ideal_contended(root) {
+                NetState::Contention
+            } else if let Some(solution) = &escalated {
+                solution.state_of(NetId(root)).unwrap_or_else(|| {
+                    tracing::warn!(net = %nets[i].name, "cluster solver omitted a node; reporting Floating");
+                    NetState::Floating
+                })
+            } else if let Some(v) = direct_of(root) {
+                NetState::Analog(v)
+            } else if let Some(slots) = drivers_of(root) {
+                let (high, low) = levels_of(root);
+                if high && low {
+                    NetState::Contention
+                } else {
+                    NetState::Driven(level_of_volts(drive_of(slots[0]).volts))
+                }
+            } else if cluster_sourced {
+                // Reached only through conduction edges: project as pulled
+                // toward the cluster's source — a *driver* counts, not only a
+                // declared rail, or a driven signal would stop arriving the
+                // moment it crossed a series resistor.
+                let level = match cluster_power {
+                    Some(v) => level_of_volts(v),
+                    None => cluster_driver_level(&self.slots, &c.slots, Level::High),
+                };
+                NetState::Pulled(level, c.edge_total_ohms)
+            } else {
+                NetState::Floating
+            };
+            nets[i].state = state;
+        }
+
+        // -- findings ---------------------------------------------------------
+        // Contention per identity root (deduped), keyed by the first net
+        // index that reports it; cross-root fights name every fighting
+        // driver, direct fights the root's own, ideal-source fights the net.
+        let mut reported_contention: Vec<usize> = Vec::new();
+        for &i in &c.nets {
+            let root = root_of[i];
+            if nets[i].state == NetState::Contention && !reported_contention.contains(&root) {
+                reported_contention.push(root);
+                let drivers = contended_drivers(root)
+                    .or_else(|| drivers_of(root))
+                    .map(|slots| slots.iter().map(|&si| self.slots[si].pin.clone()).collect())
+                    .unwrap_or_default();
+                findings.contention.push((
+                    i,
+                    Finding::Contention {
+                        net: nets[root.min(i)].name.clone(),
+                        drivers,
+                    },
+                ));
+            }
+        }
+        // Floating senses (deduped per (identity root, kind)), keyed by
+        // registration order within the kind.
+        let mut reported_floating: Vec<(usize, SenseKind)> = Vec::new();
+        for (senses, kind, kind_order) in [
+            (&c.digital_senses, SenseKind::Digital, 0usize),
+            (&c.analog_senses, SenseKind::Analog, 1usize),
+        ] {
+            for &(pos, net) in senses {
+                let root = root_of[net];
+                if nets[net].state == NetState::Floating
+                    && !reported_floating.contains(&(root, kind))
+                {
+                    reported_floating.push((root, kind));
+                    findings.floating.push((
+                        (kind_order, pos),
+                        Finding::FloatingSense {
+                            net: nets[net].name.clone(),
+                            kind,
+                        },
+                    ));
+                }
+            }
+        }
+        // Power senses on an unsourced cluster (deduped per identity root).
+        let mut reported_power: Vec<usize> = Vec::new();
+        for &(pos, net) in &c.power_senses {
+            let root = root_of[net];
+            if !cluster_sourced && !reported_power.contains(&root) {
+                reported_power.push(root);
+                findings.power.push((
+                    pos,
+                    Finding::PowerNetUnsourced {
+                        net: nets[net].name.clone(),
+                    },
+                ));
+            }
+        }
+    }
+
+    /// The resolver as it was before the per-cluster rewrite: one global pass.
+    /// Kept, test-only, as the reference the new pass is checked against.
+    #[cfg(test)]
+    pub(crate) fn resolve_reference(
         &mut self,
         nets: &mut [Net],
         diagnostics: &mut Diagnostics,
@@ -665,7 +1351,14 @@ impl Resolver {
             }
             cluster_sourced.insert(c);
         }
-        for (net, _volts) in &self.stuck_sources {
+        for (net, volts) in &self.stuck_sources {
+            // An injected `net_stuck` is an *ideal* source, so it counts for
+            // the level heuristic exactly like a rail. Leaving it out let a
+            // 25 Ω driver behind kilohms of series resistance out-vote a 0 Ω
+            // short — the opposite of what fault injection is for.
+            if !volts.is_nan() {
+                cluster_power.entry(cluster_of[*net]).or_insert(*volts);
+            }
             cluster_sourced.insert(cluster_of[*net]);
         }
 
@@ -973,9 +1666,17 @@ impl Resolver {
                     .filter(|(a, b, _)| cluster_of[*a] == cluster || cluster_of[*b] == cluster)
                     .map(|(_, _, ohms)| ohms)
                     .sum();
+                // "Toward the cluster's source" includes a *driver*, not only a
+                // declared rail. Defaulting to High whenever no rail was
+                // declared makes a driven signal stop arriving the moment it
+                // crosses a series resistor — invisible while bytes bypassed
+                // the net, and fatal once a UART's bits have to get through an
+                // ESD resistor to reach the part on the other side.
                 let level = match cluster_power.get(&cluster) {
-                    Some(v) if *v < DIGITAL_LEVEL_THRESHOLD_VOLTS => Level::Low,
-                    _ => Level::High,
+                    Some(v) => level_of_volts(*v),
+                    None => {
+                        cluster_driver_level_ref(&self.slots, &cluster_of, cluster, Level::High)
+                    }
                 };
                 NetState::Pulled(level, total)
             } else {
@@ -1037,118 +1738,6 @@ impl Resolver {
                 });
             }
         }
-    }
-
-    /// Derive the serial byte routes from the current net topology
-    /// (`BOARD_ENGINE.md`, "Stream endpoints (serial over pins)"). Byte
-    /// pipes are derived from and gated by net resolution, never installed
-    /// beside it:
-    ///
-    /// - Each `Producer` routes to every `Consumer` reachable through its
-    ///   net and through series conduction whose **accumulated** resistance
-    ///   stays below [`STREAM_COLLAPSE_THRESHOLD`] — the DS2Addon's 47 Ω
-    ///   series resistors collapse into the link.
-    /// - Two producers reachable from each other (the crossed-TX/RX harness)
-    ///   raise [`Finding::StreamMismatch`] once per pair, and neither
-    ///   producer gets a route (bytes written into it are dropped).
-    ///
-    /// Runs at `System::build`, at engine spawn, and on any
-    /// topology-affecting change, so routes can never outlive the topology
-    /// they were derived from.
-    pub(crate) fn route_streams(
-        &mut self,
-        nets: &[Net],
-        diagnostics: &mut Diagnostics,
-    ) -> Vec<StreamRouteSpec> {
-        self.identity.grow(self.net_count.max(nets.len()));
-        let n = nets.len();
-        let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
-        let root_edges: Vec<(usize, usize, f64)> = self
-            .edges
-            .iter()
-            .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
-            .filter(|(a, b, _)| a != b)
-            .collect();
-
-        let mut routes = Vec::new();
-        // hash-order shape 3: dedup gate for the StreamMismatch pair report.
-        let mut reported_pairs: HashSet<(usize, usize)> = HashSet::new();
-        for (pi, producer) in self.streams.iter().enumerate() {
-            let StreamRole::Producer { baud_hz } = producer.role else {
-                continue;
-            };
-            let origin = root_of[producer.net];
-            let dist = min_path_ohms(&root_edges, origin);
-            let reachable = |net: usize| {
-                dist.get(&root_of[net])
-                    .is_some_and(|&ohms| ohms < STREAM_COLLAPSE_THRESHOLD)
-            };
-
-            // Facing producers invalidate the route (crossed TX/RX).
-            let facing: Vec<usize> = self
-                .streams
-                .iter()
-                .enumerate()
-                .filter(|(oi, other)| {
-                    *oi != pi
-                        && matches!(other.role, StreamRole::Producer { .. })
-                        && reachable(other.net)
-                })
-                .map(|(oi, _)| oi)
-                .collect();
-            if !facing.is_empty() {
-                for oi in facing {
-                    let pair = (pi.min(oi), pi.max(oi));
-                    if reported_pairs.insert(pair) {
-                        diagnostics.report(Finding::StreamMismatch {
-                            net: nets[origin].name.clone(),
-                            producers: vec![
-                                self.streams[pair.0].pin.clone(),
-                                self.streams[pair.1].pin.clone(),
-                            ],
-                        });
-                    }
-                }
-                continue;
-            }
-
-            let consumers: Vec<EndpointId> = self
-                .streams
-                .iter()
-                .filter(|s| matches!(s.role, StreamRole::Consumer { .. }) && reachable(s.net))
-                .map(|s| s.endpoint)
-                .collect();
-            // Pulse roles share the `streams` registration table but are a
-            // different channel: they neither consume bytes nor count as a
-            // facing producer. `route_pulses` derives their routes over the
-            // same topology.
-            // Deliberately conservative gate: EVERY identity root within
-            // the collapse radius of the producer is collected, not just
-            // roots on a producer→consumer path — so delivery is also
-            // gated on side branches hanging off the link below the
-            // threshold. Reconstructing exact shortest paths from the
-            // dist map (predecessor tracking, or two-sided distance
-            // equality over accumulated f64 sums) buys little fidelity
-            // for the added subtlety: over-gating can only drop bytes a
-            // real link might have carried; it never leaks bytes onto a
-            // broken one.
-            // hash-order shape 2: `min_path_ohms` returns a `HashMap`, but its
-            // *values* are order-independent (relaxation over the `root_edges`
-            // Vec to a fixpoint) and the keys collected here are sorted below.
-            let mut path_roots: Vec<usize> = dist
-                .iter()
-                .filter(|(_, &ohms)| ohms < STREAM_COLLAPSE_THRESHOLD)
-                .map(|(&root, _)| root)
-                .collect();
-            path_roots.sort_unstable();
-            routes.push(StreamRouteSpec {
-                producer: producer.endpoint,
-                baud_hz,
-                consumers,
-                path_roots,
-            });
-        }
-        routes
     }
 
     /// Derive the **pulse** routes from the current net topology — the
@@ -1263,6 +1852,70 @@ fn same_state(a: &NetState, b: &NetState) -> bool {
     }
 }
 
+#[cfg(test)]
+fn cluster_driver_level_ref(
+    slots: &[DriveSlot],
+    cluster_of: &[usize],
+    cluster: usize,
+    fallback: Level,
+) -> Level {
+    let mut level: Option<Level> = None;
+    for slot in slots {
+        let Some(drive) = slot.drive else { continue };
+        if cluster_of[slot.net] != cluster {
+            continue;
+        }
+        let this = level_of_volts(drive.volts);
+        match level {
+            None => level = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return fallback, // drivers disagree
+        }
+    }
+    level.unwrap_or(fallback)
+}
+
+/// Digital projection of a source voltage (NaN — an unmodeled rail — never
+/// reaches this: callers skip NaN sources).
+/// The level every driver in a conduction cluster agrees on, or `fallback`
+/// when the cluster has no drivers or its drivers disagree.
+///
+/// Disagreement is deliberately *not* reported as contention here: drivers on
+/// one identity root are already checked for that, and drivers separated by
+/// real resistance are what the escalated cluster solver exists to arbitrate.
+/// This arm only runs when neither applied, so the honest answer is "no single
+/// level", and the caller's fallback stands.
+///
+/// # What this is not
+///
+/// It is **distance-blind**, like the `Pulled` projection it feeds: every
+/// driver in the conduction cluster votes equally, however much resistance
+/// lies between it and the net being projected. And it is consulted only when
+/// the cluster has no ideal source at all — a cluster that also touches a rail
+/// or an injected fault takes that source's level regardless of what any
+/// driver is doing.
+///
+/// Both are properties of the coarse `Pulled` path, not of this function: that
+/// path reports the *sum* of the cluster's edge resistances as an upper bound
+/// and makes no attempt at a divider. A cluster where the answer genuinely
+/// depends on the ratio is one the impedance-escalation rule should hand to
+/// [`QuasiStaticMna`], and this arm never runs for it.
+fn cluster_driver_level(slots: &[DriveSlot], cluster_slots: &[usize], fallback: Level) -> Level {
+    let mut level: Option<Level> = None;
+    for &si in cluster_slots {
+        let Some(drive) = slots[si].drive else {
+            continue;
+        };
+        let this = level_of_volts(drive.volts);
+        match level {
+            None => level = Some(this),
+            Some(seen) if seen == this => {}
+            Some(_) => return fallback, // drivers disagree
+        }
+    }
+    level.unwrap_or(fallback)
+}
+
 /// Digital projection of a source voltage (NaN — an unmodeled rail — never
 /// reaches this: callers skip NaN sources).
 fn level_of_volts(volts: Volts) -> Level {
@@ -1313,20 +1966,18 @@ fn min_path_ohms(root_edges: &[(usize, usize, f64)], from: usize) -> HashMap<usi
 enum TimerTarget {
     /// A component wakeup (`schedule_at` / `schedule_every`).
     Wake(ComponentId),
-    /// Paced byte delivery on one stream producer's route.
-    Stream(EndpointId),
 }
 
-/// One armed wakeup. Ordered by `(deadline_us, seq)` so simultaneous and
+/// One armed wakeup. Ordered by `(deadline_ns, seq)` so simultaneous and
 /// late deadlines fire in schedule order.
 #[derive(Debug, Clone, Copy, Eq)]
 struct TimerEntry {
-    deadline_us: u64,
+    deadline_ns: u64,
     seq: u64,
     target: TimerTarget,
     /// `Some(period)` re-arms after firing (periodic wakes only); `None`
     /// is one-shot.
-    period_us: Option<u64>,
+    period_ns: Option<u64>,
 }
 
 impl PartialEq for TimerEntry {
@@ -1337,7 +1988,7 @@ impl PartialEq for TimerEntry {
 
 impl Ord for TimerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.deadline_us, self.seq).cmp(&(other.deadline_us, other.seq))
+        (self.deadline_ns, self.seq).cmp(&(other.deadline_ns, other.seq))
     }
 }
 
@@ -1351,23 +2002,6 @@ impl PartialOrd for TimerEntry {
 // Engine core (owned by the engine thread)
 // ============================================================
 
-/// Live per-producer route state: the derived consumers, the pacing
-/// schedule, and the in-flight (deadline-stamped) bytes.
-struct LiveRoute {
-    /// Producer's declared byte pacing rate (0 = unpaced).
-    baud_hz: u32,
-    /// Consumer endpoints on the collapsed link.
-    consumers: Vec<EndpointId>,
-    /// Identity roots of the nets the link spans (delivery gate).
-    path_roots: Vec<usize>,
-    /// Bytes clocked onto the link, stamped with the virtual deadline at
-    /// which their frame finishes.
-    queue: VecDeque<(u64, u8)>,
-    /// Virtual time at which the line is next free — the pacing slot,
-    /// mirroring the embsim serial peripheral's `tx_next_v_us` convention.
-    line_next_v_us: u64,
-}
-
 /// Live per-source pulse route: the derived sinks and the delivery gate.
 ///
 /// Deliberately has no queue and no pacing slot — a pulse channel carries a
@@ -1377,26 +2011,6 @@ struct LivePulseRoute {
     sinks: Vec<EndpointId>,
     /// Identity roots of the nets the link spans (delivery gate).
     path_roots: Vec<usize>,
-}
-
-/// Byte-loss injection state for one endpoint (`Scenario::stream_drop`).
-struct DropState {
-    policy: StreamDropPolicy,
-    /// Bytes offered so far (the `EveryNth` counter).
-    seen: u64,
-}
-
-impl DropState {
-    /// Count one offered byte; true when the policy says to drop it.
-    fn drops_next(&mut self) -> bool {
-        self.seen += 1;
-        match self.policy {
-            StreamDropPolicy::All => true,
-            // Degenerate EveryNth(0) keeps everything (warned at spawn).
-            StreamDropPolicy::EveryNth(0) => false,
-            StreamDropPolicy::EveryNth(n) => self.seen.is_multiple_of(u64::from(n)),
-        }
-    }
 }
 
 /// All net state, owned exclusively by the engine thread. The only shared
@@ -1417,11 +2031,6 @@ struct EngineCore {
     // (see the module's review rule).
     sense_subs: HashMap<usize, Vec<SenseCallback>>,
     wake_subs: HashMap<usize, WakeCallback>,
-    /// Live stream routes, keyed by producer endpoint index. Rebuilt (and
-    /// in-flight bytes discarded) on every routing pass.
-    routes: HashMap<usize, LiveRoute>,
-    /// Stream byte subscriptions, keyed by consumer endpoint index.
-    stream_subs: HashMap<usize, Vec<StreamCallback>>,
     /// Live pulse routes, keyed by source endpoint index. Rebuilt on every
     /// routing pass.
     pulse_routes: HashMap<usize, LivePulseRoute>,
@@ -1432,11 +2041,20 @@ struct EngineCore {
     /// after the source published still learns the channel's current state
     /// (the once-at-registration contract `on_sense` honors).
     pulse_state: HashMap<usize, PulseTrain>,
-    /// `stream_drop` fault state, keyed by endpoint index.
-    drop_state: HashMap<usize, DropState>,
     topology_observers: Vec<TopologyCallback>,
     topology_epoch: u64,
     wheel: BinaryHeap<Reverse<TimerEntry>>,
+    /// `(component, deadline)` of every wake entry on the wheel that has not
+    /// fired yet. A wake carries only its instant, so two entries for the
+    /// same component at the same instant are one wake delivered twice --
+    /// pure cost, and a compounding one: a callback that re-requests a
+    /// deadline on every wake (a pulse train's next edge, a bus clock's next
+    /// half period) then fires once per *previous* wake at that instant,
+    /// each of which re-requests again. Measured before this set: ~500 wheel
+    /// entries per stepper edge during an SD burst, a quarter of the engine
+    /// thread in `BinaryHeap::pop`, and virtual time at 0.0001x.
+    /// hash-order: keyed access only (`insert`, `remove`), never iterated.
+    armed_wakes: HashSet<(usize, u64)>,
     timer_seq: u64,
     /// Drives received but not yet applicable (a lower enqueue seq is still
     /// in flight); applied strictly in seq order.
@@ -1446,6 +2064,10 @@ struct EngineCore {
     /// at its initial value until it does, so every component's first schedule
     /// is anchored at the same instant.
     clock_released: bool,
+    /// Scheduling requests sent but not yet handled — see
+    /// [`EngineLink::pending_schedules`]. Time does not advance while it is
+    /// non-zero.
+    pending_schedules: Arc<AtomicUsize>,
     /// Stepped mode: reported [`Finding::QuiescenceTimeout`] already? The
     /// finding is deduped on the cumulative bus anyway; this keeps the engine
     /// from re-waiting the full timeout on every iteration once an actor is
@@ -1576,36 +2198,20 @@ impl EngineCore {
         }
     }
 
-    /// (Re-)derive the stream **and pulse** routes from the current topology
-    /// and merge the routing findings (`StreamMismatch`). Runs at spawn and on
-    /// any topology-affecting change; in-flight bytes on stale routes are
-    /// discarded — a broken route stops delivery, it never queues forever.
+    /// (Re-)derive the pulse routes from the current topology and merge the
+    /// routing findings (`StreamMismatch`). Runs at spawn and on any
+    /// topology-affecting change, so a route can never outlive the topology it
+    /// was derived from.
     ///
     /// Pulse routes carry nothing in flight (a rate, not a queue), so a
     /// re-derivation loses no pulses: each source's current train is retained
     /// in `pulse_state` and handed to any sink that registers afterwards.
     fn reroute_channels(&mut self) {
         let mut pass = Diagnostics::new();
-        let specs = self.resolver.route_streams(&self.nets, &mut pass);
         let pulse_specs = self.resolver.route_pulses(&self.nets, &mut pass);
         self.merge_findings(&pass);
         let epoch = self.topology_epoch;
         self.event_log.record(|| EngineEvent::Reroute { epoch });
-        self.routes = specs
-            .into_iter()
-            .map(|spec| {
-                (
-                    spec.producer.0,
-                    LiveRoute {
-                        baud_hz: spec.baud_hz,
-                        consumers: spec.consumers,
-                        path_roots: spec.path_roots,
-                        queue: VecDeque::new(),
-                        line_next_v_us: 0,
-                    },
-                )
-            })
-            .collect();
         self.pulse_routes = pulse_specs
             .into_iter()
             .map(|spec| {
@@ -1684,178 +2290,12 @@ impl EngineCore {
         })
     }
 
-    /// Clock producer bytes onto their derived route: apply the
-    /// producer-side drop policy, then either deliver immediately (unpaced)
-    /// or stamp each byte with its virtual delivery deadline at the
-    /// producer's declared baud ([`STREAM_BITS_PER_BYTE`] bits per byte, the
-    /// embsim 8N1 pacing convention) and arm the wheel. Bytes written into a
-    /// broken or missing route are dropped with a trace.
-    fn stream_write(&mut self, endpoint: EndpointId, bytes: Vec<u8>) {
-        let bytes: Vec<u8> = match self.drop_state.get_mut(&endpoint.0) {
-            Some(state) => bytes.into_iter().filter(|_| !state.drops_next()).collect(),
-            None => bytes,
-        };
-        let Some(route) = self.routes.get(&endpoint.0) else {
-            tracing::debug!(
-                endpoint = endpoint.0,
-                dropped = bytes.len(),
-                "stream bytes dropped: producer has no valid route"
-            );
-            return;
-        };
-        if bytes.is_empty() {
-            return;
-        }
-        let cost_v_us = if route.baud_hz == 0 {
-            0
-        } else {
-            STREAM_BITS_PER_BYTE.saturating_mul(1_000_000) / u64::from(route.baud_hz)
-        };
-        if cost_v_us == 0 {
-            // Unpaced (baud 0, or faster than a byte per µs): deliver now,
-            // in write order, without ever touching the virtual clock.
-            let consumers = route.consumers.clone();
-            let path_roots = route.path_roots.clone();
-            self.deliver_stream_bytes(endpoint, &consumers, &path_roots, &bytes);
-            return;
-        }
-        // Paced delivery needs the virtual clock — validated loudly here so
-        // a missing `virtual_clock::init` cannot panic the engine thread.
-        if !self.clock_ready("paced stream write") {
-            tracing::debug!(
-                endpoint = endpoint.0,
-                dropped = bytes.len(),
-                "paced stream bytes dropped: virtual clock not initialized"
-            );
-            return;
-        }
-        let now = virtual_clock::virtual_us();
-        let route = self
-            .routes
-            .get_mut(&endpoint.0)
-            .expect("route existed above; routes are engine-thread-owned");
-        // Cap the in-flight queue ([`STREAM_ROUTE_QUEUE_MAX`]): the newest
-        // bytes are shed first, like a full TX FIFO, and the mismatch is
-        // surfaced below rather than modeling an infinite buffer no UART has.
-        let room = STREAM_ROUTE_QUEUE_MAX.saturating_sub(route.queue.len());
-        let accepted = bytes.len().min(room);
-        let shed = bytes.len() - accepted;
-        let start = route.line_next_v_us.max(now);
-        let first_deadline = start.saturating_add(cost_v_us);
-        let mut deadline = start;
-        for &byte in &bytes[..accepted] {
-            deadline = deadline.saturating_add(cost_v_us);
-            route.queue.push_back((deadline, byte));
-        }
-        route.line_next_v_us = deadline;
-        if accepted > 0 {
-            self.arm(first_deadline, TimerTarget::Stream(endpoint), None);
-        }
-        if shed > 0 {
-            let producer = self
-                .resolver
-                .streams
-                .iter()
-                .find(|s| s.endpoint == endpoint)
-                .map(|s| s.pin.clone())
-                .unwrap_or_else(|| PinRef::new("?", "?"));
-            tracing::warn!(
-                producer = ?producer,
-                shed,
-                in_flight = STREAM_ROUTE_QUEUE_MAX,
-                "paced stream route overflowed: producer sustains more than \
-                 its declared baud; overflow bytes shed"
-            );
-            self.report_finding(Finding::StreamOverrun { producer });
-        }
-    }
-
-    /// Deliver every queued byte whose deadline has passed on one producer's
-    /// route, then re-arm the wheel for the next in-flight byte.
-    fn deliver_due_stream(&mut self, endpoint: EndpointId, now: u64) {
-        let Some(route) = self.routes.get_mut(&endpoint.0) else {
-            return; // route dissolved while the timer was in flight
-        };
-        let mut due: Vec<u8> = Vec::new();
-        while let Some(&(deadline, byte)) = route.queue.front() {
-            if deadline > now {
-                break;
-            }
-            route.queue.pop_front();
-            due.push(byte);
-        }
-        let next = route.queue.front().map(|&(deadline, _)| deadline);
-        let consumers = route.consumers.clone();
-        let path_roots = route.path_roots.clone();
-        if let Some(deadline) = next {
-            self.arm(deadline, TimerTarget::Stream(endpoint), None);
-        }
-        self.deliver_stream_bytes(endpoint, &consumers, &path_roots, &due);
-    }
-
-    /// Deliver bytes to a route's consumers, gated by net resolution: a link
-    /// whose nets currently resolve `Contention` or `Floating` cannot carry
-    /// clean bytes, so the bytes are dropped with a trace (never queued
-    /// forever). Callbacks run on the engine thread with no lock held.
-    fn deliver_stream_bytes(
-        &mut self,
-        producer: EndpointId,
-        consumers: &[EndpointId],
-        path_roots: &[usize],
-        bytes: &[u8],
-    ) {
-        if bytes.is_empty() {
-            return;
-        }
-        if !self.route_is_signal_capable(path_roots) {
-            tracing::debug!(
-                dropped = bytes.len(),
-                "stream bytes dropped: a net on the route is not signal-capable"
-            );
-            return;
-        }
-        // Consumer identities for panic-containment findings, resolved once
-        // per delivery batch rather than once per byte.
-        let subscribers: Vec<String> = consumers
-            .iter()
-            .map(|consumer| {
-                self.resolver
-                    .streams
-                    .iter()
-                    .find(|s| s.endpoint == *consumer)
-                    .map(|s| format!("{}.{}", s.pin.reference, s.pin.pin))
-                    .unwrap_or_else(|| format!("stream consumer endpoint {}", consumer.0))
-            })
-            .collect();
-        for &byte in bytes {
-            for (ci, consumer) in consumers.iter().enumerate() {
-                if let Some(state) = self.drop_state.get_mut(&consumer.0) {
-                    if state.drops_next() {
-                        continue;
-                    }
-                }
-                if let Some(subs) = self.stream_subs.get(&consumer.0) {
-                    // One record per (byte, consumer) that actually crosses —
-                    // the wire event, not the fan-out to however many callbacks
-                    // that endpoint registered. Bytes the drop policy ate above
-                    // never reach here, so the log shows what the link carried.
-                    self.event_log.record(|| EngineEvent::StreamByte {
-                        producer,
-                        consumer: *consumer,
-                        byte,
-                    });
-                    for callback in subs {
-                        self.deliver_contained(CallbackKind::StreamByte, &subscribers[ci], || {
-                            callback(byte);
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     /// Apply buffered drives strictly in enqueue-seq order, resolving after
     /// each so senses observe the authoritative event order.
+    ///
+    /// Only the cluster the drive belongs to is re-resolved (every other
+    /// net's state is provably unchanged), and a drive identical to the one
+    /// already held resolves nothing at all.
     fn apply_ready_drives(&mut self) {
         while let Some((endpoint, drive)) = self.pending_drives.remove(&self.next_drive_seq) {
             let seq = self.next_drive_seq;
@@ -1865,8 +2305,60 @@ impl EngineCore {
                 endpoint,
                 drive,
             });
-            self.resolver.set_drive(endpoint, drive);
-            self.resolve_and_publish();
+            if self.resolver.set_drive(endpoint, drive) {
+                self.resolve_and_publish_dirty();
+            }
+        }
+    }
+
+    /// [`Self::resolve_and_publish`] scoped to the clusters the drives since
+    /// the last pass touched: the same resolution, publication and delivery,
+    /// over the nets that can have changed.
+    fn resolve_and_publish_dirty(&mut self) {
+        let scope = self.resolver.dirty_scope(self.nets.len());
+        if scope.is_empty() {
+            return;
+        }
+        let old: Vec<NetState> = scope.iter().map(|&i| self.nets[i].state).collect();
+        let mut pass = Diagnostics::new();
+        self.resolver
+            .resolve_dirty(&mut self.nets, &mut pass, self.solver.as_ref());
+
+        {
+            let mut shared = self.states.lock().unwrap();
+            if shared.len() == self.nets.len() {
+                for &i in &scope {
+                    shared[i] = self.nets[i].state;
+                }
+            } else {
+                shared.clear();
+                shared.extend(self.nets.iter().map(|n| n.state));
+            }
+        }
+        self.merge_findings(&pass);
+
+        // Changed nets in ascending index order, per-net callbacks in
+        // registration order — the sequence the full pass records.
+        for (k, &i) in scope.iter().enumerate() {
+            let net = &self.nets[i];
+            if same_state(&old[k], &net.state) {
+                continue;
+            }
+            self.event_log.record(|| EngineEvent::NetResolved {
+                net: NetId(i),
+                state: net.state,
+            });
+            if let Some(subs) = self.sense_subs.get(&i) {
+                for callback in subs {
+                    self.event_log.record(|| EngineEvent::SenseDelivered {
+                        net: NetId(i),
+                        state: net.state,
+                    });
+                    self.deliver_contained(CallbackKind::Sense, &net.name, || {
+                        callback(net.state);
+                    });
+                }
+            }
         }
     }
 
@@ -1879,15 +2371,24 @@ impl EngineCore {
     fn fire_due_timers(&mut self) -> usize {
         let mut fired = 0usize;
         while let Some(&Reverse(head)) = self.wheel.peek() {
-            let now = virtual_clock::virtual_us();
-            if head.deadline_us > now {
+            let now = virtual_clock::virtual_ns();
+            if head.deadline_ns > now {
                 break;
             }
             self.wheel.pop();
             fired += 1;
             match head.target {
                 TimerTarget::Wake(component) => {
-                    if let Some(callback) = self.wake_subs.get(&component.0) {
+                    // Cleared before delivery: a callback asking to be woken
+                    // again at this same instant is asking for a *new* wake.
+                    // A second entry for the same instant (a periodic one
+                    // pushed beside a one-shot, or a re-request delivered
+                    // under an earlier entry) finds the key gone and is not
+                    // delivered; its period, if any, still re-arms below.
+                    let deliver = self.armed_wakes.remove(&(component.0, head.deadline_ns));
+                    if !deliver {
+                        // fall through to the periodic re-arm
+                    } else if let Some(callback) = self.wake_subs.get(&component.0) {
                         self.event_log.record(|| EngineEvent::Wake { component });
                         let subscriber = format!("component {}", component.0);
                         self.deliver_contained(CallbackKind::Wake, &subscriber, || {
@@ -1899,29 +2400,36 @@ impl EngineCore {
                             "timer fired for a component with no wake handler"
                         );
                     }
-                    if let Some(period) = head.period_us {
-                        let mut next = head.deadline_us.saturating_add(period);
+                    if let Some(period) = head.period_ns {
+                        let mut next = head.deadline_ns.saturating_add(period);
                         if next <= now {
                             next = now.saturating_add(period);
                         }
                         self.arm(next, head.target, Some(period));
                     }
                 }
-                TimerTarget::Stream(endpoint) => self.deliver_due_stream(endpoint, now),
             }
         }
         fired
     }
 
     /// Push a wheel entry.
-    fn arm(&mut self, deadline_us: u64, target: TimerTarget, period_us: Option<u64>) {
+    fn arm(&mut self, deadline_ns: u64, target: TimerTarget, period_ns: Option<u64>) {
+        // One wake per component per instant (see `armed_wakes`). A periodic
+        // entry is always pushed: it carries the period the chain continues
+        // on, which a one-shot already armed at the same instant does not.
+        let TimerTarget::Wake(component) = target;
+        let fresh = self.armed_wakes.insert((component.0, deadline_ns));
+        if !fresh && period_ns.is_none() {
+            return;
+        }
         let seq = self.timer_seq;
         self.timer_seq += 1;
         self.wheel.push(Reverse(TimerEntry {
-            deadline_us,
+            deadline_ns,
             seq,
             target,
-            period_us,
+            period_ns,
         }));
     }
 
@@ -1960,26 +2468,26 @@ impl EngineCore {
             } => {
                 self.wake_subs.insert(component.0, callback);
             }
-            Command::ScheduleAt { component, at_us } => {
+            Command::ScheduleAt { component, at_ns } => {
                 // Wheel entries make the run loop read the virtual clock;
                 // gate here (and at every other arm entry point) so a
                 // missing init fails the request, never the engine thread.
                 if self.clock_ready("schedule_at") {
-                    self.arm(at_us, TimerTarget::Wake(component), None);
+                    self.arm(at_ns, TimerTarget::Wake(component), None);
                 }
             }
             Command::ScheduleEvery {
                 component,
-                period_us,
+                period_ns,
             } => {
-                if period_us == 0 {
+                if period_ns == 0 {
                     tracing::warn!(component = component.0, "schedule_every(0) ignored");
                 } else if self.clock_ready("schedule_every") {
-                    let now = virtual_clock::virtual_us();
+                    let now = virtual_clock::virtual_ns();
                     self.arm(
-                        now.saturating_add(period_us),
+                        now.saturating_add(period_ns),
                         TimerTarget::Wake(component),
-                        Some(period_us),
+                        Some(period_ns),
                     );
                 }
             }
@@ -1989,15 +2497,6 @@ impl EngineCore {
                     callback(epoch);
                 });
                 self.topology_observers.push(callback);
-            }
-            Command::StreamWrite { endpoint, bytes } => {
-                self.stream_write(endpoint, bytes);
-            }
-            Command::RegisterStreamConsumer { endpoint, callback } => {
-                self.stream_subs
-                    .entry(endpoint.0)
-                    .or_default()
-                    .push(callback);
             }
             Command::PulseUpdate { endpoint, train } => {
                 self.pulse_update(endpoint, train);
@@ -2038,10 +2537,30 @@ impl EngineCore {
     /// Engine thread body. Virtual time is a counter; this loop is the time
     /// authority. `--speed` only paces the host after
     /// [`embsim_core::virtual_clock::advance_to`].
-    fn run(mut self, rx: Receiver<Command>) {
+    fn run(mut self, rx: Receiver<Command>, control_rx: Receiver<Command>) {
         loop {
-            if self.run_stepped_iteration(&rx) {
+            if self.run_stepped_iteration(&rx, &control_rx) {
                 break;
+            }
+        }
+    }
+
+    /// Handle every control-plane command waiting, with no cap: a deadline the
+    /// engine has not armed is one it can step over. Returns the number
+    /// handled, and `true` on shutdown.
+    fn drain_control(&mut self, control_rx: &Receiver<Command>) -> (usize, bool) {
+        let mut handled = 0usize;
+        loop {
+            match control_rx.try_recv() {
+                Ok(command) => {
+                    handled += 1;
+                    self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                    if self.handle(command) {
+                        return (handled, true);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return (handled, false),
+                Err(mpsc::TryRecvError::Disconnected) => return (handled, true),
             }
         }
     }
@@ -2051,9 +2570,11 @@ impl EngineCore {
     ///
     /// 1. **Quiesce.** Wait for every registered actor to park. Only then is
     ///    the set of pending work stable enough to reason about.
-    /// 2. **Drain the command queue**, at most [`COMMAND_DRAIN_BATCH_MAX`]
-    ///    per pass. A live flood can keep the queue non-empty forever; the
-    ///    cap lets a future wheel deadline still jump.
+    /// 2. **Drain the control queue in full**, then the data queue, at most
+    ///    [`COMMAND_DRAIN_BATCH_MAX`] per pass. A live flood can keep the data
+    ///    queue non-empty forever; the cap lets a future wheel deadline still
+    ///    jump. Scheduling is never capped — see
+    ///    [`EngineLink::control_tx`] for why the two planes are separate.
     /// 3. **Fire every wheel entry due at `now`**, in `(deadline, seq)` order.
     /// 4. Loop 1–3 to a fixpoint, or break after a full batch when the next
     ///    deadline is in the future so time can move.
@@ -2067,11 +2588,21 @@ impl EngineCore {
     /// next park first, then the engine drains and fires. What is *not* fixed
     /// is the interleaving of two actors released at the same instant — they
     /// race `next_drive_seq`, exactly as `DETERMINISM.md` says T1 does not fix.
-    fn run_stepped_iteration(&mut self, rx: &Receiver<Command>) -> bool {
+    fn run_stepped_iteration(
+        &mut self,
+        rx: &Receiver<Command>,
+        control_rx: &Receiver<Command>,
+    ) -> bool {
+        let mut capped_passes = 0usize;
         loop {
             self.await_actor_quiescence();
             let mut work = 0usize;
             let mut drained = 0usize;
+            let (control, stop) = self.drain_control(control_rx);
+            if stop {
+                return true;
+            }
+            work += control;
             loop {
                 if drained >= COMMAND_DRAIN_BATCH_MAX {
                     break;
@@ -2093,17 +2624,41 @@ impl EngineCore {
                 break;
             }
             if drained >= COMMAND_DRAIN_BATCH_MAX {
-                let now = virtual_clock::virtual_us();
-                if self
-                    .next_virtual_deadline()
-                    .is_some_and(|deadline| deadline > now)
-                {
-                    break;
+                capped_passes += 1;
+                if capped_passes >= COMMAND_DRAIN_CAPPED_PASSES_MAX {
+                    let now = virtual_clock::virtual_ns();
+                    if self
+                        .next_virtual_deadline()
+                        .is_some_and(|deadline| deadline > now)
+                    {
+                        break;
+                    }
                 }
+            } else {
+                capped_passes = 0;
             }
         }
 
-        let now = virtual_clock::virtual_us();
+        // The control queue is drained in full above, so anything still
+        // counted here is a request whose send has not landed yet — a window
+        // a few instructions wide. Hold time rather than step over a deadline
+        // that is already on its way; that is how a whole UART byte ends up on
+        // the wire at a single instant.
+        //
+        // Wait for it rather than spinning: the enqueuer is between its
+        // increment and its `send`, so blocking on the control queue is
+        // exactly the right thing to block on.
+        if self.pending_schedules.load(Ordering::Acquire) > 0 {
+            return match control_rx.recv_timeout(STEPPED_IDLE_POLL) {
+                Ok(command) => {
+                    self.pending_schedules.fetch_sub(1, Ordering::AcqRel);
+                    self.handle(command)
+                }
+                Err(RecvTimeoutError::Timeout) => false,
+                Err(RecvTimeoutError::Disconnected) => true,
+            };
+        }
+        let now = virtual_clock::virtual_ns();
         let next = match (self.clock_released, self.next_virtual_deadline()) {
             // Time is held until the system has finished assembling.
             (false, _) => None,
@@ -2111,7 +2666,7 @@ impl EngineCore {
         };
         match next {
             Some(deadline) if deadline > now => {
-                if let Err(error) = virtual_clock::advance_to(deadline) {
+                if let Err(error) = virtual_clock::advance_to_ns(deadline) {
                     // Unreachable while this engine is the only scheduler:
                     // `next_virtual_deadline` is >= now by construction and the
                     // mode was stepped one instruction ago. Report rather than
@@ -2125,6 +2680,18 @@ impl EngineCore {
             Some(_) => false,
             None => {
                 self.warn_on_stepped_drive_gap();
+                // Two queues, no combined wait: block on the data queue for a
+                // short poll, but take a control command first if one is
+                // already there. A control command that arrives mid-park waits
+                // out at most one `STEPPED_IDLE_POLL`, which is the same
+                // latency the data queue has always had while idle.
+                let (control, stop) = self.drain_control(control_rx);
+                if stop {
+                    return true;
+                }
+                if control > 0 {
+                    return false;
+                }
                 match rx.recv_timeout(STEPPED_IDLE_POLL) {
                     Ok(command) => self.handle(command),
                     Err(RecvTimeoutError::Timeout) => false,
@@ -2196,13 +2763,13 @@ impl EngineCore {
         }
     }
 
-    /// Stepped mode: the next virtual instant anything is waiting for — the
+    /// Stepped mode: the next virtual instant (ns) anything is waiting for — the
     /// earlier of the wheel head and the earliest pending park deadline across
     /// every waiter (registered actor or not; an unregistered waiter cannot
     /// hold time back, but it must still be released).
     fn next_virtual_deadline(&self) -> Option<u64> {
-        let wheel = self.wheel.peek().map(|&Reverse(head)| head.deadline_us);
-        let parked = virtual_clock::scheduler_state().next_deadline_us;
+        let wheel = self.wheel.peek().map(|&Reverse(head)| head.deadline_ns);
+        let parked = virtual_clock::scheduler_state().next_deadline_ns;
         match (wheel, parked) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -2250,22 +2817,9 @@ impl EngineHandle {
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
         let diagnostics = Arc::new(Mutex::new(Diagnostics::new()));
+        let pending_schedules: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel();
-
-        // Scenario byte-loss state, keyed by endpoint (last policy wins).
-        let drop_state: HashMap<usize, DropState> = resolver
-            .stream_drops
-            .iter()
-            .map(|&(endpoint, policy)| {
-                if policy == StreamDropPolicy::EveryNth(0) {
-                    tracing::warn!(
-                        endpoint = endpoint.0,
-                        "stream_drop EveryNth(0) never drops a byte"
-                    );
-                }
-                (endpoint.0, DropState { policy, seen: 0 })
-            })
-            .collect();
+        let (control_tx, control_rx) = mpsc::channel();
 
         let mut core = EngineCore {
             resolver,
@@ -2275,19 +2829,18 @@ impl EngineHandle {
             diagnostics: Arc::clone(&diagnostics),
             sense_subs: HashMap::new(),
             wake_subs: HashMap::new(),
-            routes: HashMap::new(),
-            stream_subs: HashMap::new(),
             pulse_routes: HashMap::new(),
             pulse_subs: HashMap::new(),
             pulse_state: HashMap::new(),
-            drop_state,
             topology_observers: Vec::new(),
             topology_epoch: 0,
             wheel: BinaryHeap::new(),
+            armed_wakes: HashSet::new(),
             timer_seq: 0,
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
             clock_released: false,
+            pending_schedules: Arc::clone(&pending_schedules),
             quiescence_stalled: false,
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
             stepped_gap_logged: None,
@@ -2303,13 +2856,15 @@ impl EngineHandle {
 
         let join = std::thread::Builder::new()
             .name("embsim-board-net-engine".to_string())
-            .spawn(move || core.run(rx))
+            .spawn(move || core.run(rx, control_rx))
             .expect("failed to spawn the net-engine thread");
 
         Self {
             link: EngineLink {
                 tx: Some(tx),
+                control_tx: Some(control_tx),
                 drive_seq: Arc::new(AtomicU64::new(0)),
+                pending_schedules,
                 states,
                 // Live path: drives go to the engine, never to a log.
                 recorded_drives: None,
@@ -3013,6 +3568,107 @@ mod tests {
         }
     }
 
+    /// A net reached only through a series resistor carries the **driver's**
+    /// level, not a default.
+    ///
+    /// The projection used to take its level from the cluster's *power* source
+    /// alone, so a cluster fed by a signal driver — which has none — read
+    /// `Pulled(High)` whichever way the driver was pointing. Nothing noticed
+    /// while UART bytes were routed around the resolution entirely; the moment
+    /// a UART's *bits* had to cross the DS2Addon's 47 ohm series resistors to
+    /// reach the ADC, every frame arrived as 0xFF.
+    #[rstest]
+    #[case::low(low(), Level::Low)]
+    #[case::high(high(), Level::High)]
+    fn a_driven_level_crosses_a_series_resistor(
+        #[case] drive: TheveninDrive,
+        #[case] expect: Level,
+    ) {
+        // driver —47 ohm— far
+        let mut resolver = Resolver::new(2, Dsu::new(2));
+        let endpoint = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
+        resolver.add_edge(0, 1, 47.0);
+        resolver.set_drive(endpoint, Some(drive));
+
+        let mut net_table = nets(2);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+
+        assert_eq!(net_table[0].state, NetState::Driven(expect));
+        assert_eq!(
+            net_table[1].state,
+            NetState::Pulled(expect, 47.0),
+            "the far side of a series resistor must follow the driver"
+        );
+    }
+
+    #[rstest]
+    #[case::pullup_3v3(3.3, low(), "driver Low, 10k pull-up to 3.3")]
+    #[case::pulldown_gnd(0.0, high(), "driver High, 10k pull-down to GND")]
+    fn zz_probe_rail_vs_driver(
+        #[case] rail: f64,
+        #[case] drive: TheveninDrive,
+        #[case] label: &str,
+    ) {
+        // driver(net0) —47— mid(net1) —10k— rail(net2)
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        let endpoint = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
+        resolver.add_edge(0, 1, 47.0);
+        resolver.add_edge(1, 2, 10_000.0);
+        resolver.add_power_source(2, rail);
+        resolver.add_digital_sense(1);
+        resolver.set_drive(endpoint, Some(drive));
+
+        let mut net_table = nets(3);
+        let mut diags = Diagnostics::new();
+        resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+        eprintln!(
+            "PROBE[{label}]: n0={:?} n1={:?} n2={:?} findings={}",
+            net_table[0].state,
+            net_table[1].state,
+            net_table[2].state,
+            diags.findings().len()
+        );
+    }
+
+    /// An injected `net_stuck` fault is an **ideal** source, so it beats a
+    /// driver reached through resistance — the same way a declared rail does.
+    ///
+    /// `cluster_sourced` absorbed stuck faults but threw their voltage away,
+    /// so once the projection learned to fall back to the cluster's drivers, a
+    /// 25 Ω driver behind kilohms of series resistance could out-vote a 0 Ω
+    /// short. Fault injection exists to be observable; losing to a driver is
+    /// the opposite.
+    #[rstest]
+    fn an_injected_short_outvotes_a_driver_reached_through_resistance() {
+        // stuck(3.3 V) —47 Ω— mid —10 kΩ— driver(Low, 25 Ω)
+        let build = |stuck: bool| {
+            let mut resolver = Resolver::new(3, Dsu::new(3));
+            let endpoint = resolver.add_endpoint(2, PinRef::new("U1", "1"), None);
+            resolver.add_edge(0, 1, 47.0);
+            resolver.add_edge(1, 2, 10_000.0);
+            resolver.set_drive(endpoint, Some(low()));
+            if stuck {
+                resolver.add_stuck_source(0, 3.3);
+            }
+            let mut net_table = nets(3);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            net_table[1].state
+        };
+
+        assert!(
+            matches!(build(false), NetState::Pulled(Level::Low, _)),
+            "with no fault the driver is the only source; got {:?}",
+            build(false)
+        );
+        assert!(
+            matches!(build(true), NetState::Pulled(Level::High, _)),
+            "a 0 ohm short must win over a driver behind 10 kohm; got {:?}",
+            build(true)
+        );
+    }
+
     /// A `net_stuck` fault fighting a power rail on the SAME root is two
     /// disagreeing ideal sources: the root projects Contention with a
     /// finding — never a silent first-source-wins `Analog(3.3)` (fault
@@ -3113,23 +3769,139 @@ mod tests {
     fn wake_log(handle: &EngineHandle, component: ComponentId) -> Arc<StdMutex<Vec<u64>>> {
         let log: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&log);
-        handle.link().send(Command::RegisterWake {
+        handle.link().send_control(Command::RegisterWake {
             component,
-            callback: Box::new(move |now_us| sink.lock().unwrap().push(now_us)),
+            callback: Box::new(move |now_ns| sink.lock().unwrap().push(now_ns)),
         });
         log
     }
 
     fn empty_engine() -> EngineHandle {
-        let handle = EngineHandle::spawn(
+        let handle = empty_engine_held();
+        handle.release_time();
+        handle
+    }
+
+    /// An empty engine with virtual time **held**: it drains and arms, but
+    /// nothing fires until [`EngineHandle::release_time`]. A test that must
+    /// get several requests in before any of them is served needs this —
+    /// otherwise it races the engine, which is free to serve the first
+    /// request while the rest are still in flight.
+    fn empty_engine_held() -> EngineHandle {
+        EngineHandle::spawn(
             Resolver::new(0, Dsu::new(0)),
             Vec::new(),
             Box::new(QuasiStaticMna),
             EventLog::disabled(),
             None,
+        )
+    }
+
+    /// The wheel resolves deadlines a *bit period* apart, not a microsecond.
+    ///
+    /// This is why the timebase is nanoseconds: at 2 Mbaud a UART bit is 500 ns,
+    /// so eight of them fit inside a single microsecond. With a µs wheel all
+    /// eight of these deadlines would be the same instant, and a synthesized
+    /// waveform would collapse to one edge.
+    #[rstest]
+    fn the_wheel_separates_sub_microsecond_deadlines() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let handle = empty_engine();
+        let log = wake_log(&handle, ComponentId(0));
+
+        const BIT_NS: u64 = 500; // one bit at 2,000,000 baud
+        let start = virtual_clock::virtual_ns();
+        let deadlines: Vec<u64> = (1..=8).map(|i| start + i * BIT_NS).collect();
+        for &at_ns in &deadlines {
+            handle.link().send_control(Command::ScheduleAt {
+                component: ComponentId(0),
+                at_ns,
+            });
+        }
+
+        assert!(
+            wait_for(|| log.lock().unwrap().len() == 8, Duration::from_secs(5)),
+            "every bit deadline must fire; got {:?}",
+            log.lock().unwrap()
         );
+        // Stepped time advances *to* each deadline, so the stamps are exact.
+        assert_eq!(*log.lock().unwrap(), deadlines);
+    }
+
+    /// Re-requesting a deadline already armed for the same component is a
+    /// no-op: the wake is delivered once, not once per request. A callback
+    /// that re-arms its next edge on every wake would otherwise fire once
+    /// per previous wake at that instant, and compound.
+    #[rstest]
+    fn a_deadline_armed_repeatedly_wakes_once() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        // Time held while the requests go in: a delivered wake frees its
+        // instant to be armed again (that is the contract), so a test that
+        // let the engine run would be asserting on a race, not on dedupe.
+        let handle = empty_engine_held();
+        let log = wake_log(&handle, ComponentId(0));
+
+        let now = virtual_clock::virtual_ns();
+        let first = now + 1_000_000;
+        let second = now + 2_000_000;
+        for _ in 0..50 {
+            handle.link().send_control(Command::ScheduleAt {
+                component: ComponentId(0),
+                at_ns: first,
+            });
+        }
+        handle.link().send_control(Command::ScheduleAt {
+            component: ComponentId(0),
+            at_ns: second,
+        });
+        // Every request is now queued ahead of the release, so all 50 are
+        // deduped against one armed entry.
         handle.release_time();
-        handle
+
+        assert!(
+            wait_for(|| log.lock().unwrap().len() >= 2, Duration::from_secs(5)),
+            "both distinct deadlines must fire; got {:?}",
+            log.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(*log.lock().unwrap(), vec![first, second]);
+    }
+
+    /// A one-shot armed at the instant a periodic entry is due does not eat
+    /// the periodic chain: both fire there (one wake), and the period goes on.
+    #[rstest]
+    fn a_periodic_chain_survives_a_one_shot_at_its_instant() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        // Held, so the one-shot and the periodic entry land on the same
+        // instant by construction rather than by winning a race.
+        let handle = empty_engine_held();
+        let log = wake_log(&handle, ComponentId(0));
+
+        let now = virtual_clock::virtual_ns();
+        let period = 1_000_000u64;
+        handle.link().send_control(Command::ScheduleAt {
+            component: ComponentId(0),
+            at_ns: now + period,
+        });
+        handle.link().send_control(Command::ScheduleEvery {
+            component: ComponentId(0),
+            period_ns: period,
+        });
+        handle.release_time();
+
+        assert!(
+            wait_for(|| log.lock().unwrap().len() >= 3, Duration::from_secs(5)),
+            "the chain must continue past the shared instant; got {:?}",
+            log.lock().unwrap()
+        );
+        let stamps = log.lock().unwrap().clone();
+        assert_eq!(
+            &stamps[..3],
+            &[now + period, now + 2 * period, now + 3 * period]
+        );
     }
 
     /// `schedule_at` fires exactly once, at-or-after its virtual deadline.
@@ -3140,11 +3912,11 @@ mod tests {
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
-        let now = virtual_clock::virtual_us();
-        let deadline = now + 100_000;
-        handle.link().send(Command::ScheduleAt {
+        let now = virtual_clock::virtual_ns();
+        let deadline = now + 100_000_000; // 100 virtual ms
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: deadline,
+            at_ns: deadline,
         });
 
         assert!(
@@ -3167,9 +3939,9 @@ mod tests {
         let handle = empty_engine();
         let log = wake_log(&handle, ComponentId(0));
 
-        handle.link().send(Command::ScheduleEvery {
+        handle.link().send_control(Command::ScheduleEvery {
             component: ComponentId(0),
-            period_us: 20_000,
+            period_ns: 20_000_000,
         });
         assert!(
             wait_for(|| log.lock().unwrap().len() >= 3, Duration::from_secs(5)),
@@ -3193,20 +3965,20 @@ mod tests {
         let order: Arc<StdMutex<Vec<u32>>> = Arc::new(StdMutex::new(Vec::new()));
         for (component, tag) in [(ComponentId(0), 0u32), (ComponentId(1), 1u32)] {
             let sink = Arc::clone(&order);
-            handle.link().send(Command::RegisterWake {
+            handle.link().send_control(Command::RegisterWake {
                 component,
                 callback: Box::new(move |_| sink.lock().unwrap().push(tag)),
             });
         }
         // Schedule the LATER deadline first; firing order must follow the
         // deadlines, not the schedule order.
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(1),
-            at_us: 2_000,
+            at_ns: 2_000,
         });
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: 1_000,
+            at_ns: 1_000,
         });
 
         assert!(
@@ -3224,9 +3996,9 @@ mod tests {
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
         let _log = wake_log(&handle, ComponentId(0));
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: virtual_clock::virtual_us() + 60_000_000, // one virtual minute out
+            at_ns: virtual_clock::virtual_ns() + 60_000_000_000, // one virtual minute out
         });
         std::thread::sleep(Duration::from_millis(10)); // let the engine park on the deadline
 
@@ -3235,6 +4007,94 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "drop must not wait for the pending timer"
+        );
+    }
+
+    /// Virtual time must not run past a wake that has been *requested* but not
+    /// yet handled.
+    ///
+    /// The command drain is capped ([`COMMAND_DRAIN_BATCH_MAX`]) so a drive
+    /// flood cannot starve the wheel — but a `ScheduleAt` still sitting in that
+    /// queue is a deadline the wheel cannot see, and advancing past it delivers
+    /// the wake late. For a component whose events are milliseconds apart that
+    /// is invisible. For one clocking a UART bit every 8.68 µs it is fatal: the
+    /// remaining bits are all overdue at the new instant, so the rest of the
+    /// byte goes onto the wire at a single point in time and arrives as
+    /// garbage. That is exactly how the whole-machine force path failed.
+    ///
+    /// Here a component re-arms itself one bit period ahead from inside its own
+    /// wake handler while a flood keeps the command queue non-empty. The
+    /// delivered timestamps must stay on the 500 ns grid.
+    #[rstest]
+    fn time_does_not_run_past_a_schedule_still_in_flight() {
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let mut resolver = Resolver::new(1, Dsu::new(1));
+        let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
+        handle.release_time();
+
+        const BIT_NS: u64 = 500; // 2,000,000 baud
+        const BITS: usize = 20;
+        let log: Arc<StdMutex<Vec<u64>>> = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&log);
+            let link = handle.link();
+            handle.link().send_control(Command::RegisterWake {
+                component: ComponentId(0),
+                callback: Box::new(move |now_ns| {
+                    let mut seen = sink.lock().unwrap();
+                    if seen.len() >= BITS {
+                        return;
+                    }
+                    seen.push(now_ns);
+                    let next = now_ns + BIT_NS;
+                    drop(seen);
+                    link.send_control(Command::ScheduleAt {
+                        component: ComponentId(0),
+                        at_ns: next,
+                    });
+                }),
+            });
+        }
+
+        // A flood that keeps the drain loop hitting its cap the whole time.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flood = {
+            let stop = Arc::clone(&stop);
+            let pin = crate::component::PinHandle::wired(NetId(0), Some(e0), None, handle.link());
+            std::thread::spawn(move || {
+                let mut level = false;
+                while !stop.load(Ordering::Relaxed) {
+                    level = !level;
+                    pin.set_drive(Some(if level { high() } else { low() }));
+                }
+            })
+        };
+
+        handle.link().send_control(Command::ScheduleAt {
+            component: ComponentId(0),
+            at_ns: virtual_clock::virtual_ns() + BIT_NS,
+        });
+        let done = wait_for(
+            || log.lock().unwrap().len() >= BITS,
+            Duration::from_secs(10),
+        );
+        stop.store(true, Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(done, "the bit clock must keep ticking under a drive flood");
+
+        let stamps = log.lock().unwrap().clone();
+        let gaps: Vec<u64> = stamps.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.iter().all(|&gap| gap == BIT_NS),
+            "every wake must land one bit period after the last; got gaps {gaps:?}"
         );
     }
 
@@ -3271,9 +4131,9 @@ mod tests {
             })
         };
 
-        handle.link().send(Command::ScheduleAt {
+        handle.link().send_control(Command::ScheduleAt {
             component: ComponentId(0),
-            at_us: virtual_clock::virtual_us() + 10_000, // 10 virtual ms
+            at_ns: virtual_clock::virtual_ns() + 10_000_000, // 10 virtual ms
         });
         let fired = wait_for(|| !log.lock().unwrap().is_empty(), Duration::from_secs(5));
         stop.store(true, Ordering::Relaxed);
@@ -3428,74 +4288,9 @@ mod tests {
         assert_ne!(net_table[1].state, NetState::Contention);
     }
 
-    fn producer(baud_hz: u32) -> StreamRole {
-        StreamRole::Producer { baud_hz }
-    }
-
-    fn consumer(baud_hz: u32) -> StreamRole {
-        StreamRole::Consumer { baud_hz }
-    }
-
-    /// Stream routes collapse series passives below the threshold
-    /// (accumulated along the path) and stop at/above it.
-    #[rstest]
-    fn stream_routes_collapse_series_passives_below_threshold() {
-        // producer(0) --47Ω-- (1) --47Ω-- consumer(2), plus a consumer
-        // behind a 4.7 kΩ edge that must NOT be routed.
-        let mut resolver = Resolver::new(4, Dsu::new(4));
-        let p = resolver.add_endpoint(0, PinRef::new("U1", "15"), Some(high()));
-        let c_near = resolver.add_endpoint(2, PinRef::new("U2", "16"), None);
-        let c_far = resolver.add_endpoint(3, PinRef::new("U3", "16"), None);
-        resolver.add_edge(0, 1, 47.0);
-        resolver.add_edge(1, 2, 47.0);
-        resolver.add_edge(0, 3, 4_700.0);
-        resolver.add_stream_pin(p, 0, producer(115_200), PinRef::new("U1", "15"));
-        resolver.add_stream_pin(c_near, 2, consumer(115_200), PinRef::new("U2", "16"));
-        resolver.add_stream_pin(c_far, 3, consumer(115_200), PinRef::new("U3", "16"));
-
-        let net_table = nets(4);
-        let mut diags = Diagnostics::new();
-        let routes = resolver.route_streams(&net_table, &mut diags);
-        assert!(diags.is_empty(), "no mismatch: {:?}", diags.findings());
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].producer, p);
-        assert_eq!(routes[0].baud_hz, 115_200);
-        assert_eq!(routes[0].consumers, vec![c_near]);
-    }
-
-    /// Two producers reachable from each other (the crossed-TX/RX harness)
-    /// raise StreamMismatch once per pair, and neither producer routes.
-    #[rstest]
-    fn facing_producers_raise_stream_mismatch_and_do_not_route() {
-        let mut resolver = Resolver::new(2, Dsu::new(2));
-        let p_a = resolver.add_endpoint(0, PinRef::new("MCU", "1"), Some(high()));
-        let p_b = resolver.add_endpoint(1, PinRef::new("U1", "15"), Some(high()));
-        resolver.add_edge(0, 1, 47.0);
-        resolver.add_stream_pin(p_a, 0, producer(115_200), PinRef::new("MCU", "1"));
-        resolver.add_stream_pin(p_b, 1, producer(115_200), PinRef::new("U1", "15"));
-
-        let net_table = nets(2);
-        let mut diags = Diagnostics::new();
-        let routes = resolver.route_streams(&net_table, &mut diags);
-        assert!(routes.is_empty(), "facing producers must not route");
-        assert_eq!(
-            diags.len(),
-            1,
-            "one finding per pair: {:?}",
-            diags.findings()
-        );
-        assert!(diags.findings().iter().any(|f| matches!(
-            f,
-            Finding::StreamMismatch { producers, .. }
-                if producers.contains(&PinRef::new("MCU", "1"))
-                    && producers.contains(&PinRef::new("U1", "15"))
-        )));
-    }
-
-    /// Pulse routes derive over the same collapsed-conduction reachability as
-    /// byte routes — a step clock through series resistors reaches the drive,
-    /// one behind a 4.7 kΩ isolation resistor does not — and pulse roles are
-    /// invisible to the byte routing that shares their registration table.
+    /// Pulse routes collapse series passives below the threshold: a step clock
+    /// through 47 Ω resistors reaches the drive, one behind a 4.7 kΩ isolation
+    /// resistor does not.
     #[rstest]
     fn pulse_routes_collapse_series_passives_and_ignore_byte_roles() {
         // source(0) --47Ω-- (1) --47Ω-- sink(2), a sink behind 4.7 kΩ that
@@ -3504,15 +4299,12 @@ mod tests {
         let source = resolver.add_endpoint(0, PinRef::new("MCU", "P8"), Some(high()));
         let near = resolver.add_endpoint(2, PinRef::new("DRV", "STEP"), None);
         let far = resolver.add_endpoint(3, PinRef::new("FAR", "STEP"), None);
-        let uart = resolver.add_endpoint(4, PinRef::new("U2", "16"), None);
         resolver.add_edge(0, 1, 47.0);
         resolver.add_edge(1, 2, 47.0);
         resolver.add_edge(0, 3, 4_700.0);
-        resolver.add_edge(0, 4, 47.0);
         resolver.add_stream_pin(source, 0, StreamRole::PulseSource, PinRef::new("MCU", "P8"));
         resolver.add_stream_pin(near, 2, StreamRole::PulseSink, PinRef::new("DRV", "STEP"));
         resolver.add_stream_pin(far, 3, StreamRole::PulseSink, PinRef::new("FAR", "STEP"));
-        resolver.add_stream_pin(uart, 4, consumer(115_200), PinRef::new("U2", "16"));
 
         let net_table = nets(5);
         let mut diags = Diagnostics::new();
@@ -3525,12 +4317,6 @@ mod tests {
             vec![near],
             "only the sink inside the collapse radius routes"
         );
-
-        // …and the byte router sees no producer here at all, so a pulse source
-        // never manufactures a serial route.
-        let mut diags = Diagnostics::new();
-        assert!(resolver.route_streams(&net_table, &mut diags).is_empty());
-        assert!(diags.is_empty(), "{:?}", diags.findings());
     }
 
     /// Two step clocks driving one line is the same wiring error as two UART
@@ -3591,43 +4377,196 @@ mod tests {
         );
     }
 
-    /// The paced in-flight queue is capped at [`STREAM_ROUTE_QUEUE_MAX`]:
-    /// a producer writing more than the route absorbs sheds the overflow
-    /// with a [`Finding::StreamOverrun`] naming the producer pin — the
-    /// surface for a producer-vs-declared-baud mismatch — instead of
-    /// growing an infinite TX buffer no UART has.
-    #[rstest]
-    fn paced_route_queue_overflow_sheds_with_a_finding() {
-        let _g = lock_clock();
-        virtual_clock::init(1.0, 1_000_000);
-        let mut resolver = Resolver::new(2, Dsu::new(2));
-        let p = resolver.add_endpoint(0, PinRef::new("U1", "15"), Some(high()));
-        let c = resolver.add_endpoint(1, PinRef::new("U2", "16"), None);
-        resolver.add_edge(0, 1, 47.0);
-        resolver.add_stream_pin(p, 0, producer(300), PinRef::new("U1", "15"));
-        resolver.add_stream_pin(c, 1, consumer(300), PinRef::new("U2", "16"));
-        let handle = EngineHandle::spawn(
-            resolver,
-            nets(2),
-            Box::new(QuasiStaticMna),
-            EventLog::disabled(),
-            None,
-        );
+    // ============================================================
+    // Incremental resolve oracle
+    // ============================================================
+    //
+    // The live path resolves only the cluster a drive touched. The claim
+    // that this equals a full pass rests on clusters being electrically
+    // independent; this pins it on random boards — merges, resistive edges,
+    // drivers at every impedance, rails, stuck faults, senses — under random
+    // drive sequences, comparing every net's state and the cumulative
+    // findings against a resolver that recomputes the whole board each time.
+    mod incremental_oracle {
+        use super::*;
+        use proptest::prelude::*;
 
-        // One write larger than the cap: the excess sheds, loudly.
-        handle.link().send(Command::StreamWrite {
-            endpoint: p,
-            bytes: vec![0u8; STREAM_ROUTE_QUEUE_MAX + 7],
-        });
-        assert!(
-            wait_for(
-                || handle.findings().contains(&Finding::StreamOverrun {
-                    producer: PinRef::new("U1", "15"),
-                }),
-                Duration::from_secs(5)
-            ),
-            "overflow must surface as StreamOverrun; got {} findings",
-            handle.findings().len()
-        );
+        #[derive(Debug, Clone)]
+        struct Spec {
+            n: usize,
+            merges: Vec<(usize, usize)>,
+            edges: Vec<(usize, usize, f64)>,
+            endpoints: Vec<(usize, Option<TheveninDrive>)>,
+            power: Vec<(usize, Volts)>,
+            stuck: Vec<(usize, Volts)>,
+            digital_senses: Vec<usize>,
+            analog_senses: Vec<usize>,
+            power_senses: Vec<usize>,
+        }
+
+        fn drive_strategy() -> impl Strategy<Value = Option<TheveninDrive>> {
+            prop_oneof![
+                Just(None),
+                (
+                    prop_oneof![Just(0.0f64), Just(3.3), Just(5.0)],
+                    prop_oneof![Just(25.0f64), Just(470.0), Just(15_000.0), Just(100_000.0)],
+                )
+                    .prop_map(|(volts, impedance)| Some(TheveninDrive { volts, impedance })),
+            ]
+        }
+
+        fn spec_strategy() -> impl Strategy<Value = Spec> {
+            (2usize..10).prop_flat_map(|n| {
+                (
+                    prop::collection::vec((0..n, 0..n), 0..3),
+                    prop::collection::vec(
+                        (
+                            0..n,
+                            0..n,
+                            prop_oneof![
+                                Just(0.0f64),
+                                Just(47.0),
+                                Just(470.0),
+                                Just(4_700.0),
+                                Just(15_000.0)
+                            ],
+                        ),
+                        0..4,
+                    ),
+                    prop::collection::vec((0..n, drive_strategy()), 1..8),
+                    prop::collection::vec(
+                        (0..n, prop_oneof![Just(0.0f64), Just(3.3), Just(f64::NAN)]),
+                        0..3,
+                    ),
+                    prop::collection::vec((0..n, prop_oneof![Just(0.0f64), Just(3.3)]), 0..2),
+                    prop::collection::vec(0..n, 0..3),
+                    prop::collection::vec(0..n, 0..3),
+                    prop::collection::vec(0..n, 0..2),
+                )
+                    .prop_map(
+                        move |(
+                            merges,
+                            edges,
+                            endpoints,
+                            power,
+                            stuck,
+                            digital_senses,
+                            analog_senses,
+                            power_senses,
+                        )| Spec {
+                            n,
+                            merges,
+                            edges,
+                            endpoints,
+                            power,
+                            stuck,
+                            digital_senses,
+                            analog_senses,
+                            power_senses,
+                        },
+                    )
+            })
+        }
+
+        fn build(spec: &Spec) -> (Resolver, Vec<EndpointId>) {
+            let mut identity = Dsu::new(spec.n);
+            for &(a, b) in &spec.merges {
+                identity.union(a, b);
+            }
+            let mut resolver = Resolver::new(spec.n, identity);
+            for &(a, b, ohms) in &spec.edges {
+                resolver.add_edge(a, b, ohms);
+            }
+            let ids: Vec<EndpointId> = spec
+                .endpoints
+                .iter()
+                .enumerate()
+                .map(|(i, (net, drive))| {
+                    resolver.add_endpoint(*net, PinRef::new("U", format!("{i}")), *drive)
+                })
+                .collect();
+            for &(net, volts) in &spec.power {
+                resolver.add_power_source(net, volts);
+            }
+            for &(net, volts) in &spec.stuck {
+                resolver.add_stuck_source(net, volts);
+            }
+            for &net in &spec.digital_senses {
+                resolver.add_digital_sense(net);
+            }
+            for &net in &spec.analog_senses {
+                resolver.add_analog_sense(net);
+            }
+            for &net in &spec.power_senses {
+                resolver.add_power_sense(net);
+            }
+            (resolver, ids)
+        }
+
+        fn bus_of(bus: &Diagnostics) -> Vec<String> {
+            let mut found: Vec<String> = bus.findings().iter().map(|f| format!("{f:?}")).collect();
+            found.sort();
+            found
+        }
+
+        fn merge_into(bus: &mut Diagnostics, pass: &Diagnostics) {
+            for finding in pass.findings() {
+                bus.report(finding.clone());
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
+            #[test]
+            fn resolving_only_the_touched_cluster_matches_a_full_pass(
+                spec in spec_strategy(),
+                ops in prop::collection::vec((0usize..8, drive_strategy()), 1..12),
+            ) {
+                let (mut incremental, ids) = build(&spec);
+                let (mut full, _) = build(&spec); // the OLD algorithm, one global pass
+                let mut nets_inc = nets(spec.n);
+                let mut nets_full = nets(spec.n);
+                let mut bus_inc = Diagnostics::new();
+                let mut bus_full = Diagnostics::new();
+
+                let mut pass = Diagnostics::new();
+                incremental.resolve(&mut nets_inc, &mut pass, &QuasiStaticMna);
+                merge_into(&mut bus_inc, &pass);
+                let mut pass = Diagnostics::new();
+                full.resolve_reference(&mut nets_full, &mut pass, &QuasiStaticMna);
+                merge_into(&mut bus_full, &pass);
+                for i in 0..spec.n {
+                    prop_assert!(
+                        same_state(&nets_inc[i].state, &nets_full[i].state),
+                        "initial pass, net {i}: new {:?}, reference {:?}",
+                        nets_inc[i].state,
+                        nets_full[i].state
+                    );
+                }
+
+                for (step, (slot, drive)) in ops.into_iter().enumerate() {
+                    let endpoint = ids[slot % ids.len()];
+                    let changed = incremental.set_drive(endpoint, drive);
+                    let _ = full.set_drive(endpoint, drive);
+
+                    let mut pass = Diagnostics::new();
+                    incremental.resolve_dirty(&mut nets_inc, &mut pass, &QuasiStaticMna);
+                    merge_into(&mut bus_inc, &pass);
+                    let mut pass = Diagnostics::new();
+                    full.resolve_reference(&mut nets_full, &mut pass, &QuasiStaticMna);
+                    merge_into(&mut bus_full, &pass);
+
+                    for i in 0..spec.n {
+                        prop_assert!(
+                            same_state(&nets_inc[i].state, &nets_full[i].state),
+                            "step {step} (changed={changed}) net {i}: incremental {:?}, reference {:?}",
+                            nets_inc[i].state,
+                            nets_full[i].state
+                        );
+                    }
+                    prop_assert_eq!(bus_of(&bus_inc), bus_of(&bus_full), "findings after step {}", step);
+                }
+            }
+        }
     }
 }

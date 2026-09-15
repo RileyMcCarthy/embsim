@@ -118,15 +118,6 @@ pub enum EngineEvent {
         /// Component whose wake handler ran.
         component: ComponentId,
     },
-    /// One byte crossed a derived stream route to one consumer.
-    StreamByte {
-        /// Producer endpoint the byte was written on.
-        producer: EndpointId,
-        /// Consumer endpoint it was delivered to.
-        consumer: EndpointId,
-        /// The byte.
-        byte: u8,
-    },
     /// A pulse train crossed a derived pulse route to one sink — one record
     /// per **rate change**, never per pulse (that is the representation's
     /// point; see [`crate::component::StreamRole::PulseSource`]). The record
@@ -202,14 +193,6 @@ impl EngineEventRecord {
                 format!("sense net={} state={}", net.0, state_form(state))
             }
             EngineEvent::Wake { component } => format!("wake component={}", component.0),
-            EngineEvent::StreamByte {
-                producer,
-                consumer,
-                byte,
-            } => format!(
-                "stream_byte producer={} consumer={} byte={byte:#04x}",
-                producer.0, consumer.0
-            ),
             EngineEvent::PulseUpdate {
                 source,
                 sink,
@@ -439,7 +422,6 @@ mod tests {
 
     use super::*;
     use crate::diagnostics::SenseKind;
-    use crate::net::PinRef;
 
     fn record(event: EngineEvent) -> EngineEventRecord {
         EngineEventRecord {
@@ -632,18 +614,10 @@ mod tests {
             EngineEvent::Wake {
                 component: ComponentId(0),
             },
-            EngineEvent::StreamByte {
-                producer: EndpointId(0),
-                consumer: EndpointId(1),
-                byte: 0x5a,
-            },
             EngineEvent::Reroute { epoch: 0 },
             EngineEvent::Finding(Finding::FloatingSense {
                 net: "N0".to_string(),
                 kind: SenseKind::Digital,
-            }),
-            EngineEvent::Finding(Finding::StreamOverrun {
-                producer: PinRef::new("U1", "1"),
             }),
         ];
         let forms: Vec<String> = events
@@ -665,7 +639,7 @@ mod tests {
             "7 drive_applied seq=1 endpoint=0 drive=3300000uv@25000mohm"
         );
         assert_eq!(forms[1], "7 drive_applied seq=1 endpoint=0 drive=release");
-        assert_eq!(forms[5], "7 stream_byte producer=0 consumer=1 byte=0x5a");
+        assert_eq!(forms[5], "7 reroute epoch=0");
     }
 
     /// Non-finite floats encode as fixed tokens rather than platform-dependent

@@ -57,6 +57,7 @@ reference consumer.
 | `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
 | `embsim-peripherals` | [`peripherals/`](peripherals) | GPIO, serial, encoder, pulse trains, timer, locks, threads, I2C, filesystem |
 | `embsim-models` | [`models/`](models) | Generic device/IC models (ADS122U04 ADC, limit switch, edge detector) |
+| `embsim-qemu` | [`qemu/`](qemu) | A QEMU VM as a board component: guest clock metered by the virtual clock, serial port on a net |
 | `embsim-runtime` | [`runtime/`](runtime) | `Emulator` builder, `Platform`/`Machine` traits, init ordering |
 | `embsim-p2` | [`platforms/p2/`](platforms/p2) | Reference platform: Parallax Propeller 2 HAL trampolines + constants |
 | `embsim-build` | [`build-support/`](build-support) | Two-line `build.rs` helper to find & link `lib<firmware>.a` |
@@ -64,6 +65,7 @@ reference consumer.
 | `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
 | `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer (and your custom views) mount into |
 | `embsim-minimal-example` | [`examples/minimal/`](examples/minimal) | Complete runnable firmware-free template |
+| `embsim-cpu-oracle` | [`cpu-oracle/`](cpu-oracle) | ISS-vs-silicon golden records (parse, diff). CPU adapters supply the image and ISS. |
 
 ## What a new project provides
 
@@ -194,6 +196,7 @@ Per-crate, if you want to iterate on one area:
 cargo test -p embsim-core           # virtual clock, observers, serial PTY
 cargo test -p embsim-peripherals    # gpio/serial/encoder/pulse_out/timer/lock/system/i2c/fs
 cargo test -p embsim-models         # ADS122U04, limit switch, edge detector
+cargo test -p embsim-qemu           # QEMU computer node (fake guest; real QEMU when installed)
 cargo test -p embsim-runtime        # Emulator builder + full no-firmware run
 cargo test -p embsim-memory-inspect # DWARF parser (compiles a tiny C fixture at test time)
 cargo test -p embsim-trace          # trace recorder + firmware-variable discovery

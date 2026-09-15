@@ -15,19 +15,19 @@ use rstest::rstest;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use embsim_board::component::StreamTx;
+use embsim_board::uart::UartFraming;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, Harness, NetState, PartRegistry,
-    PinDecl, PinHandle, PinKind, StreamRole, System, SystemError, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, Harness, NetState, PartRegistry, PinDecl,
+    PinHandle, PinKind, System, SystemError, TheveninDrive,
 };
 use embsim_core::virtual_clock;
+
+mod uart_probe;
+use uart_probe::{ProbeHandle, UartProbe};
 
 // ============================================================
 // Shared plumbing
 // ============================================================
-
-type TxSlot = Arc<Mutex<Option<StreamTx>>>;
-type ByteLog = Arc<Mutex<Vec<u8>>>;
 
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
@@ -38,56 +38,6 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(1));
     }
     pred()
-}
-
-// ============================================================
-// Fixture: a bench UART (stream pins with alias names)
-// ============================================================
-
-/// Bench UART probe: pin numbers "1"/"2" with "TX"/"RX" aliases, so bare
-/// endpoints resolve by either identity.
-struct BenchUart {
-    pins: [PinDecl; 2],
-    tx: TxSlot,
-    rx: ByteLog,
-}
-
-impl BenchUart {
-    fn new(baud_hz: u32, tx: TxSlot, rx: ByteLog) -> Self {
-        Self {
-            pins: [
-                PinDecl {
-                    number: "1",
-                    name: Some("TX"),
-                    kind: PinKind::DigitalOut,
-                    stream: Some(StreamRole::Producer { baud_hz }),
-                    drive_impedance: None,
-                },
-                PinDecl {
-                    number: "2",
-                    name: Some("RX"),
-                    kind: PinKind::DigitalIn,
-                    stream: Some(StreamRole::Consumer { baud_hz }),
-                    drive_impedance: None,
-                },
-            ],
-            tx,
-            rx,
-        }
-    }
-}
-
-impl Component for BenchUart {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        *self.tx.lock().unwrap() = Some(io.stream_tx("TX")?);
-        let log = Arc::clone(&self.rx);
-        io.on_byte("RX", move |byte| log.lock().unwrap().push(byte))?;
-        Ok(())
-    }
 }
 
 // ============================================================
@@ -154,17 +104,19 @@ const fn analog_pin(number: &'static str) -> PinDecl {
 
 /// Two bench UARTs cross-wired by bare (alias) endpoints roundtrip bytes in
 /// both directions — the bench-MCU serial path with no board netlist at all.
+///
+/// The pins are plain digital and the bytes are framed onto them as edges, so
+/// what this proves is that a *bare endpoint* resolves by either identity and
+/// the two nets carry a waveform between them.
 #[rstest]
 fn bench_uarts_roundtrip_over_bare_endpoints() {
-    // Stream pacing samples the free-running virtual clock; 50x scale keeps
-    // the 115.2 kbaud pacing sub-millisecond in wall time. This is the only
-    // test in this binary that touches the process-global clock.
+    // 50x scale keeps the 115.2 kbaud bit clock sub-millisecond in wall time.
+    // This is the only test in this binary that touches the global clock.
     virtual_clock::init(50.0, 1_000_000);
 
-    let host_tx: TxSlot = Arc::new(Mutex::new(None));
-    let host_rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
-    let dev_tx: TxSlot = Arc::new(Mutex::new(None));
-    let dev_rx: ByteLog = Arc::new(Mutex::new(Vec::new()));
+    let host = ProbeHandle::new();
+    let dev = ProbeHandle::new();
+    let framing = UartFraming::new_8n1(115_200);
 
     let harness = Harness::new()
         .connect_str("HOST.TX", "DEV.RX")
@@ -175,53 +127,42 @@ fn bench_uarts_roundtrip_over_bare_endpoints() {
     let system = System::new()
         .component(
             "HOST",
-            Box::new(BenchUart::new(
-                115_200,
-                Arc::clone(&host_tx),
-                Arc::clone(&host_rx),
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                framing,
+                host.clone(),
             )),
         )
         .component(
             "DEV",
-            Box::new(BenchUart::new(
-                115_200,
-                Arc::clone(&dev_tx),
-                Arc::clone(&dev_rx),
+            Box::new(UartProbe::new(
+                "1",
+                Some("TX"),
+                "2",
+                Some("RX"),
+                framing,
+                dev.clone(),
             )),
         )
         .harness(harness)
         .start()
         .expect("bench system starts");
 
+    host.send(&[0x55, 0x10]);
     assert!(
-        !system
-            .findings()
-            .iter()
-            .any(|f| matches!(f, Finding::StreamMismatch { .. })),
-        "straight bare-endpoint harness must route cleanly; got {:?}",
-        system.findings()
-    );
-
-    let host = host_tx.lock().unwrap().clone().expect("host attached");
-    host.write(&[0x55, 0x10]);
-    assert!(
-        wait_for(
-            || dev_rx.lock().unwrap().as_slice() == [0x55, 0x10],
-            Duration::from_secs(5)
-        ),
+        wait_for(|| dev.received() == [0x55, 0x10], Duration::from_secs(5)),
         "host bytes must reach the device; got {:?}",
-        dev_rx.lock().unwrap()
+        dev.frames()
     );
 
-    let dev = dev_tx.lock().unwrap().clone().expect("dev attached");
-    dev.write(b"OK");
+    dev.send(b"OK");
     assert!(
-        wait_for(
-            || host_rx.lock().unwrap().as_slice() == b"OK",
-            Duration::from_secs(5)
-        ),
+        wait_for(|| host.received() == b"OK", Duration::from_secs(5)),
         "device bytes must reach the host; got {:?}",
-        host_rx.lock().unwrap()
+        host.frames()
     );
 
     system.shutdown();

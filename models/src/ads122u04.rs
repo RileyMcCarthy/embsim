@@ -394,7 +394,17 @@ fn process_byte(
                     trace!("ADS122U04: WREG reg={} (waiting for data)", register);
                     ParseState::WaitWriteData { register }
                 } else {
-                    trace!("ADS122U04: unknown command 0x{:02x}", command);
+                    // A command byte the chip does not recognise did not come
+                    // from the driver -- the driver only ever sends legal ones.
+                    // It means the link corrupted a byte, and the visible
+                    // symptom is a *timeout* in the driver waiting for a reply
+                    // that was never provoked. That is very hard to diagnose
+                    // from the far end, so say so rather than hiding it at
+                    // trace level; on a healthy link this never fires.
+                    warn!(
+                        "ADS122U04: unknown command 0x{:02x} (corrupted on the wire?)",
+                        command
+                    );
                     ParseState::WaitSync
                 }
             }
