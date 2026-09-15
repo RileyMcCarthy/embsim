@@ -114,6 +114,7 @@ use crate::net::{
     Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, ESCALATION_IMPEDANCE_RATIO,
     STREAM_COLLAPSE_THRESHOLD,
 };
+use crate::system::EdgeFaultKind;
 
 // ============================================================
 // Constants
@@ -502,6 +503,57 @@ pub(crate) struct PulseRouteSpec {
     pub(crate) path_roots: Vec<usize>,
 }
 
+/// Build-time description of one [`crate::Scenario::edge_fault`] injector.
+///
+/// The live engine turns each of these into an [`EdgeFaultState`] that counts
+/// matching drive edges and opens the float/stuck/contention window.
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeFaultSpec {
+    /// Pin endpoint to count (and suppress, for Float). `None` = every drive
+    /// whose slot sits on [`Self::net`].
+    pub endpoint: Option<EndpointId>,
+    /// Net the stuck/contention ideal source attaches to.
+    pub net: usize,
+    /// Level-domain effect while the window is open.
+    pub kind: EdgeFaultKind,
+    /// Matching drives to skip before the window opens.
+    pub after_edges: u64,
+    /// Matching drives the window stays open for.
+    pub edge_count: u64,
+}
+
+/// Live counter + window state for one [`EdgeFaultSpec`].
+struct EdgeFaultState {
+    spec: EdgeFaultSpec,
+    /// Matching drive edges observed so far.
+    seen: u64,
+}
+
+impl EdgeFaultState {
+    fn new(spec: EdgeFaultSpec) -> Self {
+        Self { spec, seen: 0 }
+    }
+
+    /// Whether the window covers the *next* matching drive (index `seen`).
+    fn active(&self) -> bool {
+        self.spec.edge_count > 0
+            && self.seen >= self.spec.after_edges
+            && self.seen < self.spec.after_edges.saturating_add(self.spec.edge_count)
+    }
+
+    /// Does this drive match the injector's target?
+    fn matches(&self, endpoint: EndpointId, net: usize) -> bool {
+        match self.spec.endpoint {
+            Some(ep) => ep == endpoint,
+            None => net == self.spec.net,
+        }
+    }
+
+    fn tick(&mut self) {
+        self.seen = self.seen.saturating_add(1);
+    }
+}
+
 /// Resolution state shared by the build-time pass and the live engine:
 /// topology (identity merges, conduction edges, static sources, senses) plus
 /// the per-endpoint drive table the live path mutates. `resolve` recomputes
@@ -521,7 +573,12 @@ pub(crate) struct Resolver {
     power_senses: Vec<usize>,
     /// Serial-capable pins, in registration order (stream routing).
     streams: Vec<StreamPin>,
-    /// Scenario `stream_drop` byte-loss policies per endpoint.
+    /// Scenario [`crate::Scenario::edge_fault`] injectors (build-time specs).
+    edge_faults: Vec<EdgeFaultSpec>,
+    /// Endpoints whose drive is suppressed by an active Float window.
+    drive_suppressed: Vec<bool>,
+    /// Transient ideal sources from active Stuck/Contention windows.
+    edge_stuck_sources: Vec<(usize, Volts)>,
     net_count: usize,
     /// Everything about the board that does not change between drives —
     /// clusters, roots, path resistances — derived once per topology and
@@ -627,6 +684,9 @@ impl Resolver {
             analog_senses: Vec::new(),
             power_senses: Vec::new(),
             streams: Vec::new(),
+            edge_faults: Vec::new(),
+            drive_suppressed: Vec::new(),
+            edge_stuck_sources: Vec::new(),
             net_count,
             topology: None,
             topology_version: 0,
@@ -697,6 +757,104 @@ impl Resolver {
     pub(crate) fn add_stuck_source(&mut self, net: usize, volts: Volts) {
         self.topology_version += 1;
         self.stuck_sources.push((net, volts));
+    }
+
+    /// Register a scenario edge-level fault injector.
+    pub(crate) fn add_edge_fault(&mut self, spec: EdgeFaultSpec) {
+        self.edge_faults.push(spec);
+    }
+
+    /// Build-time specs the live engine arms as [`EdgeFaultState`]s.
+    pub(crate) fn edge_faults(&self) -> &[EdgeFaultSpec] {
+        &self.edge_faults
+    }
+
+    /// Net index a drive endpoint sits on, if the endpoint exists.
+    pub(crate) fn endpoint_net(&self, endpoint: EndpointId) -> Option<usize> {
+        self.slots.get(endpoint.0).map(|s| s.net)
+    }
+
+    /// Every drive-capable endpoint whose slot sits on `net`, ascending.
+    pub(crate) fn endpoints_on_net(&self, net: usize) -> Vec<EndpointId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.net == net)
+            .map(|(si, _)| EndpointId(si))
+            .collect()
+    }
+
+    /// Drive contribution visible to resolution (Float windows suppress).
+    fn effective_drive(&self, si: usize) -> Option<TheveninDrive> {
+        if self.drive_suppressed.get(si).copied().unwrap_or(false) {
+            return None;
+        }
+        self.slots.get(si).and_then(|s| s.drive)
+    }
+
+    /// Apply Float suppress masks and Stuck/Contention ideal sources from the
+    /// live injector snapshot. `float_endpoints` is the full set of endpoints
+    /// any Float injector may suppress; `suppressed_now` is which of them are
+    /// active this tick. Marks affected clusters dirty on change.
+    pub(crate) fn apply_edge_fault_effects(
+        &mut self,
+        float_endpoints: &[EndpointId],
+        suppressed_now: &[EndpointId],
+        stuck: &[(usize, Volts)],
+    ) -> bool {
+        let mut changed = false;
+        let need = float_endpoints
+            .iter()
+            .map(|ep| ep.0 + 1)
+            .max()
+            .unwrap_or(0)
+            .max(self.drive_suppressed.len());
+        if self.drive_suppressed.len() < need {
+            self.drive_suppressed.resize(need, false);
+        }
+        let active: HashSet<usize> = suppressed_now.iter().map(|ep| ep.0).collect();
+        for &endpoint in float_endpoints {
+            if endpoint.0 >= self.drive_suppressed.len() {
+                self.drive_suppressed.resize(endpoint.0 + 1, false);
+            }
+            let on = active.contains(&endpoint.0);
+            if self.drive_suppressed[endpoint.0] != on {
+                self.drive_suppressed[endpoint.0] = on;
+                changed = true;
+                if let Some(net) = self.endpoint_net(endpoint) {
+                    self.mark_net_dirty(net);
+                }
+            }
+        }
+        let mut new_stuck = stuck.to_vec();
+        new_stuck.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        if self.edge_stuck_sources != new_stuck {
+            let nets: Vec<usize> = self
+                .edge_stuck_sources
+                .iter()
+                .chain(new_stuck.iter())
+                .map(|&(net, _)| net)
+                .collect();
+            for net in nets {
+                self.mark_net_dirty(net);
+            }
+            self.edge_stuck_sources = new_stuck;
+            changed = true;
+        }
+        changed
+    }
+
+    fn mark_net_dirty(&mut self, net: usize) {
+        if let Some(topology) = self
+            .topology
+            .as_ref()
+            .filter(|t| t.version == self.topology_version && net < t.cluster_index.len())
+        {
+            let cluster = topology.cluster_index[net];
+            if !self.dirty.contains(&cluster) {
+                self.dirty.push(cluster);
+            }
+        }
     }
 
     /// Register a digital sense pin (floating-sense findings).
@@ -982,19 +1140,38 @@ impl Resolver {
         // for the level heuristic exactly like a rail.
         let mut cluster_power: Option<Volts> = None;
         let mut cluster_sourced = false;
-        for (_, volts) in c.power.iter().chain(c.stuck.iter()) {
+        // Scenario edge-fault Stuck/Contention sources that land in this cluster.
+        let edge_stuck_here: Vec<(usize, Volts)> = self
+            .edge_stuck_sources
+            .iter()
+            .filter_map(|&(net, volts)| {
+                let root = root_of.get(net).copied()?;
+                if c.roots.contains(&root) {
+                    Some((root, volts))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let stuck_iter = c
+            .stuck
+            .iter()
+            .copied()
+            .chain(edge_stuck_here.iter().copied());
+
+        for (_, volts) in c.power.iter().copied().chain(stuck_iter.clone()) {
             if !volts.is_nan() && cluster_power.is_none() {
-                cluster_power = Some(*volts);
+                cluster_power = Some(volts);
             }
             cluster_sourced = true;
         }
 
         // Driving endpoints per identity root, in endpoint order; drivers
-        // also source their cluster.
+        // also source their cluster. Float windows suppress via effective_drive.
         let mut net_drivers: Vec<(usize, Vec<usize>)> = Vec::new();
         for &si in &c.slots {
             let slot = &self.slots[si];
-            if slot.drive.is_none() {
+            if self.effective_drive(si).is_none() {
                 continue;
             }
             let root = root_of[slot.net];
@@ -1011,8 +1188,7 @@ impl Resolver {
                 .map(|(_, slots)| slots.as_slice())
         };
         let drive_of = |si: usize| {
-            self.slots[si]
-                .drive
+            self.effective_drive(si)
                 .expect("net_drivers only holds driving slots")
         };
         // (has a High driver, has a Low driver) on a root: the two facts the
@@ -1032,11 +1208,11 @@ impl Resolver {
         // Direct source levels per identity root (power/stuck beat drivers
         // for the fast-path state projection); NaN rails skipped.
         let mut direct_volts: Vec<(usize, Volts)> = Vec::new();
-        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
-            if volts.is_nan() || direct_volts.iter().any(|(r, _)| r == root) {
+        for (root, volts) in c.power.iter().copied().chain(stuck_iter.clone()) {
+            if volts.is_nan() || direct_volts.iter().any(|(r, _)| *r == root) {
                 continue;
             }
-            direct_volts.push((*root, *volts));
+            direct_volts.push((root, volts));
         }
         let direct_of = |root: usize| -> Option<Volts> {
             direct_volts
@@ -1051,7 +1227,7 @@ impl Resolver {
         let mut sources: Vec<ClusterSource> = Vec::new();
         for &si in &c.slots {
             let slot = &self.slots[si];
-            if let Some(drive) = slot.drive {
+            if let Some(drive) = self.effective_drive(si) {
                 sources.push(ClusterSource {
                     node: NetId(root_of[slot.net]),
                     volts: drive.volts,
@@ -1059,13 +1235,13 @@ impl Resolver {
                 });
             }
         }
-        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
+        for (root, volts) in c.power.iter().copied().chain(stuck_iter) {
             if volts.is_nan() {
                 continue;
             }
             sources.push(ClusterSource {
-                node: NetId(*root),
-                volts: *volts,
+                node: NetId(root),
+                volts,
                 impedance: 0.0,
             });
         }
@@ -2083,6 +2259,8 @@ struct EngineCore {
     /// recording site is closure-guarded, so an off log costs one `Option`
     /// check.
     event_log: EventLog,
+    /// Live edge-level fault injectors armed from scenario specs.
+    edge_faults: Vec<EdgeFaultState>,
 }
 
 impl EngineCore {
@@ -2305,10 +2483,75 @@ impl EngineCore {
                 endpoint,
                 drive,
             });
-            if self.resolver.set_drive(endpoint, drive) {
+            let drive_changed = self.resolver.set_drive(endpoint, drive);
+            // Mask/stuck for *this* edge (index == seen), resolve, then tick.
+            let net = self.resolver.endpoint_net(endpoint);
+            let fault_changed = self.sync_edge_faults();
+            if drive_changed || fault_changed {
                 self.resolve_and_publish_dirty();
             }
+            if let Some(net) = net {
+                for fault in &mut self.edge_faults {
+                    if fault.matches(endpoint, net) {
+                        fault.tick();
+                    }
+                }
+            }
         }
+    }
+
+    /// Push the current injector window onto the resolver (Float masks +
+    /// Stuck/Contention ideal sources). Returns whether resolution must run.
+    fn sync_edge_faults(&mut self) -> bool {
+        let mut float_endpoints: Vec<EndpointId> = Vec::new();
+        let mut suppressed_now: Vec<EndpointId> = Vec::new();
+        let mut stuck: Vec<(usize, Volts)> = Vec::new();
+        for fault in &self.edge_faults {
+            let active = fault.active();
+            match fault.spec.kind {
+                EdgeFaultKind::Float => {
+                    if let Some(ep) = fault.spec.endpoint {
+                        float_endpoints.push(ep);
+                        if active {
+                            suppressed_now.push(ep);
+                        }
+                    } else {
+                        // Net-targeted Float: suppress every slot on that net.
+                        for ep in self.resolver.endpoints_on_net(fault.spec.net) {
+                            float_endpoints.push(ep);
+                            if active {
+                                suppressed_now.push(ep);
+                            }
+                        }
+                    }
+                }
+                EdgeFaultKind::Stuck(volts) => {
+                    // Force the level: suppress the target pin (if any) and
+                    // inject an ideal source — same algebra as net_stuck.
+                    if let Some(ep) = fault.spec.endpoint {
+                        float_endpoints.push(ep);
+                        if active {
+                            suppressed_now.push(ep);
+                        }
+                    }
+                    if active {
+                        stuck.push((fault.spec.net, volts));
+                    }
+                }
+                EdgeFaultKind::Contention(volts) => {
+                    // Leave drivers in place; the ideal source fights them.
+                    if active {
+                        stuck.push((fault.spec.net, volts));
+                    }
+                }
+            }
+        }
+        float_endpoints.sort_by_key(|ep| ep.0);
+        float_endpoints.dedup();
+        suppressed_now.sort_by_key(|ep| ep.0);
+        suppressed_now.dedup();
+        self.resolver
+            .apply_edge_fault_effects(&float_endpoints, &suppressed_now, &stuck)
     }
 
     /// [`Self::resolve_and_publish`] scoped to the clusters the drives since
@@ -2821,6 +3064,12 @@ impl EngineHandle {
         let (tx, rx) = mpsc::channel();
         let (control_tx, control_rx) = mpsc::channel();
 
+        let core_edge_faults: Vec<EdgeFaultState> = resolver
+            .edge_faults()
+            .iter()
+            .cloned()
+            .map(EdgeFaultState::new)
+            .collect();
         let mut core = EngineCore {
             resolver,
             nets,
@@ -2845,7 +3094,11 @@ impl EngineHandle {
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
             stepped_gap_logged: None,
             event_log: event_log.clone(),
+            edge_faults: core_edge_faults,
         };
+        // Arm injectors before the first resolve so after_edges=0 windows
+        // cover idle / pre-drive state (Stuck/Contention) correctly.
+        core.sync_edge_faults();
         core.resolve_and_publish();
         // Byte pipes and pulse routes are derived from net resolution, never
         // installed beside it: the routing pass runs against the just-resolved

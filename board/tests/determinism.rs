@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::{UartDecoder, UartFraming};
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EventLog, Harness, PartRegistry, PinDecl,
-    PinHandle, PinKind, Scenario, SerialLevelBridge, System, SystemHandle, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, EdgeFaultKind, EventLog, Harness, PartRegistry,
+    PinDecl, PinHandle, PinKind, Scenario, SerialLevelBridge, System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -534,6 +534,7 @@ const CASES: &[&str] = &[
     "nominal_analog_cluster",
     "net_stuck_shared_node",
     "serial_levels",
+    "edge_fault_float",
     "wake_ladder",
 ];
 
@@ -550,6 +551,21 @@ fn run_case(name: &str) -> EventLog {
             let payload = [0x00u8, 0x5A, 0xFF, 0xA5];
             stream_scenario(Scenario::default(), &payload, payload.len())
         }
+        "edge_fault_float" => {
+            // Same four-byte payload as serial_levels, but Float the TX pin
+            // for ten drive edges after the idle + first frame (11 edges).
+            // That punches a hole through the second byte on the wire — the
+            // level-era stand-in for the deleted stream_drop_every_nth case.
+            let payload = [0x00u8, 0x5A, 0xFF, 0xA5];
+            // First byte survives; the floated stretch breaks framing so the
+            // receiver is not required to recover later bytes — wait for the
+            // one survivor the injector leaves intact.
+            stream_scenario(
+                Scenario::default().edge_fault("Rig.MCU.1", EdgeFaultKind::Float, 11, 10),
+                &payload,
+                1,
+            )
+        }
         "wake_ladder" => wake_ladder_scenario(),
         other => panic!("unknown determinism case {other:?}"),
     }
@@ -560,7 +576,7 @@ fn run_case(name: &str) -> EventLog {
 /// at real time.
 fn free_running_scale(name: &str) -> f64 {
     match name {
-        "serial_levels" => 50.0,
+        "serial_levels" | "edge_fault_float" => 50.0,
         _ => 1.0,
     }
 }
@@ -694,6 +710,7 @@ fn free_running_matrix(case: &str) {
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::serial_levels("serial_levels")]
+#[case::edge_fault_float("edge_fault_float")]
 #[case::wake_ladder("wake_ladder")]
 fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
     let _suite = suite_lock();
@@ -707,6 +724,7 @@ fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::serial_levels("serial_levels")]
+#[case::edge_fault_float("edge_fault_float")]
 #[case::wake_ladder("wake_ladder")]
 fn paced_order_is_reproducible(#[case] case: &str) {
     let _suite = suite_lock();
@@ -790,6 +808,7 @@ fn golden_path(case: &str) -> std::path::PathBuf {
 #[case::nominal("nominal_analog_cluster")]
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::serial_levels("serial_levels")]
+#[case::edge_fault_float("edge_fault_float")]
 #[case::wake_ladder("wake_ladder")]
 fn stepped_logs_match_their_golden_trace(#[case] case: &str) {
     let _suite = suite_lock();
@@ -921,6 +940,7 @@ fn dump_via_subprocess(case: &str) -> Vec<String> {
 #[rstest]
 #[case::nominal("nominal_analog_cluster")]
 #[case::serial_levels("serial_levels")]
+#[case::edge_fault_float("edge_fault_float")]
 #[case::wake_ladder("wake_ladder")]
 fn stepped_logs_are_identical_across_processes(#[case] case: &str) {
     let logs: Vec<Vec<String>> = (0..PROCESS_RUNS)
