@@ -550,9 +550,10 @@ fn the_rs422_receiver_decodes_the_encoder_pair_with_a_failsafe(
 /// worth having a test for, since nothing about "the encoder cable is plugged
 /// in" suggests a jumper is involved.
 #[rstest]
-fn the_z_ground_jumper_is_what_enables_the_encoder_receiver() {
+fn jumper_open_leaves_the_receiver_disabled() {
     // JP4 open: enables unasserted (`Z+` and `Z-` both floating), outputs
-    // released.
+    // released. Own start/shutdown so a slow engine on a loaded runner cannot
+    // leave the closed-jumper case looking at a half-torn-down system.
     let system = start_servo_domain(false, &[("EdgeBoard./MaD_Edge_Sheet3/A+", 3.3)]);
     assert_eq!(
         settled_state(&system, "EdgeBoard.Net-(IC16-INA)", NetState::Floating),
@@ -560,7 +561,10 @@ fn the_z_ground_jumper_is_what_enables_the_encoder_receiver() {
         "with JP4 open the receiver must be disabled"
     );
     system.shutdown();
+}
 
+#[rstest]
+fn jumper_closed_enables_the_receiver() {
     // JP4 closed: `Z-` sits at the isolated ground, asserting the active-low
     // enable, and the same differential now reads high.
     let system = start_servo_domain(true, &[("EdgeBoard./MaD_Edge_Sheet3/A+", 3.3)]);
