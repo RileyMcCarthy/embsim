@@ -888,11 +888,19 @@ mod tests {
         // running, the scheduler may not advance.
         let reader_actor = embsim_core::virtual_clock::register_actor("reader-cog");
 
+        // The peer must be registered before the reader parks. Otherwise the
+        // reader is briefly the only running actor, idle-jumps its whole
+        // timeout, and the assertion fails as `got == false` — a startup race
+        // that showed up under load on macOS CI while the peer-waveform test
+        // failed the same suite for an unrelated reason.
+        let peer_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let peer_stop = std::sync::Arc::clone(&stop);
+        let peer_ready_peer = std::sync::Arc::clone(&peer_ready);
         let far = pair.b;
         let peer = std::thread::spawn(move || {
             let _actor = embsim_core::virtual_clock::register_actor("device-model");
+            peer_ready_peer.wait();
             embsim_core::virtual_clock::wait_virtual_us(250);
             let fd = unsafe { BorrowedFd::borrow_raw(far) };
             let _ = nix::unistd::write(fd, b"R");
@@ -905,6 +913,7 @@ mod tests {
                 embsim_core::virtual_clock::wait_virtual_us(1_000);
             }
         });
+        peer_ready.wait();
 
         let mut buf = [0u8; 1];
         let got = receive_data_timeout(0, &mut buf, 5_000);
