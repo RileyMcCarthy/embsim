@@ -24,7 +24,8 @@ board/                    # new workspace member: embsim-board
 ├── src/engine.rs         # net-engine thread: drive queue, resolution, timer wheel, diagnostics
 ├── src/net.rs            # net state model, Thevenin drive resolution, digital projection
 ├── src/cluster.rs        # analog cluster extraction + quasi-static MNA solver (trait)
-├── src/stream.rs         # stream endpoints (serial byte pipes) derived from net routes
+├── src/uart.rs           # UART framing codec (byte ↔ timed digital levels)
+├── src/serial_levels.rs  # SerialLevelBridge: that codec on a pin (no byte route)
 ├── src/board.rs          # Board::from_netlist(netlist, registry) → components + nets
 ├── src/system.rs         # System: boards + harnesses + scenario overrides + fault algebra
 └── tests/                # parser fixtures (per KiCad version), net truth tables, MNA hand-checks
@@ -116,7 +117,7 @@ pub struct PinDecl {
     pub number: &'static str,        // netlist pin number ("3")
     pub name: Option<&'static str>,  // alias ("RX") — matches KiCad pinfunction when present
     pub kind: PinKind,
-    pub stream: Option<StreamRole>,  // serial endpoints; see "Stream endpoints"
+    pub stream: Option<StreamRole>,  // pulse-train role; see "Stream endpoints"
     pub drive_impedance: Option<Ohms>, // Thevenin source impedance; default per kind
 }
 
@@ -232,31 +233,38 @@ SPICE-backed solver is a possible future implementation and is intentionally
 **not** part of this design (no ngspice dependency, no cluster-marking syntax —
 see the consumer decision record for the rationale and revisit trigger).
 
-### Stream endpoints (serial over pins)
+### Stream endpoints (pulse trains; serial is levels)
 
-A UART link is two nets carrying byte streams. Byte pipes are **derived from
-and gated by net resolution**, never installed beside it:
+`StreamRole` is only for **step clocks carried as a rate**. UART bytes are
+**not** a stream role — they are framed onto ordinary digital pins as timed
+levels by [`SerialLevelBridge`](board/src/serial_levels.rs) (codec in
+`board/src/uart.rs`). There used to be `Producer`/`Consumer` byte-route roles
+and a `board/src/stream.rs` pipe layer; they are gone (history on
+`StreamRole` in `board/src/component.rs` and on `SerialLevelBridge`).
 
-- A serial-capable pin declares `stream: Some(Producer { baud })` or
-  `Consumer { baud }`; its `PinKind` stays digital, with a declared idle drive
-  (UART TX idles `Driven(High)`).
+**Pulse trains** (`PulseSource` / `PulseSink`):
+
+- A step-clock pin declares `stream: Some(PulseSource)` or `PulseSink`; its
+  `PinKind` stays digital, with a resolvable idle drive.
 - At build (and on any topology-affecting change: jumper toggles, faults,
-  harness swaps), the engine routes each `Producer` to `Consumer`s reachable
-  through its net **and through series passives below a collapse threshold
-  (default < 1 kΩ)** — so the DS2Addon's 47 Ω series resistors correctly
-  collapse into the link.
-- Bytes flow on the derived route with baud pacing. Route validity is
-  re-checked when the underlying nets change; a broken route stops delivery.
-- Compatibility findings at routing time: a route with two `Producer`s facing
-  each other (the crossed-TX/RX harness) raises **`StreamMismatch`**, and the
-  underlying nets — one with opposing push-pull sources through collapsed
-  resistance, one with no producer — additionally resolve per the net rules
-  (`Contention` / idle-high with a silent consumer). The regression test
-  asserts the findings, and the mid-rail voltage is available from the
-  escalated solve for scenarios that want it.
-- Byte-loss fidelity is explicitly **not** modeled at pipe granularity (no
-  RX-overrun emergence); scenario-driven byte-drop fault injection on a stream
-  is the supported way to exercise loss-handling code.
+  harness swaps), the engine routes each `PulseSource` to `PulseSink`s
+  reachable through its net **and through series passives below a collapse
+  threshold (default < 1 kΩ)**.
+- A `PulseTrain` (frequency, direction, count, anchor) is published **once per
+  rate change** and integrated by sinks at read time — not per edge.
+- Two `PulseSource`s reachable from each other raise **`StreamMismatch`** and
+  neither routes.
+
+**Serial over pins** (levels, not a byte pipe):
+
+- TX/RX pins are plain `DigitalOut` / `DigitalIn` (no `StreamRole`).
+  `SerialLevelBridge` clocks start/data/stop bits onto the net; the peer
+  decodes levels back to bytes. Contention, floating lines, and series
+  resistors are therefore ordinary net effects.
+- Scenario byte-drop on a *route* (`stream_drop`) was deleted with the byte
+  route. Level-domain fault injection for the serial era is
+  [`Scenario::edge_fault`](https://github.com/RileyMcCarthy/embsim/pull/48)
+  (draft; issue #44) — do not invent a byte-pipe injector here.
 
 ### Netlist ingestion
 
@@ -349,7 +357,8 @@ actually has (an N-pin net has no "where" for a generic open):
 - `net_stuck(net, rail)` — add a Thevenin source to a net;
 - `value_override("Board.R5", "4k7")`, `dnp_override("Board.C7", Populated)` —
   scenario-time BOM changes;
-- `stream_drop(endpoint, policy)` — byte-loss injection on a serial route.
+- Level-domain serial/line faults: see draft PR #48 / issue #44
+  (`Scenario::edge_fault`) once merged — not a byte-route `stream_drop`.
 
 Harness endpoints are `Board.Connector.Pin` references; bare MCU-pin endpoints
 (`P2EVAL.P0`) are allowed for bench rigs that aren't a designed PCB —
@@ -397,10 +406,12 @@ A platform crate (per `CONTRACT.md`) provides the MCU component:
    asserts the tables are present and non-empty before the emulator boots, so
    "table optimized away" is a build failure, not a mystery unwired pin.
 
-Channel behavior stays HAL-granular (byte pipes, GPIO levels, pulse rates);
-pins are topology. Baud and channel parameters come from the same tables — the
+Channel behavior stays HAL-granular (GPIO levels, pulse rates, and — where a
+bridge still uses the peripheral serial bank — socketpair byte FDs); pins are
+topology. Baud and channel parameters come from the same tables — the
 emulator stops inventing its own defaults (consumers may keep explicit pacing
-overrides for tests).
+overrides for tests). Level-framed serial (`SerialLevelBridge`) puts bits on
+the pin facade directly rather than through a derived byte route.
 
 > **Slice status (2026-08):** the MCU-as-a-component pattern ships in
 > `board/src/mcu.rs` for **all four channel kinds**, each opt-in per channel
@@ -470,8 +481,9 @@ present-but-undeclared).
   `NetState`), including the impedance-escalation boundary.
 - MNA: hand-computed reference circuits (bridge, divider ladder, pull-up vs
   driver, source-free singular cluster) asserted to µV.
-- Streams: routing through series passives, crossed-producer detection, route
-  invalidation on jumper/fault changes.
+- Pulse routes: routing through series passives, facing-`PulseSource`
+  detection, route invalidation on jumper/fault changes; serial-as-levels
+  bit clocks (`board/tests/serial_levels.rs`, determinism `serial_levels`).
 - Pin bridges: fake firmware driving the peripheral free functions with peer
   components watching the pins — exact step counts, mid-train direction
   reversal, GPIO in both directions at the channel's polarity, encoder counts
@@ -492,8 +504,9 @@ present-but-undeclared).
 ## Non-goals
 
 - SPICE/transient analog simulation (trait seam reserved; not built).
-- Cycle-accurate MCU peripheral timing; emergent byte-loss on serial pipes
-  (fault injection covers loss-handling code paths).
+- Cycle-accurate MCU peripheral timing; emergent RX-FIFO overrun on a
+  deleted byte pipe (serial is levels now; line faults are net effects —
+  level-era injectors land via #44 / PR #48, not a scenario byte-drop).
 - PCB physical effects (parasitics, thermal, EMC).
 - Auto-generating *plant* physics — transducer components expose parameterized
   primitives (e.g. bridge legs) for consumer physics models to drive.

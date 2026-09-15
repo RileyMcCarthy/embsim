@@ -265,11 +265,11 @@ pub(crate) enum Command {
         callback: TopologyCallback,
     },
     /// A pulse source published a new constant-rate segment. Delivered to the
-    /// sinks on the source's derived route (gated by net resolution, like
-    /// stream bytes), and retained so a sink registering later sees the
-    /// channel's current state. Carries no enqueue sequence for the same
-    /// reason [`Command::StreamWrite`] does not: per-source order is this
-    /// channel's order, and cross-source ordering is not meaningful.
+    /// sinks on the source's derived route (gated by net resolution), and
+    /// retained so a sink registering later sees the channel's current state.
+    /// Carries no enqueue sequence: per-source order *is* this channel's
+    /// order, and cross-source ordering is not meaningful. (The deleted
+    /// byte-route `StreamWrite` command used the same rule.)
     PulseUpdate {
         /// Source endpoint.
         endpoint: EndpointId,
@@ -519,9 +519,8 @@ pub(crate) struct Resolver {
     digital_senses: Vec<usize>,
     analog_senses: Vec<usize>,
     power_senses: Vec<usize>,
-    /// Serial-capable pins, in registration order (stream routing).
+    /// Pulse-capable pins, in registration order (pulse routing).
     streams: Vec<StreamPin>,
-    /// Scenario `stream_drop` byte-loss policies per endpoint.
     net_count: usize,
     /// Everything about the board that does not change between drives —
     /// clusters, roots, path resistances — derived once per topology and
@@ -1740,11 +1739,10 @@ impl Resolver {
         }
     }
 
-    /// Derive the **pulse** routes from the current net topology — the
-    /// step-clock analogue of [`Resolver::route_streams`], over the same
-    /// collapsed-conduction reachability ([`STREAM_COLLAPSE_THRESHOLD`]), so a
-    /// step signal that passes through series resistors or an isolator's
-    /// short-circuit stub reaches the drive exactly like a byte route does.
+    /// Derive the **pulse** routes from the current net topology — over the
+    /// same collapsed-conduction reachability ([`STREAM_COLLAPSE_THRESHOLD`]),
+    /// so a step signal that passes through series resistors or an isolator's
+    /// short-circuit stub still reaches the drive.
     ///
     /// Two pulse sources reachable from each other raise
     /// [`Finding::StreamMismatch`] once per pair and neither routes: two step
@@ -1752,8 +1750,8 @@ impl Resolver {
     /// transmitters, and the underlying net additionally resolves
     /// `Contention` on its own.
     ///
-    /// Runs wherever `route_streams` runs, from the same pass, so pulse routes
-    /// can never outlive the topology they were derived from.
+    /// Rebuild on every topology-affecting change so pulse routes can never
+    /// outlive the graph they were derived from.
     pub(crate) fn route_pulses(
         &mut self,
         nets: &[Net],
@@ -1814,7 +1812,7 @@ impl Resolver {
                 .filter(|s| s.role == StreamRole::PulseSink && reachable(s.net))
                 .map(|s| s.endpoint)
                 .collect();
-            // Same deliberately conservative gate as the byte routes: every
+            // Same deliberately conservative collapse gate as before: every
             // identity root within the collapse radius, sorted.
             // hash-order shape 2: `min_path_ohms` values are order-independent
             // and the collected keys are sorted here.
@@ -2847,9 +2845,8 @@ impl EngineHandle {
             event_log: event_log.clone(),
         };
         core.resolve_and_publish();
-        // Byte pipes and pulse routes are derived from net resolution, never
-        // installed beside it: the routing pass runs against the just-resolved
-        // nets.
+        // Pulse routes are derived from net resolution, never installed beside
+        // it: the routing pass runs against the just-resolved nets.
         core.reroute_channels();
 
         let time_authority = virtual_clock::take_time_authority();
