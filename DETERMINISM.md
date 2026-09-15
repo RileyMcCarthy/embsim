@@ -83,15 +83,17 @@ is real, but it is not the class of bug this machine's SIL suite is hunting.
   `resolve` sorts everywhere
   iteration order could reach an outcome (`driver_roots.sort_unstable()`,
   `fighting.sort_unstable()`, `extra_clusters.sort_unstable()`), and the
-  engine's `HashMap` fields (`sense_subs`, `wake_subs`, `routes`,
-  `stream_subs`, `drop_state`) are only ever accessed by key — sense delivery
-  walks `self.nets` by index, and per-net callbacks are a `Vec` in registration
-  order. `route_streams` walks `self.streams` in registration order and sorts
-  `path_roots`.
+  engine's `HashMap` fields (`sense_subs`, `wake_subs`, `pulse_routes`) are
+  only ever accessed by key — sense delivery walks `self.nets` by index, and
+  per-net callbacks are a `Vec` in registration order. `route_pulses` walks
+  `self.streams` in registration order and sorts `path_roots`. (Historical:
+  the byte-route maps `routes` / `stream_subs` / `drop_state` and
+  `route_streams` were deleted with `Producer`/`Consumer`.)
 - **Timer tie-breaks.** `TimerEntry::cmp` orders by `(deadline_us, seq)`, so
   simultaneous and late deadlines fire in schedule order.
-- **Per-producer stream FIFO.** `Command::StreamWrite` carries no seq because
-  the channel's own order *is* the wire contract per producer.
+- **Per-source pulse FIFO.** `Command::PulseUpdate` carries no seq because
+  the channel's own order *is* the wire contract per `PulseSource` (the old
+  byte-route `StreamWrite` command is gone with `Producer`/`Consumer`).
 - **The analog solve** (`board/src/cluster.rs`, `Spice::solve`) is
   deterministic given identical inputs *in identical order* — the deck is
   stamped from dense `Vec`s and ngspice `.op` on a linear network does not
@@ -426,13 +428,17 @@ that answer it:
   work nor parked-at-a-deadline; the barrier cannot classify it.
 
   **Boundary: in stepped mode, byte transports become in-process deterministic
-  queues.** The engine side already is one (`StreamTx::write` and `on_byte` are
-  engine commands). It is the *HAL* side that must change: add a
-  `serial::Transport` seam in `embsim-peripherals` with two implementations —
-  `FdTransport` (today's, free-running) and `QueueTransport` (an in-process
-  ring, whose blocking read is a `wait_until`-style actor park). `McuComponent`
-  selects by clock mode at attach; `Serial::init_channel_fd` gains a
-  transport-installing sibling. **This is the single largest piece of T1.**
+  queues.** Level-framed serial (`SerialLevelBridge`) already posts ordinary
+  `Command::Drive`s for each bit edge — engine-side order is the drive seq.
+  Where a bridge still crosses a `socketpair` into the peripheral serial bank,
+  it is the *HAL* side that must change: add a `serial::Transport` seam in
+  `embsim-peripherals` with two implementations — `FdTransport` (today's,
+  free-running) and `QueueTransport` (an in-process ring, whose blocking read
+  is a `wait_until`-style actor park). `McuComponent` selects by clock mode at
+  attach; `Serial::init_channel_fd` gains a transport-installing sibling.
+  **This is the single largest piece of T1.** (Historical: the deleted byte
+  route made `StreamTx::write` / `on_byte` the engine-side queue; that path is
+  gone.)
 
 - **The host PTY is excluded.** `core/src/serial_pty.rs` + `Emulator::run` step
   3 bridge a real terminal device driven by a human or by Playwright over
@@ -652,27 +658,33 @@ needs normalization before it can be compared.
 
 - **N-run identity** — `board/tests/determinism.rs` (its own binary, per
   `TESTING.md` rule 5). Run the same `System` + `Scenario` N = 5 times
-  in-process and compare the normalized event logs. `#[rstest]` cases over a
-  scenario matrix: nominal, `pin_detach` on AVDD, `stream_drop(EveryNth(3))`,
-  crossed-TX/RX harness, jumper open/closed.
+  in-process and compare the normalized event logs. `#[rstest]` cases over the
+  current scenario matrix: nominal analog cluster, `net_stuck` on a shared
+  node, `serial_levels` (four UART bytes framed onto the net as timed edges),
+  and a **wake ladder** (eight one-shot wheel wakeups 1 ms apart).
 
-  **Landed at D0 as an observational suite** (four cases: nominal analog
-  cluster, `net_stuck`, paced stream, `stream_drop(EveryNth(3))`). Free-running
-  mode cannot yet be held to full identity, so the binary *asserts* the
-  timestamp-free projection — the order T0 already determines — and *reports*
-  the timestamped divergence with numbers. It also carries its own
-  anti-vacuity guards: an empty log fails, and the comparator is checked
-  against reordered/truncated/mutated synthetic logs. D1 turns the reported
-  divergence into an assertion and adds the remaining matrix cases.
+  **Landed at D0 as an observational suite** (four cases in the *byte-route*
+  era: nominal analog cluster, `net_stuck`, paced stream,
+  `stream_drop(EveryNth(3))` — historical; see
+  [What D0 measured](#what-d0-measured)). Free-running mode cannot yet be held
+  to full identity, so the binary *asserts* the timestamp-free projection —
+  the order T0 already determines — and *reports* the timestamped divergence
+  with numbers. It also carries its own anti-vacuity guards: an empty log
+  fails, and the comparator is checked against reordered/truncated/mutated
+  synthetic logs. D1 turns the reported divergence into an assertion and adds
+  the remaining matrix cases.
 
   **Done at D1.** Every case now runs in **both** modes: stepped asserts the
   *full* timestamped projection identical over N = 5 runs; free-running keeps
-  the D0 split (order asserted, timestamps reported). A fifth case joined the
-  matrix — a **wake ladder**, eight one-shot wheel wakeups 1 ms apart — because
-  the four D0 cases are all scripted-stimulus scenarios whose stepped logs are
-  stamped `v_us = 0` throughout (nothing arms the wheel, so time never
-  advances). Without a case whose events are stamped at instants the *clock*
-  chose, "the timestamps are identical" would have been true and vacuous.
+  the D0 split (order asserted, timestamps reported). A **wake ladder** joined
+  the matrix because the scripted-stimulus cases alone are stamped `v_us = 0`
+  throughout (nothing arms the wheel, so time never advances). Without a case
+  whose events are stamped at instants the *clock* chose, "the timestamps are
+  identical" would have been true and vacuous. After the byte-route deletion,
+  the paced-stream / `stream_drop` rows were replaced by **`serial_levels`**
+  (level-era bit clock); the live matrix is the four cases named above
+  (`board/tests/determinism.rs`, four goldens under
+  `board/tests/fixtures/traces/`).
 - **Multi-process identity** — CI must run the binary N times as separate
   processes. (The original rationale — "in-process repetition shares one
   `HashMap` seed, so it cannot catch hash-order nondeterminism" — is wrong; see
@@ -692,9 +704,11 @@ needs normalization before it can be compared.
   **Done at D1**, as `board/tests/fixtures/traces/*.trace` — *not* `.jsonl`. The
   normalized form D0 shipped is deliberately line-oriented plain text with no
   serializer dependency (`event_log.rs`, "Normalization"), so a `.jsonl`
-  extension would have been a lie about the format. Five goldens, one per matrix
-  case, blessed with `EMBSIM_BLESS=1`; CI additionally fails if a test run left
-  the fixture tree dirty.
+  extension would have been a lie about the format. Four goldens in the live
+  matrix (one per case; the byte-route era shipped five before
+  paced-stream/`stream_drop` gave way to `serial_levels`), blessed with
+  `EMBSIM_BLESS=1`; CI additionally fails if a test run left the fixture tree
+  dirty.
 - **Negative control** — one test that runs the same scenario in *free-running*
   mode and asserts the traces are **not** required to match (and, where it is
   stable enough to assert, that timestamps differ). Without it, someone later
@@ -774,8 +788,10 @@ call sites rather than a rewrite spread over five crates.)
   `check_drive_stall` disabled and a new system-assembly time barrier; the
   ADS122U04 adapter's pump thread **deleted** in favour of an engine wakeup, and
   the model's protocol thread registered as an actor; a stepped/free-running
-  test matrix with five cases, five golden traces, cross-process identity, and
-  the free-running-vs-stepped contrast; and the `determinism` CI job.
+  test matrix (live: four cases / four goldens after `serial_levels` replaced
+  the paced-stream / `stream_drop` pair; D1 originally shipped five),
+  cross-process identity, and the free-running-vs-stepped contrast; and the
+  `determinism` CI job.
   Free-running remains the default and is behaviorally unchanged. See
   [What D1 measured](#what-d1-measured) and
   [Deviations from the design doc](#deviations-from-the-design-doc).
@@ -846,14 +862,17 @@ correction.
    class of bug.
 
 The measured free-running baseline, from `board/tests/determinism.rs` (N = 5 runs
-per scenario, clock re-anchored per run):
+per scenario, clock re-anchored per run). **Historical D0 numbers** from the
+byte-route era (paced stream / `stream_drop`); the live matrix uses
+`serial_levels` instead — see [Tests](#tests) and the level-era goldens under
+`board/tests/fixtures/traces/`:
 
 | scenario | records/run | order identical | timestamped logs identical | final `v_us` spread |
 |---|---|---|---|---|
 | nominal analog cluster | 63 | 5/5 | 0/4 | 20–45 ms |
 | `net_stuck` on the shared node | 65 | 5/5 | 0/4 | 19–48 ms |
-| paced stream, 16 bytes | 18 | 5/5 | 0/4 | 11–58 ms |
-| paced stream, `stream_drop(EveryNth(3))` | 12 | 5/5 | 0/4 | 9–34 ms |
+| paced stream, 16 bytes *(historical)* | 18 | 5/5 | 0/4 | 11–58 ms |
+| paced stream, `stream_drop(EveryNth(3))` *(historical)* | 12 | 5/5 | 0/4 | 9–34 ms |
 
 The record counts and the order columns were **identical across three repeats
 of the whole suite and across separate processes**; only the `v_us` spread
@@ -877,14 +896,16 @@ is wall-dependent and therefore changes the record count run to run.
 The same suite, now run in both modes (`board/tests/determinism.rs`, N = 5 runs
 per case per mode, clock re-anchored per run; reference host: M2, macOS, debug).
 "identical" means the **full** normalized line — append seq, `v_us`, and the
-event payload:
+event payload. **Historical D1 numbers** for the paced-stream /
+`stream_drop` rows (byte-route era); live replacement is `serial_levels`
+(130 records/run in the golden — bit-timed edges, not paced byte pipes):
 
 | case | records/run | stepped: identical (5 runs) | stepped: identical (3 processes) | free-running: identical | free-running `v_us` spread |
 |---|---|---|---|---|---|
 | nominal analog cluster | 63 | **5/5** | **3/3** | 0/4 | 29–186 µs |
 | `net_stuck` on the shared node | 65 | **5/5** | — | 0/4 | 29–727 µs |
-| paced stream, 16 bytes | 18 | **5/5** | **3/3** | 0/4 | 800–2 200 µs |
-| paced stream, `stream_drop(EveryNth(3))` | 12 | **5/5** | — | 0/4 | 600–1 800 µs |
+| paced stream, 16 bytes *(historical)* | 18 | **5/5** | **3/3** | 0/4 | 800–2 200 µs |
+| paced stream, `stream_drop(EveryNth(3))` *(historical)* | 12 | **5/5** | — | 0/4 | 600–1 800 µs |
 | wake ladder, 8 × 1 ms | 43 | **5/5** | **3/3** | 0/4 | 102–233 µs |
 
 The free-running spreads are ranges over three repeats of the whole suite; they
@@ -898,9 +919,11 @@ The numbers that show *why* it is deterministic rather than merely equal:
   scheduled deadlines, not "shortly after" them. In free-running the same
   ladder's wakes are stamped at sampled wall instants and the two runs disagree
   from **record 0**.
-- **Paced stream**: bytes cross at exactly `86, 172, 258, …` µs —
-  `10 bits / 115 200 baud`, truncated, accumulated by the engine. The pacing
-  arithmetic *is* the trace.
+- **Paced stream** *(historical byte-route case)*: bytes crossed at exactly
+  `86, 172, 258, …` µs — `10 bits / 115 200 baud`, truncated, accumulated by
+  the engine. The live replacement is **`serial_levels`**: the same baud math
+  now stamps *bit edges* on the net (`SerialLevelBridge`), so the golden is a
+  drive/sense/wake ladder rather than a paced byte-pipe log.
 - **Scripted-stimulus cases** stay at `v_us = 0` throughout, because nothing
   arms the wheel and a stepped clock has no reason to advance. That is correct,
   and it is also why the wake ladder had to be added: without it the timestamp
@@ -976,7 +999,9 @@ force path + gantry):
   papered over with tolerance windows. A bench bug reproduced by patience.
 - **T1 (D1 + D2).** The bench-bug suite becomes *exactly* repeatable: the
   floating `~RESET` case, the crossed-TX/RX harness, the unstrapped AVDD case,
-  `stream_drop` loss handling, and the force-path sample cadence all produce
+  level-era serial/line faults (see draft PR #48 / issue #44 for
+  `Scenario::edge_fault`; the deleted `stream_drop` byte-loss knob is not
+  coming back), and the force-path sample cadence all produce
   identical event traces run to run and machine to machine. Golden traces make
   wire-behavior changes a diff. Wall-clock tolerance windows come out of the
   tests. CI stops needing single-worker execution *for timing reasons* (the
