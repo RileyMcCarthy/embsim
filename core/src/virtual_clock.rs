@@ -1467,13 +1467,26 @@ mod tests {
     /// while it is doing work, `await_quiescence` returns only once it parks,
     /// and `advance_to` restores its runnable accounting **before** it returns
     /// — so a scheduler can never step past the instant it just woke it for.
+    ///
+    /// The woken actor deliberately stays runnable (busy-waits on a release
+    /// counter) until the test has observed that accounting. Asserting
+    /// `running == 1` immediately after `advance_to` without that handshake is
+    /// a race: `advance_to` notifies before it returns, so under llvm-cov /
+    /// coverage load the actor can re-park — or unregister on the last step —
+    /// before the scheduler thread samples `scheduler_state()`. The invariant
+    /// under test is structural (accounting restored before return), not a
+    /// wall-clock timing window.
     #[rstest]
     fn registered_actor_holds_the_barrier_until_it_parks() {
         let _g = SteppedGuard::enter();
         let gate = Arc::new(AtomicU64::new(0));
+        // Bumped by the test after each post-advance accounting check; the
+        // actor stays runnable until `release >=` the step it just woke from.
+        let release = Arc::new(AtomicU64::new(0));
         let observed = Arc::new(Mutex::new(Vec::<u64>::new()));
 
         let actor_gate = Arc::clone(&gate);
+        let actor_release = Arc::clone(&release);
         let actor_observed = Arc::clone(&observed);
         let actor = std::thread::spawn(move || {
             let _registration = register_actor("test-actor");
@@ -1481,9 +1494,14 @@ mod tests {
             while actor_gate.load(Ordering::SeqCst) == 0 {
                 std::thread::yield_now();
             }
-            for _ in 0..3 {
+            for step in 1..=3u64 {
                 wait_virtual_us(100);
                 actor_observed.lock().unwrap().push(virtual_us());
+                // Hold the barrier as a runnable actor until the test has
+                // observed `advance_to`'s restored accounting for this wake.
+                while actor_release.load(Ordering::SeqCst) < step {
+                    std::thread::yield_now();
+                }
             }
         });
 
@@ -1511,12 +1529,22 @@ mod tests {
                 "a parked actor is not runnable"
             );
             advance_to(step * 100).expect("forward");
+            // Actor is held runnable by the release handshake above, so this
+            // is a structural check — not a race against re-park / unregister.
             assert_eq!(
                 scheduler_state().running,
                 1,
-                "advance_to must restore the woken actor's runnable accounting \
-                 BEFORE it returns"
+                "advance_to must restore the woken actor's runnable accounting                  BEFORE it returns (step {step})"
             );
+            match await_quiescence(Duration::from_millis(50)) {
+                Quiescence::Stalled { actors } => {
+                    assert_eq!(actors, vec!["test-actor".to_string()])
+                }
+                other => panic!(
+                    "step {step}: woken actor must hold the barrier until released, got {other:?}"
+                ),
+            }
+            release.store(step, Ordering::SeqCst);
         }
         actor.join().expect("actor joins");
         assert_eq!(*observed.lock().unwrap(), vec![100, 200, 300]);
