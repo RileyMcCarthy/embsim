@@ -415,7 +415,47 @@ pub struct TimeAuthority {
 
 impl Drop for TimeAuthority {
     fn drop(&mut self) {
-        TIME_AUTHORITY.fetch_sub(1, Ordering::Release);
+        let previous = TIME_AUTHORITY.fetch_sub(1, Ordering::Release);
+        if previous != 1 {
+            return; // a nested hold remains; someone is still advancing time
+        }
+        // Last authority released — wake whoever is parked so they can idle-jump
+        // again.
+        //
+        // [`park_until_virtual`] decides whether to idle-jump ON THE WAY IN: with
+        // an authority held it does not, and then sleeps on `ADVANCED` until
+        // someone calls [`advance_to`]. When the authority itself goes away, that
+        // someone no longer exists, and nothing re-evaluates the decision — so
+        // every actor that was parked at that moment sleeps forever.
+        //
+        // This went unnoticed while the only actors parked at shutdown were
+        // detached threads nobody joined. It becomes a hang the moment a joined
+        // thread parks on the virtual clock — which is exactly what the MCU
+        // serial pump now does, and `SystemHandle` joins the engine (releasing
+        // this authority) BEFORE it drops the components that join their pumps.
+        //
+        // One nudge is enough to become self-sustaining: a waiter woken here
+        // returns, and the next time it parks it takes the no-authority branch
+        // and idle-jumps under its own power.
+        // `waits` is keyed in NANOSECONDS — advance with the ns entry point.
+        // `advance_to` takes microseconds and would scale this by 1000.
+        let idle_to_ns = {
+            let sched = lock_sched();
+            if sched.running == 0 {
+                sched
+                    .waits
+                    .keys()
+                    .next()
+                    .map(|&(deadline_ns, _)| deadline_ns)
+            } else {
+                // Someone is still runnable; it will park shortly and idle-jump
+                // itself, since the authority is already gone.
+                None
+            }
+        };
+        if let Some(deadline_ns) = idle_to_ns {
+            let _ = advance_to_ns(deadline_ns);
+        }
     }
 }
 
@@ -613,6 +653,23 @@ pub fn register_actor(name: &str) -> Actor {
 /// Number of actors currently registered (diagnostics and tests).
 pub fn registered_actors() -> usize {
     lock_sched().actors.len()
+}
+
+/// Names of the actors currently registered, in registration order
+/// (diagnostics and tests).
+///
+/// The count alone cannot answer the question a determinism test actually
+/// needs to ask — *which* threads the quiescence barrier is accounting for.
+/// A byte-carrying thread that forgets to register is invisible to the
+/// barrier, and the symptom is not a failure here but virtual time quietly
+/// running away from the bytes it carries (`DETERMINISM.md` T1 §4).
+pub fn registered_actor_names() -> Vec<String> {
+    let sched = lock_sched();
+    let mut ids: Vec<_> = sched.actors.keys().copied().collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .filter_map(|id| sched.actors.get(&id).map(|a| a.name.clone()))
+        .collect()
 }
 
 /// Park the calling thread until "now" reaches `deadline_v_ns`.
@@ -962,6 +1019,68 @@ mod tests {
             "a 60 ms virtual jump at 1x paced only {elapsed:?}"
         );
         set_scale(0.0);
+    }
+
+    /// Releasing the last time authority wakes whoever is parked.
+    ///
+    /// `park_until_virtual` decides whether to idle-jump on the way IN: with an
+    /// authority held it does not, and sleeps until someone calls `advance_to`.
+    /// When the authority goes away, that someone stops existing — so without
+    /// this, every actor parked at that instant sleeps forever.
+    ///
+    /// That is a shutdown hang, not a slow path, and it is reachable from any
+    /// joined thread that parks on the virtual clock: `SystemHandle` joins the
+    /// engine (releasing its authority) before it drops the components that
+    /// join their own threads.
+    #[rstest]
+    fn releasing_the_last_time_authority_wakes_parked_waiters() {
+        let _g = lock_or_recover();
+        init(0.0, 1_000_000);
+
+        let authority = take_time_authority();
+        let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let flag = std::sync::Arc::clone(&woke);
+        let parked = std::thread::spawn(move || {
+            let _actor = register_actor("parked-at-shutdown");
+            // Far enough out that only an idle jump can retire it.
+            wait_virtual_us(1_000_000);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        // Wait until the thread has REGISTERED and then parked. Waiting only
+        // for `running == 0` is not enough: that is already true before the
+        // thread registers, so the authority would be released too early, the
+        // thread would park with none held, and it would idle-jump under its
+        // own power — the test would pass whether or not the bug is present.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let registered = registered_actor_names()
+                .iter()
+                .any(|n| n == "parked-at-shutdown");
+            if registered && scheduler_state().running == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "thread never registered + parked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!woke.load(Ordering::SeqCst), "must still be parked");
+
+        drop(authority);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !woke.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            woke.load(Ordering::SeqCst),
+            "a waiter parked when the last authority is released must be woken \
+             to idle-jump under its own power, or it sleeps forever"
+        );
+        parked.join().expect("parked thread joins");
     }
 
     /// `virtual_to_wall_us(0)` is always 0 regardless of scale (no wait → no
