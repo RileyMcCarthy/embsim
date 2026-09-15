@@ -197,6 +197,25 @@ pub enum DnpState {
     Absent,
 }
 
+/// Level-domain effect an [`Fault::EdgeFault`] forces for its active window.
+///
+/// Replaces the deleted byte-route `stream_drop` knob: the injector acts on
+/// the wire (float / stuck / contention) for a chosen stretch of drive edges,
+/// rather than dropping opaque bytes off a pipe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EdgeFaultKind {
+    /// Suppress the target pin's drive contribution (high-Z). The net floats
+    /// unless another source still reaches it.
+    Float,
+    /// Force an ideal stuck source at `volts` on the target's net (same
+    /// algebra as [`Scenario::net_stuck`], but timed to an edge window).
+    Stuck(Volts),
+    /// Inject an ideal source at `volts` *alongside* live drivers — a brief
+    /// fight that projects [`crate::NetState::Contention`] when the levels
+    /// disagree.
+    Contention(Volts),
+}
+
 /// One injected fault, defined in terms of graph primitives the netlist
 /// actually has.
 #[derive(Debug, Clone, PartialEq)]
@@ -220,6 +239,20 @@ pub enum Fault {
         net: String,
         /// Rail voltage of the injected source.
         volts: Volts,
+    },
+    /// Timed level-domain fault on a named pin or net: force float, stuck
+    /// level, or contention for `edge_count` drive edges after skipping
+    /// `after_edges` matching drives. The level-era replacement for the
+    /// deleted `Scenario::stream_drop`.
+    EdgeFault {
+        /// Dotted pin (`"Board.Ref.Pin"`) or net (`"Board.NETNAME"`).
+        target: String,
+        /// What the injector forces while the window is open.
+        kind: EdgeFaultKind,
+        /// Matching drive edges to skip before the window opens.
+        after_edges: u64,
+        /// Matching drive edges the window stays open for.
+        edge_count: u64,
     },
 }
 
@@ -261,6 +294,28 @@ impl Scenario {
         self.faults.push(Fault::NetStuck {
             net: net.to_string(),
             volts,
+        });
+        self
+    }
+
+    /// Inject a timed level-domain fault on a named pin or net.
+    ///
+    /// `after_edges` matching drive edges are skipped; the next `edge_count`
+    /// matching drives open the window. A pin target counts (and, for
+    /// [`EdgeFaultKind::Float`], suppresses) that endpoint only; a net target
+    /// counts every drive whose slot sits on that net.
+    pub fn edge_fault(
+        mut self,
+        target: &str,
+        kind: EdgeFaultKind,
+        after_edges: u64,
+        edge_count: u64,
+    ) -> Self {
+        self.faults.push(Fault::EdgeFault {
+            target: target.to_string(),
+            kind,
+            after_edges,
+            edge_count,
         });
         self
     }
@@ -783,6 +838,9 @@ impl System {
         }
 
         // -- scenario: fault algebra ---------------------------------------
+        // EdgeFault specs need drive endpoints, which are registered after
+        // this pass — stash them and resolve once the endpoint map exists.
+        let mut pending_edge_faults: Vec<Fault> = Vec::new();
         for fault in self.scenario.faults().to_vec() {
             match fault {
                 Fault::PinDetach { endpoint } => {
@@ -802,6 +860,7 @@ impl System {
                     let idx = self.named_net(&net, &nets)?;
                     stuck_sources.push((idx, volts));
                 }
+                edge @ Fault::EdgeFault { .. } => pending_edge_faults.push(edge),
             }
         }
 
@@ -913,6 +972,51 @@ impl System {
                 eps.push(endpoint);
             }
             bench_endpoints.push(eps);
+        }
+
+        // -- scenario: edge-level fault injectors ---------------------------
+        for fault in pending_edge_faults {
+            let Fault::EdgeFault {
+                target,
+                kind,
+                after_edges,
+                edge_count,
+            } = fault
+            else {
+                unreachable!("pending_edge_faults holds only EdgeFault");
+            };
+            // Prefer a pin endpoint (counts/suppresses that drive); fall back
+            // to a named net (counts every drive on the net).
+            let spec = if let Some(key) = split_board_pin(&target, &board_index) {
+                let net = *net_of_pin
+                    .get(&key)
+                    .ok_or_else(|| SystemError::UnknownEndpoint {
+                        endpoint: target.clone(),
+                    })?;
+                let endpoint =
+                    *endpoints
+                        .get(&key)
+                        .ok_or_else(|| SystemError::UnknownEndpoint {
+                            endpoint: target.clone(),
+                        })?;
+                crate::engine::EdgeFaultSpec {
+                    endpoint: Some(endpoint),
+                    net,
+                    kind,
+                    after_edges,
+                    edge_count,
+                }
+            } else {
+                let net = self.named_net(&target, &nets)?;
+                crate::engine::EdgeFaultSpec {
+                    endpoint: None,
+                    net,
+                    kind,
+                    after_edges,
+                    edge_count,
+                }
+            };
+            resolver.add_edge_fault(spec);
         }
 
         // -- prepare registered components for attach ------------------------
@@ -1443,6 +1547,7 @@ mod tests {
             .pin_detach("DS2Addon.U1.3")
             .pin_short("DS2Addon.A0", "DS2Addon.A1")
             .net_stuck("DS2Addon.AIN0", 3.3)
+            .edge_fault("DS2Addon.U1.2", EdgeFaultKind::Float, 11, 10)
             .value_override("DS2Addon.R5", "4k7")
             .dnp_override("DS2Addon.C7", DnpState::Populated);
 
@@ -1450,7 +1555,7 @@ mod tests {
             scenario.jumpers(),
             &[("DS2Addon.JP1".to_string(), JumperState::Closed)]
         );
-        assert_eq!(scenario.faults().len(), 3);
+        assert_eq!(scenario.faults().len(), 4);
         assert_eq!(
             scenario.faults()[0],
             Fault::PinDetach {

@@ -653,11 +653,11 @@ needs normalization before it can be compared.
 - **N-run identity** — `board/tests/determinism.rs` (its own binary, per
   `TESTING.md` rule 5). Run the same `System` + `Scenario` N = 5 times
   in-process and compare the normalized event logs. `#[rstest]` cases over a
-  scenario matrix: nominal, `pin_detach` on AVDD, `stream_drop(EveryNth(3))`,
-  crossed-TX/RX harness, jumper open/closed.
+  scenario matrix: nominal, `pin_detach` on AVDD, `edge_fault(Float, …)` on a
+  serial pin, crossed-TX/RX harness, jumper open/closed.
 
   **Landed at D0 as an observational suite** (four cases: nominal analog
-  cluster, `net_stuck`, paced stream, `stream_drop(EveryNth(3))`). Free-running
+  cluster, `net_stuck`, paced stream, edge-fault float). Free-running
   mode cannot yet be held to full identity, so the binary *asserts* the
   timestamp-free projection — the order T0 already determines — and *reports*
   the timestamped divergence with numbers. It also carries its own
@@ -667,7 +667,7 @@ needs normalization before it can be compared.
 
   **Done at D1.** Every case now runs in **both** modes: stepped asserts the
   *full* timestamped projection identical over N = 5 runs; free-running keeps
-  the D0 split (order asserted, timestamps reported). A fifth case joined the
+  the D0 split (order asserted, timestamps reported). An edge-fault float case and a wake-ladder case joined the
   matrix — a **wake ladder**, eight one-shot wheel wakeups 1 ms apart — because
   the four D0 cases are all scripted-stimulus scenarios whose stepped logs are
   stamped `v_us = 0` throughout (nothing arms the wheel, so time never
@@ -692,7 +692,7 @@ needs normalization before it can be compared.
   **Done at D1**, as `board/tests/fixtures/traces/*.trace` — *not* `.jsonl`. The
   normalized form D0 shipped is deliberately line-oriented plain text with no
   serializer dependency (`event_log.rs`, "Normalization"), so a `.jsonl`
-  extension would have been a lie about the format. Five goldens, one per matrix
+  extension would have been a lie about the format. Six goldens, one per matrix
   case, blessed with `EMBSIM_BLESS=1`; CI additionally fails if a test run left
   the fixture tree dirty.
 - **Negative control** — one test that runs the same scenario in *free-running*
@@ -774,7 +774,7 @@ call sites rather than a rewrite spread over five crates.)
   `check_drive_stall` disabled and a new system-assembly time barrier; the
   ADS122U04 adapter's pump thread **deleted** in favour of an engine wakeup, and
   the model's protocol thread registered as an actor; a stepped/free-running
-  test matrix with five cases, five golden traces, cross-process identity, and
+  test matrix with six cases, six golden traces, cross-process identity, and
   the free-running-vs-stepped contrast; and the `determinism` CI job.
   Free-running remains the default and is behaviorally unchanged. See
   [What D1 measured](#what-d1-measured) and
@@ -853,7 +853,7 @@ per scenario, clock re-anchored per run):
 | nominal analog cluster | 63 | 5/5 | 0/4 | 20–45 ms |
 | `net_stuck` on the shared node | 65 | 5/5 | 0/4 | 19–48 ms |
 | paced stream, 16 bytes | 18 | 5/5 | 0/4 | 11–58 ms |
-| paced stream, `stream_drop(EveryNth(3))` | 12 | 5/5 | 0/4 | 9–34 ms |
+| paced stream, edge-fault float | 12 | 5/5 | 0/4 | 9–34 ms |
 
 The record counts and the order columns were **identical across three repeats
 of the whole suite and across separate processes**; only the `v_us` spread
@@ -884,7 +884,7 @@ event payload:
 | nominal analog cluster | 63 | **5/5** | **3/3** | 0/4 | 29–186 µs |
 | `net_stuck` on the shared node | 65 | **5/5** | — | 0/4 | 29–727 µs |
 | paced stream, 16 bytes | 18 | **5/5** | **3/3** | 0/4 | 800–2 200 µs |
-| paced stream, `stream_drop(EveryNth(3))` | 12 | **5/5** | — | 0/4 | 600–1 800 µs |
+| paced stream, edge-fault float | 12 | **5/5** | — | 0/4 | 600–1 800 µs |
 | wake ladder, 8 × 1 ms | 43 | **5/5** | **3/3** | 0/4 | 102–233 µs |
 
 The free-running spreads are ranges over three repeats of the whole suite; they
@@ -976,7 +976,7 @@ force path + gantry):
   papered over with tolerance windows. A bench bug reproduced by patience.
 - **T1 (D1 + D2).** The bench-bug suite becomes *exactly* repeatable: the
   floating `~RESET` case, the crossed-TX/RX harness, the unstrapped AVDD case,
-  `stream_drop` loss handling, and the force-path sample cadence all produce
+  edge-fault loss handling, and the force-path sample cadence all produce
   identical event traces run to run and machine to machine. Golden traces make
   wire-behavior changes a diff. Wall-clock tolerance windows come out of the
   tests. CI stops needing single-worker execution *for timing reasons* (the

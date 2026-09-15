@@ -74,7 +74,7 @@ pub use registry::{
 };
 pub use serial_levels::SerialLevelBridge;
 pub use system::{
-    BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
-    HarnessError, Scenario, System, SystemError, SystemHandle,
+    BuiltSystem, DnpState, EdgeFaultKind, EndpointKind, EndpointRef, Fault, Harness,
+    HarnessConnection, HarnessError, Scenario, System, SystemError, SystemHandle,
 };
 pub use uart::{FramingError, UartDecoder, UartEncoder, UartFraming};

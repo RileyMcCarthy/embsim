@@ -349,7 +349,10 @@ actually has (an N-pin net has no "where" for a generic open):
 - `net_stuck(net, rail)` — add a Thevenin source to a net;
 - `value_override("Board.R5", "4k7")`, `dnp_override("Board.C7", Populated)` —
   scenario-time BOM changes;
-- `stream_drop(endpoint, policy)` — byte-loss injection on a serial route.
+- `edge_fault(target, kind, after_edges, edge_count)` — timed level-domain
+  fault on a named pin or net (`EdgeFaultKind::Float`, `Stuck(volts)`, or
+  `Contention(volts)`) for a chosen stretch of drive edges. Replaces the
+  deleted byte-route `stream_drop` knob; there is no byte-pipe injector.
 
 Harness endpoints are `Board.Connector.Pin` references; bare MCU-pin endpoints
 (`P2EVAL.P0`) are allowed for bench rigs that aren't a designed PCB —
