@@ -353,8 +353,8 @@ fn rig(event_log: bool) -> Rig {
 
 /// Tear the rig down and leave the process banks clean for the next case.
 fn teardown(rig: Rig) {
-    // The engine joins before the components drop (`SystemHandle`'s documented
-    // order), so no callback can race the bank reset below.
+    // Components drop before the engine joins (`SystemHandle`'s documented
+    // order); callbacks gate on shutdown so the bank reset below is safe.
     drop(rig);
     pulse_out::reset();
     gpio::reset();
