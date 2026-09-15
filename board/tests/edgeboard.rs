@@ -31,17 +31,19 @@
 mod machine_parts;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use rstest::rstest;
 
 use embsim_board::{
-    Board, Finding, JumperState, Level, NetState, PinKind, PinRef, Scenario, SenseKind, System,
-    SystemHandle,
+    AttachError, Board, Component, ComponentNetIo, Finding, JumperState, Level, NetState, PinDecl,
+    PinKind, PinRef, Scenario, SenseKind, System, SystemHandle,
 };
+use embsim_core::virtual_clock;
 use machine_parts::{
-    bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed, iso6731_pins,
+    bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed, ep, iso6731_pins,
 };
 
 /// Registered (non-passive, non-boundary, non-ignored) component count: the 16
@@ -52,7 +54,8 @@ const EXPECTED_REGISTERED: usize = 49;
 /// virtual clock, and `init` re-anchors it — so it runs once per binary.
 fn ensure_clock() {
     static CLOCK: Once = Once::new();
-    CLOCK.call_once(|| embsim_core::virtual_clock::init(1.0, 1_000_000));
+    // Unpaced: DC analog settle is a virtual-time fact, not a wall-paced jump.
+    CLOCK.call_once(|| virtual_clock::init(0.0, 1_000_000));
 }
 
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
@@ -61,6 +64,8 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
         if pred() {
             return true;
         }
+        // Test-side liveness only — this thread is not an actor and must not
+        // park on a clock the engine is stepping.
         std::thread::sleep(Duration::from_millis(1));
     }
     pred()
@@ -385,6 +390,101 @@ fn settled_state(system: &SystemHandle, net: &str, expected: NetState) -> NetSta
         .unwrap_or_else(|| panic!("net {net} exists"))
 }
 
+/// One virtual microsecond after attach. The engine holds time until every
+/// component has attached (`ReleaseTime`), drains the attach-time drive/sense
+/// cascade to a fixpoint at t = 0, then advances to this deadline — so the
+/// capture is the settled DC state, not a wall-race sample of a transient
+/// `Driven(High)` that a later `Drive(None)` released.
+///
+/// macos CI on `3c10c04` failed `case_3_failsafe` in a 0.26 s edgeboard binary:
+/// `settled_state` returns on the first High, then the assertion reads
+/// Floating. That is a TOCTOU, not a slow runner.
+const SETTLE_WAKE_US: u64 = 1;
+
+/// High-impedance probe on the receiver's channel-1 output (`U25.1Y` /
+/// `Net-(IC16-INA)`). Captures on the engine thread at [`SETTLE_WAKE_US`].
+struct SettleProbe {
+    pins: [PinDecl; 1],
+    capture: Arc<Mutex<Option<NetState>>>,
+    done: Arc<AtomicBool>,
+}
+
+impl Component for SettleProbe {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let y = io.pin("Y")?;
+        let capture = Arc::clone(&self.capture);
+        let done = Arc::clone(&self.done);
+        io.on_wake(move |_now_us| {
+            *capture.lock().unwrap() = Some(y.sense());
+            done.store(true, Ordering::SeqCst);
+        });
+        io.schedule_at(virtual_clock::virtual_us() + SETTLE_WAKE_US);
+        Ok(())
+    }
+}
+
+fn probe_pin() -> PinDecl {
+    PinDecl {
+        number: "Y",
+        name: None,
+        kind: PinKind::DigitalIn,
+        stream: None,
+        drive_impedance: None,
+    }
+}
+
+/// Start the servo-domain board with an engine-hosted settle probe on the
+/// receiver output. The returned `NetState` was captured on the engine thread
+/// after the attach cascade, so it cannot be a mid-resolution transient.
+///
+/// One live engine at a time: two engines sharing the process clock will
+/// advance a settle wake for each other mid-cascade (the reverse case then
+/// samples failsafe High instead of the injected differential).
+fn start_servo_settled(scenario: Scenario) -> NetState {
+    static LIVE: Mutex<()> = Mutex::new(());
+    let _guard = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_clock();
+    let capture = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    let probe = SettleProbe {
+        pins: [probe_pin()],
+        capture: Arc::clone(&capture),
+        done: Arc::clone(&done),
+    };
+    let system = System::new()
+        .board("EdgeBoard", edge_board())
+        .component("SETTLE", Box::new(probe))
+        .harness(bench_rails("EdgeBoard").connect(ep("SETTLE.Y"), ep("EdgeBoard.U25.3")))
+        .scenario(scenario)
+        .start()
+        .expect("the servo-domain system starts");
+    assert!(
+        wait_for(|| done.load(Ordering::SeqCst), SETTLE),
+        "the engine never reached the DC settle wake — analog cascade is still on wall time"
+    );
+    let got = capture
+        .lock()
+        .unwrap()
+        .expect("settle wake fired without capturing");
+    system.shutdown();
+    got
+}
+
+fn encoder_scenario(jumpers_closed: bool, sources: &[(&str, f64)]) -> Scenario {
+    let mut scenario = edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard");
+    if jumpers_closed {
+        scenario = encoder_jumpers_closed(scenario, "EdgeBoard");
+    }
+    for (net, volts) in sources {
+        scenario = scenario.net_stuck(net, *volts);
+    }
+    scenario
+}
+
 /// The AM26LS31 turns one logic input into a complementary pair on the real
 /// netlist's `SC_PUL±` nets — the step signal the machine's stepper driver
 /// receives. Reversing the input reverses both legs.
@@ -513,35 +613,17 @@ fn the_rs422_receiver_decodes_the_encoder_pair_with_a_failsafe(
 ) {
     // JP4 (`Z_GND`) must be closed for the receiver to be enabled at all; the
     // reverse case needs JP2 open, so it closes JP4 on its own.
-    let mut sources = sources.to_vec();
-    let system = if jumpers_closed {
-        start_servo_domain(true, &sources)
+    let scenario = if jumpers_closed {
+        encoder_scenario(true, sources)
     } else {
-        ensure_clock();
-        let mut scenario = edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard")
-            .jumper("EdgeBoard.JP4", JumperState::Closed);
-        for (net, volts) in sources.drain(..) {
-            scenario = scenario.net_stuck(net, volts);
-        }
-        System::new()
-            .board("EdgeBoard", edge_board())
-            .harness(bench_rails("EdgeBoard"))
-            .scenario(scenario)
-            .start()
-            .expect("starts")
+        encoder_scenario(false, sources).jumper("EdgeBoard.JP4", JumperState::Closed)
     };
-
     // The receiver's channel-1 output is the isolator input the P2 reads as P9.
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard.Net-(IC16-INA)",
-            NetState::Driven(expected)
-        ),
+        start_servo_settled(scenario),
         NetState::Driven(expected),
         "the receiver output for this differential"
     );
-    system.shutdown();
 }
 
 /// The board wires the encoder's index pair to the receiver's **enable** pins,
@@ -549,31 +631,33 @@ fn the_rs422_receiver_decodes_the_encoder_pair_with_a_failsafe(
 /// four receiver outputs are high-Z and the encoder is silent — a wiring trap
 /// worth having a test for, since nothing about "the encoder cable is plugged
 /// in" suggests a jumper is involved.
+///
+/// Each jumper state is its own system (and its own settle wake): running
+/// open-then-closed in one test shut the first engine down and started the
+/// second immediately, and on a loaded runner the closed case still saw
+/// Floating after five seconds of wall settle.
 #[rstest]
-fn the_z_ground_jumper_is_what_enables_the_encoder_receiver() {
-    // JP4 open: enables unasserted (`Z+` and `Z-` both floating), outputs
-    // released.
-    let system = start_servo_domain(false, &[("EdgeBoard./MaD_Edge_Sheet3/A+", 3.3)]);
+fn the_z_ground_jumper_open_disables_the_encoder_receiver() {
     assert_eq!(
-        settled_state(&system, "EdgeBoard.Net-(IC16-INA)", NetState::Floating),
+        start_servo_settled(encoder_scenario(
+            false,
+            &[("EdgeBoard./MaD_Edge_Sheet3/A+", 3.3)],
+        )),
         NetState::Floating,
         "with JP4 open the receiver must be disabled"
     );
-    system.shutdown();
+}
 
-    // JP4 closed: `Z-` sits at the isolated ground, asserting the active-low
-    // enable, and the same differential now reads high.
-    let system = start_servo_domain(true, &[("EdgeBoard./MaD_Edge_Sheet3/A+", 3.3)]);
+#[rstest]
+fn the_z_ground_jumper_closed_enables_the_encoder_receiver() {
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard.Net-(IC16-INA)",
-            NetState::Driven(Level::High)
-        ),
+        start_servo_settled(encoder_scenario(
+            true,
+            &[("EdgeBoard./MaD_Edge_Sheet3/A+", 3.3)],
+        )),
         NetState::Driven(Level::High),
         "closing JP4 enables the receiver"
     );
-    system.shutdown();
 }
 
 /// Channel 4 of the receiver has its inputs marked no-connect while its output
