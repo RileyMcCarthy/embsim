@@ -383,6 +383,13 @@ struct Plant {
     /// `steps` is for edges, kept apart so a defect in one path cannot look
     /// like the other.
     train_steps: i64,
+    /// How late the current rate-carried train was delivered relative to its
+    /// publisher anchor (`delivery − since_us`). Zero when the engine handed
+    /// it over on time. Shifted onto [`MotorCore::train_end`] so the plant
+    /// integrates `rate × duration` even when free-running delivery slipped —
+    /// otherwise pulse count and distance disagree by exactly `lag × rate`
+    /// (see issue #43).
+    train_delivery_lag_us: u64,
     /// Last position (rounded to whole steps) published to observers.
     emitted: i64,
     /// Last projected STEP level, for edge detection.
@@ -407,6 +414,7 @@ impl Plant {
             train: None,
             train_folded: 0,
             train_steps: 0,
+            train_delivery_lag_us: 0,
             emitted: 0,
             step_level: None,
             // Before DIR ever presents a level the drive assumes forward;
@@ -483,10 +491,17 @@ impl MotorCore {
         self.train_sign(plant, train) as f64 * f64::from(train.pulses.freq_hz)
     }
 
-    /// Virtual time (µs) at which the current rate-carried finite train emits
-    /// its last pulse.
+    /// Virtual time (µs) at which the current rate-carried finite train stops
+    /// commanding — the publisher's last-pulse instant, shifted by any
+    /// free-running delivery lag so travel equals `rate × duration` even when
+    /// the train arrived late (issue #43).
     fn train_end(&self, plant: &Plant) -> Option<u64> {
-        plant.train?.completes_at()
+        Some(
+            plant
+                .train?
+                .completes_at()?
+                .saturating_add(plant.train_delivery_lag_us),
+        )
     }
 
     /// Advance the closed form to `to_us`, splitting wherever the commanded
@@ -564,8 +579,11 @@ impl MotorCore {
     fn set_train(&self, train: PulseTrain) {
         let mut plant = self.plant.lock().unwrap();
         // The engine may deliver later than the source acted (free-running);
-        // never rewind the plant to match.
+        // never rewind the plant to match. Record the lag so `train_end`
+        // finishes `lag` later than the source said — conserving the
+        // pulse↔distance invariant instead of silently truncating travel.
         let at = train.pulses.since_us.max(plant.now_us);
+        let delivery_lag_us = at.saturating_sub(train.pulses.since_us);
         self.advance(&mut plant, at);
         // `advance` is a no-op when `at == now_us`, so fold explicitly. It is
         // idempotent, so doing both is safe.
@@ -573,6 +591,7 @@ impl MotorCore {
         plant.cmd = self.train_rate(&plant, &train);
         plant.train = Some(train);
         plant.train_folded = 0;
+        plant.train_delivery_lag_us = delivery_lag_us;
         // A rate-carried train supplies its own rate, so the edge path's
         // phase measurement (and its stall window) must not also apply.
         plant.last_edge_us = None;
@@ -1691,6 +1710,46 @@ mod tests {
             shaft.train(),
             Some(published),
             "the shaft reports the train as it was published, un-anchored"
+        );
+    }
+
+    /// A late-delivered finite train must still travel `rate × duration`.
+    ///
+    /// Before the delivery-lag shift on `train_end`, integrating only from
+    /// delivery to the publisher's `completes_at` lost exactly `lag × rate`
+    /// of distance while `commanded_steps` (the fold) still saw every pulse —
+    /// the plant's two views of the same motion disagreed (issue #43).
+    #[rstest]
+    fn a_late_delivered_finite_train_conserves_distance() {
+        let core = enabled_core(quasi_static());
+        // Pretend the plant already free-ran past the publisher's since_us.
+        {
+            let mut plant = core.plant.lock().unwrap();
+            plant.now_us = 200; // 200 µs late relative to since_us = 0
+        }
+        // 100 pulses at 20 kHz → 5 ms of commanded travel.
+        core.set_train(train(20_000, 0, Some(100)));
+        assert_eq!(
+            core.plant.lock().unwrap().train_delivery_lag_us,
+            200,
+            "delivery lag must be recorded"
+        );
+
+        // Settle well past the shifted end (completes_at 5_000 + lag 200).
+        read_at(&core, 5_200);
+        // Coast through the lag so velocity decays to rest.
+        read_at(&core, 5_200 + 100_000);
+
+        assert_eq!(train_steps(&core), 100, "fold still sees every pulse");
+        assert!(
+            (pos(&core) - 100.0).abs() < 0.01,
+            "late delivery must not truncate travel; expected 100 steps, got {}",
+            pos(&core)
+        );
+        assert!(
+            vel(&core).abs() < 0.01,
+            "and the carriage must be at rest, v = {}",
+            vel(&core)
         );
     }
 }
