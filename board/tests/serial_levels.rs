@@ -163,7 +163,8 @@ struct PeerState {
     outbox: VecDeque<u8>,
     /// Levels of the frame being clocked out.
     bits: VecDeque<Level>,
-    /// Instant the next TX bit is driven at.
+    /// Instant the next TX bit is driven at; `None` until the engine anchors
+    /// the frame (see [`Peer::send`] / the wake handler).
     next_edge_ns: Option<u64>,
     /// Filled at attach, so the test can kick a transmission.
     io: Option<ComponentNetIo>,
@@ -182,17 +183,28 @@ impl Peer {
     }
 
     /// Queue bytes and wake the peer to start clocking them out.
+    ///
+    /// Deliberately does **not** stamp [`PeerState::next_edge_ns`] here — same
+    /// reason as [`embsim_board::SerialLevelBridge::transmit`]: a test-thread
+    /// clock read may already be past by the time the engine handles the wake,
+    /// and anchoring there dumps the whole frame at one instant so the far end
+    /// decodes nothing (`got []` under load). The engine anchors when it starts
+    /// the frame; this only asks it to.
     fn send(&self, bytes: &[u8]) {
-        let io = {
+        if bytes.is_empty() {
+            return;
+        }
+        let (io, kick) = {
             let mut state = self.lock();
+            let idle =
+                state.next_edge_ns.is_none() && state.bits.is_empty() && state.outbox.is_empty();
             state.outbox.extend(bytes);
-            if state.next_edge_ns.is_none() {
-                state.next_edge_ns = Some(virtual_clock::virtual_ns());
-            }
-            state.io.clone()
+            (state.io.clone(), idle)
         };
-        if let Some(io) = io {
-            io.schedule_at_ns(virtual_clock::virtual_ns());
+        if kick {
+            if let Some(io) = io {
+                io.schedule_at_ns(virtual_clock::virtual_ns());
+            }
         }
     }
 
@@ -280,10 +292,20 @@ impl Component for PeerUart {
             io.clone().on_wake_ns(move |now| {
                 let (level, next) = {
                     let mut peer = state.lock();
-                    match peer.next_edge_ns {
+                    // Resolve the TX due instant. `None` with work queued means
+                    // `send` asked us to start: anchor on *this* (engine) clock,
+                    // never the test thread's — see SerialLevelBridge::service_tx.
+                    if matches!(peer.next_edge_ns, Some(due) if due > now) {
                         // Not this bit yet: leave the line where it is.
-                        Some(due) if due > now => (None, Some(due)),
-                        Some(due) => {
+                        (None, peer.next_edge_ns)
+                    } else {
+                        let due = peer.next_edge_ns.unwrap_or(now);
+                        let has_work = peer.next_edge_ns.is_some()
+                            || !peer.outbox.is_empty()
+                            || !peer.bits.is_empty();
+                        if !has_work {
+                            (None, None)
+                        } else {
                             if peer.bits.is_empty() {
                                 if let Some(byte) = peer.outbox.pop_front() {
                                     peer.bits =
@@ -303,7 +325,6 @@ impl Component for PeerUart {
                                 }
                             }
                         }
-                        None => (None, None),
                     }
                 };
                 if let Some(level) = level {
