@@ -233,10 +233,7 @@ fn host_fixture() -> Option<&'static HostFixture> {
     FIXTURE
         .get_or_init(|| {
             let (archive, dir) = build_fixture_archive()?;
-            Some(HostFixture {
-                archive,
-                _dir: dir,
-            })
+            Some(HostFixture { archive, _dir: dir })
         })
         .as_ref()
 }
