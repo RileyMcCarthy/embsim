@@ -421,10 +421,11 @@ impl Drop for Ads122u04Component {
         // Stop the UART bridge before the FDs go: a wake callback the engine
         // has not yet dropped must be inert, not driving a dead pin.
         self.shutdown.store(true, Ordering::Relaxed);
-        // Dropping `firmware_fd` closes the pipe end once the engine has
-        // dropped its wake callback (SystemHandle joins the engine *before* it
-        // drops components — the documented drop order). The model's protocol
-        // thread then reads EOF and idles, exactly as in the hand-wired setup.
+        // Dropping `firmware_fd` closes the pipe end. Wake callbacks gate on
+        // `shutdown` (set above) so a still-running engine cannot drive a dead
+        // pin; `SystemHandle` drops components before joining the engine.
+        // The model's protocol thread then reads EOF and idles, exactly as in
+        // the hand-wired setup.
         debug!("ADS122U04 component shut down");
     }
 }

@@ -344,9 +344,9 @@ impl Drop for QemuNode {
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }
-        // Components drop after the engine is joined, and the engine only
-        // exits once every actor has parked — so the actor is parked here,
-        // the guest is not mid-slice, and taking it out of the slot is safe.
+        // `SystemHandle` drops components before joining the engine. The
+        // shutdown flag above stops the pump; the guest actor is expected to
+        // be parked (not mid-slice) so taking it out of the slot is safe.
         // Dropping the guest is what shuts it down (a `QemuVm` quits QEMU).
         // The actor thread itself stays parked on a deadline the board will
         // never reach; it is not joined — the same detach an MCU's firmware
