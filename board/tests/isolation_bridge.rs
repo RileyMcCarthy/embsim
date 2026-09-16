@@ -35,8 +35,11 @@
 mod machine_parts;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
+
+use embsim_core::virtual_clock;
 
 use rstest::rstest;
 
@@ -85,6 +88,93 @@ fn settled_state(system: &SystemHandle, net: &str, expected: NetState) -> NetSta
     system
         .net_state(net)
         .unwrap_or_else(|| panic!("net {net} exists"))
+}
+
+/// One virtual microsecond after a stimulus. Same idea as `edgeboard.rs`:
+/// the engine drains the attach/drive cascade to a fixpoint, then the wake
+/// samples settled DC — not a wall-race glance at a transient.
+const SETTLE_WAKE_US: u64 = 1;
+
+/// End-switch / opto loop facts captured on the engine thread.
+#[derive(Clone, Debug)]
+struct EndSwitchSettled {
+    p19: NetState,
+    lit: bool,
+    sinking: bool,
+    current_ma: f64,
+}
+
+/// High-impedance probe on `P19` that also snapshots the opto/regulator
+/// monitors at the settle wake. Re-armable so open → closed → open cycles
+/// can each capture a virtual-time settled sample.
+struct EndSwitchSettleProbe {
+    pins: [PinDecl; 1],
+    opto: Vo2631Monitor,
+    ccr: Nsi50010Regulator,
+    capture: Arc<Mutex<Option<EndSwitchSettled>>>,
+    done: Arc<AtomicBool>,
+    io: Arc<Mutex<Option<ComponentNetIo>>>,
+}
+
+impl Component for EndSwitchSettleProbe {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let y = io.pin("Y")?;
+        let opto = self.opto.clone();
+        let ccr = self.ccr.clone();
+        let capture = Arc::clone(&self.capture);
+        let done = Arc::clone(&self.done);
+        io.on_wake(move |_now_us| {
+            *capture.lock().unwrap() = Some(EndSwitchSettled {
+                p19: y.sense(),
+                lit: opto.is_lit(vo2631::OptoChannel::Two),
+                sinking: opto.is_sinking(vo2631::OptoChannel::Two),
+                current_ma: ccr.current_ma(),
+            });
+            done.store(true, Ordering::SeqCst);
+        });
+        *self.io.lock().unwrap() = Some(io.clone());
+        io.schedule_at(virtual_clock::virtual_us() + SETTLE_WAKE_US);
+        Ok(())
+    }
+}
+
+fn settle_probe_pin() -> PinDecl {
+    PinDecl {
+        number: "Y",
+        name: None,
+        kind: PinKind::DigitalIn,
+        stream: None,
+        drive_impedance: None,
+    }
+}
+
+/// Re-arm the end-switch settle probe and wait for the engine-thread capture.
+fn capture_end_switch_settled(
+    done: &AtomicBool,
+    capture: &Mutex<Option<EndSwitchSettled>>,
+    io: &Mutex<Option<ComponentNetIo>>,
+) -> EndSwitchSettled {
+    done.store(false, Ordering::SeqCst);
+    *capture.lock().unwrap() = None;
+    let handle = io
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("end-switch settle probe attached");
+    handle.schedule_at(virtual_clock::virtual_us() + SETTLE_WAKE_US);
+    assert!(
+        wait_for(|| done.load(Ordering::SeqCst), SETTLE),
+        "end-switch settle wake never fired — analog cascade is still on wall time"
+    );
+    capture
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("settle wake fired without capturing")
 }
 
 // ============================================================
@@ -391,12 +481,61 @@ fn rig_harness() -> Harness {
         .connect(ep(&format!("{EDGE}.J16.1")), ep("END_U.NO"))
 }
 
+/// Probe wiring returned from `start_inner` before the LIVE suite lock is applied.
+struct EndSwitchSettleParts {
+    capture: Arc<Mutex<Option<EndSwitchSettled>>>,
+    done: Arc<AtomicBool>,
+    io: Arc<Mutex<Option<ComponentNetIo>>>,
+}
+
+/// Handles for re-arming the end-switch settle probe after a position change.
+///
+/// `_live` serializes settle-probe engines so a sibling test cannot advance
+/// the shared virtual clock mid-cascade (see `edgeboard.rs` `SettleProbe`).
+struct EndSwitchSettle {
+    parts: EndSwitchSettleParts,
+    _live: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EndSwitchSettle {
+    fn capture(&self) -> EndSwitchSettled {
+        capture_end_switch_settled(&self.parts.done, &self.parts.capture, &self.parts.io)
+    }
+}
+
 /// Build and start the promoted board.
 ///
 /// `servo_domain` powers `SC_5V` — the isolated servo rail `IC14`'s side 2 and
 /// `IC16`'s side 1 run from. Dropping it is how a test asks "what does an
 /// isolator with one side dead do?".
 fn start(servo_domain: bool, event_log: bool, sources: &[(&str, f64)]) -> Rig {
+    start_inner(servo_domain, event_log, sources, false).0
+}
+
+/// Start the end-switch loop with an engine-hosted settle probe on U6.VO2 (net P19).
+///
+/// One live settle-probe engine at a time: two engines sharing the process
+/// clock will advance a settle wake for each other mid-cascade (same hazard
+/// `edgeboard.rs` documents for its `SettleProbe`).
+fn start_end_switch_loop(sources: &[(&str, f64)]) -> (Rig, EndSwitchSettle) {
+    static LIVE: Mutex<()> = Mutex::new(());
+    let live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (rig, parts) = start_inner(true, false, sources, true);
+    let settle = EndSwitchSettle {
+        parts: parts.expect("end-switch settle probe requested"),
+        _live: live,
+    };
+    // Drain the attach-time cascade before the test samples open-loop facts.
+    let _ = settle.capture();
+    (rig, settle)
+}
+
+fn start_inner(
+    servo_domain: bool,
+    event_log: bool,
+    sources: &[(&str, f64)],
+    with_end_switch_settle: bool,
+) -> (Rig, Option<EndSwitchSettleParts>) {
     ensure_clock();
     let promoted = Promoted::default();
     let board = promoted_board(&promoted);
@@ -431,11 +570,37 @@ fn start(servo_domain: bool, event_log: bool, sources: &[(&str, f64)]) -> Rig {
             .power(ep("BENCH.SERVOGND"), ep(&format!("{EDGE}.J21.8")), 0.0);
     }
 
+    let settle_handles = if with_end_switch_settle {
+        let capture = Arc::new(Mutex::new(None));
+        let done = Arc::new(AtomicBool::new(false));
+        let io = Arc::new(Mutex::new(None));
+        let probe = EndSwitchSettleProbe {
+            pins: [settle_probe_pin()],
+            opto: promoted.opto("U6"),
+            ccr: promoted.regulator("IC9"),
+            capture: Arc::clone(&capture),
+            done: Arc::clone(&done),
+            io: Arc::clone(&io),
+        };
+        Some((probe, EndSwitchSettleParts { capture, done, io }))
+    } else {
+        None
+    };
+
     let mut system = System::new()
         .board(EDGE, board)
         .component("MCU", Box::new(mcu))
         .component("STEPSINK", Box::new(sink))
-        .component("END_U", Box::new(switch))
+        .component("END_U", Box::new(switch));
+    let settle = if let Some((probe, handles)) = settle_handles {
+        system = system
+            .component("END_SETTLE", Box::new(probe))
+            .harness(Harness::new().connect(ep("END_SETTLE.Y"), ep(&format!("{EDGE}.U6.6"))));
+        Some(handles)
+    } else {
+        None
+    };
+    system = system
         .harness(rails)
         .harness(extra_rails())
         .harness(rig_harness())
@@ -445,14 +610,17 @@ fn start(servo_domain: bool, event_log: bool, sources: &[(&str, f64)]) -> Rig {
     }
     let system = system.start().expect("the promoted EdgeBoard starts");
 
-    Rig {
-        system,
-        promoted,
-        handles,
-        step_tx,
-        trains,
-        end_switch,
-    }
+    (
+        Rig {
+            system,
+            promoted,
+            handles,
+            step_tx,
+            trains,
+            end_switch,
+        },
+        settle,
+    )
 }
 
 // ============================================================
@@ -713,41 +881,46 @@ fn the_encoder_isolator_fails_safe_low_when_its_input_side_dies() {
 /// exactly what "pulled to its rail, not floating" means.
 #[rstest]
 fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
-    let rig = start(true, false, &[]);
-    let p19 = format!("{EDGE}.P19");
+    // Engine-hosted settle probe (see edgeboard `SettleProbe`): open/closed
+    // facts are sampled on the engine thread after a virtual-time wake so a
+    // wall-race glance at a mid-cascade transient cannot pass wait_for and
+    // then fail the lit/current asserts (ubuntu release smoke flake on
+    // #50 / run 35007027583).
+    let (rig, settle) = start_end_switch_loop(&[]);
     let ccr = rig.promoted.regulator("IC9");
     let opto = rig.promoted.opto("U6");
 
     // Open contact: no return path, so the loop carries nothing.
     rig.end_switch.set_position_mm(0.0);
+    let open = settle.capture();
     assert!(
-        wait_for(
-            || matches!(
-                rig.system.net_state(&p19),
-                Some(NetState::Pulled(Level::High, _))
-            ),
-            SETTLE
-        ),
+        matches!(open.p19, NetState::Pulled(Level::High, _)),
         "an unlit optocoupler must leave P19 to the pull-up; got {:?}",
-        rig.system.net_state(&p19)
+        open.p19
     );
+    assert_eq!(open.current_ma, 0.0, "an open loop regulates nothing");
+    assert!(!open.lit, "open loop must leave the opto dark");
+    assert!(!open.sinking, "open loop must release the open-collector");
+    // Monitors agree with the engine-thread snapshot (still strong asserts).
     assert_eq!(ccr.current_ma(), 0.0, "an open loop regulates nothing");
     assert!(!opto.is_lit(vo2631::OptoChannel::Two));
     assert!(!opto.is_sinking(vo2631::OptoChannel::Two));
 
     // Closed contact: the loop completes.
     rig.end_switch.set_position_mm(150.0);
+    let closed = settle.capture();
     assert!(
-        wait_for(
-            || matches!(
-                rig.system.net_state(&p19),
-                Some(NetState::Driven(Level::Low))
-            ),
-            SETTLE
-        ),
+        matches!(closed.p19, NetState::Driven(Level::Low)),
         "a closed contact must pull P19 down; got {:?}",
-        rig.system.net_state(&p19)
+        closed.p19
     );
+    assert!(
+        (closed.current_ma - nsi50010::DEFAULT_REGULATION_MA).abs() < 1e-9,
+        "the regulator holds its regulation current, got {} mA",
+        closed.current_ma
+    );
+    assert!(closed.lit, "the LED must be lit past ITH");
+    assert!(closed.sinking, "a lit, powered detector must sink");
     assert!(
         (ccr.current_ma() - nsi50010::DEFAULT_REGULATION_MA).abs() < 1e-9,
         "the regulator holds its regulation current, got {} mA",
@@ -762,13 +935,14 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
 
     // And back: the path is not one-way.
     rig.end_switch.set_position_mm(0.0);
-    assert!(wait_for(
-        || matches!(
-            rig.system.net_state(&p19),
-            Some(NetState::Pulled(Level::High, _))
-        ),
-        SETTLE
-    ));
+    let reopen = settle.capture();
+    assert!(
+        matches!(reopen.p19, NetState::Pulled(Level::High, _)),
+        "re-opening must return P19 to the pull-up; got {:?}",
+        reopen.p19
+    );
+    assert!(!reopen.lit);
+    assert!(!reopen.sinking);
     rig.system.shutdown();
 }
 

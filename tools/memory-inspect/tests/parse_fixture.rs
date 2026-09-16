@@ -29,6 +29,8 @@ use embsim_memory_inspect::{FirmwareInfo, ParseOptions, TypeInfo};
 use rstest::rstest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// The C fixture. Covers: enum (with `_COUNT`), nested struct, array of structs,
 /// float + double, bitfields, union, typedefs, enum-typed field, top-level vars.
@@ -56,10 +58,12 @@ fn find_compiler() -> Option<&'static str> {
 /// a nonce so parallel test binaries don't collide. Returns `None` (after
 /// printing a skip message) if the dir can't be created.
 fn make_temp_dir(tag: &str) -> Option<PathBuf> {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    // Pid + thread id + monotonic counter — not SystemTime nanos. Parallel
+    // rstest workers in the same process can share a nanosecond and race on
+    // the same path (macos CI flake: one worker's partial `.o` left
+    // `channel_S` missing from DWARF).
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "embsim_dwarf_{}_{}_{}",
         tag,
@@ -190,6 +194,10 @@ fn build_archive_with(cc: &str, flag_sets: &[&[&str]], tag: &str) -> Option<(Pat
 /// Build the fixture archive for the **host** target. Compiles with DWARF
 /// debug info pinned to DWARF v4 for the widest gimli support; if the compiler
 /// rejects the flag, falls back to plain `-g`.
+///
+/// `-fno-eliminate-unused-debug-types` keeps nested typedefs like `channel_S`
+/// / `flags_S` present even when a host toolchain would otherwise drop them
+/// from an archive member that only references them indirectly.
 fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
     let cc = match find_compiler() {
         Some(c) => c,
@@ -198,7 +206,36 @@ fn build_fixture_archive() -> Option<(PathBuf, PathBuf)> {
             return None;
         }
     };
-    build_archive_with(cc, &[&["-g", "-gdwarf-4"], &["-g"]], "fixture")
+    build_archive_with(
+        cc,
+        &[
+            &["-g", "-gdwarf-4", "-fno-eliminate-unused-debug-types"],
+            &["-g", "-gdwarf-4"],
+            &["-g", "-fno-eliminate-unused-debug-types"],
+            &["-g"],
+        ],
+        "fixture",
+    )
+}
+
+/// Host-target fixture built once per test process. Parallel `parse_fixture`
+/// tests previously each recompiled into a time-derived temp dir; on macos CI
+/// that raced and occasionally yielded an archive whose DWARF lacked
+/// `channel_S` (`bitfield_field_is_recovered` panic in run 35007027583).
+struct HostFixture {
+    archive: PathBuf,
+    /// Keep the temp dir alive for the process lifetime.
+    _dir: PathBuf,
+}
+
+fn host_fixture() -> Option<&'static HostFixture> {
+    static FIXTURE: OnceLock<Option<HostFixture>> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let (archive, dir) = build_fixture_archive()?;
+            Some(HostFixture { archive, _dir: dir })
+        })
+        .as_ref()
 }
 
 /// `clang --version` output for diagnostics, or a placeholder if unavailable.
@@ -227,7 +264,15 @@ fn build_elf_fixture_archive() -> Option<(PathBuf, PathBuf)> {
     }
     let (o_path, dir) = compile_fixture_object(
         "clang",
-        &[&["--target=x86_64-unknown-linux-gnu", "-g", "-gdwarf-4"]],
+        &[
+            &[
+                "--target=x86_64-unknown-linux-gnu",
+                "-g",
+                "-gdwarf-4",
+                "-fno-eliminate-unused-debug-types",
+            ],
+            &["--target=x86_64-unknown-linux-gnu", "-g", "-gdwarf-4"],
+        ],
         "elf",
     )?;
     let a_path = dir.join("libfixture.a");
@@ -245,18 +290,18 @@ fn build_elf_fixture_archive() -> Option<(PathBuf, PathBuf)> {
     Some((a_path, dir))
 }
 
-/// Parse the fixture archive, or `None` if it could not be built.
-fn parse_fixture() -> Option<(FirmwareInfo, PathBuf)> {
-    let (a_path, dir) = build_fixture_archive()?;
-    let fw = FirmwareInfo::from_archive(&a_path)
+/// Parse the shared host fixture archive, or `None` if it could not be built.
+fn parse_fixture() -> Option<FirmwareInfo> {
+    let fix = host_fixture()?;
+    let fw = FirmwareInfo::from_archive(&fix.archive)
         .unwrap_or_else(|e| panic!("from_archive failed on a valid fixture archive: {e}"));
-    Some((fw, dir))
+    Some(fw)
 }
 
 /// The enum is recovered with its variants, values, and `_COUNT` convention.
 #[rstest]
 fn enum_variants_values_and_count() {
-    let (fw, _dir) = match parse_fixture() {
+    let fw = match parse_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -287,7 +332,7 @@ fn enum_variants_values_and_count() {
 /// field types (signed int, float, double).
 #[rstest]
 fn struct_layout_and_primitive_field_types() {
-    let (fw, _dir) = match parse_fixture() {
+    let fw = match parse_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -327,7 +372,7 @@ fn struct_layout_and_primitive_field_types() {
 /// Bitfield members are recovered as [`TypeInfo::Bitfield`].
 #[rstest]
 fn bitfield_field_is_recovered() {
-    let (fw, _dir) = match parse_fixture() {
+    let fw = match parse_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -355,7 +400,7 @@ fn bitfield_field_is_recovered() {
 /// A union is stored among structs and all its members sit at offset 0.
 #[rstest]
 fn union_members_share_offset_zero() {
-    let (fw, _dir) = match parse_fixture() {
+    let fw = match parse_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -385,7 +430,7 @@ fn union_members_share_offset_zero() {
 /// out-of-bounds indices resolve to `None`.
 #[rstest]
 fn array_element_offsets_are_relative_and_bounded() {
-    let (fw, _dir) = match parse_fixture() {
+    let fw = match parse_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -413,7 +458,7 @@ fn array_element_offsets_are_relative_and_bounded() {
 /// Top-level variables are recovered, including their resolved types.
 #[rstest]
 fn top_level_variables_are_recovered() {
-    let (fw, _dir) = match parse_fixture() {
+    let fw = match parse_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -477,7 +522,7 @@ fn missing_file_yields_err() {
 /// full archive, and the default `_COUNT` suffix is overridden.
 #[rstest]
 fn from_archive_with_custom_options() {
-    let (a_path, dir) = match build_fixture_archive() {
+    let fix = match host_fixture() {
         Some(v) => v,
         None => return,
     };
@@ -487,7 +532,7 @@ fn from_archive_with_custom_options() {
         pointer_size: 4,
         count_suffix: "_TOTAL".to_string(),
     };
-    let fw = FirmwareInfo::from_archive_with(&a_path, &opts)
+    let fw = FirmwareInfo::from_archive_with(&fix.archive, &opts)
         .expect("from_archive_with should parse a valid archive");
 
     // Structs/enums still parsed regardless of the suffix override.
@@ -499,11 +544,9 @@ fn from_archive_with_custom_options() {
     assert_eq!(fw.try_channel_count("HAL_GPIO_channel_E"), None);
 
     // And the default-suffix parse still finds the `_COUNT` variant.
-    let default =
-        FirmwareInfo::from_archive_with(&a_path, &ParseOptions::default()).expect("default parse");
+    let default = FirmwareInfo::from_archive_with(&fix.archive, &ParseOptions::default())
+        .expect("default parse");
     assert_eq!(default.try_channel_count("HAL_GPIO_channel_E"), Some(2));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// ELF relocatable objects store DWARF cross-section references (e.g.
