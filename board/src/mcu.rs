@@ -1392,9 +1392,26 @@ impl Drop for McuComponent {
 /// — enough to blow through a 1 s firmware timeout while this thread is simply
 /// waiting for a timeslice.
 ///
-/// 100 µs matches `Serial::receive_data_timeout`'s own RX poll interval, so the
-/// pump never becomes the slower half of a firmware round trip.
-const PUMP_POLL_INTERVAL_US: u64 = 100;
+/// 250 µs matches the cadence of the device model this link feeds
+/// (`embsim-models`' ADS122U04 `protocol_loop` parks for the same), so the pump
+/// introduces no time granularity finer than the system already had.
+///
+/// It was 100 µs — `Serial::receive_data_timeout`'s RX poll interval — on the
+/// reasoning that the pump should never be the slower half of a round trip.
+/// That is true but it is not free: a registered actor's park deadline caps
+/// EVERY engine advance (`next_virtual_deadline` takes the earlier of the wheel
+/// head and the earliest park), so a 100 µs pump subdivides the whole run's
+/// virtual time into 100 µs steps and changes where every cog lands relative to
+/// every other. The reference consumer's `M12` motion matrix — which did not
+/// exist when this landed — caught the difference as one-sample outliers in the
+/// recorded setpoint staircase, up to 36 profiler ticks off an otherwise clean
+/// trace (rms well inside budget, L∞ not).
+///
+/// Matching the model's own 250 µs keeps the byte-latency bound that the
+/// registration exists for — still four orders of magnitude under the
+/// firmware's 1 s ADC read timeout — while adding no deadline the ADS122U04
+/// model was not already imposing.
+const PUMP_POLL_INTERVAL_US: u64 = 250;
 
 /// Read chunk for draining firmware TX bytes.
 const PUMP_READ_CHUNK: usize = 256;
