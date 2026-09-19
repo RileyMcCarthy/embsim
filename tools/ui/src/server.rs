@@ -277,30 +277,41 @@ mod routing_tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    #[tokio::test]
-    async fn a_namespaced_action_is_reachable_over_http() {
+    // A plain #[test] with its own runtime, not #[tokio::test]: the registry
+    // guard is a std MutexGuard and holding one across an await is a clippy
+    // error (and a real hazard). Blocking on each request keeps the guard's
+    // whole life synchronous.
+    #[test]
+    fn a_namespaced_action_is_reachable_over_http() {
         let _g = crate::test_lock::guard();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
         clear_actions();
         register_action("link/unplug", || Ok(()));
         register_action("link/refuses", || Err("the guest is gone".into()));
 
         let post = |path: &str| {
             let req = Request::post(path).body(Body::empty()).unwrap();
-            router().oneshot(req)
+            rt.block_on(router().oneshot(req)).unwrap().status()
         };
 
         // The slash in the name is the whole point: `/action/{name}` captures
         // one segment and would 404 here.
-        let r = post("/action/link/unplug").await.unwrap();
-        assert_eq!(r.status(), StatusCode::OK, "a slashed action name routes");
-
+        assert_eq!(
+            post("/action/link/unplug"),
+            StatusCode::OK,
+            "a slashed action name routes"
+        );
         // A failing action is 500, not 404 -- a caller has to tell "no such
         // action" from "the action said no".
-        let r = post("/action/link/refuses").await.unwrap();
-        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let r = post("/action/link/nope").await.unwrap();
-        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            post("/action/link/refuses"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(post("/action/link/nope"), StatusCode::NOT_FOUND);
 
         clear_actions();
     }
