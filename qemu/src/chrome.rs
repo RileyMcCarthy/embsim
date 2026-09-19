@@ -372,6 +372,14 @@ impl Guest for ChromeVm {
         self.vm.serial_fd()
     }
 
+    fn serial_attached(&self) -> bool {
+        self.vm.serial_attached()
+    }
+
+    fn set_serial_attached(&mut self, attached: bool) -> io::Result<()> {
+        self.vm.set_serial_attached(attached)
+    }
+
     fn clock_ns(&mut self) -> Option<u64> {
         self.vm.clock_ns()
     }

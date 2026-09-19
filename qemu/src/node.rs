@@ -484,9 +484,20 @@ fn run_slice(
     budget: Duration,
 ) -> io::Result<(Duration, Option<u64>)> {
     let fd = guest.serial_fd();
-    // Hand the guest what the board sent while it was frozen. Whatever the
-    // socket will not take yet goes on the first POLLOUT below.
-    drain_outbound(fd, outbound, stats)?;
+    if fd < 0 {
+        // Unplugged. Anything the board sent meanwhile is DISCARDED rather
+        // than held: a cable that is out does not buffer, and delivering the
+        // backlog on replug would be a fiction no real port performs -- and
+        // the app's reconnect path would then see a burst that never happened.
+        outbound
+            .lock()
+            .expect("outbound queue never poisoned")
+            .clear();
+    } else {
+        // Hand the guest what the board sent while it was frozen. Whatever the
+        // socket will not take yet goes on the first POLLOUT below.
+        drain_outbound(fd, outbound, stats)?;
+    }
     guest.resume()?;
     let start = Instant::now();
     let clock = guest.clock_ns();
