@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -129,6 +129,13 @@ type GuestSlot = Arc<Mutex<Option<Box<dyn Guest>>>>;
 /// A byte queue between two threads.
 type ByteQueue = Arc<Mutex<VecDeque<u8>>>;
 
+/// The guest's serial descriptor as the reader sees it, or -1 while unplugged.
+///
+/// The reader cannot ask the guest directly: the actor holds that lock for a
+/// whole slice, so a reader that locked per poll would stall for a slice at a
+/// time. An atomic is the handoff.
+type SerialFd = Arc<AtomicI32>;
+
 /// The cable, as a thing a test can pull.
 ///
 /// A handle onto one node's serial attachment and nothing else: the guest sits
@@ -142,6 +149,7 @@ type ByteQueue = Arc<Mutex<VecDeque<u8>>>;
 #[derive(Clone)]
 pub struct LinkControl {
     guest: GuestSlot,
+    fd: SerialFd,
 }
 
 impl std::fmt::Debug for LinkControl {
@@ -173,7 +181,13 @@ impl LinkControl {
     fn set(&self, attached: bool) -> io::Result<()> {
         let mut slot = self.guest.lock().expect("guest slot never poisoned");
         match slot.as_mut() {
-            Some(guest) => guest.set_serial_attached(attached),
+            Some(guest) => {
+                guest.set_serial_attached(attached)?;
+                // Publish the new descriptor before releasing the guest, so
+                // the reader never polls one that has just been closed.
+                self.fd.store(guest.serial_fd(), Ordering::Release);
+                Ok(())
+            }
             // The node was dropped and took the guest with it. Saying so beats
             // reporting success for a cable that no longer has a machine on
             // the other end.
@@ -209,6 +223,7 @@ pub struct QemuNode {
     outbound: ByteQueue,
     inbound: ByteQueue,
     stats: Arc<NodeStats>,
+    serial_fd: SerialFd,
     pump: Option<JoinHandle<()>>,
     started: bool,
 }
@@ -247,6 +262,7 @@ impl QemuNode {
             slice_ns: DEFAULT_SLICE.as_nanos() as u64,
             guest: Arc::new(Mutex::new(Some(guest))),
             shutdown: Arc::new(AtomicBool::new(false)),
+            serial_fd: Arc::new(AtomicI32::new(-1)),
             bridge: None,
             outbound: Arc::new(Mutex::new(VecDeque::new())),
             inbound: Arc::new(Mutex::new(VecDeque::new())),
@@ -278,6 +294,7 @@ impl QemuNode {
     pub fn link(&self) -> LinkControl {
         LinkControl {
             guest: Arc::clone(&self.guest),
+            fd: Arc::clone(&self.serial_fd),
         }
     }
 
@@ -355,18 +372,20 @@ impl Component for QemuNode {
                 return;
             }
         };
+        self.serial_fd.store(fd, Ordering::Release);
         self.started = true;
 
         // The pump: reads the guest's port for as long as the node lives.
         {
-            let (inbound, stats, shutdown) = (
+            let (inbound, stats, shutdown, serial_fd) = (
                 Arc::clone(&self.inbound),
                 Arc::clone(&self.stats),
                 Arc::clone(&self.shutdown),
+                Arc::clone(&self.serial_fd),
             );
             match thread::Builder::new()
                 .name("embsim-qemu-pump".into())
-                .spawn(move || pump_main(fd, &inbound, &stats, &shutdown))
+                .spawn(move || pump_main(&serial_fd, &inbound, &stats, &shutdown))
             {
                 Ok(handle) => self.pump = Some(handle),
                 Err(e) => {
@@ -635,9 +654,26 @@ fn service_writes(
 
 /// The pump: read the guest's port into `inbound` for as long as the node
 /// lives, whether or not the guest is running or the line has room.
-fn pump_main(fd: RawFd, inbound: &Mutex<VecDeque<u8>>, stats: &NodeStats, shutdown: &AtomicBool) {
+fn pump_main(
+    serial_fd: &SerialFd,
+    inbound: &Mutex<VecDeque<u8>>,
+    stats: &NodeStats,
+    shutdown: &AtomicBool,
+) {
     let mut buf = [0u8; READ_CHUNK];
     while !shutdown.load(Ordering::Relaxed) {
+        // Re-read every pass. The descriptor changes when the cable is pulled
+        // and again when it is put back, and a reader holding the old one
+        // would poll a closed fd, get POLLNVAL and declare the guest dead --
+        // which is exactly what a deliberate unplug used to do here.
+        let fd = serial_fd.load(Ordering::Acquire);
+        if fd < 0 {
+            // Unplugged, not gone. Wait for it to come back rather than
+            // ending the pump; the node has to survive the outage for a
+            // reconnect test to have anything to reconnect to.
+            std::thread::sleep(Duration::from_millis(PUMP_POLL_MS as u64));
+            continue;
+        }
         let mut pollfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -669,7 +705,13 @@ fn pump_main(fd: RawFd, inbound: &Mutex<VecDeque<u8>>, stats: &NodeStats, shutdo
                 break;
             }
             if n == 0 {
-                break; // EOF: the guest closed its port
+                // EOF. If the descriptor has been replaced since this pass
+                // began, the cable was pulled -- go round and pick up the new
+                // one. Otherwise the guest really did close its port.
+                if serial_fd.load(Ordering::Acquire) != fd {
+                    continue;
+                }
+                break;
             }
             got_data = true;
             let mut queue = inbound.lock().expect("inbound queue never poisoned");
@@ -684,6 +726,11 @@ fn pump_main(fd: RawFd, inbound: &Mutex<VecDeque<u8>>, stats: &NodeStats, shutdo
         // IN; those are read first (the loop comes back here) and only then
         // is the hang-up the end.
         if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 && !got_data {
+            // Same distinction as the EOF above: a descriptor that has been
+            // replaced since this poll began was unplugged, not lost.
+            if serial_fd.load(Ordering::Acquire) != fd {
+                continue;
+            }
             break;
         }
     }

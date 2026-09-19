@@ -476,6 +476,18 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
         "nothing crossed after the port was plugged back in"
     );
 
+    // The node must not have written itself off. NOTE: this fake reports -1
+    // while detached but keeps its socketpair open, so the reader's descriptor
+    // stays valid and this cannot reproduce the failure the real QemuVm had --
+    // there, closing the chardev made the reader poll a dead fd, take POLLNVAL
+    // for the guest exiting, log "the guest's serial port went away" and stop
+    // for good. That was found by running the cosim, not here. This assertion
+    // guards the weaker property the fake can actually express.
+    assert!(
+        !stats_a.disconnected(),
+        "an unplug was mistaken for the guest going away"
+    );
+
     assert!(stats_b.slices() > 0, "B never ran");
 }
 
