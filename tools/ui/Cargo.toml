@@ -16,4 +16,5 @@ tracing.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 rstest.workspace = true

@@ -40,12 +40,7 @@ pub fn start(port: u16) -> std::io::Result<()> {
                 .expect("Failed to create tokio runtime for UI server");
 
             rt.block_on(async move {
-                let app = Router::new()
-                    .route("/", get(index_handler))
-                    .route("/ws/{view_id}", get(ws_handler))
-                    .route("/asset/{view_id}/{name}", get(asset_handler))
-                    .route("/action", get(action_index_handler))
-                    .route("/action/{name}", post(action_handler));
+                let app = router();
 
                 let listener = tokio::net::TcpListener::from_std(std_listener)
                     .expect("Failed to adopt UI listener into tokio runtime");
@@ -55,6 +50,22 @@ pub fn start(port: u16) -> std::io::Result<()> {
         })?;
 
     Ok(())
+}
+
+/// The route table.
+///
+/// Factored out so a test can drive real ROUTING rather than calling handlers
+/// directly: the handler tests below pass `Path(..)` straight in, which is how
+/// `/action/{name}` shipped broken -- it matches one segment, action names are
+/// namespaced with slashes, and every POST 404'd while `GET /action` happily
+/// listed the name.
+fn router() -> Router {
+    Router::new()
+        .route("/", get(index_handler))
+        .route("/ws/{view_id}", get(ws_handler))
+        .route("/asset/{view_id}/{name}", get(asset_handler))
+        .route("/action", get(action_index_handler))
+        .route("/action/{*name}", post(action_handler))
 }
 
 /// Serve the shell HTML page with all registered views.
@@ -253,5 +264,44 @@ mod tests {
         assert_eq!(unknown_view.status(), StatusCode::NOT_FOUND);
 
         clear_views();
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! Unlike the handler tests above, these go through the Router, which is
+    //! the only way to catch a path pattern that does not match.
+    use super::router;
+    use crate::{clear_actions, register_action};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn a_namespaced_action_is_reachable_over_http() {
+        let _g = crate::test_lock::guard();
+        clear_actions();
+        register_action("link/unplug", || Ok(()));
+        register_action("link/refuses", || Err("the guest is gone".into()));
+
+        let post = |path: &str| {
+            let req = Request::post(path).body(Body::empty()).unwrap();
+            router().oneshot(req)
+        };
+
+        // The slash in the name is the whole point: `/action/{name}` captures
+        // one segment and would 404 here.
+        let r = post("/action/link/unplug").await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "a slashed action name routes");
+
+        // A failing action is 500, not 404 -- a caller has to tell "no such
+        // action" from "the action said no".
+        let r = post("/action/link/refuses").await.unwrap();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let r = post("/action/link/nope").await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        clear_actions();
     }
 }
