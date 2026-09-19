@@ -4,8 +4,9 @@
 use crate::{shell, views};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::Path;
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
@@ -42,7 +43,9 @@ pub fn start(port: u16) -> std::io::Result<()> {
                 let app = Router::new()
                     .route("/", get(index_handler))
                     .route("/ws/{view_id}", get(ws_handler))
-                    .route("/asset/{view_id}/{name}", get(asset_handler));
+                    .route("/asset/{view_id}/{name}", get(asset_handler))
+                    .route("/action", get(action_index_handler))
+                    .route("/action/{name}", post(action_handler));
 
                 let listener = tokio::net::TcpListener::from_std(std_listener)
                     .expect("Failed to adopt UI listener into tokio runtime");
@@ -105,6 +108,38 @@ async fn ws_handler(Path(view_id): Path<String>, ws: WebSocketUpgrade) -> impl I
 // ============================================================
 // Tests
 // ============================================================
+
+/// The registered action names, so a harness can check what it can trigger
+/// instead of discovering a typo as a 404 mid-test.
+async fn action_index_handler() -> impl IntoResponse {
+    crate::action_names().join("\n")
+}
+
+/// Run a registered action. 404 when there is no such action, 500 with the
+/// reason when it fails -- a harness must be able to tell "no such action"
+/// from "the action said no".
+async fn action_handler(Path(name): Path<String>) -> impl IntoResponse {
+    let Some(action) = crate::action(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no action {name:?}; registered: {}",
+                crate::action_names().join(", ")
+            ),
+        );
+    };
+    // Actions block (unplugging waits for the current slice to finish), so
+    // this must not run on the async worker that is also serving the socket
+    // the harness is waiting on.
+    match tokio::task::spawn_blocking(move || action()).await {
+        Ok(Ok(())) => (StatusCode::OK, String::from("ok")),
+        Ok(Err(why)) => (StatusCode::INTERNAL_SERVER_ERROR, why),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("action panicked: {e}"),
+        ),
+    }
+}
 
 #[cfg(test)]
 mod tests {

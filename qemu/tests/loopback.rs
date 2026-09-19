@@ -407,11 +407,14 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     let _suite = suite_lock();
     let _stepped = Stepped::enter();
 
-    let (guest_a, mut far_a, cable_a) = FakeGuest::unpluggable();
+    let (guest_a, mut far_a, _cable_a) = FakeGuest::unpluggable();
     let (guest_b, mut far_b, _) = FakeGuest::new();
     let node_a = QemuNode::new(Box::new(guest_a), 2_000_000);
     let node_b = QemuNode::new(Box::new(guest_b), 2_000_000);
     let (stats_a, stats_b) = (node_a.stats(), node_b.stats());
+    // The public handle, not the guest's own flag: this is the path a test
+    // harness takes, so it is the path worth covering.
+    let cable_a = node_a.link();
     let harness = Harness::new()
         .connect_str("A.TX", "B.RX")
         .unwrap()
@@ -431,7 +434,9 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     let _ = far_a.read(&mut buf);
 
     // Pull the cable. B keeps talking into a port that is not there.
-    cable_a.store(true, Ordering::Relaxed);
+    assert!(cable_a.is_plugged(), "the port starts plugged in");
+    cable_a.unplug().expect("unplug");
+    assert!(!cable_a.is_plugged(), "the port reports itself unplugged");
     far_b.write_all(b"into the void").unwrap();
     let slices_during = wait_for_slices(&stats_a, slices_before + 4);
 
@@ -450,6 +455,26 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     let mut void = [0u8; 64];
     let got = far_a.read(&mut void).unwrap_or(0);
     assert_eq!(got, 0, "bytes crossed a port that was unplugged");
+
+    // Put it back: a reconnect test needs the port to RETURN, not just vanish.
+    cable_a.plug().expect("replug");
+    assert!(cable_a.is_plugged(), "the port came back");
+    far_b.write_all(b"back again").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline && seen.len() < b"back again".len() {
+        let mut buf = [0u8; 64];
+        match far_a.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+            Err(_) => continue,
+        }
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&seen),
+        "back again",
+        "nothing crossed after the port was plugged back in"
+    );
 
     assert!(stats_b.slices() > 0, "B never ran");
 }

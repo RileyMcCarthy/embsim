@@ -56,7 +56,7 @@ pub use chrome::{
     GUEST_DEVTOOLS_PORT,
 };
 pub use guest::Guest;
-pub use node::{NodeStats, QemuNode, DEFAULT_SLICE, MAX_SLICE};
+pub use node::{LinkControl, NodeStats, QemuNode, DEFAULT_SLICE, MAX_SLICE};
 pub use qmp::{Qmp, QmpError, RunState, MAX_RETAINED_EVENTS};
 pub use vm::{
     QemuSpec, QemuVm, SerialDevice, SpawnError, AGENT_PORT_NAME, DEFAULT_STARTUP_TIMEOUT,

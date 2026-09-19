@@ -129,6 +129,62 @@ type GuestSlot = Arc<Mutex<Option<Box<dyn Guest>>>>;
 /// A byte queue between two threads.
 type ByteQueue = Arc<Mutex<VecDeque<u8>>>;
 
+/// The cable, as a thing a test can pull.
+///
+/// A handle onto one node's serial attachment and nothing else: the guest sits
+/// behind the same mutex the pump uses, so a caller here cannot reach the rest
+/// of it, and cannot resume or pause a guest the actor is metering.
+///
+/// The timing works out for free. The pump locks the slot for exactly one
+/// slice and drops it, so a call made from any other thread waits for the
+/// current slice to finish and then runs BETWEEN slices -- never against a
+/// guest that is mid-run.
+#[derive(Clone)]
+pub struct LinkControl {
+    guest: GuestSlot,
+}
+
+impl std::fmt::Debug for LinkControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkControl").finish_non_exhaustive()
+    }
+}
+
+impl LinkControl {
+    /// Pull the cable: the guest's serial port detaches as if unplugged.
+    pub fn unplug(&self) -> io::Result<()> {
+        self.set(false)
+    }
+
+    /// Put it back. The port re-enumerates in the guest.
+    pub fn plug(&self) -> io::Result<()> {
+        self.set(true)
+    }
+
+    /// Whether the port is attached right now.
+    pub fn is_plugged(&self) -> bool {
+        self.guest
+            .lock()
+            .expect("guest slot never poisoned")
+            .as_ref()
+            .is_some_and(|g| g.serial_attached())
+    }
+
+    fn set(&self, attached: bool) -> io::Result<()> {
+        let mut slot = self.guest.lock().expect("guest slot never poisoned");
+        match slot.as_mut() {
+            Some(guest) => guest.set_serial_attached(attached),
+            // The node was dropped and took the guest with it. Saying so beats
+            // reporting success for a cable that no longer has a machine on
+            // the other end.
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the guest is gone",
+            )),
+        }
+    }
+}
+
 /// A computer on the board.
 ///
 /// Two pins, named from the computer's point of view: `TX` is what it
@@ -215,6 +271,16 @@ impl QemuNode {
     }
 
     /// The node's counters, readable from any thread.
+    /// A handle for unplugging and replugging this node's serial port.
+    ///
+    /// Cloneable and safe to keep across the node's lifetime -- once the node
+    /// is dropped, every call reports `NotConnected` rather than panicking.
+    pub fn link(&self) -> LinkControl {
+        LinkControl {
+            guest: Arc::clone(&self.guest),
+        }
+    }
+
     pub fn stats(&self) -> Arc<NodeStats> {
         Arc::clone(&self.stats)
     }
