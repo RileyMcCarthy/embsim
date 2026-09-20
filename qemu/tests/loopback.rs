@@ -79,6 +79,14 @@ struct FakeGuest {
     dropped: Arc<AtomicBool>,
 }
 
+/// Parts returned by [`FakeGuest::with_drop_flag`].
+type FakeGuestWithDropFlag = (
+    FakeGuest,
+    Arc<Mutex<Option<UnixStream>>>,
+    Arc<Mutex<Stopwatch>>,
+    Arc<AtomicBool>,
+);
+
 impl Drop for FakeGuest {
     fn drop(&mut self) {
         self.dropped.store(true, Ordering::Relaxed);
@@ -108,12 +116,7 @@ impl FakeGuest {
     }
 
     /// [`new`](Self::new), plus a flag the guest raises when it is dropped.
-    fn with_drop_flag() -> (
-        Self,
-        Arc<Mutex<Option<UnixStream>>>,
-        Arc<Mutex<Stopwatch>>,
-        Arc<AtomicBool>,
-    ) {
+    fn with_drop_flag() -> FakeGuestWithDropFlag {
         let (near, far) = Self::open_pair();
         let far_slot = Arc::new(Mutex::new(Some(far)));
         let clock = Arc::new(Mutex::new(Stopwatch::default()));
