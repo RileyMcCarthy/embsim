@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+
+# Vibes runs on Node; nothing else here does.
+node_modules/

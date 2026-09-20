@@ -1,0 +1,8 @@
+{
+  "name": "embsim",
+  "private": true,
+  "description": "Node is here only to run Vibes, the behaviour ledger. The code is Rust.",
+  "devDependencies": {
+    "vibes": "github:RileyMcCarthy/vibes"
+  }
+}

@@ -29,6 +29,7 @@ use embsim_board::{Level, NetState, Scenario, System, SystemHandle};
 use machine_parts::{
     bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed,
 };
+use vibes_behaviour::{behaviour, expect, Test};
 
 /// The isolator input the P2 reads as P9 — the receiver's channel-1 output.
 const OUTPUT: &str = "EdgeBoard.Net-(IC16-INA)";
@@ -120,6 +121,24 @@ fn settle_once() -> (NetState, Vec<String>) {
 #[ignore = "reproduces an open engine nondeterminism; run with --ignored"]
 #[test]
 fn the_rs422_receiver_settles_the_same_way_every_time() {
+    behaviour!(Test {
+        id: "rs422.settles-the-same-way",
+        covers: Some("board/src/engine.rs#EngineCore::run_stepped_iteration"),
+        given: "one declared RS-422 scenario, its A+ line at 3.3 volts and its A- line \
+                at ground, is started and settled repeatedly inside one process",
+    });
+    expect!(
+        "agree-across-runs",
+        "every run comes to rest with the receiver output in the same state",
+        "a simulation with no firmware in it, a board and scripted stimulus alone, must \
+         reach one steady state for one input whatever the thread scheduling"
+    );
+    expect!(
+        "decodes-high",
+        "the receiver output settles driven high",
+        "a high A+ leg against a grounded A- leg is a differential high"
+    );
+
     const RUNS: usize = 12;
 
     let mut outcomes: Vec<(NetState, Vec<String>)> = Vec::with_capacity(RUNS);

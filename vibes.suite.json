@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "name": "board",
+  "lang": "rust",
+  "cmd": "cargo test -p embsim-board",
+  "results": "cargo-stdout"
+}
