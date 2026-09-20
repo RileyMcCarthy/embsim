@@ -2945,6 +2945,7 @@ impl Drop for EngineHandle {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vibes_behaviour::{behaviour, expect, Test};
 
     use super::*;
     use crate::cluster::QuasiStaticMna;
@@ -3014,6 +3015,18 @@ mod tests {
     /// enqueuers can interleave reserve-then-send).
     #[rstest]
     fn drives_apply_in_enqueue_seq_order_despite_arrival_order() {
+        behaviour!(Test {
+            id: "engine.drives-apply-in-issue-order",
+            covers: Some("board/src/engine.rs#EngineCore::apply_ready_drives"),
+            given: "two pins on one net whose drives reach the engine in the opposite order to the one they were issued in",
+        });
+        expect!("later-drive-waits", "the drive issued second takes no effect while the one issued first is still on its way");
+        expect!(
+            "issue-order",
+            "observers see the net driven by the first drive and then in contention once the second lands",
+            "the order drives were issued is the authoritative event order, whatever order they cross the queue in",
+        );
+        expect!("contention-reported", "the fight between the two pins is reported as a contention finding while the engine runs");
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e1 = resolver.add_endpoint(0, PinRef::new("U2", "1"), None);
@@ -3068,6 +3081,16 @@ mod tests {
     /// individually (no coalescing, no loss) in a valid enqueue order.
     #[rstest]
     fn racing_public_drives_all_apply_individually() {
+        behaviour!(Test {
+            id: "engine.racing-drives-all-apply",
+            covers: Some("board/src/component.rs#PinHandle::set_drive"),
+            given: "two threads each driving its own pin on one shared net at the same moment",
+        });
+        expect!("applied-individually", "each drive is applied on its own: the net is seen driven by whichever landed first before it is seen contended");
+        expect!(
+            "ends-contended",
+            "once both have landed the net is in contention"
+        );
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e1 = resolver.add_endpoint(0, PinRef::new("U2", "1"), None);
@@ -3110,6 +3133,17 @@ mod tests {
     /// deadlocking.
     #[rstest]
     fn sense_callback_drive_is_enqueued_not_inline_and_loop_converges() {
+        behaviour!(Test {
+            id: "engine.sense-drive-deferred",
+            covers: Some("board/src/engine.rs#EngineCore::resolve_and_publish"),
+            given: "two nets whose senses each drive the other's pin high on seeing a high, closing a feedback loop",
+        });
+        expect!(
+            "deferred",
+            "a drive issued from inside a sense takes effect in a later pass, after that sense has returned",
+            "senses are delivered with no engine lock held, so a loop through driver, net and sense is deadlock-free by construction",
+        );
+        expect!("converges", "the loop settles: each net is seen to change exactly once and then nothing more is delivered");
         let mut resolver = Resolver::new(2, Dsu::new(2));
         let e_a = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let e_a2 = resolver.add_endpoint(0, PinRef::new("U3", "1"), None);
@@ -3194,6 +3228,16 @@ mod tests {
     /// livelock the engine.
     #[rstest]
     fn unmodeled_power_rail_publishes_stable_non_nan_state() {
+        behaviour!(Test {
+            id: "engine.unmodelled-rail-stable-state",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a sense on a power rail whose voltage is not modelled, while an unrelated net is driven back and forth ten times",
+        });
+        expect!(
+            "delivered-once",
+            "the rail's sense is delivered once, at registration, reading pulled high, and none of the ten passes deliver it again",
+            "a rail with an unmodelled voltage must still project a definite level that compares equal to itself across passes, so its senses fire only on a real change",
+        );
         let mut resolver = Resolver::new(2, Dsu::new(2));
         // The `PowerOut` registration path (`system.rs` add_pin_descriptor).
         resolver.add_power_source(0, f64::NAN);
@@ -3243,6 +3287,20 @@ mod tests {
     /// delivery.
     #[rstest]
     fn nan_rail_sense_feedback_loop_converges() {
+        behaviour!(Test {
+            id: "engine.unmodelled-rail-feedback-converges",
+            covers: Some("board/src/engine.rs#EngineCore::resolve_and_publish_dirty"),
+            given: "a sense on a rail whose voltage is not modelled, which drives a pin every time it is delivered",
+        });
+        expect!(
+            "drive-lands",
+            "the drive made from the registration delivery takes effect on its pin"
+        );
+        expect!("delivered-once", "the sense fires exactly once, at registration, and the pass its own drive causes leaves it silent");
+        expect!(
+            "definite-level",
+            "the rail reads as pulled high with no series resistance"
+        );
         let mut resolver = Resolver::new(2, Dsu::new(2));
         resolver.add_power_source(0, f64::NAN);
         let e1 = resolver.add_endpoint(1, PinRef::new("U1", "1"), None);
@@ -3312,6 +3370,14 @@ mod tests {
     /// competing path (or an agreeing one) stays on the digital fast path.
     #[rstest]
     fn competing_path_within_ratio_escalates_to_cluster_solver() {
+        behaviour!(Test {
+            id: "engine.competing-path-escalates",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a push-pull pin driving one net, joined by a series resistor to a net carrying a 3.3 volt rail",
+        });
+        expect!("close-opposing-rail-solved", "a low driver with the rail within ten times its own impedance sends both nets through the analog solver, which sets their states");
+        expect!("distant-opposing-rail-digital", "a low driver with the rail beyond that ratio keeps its digital level, the rail's net keeps its voltage, and nothing is solved");
+        expect!("agreeing-rail-digital", "a high driver agreeing with the rail keeps its digital level however close the rail is, and nothing is solved");
         let calls: Arc<StdMutex<Vec<Vec<NetId>>>> = Arc::new(StdMutex::new(Vec::new()));
         let solver = RecordingSolver {
             calls: Arc::clone(&calls),
@@ -3438,6 +3504,18 @@ mod tests {
     #[case::three(3)]
     #[case::eight(8)]
     fn cluster_sources_follow_dense_endpoint_order(#[case] drivers: usize) {
+        behaviour!(Test {
+            id: "engine.cluster-sources-in-pin-order",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "several agreeing drivers on separate nets, chained by resistors into one cluster that carries an analog sense",
+        });
+        expect!(
+            &format!("pin-order-with-{drivers}-drivers"),
+            &format!(
+                "with {drivers} drivers, the cluster is solved once, its sources handed over in the order their pins were registered"
+            ),
+            "the order the solver receives sources is the order their contributions are summed, and a summation order that varies between passes moves the last bits of the solved voltage",
+        );
         let seen: SourceListLog = Arc::new(StdMutex::new(Vec::new()));
         let solver = SourceOrderSolver {
             seen: Arc::clone(&seen),
@@ -3486,6 +3564,20 @@ mod tests {
     ///    float differences, but it is not the only net that catches this.
     #[rstest]
     fn repeated_resolutions_of_a_multi_source_cluster_are_bit_identical() {
+        behaviour!(Test {
+            id: "engine.repeated-solves-bit-identical",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "six drivers at assorted voltages and impedances tied into one node by zero-ohm links, with a ground rail 37 ohms away, resolved from scratch sixty-four times",
+        });
+        expect!(
+            "bit-identical",
+            "every pass solves the node to the same voltage, bit for bit",
+            "resolution is a pure function of the drive table, so a run can be replayed and compared bit for bit",
+        );
+        expect!(
+            "source-order-stable",
+            "every pass hands the solver the same list: the drivers in pin order, then the rail"
+        );
         // Six agreeing drivers at awkward (volts, Ω), each on its own net,
         // all merged into ONE supernode by 0 Ω edges — so every driver's
         // Norton conductance and injection accumulate into the same
@@ -3581,6 +3673,20 @@ mod tests {
         #[case] drive: TheveninDrive,
         #[case] expect: Level,
     ) {
+        behaviour!(Test {
+            id: "engine.driven-level-crosses-series-resistor",
+            covers: Some("board/src/engine.rs#cluster_driver_level"),
+            given: "a pin driving one net, and a second net reached from it only through a 47 ohm series resistor",
+        });
+        let level = match expect {
+            Level::Low => "low",
+            Level::High => "high",
+        };
+        expect!(
+            &format!("{level}-level-crosses"),
+            &format!("driven {level}, the far net reads {level} as well, pulled through the resistor's 47 ohms"),
+            "a driven signal keeps its level across a series resistor, so a receiver behind one sees every bit its driver sends",
+        );
         // driver —47 ohm— far
         let mut resolver = Resolver::new(2, Dsu::new(2));
         let endpoint = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -3607,6 +3713,12 @@ mod tests {
         #[case] drive: TheveninDrive,
         #[case] label: &str,
     ) {
+        // A probe: it prints and asserts nothing, so it claims nothing.
+        behaviour!(Test {
+            id: "engine.rail-vs-driver-probe",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a driver behind 47 ohms with a 10 kilohm pull to a rail at the opposite level",
+        });
         // driver(net0) —47— mid(net1) —10k— rail(net2)
         let mut resolver = Resolver::new(3, Dsu::new(3));
         let endpoint = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
@@ -3638,6 +3750,20 @@ mod tests {
     /// the opposite.
     #[rstest]
     fn an_injected_short_outvotes_a_driver_reached_through_resistance() {
+        behaviour!(Test {
+            id: "engine.injected-short-outvotes-driver",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a low-driving pin behind 10 kilohms, a middle net, and 47 ohms beyond it a far net where a short to 3.3 volts can be injected",
+        });
+        expect!(
+            "driver-alone",
+            "with nothing injected, the middle net is pulled low by the driver"
+        );
+        expect!(
+            "short-wins",
+            "with the short injected, the middle net is pulled high; the zero-ohm fault outvotes the driver behind ten kilohms",
+            "an injected short is an ideal source and ranks like a declared rail, so a fault someone injected is visible from every net it reaches",
+        );
         // stuck(3.3 V) —47 Ω— mid —10 kΩ— driver(Low, 25 Ω)
         let build = |stuck: bool| {
             let mut resolver = Resolver::new(3, Dsu::new(3));
@@ -3672,6 +3798,21 @@ mod tests {
     /// algebra: an injected short-to-ground must be observable).
     #[rstest]
     fn stuck_fault_fighting_a_power_rail_projects_contention() {
+        behaviour!(Test {
+            id: "engine.stuck-fault-vs-rail",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a 3.3 volt rail with a short injected onto the same net",
+        });
+        expect!(
+            "opposing-short-contends",
+            "a short to ground puts the net in contention",
+            "two ideal sources that disagree are a fight the operator must see, whichever was declared first",
+        );
+        expect!(
+            "opposing-short-reported",
+            "the fight is reported as a contention finding"
+        );
+        expect!("agreeing-short-quiet", "a short to the rail's own voltage leaves the net at that voltage with nothing reported");
         let mut resolver = Resolver::new(1, Dsu::new(1));
         resolver.add_power_source(0, 3.3);
         resolver.add_stuck_source(0, 0.0);
@@ -3705,6 +3846,16 @@ mod tests {
     /// fallback.
     #[rstest]
     fn sourced_divider_without_a_driver_reaches_the_cluster_solver() {
+        behaviour!(Test {
+            id: "engine.divider-reaches-solver",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "two equal 4.7 kilohm resistors in series between a 3.3 volt rail and ground, with no push-pull driver anywhere",
+        });
+        expect!(
+            "midpoint-solved",
+            "the midpoint reads the divided voltage, 1.65 volts"
+        );
+        expect!("nothing-reported", "nothing is reported for it");
         // 3.3 V —4.7 kΩ— mid —4.7 kΩ— 0 V: V_mid = 1.65 V.
         let mut resolver = Resolver::new(3, Dsu::new(3));
         resolver.add_power_source(0, 3.3);
@@ -3737,6 +3888,20 @@ mod tests {
     /// the meaningful pull-up view).
     #[rstest]
     fn analog_sense_escalates_sourced_cluster_but_pull_up_stays_pulled() {
+        behaviour!(Test {
+            id: "engine.analog-sense-escalates",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a 3.3 volt rail reaching an unloaded input through a 4.7 kilohm pull-up",
+        });
+        expect!(
+            "analog-reads-solved",
+            "an analog sense on the input reads the solved voltage, the rail's full 3.3 volts"
+        );
+        expect!(
+            "digital-stays-pulled",
+            "a digital sense on the same input reads it as pulled high through the 4.7 kilohms",
+            "a digital reader wants the pull-up view, which a numeric solve would replace with a bare voltage",
+        );
         // 3.3 V rail —4.7 kΩ— AIN (no load: solves to the rail's OCV).
         let mut resolver = Resolver::new(2, Dsu::new(2));
         resolver.add_power_source(0, 3.3);
@@ -3802,6 +3967,16 @@ mod tests {
     /// waveform would collapse to one edge.
     #[rstest]
     fn the_wheel_separates_sub_microsecond_deadlines() {
+        behaviour!(Test {
+            id: "engine.wheel-separates-sub-microsecond",
+            covers: Some("board/src/engine.rs#EngineCore::fire_due_timers"),
+            given: "eight wakeups requested 500 nanoseconds apart, one bit period at 2 megabaud",
+        });
+        expect!(
+            "each-at-its-instant",
+            "all eight fire, each stamped with exactly its own requested instant",
+            "at 2 megabaud eight bit edges fit inside one microsecond, and a timebase that cannot tell them apart collapses a synthesised waveform to one edge",
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
@@ -3832,6 +4007,16 @@ mod tests {
     /// per previous wake at that instant, and compound.
     #[rstest]
     fn a_deadline_armed_repeatedly_wakes_once() {
+        behaviour!(Test {
+            id: "engine.repeated-deadline-wakes-once",
+            covers: Some("board/src/engine.rs#EngineCore::arm"),
+            given: "one component requesting the same wakeup instant fifty times and a later instant once, all before time is released",
+        });
+        expect!(
+            "one-wake-per-instant",
+            "the component is woken once at the first instant and once at the second",
+            "one wake per component per instant, so a handler that re-arms itself from every wake stays at one wake per edge",
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         // Time held while the requests go in: a delivered wake frees its
@@ -3870,6 +4055,15 @@ mod tests {
     /// the periodic chain: both fire there (one wake), and the period goes on.
     #[rstest]
     fn a_periodic_chain_survives_a_one_shot_at_its_instant() {
+        behaviour!(Test {
+            id: "engine.periodic-survives-one-shot",
+            covers: Some("board/src/engine.rs#EngineCore::fire_due_timers"),
+            given: "a one-shot wakeup requested for exactly the instant a component's periodic wakeup is first due, with time held while both are armed",
+        });
+        expect!(
+            "chain-continues",
+            "the component is woken once at the shared instant and again at each following period"
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         // Held, so the one-shot and the periodic entry land on the same
@@ -3904,6 +4098,16 @@ mod tests {
     /// `schedule_at` fires exactly once, at-or-after its virtual deadline.
     #[rstest]
     fn one_shot_timer_fires_once_at_virtual_deadline() {
+        behaviour!(Test {
+            id: "engine.one-shot-fires-once",
+            covers: Some("board/src/engine.rs#EngineCore::fire_due_timers"),
+            given: "a single wakeup requested 100 virtual milliseconds ahead",
+        });
+        expect!(
+            "at-or-after",
+            "the wake is delivered stamped at or after the requested instant"
+        );
+        expect!("exactly-once", "it is delivered exactly once");
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
@@ -3931,6 +4135,19 @@ mod tests {
     /// `schedule_every` keeps firing with non-decreasing sampled timestamps.
     #[rstest]
     fn periodic_timer_fires_repeatedly_against_scaled_clock() {
+        behaviour!(Test {
+            id: "engine.periodic-keeps-firing",
+            covers: Some("board/src/engine.rs#EngineCore::fire_due_timers"),
+            given: "a wakeup requested every 20 virtual milliseconds",
+        });
+        expect!(
+            "keeps-firing",
+            "the component keeps being woken, period after period"
+        );
+        expect!(
+            "stamps-monotonic",
+            "the delivered timestamps never go backwards"
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
@@ -3955,6 +4172,15 @@ mod tests {
     /// Deadlines already in the past fire immediately, in deadline order.
     #[rstest]
     fn late_wakeups_fire_immediately_in_deadline_order() {
+        behaviour!(Test {
+            id: "engine.late-wakes-in-deadline-order",
+            covers: Some("board/src/engine.rs#EngineCore::fire_due_timers"),
+            given: "two components requesting wakeups at instants already in the past, the later instant requested first",
+        });
+        expect!(
+            "deadline-order",
+            "both fire, the earlier deadline first, whichever was requested first"
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
@@ -3989,6 +4215,15 @@ mod tests {
     /// no detached thread, no deadlock against the parked wheel.
     #[rstest]
     fn shutdown_joins_cleanly_with_pending_timers() {
+        behaviour!(Test {
+            id: "engine.shutdown-with-pending-timers",
+            covers: Some("board/src/engine.rs#EngineHandle::drop"),
+            given: "an engine parked on a wakeup a virtual minute away when its handle is dropped",
+        });
+        expect!(
+            "prompt-shutdown",
+            "the engine shuts down and is joined promptly, the pending wakeup abandoned"
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let handle = empty_engine();
@@ -4024,6 +4259,20 @@ mod tests {
     /// delivered timestamps must stay on the 500 ns grid.
     #[rstest]
     fn time_does_not_run_past_a_schedule_still_in_flight() {
+        behaviour!(Test {
+            id: "engine.time-waits-for-in-flight-schedule",
+            covers: Some("board/src/engine.rs#EngineCore::run_stepped_iteration"),
+            given: "a component re-arming itself one bit period ahead from inside its own wake handler, while another thread floods the engine with drives",
+        });
+        expect!(
+            "keeps-ticking",
+            "the bit clock keeps ticking under the flood, twenty wakes delivered"
+        );
+        expect!(
+            "grid-kept",
+            "every wake lands exactly one bit period after the one before it",
+            "virtual time waits for every requested wakeup to be armed before it advances, so a bit clock is never delivered late and a byte's edges keep their spacing",
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let mut resolver = Resolver::new(1, Dsu::new(1));
@@ -4101,6 +4350,16 @@ mod tests {
     /// [`COMMAND_DRAIN_BATCH_MAX`] so time can jump.
     #[rstest]
     fn sustained_drive_flood_does_not_starve_the_timer_wheel() {
+        behaviour!(Test {
+            id: "engine.wheel-survives-drive-flood",
+            covers: Some("board/src/engine.rs#EngineCore::run_stepped_iteration"),
+            given: "a wakeup requested 10 virtual milliseconds ahead while another thread floods the engine with drives without pause",
+        });
+        expect!(
+            "wake-fires",
+            "the wakeup is still delivered while the flood is sustained",
+            "drives are applied in bounded batches, so time can always advance to the next deadline however busy the drivers are",
+        );
         let _g = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let mut resolver = Resolver::new(1, Dsu::new(1));
@@ -4148,6 +4407,23 @@ mod tests {
     /// buffered drives.
     #[rstest]
     fn missing_drive_seq_is_skipped_after_a_bounded_wait() {
+        behaviour!(Test {
+            id: "engine.drive-order-gap-skipped",
+            covers: Some("board/src/engine.rs#EngineCore::warn_on_stepped_drive_gap"),
+            given: "a reserved place in the drive order that is never filled, with the next drive arriving normally behind it",
+        });
+        expect!(
+            "later-drive-waits",
+            "for a short while the later drive waits, in case the missing one is merely late"
+        );
+        expect!(
+            "gap-skipped",
+            "after a bounded wait the gap is skipped and the waiting drive takes effect"
+        );
+        expect!(
+            "gap-reported",
+            "the skip is reported as a finding naming the missing place in the order"
+        );
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let handle = EngineHandle::spawn(
@@ -4191,6 +4467,24 @@ mod tests {
     /// end net service for the rest of the system.
     #[rstest]
     fn sense_callback_panic_is_contained_and_reported() {
+        behaviour!(Test {
+            id: "engine.sense-crash-contained",
+            covers: Some("board/src/engine.rs#EngineCore::deliver_contained"),
+            given: "a sense handler that crashes on every delivery, beside a well-behaved sense on the same net, as the net is driven",
+        });
+        expect!(
+            "others-served",
+            "the well-behaved sense keeps receiving deliveries"
+        );
+        expect!(
+            "engine-alive",
+            "the engine stays alive",
+            "net service for every other component survives one component's misbehaviour",
+        );
+        expect!(
+            "crash-reported",
+            "the crash is reported as a finding naming the net"
+        );
         let mut resolver = Resolver::new(1, Dsu::new(1));
         let e0 = resolver.add_endpoint(0, PinRef::new("U1", "1"), None);
         let handle = EngineHandle::spawn(
@@ -4235,6 +4529,16 @@ mod tests {
     /// Inert handles (build-time analysis path) are safe no-ops.
     #[rstest]
     fn inert_handles_are_safe_noops() {
+        behaviour!(Test {
+            id: "engine.inert-handles-are-no-ops",
+            covers: Some("board/src/engine.rs#EngineLink::send"),
+            given: "a pin handle and a component's timing interface that are attached to no engine",
+        });
+        expect!(
+            "quiet-no-ops",
+            "driving the pin and requesting wakeups do nothing and raise no error"
+        );
+        expect!("senses-floating", "the pin reads as floating");
         let handle = crate::component::PinHandle::new(NetId(0));
         handle.set_drive(Some(high())); // dropped with a trace, no panic
         assert_eq!(handle.sense(), NetState::Floating);
@@ -4251,6 +4555,24 @@ mod tests {
     /// through resistance at/above the threshold does not contend.
     #[rstest]
     fn disagreeing_drivers_through_collapsed_resistance_resolve_contention() {
+        behaviour!(Test {
+            id: "engine.disagreeing-drivers-across-resistor",
+            covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+            given: "a pin driving high and a pin driving low on separate nets joined by a series resistor",
+        });
+        expect!(
+            "both-contend",
+            "through 47 ohms, both nets are in contention",
+            "for signalling purposes two nets joined by a small series resistance are one node, so drivers disagreeing across it are fighting",
+        );
+        expect!(
+            "both-named",
+            "the contention finding names both fighting pins"
+        );
+        expect!(
+            "limit-is-strict",
+            "through exactly 1 kilohm, the collapse limit itself, neither net is in contention"
+        );
         // 25 Ω high vs 25 Ω low through 47 Ω: Contention on both roots.
         let mut resolver = Resolver::new(2, Dsu::new(2));
         resolver.add_endpoint(0, PinRef::new("U1", "1"), Some(high()));
@@ -4290,6 +4612,17 @@ mod tests {
     /// resistor does not.
     #[rstest]
     fn pulse_routes_collapse_series_passives_and_ignore_byte_roles() {
+        behaviour!(Test {
+            id: "engine.pulse-route-collapses-passives",
+            covers: Some("board/src/engine.rs#Resolver::route_pulses"),
+            given: "a step-clock source reaching one drive input through two 47 ohm resistors and another input through a 4.7 kilohm isolation resistor",
+        });
+        expect!(
+            "near-input-only",
+            "one route is derived, carrying the source to the input behind the small resistors alone",
+            "series resistance below 1 kilohm is part of the link, and an isolation resistor marks where a step clock stops",
+        );
+        expect!("nothing-reported", "nothing is reported");
         // source(0) --47Ω-- (1) --47Ω-- sink(2), a sink behind 4.7 kΩ that
         // must NOT route, and a UART consumer that is not a pulse sink at all.
         let mut resolver = Resolver::new(5, Dsu::new(5));
@@ -4320,6 +4653,18 @@ mod tests {
     /// transmitters: reported once per pair, and neither routes.
     #[rstest]
     fn facing_pulse_sources_raise_stream_mismatch_and_do_not_route() {
+        behaviour!(Test {
+            id: "engine.facing-pulse-sources",
+            covers: Some("board/src/engine.rs#Resolver::route_pulses"),
+            given:
+                "two step-clock sources on one line, 47 ohms apart, with a drive input beyond them",
+        });
+        expect!("neither-routes", "neither source gets a route");
+        expect!(
+            "one-finding-per-pair",
+            "exactly one finding is raised, naming both sources as a mismatched pair",
+            "two step clocks driving one line is the same wiring error as two transmitters on one serial line",
+        );
         let mut resolver = Resolver::new(3, Dsu::new(3));
         let a = resolver.add_endpoint(0, PinRef::new("MCU", "P8"), Some(high()));
         let b = resolver.add_endpoint(1, PinRef::new("ALT", "P9"), Some(high()));
@@ -4353,6 +4698,17 @@ mod tests {
     /// served — and a lone sink is inert, not an error.
     #[rstest]
     fn a_pulse_source_with_no_sink_routes_to_nobody() {
+        behaviour!(Test {
+            id: "engine.pulse-source-without-sink",
+            covers: Some("board/src/engine.rs#Resolver::route_pulses"),
+            given: "a step-clock source with nothing connected to it, and a drive input on another net with nothing connected either",
+        });
+        expect!(
+            "route-with-no-inputs",
+            "the source keeps a route with no inputs on it",
+            "a source's current train is retained on its route, so an input attached later can be served straight away",
+        );
+        expect!("nothing-reported", "nothing is reported for either");
         let mut resolver = Resolver::new(2, Dsu::new(2));
         let source = resolver.add_endpoint(0, PinRef::new("MCU", "P8"), Some(high()));
         let orphan = resolver.add_endpoint(1, PinRef::new("DRV", "STEP"), None);
@@ -4512,10 +4868,30 @@ mod tests {
             }
         }
 
+        /// Declared once, outside the case loop: the body below runs two
+        /// thousand times, and the ledger wants one line per expectation.
+        #[test]
+        fn resolving_only_the_touched_cluster_matches_a_full_pass() {
+            behaviour!(Test {
+                id: "engine.incremental-resolve-matches-full-pass",
+                covers: Some("board/src/engine.rs#Resolver::resolve_dirty"),
+                given: "a random board of up to nine nets with shorts, resistors, drivers at assorted impedances, rails, injected faults and senses, under a random sequence of drive changes",
+            });
+            expect!(
+                "states-match",
+                "after the first pass and after every change, each net's state equals what a full pass over the whole board gives",
+                "clusters are electrically independent, so re-resolving only the cluster a drive touched is exact",
+            );
+            expect!(
+                "findings-match",
+                "after every change, the accumulated findings equal those of the full pass",
+            );
+            touched_cluster_cases();
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
-            #[test]
-            fn resolving_only_the_touched_cluster_matches_a_full_pass(
+            fn touched_cluster_cases(
                 spec in spec_strategy(),
                 ops in prop::collection::vec((0usize..8, drive_strategy()), 1..12),
             ) {

@@ -73,3 +73,7 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# The Vibes behaviour binding is consumed straight from its repo rather than
+# from crates.io, so it needs listing here by hand -- which is the point of
+# denying unknown git sources: every one is a deliberate, named decision.
+allow-git = ["https://github.com/RileyMcCarthy/vibes"]

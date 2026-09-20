@@ -310,6 +310,7 @@ impl UartDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vibes_behaviour::{behaviour, expect, Test};
 
     /// Play an encoded byte into a decoder, returning the time it ended at.
     fn play(dec: &mut UartDecoder, framing: UartFraming, byte: u8, from: u64) -> u64 {
@@ -333,6 +334,16 @@ mod tests {
     /// register data and the force gauge never came up.
     #[test]
     fn a_marginally_fast_sender_still_frames_back_to_back_bytes() {
+        behaviour!(Test {
+            id: "uart.fast-sender-burst",
+            covers: Some("board/src/uart.rs#UartDecoder::on_level"),
+            given: "a sender a fraction fast streams bytes back to back, with no idle gap, into a receiver at the nominal rate",
+        });
+        expect!(
+            "all-bytes-decode",
+            "every byte of the burst decodes, in the order sent",
+            "a sender's clock is never exactly nominal; a real receiver accepts the next start bit from the midpoint of the stop bit, which grants half a bit of tolerance either way",
+        );
         let fast = UartFraming::new_8n1(115_273);
         let nominal = UartFraming::new_8n1(115_200);
         assert!(
@@ -362,6 +373,16 @@ mod tests {
     /// The tolerance is symmetric: a marginally *slow* sender must also frame.
     #[test]
     fn a_marginally_slow_sender_still_frames_back_to_back_bytes() {
+        behaviour!(Test {
+            id: "uart.slow-sender-burst",
+            covers: Some("board/src/uart.rs#UartDecoder::on_level"),
+            given: "a sender a fraction slow streams bytes back to back, with no idle gap, into a receiver at the nominal rate",
+        });
+        expect!(
+            "all-bytes-decode",
+            "every byte of the burst decodes, in the order sent",
+            "the receiver's half-bit tolerance holds in both directions",
+        );
         let slow = UartFraming::new_8n1(115_000);
         let nominal = UartFraming::new_8n1(115_200);
         let mut dec = UartDecoder::new(nominal);
@@ -385,6 +406,15 @@ mod tests {
 
     #[test]
     fn every_byte_round_trips() {
+        behaviour!(Test {
+            id: "uart.every-byte-round-trips",
+            covers: Some("board/src/uart.rs#UartDecoder::poll"),
+            given: "each of the 256 byte values, sent alone on an otherwise idle line",
+        });
+        expect!(
+            "value-survives",
+            "the receiver reads back the value that was sent"
+        );
         let framing = UartFraming::new_8n1(2_000_000);
         for byte in 0u8..=255 {
             assert_eq!(
@@ -400,6 +430,21 @@ mod tests {
     /// the stop bit.
     #[test]
     fn transition_free_frames_still_decode() {
+        behaviour!(Test {
+            id: "uart.transition-free-frames",
+            covers: Some("board/src/uart.rs#UartDecoder::absorb_until"),
+            given: "a byte with no transition among its data bits: all zeros, or all ones",
+        });
+        expect!(
+            "all-zeros",
+            "the all-zeros byte decodes as zero",
+            "its start bit and eight data bits are one unbroken low run; the receiver only hears about level changes, so bit counts come from how long a level is held",
+        );
+        expect!(
+            "all-ones",
+            "the all-ones byte decodes as all ones",
+            "its data, stop bit and the idle after are one unbroken high run, so no edge ever marks the frame's end; the receiver closes it on the clock",
+        );
         let framing = UartFraming::new_8n1(115_200);
         assert_eq!(round_trip(framing, 0x00), Some(Ok(0x00)));
         assert_eq!(round_trip(framing, 0xFF), Some(Ok(0xFF)));
@@ -407,6 +452,19 @@ mod tests {
 
     #[test]
     fn msb_first_is_the_mirror_of_lsb_first() {
+        behaviour!(Test {
+            id: "uart.msb-first",
+            covers: Some("board/src/uart.rs#UartEncoder::encode"),
+            given: "a link configured most-significant bit first, carrying a byte whose bit pattern is not symmetric",
+        });
+        expect!(
+            "round-trips",
+            "the receiver reads back the byte that was sent"
+        );
+        expect!(
+            "wire-differs",
+            "the levels put on the line differ from those the same byte produces least-significant bit first",
+        );
         let lsb = UartFraming::new_8n1(115_200);
         let msb = UartFraming {
             lsb_first: false,
@@ -425,6 +483,16 @@ mod tests {
     /// the bit order were backwards.
     #[test]
     fn a_hand_written_waveform_decodes() {
+        behaviour!(Test {
+            id: "uart.hand-written-waveform",
+            covers: Some("board/src/uart.rs#UartDecoder::on_level"),
+            given: "a hand-written waveform for a known byte, least-significant bit first, that is played onto the line bit by bit",
+        });
+        expect!(
+            "decodes",
+            "the receiver reads the byte the waveform encodes",
+            "sender and receiver would agree with each other even with the bit order reversed, so the order is checked against a reference neither of them produced",
+        );
         use Level::{High as H, Low as L};
         let framing = UartFraming::new_8n1(1_000_000); // 1 µs per bit
         let mut dec = UartDecoder::new(framing);
@@ -440,6 +508,17 @@ mod tests {
 
     #[test]
     fn a_low_stop_bit_is_a_framing_error() {
+        behaviour!(Test {
+            id: "uart.low-stop-bit",
+            covers: Some("board/src/uart.rs#UartDecoder::poll"),
+            given: "the line falls and stays low past where the stop bit should be",
+        });
+        expect!("framing-error", "the frame is reported as a framing error");
+        expect!(
+            "recovers",
+            "a byte sent after the line returns to idle decodes cleanly",
+            "a break must not poison every frame that follows it",
+        );
         let framing = UartFraming::new_8n1(115_200);
         let mut dec = UartDecoder::new(framing);
         // A break: the line falls and simply stays down past the stop bit.
@@ -458,6 +537,16 @@ mod tests {
     /// that opens the second frame has to close the first.
     #[test]
     fn back_to_back_frames_decode_without_an_intervening_poll() {
+        behaviour!(Test {
+            id: "uart.back-to-back-without-a-read",
+            covers: Some("board/src/uart.rs#UartDecoder::on_level"),
+            given: "a stream of bytes with no idle gap between them, and the receiver is read only once the last has ended",
+        });
+        expect!(
+            "all-in-order",
+            "every byte comes out, in the order sent",
+            "the edge that opens a frame closes the one before it, so decoding cannot depend on how often the receiver is read",
+        );
         let framing = UartFraming::new_8n1(2_000_000);
         let mut dec = UartDecoder::new(framing);
         let mut t = 500_000u64;
@@ -473,6 +562,28 @@ mod tests {
 
     #[test]
     fn the_frame_deadline_is_how_a_silent_tail_gets_closed() {
+        behaviour!(Test {
+            id: "uart.frame-completion-time",
+            covers: Some("board/src/uart.rs#UartDecoder::frame_deadline_ns"),
+            given: "an all-ones byte arriving on an idle line, its only edge the start bit",
+        });
+        expect!(
+            "none-while-idle",
+            "before the start bit, the receiver names no completion time"
+        );
+        expect!(
+            "one-frame-after-start",
+            "once the start bit falls, the receiver names the frame's completion time as one full frame after it",
+            "a listener that only hears about edges has to arm a timer for this, since a frame whose tail is silent has no edge to close it",
+        );
+        expect!(
+            "unchanged-by-edges",
+            "edges inside the frame leave that time unchanged"
+        );
+        expect!(
+            "closes-at-that-time",
+            "read at that instant, the byte comes out and no completion time remains",
+        );
         let framing = UartFraming::new_8n1(115_200);
         let mut dec = UartDecoder::new(framing);
         assert_eq!(dec.frame_deadline_ns(), None, "no frame, no deadline");
@@ -490,6 +601,16 @@ mod tests {
 
     #[test]
     fn a_frame_is_not_reported_before_it_has_elapsed() {
+        behaviour!(Test {
+            id: "uart.frame-held-to-full-length",
+            covers: Some("board/src/uart.rs#UartDecoder::poll"),
+            given: "a start bit has fallen and the receiver is asked for a byte a moment before the frame's nominal end",
+        });
+        expect!(
+            "nothing-yet",
+            "no byte is reported",
+            "the half-bit tolerance is for a frame the next start bit closes; a frame the clock closes runs its full nominal length",
+        );
         let framing = UartFraming::new_8n1(115_200);
         let mut dec = UartDecoder::new(framing);
         dec.on_level(Level::Low, 0);
@@ -498,6 +619,20 @@ mod tests {
 
     #[test]
     fn baud_sets_the_bit_period() {
+        behaviour!(Test {
+            id: "uart.baud-sets-framing",
+            covers: Some("board/src/uart.rs#UartFraming::new_8n1"),
+            given: "a link configured 8N1 at a stated baud rate",
+        });
+        expect!(
+            "bit-period",
+            "one bit lasts one second divided by the baud rate"
+        );
+        expect!(
+            "ten-bits-per-frame",
+            "a frame is ten bits: one start, eight data, one stop"
+        );
+        expect!("frame-time", "a frame lasts ten bit periods");
         assert_eq!(UartFraming::new_8n1(1_000_000).bit_period_ns, 1_000);
         assert_eq!(UartFraming::new_8n1(2_000_000).frame_bits(), 10);
         assert_eq!(UartFraming::new_8n1(2_000_000).frame_ns(), 5_000);

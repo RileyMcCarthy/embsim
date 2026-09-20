@@ -19,6 +19,7 @@ nix.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }
 rstest.workspace = true
 proptest.workspace = true
 # Dev-only cycle (allowed by Cargo): the DS2Addon integration tests exercise
