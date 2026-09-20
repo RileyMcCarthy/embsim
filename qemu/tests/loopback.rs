@@ -66,14 +66,26 @@ struct Stopwatch {
 }
 
 /// A guest that is a socketpair and a stopwatch.
+///
+/// The near end mirrors [`embsim_qemu::QemuVm`]: detach drops it so the old
+/// raw fd is dead (poll sees `POLLNVAL`); attach builds a fresh pair. The
+/// test's far end lives in a shared slot so a reconnect can hand back a live
+/// handle after the previous one has hung up.
 struct FakeGuest {
-    port: UnixStream,
+    port: Option<UnixStream>,
+    /// The test's end of the cable. Replaced on each attach.
+    far: Arc<Mutex<Option<UnixStream>>>,
     clock: Arc<Mutex<Stopwatch>>,
     dropped: Arc<AtomicBool>,
-    /// Stands in for a pulled cable: `serial_fd` reports -1 while set, which
-    /// is exactly what `QemuVm` does once it has closed the chardev.
-    detached: Arc<AtomicBool>,
 }
+
+/// Parts returned by [`FakeGuest::with_drop_flag`].
+type FakeGuestWithDropFlag = (
+    FakeGuest,
+    Arc<Mutex<Option<UnixStream>>>,
+    Arc<Mutex<Stopwatch>>,
+    Arc<AtomicBool>,
+);
 
 impl Drop for FakeGuest {
     fn drop(&mut self) {
@@ -84,38 +96,50 @@ impl Drop for FakeGuest {
 impl FakeGuest {
     /// Returns the guest and the test's end of its serial port.
     fn new() -> (Self, UnixStream, Arc<Mutex<Stopwatch>>) {
-        let (guest, far, clock, _) = Self::with_drop_flag();
+        let (guest, far_slot, clock, _) = Self::with_drop_flag();
+        // Ordinary tests never unplug: take the far end out of the slot and
+        // hold it directly. A later attach would refill the slot; nobody
+        // looks.
+        let far = far_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("fresh fake guest has a far end");
         (guest, far, clock)
     }
 
-    /// [`new`](Self::new), plus the cable: setting the flag makes the guest
-    /// report no descriptor, which is what a pulled USB serial adapter looks
-    /// like to the node.
-    fn unpluggable() -> (Self, UnixStream, Arc<AtomicBool>) {
-        let (guest, far, _, _) = Self::with_drop_flag();
-        let cable = Arc::clone(&guest.detached);
-        (guest, far, cable)
+    /// [`new`](Self::new), but keeps the far end in a shared slot so the test
+    /// can pick up a replacement after a plug following an unplug.
+    fn unpluggable() -> (Self, Arc<Mutex<Option<UnixStream>>>) {
+        let (guest, far_slot, _, _) = Self::with_drop_flag();
+        (guest, far_slot)
     }
 
     /// [`new`](Self::new), plus a flag the guest raises when it is dropped.
-    fn with_drop_flag() -> (Self, UnixStream, Arc<Mutex<Stopwatch>>, Arc<AtomicBool>) {
-        let (port, far) = UnixStream::pair().expect("socketpair");
-        port.set_nonblocking(true).expect("nonblocking");
-        far.set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("read timeout");
+    fn with_drop_flag() -> FakeGuestWithDropFlag {
+        let (near, far) = Self::open_pair();
+        let far_slot = Arc::new(Mutex::new(Some(far)));
         let clock = Arc::new(Mutex::new(Stopwatch::default()));
         let dropped = Arc::new(AtomicBool::new(false));
         (
             Self {
-                port,
+                port: Some(near),
+                far: Arc::clone(&far_slot),
                 clock: Arc::clone(&clock),
                 dropped: Arc::clone(&dropped),
-                detached: Arc::new(AtomicBool::new(false)),
             },
-            far,
+            far_slot,
             clock,
             dropped,
         )
+    }
+
+    fn open_pair() -> (UnixStream, UnixStream) {
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        near.set_nonblocking(true).expect("nonblocking");
+        far.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        (near, far)
     }
 }
 
@@ -137,19 +161,29 @@ impl Guest for FakeGuest {
     }
 
     fn serial_fd(&self) -> RawFd {
-        if self.detached.load(Ordering::Relaxed) {
-            -1
-        } else {
-            self.port.as_raw_fd()
-        }
+        // -1 while unplugged, matching QemuVm: poll(2) ignores a negative fd.
+        self.port.as_ref().map_or(-1, |s| s.as_raw_fd())
     }
 
     fn serial_attached(&self) -> bool {
-        !self.detached.load(Ordering::Relaxed)
+        self.port.is_some()
     }
 
     fn set_serial_attached(&mut self, attached: bool) -> io::Result<()> {
-        self.detached.store(!attached, Ordering::Relaxed);
+        match (attached, self.port.is_some()) {
+            (true, false) => {
+                let (near, far) = Self::open_pair();
+                self.port = Some(near);
+                *self.far.lock().unwrap() = Some(far);
+            }
+            (false, true) => {
+                // Dropping closes it — the prior raw fd must go dead so a
+                // capture-once pump_main would see POLLNVAL, just as QemuVm
+                // does when it drops the chardev stream.
+                self.port = None;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -407,7 +441,7 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     let _suite = suite_lock();
     let _stepped = Stepped::enter();
 
-    let (guest_a, mut far_a, _cable_a) = FakeGuest::unpluggable();
+    let (guest_a, far_a) = FakeGuest::unpluggable();
     let (guest_b, mut far_b, _) = FakeGuest::new();
     let node_a = QemuNode::new(Box::new(guest_a), 2_000_000);
     let node_b = QemuNode::new(Box::new(guest_b), 2_000_000);
@@ -431,7 +465,12 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     far_b.write_all(b"plugged").unwrap();
     let slices_before = wait_for_slices(&stats_a, 1);
     let mut buf = [0u8; 32];
-    let _ = far_a.read(&mut buf);
+    let _ = far_a
+        .lock()
+        .unwrap()
+        .as_mut()
+        .expect("plugged far end")
+        .read(&mut buf);
 
     // Pull the cable. B keeps talking into a port that is not there.
     assert!(cable_a.is_plugged(), "the port starts plugged in");
@@ -451,12 +490,19 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
         "the node stopped slicing an unplugged guest ({slices_before} -> {slices_during}, wanted {})",
         slices_before + 4
     );
-    // ...and nothing arrived while it was out.
+    // ...and nothing arrived while it was out. The far end may already have
+    // seen EOF from the closed near end; that is still "nothing crossed".
     let mut void = [0u8; 64];
-    let got = far_a.read(&mut void).unwrap_or(0);
+    let got = far_a
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(|s| s.read(&mut void).unwrap_or(0))
+        .unwrap_or(0);
     assert_eq!(got, 0, "bytes crossed a port that was unplugged");
 
     // Put it back: a reconnect test needs the port to RETURN, not just vanish.
+    // Plug replaces the far end in the shared slot — pick it up before reading.
     cable_a.plug().expect("replug");
     assert!(cable_a.is_plugged(), "the port came back");
     far_b.write_all(b"back again").unwrap();
@@ -464,11 +510,18 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     let mut seen = Vec::new();
     while Instant::now() < deadline && seen.len() < b"back again".len() {
         let mut buf = [0u8; 64];
-        match far_a.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => seen.extend_from_slice(&buf[..n]),
-            Err(_) => continue,
-        }
+        let n = {
+            let mut slot = far_a.lock().unwrap();
+            match slot.as_mut() {
+                Some(s) => match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => continue,
+                },
+                None => continue,
+            }
+        };
+        seen.extend_from_slice(&buf[..n]);
     }
     assert_eq!(
         String::from_utf8_lossy(&seen),
@@ -476,13 +529,10 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
         "nothing crossed after the port was plugged back in"
     );
 
-    // The node must not have written itself off. NOTE: this fake reports -1
-    // while detached but keeps its socketpair open, so the reader's descriptor
-    // stays valid and this cannot reproduce the failure the real QemuVm had --
-    // there, closing the chardev made the reader poll a dead fd, take POLLNVAL
-    // for the guest exiting, log "the guest's serial port went away" and stop
-    // for good. That was found by running the cosim, not here. This assertion
-    // guards the weaker property the fake can actually express.
+    // Closing the near end on unplug makes the reader's prior fd dead. If
+    // pump_main were mutated back to capturing the fd once at start, it would
+    // poll that closed descriptor, take POLLNVAL for the guest exiting, set
+    // disconnected, and this assertion would fail — the regression #53 fixed.
     assert!(
         !stats_a.disconnected(),
         "an unplug was mistaken for the guest going away"
