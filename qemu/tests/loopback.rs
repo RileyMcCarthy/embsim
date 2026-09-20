@@ -70,6 +70,9 @@ struct FakeGuest {
     port: UnixStream,
     clock: Arc<Mutex<Stopwatch>>,
     dropped: Arc<AtomicBool>,
+    /// Stands in for a pulled cable: `serial_fd` reports -1 while set, which
+    /// is exactly what `QemuVm` does once it has closed the chardev.
+    detached: Arc<AtomicBool>,
 }
 
 impl Drop for FakeGuest {
@@ -85,6 +88,15 @@ impl FakeGuest {
         (guest, far, clock)
     }
 
+    /// [`new`](Self::new), plus the cable: setting the flag makes the guest
+    /// report no descriptor, which is what a pulled USB serial adapter looks
+    /// like to the node.
+    fn unpluggable() -> (Self, UnixStream, Arc<AtomicBool>) {
+        let (guest, far, _, _) = Self::with_drop_flag();
+        let cable = Arc::clone(&guest.detached);
+        (guest, far, cable)
+    }
+
     /// [`new`](Self::new), plus a flag the guest raises when it is dropped.
     fn with_drop_flag() -> (Self, UnixStream, Arc<Mutex<Stopwatch>>, Arc<AtomicBool>) {
         let (port, far) = UnixStream::pair().expect("socketpair");
@@ -98,6 +110,7 @@ impl FakeGuest {
                 port,
                 clock: Arc::clone(&clock),
                 dropped: Arc::clone(&dropped),
+                detached: Arc::new(AtomicBool::new(false)),
             },
             far,
             clock,
@@ -124,7 +137,20 @@ impl Guest for FakeGuest {
     }
 
     fn serial_fd(&self) -> RawFd {
-        self.port.as_raw_fd()
+        if self.detached.load(Ordering::Relaxed) {
+            -1
+        } else {
+            self.port.as_raw_fd()
+        }
+    }
+
+    fn serial_attached(&self) -> bool {
+        !self.detached.load(Ordering::Relaxed)
+    }
+
+    fn set_serial_attached(&mut self, attached: bool) -> io::Result<()> {
+        self.detached.store(!attached, Ordering::Relaxed);
+        Ok(())
     }
 
     fn clock_ns(&mut self) -> Option<u64> {
@@ -368,4 +394,112 @@ fn a_guest_that_outruns_the_line_is_never_blocked() {
     assert_eq!(stats_b.shed(), 0);
 
     drop(system);
+}
+
+/// A port that is unplugged carries nothing, and the guest keeps running.
+///
+/// The node meters the guest against the board's clock, so an unplugged slice
+/// still has to resume and pause it -- a guest frozen for the duration of the
+/// unplug could not notice the unplug, and the browser inside it would never
+/// fire the disconnect event the reconnect path is waiting for.
+#[test]
+fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
+    let _suite = suite_lock();
+    let _stepped = Stepped::enter();
+
+    let (guest_a, mut far_a, _cable_a) = FakeGuest::unpluggable();
+    let (guest_b, mut far_b, _) = FakeGuest::new();
+    let node_a = QemuNode::new(Box::new(guest_a), 2_000_000);
+    let node_b = QemuNode::new(Box::new(guest_b), 2_000_000);
+    let (stats_a, stats_b) = (node_a.stats(), node_b.stats());
+    // The public handle, not the guest's own flag: this is the path a test
+    // harness takes, so it is the path worth covering.
+    let cable_a = node_a.link();
+    let harness = Harness::new()
+        .connect_str("A.TX", "B.RX")
+        .unwrap()
+        .connect_str("B.TX", "A.RX")
+        .unwrap();
+    let _system = System::new()
+        .component("A", Box::new(node_a))
+        .component("B", Box::new(node_b))
+        .harness(harness)
+        .start()
+        .expect("system starts");
+
+    // Plugged: a byte from B reaches A's guest.
+    far_b.write_all(b"plugged").unwrap();
+    let slices_before = wait_for_slices(&stats_a, 1);
+    let mut buf = [0u8; 32];
+    let _ = far_a.read(&mut buf);
+
+    // Pull the cable. B keeps talking into a port that is not there.
+    assert!(cable_a.is_plugged(), "the port starts plugged in");
+    cable_a.unplug().expect("unplug");
+    assert!(!cable_a.is_plugged(), "the port reports itself unplugged");
+    far_b.write_all(b"into the void").unwrap();
+    let slices_during = wait_for_slices(&stats_a, slices_before + 4);
+
+    // The guest went on being scheduled -- that is the claim, and it has to be
+    // "kept going" rather than "twitched once". Removing the unplugged-path
+    // guard in run_slice makes drain_outbound write to fd -1, which returns
+    // EBADF and kills the pump; a few slices still land before it dies, so
+    // `> slices_before` passes and proves nothing. Requiring the node to reach
+    // the target is what makes this test fail for that mutation.
+    assert!(
+        slices_during >= slices_before + 4,
+        "the node stopped slicing an unplugged guest ({slices_before} -> {slices_during}, wanted {})",
+        slices_before + 4
+    );
+    // ...and nothing arrived while it was out.
+    let mut void = [0u8; 64];
+    let got = far_a.read(&mut void).unwrap_or(0);
+    assert_eq!(got, 0, "bytes crossed a port that was unplugged");
+
+    // Put it back: a reconnect test needs the port to RETURN, not just vanish.
+    cable_a.plug().expect("replug");
+    assert!(cable_a.is_plugged(), "the port came back");
+    far_b.write_all(b"back again").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline && seen.len() < b"back again".len() {
+        let mut buf = [0u8; 64];
+        match far_a.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+            Err(_) => continue,
+        }
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&seen),
+        "back again",
+        "nothing crossed after the port was plugged back in"
+    );
+
+    // The node must not have written itself off. NOTE: this fake reports -1
+    // while detached but keeps its socketpair open, so the reader's descriptor
+    // stays valid and this cannot reproduce the failure the real QemuVm had --
+    // there, closing the chardev made the reader poll a dead fd, take POLLNVAL
+    // for the guest exiting, log "the guest's serial port went away" and stop
+    // for good. That was found by running the cosim, not here. This assertion
+    // guards the weaker property the fake can actually express.
+    assert!(
+        !stats_a.disconnected(),
+        "an unplug was mistaken for the guest going away"
+    );
+
+    assert!(stats_b.slices() > 0, "B never ran");
+}
+
+/// Wait until the node has completed at least `want` slices, and report where
+/// it got to. Bounded so a stalled node fails the test rather than hanging it.
+fn wait_for_slices(stats: &Arc<NodeStats>, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = stats.slices();
+        if now >= want || Instant::now() > deadline {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

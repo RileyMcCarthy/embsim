@@ -374,7 +374,7 @@ impl QemuSpec {
             child,
             workdir,
             qmp,
-            serial,
+            serial: Some(serial),
             agent,
         })
     }
@@ -445,7 +445,10 @@ pub struct QemuVm {
     child: Child,
     workdir: PathBuf,
     qmp: Qmp,
-    serial: UnixStream,
+    /// `None` while the port is unplugged. Closing this stream is what QEMU
+    /// turns into a USB detach, so the absence IS the unplug -- there is no
+    /// separate "detached" flag to fall out of step with it.
+    serial: Option<UnixStream>,
     agent: Option<AgentLink>,
 }
 
@@ -581,7 +584,34 @@ impl Guest for QemuVm {
     }
 
     fn serial_fd(&self) -> RawFd {
-        self.serial.as_raw_fd()
+        // -1 while unplugged. poll(2) ignores a negative descriptor and
+        // reports no events for it, so a slice with no port simply waits out
+        // its budget -- the guest still runs, which is the whole point.
+        self.serial.as_ref().map_or(-1, |s| s.as_raw_fd())
+    }
+
+    fn serial_attached(&self) -> bool {
+        self.serial.is_some()
+    }
+
+    fn set_serial_attached(&mut self, attached: bool) -> io::Result<()> {
+        match (attached, self.serial.is_some()) {
+            (true, false) => {
+                // The chardev was created `server=on`, so QEMU re-arms its
+                // listener when a client goes away and this reconnect is a
+                // genuine re-attach: the guest enumerates the device again and
+                // a browser sees a connect event, not a resurrected handle.
+                let s = UnixStream::connect(self.workdir.join(SERIAL_SOCKET))?;
+                s.set_nonblocking(true)?;
+                self.serial = Some(s);
+            }
+            (false, true) => {
+                // Dropping closes it, which is the detach.
+                self.serial = None;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn clock_ns(&mut self) -> Option<u64> {

@@ -28,9 +28,10 @@ mod shell;
 
 use axum::extract::ws::WebSocket;
 use parking_lot::RwLock;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Type alias for an async WebSocket handler function.
 ///
@@ -114,6 +115,50 @@ fn views() -> &'static RwLock<Vec<View>> {
 /// Register a view. Must be called before `start_server`.
 pub fn register_view(view: View) {
     views().write().push(view);
+}
+
+/// A named side effect the server can be asked to perform.
+///
+/// Returns `Ok` when it happened and `Err(reason)` when it did not; the
+/// reason reaches the caller as the response body, because an action that
+/// quietly fails is worse than one that is missing.
+pub type Action = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Global action registry.
+static ACTIONS: OnceLock<RwLock<BTreeMap<String, Action>>> = OnceLock::new();
+
+fn actions() -> &'static RwLock<BTreeMap<String, Action>> {
+    ACTIONS.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+/// Register something a test harness can trigger over HTTP, reachable at
+/// `POST /action/<name>`.
+///
+/// This exists so a harness outside the process can do things only the
+/// simulation can do -- unplug a cable, assert a reset -- without inventing a
+/// second protocol for it. The server is opt-in (it runs only when a port is
+/// given), so nothing is exposed in a normal run.
+pub fn register_action(
+    name: &str,
+    action: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+) {
+    actions().write().insert(name.to_string(), Arc::new(action));
+}
+
+/// Look up a registered action by name.
+pub fn action(name: &str) -> Option<Action> {
+    actions().read().get(name).cloned()
+}
+
+/// The names of every registered action, for a caller that wants to discover
+/// them rather than guess.
+pub fn action_names() -> Vec<String> {
+    actions().read().keys().cloned().collect()
+}
+
+/// Remove all registered actions, alongside [`clear_views`].
+pub fn clear_actions() {
+    actions().write().clear();
 }
 
 /// Remove all registered views. Used to re-register a fresh view set for an
@@ -296,5 +341,41 @@ mod tests {
         clear_views();
         clear_views();
         assert!(views().read().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn an_action_runs_and_reports_what_happened() {
+        let _g = test_lock::guard();
+        clear_actions();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        register_action("link/unplug", move || {
+            c.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        register_action("link/refuses", || Err("the guest is gone".into()));
+
+        assert_eq!(action_names(), vec!["link/refuses", "link/unplug"]);
+        assert!(action("nope").is_none(), "an unknown action is absent");
+
+        assert_eq!(action("link/unplug").unwrap()(), Ok(()));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // A failure carries its reason: the handler turns this into a 500 with
+        // the text, so a harness can tell "no such action" from "it said no".
+        assert_eq!(
+            action("link/refuses").unwrap()(),
+            Err("the guest is gone".to_string())
+        );
+
+        clear_actions();
+        assert!(action_names().is_empty(), "clear_actions clears them");
     }
 }

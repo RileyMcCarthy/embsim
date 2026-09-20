@@ -4,8 +4,9 @@
 use crate::{shell, views};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::Path;
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
@@ -39,10 +40,7 @@ pub fn start(port: u16) -> std::io::Result<()> {
                 .expect("Failed to create tokio runtime for UI server");
 
             rt.block_on(async move {
-                let app = Router::new()
-                    .route("/", get(index_handler))
-                    .route("/ws/{view_id}", get(ws_handler))
-                    .route("/asset/{view_id}/{name}", get(asset_handler));
+                let app = router();
 
                 let listener = tokio::net::TcpListener::from_std(std_listener)
                     .expect("Failed to adopt UI listener into tokio runtime");
@@ -52,6 +50,22 @@ pub fn start(port: u16) -> std::io::Result<()> {
         })?;
 
     Ok(())
+}
+
+/// The route table.
+///
+/// Factored out so a test can drive real ROUTING rather than calling handlers
+/// directly: the handler tests below pass `Path(..)` straight in, which is how
+/// `/action/{name}` shipped broken -- it matches one segment, action names are
+/// namespaced with slashes, and every POST 404'd while `GET /action` happily
+/// listed the name.
+fn router() -> Router {
+    Router::new()
+        .route("/", get(index_handler))
+        .route("/ws/{view_id}", get(ws_handler))
+        .route("/asset/{view_id}/{name}", get(asset_handler))
+        .route("/action", get(action_index_handler))
+        .route("/action/{*name}", post(action_handler))
 }
 
 /// Serve the shell HTML page with all registered views.
@@ -105,6 +119,38 @@ async fn ws_handler(Path(view_id): Path<String>, ws: WebSocketUpgrade) -> impl I
 // ============================================================
 // Tests
 // ============================================================
+
+/// The registered action names, so a harness can check what it can trigger
+/// instead of discovering a typo as a 404 mid-test.
+async fn action_index_handler() -> impl IntoResponse {
+    crate::action_names().join("\n")
+}
+
+/// Run a registered action. 404 when there is no such action, 500 with the
+/// reason when it fails -- a harness must be able to tell "no such action"
+/// from "the action said no".
+async fn action_handler(Path(name): Path<String>) -> impl IntoResponse {
+    let Some(action) = crate::action(&name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "no action {name:?}; registered: {}",
+                crate::action_names().join(", ")
+            ),
+        );
+    };
+    // Actions block (unplugging waits for the current slice to finish), so
+    // this must not run on the async worker that is also serving the socket
+    // the harness is waiting on.
+    match tokio::task::spawn_blocking(move || action()).await {
+        Ok(Ok(())) => (StatusCode::OK, String::from("ok")),
+        Ok(Err(why)) => (StatusCode::INTERNAL_SERVER_ERROR, why),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("action panicked: {e}"),
+        ),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -218,5 +264,55 @@ mod tests {
         assert_eq!(unknown_view.status(), StatusCode::NOT_FOUND);
 
         clear_views();
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! Unlike the handler tests above, these go through the Router, which is
+    //! the only way to catch a path pattern that does not match.
+    use super::router;
+    use crate::{clear_actions, register_action};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    // A plain #[test] with its own runtime, not #[tokio::test]: the registry
+    // guard is a std MutexGuard and holding one across an await is a clippy
+    // error (and a real hazard). Blocking on each request keeps the guard's
+    // whole life synchronous.
+    #[test]
+    fn a_namespaced_action_is_reachable_over_http() {
+        let _g = crate::test_lock::guard();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        clear_actions();
+        register_action("link/unplug", || Ok(()));
+        register_action("link/refuses", || Err("the guest is gone".into()));
+
+        let post = |path: &str| {
+            let req = Request::post(path).body(Body::empty()).unwrap();
+            rt.block_on(router().oneshot(req)).unwrap().status()
+        };
+
+        // The slash in the name is the whole point: `/action/{name}` captures
+        // one segment and would 404 here.
+        assert_eq!(
+            post("/action/link/unplug"),
+            StatusCode::OK,
+            "a slashed action name routes"
+        );
+        // A failing action is 500, not 404 -- a caller has to tell "no such
+        // action" from "the action said no".
+        assert_eq!(
+            post("/action/link/refuses"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(post("/action/link/nope"), StatusCode::NOT_FOUND);
+
+        clear_actions();
     }
 }

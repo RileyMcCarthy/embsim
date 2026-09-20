@@ -24,6 +24,31 @@ pub trait Guest: Send {
     /// node polls, reads and writes for as long as the guest lives.
     fn serial_fd(&self) -> RawFd;
 
+    /// Whether the guest's serial port is currently attached.
+    ///
+    /// A node still runs the guest while this is false -- an unplugged port is
+    /// the point of the test and the guest has to keep executing to notice it
+    /// -- but it moves no bytes for that slice.
+    fn serial_attached(&self) -> bool {
+        true
+    }
+
+    /// Attach or detach the guest's serial port, as a cable would.
+    ///
+    /// The default is a no-op for guests whose port cannot be unplugged. For
+    /// QEMU this closes the chardev the emulated USB serial adapter is backed
+    /// by, which QEMU turns into a real USB detach (`usb_serial_event` maps
+    /// `CHR_EVENT_CLOSED` onto `usb_device_detach` unless the device was
+    /// created `always-plugged`), so the guest kernel removes the tty and a
+    /// browser sees a genuine disconnect rather than a simulated one.
+    fn set_serial_attached(&mut self, attached: bool) -> io::Result<()> {
+        let _ = attached;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this guest's serial port cannot be unplugged",
+        ))
+    }
+
     /// The guest's own monotonic clock, in nanoseconds, if it can be read.
     ///
     /// Called once per slice, immediately after [`resume`](Self::resume),
