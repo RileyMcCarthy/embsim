@@ -7,6 +7,16 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # Root npm is only the Vibes CLI (devDependency). Do not group with future
+  # unrelated npm deps. Bumping vibes means refreshing BOTH package-lock.json
+  # and Cargo.lock (vibes-behaviour) to the same git commit — CI asserts that
+  # lockstep in the Behaviour ledger job.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+
   # GitHub Actions used by CI.
   - package-ecosystem: github-actions
     directory: /
