@@ -1,7 +1,7 @@
 {
   "name": "embsim",
   "private": true,
-  "description": "Node is here only to run Vibes, the behaviour ledger. The code is Rust.",
+  "description": "Node is here only to run Vibes, the behaviour ledger. The code is Rust. Bump vibes by refreshing BOTH package-lock.json and Cargo.lock (vibes-behaviour) to the same git commit.",
   "devDependencies": {
     "vibes": "github:RileyMcCarthy/vibes"
   }
