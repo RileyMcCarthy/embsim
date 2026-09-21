@@ -218,6 +218,42 @@ jobs:
       # Node is here only for Vibes. `npm ci` installs it from git and builds
       # it via its `prepare` script; the Rust binding the tests use resolves
       # through Cargo on its own.
+      #
+      # Keep CLI (package-lock) and binding (Cargo.lock) on the same vibes
+      # commit. Prefer git+https in package-lock so HTTPS-only tokens work.
+      - name: Vibes CLI/binding lockstep
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          cargo = open("Cargo.lock", encoding="utf-8").read()
+          npm = open("package-lock.json", encoding="utf-8").read()
+          m_c = re.search(
+              r'name = "vibes-behaviour"\nversion = "[^"]+"\n'
+              r'source = "git\+https://github\.com/RileyMcCarthy/vibes\.git#([0-9a-f]+)"',
+              cargo,
+          )
+          m_n = re.search(
+              r'"node_modules/vibes"\s*:\s*\{[^}]*?'
+              r'"resolved"\s*:\s*"git\+https://github\.com/RileyMcCarthy/vibes\.git#([0-9a-f]+)"',
+              npm,
+              re.S,
+          )
+          if not m_c:
+              sys.exit("vibes-behaviour git+https SHA not found in Cargo.lock")
+          if not m_n:
+              sys.exit(
+                  "node_modules/vibes git+https SHA not found in package-lock.json "
+                  "(ssh resolved URLs are not accepted)"
+              )
+          if m_c.group(1) != m_n.group(1):
+              print(
+                  f"::error::vibes SHA mismatch: Cargo.lock={m_c.group(1)} "
+                  f"package-lock.json={m_n.group(1)}"
+              )
+              sys.exit(1)
+          print(f"vibes lockstep OK: {m_c.group(1)}")
+          PY
+
       - name: Install Vibes
         run: npm ci --no-audit --no-fund
 
