@@ -202,6 +202,52 @@ impl SpiNorFlashComponent {
     pub fn reads(&self) -> Vec<u32> {
         self.shared.lock().expect("flash mutex").flash.reads.clone()
     }
+
+    /// A view that survives handing this component to a `System`.
+    pub fn view(&self) -> FlashView {
+        FlashView {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// A view of the part that survives handing the component to a `System`.
+///
+/// The component's own accessors need `&self`, and a `System` takes ownership —
+/// so a test that wants to know what the flash served has to take this first.
+/// Same shape as the SD card's `counters()`.
+#[derive(Clone)]
+pub struct FlashView {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl std::fmt::Debug for FlashView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashView").finish_non_exhaustive()
+    }
+}
+
+impl FlashView {
+    /// Starting addresses of the reads served, oldest first — where a boot
+    /// actually looked, which is a sharper claim than whether it finished.
+    pub fn reads(&self) -> Vec<u32> {
+        self.shared.lock().expect("flash mutex").flash.reads.clone()
+    }
+
+    /// Every command opcode the master has issued, in order.
+    pub fn commands(&self) -> Vec<u8> {
+        self.shared
+            .lock()
+            .expect("flash mutex")
+            .flash
+            .commands
+            .clone()
+    }
+
+    /// The backing image as programming and erase have left it.
+    pub fn image_bytes(&self) -> Vec<u8> {
+        self.shared.lock().expect("flash mutex").flash.image_bytes()
+    }
 }
 
 /// Publish the device's current data-out level, or release the line when the
