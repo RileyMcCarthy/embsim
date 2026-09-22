@@ -9,6 +9,11 @@
 //!   ISO67xx digital isolator family, a dual optocoupler, a constant-current
 //!   LED driver, and a small NPN switch
 //! - [`limit_switch`] — position-threshold limit switch
+//! - [`spi_flash`] — a serial NOR flash, bit-level and bus-agnostic: anything
+//!   that can produce a chip select, a clock edge and a data bit can talk to
+//!   it, whether bit-banged or peripheral-clocked
+//! - [`spi_flash_component`] — that model as a live `embsim-board` component
+//!   (SOIC-8 pin facade, active-low ~CS, DO driven from the sense callbacks)
 //! - [`edge`] — edge-detection primitive shared by threshold models
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
 //!   components: a step/direction motor drive, a quadrature encoder, and an
@@ -27,3 +32,5 @@ pub mod edge;
 pub mod isolation;
 pub mod limit_switch;
 pub mod machine;
+pub mod spi_flash;
+pub mod spi_flash_component;
