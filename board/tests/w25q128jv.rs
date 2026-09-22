@@ -1,9 +1,10 @@
-//! The P2-EC32MB module's boot flash as a LIVE component, not a stub.
+//! The Winbond W25Q128JV as a LIVE board component.
 //!
-//! `ec32mb_module.rs` builds the whole module with every part but the P2 as a
-//! pin-facade stub, which proves the netlist classifies and resolves. This
-//! binary swaps one stub — `U301`, the Winbond W25Q128JVSIM — for the real
-//! [`SpiNorFlashComponent`] and asserts the module still builds.
+//! [`SpiNorFlashComponent`] is generic, so what it needs proving against is a
+//! real part on a real netlist. This binary uses the one netlist in the tree
+//! that carries a serial NOR flash — the Parallax P2-EC32MB module, whose
+//! `U301` is a `W25Q128JVSIM` — and swaps that stub for the live component.
+//! The board is the fixture here; the part is the subject.
 //!
 //! # What that actually proves
 //!
@@ -54,7 +55,7 @@ fn registry_with_live_flash() -> PartRegistry {
 }
 
 #[test]
-fn the_module_builds_with_a_live_flash_in_place_of_the_stub() {
+fn the_part_mounts_on_a_real_netlist_in_place_of_its_stub() {
     let parsed =
         netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
     let board =
@@ -92,7 +93,7 @@ fn a_facade_keyed_by_pin_number_does_not_mount_on_this_netlist() {
 }
 
 #[test]
-fn the_part_is_the_one_the_module_ships() {
+fn the_default_jedec_id_matches_the_ordering_option_on_the_fixture() {
     const FIXTURE: &str = include_str!("fixtures/p2_ec32mb.net");
     let parsed = netlist::parse(FIXTURE).expect("the EC32MB fixture parses");
     let u301 = parsed
