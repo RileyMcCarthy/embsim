@@ -505,3 +505,139 @@ fn a_program_without_write_enable_changes_nothing_over_the_net() {
         "the byte was never written, so the cell is erased"
     );
 }
+
+// ============================================================
+// The sequence a Propeller 2 boot ROM actually issues
+// ============================================================
+//
+// Replayed frame for frame from Parallax's `ROM_Booter_v33k.spin2` — `try_spi`
+// at lines 239-269 and the framing helpers `spi_cmd`/`spi_in` at 343-364, as
+// vendored in the consumer tree this model was ported from. It is not an
+// invented sequence and not a paraphrase of one.
+//
+// No CPU is involved: the ROM's frames are replayed by the bench master. That
+// proves the PART answers what a boot ROM asks, which is a different claim
+// from "the ROM boots" — running the ROM needs a P2 core, and there is none
+// in this workspace.
+
+/// `spi_cmd`: raise CS, lower it, then shift `bits` bits of `value` out MSB
+/// first, MSB-justified into 32 bits — so a byte command is `(byte, 8)` and
+/// the ROM's read frame is `($03000000, 32)`, opcode and 24-bit address in one
+/// transaction.
+fn spi_cmd(pins: &MasterPins, value: u32, bits: u32) {
+    let (cs, clk, di) = (
+        pins.cs.as_ref().unwrap(),
+        pins.clk.as_ref().unwrap(),
+        pins.di.as_ref().unwrap(),
+    );
+    drive_and_settle(cs, Level::High);
+    drive_and_settle(cs, Level::Low);
+    let justified = if bits == 8 { value << 24 } else { value };
+    for i in 0..bits {
+        let level = if (justified >> (31 - i)) & 1 != 0 {
+            Level::High
+        } else {
+            Level::Low
+        };
+        drive_and_settle(di, level);
+        drive_and_settle(clk, Level::High);
+        drive_and_settle(clk, Level::Low);
+    }
+}
+
+/// `spi_in`: eight clocks, sampling after each pulse — and crucially WITHOUT
+/// touching chip select, so the byte continues the transaction the preceding
+/// `spi_cmd` opened. The ROM's own comment notes it samples "from before
+/// `drvh`", the beat-late input this model's bit presentation is built for.
+fn spi_in(pins: &MasterPins) -> u8 {
+    let (clk, dout) = (pins.clk.as_ref().unwrap(), pins.dout.as_ref().unwrap());
+    let mut byte = 0u8;
+    for _ in 0..8 {
+        drive_and_settle(clk, Level::High);
+        drive_and_settle(clk, Level::Low);
+        byte = (byte << 1) | u8::from(sense_bit(dout));
+    }
+    byte
+}
+
+/// Everything `try_spi` does before it decides a device is there: the three
+/// all-ones bursts that exit quad and dual mode, reset-enable, reset,
+/// write-disable, then read-status. Returns the status byte the ROM gates on.
+fn rom_probe(pins: &MasterPins) -> u8 {
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
+    drive_and_settle(pins.cs.as_ref().unwrap(), Level::High);
+
+    // `neg pb,#1` then callpa #2 / #8 / #16 — all ones, to leave quad/dual.
+    for bits in [2u32, 8, 16] {
+        spi_cmd(pins, u32::MAX, bits);
+    }
+    spi_cmd(pins, 0x66, 8); // reset-enable
+    spi_cmd(pins, 0x99, 8); // reset
+    spi_cmd(pins, 0x04, 8); // write-disable, "to clear WEL"
+    spi_cmd(pins, 0x05, 8); // read-status
+    spi_in(pins)
+}
+
+#[test]
+fn the_part_passes_the_boot_roms_presence_check() {
+    let (_system, handles) = bench(SpiNorFlash::blank(4096));
+    let pins = handles.lock().expect("master pins");
+
+    let status = rom_probe(&pins);
+
+    // `testbn x,#1 wz` / `if_nz jmp #.fail` — WEL high means NO SPI MEMORY to
+    // the ROM. This is the bit that decides whether a board boots from flash
+    // at all, and it is why $04 is issued first.
+    assert_eq!(status & 0b10, 0, "WEL clear, so the ROM sees a device");
+    // `testbn x,#0 wz` / `if_nz jmp #.wait` — BUSY high means poll again.
+    assert_eq!(status & 0b01, 0, "BUSY clear, so the ROM stops polling");
+}
+
+#[test]
+fn a_part_left_write_enabled_reads_as_absent_to_the_boot_rom() {
+    // The same probe with the write-disable omitted, after something has set
+    // the latch. The ROM would take the WEL bit for "no SPI memory" and fall
+    // through to its next boot source — a failure that looks like missing
+    // hardware rather than a protocol error.
+    let (_system, handles) = bench(SpiNorFlash::blank(4096));
+    let pins = handles.lock().expect("master pins");
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
+    drive_and_settle(pins.cs.as_ref().unwrap(), Level::High);
+
+    spi_cmd(&pins, 0x06, 8); // write-enable: sets WEL
+    spi_cmd(&pins, 0x05, 8);
+    let status = spi_in(&pins);
+
+    assert_eq!(
+        status & 0b10,
+        0b10,
+        "WEL is set, which the ROM reads as absent"
+    );
+}
+
+#[test]
+fn the_boot_roms_read_frame_streams_the_image_from_zero() {
+    // `mov pa,#32` / `callpb #$03,#spi_cmd` is ONE 32-bit frame: the opcode
+    // and a 24-bit address of zero. The ROM then holds CS low and clocks out
+    // $400 bytes; this reads the first eight, which is the framing claim —
+    // the volume is the ROM's business, not the part's.
+    let mut image = vec![0xFF; 4096];
+    image[..8].copy_from_slice(b"Prop");
+    let (_system, handles) = bench(SpiNorFlash::with_image(image));
+    let pins = handles.lock().expect("master pins");
+
+    let status = rom_probe(&pins);
+    assert_eq!(status & 0b11, 0, "the probe passed before the read");
+
+    spi_cmd(&pins, 0x0300_0000, 32);
+    let mut got = [0u8; 8];
+    for byte in got.iter_mut() {
+        *byte = spi_in(&pins);
+    }
+    drive_and_settle(pins.cs.as_ref().unwrap(), Level::High);
+
+    assert_eq!(
+        &got, b"Prop\x01\x02\x03\x04",
+        "opcode and 24-bit address in one frame, then a stream with CS held low"
+    );
+}
