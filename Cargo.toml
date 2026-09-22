@@ -6,6 +6,7 @@ members = [
     "platforms/p2",
     "models",
     "boards",
+    "cffi",
     "qemu",
     "runtime",
     "build-support",
