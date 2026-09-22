@@ -241,6 +241,23 @@ fn recv(pins: &MasterPins) -> u8 {
     byte
 }
 
+/// Assert or release chip select, which is active low.
+fn select(pins: &MasterPins, selected: bool) {
+    drive_and_settle(
+        pins.cs.as_ref().unwrap(),
+        if selected { Level::Low } else { Level::High },
+    );
+}
+
+/// One complete transaction: select, shift bytes out, deselect.
+fn transact(pins: &MasterPins, bytes: &[u8]) {
+    select(pins, true);
+    for &b in bytes {
+        send(pins, b);
+    }
+    select(pins, false);
+}
+
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -380,5 +397,111 @@ fn the_part_answers_a_jedec_id_read_driven_bit_by_bit_over_nets() {
         id,
         [0xEF, 0x70, 0x18],
         "the JEDEC triple survived four nets and an engine round trip per edge"
+    );
+}
+
+/// Bring up a master opposite a flash on a bench system, and hand back the
+/// master's pins. The system is returned too: dropping it stops the engine.
+fn bench(flash: SpiNorFlash) -> (embsim_board::SystemHandle, Arc<Mutex<MasterPins>>) {
+    virtual_clock::init(50.0, 1_000_000);
+    let handles = Arc::new(Mutex::new(MasterPins::default()));
+    let harness = Harness::new()
+        .connect_str("MASTER.CS", "FLASH.CSn")
+        .expect("endpoints parse")
+        .connect_str("MASTER.CLK", "FLASH.CLK")
+        .expect("endpoints parse")
+        .connect_str("MASTER.DI", "FLASH.DI_IO0")
+        .expect("endpoints parse")
+        .connect_str("MASTER.DO", "FLASH.DO_IO1")
+        .expect("endpoints parse");
+    let system = System::new()
+        .component("MASTER", Box::new(BitBangMaster::new(Arc::clone(&handles))))
+        .component(
+            "FLASH",
+            Box::new(SpiNorFlashComponent::new(flash).with_pins(&SPI_FLASH_PINS_BY_FUNCTION)),
+        )
+        .harness(harness)
+        .start()
+        .expect("the bench system starts");
+    assert!(wait_for(
+        || handles.lock().expect("master pins").clk.is_some(),
+        Duration::from_secs(5)
+    ));
+    (system, handles)
+}
+
+#[test]
+fn an_image_flashed_into_the_part_reads_back_over_the_net() {
+    // The shape a bootloader cares about: an image sits in the part, and the
+    // first bytes of it come back from a read at a 24-bit address.
+    let mut image = vec![0xFF; 4096];
+    image[0x100..0x104].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    let (_system, handles) = bench(SpiNorFlash::with_image(image));
+    let pins = handles.lock().expect("master pins");
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
+    select(&pins, false);
+
+    select(&pins, true);
+    for byte in [0x03, 0x00, 0x01, 0x00] {
+        send(&pins, byte);
+    }
+    let got = [recv(&pins), recv(&pins), recv(&pins), recv(&pins)];
+    select(&pins, false);
+
+    assert_eq!(
+        got,
+        [0xDE, 0xAD, 0xBE, 0xEF],
+        "a read at $000100 streams the image from that offset"
+    );
+}
+
+#[test]
+fn a_program_lands_in_the_part_and_reads_back_over_the_net() {
+    // The write path, end to end and entirely over nets: enable, program,
+    // deselect to commit, then read it back the way a verifier would.
+    let (_system, handles) = bench(SpiNorFlash::blank(4096));
+    let pins = handles.lock().expect("master pins");
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
+    select(&pins, false);
+
+    transact(&pins, &[0x06]); // Write Enable (§8.2.1, p.24)
+    transact(&pins, &[0x02, 0x00, 0x00, 0x08, 0x11, 0x22]);
+
+    select(&pins, true);
+    for byte in [0x03, 0x00, 0x00, 0x08] {
+        send(&pins, byte);
+    }
+    let got = [recv(&pins), recv(&pins)];
+    select(&pins, false);
+
+    assert_eq!(
+        got,
+        [0x11, 0x22],
+        "programmed bytes are readable through the same four nets"
+    );
+}
+
+#[test]
+fn a_program_without_write_enable_changes_nothing_over_the_net() {
+    // The latch is the part's own protection, and it has to survive the trip
+    // through the engine intact: an unlatched program is discarded here
+    // exactly as it is on silicon (§7.1.2, p.13).
+    let (_system, handles) = bench(SpiNorFlash::blank(4096));
+    let pins = handles.lock().expect("master pins");
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
+    select(&pins, false);
+
+    transact(&pins, &[0x02, 0x00, 0x00, 0x08, 0xAA]); // no $06 first
+
+    select(&pins, true);
+    for byte in [0x03, 0x00, 0x00, 0x08] {
+        send(&pins, byte);
+    }
+    let got = recv(&pins);
+    select(&pins, false);
+
+    assert_eq!(
+        got, 0xFF,
+        "the byte was never written, so the cell is erased"
     );
 }
