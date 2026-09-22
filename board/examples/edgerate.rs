@@ -7,12 +7,29 @@
 //! that decides whether an interface can be carried as edges is this one:
 //! **resolved, delivered transitions per second.**
 //!
-//! It decides one concrete question. The step clock is the only signal embsim
-//! deliberately does NOT carry as edges — `StreamRole::PulseTrain` carries it as
-//! a rate — and the stated reason is arithmetic: 8192 steps/mm on the reference
-//! machine means 50 mm/s of carriage speed is over 400 000 edges/s. If the
-//! engine can resolve that many, the exception is unnecessary and everything can
-//! be edges and voltage levels. If it cannot, the exception is load-bearing.
+//! # What this does NOT decide
+//!
+//! This example was written to test whether the step clock could be carried as
+//! edges rather than as a rate, and it answered the wrong question. Cost is not
+//! why `StreamRole::PulseTrain` exists. **Correctness is**, and it was measured
+//! before this was written — `p2iss/src/pulse.rs:40`:
+//!
+//! > driving it edge by edge makes every step a wheel deadline, and any service
+//! > that arrives late collapses the edges it missed into one `set_drive` of the
+//! > final level — an even number of them is no change at all, so a consumer
+//! > that counts transitions loses them silently. At 20 mm/s that lost all but
+//! > ~1.5% of the commanded distance.
+//!
+//! The general rule, which the node contract needs: **a net carries a LEVEL, and
+//! a level cannot carry a COUNT.** Any signal whose information is the *number*
+//! of transitions rather than their presence is lossy on a level-resolved net
+//! the moment a consumer can sample late. No amount of engine throughput fixes
+//! that, because the loss happens in the resolution, not in the queue.
+//!
+//! So what remains useful here is the raw figure: how many resolved, delivered
+//! transitions per second the engine sustains. That bounds every signal whose
+//! information IS its edges — serial, SPI, chip selects — and it is worth
+//! keeping current.
 //!
 //! The driver here is an engine-hosted node re-arming at the next instant, which
 //! is the fully-synced shape: no actor, no park, one edge per wake.
@@ -27,8 +44,12 @@ use embsim_board::{
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
-/// Virtual nanoseconds between edges. 1220 ns is one half-period of a 410 kHz
-/// step clock — the rate the PulseTrain exception exists to avoid.
+/// Virtual nanoseconds between edges: 1220 ns, so ~820 000 transitions/s.
+///
+/// That is the reference machine at full traverse — 8192 steps/mm, 50 mm/s, and
+/// **two transitions per step** (`HAL_pulseOut.c:66`, `_wypin(pulses * 2U)`).
+/// An earlier version of this file called it 410 kHz and then divided the
+/// result by 410 000, halving the price it reported.
 const HALF_PERIOD_NS: u64 = 1220;
 
 const EDGES: u64 = 40_000;
@@ -170,18 +191,18 @@ fn main() {
     println!("per edge        : {per_edge_us:.2} us   (resolve + deliver, no park)");
     println!("engine can do   : {:.0} edges/s", rate);
     println!();
-    println!("the step clock needs 410 000 edges/s at 50 mm/s:");
+    // 8192 steps/mm x 50 mm/s x 2 transitions/step.
+    const STEP_TRANSITIONS_PER_S: f64 = 819_200.0;
+    println!("a step train at 50 mm/s is {STEP_TRANSITIONS_PER_S:.0} transitions/s:");
     println!(
         "  cost per simulated second : {:.2} s  ({:.0}%)",
-        410_000.0 / rate,
-        100.0 * 410_000.0 / rate
+        STEP_TRANSITIONS_PER_S / rate,
+        100.0 * STEP_TRANSITIONS_PER_S / rate
     );
-    println!(
-        "  VERDICT : {}",
-        if rate > 410_000.0 {
-            "affordable as edges — the PulseTrain rate exception is unnecessary"
-        } else {
-            "NOT affordable as edges — the rate exception is load-bearing"
-        }
-    );
+    println!();
+    println!("  ...but cost is NOT why the step clock is a rate. A level cannot");
+    println!("  carry a count: a late consumer folds missed toggles into one");
+    println!("  drive, and an even number of them is no change at all. Measured");
+    println!("  at 1.5% of commanded distance surviving, at 20 mm/s.");
+    println!("  See p2iss/src/pulse.rs:40. Throughput does not fix it.");
 }
