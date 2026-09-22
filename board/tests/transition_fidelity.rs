@@ -43,13 +43,24 @@ const HALF_PERIOD_NS: u64 = 1220;
 
 const TRANSITIONS: u64 = 20_000;
 
-struct Stepped;
+/// The virtual clock is process-global, so these tests take it one at a time.
+/// Without this they pass under `--test-threads=1` and fail in parallel, which
+/// is the worst way for a test to be wrong.
+static CLOCK_LOCK: Mutex<()> = Mutex::new(());
+
+struct Stepped(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
 impl Stepped {
     fn enter() -> Self {
+        let guard = CLOCK_LOCK.lock().unwrap_or_else(|poisoned| {
+            CLOCK_LOCK.clear_poison();
+            poisoned.into_inner()
+        });
         virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
-        Self
+        Self(guard)
     }
 }
+
 impl Drop for Stepped {
     fn drop(&mut self) {
         virtual_clock::init(1.0, 1_000_000);
@@ -258,5 +269,201 @@ fn a_producer_that_catches_up_in_bulk_loses_almost_everything() {
          once per batch, and an even batch is no change at all. Got {sensed} of \
          {driven}. If this no longer reproduces, the positive test above is \
          measuring nothing."
+    );
+}
+
+// ============================================================
+// The observability limit: what a transition's INSTANT is worth
+// ============================================================
+//
+// The tests above count transitions. These ask the other question: does a
+// consumer learn *when* each one happened?
+//
+// It matters because the two failures look nothing alike. A consumer that
+// counts (a step counter, an encoder) needs only order. A consumer that
+// MEASURES (a UART deframer recovering bit periods, a setup/hold check, a
+// timeout, a waveform view) needs the instants to be distinct and true. The ISS
+// stamps every edge in a 100 us slice identically today
+// (`p2iss/src/lib.rs:1259` re-arms at `virtual_clock::virtual_ns()`), so this
+// is the property that decides whether that is a latent bug or a live one.
+
+/// What the consumer observed: one virtual timestamp per transition.
+#[derive(Debug, Default)]
+struct Stamps {
+    at_ns: Mutex<Vec<u64>>,
+    done: AtomicBool,
+}
+
+struct StampingConsumer {
+    pins: [PinDecl; 1],
+    stamps: Arc<Stamps>,
+}
+
+impl Component for StampingConsumer {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let stamps = Arc::clone(&self.stamps);
+        let last: Mutex<Option<Level>> = Mutex::new(None);
+        io.on_sense("IN", move |state| {
+            let Some(level) = level_of(state) else { return };
+            let mut last = last.lock().unwrap();
+            if *last != Some(level) {
+                *last = Some(level);
+                stamps
+                    .at_ns
+                    .lock()
+                    .unwrap()
+                    .push(virtual_clock::virtual_ns());
+            }
+        })?;
+        Ok(())
+    }
+}
+
+/// Emits `n` transitions `apart_ns` apart. `apart_ns == 0` puts them all at one
+/// instant, inside a single wake.
+struct SpacedProducer {
+    pins: [PinDecl; 1],
+    pin: Arc<Mutex<Option<PinHandle>>>,
+    stamps: Arc<Stamps>,
+    n: u64,
+    apart_ns: u64,
+}
+
+impl Component for SpacedProducer {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        *self.pin.lock().unwrap() = Some(io.pin("OUT")?);
+        let (pin, stamps, n, apart) = (
+            Arc::clone(&self.pin),
+            Arc::clone(&self.stamps),
+            self.n,
+            self.apart_ns,
+        );
+        let arm = io.clone();
+        let emitted = Mutex::new(0u64);
+        io.on_wake_ns(move |now_ns| {
+            let guard = pin.lock().unwrap();
+            let Some(p) = guard.as_ref() else { return };
+            let mut done_count = emitted.lock().unwrap();
+            if *done_count >= n {
+                stamps.done.store(true, Ordering::Release);
+                return;
+            }
+            if apart == 0 {
+                for i in 0..n {
+                    let level = i % 2 == 0;
+                    p.set_drive(Some(digital_drive(if level {
+                        Level::High
+                    } else {
+                        Level::Low
+                    })));
+                }
+                *done_count = n;
+                stamps.done.store(true, Ordering::Release);
+            } else {
+                let level = (*done_count).is_multiple_of(2);
+                p.set_drive(Some(digital_drive(if level {
+                    Level::High
+                } else {
+                    Level::Low
+                })));
+                *done_count += 1;
+                arm.schedule_at_ns(now_ns + apart);
+            }
+        });
+        io.schedule_at_ns(apart.max(1));
+        Ok(())
+    }
+}
+
+/// Run `n` transitions `apart_ns` apart; return (observed, distinct instants).
+fn stamped_run(n: u64, apart_ns: u64) -> (usize, usize) {
+    let stamps = Arc::new(Stamps::default());
+    let harness = Harness::new()
+        .connect_str("P.OUT", "C.IN")
+        .expect("endpoints parse");
+    let _system = System::new()
+        .component(
+            "P",
+            Box::new(SpacedProducer {
+                pins: [decl("OUT", PinKind::DigitalOut)],
+                pin: Arc::new(Mutex::new(None)),
+                stamps: Arc::clone(&stamps),
+                n,
+                apart_ns,
+            }),
+        )
+        .component(
+            "C",
+            Box::new(StampingConsumer {
+                pins: [decl("IN", PinKind::DigitalIn)],
+                stamps: Arc::clone(&stamps),
+            }),
+        )
+        .harness(harness)
+        .start()
+        .expect("system starts");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !stamps.done.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let at = stamps.at_ns.lock().unwrap().clone();
+    let mut distinct = at.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    (at.len(), distinct.len())
+}
+
+/// Transitions crowded into one instant are all DELIVERED but share a stamp.
+///
+/// This is the shape that matters: nothing is lost, so a counting consumer is
+/// fine and a bit-banged SPI works — which is exactly why the ISS's identical
+/// stamping has gone unnoticed. A consumer that measures an interval sees zero
+/// for every one of them.
+#[test]
+fn transitions_at_one_instant_are_delivered_but_share_a_timestamp() {
+    let _stepped = Stepped::enter();
+    let (observed, distinct) = stamped_run(500, 0);
+    eprintln!("  same instant : observed {observed}, distinct instants {distinct}");
+    assert_eq!(
+        observed, 500,
+        "every transition is still delivered, in order"
+    );
+    // A handful, not one: the wake that emits them sits at its own instant and
+    // the engine may advance once while draining. The point is the ratio —
+    // hundreds of transitions collapsing onto a couple of timestamps.
+    assert!(
+        distinct <= 2,
+        "they collapse onto one or two timestamps, so any consumer measuring an \
+         interval reads zero for almost all of them. Got {distinct} distinct \
+         instants for {observed} transitions. This is the ISS's current \
+         behaviour for a whole 100 us slice."
+    );
+}
+
+/// One nanosecond of separation is enough to make them distinguishable, so the
+/// clock's resolution — not the engine — is the limit on representable
+/// frequency.
+#[test]
+fn one_nanosecond_of_separation_is_enough_to_distinguish_transitions() {
+    let _stepped = Stepped::enter();
+    let (observed, distinct) = stamped_run(500, 1);
+    eprintln!("  1 ns apart   : observed {observed}, distinct instants {distinct}");
+    assert_eq!(observed, 500);
+    assert_eq!(
+        distinct, observed,
+        "a 1 ns gap gives every transition its own instant — the ceiling on \
+         representable signal frequency is the clock's nanosecond resolution \
+         (1 GHz), not anything the engine imposes"
     );
 }
