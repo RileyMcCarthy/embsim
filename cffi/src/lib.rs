@@ -12,13 +12,18 @@
 //! peripheral-clocked bus it is the right one. A **CPU-bit-banged** bus is
 //! different: a boot ROM drives a clock edge and samples the data line
 //! microseconds later, far sooner than the engine resolves a net between wakes,
-//! and the P2's boot ROM does roughly 25 000 edges to load one kilobyte. So the
+//! and the P2's boot ROM does roughly 16 600 edges to load one kilobyte. So the
 //! transport here is a direct call — nanoseconds — and the *model* is still the
 //! shared one. Generic model, in-process transport; those are separable choices
 //! and this crate is where they separate.
 //!
 //! # Safety contract for every function here
 //!
+//! - A function that fills a caller's buffer returns **how many items it
+//!   wrote**, never a total the buffer might not hold. Getting that backwards
+//!   is how a C caller walks off the end of a fixed array while looking like
+//!   it is doing the obvious thing; use the matching `_count`/`_capacity`
+//!   accessor to size.
 //! - Handles are opaque and must come from a `_new`/`_blank` in this module and
 //!   be released with the matching `_free` exactly once.
 //! - A null handle is tolerated and treated as "no device" rather than
@@ -177,8 +182,25 @@ pub unsafe extern "C" fn embsim_spi_flash_present(flash: *const EmbsimSpiFlash) 
     guard("embsim_spi_flash_present", || f.inner.present())
 }
 
-/// Copy up to `cap` bytes of the backing image into `out`; returns the part's
-/// full capacity, so a caller can size a buffer by passing `cap == 0`.
+/// The part's capacity in bytes — what [`embsim_spi_flash_image`] will yield.
+///
+/// # Safety
+/// `flash` must be a valid handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn embsim_spi_flash_capacity(flash: *const EmbsimSpiFlash) -> usize {
+    // SAFETY: the caller promises a valid handle; null is checked.
+    let Some(f) = (unsafe { flash.as_ref() }) else {
+        return 0;
+    };
+    guard("embsim_spi_flash_capacity", || f.inner.capacity())
+}
+
+/// Copy up to `cap` bytes of the backing image into `out`, and return **how
+/// many were copied**.
+///
+/// The count is what was WRITTEN, never a total the buffer might not hold —
+/// see [`embsim_spi_flash_reads`] for why that distinction is load-bearing.
+/// Use [`embsim_spi_flash_capacity`] to size a buffer.
 ///
 /// # Safety
 /// `out` must point to at least `cap` writable bytes, or be null with
@@ -195,20 +217,47 @@ pub unsafe extern "C" fn embsim_spi_flash_image(
     };
     guard("embsim_spi_flash_image", || {
         let image = f.inner.image_bytes();
-        if !out.is_null() && cap > 0 {
-            let n = cap.min(image.len());
-            // SAFETY: the caller promises `cap` writable bytes at `out`.
-            unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), out, n) };
+        if out.is_null() || cap == 0 {
+            return 0;
         }
-        image.len()
+        let n = cap.min(image.len());
+        // SAFETY: the caller promises `cap` writable bytes at `out`.
+        unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), out, n) };
+        n
     })
 }
 
-/// Copy up to `cap` read start-addresses into `out`, oldest first; returns how
-/// many the part has served.
+/// How many reads the part has served.
+///
+/// # Safety
+/// `flash` must be a valid handle or null.
+#[no_mangle]
+pub unsafe extern "C" fn embsim_spi_flash_read_count(flash: *const EmbsimSpiFlash) -> usize {
+    // SAFETY: the caller promises a valid handle; null is checked.
+    let Some(f) = (unsafe { flash.as_ref() }) else {
+        return 0;
+    };
+    guard("embsim_spi_flash_read_count", || f.inner.reads.len())
+}
+
+/// Copy up to `cap` read start-addresses into `out`, beginning at index
+/// `start`, and return **how many were copied**.
 ///
 /// This is the cheapest way for a host test to say *where a boot actually
-/// looked*, which is a much sharper assertion than whether it finished.
+/// looked*, which is a much sharper assertion than whether it finished. The
+/// `start` index is what lets a caller drain new entries as they appear
+/// without re-reading the whole list.
+///
+/// # Why the return is the COPIED count and not the total
+///
+/// It used to be the total, so a caller could size a buffer with `cap == 0`.
+/// That reads fine and is a trap: the obvious loop takes the return value as
+/// the number of valid entries in `out` and walks off the end of a fixed
+/// buffer the moment more reads exist than it holds. The QEMU pin bus did
+/// exactly that, and it was invisible because a ROM boot serves two reads —
+/// it would have fired on the first firmware that paged from flash. Use
+/// [`embsim_spi_flash_read_count`] to size, this to fill, and the two can no
+/// longer be confused.
 ///
 /// # Safety
 /// `out` must point to at least `cap` writable `uint32_t`s, or be null with
@@ -216,6 +265,7 @@ pub unsafe extern "C" fn embsim_spi_flash_image(
 #[no_mangle]
 pub unsafe extern "C" fn embsim_spi_flash_reads(
     flash: *const EmbsimSpiFlash,
+    start: usize,
     out: *mut u32,
     cap: usize,
 ) -> usize {
@@ -225,11 +275,13 @@ pub unsafe extern "C" fn embsim_spi_flash_reads(
     };
     guard("embsim_spi_flash_reads", || {
         let reads = &f.inner.reads;
-        if !out.is_null() && cap > 0 {
-            let n = cap.min(reads.len());
-            // SAFETY: the caller promises `cap` writable u32s at `out`.
-            unsafe { std::ptr::copy_nonoverlapping(reads.as_ptr(), out, n) };
+        if out.is_null() || cap == 0 || start >= reads.len() {
+            return 0;
         }
-        reads.len()
+        let n = cap.min(reads.len() - start);
+        // SAFETY: the caller promises `cap` writable u32s at `out`, and `n` is
+        // bounded by both `cap` and what remains after `start`.
+        unsafe { std::ptr::copy_nonoverlapping(reads[start..].as_ptr(), out, n) };
+        n
     })
 }

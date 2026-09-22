@@ -56,8 +56,12 @@ int main(void) {
         fprintf(stderr, "got %02X %02X %02X %02X\n", got[0], got[1], got[2], got[3]);
         return 1;
     }
+    if (embsim_spi_flash_read_count(f) != 1) {
+        fprintf(stderr, "read count wrong\n");
+        return 1;
+    }
     uint32_t where = 0xFFFFFFFF;
-    if (embsim_spi_flash_reads(f, &where, 1) != 1 || where != 0) {
+    if (embsim_spi_flash_reads(f, 0, &where, 1) != 1 || where != 0) {
         fprintf(stderr, "reads wrong: %u\n", where);
         return 1;
     }

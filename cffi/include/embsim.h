@@ -77,18 +77,30 @@ bool embsim_spi_flash_miso(const EmbsimSpiFlash *flash);
 /* Whether an array is fitted at all. */
 bool embsim_spi_flash_present(const EmbsimSpiFlash *flash);
 
+/* The part's capacity in bytes. */
+size_t embsim_spi_flash_capacity(const EmbsimSpiFlash *flash);
+
 /*
- * Copy up to `cap` bytes of the backing image into `out`; returns the part's
- * full capacity, so passing cap == 0 sizes a buffer.
+ * Copy up to `cap` bytes of the backing image into `out`; returns HOW MANY
+ * WERE COPIED. Size the buffer with embsim_spi_flash_capacity().
  */
 size_t embsim_spi_flash_image(const EmbsimSpiFlash *flash, uint8_t *out, size_t cap);
 
+/* How many reads the part has served. */
+size_t embsim_spi_flash_read_count(const EmbsimSpiFlash *flash);
+
 /*
- * Copy up to `cap` read start-addresses into `out`, oldest first; returns how
- * many the part has served. The cheapest way for a test to say WHERE a boot
- * looked, which is a sharper assertion than whether it finished.
+ * Copy up to `cap` read start-addresses into `out` beginning at index `start`,
+ * oldest first; returns HOW MANY WERE COPIED. The cheapest way for a test to
+ * say WHERE a boot looked, which is a sharper assertion than whether it
+ * finished, and `start` is what lets a caller drain new entries as they appear.
+ *
+ * Every filling function here returns the COPIED count, never a total the
+ * buffer might not hold: taking a total as the number of valid entries is how
+ * a caller walks off the end of a fixed array while looking correct.
  */
-size_t embsim_spi_flash_reads(const EmbsimSpiFlash *flash, uint32_t *out, size_t cap);
+size_t embsim_spi_flash_reads(const EmbsimSpiFlash *flash, size_t start,
+                              uint32_t *out, size_t cap);
 
 #ifdef __cplusplus
 }

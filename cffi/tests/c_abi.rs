@@ -51,12 +51,14 @@ fn a_null_handle_reads_as_an_empty_socket_rather_than_crashing() {
             "nothing drives the line, so a pulled-up bus reads ones"
         );
         assert!(!embsim_spi_flash_present(std::ptr::null()));
+        assert_eq!(embsim_spi_flash_capacity(std::ptr::null()), 0);
         assert_eq!(
             embsim_spi_flash_image(std::ptr::null(), std::ptr::null_mut(), 0),
             0
         );
+        assert_eq!(embsim_spi_flash_read_count(std::ptr::null()), 0);
         assert_eq!(
-            embsim_spi_flash_reads(std::ptr::null(), std::ptr::null_mut(), 0),
+            embsim_spi_flash_reads(std::ptr::null(), 0, std::ptr::null_mut(), 0),
             0
         );
         // And the mutating ones are no-ops, not faults.
@@ -71,7 +73,7 @@ fn an_image_shorter_than_the_part_leaves_the_rest_erased() {
     let image = [0xA5u8; 16];
     let flash = unsafe { embsim_spi_flash_with_image(1024, image.as_ptr(), image.len()) };
     assert_eq!(
-        unsafe { embsim_spi_flash_image(flash, std::ptr::null_mut(), 0) },
+        unsafe { embsim_spi_flash_capacity(flash) },
         1024,
         "capacity is the part's, not the image's"
     );
@@ -109,10 +111,11 @@ fn a_read_over_the_c_abi_returns_the_bytes_and_records_where_it_looked() {
             "the part served the bytes at the address it was given"
         );
 
-        let n = embsim_spi_flash_reads(flash, std::ptr::null_mut(), 0);
+        let n = embsim_spi_flash_read_count(flash);
         assert_eq!(n, 1, "exactly one read");
         let mut looked = vec![0u32; n];
-        embsim_spi_flash_reads(flash, looked.as_mut_ptr(), looked.len());
+        let copied = embsim_spi_flash_reads(flash, 0, looked.as_mut_ptr(), looked.len());
+        assert_eq!(copied, 1, "and the fill reports what it WROTE");
         assert_eq!(looked, vec![8], "and it looked where it was told to");
 
         embsim_spi_flash_free(flash);
@@ -129,10 +132,57 @@ fn a_deselected_part_ignores_the_bus() {
         send(flash, 0x00);
         send(flash, 0x00);
         assert_eq!(
-            embsim_spi_flash_reads(flash, std::ptr::null_mut(), 0),
+            embsim_spi_flash_read_count(flash),
             0,
             "a part that was never addressed served nothing"
         );
+        embsim_spi_flash_free(flash);
+    }
+}
+
+/// The trap the split return exists to close.
+///
+/// A caller with a small fixed buffer and many reads must never be told a
+/// number larger than it can hold — that is exactly how the QEMU pin bus came
+/// to index past a 16-element stack array. It was invisible there because a ROM
+/// boot serves two reads; it would have fired on the first firmware that paged
+/// from flash.
+#[test]
+fn a_fill_never_reports_more_than_the_buffer_holds() {
+    let image: Vec<u8> = vec![0u8; 4096];
+    let flash = unsafe { embsim_spi_flash_with_image(4096, image.as_ptr(), image.len()) };
+    unsafe {
+        embsim_spi_flash_set_selected(flash, true);
+        // Twenty reads: more than any window a caller is likely to use.
+        for addr in 0..20u32 {
+            send(flash, 0x03);
+            send(flash, 0);
+            send(flash, 0);
+            send(flash, addr as u8);
+            recv(flash);
+            // A fresh command frame needs the part back in its command phase.
+            embsim_spi_flash_set_selected(flash, false);
+            embsim_spi_flash_set_selected(flash, true);
+        }
+        assert_eq!(embsim_spi_flash_read_count(flash), 20);
+
+        let mut window = [0u32; 4];
+        let got = embsim_spi_flash_reads(flash, 0, window.as_mut_ptr(), window.len());
+        assert_eq!(got, 4, "never more than the buffer holds");
+
+        // And `start` drains the rest without re-reading what was seen.
+        let mut seen = 0usize;
+        let mut all = Vec::new();
+        loop {
+            let n = embsim_spi_flash_reads(flash, seen, window.as_mut_ptr(), window.len());
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&window[..n]);
+            seen += n;
+        }
+        assert_eq!(all, (0..20u32).collect::<Vec<_>>(), "every read, once each");
+
         embsim_spi_flash_free(flash);
     }
 }
