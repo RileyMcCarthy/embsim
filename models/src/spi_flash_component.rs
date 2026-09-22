@@ -118,6 +118,18 @@ pub const SPI_FLASH_PINS_BY_FUNCTION: [PinDecl; 8] = [
     pin_unaliased("VCC", PinKind::PowerIn),
 ];
 
+/// A bare four-wire facade, for a bench netlist that names the SPI signals and
+/// nothing else.
+///
+/// `~WP` and `~HOLD` are absent rather than declared-and-ignored: a bench that
+/// does not wire them should not have to, and neither is modelled anyway.
+pub const SPI_FLASH_PINS_SPI_ONLY: [PinDecl; 4] = [
+    pin("CS", "~CS", PinKind::DigitalIn),
+    pin_unaliased("CLK", PinKind::DigitalIn),
+    pin("MOSI", "DI", PinKind::DigitalIn),
+    pin("MISO", "DO", PinKind::DigitalOut),
+];
+
 /// Shared between the sense callbacks, which the engine delivers serially from
 /// one thread — so this mutex is never contended by the engine with itself,
 /// only with a consumer reading the image out.
