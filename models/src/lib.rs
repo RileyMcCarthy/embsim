@@ -20,6 +20,8 @@
 //! - [`spi_flash_component`] — that model as a live `embsim-board` component
 //!   (SOIC-8 pin facade, active-low ~CS, DO driven from the sense callbacks)
 //! - [`edge`] — edge-detection primitive shared by threshold models
+//! - [`fat16`] — a FAT16 card image built in memory, so a guest filesystem has
+//!   something to mount on [`sd_card`]
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
 //!   components: a step/direction motor drive, a quadrature encoder, and an
 //!   end-of-travel switch, each with a real pin facade
@@ -34,6 +36,7 @@
 pub mod ads122u04;
 pub mod ads122u04_component;
 pub mod edge;
+pub mod fat16;
 pub mod isolation;
 pub mod limit_switch;
 pub mod machine;

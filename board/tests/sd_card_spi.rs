@@ -769,3 +769,57 @@ fn a_card_powers_up_deselected_and_ignores_the_bus_until_it_is_addressed() {
         "and now it answers"
     );
 }
+
+/// The two halves together: a filesystem image built in memory, mounted on the
+/// card model, read back over four nets.
+///
+/// Either piece alone is half a card — a block device with nothing on it, or an
+/// image with nothing to read it. This is the path a guest actually takes to
+/// its first sector, and the assertion is the one a FAT driver makes: the boot
+/// signature at the end of sector 0, and a volume that says FAT16.
+#[test]
+fn a_fat16_image_built_in_memory_reads_back_over_the_wire() {
+    use embsim_models::fat16::{build, Dir};
+
+    let mut root = Dir::new();
+    root.file("hello.txt", b"mounted".to_vec());
+    root.dir("data");
+    // The smallest geometry that is unambiguously FAT16; see `fat16`'s docs on
+    // why the cluster count, not the label, decides the type.
+    let image = build(32 * 1024 * 1024, &root).expect("a FAT16 image builds");
+
+    let (handles, _card, _system) = spi_bench(SdCard::with_image(image.clone()));
+    let pins = handles.lock().expect("master pins");
+    open_bus(&pins);
+
+    assert_eq!(
+        net_command(&pins, 17, 0, 1),
+        vec![0x00],
+        "CMD17 for sector 0"
+    );
+    let mut token = 0xFF;
+    for _ in 0..8 {
+        token = exchange(&pins, 0xFF);
+        if token != 0xFF {
+            break;
+        }
+    }
+    assert_eq!(token, 0xFE, "the data-block start token");
+    let sector: Vec<u8> = (0..BLOCK_LEN).map(|_| exchange(&pins, 0xFF)).collect();
+
+    assert_eq!(
+        &sector[510..512],
+        &[0x55, 0xAA],
+        "the boot signature a FAT driver looks for first"
+    );
+    assert_eq!(
+        &sector[54..59],
+        b"FAT16",
+        "and the filesystem type in the boot sector"
+    );
+    assert_eq!(
+        sector,
+        image[..BLOCK_LEN],
+        "the sector on the wire is the sector in the image, byte for byte"
+    );
+}
