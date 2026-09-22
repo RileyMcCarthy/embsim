@@ -5,6 +5,7 @@ members = [
     "peripherals",
     "platforms/p2",
     "models",
+    "boards",
     "qemu",
     "runtime",
     "build-support",
