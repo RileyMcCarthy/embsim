@@ -37,15 +37,26 @@
 //!
 //! # Pin facade
 //!
-//! The SOIC-8 facade of the W25Q/MX25/N25Q family: `~CS`, `DO`, `~WP`, `GND`,
-//! `DI`, `CLK`, `~HOLD`, `VCC`. All eight are declared because netlist
-//! validation checks both directions — a part that declares only the four it
-//! uses will not build against a real netlist.
+//! The 8-pin SOIC 208-mil package of the W25Q128JV (§3.3, p.5): `/CS`,
+//! `DO (IO1)`, `/WP (IO2)`, `GND`, `DI (IO0)`, `CLK`, `/HOLD or /RESET (IO3)`,
+//! `VCC`. All eight are declared because netlist validation checks both
+//! directions — declared-but-absent and present-but-undeclared are equally
+//! hard errors.
+//!
+//! **Which identifiers those are depends on the netlist, not on the part.**
+//! `validate_facade` matches `PinDecl::number` verbatim against the netlist's
+//! `(pin "…")`, so a KiCad export that numbers pins needs
+//! [`SPI_FLASH_PINS_SOIC8`] while a netlist transcribed with functional names
+//! — as the Parallax P2-EC32MB one is — needs
+//! [`SPI_FLASH_PINS_BY_FUNCTION`]. Both carry the same `name` aliases, and
+//! [`ComponentNetIo`] keys handles under number *and* name, so the attach code
+//! below is identical either way.
 //!
 //! `~WP` and `~HOLD` are declared and **not modelled**: block protection and
-//! the hold function are outside [`SpiNorFlash`]'s scope (see its provenance
-//! note). A system that strapped them active would get no answer on hardware
-//! and a normal answer here, which is the honest limit of this adapter.
+//! the hold function are outside [`SpiNorFlash`]'s scope (see its
+//! simplifications). A system that strapped either active would get no answer
+//! on hardware and a normal answer here, which is the honest limit of this
+//! adapter.
 
 use std::sync::{Arc, Mutex};
 
@@ -67,8 +78,9 @@ const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl
     }
 }
 
-/// The SOIC-8 pin facade, in package order.
-pub const SPI_FLASH_PINS: [PinDecl; 8] = [
+/// The SOIC-8 facade with datasheet pin NUMBERS as identifiers (§3.3, p.5) —
+/// for a netlist that numbers its pins, as a KiCad export does.
+pub const SPI_FLASH_PINS_SOIC8: [PinDecl; 8] = [
     pin("1", "~CS", PinKind::DigitalIn),
     pin("2", "DO", PinKind::DigitalOut),
     pin("3", "~WP", PinKind::DigitalIn),
@@ -77,6 +89,20 @@ pub const SPI_FLASH_PINS: [PinDecl; 8] = [
     pin("6", "CLK", PinKind::DigitalIn),
     pin("7", "~HOLD", PinKind::DigitalIn),
     pin("8", "VCC", PinKind::PowerIn),
+];
+
+/// The same facade keyed by FUNCTION, which is how a netlist transcribed from
+/// a schematic names its pins — the Parallax P2-EC32MB module's `U301` among
+/// them.
+pub const SPI_FLASH_PINS_BY_FUNCTION: [PinDecl; 8] = [
+    pin("CSn", "~CS", PinKind::DigitalIn),
+    pin("DO_IO1", "DO", PinKind::DigitalOut),
+    pin("WPn", "~WP", PinKind::DigitalIn),
+    pin("VSS", "GND", PinKind::PowerIn),
+    pin("DI_IO0", "DI", PinKind::DigitalIn),
+    pin("CLK", "CLK", PinKind::DigitalIn),
+    pin("HOLDn", "~HOLD", PinKind::DigitalIn),
+    pin("VCC", "VCC", PinKind::PowerIn),
 ];
 
 /// Shared between the sense callbacks, which the engine delivers serially from
@@ -94,6 +120,7 @@ struct Shared {
 /// A serial NOR flash on a board.
 pub struct SpiNorFlashComponent {
     shared: Arc<Mutex<Shared>>,
+    pins: &'static [PinDecl],
 }
 
 impl std::fmt::Debug for SpiNorFlashComponent {
@@ -104,7 +131,8 @@ impl std::fmt::Debug for SpiNorFlashComponent {
 }
 
 impl SpiNorFlashComponent {
-    /// Mount `flash` as a board component.
+    /// Mount `flash` as a board component, with the by-function facade a
+    /// transcribed netlist uses. Call [`Self::with_pins`] for a numbered one.
     pub fn new(flash: SpiNorFlash) -> Self {
         Self {
             shared: Arc::new(Mutex::new(Shared {
@@ -113,7 +141,15 @@ impl SpiNorFlashComponent {
                 // master that clocks before driving DI shifts in ones.
                 di: true,
             })),
+            pins: &SPI_FLASH_PINS_BY_FUNCTION,
         }
+    }
+
+    /// Declare a different pin facade — [`SPI_FLASH_PINS_SOIC8`] for a netlist
+    /// that identifies pins by number.
+    pub fn with_pins(mut self, pins: &'static [PinDecl]) -> Self {
+        self.pins = pins;
+        self
     }
 
     /// A blank part of `capacity` bytes.
@@ -164,7 +200,7 @@ fn publish_do(shared: &Mutex<Shared>, data_out: &PinHandle) {
 
 impl Component for SpiNorFlashComponent {
     fn pins(&self) -> &[PinDecl] {
-        &SPI_FLASH_PINS
+        self.pins
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
@@ -295,15 +331,23 @@ mod tests {
     #[test]
     fn the_facade_declares_every_package_pin() {
         let component = SpiNorFlashComponent::blank(16);
-        let names: Vec<_> = component
-            .pins()
-            .iter()
-            .filter_map(|p| p.name)
-            .collect::<Vec<_>>();
+        // The validator matches on `number`, so THAT is what has to line up
+        // with the netlist. The P2-EC32MB transcription names U301's pins by
+        // function; a KiCad export would number them.
+        let ids: Vec<_> = component.pins().iter().map(|p| p.number).collect();
+        assert_eq!(
+            ids,
+            ["CSn", "DO_IO1", "WPn", "VSS", "DI_IO0", "CLK", "HOLDn", "VCC"],
+            "the default facade is the one the EC32MB netlist uses"
+        );
+        let numbered = SpiNorFlashComponent::blank(16).with_pins(&SPI_FLASH_PINS_SOIC8);
+        let ids: Vec<_> = numbered.pins().iter().map(|p| p.number).collect();
+        assert_eq!(ids, ["1", "2", "3", "4", "5", "6", "7", "8"]);
+        let names: Vec<_> = numbered.pins().iter().filter_map(|p| p.name).collect();
         assert_eq!(
             names,
             ["~CS", "DO", "~WP", "GND", "DI", "CLK", "~HOLD", "VCC"],
-            "netlist validation checks both directions, so all eight are declared"
+            "the names are the same either way, so attach code does not change"
         );
     }
 }

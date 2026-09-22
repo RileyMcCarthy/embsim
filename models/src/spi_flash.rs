@@ -26,36 +26,68 @@
 //!
 //! # Provenance
 //!
-//! **This model is not datasheet-derived, and says so rather than implying
-//! otherwise.** Its command set and behaviour come from the two programs that
-//! exercise it — the Propeller 2 boot ROM's `try_spi` (read path) and loadp2's
-//! `flash_loader` stub (program path) — run as real machine code against it
-//! until they behave as they do on hardware. It was ported from
-//! `MaD/SIL/p2core/src/flash.rs`, where that validation lives
-//! (`p2core/tests/flash_program.rs` drives the loader stub through it).
+//! Modelled against **Winbond W25Q128JV, Revision F (27 March 2018)** — the
+//! part a Parallax P2-EC32MB module carries (`U301`, `W25Q128JVSIM TR`). Every
+//! behaviour below carries a section and printed-page citation. The opcodes
+//! are the JEDEC-standard SPI NOR set, so the model serves Macronix MX25 and
+//! Micron N25Q parts of the same generation; their ID triples differ.
 //!
-//! The command opcodes are the JEDEC-standard SPI NOR set common to Winbond
-//! W25Q, Macronix MX25 and Micron N25Q parts; the default JEDEC ID reports a
-//! W25Q128, which is what a Parallax P2 Edge module carries. A part whose
-//! behaviour differs in these commands would need its own model.
+//! The bit-presentation rule above is the one thing NOT taken from the
+//! datasheet: it describes when a *master* may sample, and it was settled by
+//! running the P2 boot ROM's `try_spi` and loadp2's `flash_loader` stub as
+//! real machine code (the validation lives in MaD's `p2core`, whose
+//! `src/flash.rs` this was ported from).
 //!
-//! What a datasheet would be needed to claim, and what is therefore **not**
-//! modelled: program and erase *timing* (WIP always reads 0, so a poll exits
-//! at once), power-on reset delay, SFDP, dual/quad I/O modes, block protection
-//! and status register 2/3, suspend/resume, and OTP regions.
+//! ## Deliberate simplifications
+//!
+//! Each of these would need more of the datasheet to claim, and is cheaper to
+//! name than to half-model:
+//!
+//! - **No program or erase timing.** BUSY (S0) always reads 0, so a master's
+//!   "wait while busy" spin exits at once (§7.1.1, p.13 — BUSY is 1 for the
+//!   duration of t_PP/t_SE/t_BE/t_CE, all of which are instantaneous here).
+//! - **A page program commits per byte, not on the /CS rising edge.** The part
+//!   requires /CS to be driven high after the eighth bit of the last byte or
+//!   the instruction is not executed at all (§8.2.13, p.36); this model has
+//!   already programmed the bytes it received. A master that abandons a
+//!   program mid-byte therefore sees a write here that hardware would discard.
+//! - **No block protection.** BP2-BP0, TB, SEC, CMP, SRP and the individual
+//!   block locks (§7.1.3-7.1.10, pp.13-20) are not modelled, so no program or
+//!   erase is ever refused for protection. `~WP` is wired but inert.
+//! - **Write Status Register (01h/31h/11h) is accepted and ignored**, with the
+//!   rest of the unimplemented set (§8.1.2, p.22): a master that configures
+//!   the part gets no error and no effect.
+//! - **Standard SPI only.** Dual and quad I/O, SFDP (5Ah), security registers,
+//!   suspend/resume, power-down and the unique ID are absent; QE is not
+//!   modelled, and /HOLD is inert.
 //!
 //! NOR semantics are modelled where they bite: a program may only clear bits
 //! (the byte is AND-ed into place), so writing without erasing first gives the
 //! wrong answer here exactly as it would on the part. Erase sets `$FF`. The
 //! write-enable latch clears after each program or erase, as on silicon.
 
-/// Default manufacturer/type/capacity triple for `$9F`: Winbond W25Q128.
+/// The JEDEC (`9Fh`) triple of a **W25Q128JV-IM/JM**: manufacturer `EFh`,
+/// device ID `7018h` (§8.1.1, p.21).
 ///
-/// A loader generally only needs a non-`$FF` first byte to believe a device
-/// answered; the rest is reported for completeness.
-pub const JEDEC_ID_W25Q128: [u8; 3] = [0xEF, 0x40, 0x18];
+/// This is the default because it is the part on a P2-EC32MB module:
+/// `W25Q128JVSIM` decodes as package **S** (8-pin SOIC 208-mil), temperature
+/// **I** (industrial), special option **M** (§11, p.74), and the ordering
+/// page's note 6 for **M** says outright that "a new device ID is used to
+/// identify the JV family" — which is this 70h, against the 40h of the older
+/// Q option.
+pub const JEDEC_ID_W25Q128JV_IM: [u8; 3] = [0xEF, 0x70, 0x18];
 
-/// Bytes in a page program before it wraps. 256 on every part in this family.
+/// The same part in its **-IQ/JQ** option: device ID `4018h` (§8.1.1, p.21),
+/// the variant shipped with QE fixed at 1.
+///
+/// Worth having alongside the default because the two are easy to confuse: a
+/// master that identifies the part by its JEDEC ID will reject one while
+/// accepting the other, and a master that only checks for a non-`FFh` first
+/// byte — the P2 boot ROM among them — cannot tell them apart at all.
+pub const JEDEC_ID_W25Q128JV_IQ: [u8; 3] = [0xEF, 0x40, 0x18];
+
+/// Bytes in a page program before it wraps (§8.2.13, p.36: "if more than 256
+/// bytes are sent ... the addressing will wrap to the beginning of the page").
 pub const DEFAULT_PAGE_SIZE: u32 = 256;
 
 /// How many served bytes and commands to retain for diagnostics. A boot reads
@@ -142,7 +174,7 @@ impl SpiNorFlash {
     pub fn with_image(image: Vec<u8>) -> Self {
         let mut flash = Self {
             image,
-            jedec_id: JEDEC_ID_W25Q128,
+            jedec_id: JEDEC_ID_W25Q128JV_IM,
             page_size: DEFAULT_PAGE_SIZE,
             ..Self::default()
         };
@@ -181,7 +213,8 @@ impl SpiNorFlash {
         !self.image.is_empty()
     }
 
-    /// The bit currently on the data-out line.
+    /// The bit currently on the data-out line, DO (IO1) — pin 2 of the SOIC-8
+    /// (§3.3, p.5).
     pub fn miso(&self) -> bool {
         if !self.selected {
             return true; // a released line idles high on its pull-up
@@ -258,8 +291,9 @@ impl SpiNorFlash {
     /// The byte to shift out next, by phase.
     fn next_out(&mut self) -> u8 {
         match self.phase {
-            // bit0 WIP, bit1 WEL. Programming is instantaneous here, so WIP is
-            // always clear and a master's "wait while busy" spin exits at once.
+            // S0 = BUSY, S1 = WEL (§7.1, Figure 4a, p.13). Programming is
+            // instantaneous here, so BUSY always reads 0 and a master's
+            // "wait while busy" spin exits at once.
             Phase::Status => u8::from(self.wel) << 1,
             Phase::Jedec => {
                 let b = self
@@ -288,9 +322,10 @@ impl SpiNorFlash {
         self.out_byte >> (7 - self.out_count.min(7)) & 1 != 0
     }
 
-    /// Program one byte. NOR flash can only pull bits to 0, so this AND-s
-    /// rather than assigns: programming over un-erased data gives the same
-    /// wrong answer here that it gives on the part.
+    /// Program one byte. A page program writes "at previously erased (FFh)
+    /// memory locations" (§8.2.13, p.36) — NOR can only pull bits to 0 — so
+    /// this AND-s rather than assigns, and programming over un-erased data
+    /// gives the same wrong answer here that it gives on the part.
     fn program_byte(&mut self, addr: u32, byte: u8) {
         if let Some(cell) = self.image.get_mut(addr as usize) {
             *cell &= byte;
@@ -320,43 +355,53 @@ impl SpiNorFlash {
                     self.commands.push(byte);
                 }
                 match byte {
-                    0x03 => Phase::Address { have: 0 },
-                    0x05 => Phase::Status,
+                    // Opcodes per Instruction Set Table 1 (§8.1.2, p.22).
+                    0x03 => Phase::Address { have: 0 }, // Read Data, 24-bit
+                    0x05 => Phase::Status,              // Read Status Reg-1
                     0x9F => {
+                        // JEDEC ID: MF7-MF0 then ID15-ID0
                         self.jedec_idx = 0;
                         Phase::Jedec
                     }
                     0x06 => {
+                        // Write Enable: sets WEL (§7.1.2, p.13)
                         self.wel = true;
                         Phase::Command
                     }
                     0x04 => {
+                        // Write Disable: clears WEL
                         self.wel = false;
                         Phase::Command
                     }
-                    0x02 => Phase::ProgramAddress { have: 0 },
+                    0x02 => Phase::ProgramAddress { have: 0 }, // Page Program
                     0x20 => Phase::EraseAddress {
+                        // Sector Erase, 4 KB
                         span: 4 * 1024,
                         have: 0,
                     },
                     0x52 => Phase::EraseAddress {
+                        // Block Erase, 32 KB
                         span: 32 * 1024,
                         have: 0,
                     },
                     0xD8 => Phase::EraseAddress {
+                        // Block Erase, 64 KB
                         span: 64 * 1024,
                         have: 0,
                     },
-                    // Chip erase takes no address: act at once.
+                    // Chip Erase (C7h/60h) takes no address: act at once.
                     0x60 | 0xC7 => {
                         if self.wel {
                             self.erase(0, 0);
                         }
                         Phase::Command
                     }
-                    // `$66`/`$99` reset and anything else: accepted as a no-op
-                    // rather than ignored as unknown. They need no state to be
-                    // correct, and a master that issues them is not in error.
+                    // Enable Reset (66h) / Reset Device (99h) and everything
+                    // else in Table 1 this model does not implement: accepted
+                    // as a no-op rather than ignored as unknown. They need no
+                    // state to be correct here, and a master that issues them
+                    // is not in error -- see the simplifications above for the
+                    // ones where that silence is a real gap.
                     _ => Phase::Command,
                 }
             }
@@ -394,8 +439,9 @@ impl SpiNorFlash {
                     if let Some(last) = self.writes.last_mut() {
                         last.1 += 1;
                     }
-                    // A page program wraps within its own page rather than
-                    // running on into the next one.
+                    // "If more than 256 bytes are sent to the device the
+                    // addressing will wrap to the beginning of the page"
+                    // (§8.2.13, p.36).
                     let next = addr.wrapping_add(1);
                     self.prog_addr = if next & !(self.page_size - 1) != self.prog_page {
                         self.prog_page
@@ -603,14 +649,18 @@ mod tests {
     }
 
     #[test]
-    fn the_jedec_id_answers_so_a_loader_can_see_a_device() {
+    fn the_jedec_id_defaults_to_the_part_a_p2_edge_module_carries() {
         let mut flash = SpiNorFlash::blank(16);
         flash.set_selected(true);
         send(&mut flash, 0x9F);
         assert_eq!(
             [recv(&mut flash), recv(&mut flash), recv(&mut flash)],
-            JEDEC_ID_W25Q128
+            [0xEF, 0x70, 0x18],
+            "W25Q128JVSIM is the -IM option, device ID 7018h (§8.1.1, p.21) -- \
+             NOT the 4018h of the -IQ/JQ parts"
         );
+        assert_eq!(JEDEC_ID_W25Q128JV_IM, [0xEF, 0x70, 0x18]);
+        assert_eq!(JEDEC_ID_W25Q128JV_IQ, [0xEF, 0x40, 0x18]);
     }
 
     #[test]
