@@ -78,6 +78,19 @@ const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl
     }
 }
 
+/// A pin whose netlist identifier already IS its function, so it needs no
+/// alias. Declaring one anyway makes the handle table insert the same key
+/// twice, which a bench system rejects as a duplicate endpoint.
+const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
+    PinDecl {
+        number,
+        name: None,
+        kind,
+        stream: None,
+        drive_impedance: None,
+    }
+}
+
 /// The SOIC-8 facade with datasheet pin NUMBERS as identifiers (§3.3, p.5) —
 /// for a netlist that numbers its pins, as a KiCad export does.
 pub const SPI_FLASH_PINS_SOIC8: [PinDecl; 8] = [
@@ -100,9 +113,9 @@ pub const SPI_FLASH_PINS_BY_FUNCTION: [PinDecl; 8] = [
     pin("WPn", "~WP", PinKind::DigitalIn),
     pin("VSS", "GND", PinKind::PowerIn),
     pin("DI_IO0", "DI", PinKind::DigitalIn),
-    pin("CLK", "CLK", PinKind::DigitalIn),
+    pin_unaliased("CLK", PinKind::DigitalIn),
     pin("HOLDn", "~HOLD", PinKind::DigitalIn),
-    pin("VCC", "VCC", PinKind::PowerIn),
+    pin_unaliased("VCC", PinKind::PowerIn),
 ];
 
 /// Shared between the sense callbacks, which the engine delivers serially from
@@ -349,5 +362,16 @@ mod tests {
             ["~CS", "DO", "~WP", "GND", "DI", "CLK", "~HOLD", "VCC"],
             "the names are the same either way, so attach code does not change"
         );
+        // ...except where the by-function identifier already IS the function.
+        // Aliasing it would insert the same handle key twice, which a bench
+        // system rejects as a duplicate endpoint.
+        for decl in SPI_FLASH_PINS_BY_FUNCTION {
+            assert_ne!(
+                decl.name,
+                Some(decl.number),
+                "pin {} aliases its own identifier",
+                decl.number
+            );
+        }
     }
 }
