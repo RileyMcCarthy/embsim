@@ -240,12 +240,28 @@ impl PartRegistry {
         // designator prefix (see `classify_unnamed_by_reference`). Tier 2 and
         // the error tier always report the real part name, so a synthetic
         // class never leaks into a registry key or a diagnostic.
-        let auto: &str = match (part.is_empty() && self.reference_fallback)
+        let synthetic_class = (part.is_empty() && self.reference_fallback)
             .then(|| reference_designator_class(&decl.reference))
-        {
-            Some(Some(synthetic)) => synthetic,
-            _ => part.as_str(),
-        };
+            .flatten();
+        let auto: &str = synthetic_class.unwrap_or(part.as_str());
+
+        // An EXPLICIT registration beats a SYNTHESIZED class. The reference
+        // designator is a guess made only because the netlist carried no part
+        // name; a constructor the consumer registered for this component's
+        // `value` is a statement of intent, and a guess must not override one.
+        //
+        // Without this a component can be unmountable for a reason nothing
+        // reports: `J301` on the P2-EC32MB fixture is a microSD socket with a
+        // card behind it, and a `J` prefix classified it as a board boundary
+        // before the registry was ever consulted — so registering a live card
+        // silently did nothing, and the board built without it.
+        //
+        // Narrow on purpose: a class from a REAL libsource part name (a
+        // `Conn_01x04` symbol, say) still wins, because there the netlist is
+        // telling us what the part is rather than us inferring it.
+        if synthetic_class.is_some() && self.constructors.contains_key(decl.value.as_str()) {
+            return Ok(Classification::Registered);
+        }
 
         // Tier 1a: ignored mechanicals — absent from the built board.
         if starts_with_any(auto, &["MountingHole", "Logo", "TestPoint", "Fiducial"]) {
