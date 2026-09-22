@@ -9,6 +9,11 @@
 //!   ISO67xx digital isolator family, a dual optocoupler, a constant-current
 //!   LED driver, and a small NPN switch
 //! - [`limit_switch`] — position-threshold limit switch
+//! - [`sd_card`] — an SD card, device side, in SPI mode: a byte-level protocol
+//!   model that knows nothing about who is clocking it
+//! - [`sd_card_component`] — that model as a live `embsim-board` component
+//!   (microSD or by-function pin facade, active-low CS, DO released when
+//!   deselected)
 //! - [`spi_flash`] — a serial NOR flash, bit-level and bus-agnostic: anything
 //!   that can produce a chip select, a clock edge and a data bit can talk to
 //!   it, whether bit-banged or peripheral-clocked
@@ -32,5 +37,7 @@ pub mod edge;
 pub mod isolation;
 pub mod limit_switch;
 pub mod machine;
+pub mod sd_card;
+pub mod sd_card_component;
 pub mod spi_flash;
 pub mod spi_flash_component;
