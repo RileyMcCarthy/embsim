@@ -123,10 +123,40 @@ fn null_modem(test: &str, baud_a: u32, baud_b: u32) -> NullModem {
     }
 }
 
+impl NullModem {
+    /// Wait until a byte actually crosses, then start from quiet.
+    ///
+    /// The two ends are separate components and the engine attaches them in its
+    /// own time, so a byte written before the far end has registered its
+    /// receive callback goes onto a net nobody is listening to and is simply
+    /// gone. That is true of real hardware — the first bytes into a port whose
+    /// peer is still coming up do not arrive — and host software deals with it
+    /// by retrying rather than by assuming.
+    ///
+    /// Without this the round-trip tests pass alone and fail under load, which
+    /// is the worst way for a test to be wrong.
+    fn wait_until_live(&mut self) {
+        const SYNC: &[u8] = b"\x55";
+        let start = Instant::now();
+        let mut linked = false;
+        while !linked && start.elapsed() < Duration::from_secs(30) {
+            self.a.write_all(SYNC).expect("writing the host end");
+            self.a.flush().expect("flushing the host end");
+            linked = !read_until(&mut self.b, 1, Duration::from_millis(250)).is_empty();
+        }
+        assert!(linked, "the cable never came up");
+        // Drain both ends of the sync bytes and anything they echoed, so the
+        // test that follows reads only its own payload.
+        let _ = read_until(&mut self.a, usize::MAX, Duration::from_millis(250));
+        let _ = read_until(&mut self.b, usize::MAX, Duration::from_millis(250));
+    }
+}
+
 #[test]
 fn a_byte_written_to_one_host_port_arrives_at_the_other() {
     let _clock = lock_clock();
     let mut link = null_modem("roundtrip", 115_200, 115_200);
+    link.wait_until_live();
 
     link.a.write_all(b"Hello").expect("writing the host end");
     link.a.flush().expect("flushing the host end");
@@ -154,6 +184,7 @@ fn every_byte_value_survives_the_wire() {
     // idle-level mistakes; the rest catch bit-order and off-by-one errors.
     let _clock = lock_clock();
     let mut link = null_modem("all-values", 115_200, 115_200);
+    link.wait_until_live();
 
     let payload: Vec<u8> = (0..=255u8).collect();
     link.a.write_all(&payload).expect("writing the host end");
@@ -177,6 +208,10 @@ fn a_baud_mismatch_costs_the_data_rather_than_being_defined_away() {
     // ever passes, the bytes are not really crossing a wire.
     let _clock = lock_clock();
     let mut link = null_modem("baud-mismatch", 115_200, 9_600);
+    // This cable can never carry a handshake, so it cannot use `wait_until_live`.
+    // Give the engine time to attach both ends instead, so a failure to receive
+    // is about the rate rather than about nobody listening yet.
+    std::thread::sleep(Duration::from_secs(1));
 
     link.a.write_all(b"Hello").expect("writing the host end");
     link.a.flush().expect("flushing the host end");
