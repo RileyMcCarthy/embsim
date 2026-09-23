@@ -287,6 +287,100 @@ jobs:
       - name: Propagate the verdict
         run: exit ${{ steps.report.outputs.code }}
 
+  # The P2 node boots the real Parallax ROM off the P2-EC32MB's flash, over
+  # nets, with QEMU as the CPU (p2-qemu/README.md). QEMU is built from a clean
+  # checkout with this repository's target sources and linked into the test
+  # binary as a library; the build is cached on everything that changes it.
+  # Without EMBSIM_QEMU_P2_BUILD the crate is a stub and the test asserts
+  # nothing, so the ordinary `test` job cannot stand in for this one.
+  p2-qemu-boot:
+    name: p2-qemu-boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      QEMU_TAG: v10.1.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install QEMU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libglib2.0-dev flex bison python3-venv
+
+      # The node links QEMU's OBJECTS, so the whole build directory is what a
+      # hit has to restore -- not just the binary. ~165 MB for one target.
+      # The SOURCE tree is not cached: the shim compiles against QEMU's
+      # headers, so the checkout and the staging below run on a hit too, and
+      # only configure + ninja are skipped. build.ninja carries absolute
+      # paths, which is why the tree goes to the same place every time.
+      - name: Cache the QEMU build
+        id: qemu-cache
+        uses: actions/cache@v4
+        with:
+          path: qemu-build/build-p2
+          key: qemu-p2-node-${{ env.QEMU_TAG }}-${{ hashFiles('p2-qemu/qemu-target/**', 'models/src/spi_flash.rs', 'cffi/**') }}
+
+      # The standalone binary's flash bus links the flash model as a C static
+      # library, and ninja builds that binary along with the objects the node
+      # needs. The node itself never links the archive.
+      - name: Build the device models as a C static library
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: cargo build -p embsim-cffi
+
+      # Into a directory the cache may already have populated with build-p2,
+      # which `git clone` refuses; a fetch into an initialised repository
+      # does not mind what else is there.
+      - name: Check out QEMU
+        run: |
+          set -euo pipefail
+          mkdir -p qemu-build
+          git -C qemu-build init -q
+          git -C qemu-build fetch -q --depth 1 https://gitlab.com/qemu-project/qemu.git "refs/tags/$QEMU_TAG"
+          git -C qemu-build checkout -q FETCH_HEAD
+
+      - name: Stage the P2 target into the QEMU tree
+        run: |
+          set -euo pipefail
+          T=p2-qemu/qemu-target
+          mkdir -p qemu-build/target/p2 qemu-build/hw/p2 qemu-build/configs/devices/p2-softmmu
+          cp $T/target-p2/* qemu-build/target/p2/
+          cp $T/hw-p2/*     qemu-build/hw/p2/
+          cp $T/p2-softmmu.mak          qemu-build/configs/targets/
+          cp $T/p2-softmmu-devices.mak  qemu-build/configs/devices/p2-softmmu/default.mak
+          cd qemu-build
+          patch -p1 < ../$T/register-p2.patch
+          patch -p1 < ../$T/host-thread.patch
+          python3 scripts/decodetree.py --static-decode=decode_p2 --insnwidth=32 \
+              -o /tmp/d.c.inc target/p2/insn.decode
+          python3 scripts/decodetree.py --static-decode=interp_p2 --translate=iexec \
+              --insnwidth=32 -o /tmp/i.c.inc target/p2/insn.decode
+          python3 target/p2/gen_stubs.py /tmp/d.c.inc target/p2/trans_stub.c.inc
+          python3 target/p2/gen_stubs.py /tmp/i.c.inc target/p2/interp_stub.c.inc --interp
+
+      # --enable-pie: the objects have to link into a Rust test binary, which
+      # is position-independent. --disable-containers: configure otherwise
+      # probes docker.
+      - name: Build qemu-system-p2
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd qemu-build
+          mkdir -p build-p2 && cd build-p2
+          ../configure --target-list=p2-softmmu --disable-containers --enable-pie \
+              --disable-docs --disable-werror \
+              --extra-cflags="-I$GITHUB_WORKSPACE/cffi/include" \
+              --extra-ldflags="$GITHUB_WORKSPACE/target/debug/libembsim_cffi.a -lpthread -ldl -lm"
+          ninja qemu-system-p2
+
+      - name: Boot the ROM off the module's flash, over the nets
+        env:
+          EMBSIM_QEMU_P2_BUILD: ${{ github.workspace }}/qemu-build/build-p2
+        run: cargo test -p embsim-p2-qemu -- --nocapture
+
   ci-gate:
     name: CI Gate
     needs:
@@ -297,6 +391,7 @@ jobs:
       - docs
       - supply-chain
       - msrv
+      - p2-qemu-boot
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
