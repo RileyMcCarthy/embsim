@@ -78,11 +78,20 @@ struct LinkLine {
 impl LinkLine {
     fn scrape(ninja: &str, build_dir: &Path) -> Self {
         // --- the emulator's link line ---------------------------------------
-        let target = "qemu-system-p2-unsigned";
-        let key = format!("build {target}: c_LINKER ");
-        let start = ninja.find(&key).unwrap_or_else(|| {
-            panic!("build.ninja has no `{key}` rule: is the tree configured for p2-softmmu?")
-        });
+        //
+        // macOS links `qemu-system-p2-unsigned` and code-signs it into
+        // `qemu-system-p2`; Linux links `qemu-system-p2` directly. Either
+        // rule carries the same object list.
+        let (key, start) = ["qemu-system-p2-unsigned", "qemu-system-p2"]
+            .iter()
+            .map(|target| format!("build {target}: c_LINKER "))
+            .find_map(|key| ninja.find(&key).map(|start| (key, start)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "build.ninja has no `build qemu-system-p2[-unsigned]: c_LINKER` rule: is \
+                     the tree configured for p2-softmmu?"
+                )
+            });
         let block = &ninja[start..];
         let block_end = block[10..].find("\nbuild ").map_or(block.len(), |i| i + 10);
         let block = &block[..block_end];
