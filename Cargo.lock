@@ -198,10 +198,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "embsim-boards"
+version = "0.1.0"
+dependencies = [
+ "embsim-board",
+ "embsim-models",
+]
+
+[[package]]
 name = "embsim-build"
 version = "0.1.0"
 dependencies = [
  "rstest",
+]
+
+[[package]]
+name = "embsim-cffi"
+version = "0.1.0"
+dependencies = [
+ "embsim-models",
 ]
 
 [[package]]

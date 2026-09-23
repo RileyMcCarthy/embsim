@@ -43,6 +43,7 @@ pub mod component;
 pub mod diagnostics;
 pub mod engine;
 pub mod event_log;
+pub mod host_pty;
 pub mod mcu;
 pub mod net;
 pub mod netlist;
@@ -63,6 +64,7 @@ pub use component::{
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
+pub use host_pty::HostPty;
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};
 pub use net::{
     digital_drive, level_of, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,

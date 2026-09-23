@@ -9,7 +9,19 @@
 //!   ISO67xx digital isolator family, a dual optocoupler, a constant-current
 //!   LED driver, and a small NPN switch
 //! - [`limit_switch`] — position-threshold limit switch
+//! - [`sd_card`] — an SD card, device side, in SPI mode: a byte-level protocol
+//!   model that knows nothing about who is clocking it
+//! - [`sd_card_component`] — that model as a live `embsim-board` component
+//!   (microSD or by-function pin facade, active-low CS, DO released when
+//!   deselected)
+//! - [`spi_flash`] — a serial NOR flash, bit-level and bus-agnostic: anything
+//!   that can produce a chip select, a clock edge and a data bit can talk to
+//!   it, whether bit-banged or peripheral-clocked
+//! - [`spi_flash_component`] — that model as a live `embsim-board` component
+//!   (SOIC-8 pin facade, active-low ~CS, DO driven from the sense callbacks)
 //! - [`edge`] — edge-detection primitive shared by threshold models
+//! - [`fat16`] — a FAT16 card image built in memory, so a guest filesystem has
+//!   something to mount on [`sd_card`]
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
 //!   components: a step/direction motor drive, a quadrature encoder, and an
 //!   end-of-travel switch, each with a real pin facade
@@ -24,6 +36,11 @@
 pub mod ads122u04;
 pub mod ads122u04_component;
 pub mod edge;
+pub mod fat16;
 pub mod isolation;
 pub mod limit_switch;
 pub mod machine;
+pub mod sd_card;
+pub mod sd_card_component;
+pub mod spi_flash;
+pub mod spi_flash_component;
