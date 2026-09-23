@@ -1,0 +1,28 @@
+[package]
+name = "embsim-p2-qemu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The QEMU Propeller 2 target as an embsim board component: a node that drives pins as edges on nets and boots the way silicon does"
+keywords = ["embedded", "emulator", "simulation", "sil", "qemu"]
+categories = ["embedded", "simulation"]
+
+# The node links QEMU as a library — several hundred objects scraped from a
+# configured QEMU build tree. That tree is found through EMBSIM_QEMU_P2_BUILD at
+# build time. When the variable is unset the crate still compiles, to a stub
+# that says so, because a workspace must build on a machine with no QEMU.
+build = "build.rs"
+
+[dependencies]
+embsim-core = { path = "../core" }
+embsim-board = { path = "../board" }
+tracing.workspace = true
+
+[dev-dependencies]
+embsim-models = { path = "../models" }
+embsim-boards = { path = "../boards" }
+
+[build-dependencies]
+cc = "1"
