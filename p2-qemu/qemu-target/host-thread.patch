@@ -1,0 +1,59 @@
+diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
+index 6eec5c9..c661ea6 100644
+--- a/accel/tcg/tcg-accel-ops-rr.c
++++ b/accel/tcg/tcg-accel-ops-rr.c
+@@ -186,7 +186,21 @@ static void *rr_cpu_thread_fn(void *arg)
+     rcu_register_thread();
+     force_rcu.notify = rr_force_rcu;
+     rcu_add_force_rcu_notifier(&force_rcu);
+-    tcg_register_thread();
++    /*
++     * embsim host-driven mode: leave the TCG context for the HOST thread.
++     *
++     * Round-robin TCG has exactly one context. This thread is about to park
++     * at the bottom of the function and will never execute a block, so
++     * claiming the context would leave nothing for the thread that actually
++     * runs the cogs -- which is precisely the `g_assert(n < tcg_max_ctxs)`
++     * in `tcg_register_thread`.
++     *
++     * Everything else it does still runs: RCU registration, the created-signal
++     * `qemu_init` blocks on, and the kick timer.
++     */
++    if (!getenv("EMBSIM_QEMU_HOST_THREAD")) {
++        tcg_register_thread();
++    }
+ 
+     bql_lock();
+     qemu_thread_get_self(cpu->thread);
+@@ -214,6 +228,31 @@ static void *rr_cpu_thread_fn(void *arg)
+     /* process any pending work */
+     cpu->exit_request = 1;
+ 
++    /*
++     * embsim host-driven mode: hand the CPUs to the HOST thread and get out
++     * of the way.
++     *
++     * embsim's engine calls cpu_exec on its own thread, one bounded slice at
++     * a time, so every pin edge is a function call rather than a cross-thread
++     * park/wake (measured at 10.9 us against a 0.25 us slice boundary --
++     * spike 1d). This thread has already done everything the machine start
++     * needs -- RCU registration, the created-signal qemu_init waits on, the
++     * kick timer -- and the only thing left is which thread calls cpu_exec.
++     *
++     * Parking rather than never creating the thread keeps the change to one
++     * variable. A `TCGAccelOps.create_vcpu_thread` override is the tidier
++     * form and a separate change.
++     *
++     * The BQL must be dropped: the host takes it around its own icount
++     * bookkeeping, and holding it here would deadlock on the first slice.
++     */
++    if (getenv("EMBSIM_QEMU_HOST_THREAD")) {
++        bql_unlock();
++        while (1) {
++            g_usleep(1000 * 1000);
++        }
++    }
++
+     while (1) {
+         /* Only used for icount_enabled() */
+         int64_t cpu_budget = 0;
