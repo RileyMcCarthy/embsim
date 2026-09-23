@@ -133,11 +133,11 @@ pub const PSRAM_PINS: [PinDecl; 9] = [
 
 /// `P Mosfet 30V 8A` — Vishay SI3417DV reverse-polarity pass FET (U401). Its
 /// conducting channel is not modeled; the system description expresses it with
-/// a `pin_short` (see [`module_polarity_fet_conducting`]).
+/// a `pin_short` (a `pin_short` in the scenario).
 pub const POLARITY_FET_PINS: [PinDecl; 3] = [dig_in("G"), passive("D"), passive("S")];
 
 /// `DCDC 3A SOT563` — Diodes AP62301Z buck (U402, U403). `SW` is declared
-/// [`PinKind::PowerOut`]: it is the switching node the output inductor
+/// `PinKind::PowerOut`: it is the switching node the output inductor
 /// integrates into a rail, and marking it a source is what makes the module's
 /// power tree reachable.
 pub const BUCK_PINS: [PinDecl; 5] = [
