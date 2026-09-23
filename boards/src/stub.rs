@@ -65,7 +65,7 @@ pub const fn pwr_in(number: &'static str) -> PinDecl {
 /// A rail the part generates (regulator/DC-DC output, isolated-domain
 /// reference). Registers the net as sourced at an unmodeled voltage — enough
 /// to clear [`embsim_board::Finding::PowerNetUnsourced`], not enough for a
-/// component that gates on a rail *voltage*; see [`bench_rails`].
+/// component that gates on a rail *voltage*; stick the rail with `Scenario::net_stuck`.
 pub const fn pwr_out(number: &'static str) -> PinDecl {
     PinDecl {
         number,

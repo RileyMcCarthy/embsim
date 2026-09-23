@@ -81,6 +81,39 @@ fn artifact_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// The archive a C host links: cargo's own, when this test ran under a plain
+/// `cargo test`; otherwise one built here.
+///
+/// `cargo test --tests` — which is how `cargo llvm-cov` invokes it — builds
+/// this crate only as the rlib the test depends on and never emits the
+/// `staticlib`, so the archive is missing under coverage. Building it from
+/// the test with the instrumentation flags scrubbed (an instrumented archive
+/// would need the profiling runtime to link) keeps the test meaningful there
+/// rather than skipped, and costs nothing on the ordinary path.
+fn static_library() -> PathBuf {
+    let ready = artifact_dir().join("libembsim_cffi.a");
+    if ready.exists() {
+        return ready;
+    }
+    let target_dir = artifact_dir().join("c-link-target");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = Command::new(cargo)
+        .args(["build", "-p", "embsim-cffi", "--target-dir"])
+        .arg(&target_dir)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("LLVM_PROFILE_FILE")
+        .env_remove("CARGO_LLVM_COV")
+        .env_remove("CARGO_LLVM_COV_TARGET_DIR")
+        .status()
+        .expect("cargo runs");
+    assert!(
+        status.success(),
+        "building the static library for the C link test"
+    );
+    target_dir.join("debug").join("libembsim_cffi.a")
+}
+
 #[test]
 fn a_c_program_links_against_the_static_library_and_runs() {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
@@ -89,7 +122,7 @@ fn a_c_program_links_against_the_static_library_and_runs() {
         return;
     }
 
-    let lib = artifact_dir().join("libembsim_cffi.a");
+    let lib = static_library();
     assert!(
         lib.exists(),
         "the static library must be built before this test can link it: {}\n\

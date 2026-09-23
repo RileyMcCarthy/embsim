@@ -18,7 +18,7 @@
 //!
 //! Nothing on a net-resolution path may block on a file descriptor, so reading
 //! the host is a pump thread's job. The engine thread only ever *queues* bytes
-//! for the host ([`deliver`]) and the pump drains whatever the PTY would not
+//! for the host (`deliver`) and the pump drains whatever the PTY would not
 //! take — see that function for why dropping instead would be much worse than
 //! it looks.
 
@@ -60,7 +60,7 @@ pub struct HostPty {
     bridge: Arc<Mutex<Option<Arc<SerialLevelBridge>>>>,
     shutdown: Arc<AtomicBool>,
     pump: Option<JoinHandle<()>>,
-    /// Guest bytes the PTY has not accepted yet. See [`deliver`].
+    /// Guest bytes the PTY has not accepted yet. See `deliver`.
     outbound: Arc<Mutex<VecDeque<u8>>>,
     /// Bytes discarded because the host stopped reading entirely.
     dropped: Arc<AtomicU64>,

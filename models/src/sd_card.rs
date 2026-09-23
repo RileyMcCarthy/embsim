@@ -189,7 +189,7 @@ impl SdCard {
     /// `CMD24` and then times out waiting for the card to be ready returns
     /// without ever sending the data token — leaving the card waiting for a
     /// block that will never arrive. Deselect is the only thing that frees it.
-    /// Without this the card stays in [`Phase::ReceivingBlock`] forever,
+    /// Without this the card stays in `Phase::ReceivingBlock` forever,
     /// silently swallowing every later command frame as if it were payload,
     /// and the bus goes dead for the rest of the run.
     ///

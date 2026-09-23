@@ -334,7 +334,7 @@ fn build_dir(
 /// Build a FAT16 image of `size_bytes` holding `root`.
 ///
 /// The result is a raw block device: hand it to
-/// [`p2core::SdCard::with_image`].
+/// `p2core::SdCard::with_image`.
 pub fn build(size_bytes: usize, root: &Dir) -> Result<Vec<u8>, ImageError> {
     let total_sectors = size_bytes / SECTOR;
     let root_dir_sectors = ROOT_ENTRIES * DIR_ENTRY / SECTOR;
