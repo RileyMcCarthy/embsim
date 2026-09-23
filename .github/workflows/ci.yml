@@ -313,6 +313,10 @@ jobs:
 
       # The node links QEMU's OBJECTS, so the whole build directory is what a
       # hit has to restore -- not just the binary. ~165 MB for one target.
+      # The SOURCE tree is not cached: the shim compiles against QEMU's
+      # headers, so the checkout and the staging below run on a hit too, and
+      # only configure + ninja are skipped. build.ninja carries absolute
+      # paths, which is why the tree goes to the same place every time.
       - name: Cache the QEMU build
         id: qemu-cache
         uses: actions/cache@v4
@@ -328,11 +332,9 @@ jobs:
         run: cargo build -p embsim-cffi
 
       - name: Check out QEMU
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: git clone --depth 1 --branch "$QEMU_TAG" https://gitlab.com/qemu-project/qemu.git qemu-build
 
       - name: Stage the P2 target into the QEMU tree
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           T=p2-qemu/qemu-target
