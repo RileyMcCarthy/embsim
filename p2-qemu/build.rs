@@ -82,10 +82,10 @@ impl LinkLine {
         // macOS links `qemu-system-p2-unsigned` and code-signs it into
         // `qemu-system-p2`; Linux links `qemu-system-p2` directly. Either
         // rule carries the same object list.
-        let (key, start) = ["qemu-system-p2-unsigned", "qemu-system-p2"]
+        let start = ["qemu-system-p2-unsigned", "qemu-system-p2"]
             .iter()
             .map(|target| format!("build {target}: c_LINKER "))
-            .find_map(|key| ninja.find(&key).map(|start| (key, start)))
+            .find_map(|key| ninja.find(&key))
             .unwrap_or_else(|| {
                 panic!(
                     "build.ninja has no `build qemu-system-p2[-unsigned]: c_LINKER` rule: is \
