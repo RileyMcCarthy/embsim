@@ -331,8 +331,16 @@ jobs:
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: cargo build -p embsim-cffi
 
+      # Into a directory the cache may already have populated with build-p2,
+      # which `git clone` refuses; a fetch into an initialised repository
+      # does not mind what else is there.
       - name: Check out QEMU
-        run: git clone --depth 1 --branch "$QEMU_TAG" https://gitlab.com/qemu-project/qemu.git qemu-build
+        run: |
+          set -euo pipefail
+          mkdir -p qemu-build
+          git -C qemu-build init -q
+          git -C qemu-build fetch -q --depth 1 https://gitlab.com/qemu-project/qemu.git "refs/tags/$QEMU_TAG"
+          git -C qemu-build checkout -q FETCH_HEAD
 
       - name: Stage the P2 target into the QEMU tree
         run: |
