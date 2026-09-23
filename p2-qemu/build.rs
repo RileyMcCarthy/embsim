@@ -80,16 +80,24 @@ impl LinkLine {
         // --- the emulator's link line ---------------------------------------
         //
         // macOS links `qemu-system-p2-unsigned` and code-signs it into
-        // `qemu-system-p2`; Linux links `qemu-system-p2` directly. Either
-        // rule carries the same object list.
+        // `qemu-system-p2`; Linux links `qemu-system-p2` directly. And when
+        // the command line is long — Linux's is — meson switches the rule
+        // to `c_LINKER_RSP`, which passes a response file; the inputs are
+        // still listed on the `build` line, because ninja needs them as
+        // dependencies. So match the rule by prefix.
         let start = ["qemu-system-p2-unsigned", "qemu-system-p2"]
             .iter()
-            .map(|target| format!("build {target}: c_LINKER "))
+            .map(|target| format!("build {target}: c_LINKER"))
             .find_map(|key| ninja.find(&key))
             .unwrap_or_else(|| {
+                let seen: Vec<&str> = ninja
+                    .lines()
+                    .filter(|l| l.starts_with("build qemu-system-p2"))
+                    .map(|l| &l[..l.len().min(120)])
+                    .collect();
                 panic!(
-                    "build.ninja has no `build qemu-system-p2[-unsigned]: c_LINKER` rule: is \
-                     the tree configured for p2-softmmu?"
+                    "build.ninja has no `build qemu-system-p2[-unsigned]: c_LINKER*` rule: is \
+                     the tree configured for p2-softmmu? build lines seen: {seen:?}"
                 )
             });
         let block = &ninja[start..];
