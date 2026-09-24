@@ -18,7 +18,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::uart::{FramingError, UartFraming};
-use embsim_board::{AttachError, Component, ComponentNetIo, PinDecl, PinKind, SerialLevelBridge};
+use embsim_board::{
+    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, SerialLevelBridge,
+};
 
 /// What the probe saw and what it can say, shared with the test body.
 #[derive(Debug, Default)]
@@ -99,6 +101,7 @@ impl UartProbe {
                     kind: PinKind::DigitalOut,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
                 PinDecl {
                     number: rx,
@@ -106,6 +109,7 @@ impl UartProbe {
                     kind: PinKind::DigitalIn,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
             ],
             framing,

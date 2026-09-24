@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, AttachError, Component, ComponentNetIo, Harness, Level, PinDecl, PinHandle,
-    PinKind, System,
+    digital_drive, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level, PinDecl,
+    PinHandle, PinKind, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -107,6 +107,7 @@ fn run(label: &str, mode: u8, with_flash: bool) {
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     };
     let slot = Arc::new(Mutex::new(Slot::default()));
     let out = Arc::new(Out::default());

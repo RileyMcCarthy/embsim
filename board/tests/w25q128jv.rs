@@ -8,7 +8,7 @@
 //!
 //! # What that actually proves
 //!
-//! `Board::from_netlist_with_stubs` validates every registered component's pin
+//! `Board::from_netlist` validates every registered component's pin
 //! facade against the netlist in BOTH directions, and it matches on
 //! `PinDecl::number` verbatim. A component whose facade is right for the part
 //! but wrong for the netlist's identifier convention fails here and nowhere
@@ -31,10 +31,10 @@ mod machine_parts;
 
 use std::collections::BTreeSet;
 
-use embsim_board::{netlist, Board, PartRegistry};
+use embsim_board::{netlist, Board, IdleDrive, PartRegistry};
 use embsim_models::spi_flash::{SpiNorFlash, JEDEC_ID_W25Q128JV_IM};
 use embsim_models::spi_flash_component::SpiNorFlashComponent;
-use machine_parts::{ec32mb_registry, EC32MB_STUB_REFS};
+use machine_parts::ec32mb_registry;
 
 /// 128 M-bit = 16 MiB, the density the netlist's value field states.
 const W25Q128_CAPACITY: usize = 16 * 1024 * 1024;
@@ -58,9 +58,8 @@ fn registry_with_live_flash() -> PartRegistry {
 fn the_part_mounts_on_a_real_netlist_in_place_of_its_stub() {
     let parsed =
         netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
-    let board =
-        Board::from_netlist_with_stubs(parsed, &registry_with_live_flash(), &EC32MB_STUB_REFS)
-            .expect("the live flash's pin facade matches U301 in both directions");
+    let board = Board::from_netlist(parsed, &registry_with_live_flash())
+        .expect("the live flash's pin facade matches U301 in both directions");
 
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert!(
@@ -83,7 +82,7 @@ fn a_facade_keyed_by_pin_number_does_not_mount_on_this_netlist() {
         )
     });
 
-    let error = Board::from_netlist_with_stubs(parsed, &registry, &EC32MB_STUB_REFS)
+    let error = Board::from_netlist(parsed, &registry)
         .expect_err("pin \"1\" is not a pin this netlist has");
     let rendered = format!("{error}");
     assert!(
@@ -170,6 +169,7 @@ impl BitBangMaster {
             kind,
             stream: None,
             drive_impedance: None,
+            idle: IdleDrive::KindDefault,
         };
         Self {
             pins: [

@@ -1,29 +1,33 @@
-//! Board construction: `Board::from_netlist(netlist, registry)` → components + nets.
+//! Board construction: `Board::from_netlist(netlist, registry)` → nodes + nets.
 //!
 //! Building a board classifies every netlist component (see
-//! [`crate::registry`]), instantiates registered [`Component`]s, validates
-//! each pin facade against the netlist in both directions, resolves net
-//! membership, and calls [`Component::attach`] pre-`Arc`.
-//!
-//! Slice status: the [`Board`] shape and error surface are final; the build
-//! body is the board-build slice.
+//! [`crate::registry`]) into a node class, instantiates registered
+//! [`Component`]s, validates each declared pin facade — a component's pins,
+//! a switch's poles, a piecewise-linear element's pins — against the netlist
+//! in both directions, and resolves net membership. **Every netlist part
+//! gets a record**: there is no stub list and no ignored tier (`DESIGN.md`
+//! rule 1), so a part the registry cannot classify is a build error naming
+//! the reference, the part and the value.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::component::{AttachError, Component, PinDecl};
+use crate::component::{AttachError, Component, IdleDrive, PinDecl, PinKind};
 use crate::net::{Net, NetId, NetState, PinRef};
 use crate::netlist::{normalize_net_name, NetlistError, ParsedNetlist};
-use crate::registry::{Classification, JumperState, PartRegistry, PassiveKind, RegistryError};
+use crate::registry::{
+    Classification, JumperState, PartRegistry, PassiveKind, PwlSpec, RegistryError, SwitchPole,
+};
 
 // ============================================================
 // Board
 // ============================================================
 
-/// Electrical class resolved for one fitted netlist component (build-time
-/// slice: what the resolution pass needs to know about it).
+/// The node class resolved for one netlist component — what the system build
+/// needs to know about it, and what [`Board::nodes`] reports. The classes are
+/// exactly the taxonomy rows of `NODES.md` §2.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PartClass {
+pub enum PartClass {
     /// Two-terminal passive. Only resistors (known value), inductors
     /// (DC short), and closed jumpers conduct in the build-time DC pass;
     /// capacitors, diodes, and LEDs are DC-open (documented simplification —
@@ -39,16 +43,33 @@ pub(crate) enum PartClass {
         /// Current state (default from the symbol name).
         state: JumperState,
     },
+    /// A switch: poles by pin id, each open or closed. A closed pole is a
+    /// build-time identity union of its two nets; an open pole is nothing.
+    Switch {
+        /// The poles, in declaration order (the index `Scenario::switch`
+        /// addresses).
+        poles: Vec<SwitchPole>,
+    },
+    /// A piecewise-linear element — declared ahead of its behaviour (see
+    /// [`PwlSpec`]); DC-open until the elements land.
+    Pwl {
+        /// The element's specification.
+        spec: PwlSpec,
+        /// Its pins, validated against the netlist both ways.
+        pins: Vec<String>,
+    },
     /// Connector — harness attachment boundary.
     Boundary,
+    /// A test point: a one-pin probe node.
+    Probe,
+    /// A mechanical part: pads recorded, nothing electrical.
+    Mechanical,
     /// Consumer-registered component; the pin facade snapshot drives
     /// electrical descriptors.
     Registered {
         /// Declared pins (validated against the netlist both directions).
         pins: Vec<PinDecl>,
     },
-    /// Explicitly stubbed by the board's stub list — electrically absent.
-    Stubbed,
 }
 
 /// One fitted-or-absent part the system build needs to reason about.
@@ -56,7 +77,7 @@ pub(crate) enum PartClass {
 pub(crate) struct PartRecord {
     /// Reference designator.
     pub(crate) reference: String,
-    /// Electrical class.
+    /// Node class.
     pub(crate) class: PartClass,
     /// False when DNP (`value == "X"` or the netlist `dnp` property);
     /// scenario `dnp_override` can flip this at system build.
@@ -86,29 +107,18 @@ impl fmt::Debug for Board {
 }
 
 impl Board {
-    /// Build a board from a parsed netlist and the consumer's part registry.
+    /// Build a board from a parsed netlist and the consumer's part registry —
+    /// the one constructor.
     ///
     /// DNP components (`value == "X"` or the KiCad `dnp` property) are absent
-    /// from the built board. A component with no classification and no
-    /// registry entry fails construction — use [`Board::from_netlist_with_stubs`]
-    /// to stub references explicitly.
-    ///
-    /// TODO(board-engine): board-build slice — classification, component
-    /// instantiation, facade validation (both directions), net resolution,
-    /// pre-`Arc` `attach()`.
+    /// from the built board but keep their record. A component with no
+    /// classification and no registry entry fails construction with
+    /// [`RegistryError::UnknownPart`], naming the reference, the part and the
+    /// value; a declared facade that disagrees with the netlist fails with
+    /// [`BoardError::PinFacadeMismatch`].
     pub fn from_netlist(
         netlist: ParsedNetlist,
         registry: &PartRegistry,
-    ) -> Result<Board, BoardError> {
-        Self::from_netlist_with_stubs(netlist, registry, &[])
-    }
-
-    /// [`Board::from_netlist`] with a per-board explicit stub list — the only
-    /// escape from the unclassified-component hard error.
-    pub fn from_netlist_with_stubs(
-        netlist: ParsedNetlist,
-        registry: &PartRegistry,
-        stub_refs: &[&str],
     ) -> Result<Board, BoardError> {
         // Netlist pins per reference (for pin counts and facade validation).
         let mut pins_by_ref: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -131,33 +141,36 @@ impl Board {
                 .unwrap_or_default();
             let fitted = !(decl.dnp || decl.value == "X");
 
-            let class = match registry.classify(decl, netlist_pins.len()) {
-                Ok(Classification::Ignored) => continue,
-                Ok(Classification::Boundary) => PartClass::Boundary,
-                Ok(Classification::Jumper { default, .. }) => PartClass::Jumper { state: default },
-                Ok(Classification::Passive { kind, value }) => PartClass::Passive { kind, value },
-                Ok(Classification::Registered) => {
-                    let mut component = registry
+            let class = match registry.classify(decl, netlist_pins.len())? {
+                Classification::Boundary => PartClass::Boundary,
+                Classification::Probe => PartClass::Probe,
+                Classification::Mechanical => PartClass::Mechanical,
+                Classification::Jumper { default, .. } => PartClass::Jumper { state: default },
+                Classification::Passive { kind, value } => PartClass::Passive { kind, value },
+                Classification::Switch { poles } => {
+                    let declared: Vec<&str> = poles
+                        .iter()
+                        .flat_map(|pole| [pole.a.as_str(), pole.b.as_str()])
+                        .collect();
+                    validate_pins(&decl.reference, &declared, &netlist_pins)?;
+                    PartClass::Switch { poles }
+                }
+                Classification::Pwl { spec, pins } => {
+                    let declared: Vec<&str> = pins.iter().map(String::as_str).collect();
+                    validate_pins(&decl.reference, &declared, &netlist_pins)?;
+                    PartClass::Pwl { spec, pins }
+                }
+                Classification::Registered => {
+                    let component = registry
                         .construct(decl)
                         .expect("classify() returned Registered, so construct() must succeed");
                     let pins = component.pins().to_vec();
                     validate_facade(&decl.reference, &pins, &netlist_pins)?;
-                    let pins_snapshot = pins.clone();
                     // attach() runs at system build, once final (merged) net
                     // ids exist — still pre-share.
-                    let _ = &mut component;
                     components.push((decl.reference.clone(), component));
-                    PartClass::Registered {
-                        pins: pins_snapshot,
-                    }
+                    PartClass::Registered { pins }
                 }
-                Ok(Classification::Stubbed) => PartClass::Stubbed,
-                Err(RegistryError::UnknownPart { .. })
-                    if stub_refs.contains(&decl.reference.as_str()) =>
-                {
-                    PartClass::Stubbed
-                }
-                Err(e) => return Err(BoardError::Classification(e)),
             };
 
             records.push(PartRecord {
@@ -201,27 +214,90 @@ impl Board {
         &self.nets
     }
 
-    /// Reference designators of the instantiated (non-DNP, non-ignored)
-    /// components, in netlist order.
+    /// Reference designators of the instantiated (non-DNP) components — the
+    /// [`PartClass::Registered`] nodes — in netlist order.
     pub fn component_refs(&self) -> impl Iterator<Item = &str> {
         self.components
             .iter()
             .map(|(reference, _)| reference.as_str())
     }
+
+    /// Every netlist part with the node class it was given, in netlist
+    /// order — the census of the one pipeline (`DESIGN.md` rule 1): a part is
+    /// a node whose class has behaviour, or the board did not build.
+    ///
+    /// DNP parts are listed too (their class is what the registry said of
+    /// the symbol); they are absent from the built system unless a scenario
+    /// populates them.
+    pub fn nodes(&self) -> impl Iterator<Item = (&str, &PartClass)> {
+        self.records
+            .iter()
+            .map(|record| (record.reference.as_str(), &record.class))
+    }
+
+    /// The node class of one reference, or `None` when the netlist has no
+    /// such part.
+    pub fn node_class(&self, reference: &str) -> Option<&PartClass> {
+        self.records
+            .iter()
+            .find(|record| record.reference == reference)
+            .map(|record| &record.class)
+    }
 }
 
 /// Validate a registered component's declared pin facade against the netlist
 /// in BOTH directions — declared-but-absent and present-but-undeclared pins
-/// are hard build errors.
+/// are hard build errors — and every declaration the engine would otherwise
+/// have to drop ([`validate_idle_drives`]).
 fn validate_facade(
     reference: &str,
     declared: &[PinDecl],
     netlist_pins: &[&str],
 ) -> Result<(), BoardError> {
-    let declared_numbers: HashSet<&str> = declared.iter().map(|p| p.number).collect();
+    validate_idle_drives(reference, declared)?;
+    let declared: Vec<&str> = declared.iter().map(|p| p.number).collect();
+    validate_pins(reference, &declared, netlist_pins)
+}
+
+/// A declared idle drive is honoured on every pin with a drive slot, and a
+/// power or passive pin has none ([`IdleDrive`]) — so an idle drive declared
+/// on one is a static fact the engine cannot keep, refused here rather than
+/// dropped without a word. Shared by the netlist facade check and the bench
+/// component path in `System::assemble`, which has no netlist facade to
+/// validate but the same declarations to honour.
+pub(crate) fn validate_idle_drives(
+    reference: &str,
+    declared: &[PinDecl],
+) -> Result<(), BoardError> {
+    for pin in declared {
+        let slotless = matches!(
+            pin.kind,
+            PinKind::PowerIn | PinKind::PowerOut | PinKind::Passive
+        );
+        if slotless && !matches!(pin.idle, IdleDrive::KindDefault) {
+            return Err(BoardError::IdleOnSlotlessPin {
+                reference: reference.to_string(),
+                pin: pin.number.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a set of declared pin ids (a switch's pole pins, a
+/// piecewise-linear element's pins) against the netlist in BOTH directions,
+/// like [`validate_facade`]. The two scans walk the declaration and the
+/// netlist in their own order, so the pin an error names is the first
+/// mismatch as written, the same one on every run.
+fn validate_pins(
+    reference: &str,
+    declared: &[&str],
+    netlist_pins: &[&str],
+) -> Result<(), BoardError> {
+    let declared_set: HashSet<&str> = declared.iter().copied().collect();
     let netlist_set: HashSet<&str> = netlist_pins.iter().copied().collect();
 
-    for pin in &declared_numbers {
+    for pin in declared {
         if !netlist_set.contains(pin) {
             return Err(BoardError::PinFacadeMismatch {
                 reference: reference.to_string(),
@@ -229,8 +305,8 @@ fn validate_facade(
             });
         }
     }
-    for pin in &netlist_set {
-        if !declared_numbers.contains(pin) {
+    for pin in netlist_pins {
+        if !declared_set.contains(pin) {
             return Err(BoardError::PinFacadeMismatch {
                 reference: reference.to_string(),
                 pin: (*pin).to_string(),
@@ -252,13 +328,34 @@ pub enum BoardError {
     Netlist(NetlistError),
     /// A component failed classification (unknown part, pin-count violation).
     Classification(RegistryError),
-    /// A registered component's declared pins do not match the netlist
-    /// (either direction — declared-but-absent or present-but-undeclared).
+    /// A declared pin facade — a registered component's pins, a switch's
+    /// pole pins, a piecewise-linear element's pins — does not match the
+    /// netlist (either direction — declared-but-absent or
+    /// present-but-undeclared).
     PinFacadeMismatch {
         /// Component reference designator.
         reference: String,
         /// The mismatched pin identity.
         pin: String,
+    },
+    /// A declared idle drive on a pin that has no drive slot — a power or
+    /// passive pin ([`IdleDrive`]). The engine could only drop the
+    /// declaration, so the build refuses it and names the pin.
+    IdleOnSlotlessPin {
+        /// Component reference designator.
+        reference: String,
+        /// The pin carrying the declaration.
+        pin: String,
+    },
+    /// A fitted piecewise-linear element whose specification is the
+    /// placeholder ([`PwlSpec`]) — a class declared ahead of its behaviour.
+    /// `register_pwl` is a declaration of intent until the elements land
+    /// (`NODES.md` §8 phase 3); a part it covers builds only unfitted (DNP,
+    /// or unpopulated by the scenario), like any other part without
+    /// behaviour (`DESIGN.md` rule 1).
+    UnmodelledElement {
+        /// Component reference designator.
+        reference: String,
     },
     /// A component's `attach()` failed.
     Attach {
@@ -277,6 +374,17 @@ impl fmt::Display for BoardError {
             BoardError::PinFacadeMismatch { reference, pin } => {
                 write!(f, "{reference}: pin facade mismatch on pin {pin:?}")
             }
+            BoardError::IdleOnSlotlessPin { reference, pin } => write!(
+                f,
+                "{reference}: pin {pin:?} declares an idle drive but has no drive slot \
+                 (power and passive pins idle at nothing)"
+            ),
+            BoardError::UnmodelledElement { reference } => write!(
+                f,
+                "{reference}: a piecewise-linear element declared ahead of its behaviour \
+                 cannot be fitted until the elements land; leave it unpopulated or register \
+                 a model"
+            ),
             BoardError::Attach { reference, error } => write!(f, "{reference}: {error}"),
         }
     }
@@ -288,7 +396,9 @@ impl std::error::Error for BoardError {
             BoardError::Netlist(e) => Some(e),
             BoardError::Classification(e) => Some(e),
             BoardError::Attach { error, .. } => Some(error),
-            BoardError::PinFacadeMismatch { .. } => None,
+            BoardError::PinFacadeMismatch { .. }
+            | BoardError::IdleOnSlotlessPin { .. }
+            | BoardError::UnmodelledElement { .. } => None,
         }
     }
 }
@@ -302,5 +412,156 @@ impl From<NetlistError> for BoardError {
 impl From<RegistryError> for BoardError {
     fn from(e: RegistryError) -> Self {
         BoardError::Classification(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::netlist::parse;
+    use crate::registry::PwlSpec;
+
+    /// A hand-written netlist with one of each declared class: a switch
+    /// `S1` whose pins pair off `1_ON`/`1_OFF` and `2_ON`/`2_OFF`, a diode
+    /// `D1` on pins `A`/`K`, a test point `TP1`, a mounting hole `H1`, and a
+    /// part `U9` nothing classifies.
+    const NETLIST: &str = r#"(export (version "E")
+  (components
+    (comp (ref "S1") (value "DIP2"))
+    (comp (ref "D1") (value "SS36") (libsource (lib "Diode") (part "SS36") (description "")))
+    (comp (ref "TP1") (value "TP") (libsource (lib "Connector") (part "TestPoint") (description "")))
+    (comp (ref "H1") (value "MountingHole_Pad") (libsource (lib "Mechanical") (part "MountingHole_Pad") (description "")))
+    (comp (ref "U9") (value "Frobulator 9000")))
+  (nets
+    (net (code "1") (name "A") (class "Default")
+      (node (ref "S1") (pin "1_ON") (pintype "passive"))
+      (node (ref "D1") (pin "A") (pintype "passive"))
+      (node (ref "TP1") (pin "1") (pintype "passive")))
+    (net (code "2") (name "B") (class "Default")
+      (node (ref "S1") (pin "1_OFF") (pintype "passive"))
+      (node (ref "D1") (pin "K") (pintype "passive"))
+      (node (ref "H1") (pin "1") (pintype "passive")))
+    (net (code "3") (name "C") (class "Default")
+      (node (ref "S1") (pin "2_ON") (pintype "passive"))
+      (node (ref "U9") (pin "1") (pintype "passive")))
+    (net (code "4") (name "D") (class "Default")
+      (node (ref "S1") (pin "2_OFF") (pintype "passive"))
+      (node (ref "U9") (pin "2") (pintype "passive")))))"#;
+
+    fn registry() -> PartRegistry {
+        let mut registry = PartRegistry::new();
+        registry.register_switch(
+            "DIP2",
+            vec![
+                SwitchPole::open("1_ON", "1_OFF"),
+                SwitchPole::closed("2_ON", "2_OFF"),
+            ],
+        );
+        registry.register_pwl("SS36", ["A", "K"], PwlSpec::default());
+        registry.register_mechanical("Frobulator 9000");
+        registry
+    }
+
+    /// Every netlist part is a node of the class the registry gave it.
+    #[rstest]
+    fn every_netlist_part_is_a_node_with_its_class() {
+        let board = Board::from_netlist(parse(NETLIST).unwrap(), &registry()).unwrap();
+        let nodes: Vec<(&str, &PartClass)> = board.nodes().collect();
+        assert_eq!(nodes.len(), 5, "one record per netlist part: {nodes:?}");
+        assert_eq!(
+            board.node_class("S1"),
+            Some(&PartClass::Switch {
+                poles: vec![
+                    SwitchPole::open("1_ON", "1_OFF"),
+                    SwitchPole::closed("2_ON", "2_OFF"),
+                ]
+            })
+        );
+        assert_eq!(
+            board.node_class("D1"),
+            Some(&PartClass::Pwl {
+                spec: PwlSpec::default(),
+                pins: vec!["A".to_string(), "K".to_string()],
+            })
+        );
+        assert_eq!(board.node_class("TP1"), Some(&PartClass::Probe));
+        assert_eq!(board.node_class("H1"), Some(&PartClass::Mechanical));
+        assert_eq!(board.node_class("U9"), Some(&PartClass::Mechanical));
+        assert_eq!(board.node_class("U99"), None);
+        // None of them is a component.
+        assert_eq!(board.component_refs().count(), 0);
+    }
+
+    /// A part the registry cannot classify is a build error naming the
+    /// reference, the part and the value.
+    #[rstest]
+    fn an_unclassifiable_part_fails_the_build_naming_reference_part_and_value() {
+        // The registry above without the entry that covers U9.
+        let mut registry = PartRegistry::new();
+        registry.register_switch(
+            "DIP2",
+            vec![
+                SwitchPole::open("1_ON", "1_OFF"),
+                SwitchPole::closed("2_ON", "2_OFF"),
+            ],
+        );
+        registry.register_pwl("SS36", ["A", "K"], PwlSpec::default());
+        let error =
+            Board::from_netlist(parse(NETLIST).unwrap(), &registry).expect_err("U9 has no class");
+        match &error {
+            BoardError::Classification(RegistryError::UnknownPart {
+                reference,
+                part,
+                value,
+            }) => {
+                assert_eq!(reference, "U9");
+                assert_eq!(part, "");
+                assert_eq!(value, "Frobulator 9000");
+            }
+            other => panic!("expected UnknownPart, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("U9") && rendered.contains("Frobulator 9000"),
+            "{rendered}"
+        );
+    }
+
+    /// A switch's poles must name exactly the part's netlist pins, in both
+    /// directions, like a component's facade; the pin the error names is
+    /// the first mismatch in declaration order, then in netlist order.
+    #[rstest]
+    #[case::pole_names_a_pin_the_part_lacks(vec![SwitchPole::open("1_ON", "1_OFF"), SwitchPole::open("2_ON", "9_OFF")], "9_OFF")]
+    #[case::a_pin_no_pole_names(vec![SwitchPole::open("1_ON", "1_OFF")], "2_ON")]
+    fn switch_poles_are_validated_against_the_netlist_both_ways(
+        #[case] poles: Vec<SwitchPole>,
+        #[case] named: &str,
+    ) {
+        let mut registry = registry();
+        registry.register_switch("DIP2", poles);
+        let error = Board::from_netlist(parse(NETLIST).unwrap(), &registry)
+            .expect_err("the poles disagree with the netlist");
+        match &error {
+            BoardError::PinFacadeMismatch { reference, pin } => {
+                assert_eq!(reference, "S1");
+                assert_eq!(pin, named, "the first mismatch as written is the one named");
+            }
+            other => panic!("expected PinFacadeMismatch, got {other:?}"),
+        }
+    }
+
+    /// A piecewise-linear element's pins are validated the same way.
+    #[rstest]
+    fn pwl_pins_are_validated_against_the_netlist_both_ways() {
+        let mut registry = registry();
+        registry.register_pwl("SS36", ["A"], PwlSpec::default());
+        let error = Board::from_netlist(parse(NETLIST).unwrap(), &registry)
+            .expect_err("K is a pin no declaration names");
+        assert!(
+            matches!(&error, BoardError::PinFacadeMismatch { reference, pin } if reference == "D1" && pin == "K"),
+            "{error:?}"
+        );
     }
 }

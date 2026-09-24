@@ -34,8 +34,8 @@ use embsim_board::mcu::{
     EncoderChannelConfig, GpioChannelConfig, GpioDirection, PulseOutChannelConfig,
 };
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EventLog, Harness, McuComponent, PinDecl, PinKind,
-    PulseDirection, StreamRole, System, TheveninDrive,
+    AttachError, Component, ComponentNetIo, EventLog, Harness, IdleDrive, McuComponent, PinDecl,
+    PinKind, PulseDirection, StreamRole, System, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_peripherals::{encoder, gpio, pulse_out};
@@ -210,6 +210,7 @@ fn output(number: &'static str) -> PinDecl {
         kind: PinKind::DigitalOut,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -240,6 +241,7 @@ fn input(number: &'static str, stream: Option<StreamRole>) -> PinDecl {
         kind: PinKind::DigitalIn,
         stream,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

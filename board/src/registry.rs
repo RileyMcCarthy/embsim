@@ -1,21 +1,28 @@
-//! PartRegistry: component identity → constructor; auto-classification tiers.
+//! PartRegistry: component identity → class; auto-classification tiers.
 //!
-//! Classification is three-tier and keyed primarily on the libsource **part**
-//! name (the lib name is best-effort only; rescue mangling like
+//! There is **one pipeline**: netlist part → registry class → node
+//! (`DESIGN.md` rule 1). A part is a node whose class has behaviour, or the
+//! board refuses to build naming the part and its value. Classification is
+//! three-tier and keyed primarily on the libsource **part** name (the lib
+//! name is best-effort only; rescue mangling like
 //! `DS2_Addon-rescue::Jumper_NO_Small-Device` is normalized before matching):
 //!
 //! 1. **auto** — passive primitives (`R*`/`C*`/`L*`/`LED`/`D_*`, pin-count
 //!    validated), connectors/screw terminals (board boundary pins), jumpers
-//!    (stateful shorts), and ignored mechanicals (mounting holes, logos,
-//!    test points). A board-specific connector symbol whose part name matches
-//!    no prefix joins this tier through
+//!    (stateful shorts), two-pin `SW_*` switches (one open pole), test points
+//!    (probe nodes) and mechanical parts (mounting holes, logos, fiducials —
+//!    nodes with pads and nothing electrical). A board-specific connector
+//!    symbol whose part name matches no prefix joins this tier through
 //!    [`PartRegistry::register_boundary`].
 //! 2. **registry** — anything else, keyed by part name, falling back to
-//!    `value`; consumer-registered [`Component`] constructor, with an
-//!    expansion hook (one netlist component → N primitives, for
-//!    arrays/multi-unit symbols).
-//! 3. **error** — no registry match: system construction fails; a per-board
-//!    explicit stub list is the only escape.
+//!    `value`: a consumer-registered [`Component`] constructor
+//!    ([`PartRegistry::register`]), a switch with declared poles
+//!    ([`PartRegistry::register_switch`]), a piecewise-linear element
+//!    ([`PartRegistry::register_pwl`]) or a mechanical part
+//!    ([`PartRegistry::register_mechanical`]).
+//! 3. **error** — no registry match: [`RegistryError::UnknownPart`], naming
+//!    the reference, the part and the value. System construction fails.
+//!    There is no stub tier and no allow-list.
 //!
 //! # Netlists with no `libsource`
 //!
@@ -27,9 +34,6 @@
 //! auto tier matches against a class name derived from its **reference
 //! designator prefix** ([`reference_designator_class`]). See that function for
 //! the prefix table and why the fallback is opt-in.
-//!
-//! Slice status: types and API surface are final; the classification and
-//! value-parsing bodies are the classification slice.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -56,7 +60,8 @@ pub enum PassiveKind {
     Led,
 }
 
-/// State of a jumper's stateful short (scenario-overridable).
+/// State of a jumper's stateful short, and of one switch pole
+/// (scenario-overridable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JumperState {
     /// Terminals disconnected (`_NO`/`_Open` default).
@@ -65,7 +70,54 @@ pub enum JumperState {
     Closed,
 }
 
-/// Result of classifying one netlist component.
+/// One pole of a switch: two pin ids of the part, and the pole's state.
+///
+/// A closed pole is a **build-time identity union** of the two pins' nets
+/// (the same merge a `pin_short` makes, honouring detached pins); an open
+/// pole contributes nothing. Poles are addressed by their index in the
+/// declaration order, from `Scenario::switch(reference, pole, state)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SwitchPole {
+    /// One side of the pole, by netlist pin id.
+    pub a: String,
+    /// The other side, by netlist pin id.
+    pub b: String,
+    /// The pole's state (the default at build; a scenario can change it).
+    pub state: JumperState,
+}
+
+impl SwitchPole {
+    /// A pole between pins `a` and `b`, open by default.
+    pub fn open(a: impl Into<String>, b: impl Into<String>) -> Self {
+        Self {
+            a: a.into(),
+            b: b.into(),
+            state: JumperState::Open,
+        }
+    }
+
+    /// A pole between pins `a` and `b`, closed by default.
+    pub fn closed(a: impl Into<String>, b: impl Into<String>) -> Self {
+        Self {
+            a: a.into(),
+            b: b.into(),
+            state: JumperState::Closed,
+        }
+    }
+}
+
+/// The specification of a piecewise-linear element (a diode, an LED, a FET
+/// or BJT channel, a current regulator) — **a placeholder**: the class
+/// exists so a part can be declared one now; the curves, regions and their
+/// provenance land with the elements themselves (`NODES.md` §8 phase 3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct PwlSpec {}
+
+/// Result of classifying one netlist component. Every variant is a node
+/// class with behaviour (or, for the types phase 1 declares ahead of their
+/// behaviour, a class whose behaviour is scheduled by `NODES.md`); there is
+/// no "absent" or "stubbed" outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Classification {
     /// Auto tier: a passive primitive with its parsed base-SI value
@@ -87,15 +139,36 @@ pub enum Classification {
         /// True for 3-pin `Jumper_3_*` variants with a selectable position.
         selectable: bool,
     },
-    /// Auto tier: mounting holes / logos / test points — absent from the
-    /// built board.
-    Ignored,
+    /// A switch: poles by pin id, each open or closed at build. Auto tier for
+    /// a two-pin `SW_*` symbol (one open pole across pins `1` and `2`, the
+    /// KiCad `Switch` library's two-terminal pinout); registry tier for
+    /// anything declared through [`PartRegistry::register_switch`].
+    Switch {
+        /// The poles, in declaration order.
+        poles: Vec<SwitchPole>,
+    },
+    /// Registry tier: a piecewise-linear element declared through
+    /// [`PartRegistry::register_pwl`]. Its pins are validated against the
+    /// netlist in both directions, like a registered component's facade.
+    Pwl {
+        /// The element's specification.
+        spec: PwlSpec,
+        /// The pins the element declares, by netlist pin id.
+        pins: Vec<String>,
+    },
+    /// Auto tier: a test point — a one-pin probe node that senses and never
+    /// drives. A `TestPoint*` symbol on no net is [`Classification::Mechanical`]
+    /// (a pad); one with more pins is whatever the consumer registers it as,
+    /// and a pin-count error when nothing is registered.
+    Probe,
+    /// A mechanical part — a mounting hole, a logo, a fiducial, a board
+    /// outline, a layout node: pads recorded, nothing electrical. Auto tier
+    /// by part-name prefix, or declared through
+    /// [`PartRegistry::register_mechanical`].
+    Mechanical,
     /// Registry tier: a consumer-registered [`Component`] constructor exists
     /// for this part.
     Registered,
-    /// A component the consumer explicitly stubbed out for this board (the
-    /// only escape from the error tier).
-    Stubbed,
 }
 
 // ============================================================
@@ -105,23 +178,59 @@ pub enum Classification {
 /// Constructor for a consumer-registered component.
 pub type ComponentCtor = Box<dyn Fn(&ComponentDecl) -> Box<dyn Component> + Send + Sync>;
 
-/// Expansion hook: one netlist component → N primitive declarations
-/// (resistor arrays, multi-unit symbols).
-pub type ExpansionHook = Box<dyn Fn(&ComponentDecl) -> Vec<ComponentDecl> + Send + Sync>;
+/// One registry entry: what a part keyed by name (or value) is.
+enum RegistryEntry {
+    /// A model: a component constructor.
+    Component(ComponentCtor),
+    /// A switch with declared poles.
+    Switch(Vec<SwitchPole>),
+    /// A piecewise-linear element.
+    Pwl { spec: PwlSpec, pins: Vec<String> },
+    /// A mechanical part.
+    Mechanical,
+}
 
-/// Consumer part registry: maps part identity to component constructors and
-/// expansion hooks. Lookup keys on the rescue-normalized part name, falling
-/// back to the component `value`.
+impl RegistryEntry {
+    /// The classification this entry produces.
+    fn classification(&self) -> Classification {
+        match self {
+            RegistryEntry::Component(_) => Classification::Registered,
+            RegistryEntry::Switch(poles) => Classification::Switch {
+                poles: poles.clone(),
+            },
+            RegistryEntry::Pwl { spec, pins } => Classification::Pwl {
+                spec: spec.clone(),
+                pins: pins.clone(),
+            },
+            RegistryEntry::Mechanical => Classification::Mechanical,
+        }
+    }
+
+    /// A one-word label for `Debug`.
+    fn kind(&self) -> &'static str {
+        match self {
+            RegistryEntry::Component(_) => "component",
+            RegistryEntry::Switch(_) => "switch",
+            RegistryEntry::Pwl { .. } => "pwl",
+            RegistryEntry::Mechanical => "mechanical",
+        }
+    }
+}
+
+/// Consumer part registry: maps part identity to a class — a component
+/// constructor, a switch's poles, a piecewise-linear element, a mechanical
+/// part. Lookup keys on the rescue-normalized part name, falling back to the
+/// component `value`; one table, so a later registration of the same key
+/// replaces the earlier one whatever its kind.
 #[derive(Default)]
 pub struct PartRegistry {
-    constructors: HashMap<String, ComponentCtor>,
-    expansions: HashMap<String, ExpansionHook>,
+    entries: HashMap<String, RegistryEntry>,
     boundaries: HashSet<String>,
     reference_fallback: bool,
 }
 
 impl fmt::Debug for PartRegistry {
-    /// hash-order: these three are the only unordered iterations left in the
+    /// hash-order: these two are the only unordered iterations left in the
     /// crate, and they are **not** on an engine path — `Debug` output for a
     /// human, reached by no resolution, routing, or classification decision
     /// (lookups all go through `get`). Sorting them would only be cosmetic, so
@@ -130,10 +239,13 @@ impl fmt::Debug for PartRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PartRegistry")
             .field(
-                "constructors",
-                &self.constructors.keys().collect::<Vec<_>>(),
+                "entries",
+                &self
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (key, entry.kind()))
+                    .collect::<Vec<_>>(),
             )
-            .field("expansions", &self.expansions.keys().collect::<Vec<_>>())
             .field("boundaries", &self.boundaries.iter().collect::<Vec<_>>())
             .field("reference_fallback", &self.reference_fallback)
             .finish()
@@ -146,13 +258,65 @@ impl PartRegistry {
         Self::default()
     }
 
-    /// Register a component constructor for a part name.
+    /// Register a component constructor for a part name (or, on a netlist
+    /// with no libsource, a value).
     pub fn register(
         &mut self,
         part: impl Into<String>,
         ctor: impl Fn(&ComponentDecl) -> Box<dyn Component> + Send + Sync + 'static,
     ) {
-        self.constructors.insert(part.into(), Box::new(ctor));
+        self.entries
+            .insert(part.into(), RegistryEntry::Component(Box::new(ctor)));
+    }
+
+    /// Declare a part name to be a **switch** with the given poles, each a
+    /// pair of the part's netlist pin ids with its default state.
+    ///
+    /// A DIP switch, a slide switch, a solder link: parts whose pins pair
+    /// off into contacts the netlist does not describe. The pairing is a
+    /// registry declaration; the board build validates every pole's pins
+    /// against the netlist in both directions (a pin no pole names, or a
+    /// pole naming a pin the part lacks, is a hard error). Poles are
+    /// addressed by their index here, in order, from `Scenario::switch`; a
+    /// closed pole is an identity union of its two nets at build.
+    ///
+    /// Two-pin `SW_*` symbols need no declaration — the auto tier gives them
+    /// one open pole across pins `1` and `2`.
+    pub fn register_switch(&mut self, part: impl Into<String>, poles: Vec<SwitchPole>) {
+        self.entries
+            .insert(part.into(), RegistryEntry::Switch(poles));
+    }
+
+    /// Declare a part name to be a **piecewise-linear element** with the
+    /// given pins (validated against the netlist in both directions) and
+    /// specification. The class is declared ahead of its behaviour: see
+    /// [`PwlSpec`].
+    pub fn register_pwl(
+        &mut self,
+        part: impl Into<String>,
+        pins: impl IntoIterator<Item = impl Into<String>>,
+        spec: PwlSpec,
+    ) {
+        self.entries.insert(
+            part.into(),
+            RegistryEntry::Pwl {
+                spec,
+                pins: pins.into_iter().map(Into::into).collect(),
+            },
+        );
+    }
+
+    /// Declare a part name — or, on a netlist with no libsource, a value —
+    /// to be a **mechanical** part: a node with pads and nothing electrical.
+    ///
+    /// The auto tier already recognizes `MountingHole*`, `Logo*` and
+    /// `Fiducial*` symbols. A transcribed netlist's BOM-only lines (a raw
+    /// PCB with no nodes, a layout node, a mounting hole drawn as a pad
+    /// symbol) carry no part name and match no prefix; declaring their
+    /// values here makes them the explicit mechanical nodes they are, so the
+    /// board builds with every part classified and none excused.
+    pub fn register_mechanical(&mut self, part: impl Into<String>) {
+        self.entries.insert(part.into(), RegistryEntry::Mechanical);
     }
 
     /// Declare a part name to be a **board boundary** — a connector or socket
@@ -163,10 +327,9 @@ impl PartRegistry {
     /// `Screw_Terminal*` symbols. Boards that draw their own connector symbol
     /// (`P2_EDGE_MODULE_SOCKET`, `Edge Socket Pads`, a shrouded-header
     /// footprint from a project library) match no prefix and would otherwise
-    /// need a per-board stub entry, which says "electrically absent" where the
-    /// truth is "this is where the harness plugs in". Declaring the part name
-    /// here classifies every instance as [`Classification::Boundary`], exactly
-    /// like a `Conn_01x05`.
+    /// fail to classify, where the truth is "this is where the harness plugs
+    /// in". Declaring the part name here classifies every instance as
+    /// [`Classification::Boundary`], exactly like a `Conn_01x05`.
     ///
     /// Boundary declarations win over the registry: a part that is both
     /// registered and declared boundary classifies as a boundary (the
@@ -196,37 +359,35 @@ impl PartRegistry {
         self.reference_fallback = enabled;
     }
 
-    /// Register an expansion hook for a part name (one netlist component →
-    /// N primitives).
-    pub fn register_expansion(
-        &mut self,
-        part: impl Into<String>,
-        hook: impl Fn(&ComponentDecl) -> Vec<ComponentDecl> + Send + Sync + 'static,
-    ) {
-        self.expansions.insert(part.into(), Box::new(hook));
+    /// True when a registry entry of any kind exists for the (already
+    /// normalized) part name or value.
+    pub fn has_part(&self, part: &str) -> bool {
+        self.entries.contains_key(part)
     }
 
-    /// True when a constructor is registered for the (already normalized)
-    /// part name.
-    pub fn has_part(&self, part: &str) -> bool {
-        self.constructors.contains_key(part)
+    /// The registry entry for a declaration, keyed by normalized part name
+    /// with fallback to `value`.
+    fn entry(&self, decl: &ComponentDecl) -> Option<&RegistryEntry> {
+        let part = normalize_part(decl);
+        self.entries
+            .get(part.as_str())
+            .or_else(|| self.entries.get(decl.value.as_str()))
     }
 
     /// Construct the registered component for a declaration, keyed by
     /// normalized part name with fallback to `value`. `None` when no
-    /// registry entry matches (the error tier).
+    /// component constructor matches (an entry of another kind, or none).
     pub fn construct(&self, decl: &ComponentDecl) -> Option<Box<dyn Component>> {
-        let part = normalize_part(decl);
-        self.constructors
-            .get(part.as_str())
-            .or_else(|| self.constructors.get(decl.value.as_str()))
-            .map(|ctor| ctor(decl))
+        match self.entry(decl) {
+            Some(RegistryEntry::Component(ctor)) => Some(ctor(decl)),
+            _ => None,
+        }
     }
 
     /// Classify one netlist component through the three tiers. `pin_count`
     /// is the component's node count from the netlist — a 2-terminal passive
-    /// class with a different pin count is a hard classification error
-    /// (resistor arrays etc. need a registry expansion entry).
+    /// class with a different pin count is a hard classification error, and
+    /// so is a test point with more than one pin.
     pub fn classify(
         &self,
         decl: &ComponentDecl,
@@ -247,25 +408,54 @@ impl PartRegistry {
 
         // An EXPLICIT registration beats a SYNTHESIZED class. The reference
         // designator is a guess made only because the netlist carried no part
-        // name; a constructor the consumer registered for this component's
-        // `value` is a statement of intent, and a guess must not override one.
+        // name; an entry the consumer registered for this component's `value`
+        // is a statement of intent, and a guess must not override one.
         //
         // Without this a component can be unmountable for a reason nothing
         // reports: `J301` on the P2-EC32MB fixture is a microSD socket with a
         // card behind it, and a `J` prefix classified it as a board boundary
         // before the registry was ever consulted — so registering a live card
-        // silently did nothing, and the board built without it.
+        // silently did nothing, and the board built without it. The same
+        // rule is what lets `J101` (a solder link) be the one-pole switch it
+        // is, and `J701`/`J702` (mounting holes) mechanical.
         //
         // Narrow on purpose: a class from a REAL libsource part name (a
         // `Conn_01x04` symbol, say) still wins, because there the netlist is
         // telling us what the part is rather than us inferring it.
-        if synthetic_class.is_some() && self.constructors.contains_key(decl.value.as_str()) {
-            return Ok(Classification::Registered);
+        if synthetic_class.is_some() {
+            if let Some(entry) = self.entries.get(decl.value.as_str()) {
+                return Ok(entry.classification());
+            }
         }
 
-        // Tier 1a: ignored mechanicals — absent from the built board.
-        if starts_with_any(auto, &["MountingHole", "Logo", "TestPoint", "Fiducial"]) {
-            return Ok(Classification::Ignored);
+        // Tier 1a: mechanical parts and test points — nodes with pads.
+        if starts_with_any(auto, &["MountingHole", "Logo", "Fiducial"]) {
+            return Ok(Classification::Mechanical);
+        }
+        if auto.starts_with("TestPoint") {
+            match pin_count {
+                // A probe: one pad, sensed, never driven.
+                1 => return Ok(Classification::Probe),
+                // A test point on no net is a pad with nothing electrical —
+                // the export still carries the symbol, and the board still
+                // builds.
+                0 => return Ok(Classification::Mechanical),
+                // A multi-pin `TestPoint_*` symbol (a `TestPoint_2Pole`, a
+                // probe header) is not a probe; what it is, the consumer
+                // says by registering it, and only an unregistered one is
+                // the pin-count error.
+                _ => {
+                    if let Some(entry) = self.entry(decl) {
+                        return Ok(entry.classification());
+                    }
+                    return Err(RegistryError::BadPinCount {
+                        reference: decl.reference.clone(),
+                        part,
+                        expected: 1,
+                        found: pin_count,
+                    });
+                }
+            }
         }
 
         // Tier 1b: connectors / screw terminals — board boundary pins. The
@@ -290,7 +480,28 @@ impl PartRegistry {
             });
         }
 
-        // Tier 1d: passive primitives — the part-name class is anchored so
+        // Tier 1d: two-pin switches — one open pole across pins 1 and 2, the
+        // pinout of every two-terminal symbol in the KiCad `Switch` library
+        // (`SW_Push`, `SW_SPST`, `SW_DIP_x01`, …). A `SW_*` symbol with more
+        // pins pairs them off in a way the name does not say, so it is a
+        // `register_switch` declaration like any other multi-pole part.
+        //
+        // The pole pairing here is synthesized from a library convention,
+        // and an explicit registration beats a synthesized class (the rule
+        // above): a project-library `SW_*` symbol whose pins are not `1`/`2`
+        // can only be built through `register_switch`, and a model
+        // registered for a switch part name must not be overridden by the
+        // guess.
+        if auto.starts_with("SW_") && pin_count == 2 {
+            if let Some(entry) = self.entry(decl) {
+                return Ok(entry.classification());
+            }
+            return Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("1", "2")],
+            });
+        }
+
+        // Tier 1e: passive primitives — the part-name class is anchored so
         // e.g. "RJ45" never classifies as a resistor.
         if let Some(kind) = passive_kind(auto) {
             if pin_count != 2 {
@@ -309,17 +520,17 @@ impl PartRegistry {
 
         // Tier 2: consumer registry, keyed on normalized part name with a
         // fallback to the value field.
-        if self.constructors.contains_key(part.as_str())
-            || self.constructors.contains_key(decl.value.as_str())
-        {
-            return Ok(Classification::Registered);
+        if let Some(entry) = self.entry(decl) {
+            return Ok(entry.classification());
         }
 
-        // Tier 3: hard error — the board's explicit stub list is the only
-        // escape (applied by the board build, not here).
+        // Tier 3: hard error, naming what could not be classified. There is
+        // no escape: a part is a node whose class has behaviour, or the board
+        // does not build.
         Err(RegistryError::UnknownPart {
             reference: decl.reference.clone(),
             part,
+            value: decl.value.clone(),
         })
     }
 }
@@ -351,8 +562,8 @@ fn starts_with_any(part: &str, prefixes: &[&str]) -> bool {
 /// | `L` | `L` | inductor (DC short) |
 /// | `D` | `D` | diode — LEDs share the `D` prefix and are DC-open either way |
 /// | `J`, `P` | `Conn` | board boundary (connector, socket, pad pair) |
-/// | `TP` | `TestPoint` | ignored |
-/// | `H`, `MK` | `MountingHole` | ignored |
+/// | `TP` | `TestPoint` | probe node |
+/// | `H`, `MK` | `MountingHole` | mechanical node |
 ///
 /// Everything else — `U`, `IC`, `Q`, `X`, `S`, `SW`, `FB`, … — returns `None`
 /// so active silicon still has to be registered by the consumer. That is the
@@ -427,16 +638,32 @@ pub fn normalize_part_name(part: &str) -> String {
 
 /// Parse a passive value field into base SI units (Ω / F / H).
 ///
-/// Grammar (case significant for multipliers): digits with either a decimal
-/// point or an embedded multiplier letter acting as one (`4k7` = 4.7 k,
-/// `2R2` = 2.2), an optional multiplier (`p n u µ m k K M G`, plus `R` = ×1
-/// for resistors), and an optional unit letter (`R Ω F H`) which is ignored.
-/// Returns `None` for non-numeric fields (`"X"`, `"ADS122U04"`).
+/// **First-token parsing.** The electrical value is the first token of the
+/// field in every convention this crate has met — `"4.7uF 6.3V"`,
+/// `"22uF 25V"`, `"47uH/3A"`, `"3.3uH 6.6A 28.6mOhm"`, `"1nF (1000pF)"` —
+/// and everything after whitespace, a slash, a comma or an opening
+/// parenthesis is a rating, a tolerance or an alias, which a DC model does
+/// not read. So the field is cut at the first of those and the token parsed.
+///
+/// Grammar of the token (case significant for multipliers): digits with
+/// either a decimal point or an embedded multiplier letter acting as one
+/// (`4k7` = 4.7 k, `2R2` = 2.2), an optional multiplier (`p n u µ m k K M G`,
+/// plus `R` = ×1 for resistors), and an optional unit (`R Ω Ohm F H`) which is
+/// ignored. Returns `None` for non-numeric fields (`"X"`, `"ADS122U04"`,
+/// `"White"`, `"DIP Switch 4 way"`).
 pub fn parse_passive_value(value: &str) -> Option<f64> {
-    let v = value.trim().trim_end_matches('Ω');
-    // Strip a trailing unit letter (F/H, or R when it follows the number and
-    // a multiplier was already seen: "4k7R" — keep simple: strip one trailing
-    // F or H always; R is handled as a multiplier below).
+    let token = value
+        .trim()
+        .split(|c: char| c.is_whitespace() || matches!(c, '/' | ',' | '('))
+        .next()?;
+    let v = token.trim_end_matches('Ω');
+    let v = v
+        .strip_suffix("Ohms")
+        .or_else(|| v.strip_suffix("Ohm"))
+        .or_else(|| v.strip_suffix("ohms"))
+        .or_else(|| v.strip_suffix("ohm"))
+        .unwrap_or(v);
+    // Strip a trailing unit letter (F/H); R is handled as a multiplier below.
     let v = v.strip_suffix(['F', 'H']).unwrap_or(v);
     if v.is_empty() {
         return None;
@@ -491,16 +718,20 @@ pub fn parse_passive_value(value: &str) -> Option<f64> {
 /// Classification failure (tier 3, or an auto-tier validation violation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
-    /// No auto-tier match and no registry entry — system construction fails
-    /// unless the board stubs the reference explicitly.
+    /// No auto-tier match and no registry entry — the board does not build.
+    /// Names the reference, the part and the value, because on a netlist
+    /// with no libsource the part is empty and the value is the only name
+    /// the part has.
     UnknownPart {
         /// Component reference designator.
         reference: String,
         /// Normalized part name that failed to match.
         part: String,
+        /// The component's value field.
+        value: String,
     },
-    /// An auto-classified 2-terminal class with a different netlist pin
-    /// count.
+    /// An auto-classified class with a different netlist pin count than it
+    /// requires (a 2-terminal primitive, a 1-pin test point).
     BadPinCount {
         /// Component reference designator.
         reference: String,
@@ -516,8 +747,15 @@ pub enum RegistryError {
 impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RegistryError::UnknownPart { reference, part } => {
-                write!(f, "{reference}: no classification or registry entry for part {part:?}")
+            RegistryError::UnknownPart {
+                reference,
+                part,
+                value,
+            } => {
+                write!(
+                    f,
+                    "{reference}: no classification or registry entry for part {part:?} with value {value:?}"
+                )
             }
             RegistryError::BadPinCount { reference, part, expected, found } => write!(
                 f,
@@ -593,6 +831,39 @@ mod tests {
         assert_eq!(parse_passive_value(""), None);
     }
 
+    /// The value is the first token; what follows is a rating, a tolerance
+    /// or an alias, and a DC model reads none of it.
+    #[rstest]
+    #[case::cap_with_voltage_rating("4.7uF 6.3V", 4.7e-6)]
+    #[case::cap_with_higher_rating("22uF 25V", 22e-6)]
+    #[case::inductor_with_current_rating("47uH/3A", 47e-6)]
+    #[case::inductor_with_current_and_dcr("3.3uH 6.6A 28.6mOhm", 3.3e-6)]
+    #[case::cap_with_alias_in_parens("1nF (1000pF)", 1e-9)]
+    #[case::upper_case_kilo("10.5K", 10_500.0)]
+    #[case::embedded_kilo("4k7", 4700.0)]
+    #[case::resistor_r_unit("240R", 240.0)]
+    #[case::resistor_with_tolerance("10k 1%", 10_000.0)]
+    #[case::ohm_unit_word("28.6mOhm", 28.6e-3)]
+    #[case::ohm_symbol("47Ω", 47.0)]
+    #[case::comma_separated_rating("100nF,50V", 1e-7)]
+    fn the_first_token_of_a_value_field_is_the_value(#[case] field: &str, #[case] expected: f64) {
+        assert_parses_to(field, expected);
+    }
+
+    /// A field whose first token is a word is not a value, whatever follows.
+    #[rstest]
+    #[case::dnp("X")]
+    #[case::part_number("ADS122U04")]
+    #[case::colour("White")]
+    #[case::switch("DIP Switch 4 way")]
+    #[case::regulator("LDO 300mA, 3.3V")]
+    #[case::processor("P2X8C4M64P")]
+    #[case::empty("")]
+    #[case::blank("   ")]
+    fn a_field_that_starts_with_a_word_has_no_value(#[case] field: &str) {
+        assert_eq!(parse_passive_value(field), None);
+    }
+
     #[rstest]
     fn classifies_real_ds2addon_components() {
         let registry = {
@@ -638,14 +909,30 @@ mod tests {
             registry.classify(&decl_with_lib("DS2_Addon", "ADS122U04", "ADS122U04"), 16),
             Ok(Classification::Registered)
         );
-        // Unknown part with no registry entry -> hard error naming the part.
+        // Unknown part with no registry entry -> hard error naming the part
+        // and its value.
         assert_eq!(
             registry.classify(&decl_with_lib("Weird", "FrobulatorX", "?"), 4),
             Err(RegistryError::UnknownPart {
                 reference: "U1".to_string(),
-                part: "FrobulatorX".to_string()
+                part: "FrobulatorX".to_string(),
+                value: "?".to_string(),
             })
         );
+    }
+
+    /// The error a consumer reads names all three things they need to fix
+    /// it: which part, which symbol, which value.
+    #[rstest]
+    fn an_unknown_part_error_names_the_reference_the_part_and_the_value() {
+        let registry = PartRegistry::new();
+        let error = registry
+            .classify(&decl_with_lib("Weird", "FrobulatorX", "FX-7"), 4)
+            .expect_err("nothing classifies a FrobulatorX");
+        let rendered = error.to_string();
+        for needle in ["U1", "FrobulatorX", "FX-7"] {
+            assert!(rendered.contains(needle), "{rendered:?} lacks {needle}");
+        }
     }
 
     #[rstest]
@@ -683,6 +970,107 @@ mod tests {
         );
     }
 
+    // --------------------------------------------------------
+    // Mechanical parts, test points, switches
+    // --------------------------------------------------------
+
+    /// A mounting hole, a logo or a fiducial is a mechanical node — a part
+    /// the board carries — and a test point a probe node; a test point on
+    /// no net is a pad, mechanical.
+    #[rstest]
+    #[case::mounting_hole("Mechanical", "MountingHole_Pad", 1, Classification::Mechanical)]
+    #[case::logo("Graphic", "Logo_Open_Hardware_Small", 0, Classification::Mechanical)]
+    #[case::fiducial("Mechanical", "Fiducial", 0, Classification::Mechanical)]
+    #[case::test_point("Connector", "TestPoint", 1, Classification::Probe)]
+    #[case::unconnected_test_point("Connector", "TestPoint", 0, Classification::Mechanical)]
+    fn mechanical_symbols_and_test_points_are_nodes(
+        #[case] lib: &str,
+        #[case] part: &str,
+        #[case] pins: usize,
+        #[case] expected: Classification,
+    ) {
+        let registry = PartRegistry::new();
+        assert_eq!(
+            registry.classify(&decl_with_lib(lib, part, "~"), pins),
+            Ok(expected)
+        );
+    }
+
+    /// A probe has one pin; a `TestPoint` symbol with more is not one, and
+    /// nothing registered for it is the pin-count error.
+    #[rstest]
+    fn a_test_point_with_more_than_one_pin_is_a_pin_count_error() {
+        let registry = PartRegistry::new();
+        assert_eq!(
+            registry.classify(&decl_with_lib("Connector", "TestPoint_2Pole", "TP"), 2),
+            Err(RegistryError::BadPinCount {
+                reference: "U1".to_string(),
+                part: "TestPoint_2Pole".to_string(),
+                expected: 1,
+                found: 2
+            })
+        );
+    }
+
+    /// A multi-pin `TestPoint` symbol is what the consumer registers it as
+    /// — a two-pole probe header is a switch across its pads, a probe
+    /// connector a model — reached through the same registry tier as any
+    /// other part the auto tier cannot place.
+    #[rstest]
+    fn a_multi_pin_test_point_symbol_classifies_as_registered() {
+        let mut registry = PartRegistry::new();
+        registry.register_switch("TestPoint_2Pole", vec![SwitchPole::open("1", "2")]);
+        assert_eq!(
+            registry.classify(&decl_with_lib("Connector", "TestPoint_2Pole", "TP"), 2),
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("1", "2")]
+            })
+        );
+        registry.register("TestPoint_Probe", |_| Box::new(NullComponent));
+        assert_eq!(
+            registry.classify(&decl_with_lib("Connector", "TestPoint_Probe", "TP"), 4),
+            Ok(Classification::Registered)
+        );
+    }
+
+    /// A two-pin `SW_*` symbol is a one-pole switch across pins 1 and 2,
+    /// open; a `SW_*` symbol with more pins is a registry declaration.
+    #[rstest]
+    fn two_pin_switch_symbols_get_one_open_pole() {
+        let registry = PartRegistry::new();
+        assert_eq!(
+            registry.classify(&decl_with_lib("Switch", "SW_Push", "RESET"), 2),
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("1", "2")]
+            })
+        );
+        // A DPDT symbol pairs six pins in a way its name does not say.
+        assert!(matches!(
+            registry.classify(&decl_with_lib("Switch", "SW_DPDT_x2", "S1"), 6),
+            Err(RegistryError::UnknownPart { .. })
+        ));
+    }
+
+    /// The two-pin `SW_*` pole across pins 1 and 2 is a guess from the
+    /// library convention; a registration for the part name — a switch
+    /// whose pads are named otherwise, or a model — beats it.
+    #[rstest]
+    fn an_explicit_registration_beats_the_two_pin_switch_guess() {
+        let mut registry = PartRegistry::new();
+        registry.register_switch("SW_Reset", vec![SwitchPole::open("A", "B")]);
+        assert_eq!(
+            registry.classify(&decl_with_lib("Project", "SW_Reset", "RESET"), 2),
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("A", "B")]
+            })
+        );
+        registry.register("SW_Push", |_| Box::new(NullComponent));
+        assert_eq!(
+            registry.classify(&decl_with_lib("Switch", "SW_Push", "RESET"), 2),
+            Ok(Classification::Registered)
+        );
+    }
+
     #[rstest]
     fn rescue_normalization_requires_rescue_lib() {
         assert_eq!(
@@ -697,6 +1085,67 @@ mod tests {
         assert_eq!(
             normalize_part(&decl_with_lib("SomeLib", "PART-7", "")),
             "PART-7"
+        );
+    }
+
+    /// A registered switch classifies with exactly the poles it declared,
+    /// in order, with their default states.
+    #[rstest]
+    fn a_registered_switch_carries_its_declared_poles() {
+        let mut registry = PartRegistry::new();
+        registry.register_switch(
+            "DIP Switch 4 way",
+            vec![
+                SwitchPole::open("1_ON", "1_OFF"),
+                SwitchPole::closed("2_ON", "2_OFF"),
+            ],
+        );
+        assert_eq!(
+            registry.classify(&decl("DIP Switch 4 way", "S301"), 4),
+            Ok(Classification::Switch {
+                poles: vec![
+                    SwitchPole::open("1_ON", "1_OFF"),
+                    SwitchPole::closed("2_ON", "2_OFF"),
+                ]
+            })
+        );
+        assert!(registry.has_part("DIP Switch 4 way"));
+        // A switch is not a component: nothing to construct.
+        assert!(registry
+            .construct(&decl("DIP Switch 4 way", "S301"))
+            .is_none());
+    }
+
+    /// A registered piecewise-linear element classifies with its pins and
+    /// specification.
+    #[rstest]
+    fn a_registered_pwl_element_carries_its_pins_and_spec() {
+        let mut registry = PartRegistry::new();
+        registry.register_pwl("SS36", ["K", "A"], PwlSpec::default());
+        assert_eq!(
+            registry.classify(&decl_with_lib("Diode", "SS36", "SS36"), 2),
+            Ok(Classification::Pwl {
+                spec: PwlSpec::default(),
+                pins: vec!["K".to_string(), "A".to_string()],
+            })
+        );
+    }
+
+    /// One table: registering a key again replaces the earlier entry
+    /// whatever its kind, so a model can take over a part that was declared
+    /// a class before it existed.
+    #[rstest]
+    fn a_later_registration_replaces_an_earlier_one_of_any_kind() {
+        let mut registry = PartRegistry::new();
+        registry.register_mechanical("THING");
+        assert_eq!(
+            registry.classify(&decl("THING", "?"), 3),
+            Ok(Classification::Mechanical)
+        );
+        registry.register("THING", |_| Box::new(NullComponent));
+        assert_eq!(
+            registry.classify(&decl("THING", "?"), 3),
+            Ok(Classification::Registered)
         );
     }
 
@@ -813,7 +1262,8 @@ mod tests {
             registry.classify(&unnamed("R100", "10.5K"), 2),
             Err(RegistryError::UnknownPart {
                 reference: "R100".to_string(),
-                part: String::new()
+                part: String::new(),
+                value: "10.5K".to_string(),
             })
         );
         assert!(matches!(
@@ -840,21 +1290,23 @@ mod tests {
             })
         );
         // C100: a decoupling cap whose value field carries a voltage rating —
-        // classifies, value unparsed (DC-open either way).
-        assert_eq!(
-            registry.classify(&unnamed("C100", "4.7uF 6.3V"), 2),
-            Ok(Classification::Passive {
-                kind: PassiveKind::Capacitor,
-                value: None
-            })
-        );
-        assert_eq!(
-            registry.classify(&unnamed("L401", "3.3uH 6.6A 28.6mOhm"), 2),
-            Ok(Classification::Passive {
-                kind: PassiveKind::Inductor,
-                value: None
-            })
-        );
+        // classifies, value parsed from the first token (compared with a
+        // tolerance: multiplier arithmetic carries ULP-level error).
+        let parsed_passive = |reference: &str, value: &str| -> (PassiveKind, f64) {
+            match registry.classify(&unnamed(reference, value), 2) {
+                Ok(Classification::Passive {
+                    kind,
+                    value: Some(v),
+                }) => (kind, v),
+                other => panic!("{reference} {value:?} classified as {other:?}"),
+            }
+        };
+        let (kind, farads) = parsed_passive("C100", "4.7uF 6.3V");
+        assert_eq!(kind, PassiveKind::Capacitor);
+        assert!(((farads - 4.7e-6) / 4.7e-6).abs() < 1e-12, "{farads}");
+        let (kind, henries) = parsed_passive("L401", "3.3uH 6.6A 28.6mOhm");
+        assert_eq!(kind, PassiveKind::Inductor);
+        assert!(((henries - 3.3e-6) / 3.3e-6).abs() < 1e-12, "{henries}");
         // D601 is a white LED; the `D` prefix cannot tell LED from diode, and
         // both are DC-open in the build pass.
         assert_eq!(
@@ -864,34 +1316,67 @@ mod tests {
                 value: None
             })
         );
-        // The 80-finger edge socket and the mounting-hole pads are boundaries.
+        // The 80-finger edge socket is a boundary.
         assert_eq!(
             registry.classify(&unnamed("J203", "Edge Socket Pads"), 60),
             Ok(Classification::Boundary)
         );
+        // A mounting hole drawn as a `J` pad symbol is a boundary until its
+        // value is declared mechanical; then the declaration wins over the
+        // synthesized class.
         assert_eq!(
             registry.classify(&unnamed("J701", "Mounting Hole Vss"), 1),
             Ok(Classification::Boundary)
+        );
+        registry.register_mechanical("Mounting Hole Vss");
+        assert_eq!(
+            registry.classify(&unnamed("J701", "Mounting Hole Vss"), 1),
+            Ok(Classification::Mechanical)
         );
         // Registered active silicon keys on the VALUE (there is no part name).
         assert_eq!(
             registry.classify(&unnamed("U100", "P2X8C4M64P"), 86),
             Ok(Classification::Registered)
         );
-        // Unregistered active silicon still fails loudly.
+        // Unregistered active silicon still fails loudly, naming the value —
+        // the only name it has.
         assert_eq!(
             registry.classify(&unnamed("U301", "SPI Flash 16MB (128Mb)"), 8),
             Err(RegistryError::UnknownPart {
                 reference: "U301".to_string(),
-                part: String::new()
+                part: String::new(),
+                value: "SPI Flash 16MB (128Mb)".to_string(),
             })
         );
-        // A BOM-only refdes has no class at all — the per-board stub list is
-        // the documented escape.
+        // A BOM-only refdes has no class until its value is declared
+        // mechanical — the raw board is a node with no pads.
         assert!(matches!(
             registry.classify(&unnamed("PCB", "PCB for P2 EC Module"), 0),
             Err(RegistryError::UnknownPart { .. })
         ));
+        registry.register_mechanical("PCB for P2 EC Module");
+        assert_eq!(
+            registry.classify(&unnamed("PCB", "PCB for P2 EC Module"), 0),
+            Ok(Classification::Mechanical)
+        );
+        // A switch registered by value on a reference the fallback does not
+        // classify.
+        registry.register_switch("DIP Switch 4 way", vec![SwitchPole::open("1_ON", "1_OFF")]);
+        assert_eq!(
+            registry.classify(&unnamed("S301", "DIP Switch 4 way"), 2),
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("1_ON", "1_OFF")]
+            })
+        );
+        // A solder link is a `J` — a boundary by prefix — until its value is
+        // declared the one-pole switch it is.
+        registry.register_switch("Solder Link Pads", vec![SwitchPole::open("1", "2")]);
+        assert_eq!(
+            registry.classify(&unnamed("J101", "Solder Link Pads"), 2),
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("1", "2")]
+            })
+        );
     }
 
     /// The fallback fires only for an EMPTY part name: a component that names

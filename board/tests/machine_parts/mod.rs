@@ -24,25 +24,28 @@
 //!
 //! # Stub pin kinds — the rule this module follows everywhere
 //!
-//! Most parts here are **topology-only stubs**: they declare a real pin facade
-//! (which the board build validates against the netlist in both directions, so
-//! a symbol change breaks a test instead of going unnoticed) and no behavior.
-//! Their pin kinds are not a stylistic choice:
+//! Most active parts here are still **topology-only stubs**: they declare a
+//! real pin facade (which the board build validates against the netlist in
+//! both directions, so a symbol change breaks a test instead of going
+//! unnoticed) and no behavior. `DESIGN.md` rule 1 admits no stub tier, so
+//! each is a part `NODES.md` §8 phases 2–4 replace with a model, and
+//! `cluster_census.rs` counts them as a figure that may only fall. Until
+//! then their pin kinds are not a stylistic choice:
 //!
-//! - **Power pins are declared truthfully** — [`PinKind::PowerIn`] for a rail
-//!   the part consumes, [`PinKind::PowerOut`] for one it generates. Unsourced
+//! - **Power pins are declared truthfully** — [`embsim_board::PinKind::PowerIn`] for a rail
+//!   the part consumes, [`embsim_board::PinKind::PowerOut`] for one it generates. Unsourced
 //!   rails are the highest-value diagnostic this slice produces (the DS2
 //!   bench's unstrapped AVDD is the reference case), and that only works if
 //!   supply pins say what they are.
-//! - **Signal pins are declared [`PinKind::DigitalIn`]** — a *sense*,
+//! - **Signal pins are declared [`embsim_board::PinKind::DigitalIn`]** — a *sense*,
 //!   contributing no drive — even where the real part drives. A stub has no
 //!   behavior with which to decide a level, and the engine's idle-high default
-//!   for a [`PinKind::DigitalOut`] would fabricate a drive the part does not
+//!   for a [`embsim_board::PinKind::DigitalOut`] would fabricate a drive the part does not
 //!   produce (and could manufacture [`embsim_board::Finding::Contention`] against a real
 //!   driver). Declared as senses they still participate in resolution and
 //!   still yield honest [`embsim_board::Finding::FloatingSense`] reports, while every actual
 //!   drive in the system comes from a modeled component.
-//! - **Pins the schematic marks no-connect are [`PinKind::Passive`]**
+//! - **Pins the schematic marks no-connect are [`embsim_board::PinKind::Passive`]**
 //!   ([`nc`]), so an intentionally dangling pad raises nothing.
 //!
 //! The engine takes electrical descriptors from the component facade and never
@@ -67,7 +70,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, EndpointRef, Harness, JumperState, Level,
-    McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, PinKind, Scenario,
+    McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, Scenario, SwitchPole,
     TheveninDrive, Volts,
 };
 
@@ -77,47 +80,23 @@ use embsim_board::{
 
 /// A pin the component senses and never drives.
 pub const fn dig_in(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::digital_in(number)
 }
 
 /// A push-pull output pin (idles `Driven(High)` until the component drives).
 pub const fn dig_out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::digital_out(number)
 }
 
 /// A pin whose *voltage* the component needs (participates in the cluster
 /// solve) — a differential receiver input, an ADC input.
 pub const fn analog(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::Analog,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::analog(number)
 }
 
 /// A rail the part consumes.
 pub const fn pwr_in(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::PowerIn,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::power_in(number)
 }
 
 /// A rail the part generates (regulator/DC-DC output, isolated-domain
@@ -125,24 +104,12 @@ pub const fn pwr_in(number: &'static str) -> PinDecl {
 /// to clear [`embsim_board::Finding::PowerNetUnsourced`], not enough for a
 /// component that gates on a rail *voltage*; see [`bench_rails`].
 pub const fn pwr_out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::PowerOut,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::power_out(number)
 }
 
 /// A terminal that contributes nothing electrical.
 pub const fn passive(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::Passive,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::passive(number)
 }
 
 /// A pin the schematic marks no-connect. Spelled distinctly from [`passive`]
@@ -893,7 +860,7 @@ const P2_VIO_NAMES: [&str; 16] = [
 ///   digital: the channel carries levels, so there is no byte route to
 ///   declare), every other I/O pin as a sense (a P2 pin is high-Z out of reset,
 ///   and nothing in this slice drives it), the supplies as
-///   [`PinKind::PowerIn`];
+///   [`embsim_board::PinKind::PowerIn`];
 /// - [`Component::attach`] and [`Component::start`] hand straight through to
 ///   the `McuComponent`, which finds `"P2"` and `"P0"` in the handle table it
 ///   is given and bridges them exactly as it would on a board of its own.
@@ -989,27 +956,29 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 //
 // Classification, part by part. The module's netlist carries no `libsource`,
 // so the registry runs with `classify_unnamed_by_reference(true)` and keys the
-// active parts on their `value` field:
+// other parts on their `value` field:
 //
 //   auto (reference prefix)  85 passives (C×66, R×15, L×2, D×2 LEDs) and the
-//                            five J-prefixed pad/socket symbols — J203 (the
-//                            80-finger card edge), J301 (microSD socket),
-//                            J101 (the oscillator-option solder link) and the
-//                            two mounting-hole pads J701/J702 — as boundaries.
+//                            two J-prefixed pad/socket symbols the fallback
+//                            can name — J203 (the 80-finger card edge) and
+//                            J301 (microSD socket) — as boundaries.
 //   real model               U100, the P2 (see `P2EdgeModule`).
+//   switch (by value)        S301, the four-way DIP switch, four poles by
+//                            `<position>_ON`/`<position>_OFF`; J101, the
+//                            oscillator-option solder link, one pole. Every
+//                            pole open by default; a scenario closes one.
+//   mechanical (by value)    J701/J702 (mounting holes, tied to GND), PCB
+//                            (the raw board, no nodes) and NC_Net (a layout
+//                            node): pads and nothing electrical.
 //   stub                     every other active part, below.
-//   per-board stub list      PCB and NC_Net: BOM/layout-only reference
-//                            designators with no electrical existence at all
-//                            (PCB has no nodes; NC_Net has one). They are the
-//                            documented escape rather than fake components.
 //
-// Why the rest are stubs and not models: none of them is on a signal path any
-// consumer test drives. The PSRAMs and the flash answer a QSPI controller the
+// Why the rest are still stubs and not models: none of them is on a signal
+// path any consumer test drives yet. The PSRAMs answer a QSPI controller the
 // firmware does not exercise in SIL; the LDOs, bucks, polarity FET and
 // brownout detector matter as *power topology*, which their PowerIn/PowerOut
 // declarations already express; the TCXO and its inverter buffer matter only
-// as the reason XTAL_XI exists. Promoting any of them is additive — the
-// facades below are already the netlist-validated boundary.
+// as the reason XTAL_XI exists. Each becomes a model in `NODES.md` §8 phases
+// 2–4 — the facades below are already the netlist-validated boundary.
 
 /// `74LVC2G04GW,125` — NXP dual inverter (U101 oscillator buffer, U601 LED
 /// buffer). Outputs are senses per the module docs' stub rule.
@@ -1063,7 +1032,7 @@ pub const PSRAM_PINS: [PinDecl; 9] = [
 pub const POLARITY_FET_PINS: [PinDecl; 3] = [dig_in("G"), passive("D"), passive("S")];
 
 /// `DCDC 3A SOT563` — Diodes AP62301Z buck (U402, U403). `SW` is declared
-/// [`PinKind::PowerOut`]: it is the switching node the output inductor
+/// [`embsim_board::PinKind::PowerOut`]: it is the switching node the output inductor
 /// integrates into a rail, and marking it a source is what makes the module's
 /// power tree reachable.
 pub const BUCK_PINS: [PinDecl; 5] = [
@@ -1087,29 +1056,24 @@ pub const LDO_PINS: [PinDecl; 5] = [
     pwr_out("OUT"),
 ];
 
-/// `DIP Switch 4 way` — the module's option switch (S301), pin ids
-/// `<position>_<OFF|ON>`.
-///
-/// All eight terminals are passive: a four-gang switch is not a two-terminal
-/// jumper, so the auto tier cannot classify it and the engine has no
-/// scenario primitive for a ganged position yet. The consequence is visible
-/// and asserted — with every gang open, the `P59` pull-up/pull-down and the
-/// flash chip-select strap do not conduct.
-pub const DIP_SWITCH_PINS: [PinDecl; 8] = [
-    passive("1_ON"),
-    passive("1_OFF"),
-    passive("2_ON"),
-    passive("2_OFF"),
-    passive("3_ON"),
-    passive("3_OFF"),
-    passive("4_ON"),
-    passive("4_OFF"),
-];
+/// `DIP Switch 4 way` — the module's option switch (S301): four poles, one
+/// per printed position *n*, between the netlist's `<n>_ON` and `<n>_OFF`
+/// pin ids (the pairing the pin-function labels state: `"FLASH (ON side)"` /
+/// `"FLASH (OFF side)"` on position 2). All open by default, as shipped;
+/// position *n* is pole `n - 1` to `Scenario::switch`. Closing pole 1
+/// (FLASH) ties `P2_IO61` to the flash `~CS`; pole 2 is the P59 pull-up
+/// (`R302`), pole 3 the P59 pull-down (`R303`).
+pub fn dip_switch_poles() -> Vec<SwitchPole> {
+    (1..=4)
+        .map(|n| SwitchPole::open(format!("{n}_ON"), format!("{n}_OFF")))
+        .collect()
+}
 
-/// Reference designators the module netlist declares that have no electrical
-/// existence: `PCB` is the raw board (no nodes at all) and `NC_Net` a layout
-/// node. Passed to [`Board::from_netlist_with_stubs`].
-pub const EC32MB_STUB_REFS: [&str; 2] = ["PCB", "NC_Net"];
+/// `Solder Link Pads` — J101, the oscillator-option link between `P2_IO32`
+/// and the TCXO's `NC/GND` option pad: one pole, open as shipped.
+pub fn solder_link_poles() -> Vec<SwitchPole> {
+    vec![SwitchPole::open("1", "2")]
+}
 
 /// Part registry for `fixtures/p2_ec32mb.net`.
 pub fn ec32mb_registry() -> PartRegistry {
@@ -1120,6 +1084,11 @@ pub fn ec32mb_registry() -> PartRegistry {
     registry.classify_unnamed_by_reference(true);
 
     registry.register("P2X8C4M64P", |_decl| Box::new(P2EdgeModule::new("p2")));
+    registry.register_switch("DIP Switch 4 way", dip_switch_poles());
+    registry.register_switch("Solder Link Pads", solder_link_poles());
+    registry.register_mechanical("Mounting Hole Vss");
+    registry.register_mechanical("PCB for P2 EC Module");
+    registry.register_mechanical("Layout node");
     register_stub(&mut registry, "74LVC2G04GW,125", &INVERTER_2G04_PINS);
     register_stub(&mut registry, "TG2520SMN 20.0000M-ECGNNM3", &TCXO_PINS);
     register_stub(&mut registry, "SPI Flash 16MB (128Mb)", &SPI_FLASH_PINS);
@@ -1128,7 +1097,6 @@ pub fn ec32mb_registry() -> PartRegistry {
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
     register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
     register_stub(&mut registry, "LDO 300mA, 3.3V", &LDO_PINS);
-    register_stub(&mut registry, "DIP Switch 4 way", &DIP_SWITCH_PINS);
     registry
 }
 
@@ -1136,8 +1104,76 @@ pub fn ec32mb_registry() -> PartRegistry {
 pub fn ec32mb_board() -> Board {
     let parsed = embsim_board::netlist::parse(include_str!("../fixtures/p2_ec32mb.net"))
         .expect("the EC32MB fixture parses");
-    Board::from_netlist_with_stubs(parsed, &ec32mb_registry(), &EC32MB_STUB_REFS)
-        .expect("the EC32MB module builds")
+    Board::from_netlist(parsed, &ec32mb_registry()).expect("the EC32MB module builds")
+}
+
+/// A processor-shaped placeholder for the module's `U100` slot: the
+/// netlist's own pins — supplies as [`embsim_board::PinKind::PowerIn`],
+/// everything else a sense — and no behaviour, built from the netlist so it
+/// cannot drift from what `U100` declares. It touches no process-global
+/// peripheral bank, unlike [`P2EdgeModule`], so a test that wants the
+/// module as `embsim-boards` ships it and nothing running in it can use
+/// [`shipped_ec32mb_board`] without the module-instance lock. The same
+/// shape `boards/tests/ec32mb.rs` fills the slot with;
+/// `P2Package::held_in_reset()` replaces both in `NODES.md` §8 phase 2.
+#[derive(Debug)]
+pub struct P2Slot {
+    pins: Vec<PinDecl>,
+}
+
+impl P2Slot {
+    /// The placeholder, its pins read from the module netlist.
+    pub fn new() -> Self {
+        let parsed = embsim_board::netlist::parse(include_str!("../fixtures/p2_ec32mb.net"))
+            .expect("the EC32MB fixture parses");
+        let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for net in &parsed.nets {
+            for node in &net.nodes {
+                if node.reference == "U100" {
+                    names.insert(node.pin.as_str());
+                }
+            }
+        }
+        let pins = names
+            .into_iter()
+            .map(|n| {
+                // Leaked so the facade can be `&'static`, as `Component::pins`
+                // requires. One allocation per test process.
+                let number: &'static str = Box::leak(n.to_string().into_boxed_str());
+                if n.starts_with("VIO") || n == "VDD" || n == "GND" || n == "TEST" {
+                    pwr_in(number)
+                } else {
+                    dig_in(number)
+                }
+            })
+            .collect();
+        Self { pins }
+    }
+}
+
+impl Default for P2Slot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Component for P2Slot {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
+        Ok(())
+    }
+}
+
+/// The P2-EC32MB as `embsim-boards` ships it — its own registry, a blank
+/// boot flash, an empty card socket — with the processor slot filled by a
+/// [`P2Slot`].
+pub fn shipped_ec32mb_board() -> Board {
+    embsim_boards::ec32mb::Ec32mb::new()
+        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .build()
+        .expect("the module builds")
 }
 
 // ============================================================
@@ -1151,11 +1187,12 @@ pub fn ec32mb_board() -> Board {
 //               L_Small ×2 — the 86 passives; Conn_01x0n / Screw_Terminal ×23
 //               plus the declared P2_EDGE_MODULE_SOCKET — the 24 boundaries;
 //               Jumper_2_Open ×4 + Jumper_3_Open ×1 — the stateful shorts;
-//               MountingHole_Pad ×4 — ignored.
-//               (86 + 24 + 5 + 4 + 49 registered = the netlist's 168.)
+//               SW_Push ×1 (SW1, the reset button) — a one-pole switch, open;
+//               MountingHole_Pad ×4 — mechanical nodes.
+//               (86 + 24 + 5 + 1 + 4 + 48 registered = the netlist's 168.)
 //   real model  AM26LS31CD (U24) and AM26LV32xD (U25), the encoder/servo
 //               RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator.
-//   stub        the other 13 active types, below.
+//   stub        the other 12 active types, below.
 //
 // The ISO674x/ISO672x symbols draw every pin as `passive`; their facades here
 // keep that (topology-only) rather than inventing directions, because on this
@@ -1247,7 +1284,7 @@ pub const ISO6721_PINS: [PinDecl; 8] = [
 /// `UCC12040DVER` — TI isolated 500 mW DC/DC module (IC3: the isolated I/O
 /// domain; IC4: the force-gauge domain).
 ///
-/// `VISO` **and** the three `GNDS` pins are declared [`PinKind::PowerOut`]:
+/// `VISO` **and** the three `GNDS` pins are declared [`embsim_board::PinKind::PowerOut`]:
 /// an isolated DC/DC generates a whole domain, its ground reference included,
 /// so both terminals of that domain are sourced by this part. Declaring GNDS
 /// as an input instead would leave every isolated ground permanently
@@ -1323,7 +1360,7 @@ pub const SN74LVC1G14_PINS: [PinDecl; 5] = [
 /// as `input` — including `VIN`, the four grounds, and `OUT`. Electrical
 /// descriptors come from the component, never from the netlist (see the
 /// `netlist` module docs), and getting `OUT` right as a
-/// [`PinKind::PowerOut`] is what makes the board's rails reachable through
+/// [`embsim_board::PinKind::PowerOut`] is what makes the board's rails reachable through
 /// the output inductors.
 #[rustfmt::skip]
 pub const XL1509_PINS: [PinDecl; 8] = [
@@ -1346,10 +1383,6 @@ pub const APM4953_PINS: [PinDecl; 4] = [
     passive("7"), // D1
     passive("8"), // D1
 ];
-
-/// `SW_Push` — the manual reset button (SW1), a two-terminal contact. Pressing
-/// it is a scenario `pin_short`, not a component behavior.
-pub const SW_PUSH_PINS: [PinDecl; 2] = [passive("1"), passive("2")];
 
 /// `2N3904` — NPN transistor (Q1), the open-collector sink half of the servo
 /// enable's `TTL-SINK` option.
@@ -1402,7 +1435,6 @@ pub fn edge_registry_without_socket() -> PartRegistry {
     register_stub(&mut registry, "SN74LVC1G14DBV", &SN74LVC1G14_PINS);
     register_stub(&mut registry, "XL1509", &XL1509_PINS);
     register_stub(&mut registry, "APM4953", &APM4953_PINS);
-    register_stub(&mut registry, "SW_Push", &SW_PUSH_PINS);
     register_stub(&mut registry, "2N3904", &NPN_PINS);
     registry
 }
@@ -1558,7 +1590,7 @@ pub fn machine_harness(edge: &str) -> Harness {
 /// Bench supply straps for the EdgeBoard, through the board's own connector
 /// pins — the rig a bring-up bench actually builds.
 ///
-/// Why straps at all when the board has regulators: a [`PinKind::PowerOut`]
+/// Why straps at all when the board has regulators: a [`embsim_board::PinKind::PowerOut`]
 /// pin registers its net as sourced at an *unmodeled* voltage, which clears
 /// [`embsim_board::Finding::PowerNetUnsourced`] but carries no level, so a
 /// component that gates on a rail voltage (every modeled part here does) would

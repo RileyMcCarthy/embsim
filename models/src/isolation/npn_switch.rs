@@ -69,7 +69,7 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, NetState, Ohms, PinDecl, PinHandle, PinKind,
+    AttachError, Component, ComponentNetIo, IdleDrive, NetState, Ohms, PinDecl, PinHandle, PinKind,
     TheveninDrive, Volts,
 };
 
@@ -373,6 +373,7 @@ const fn declare(number: &'static str, name: &'static str, kind: PinKind) -> Pin
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

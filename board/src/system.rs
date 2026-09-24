@@ -29,16 +29,28 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::board::{Board, BoardError, PartClass};
+use crate::board::{validate_idle_drives, Board, BoardError, PartClass};
 use crate::cluster::QuasiStaticMna;
-use crate::component::{Component, ComponentNetIo, PinDecl, PinHandle, PinKind, StreamRole};
+use crate::component::{
+    Component, ComponentNetIo, IdleDrive, PinDecl, PinHandle, PinKind, StreamRole,
+};
 use crate::diagnostics::{Diagnostics, Finding};
 use crate::engine::{
-    ComponentId, Dsu, EndpointId, EngineHandle, EngineLink, Resolver, DEFAULT_HIGH_LEVEL_VOLTS,
+    same_state, ComponentId, Dsu, EndpointId, EngineHandle, EngineLink, Resolver, SenseLog,
+    DEFAULT_HIGH_LEVEL_VOLTS,
 };
 use crate::event_log::EventLog;
 use crate::net::{Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
+
+/// How many rounds the build-time fixed point runs before it gives up and
+/// reports [`Finding::BuildNotSettled`]. Each round replays the drives
+/// components issued in response to the states the previous round delivered.
+/// The deepest chain on the reference boards is the EC32MB power tree —
+/// J203 → U401 → U402.IN → Common_LDOin → U501..U508 EN/IN, three senses
+/// deep — so eight is headroom, not a budget: a system that needs more is
+/// oscillating, and the bound is what turns that into a finding.
+pub const BUILD_FIXED_POINT_BOUND: usize = 8;
 
 // ============================================================
 // Qualified net names
@@ -223,19 +235,36 @@ pub enum Fault {
     },
 }
 
-/// Scenario overrides: jumper states, DNP/value BOM changes, injected faults.
+/// Scenario overrides: switch and jumper states, DNP/value BOM changes,
+/// injected faults.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Scenario {
     jumpers: Vec<(String, JumperState)>,
+    switches: Vec<(String, usize, JumperState)>,
     value_overrides: Vec<(String, String)>,
     dnp_overrides: Vec<(String, DnpState)>,
     faults: Vec<Fault>,
 }
 
 impl Scenario {
-    /// Set a jumper's state (`"DS2Addon.JP1"`).
+    /// Set a jumper's state (`"DS2Addon.JP1"`) — the one-pole form of
+    /// [`Scenario::switch`]: on a jumper it sets the jumper, on a switch it
+    /// sets pole 0.
     pub fn jumper(mut self, reference: &str, state: JumperState) -> Self {
         self.jumpers.push((reference.to_string(), state));
+        self
+    }
+
+    /// Set one pole of a switch (`"EC32MB.S301"`, pole `1`, closed). Poles
+    /// are indexed from 0 in the order the registry declared them (so a DIP
+    /// switch's printed position *n* is pole `n - 1`). A closed pole is a
+    /// build-time identity union of its two pins' nets, exactly the merge
+    /// [`Scenario::pin_short`] makes, and honours [`Scenario::pin_detach`]
+    /// on either pin; an open pole is nothing. On a jumper, pole 0 is the
+    /// jumper itself. A pole the part does not have fails the build with
+    /// [`SystemError::UnknownSwitchPole`].
+    pub fn switch(mut self, reference: &str, pole: usize, state: JumperState) -> Self {
+        self.switches.push((reference.to_string(), pole, state));
         self
     }
 
@@ -281,6 +310,12 @@ impl Scenario {
     /// Jumper overrides, in declaration order.
     pub fn jumpers(&self) -> &[(String, JumperState)] {
         &self.jumpers
+    }
+
+    /// Switch pole overrides, in declaration order, as `(reference, pole,
+    /// state)`.
+    pub fn switches(&self) -> &[(String, usize, JumperState)] {
+        &self.switches
     }
 
     /// Value overrides, in declaration order.
@@ -460,11 +495,22 @@ impl System {
         let _ = resolver.route_pulses(&nets, &mut diagnostics);
 
         // Inert attach: sense() reads this build-resolved snapshot; drives
-        // and schedules are traced and dropped.
+        // are recorded, sense subscriptions are delivered once and recorded,
+        // schedules are traced and dropped.
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
         let recorded_drives = Arc::new(Mutex::new(Vec::new()));
-        let link = EngineLink::inert(Arc::clone(&states), Arc::clone(&recorded_drives));
+        let recorded_senses = SenseLog::default();
+        // The build holds the sense log's one strong reference: the inert
+        // link inside every handle the components keep sees it weakly, so
+        // the callbacks the log records (which capture those handles) are
+        // freed with the log when the build is done (`SenseLog`).
+        let link = EngineLink::inert(
+            Arc::clone(&states),
+            Arc::clone(&recorded_drives),
+            &recorded_senses,
+        );
+        let mut attached = Vec::with_capacity(components.len());
         for mut prepared in components {
             let io =
                 ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone());
@@ -478,35 +524,91 @@ impl System {
                         error,
                     },
                 })?;
-            // Build-time analysis slice: the component validated its facade
-            // and is dropped here; System::start keeps it.
+            // Kept alive through the fixed point below: the sense callbacks
+            // recorded at attach may hold handles into the component.
+            attached.push(prepared.component);
         }
 
-        // Apply the drives components issued during attach, then resolve
-        // again so the published states and findings describe the system as
-        // its components actually idle it. Without this, a component that
-        // *releases* a `DigitalOut` pin (an end switch with an open contact,
-        // an open-drain output) is analyzed as if it drove the engine's
-        // idle-high default — the build pass would report `Driven(High)` on a
-        // net the live system floats, and miss the `FloatingSense` the
-        // consumer needs to see.
+        // The build fixed point. Apply the drives components issued during
+        // attach, resolve again, deliver the states that changed to the
+        // senses that registered for them, and repeat while the components
+        // answer with a different drive — so the published states and
+        // findings describe the system as its components actually idle it,
+        // the way the live engine would have settled it before its first
+        // wake. Without the replay a component that *releases* a
+        // `DigitalOut` pin (an end switch with an open contact, an open-drain
+        // output) is analyzed as if it drove the engine's idle-high default;
+        // without the iteration a chain of sense→drive components (the
+        // GPIO bridge driving its power-on level, an isolator driving at the
+        // rail it senses, a power tree three senses deep) is analyzed one
+        // hop short of where it rests.
         //
-        // One extra pass is enough: these are attach-time idle drives, not a
-        // feedback loop (senses are read from the snapshot, and a component
-        // cannot observe this second resolution to react to it). Live
-        // feedback is the engine's job, on the `start` path.
-        let idle_drives = std::mem::take(&mut *recorded_drives.lock().expect("never poisoned"));
-        if !idle_drives.is_empty() {
+        // Bounded: a system that is still changing after
+        // `BUILD_FIXED_POINT_BOUND` rounds is oscillating, and the snapshot
+        // it gets is the last round's, marked `Finding::BuildNotSettled`.
+        let mut passes = 0;
+        let mut unsettled: Vec<String> = Vec::new();
+        let settled = loop {
+            let idle_drives = std::mem::take(&mut *recorded_drives.lock().expect("never poisoned"));
+            let mut changed = false;
             for (endpoint, drive) in idle_drives {
-                resolver.set_drive(endpoint, drive);
+                changed |= resolver.set_drive(endpoint, drive);
             }
+            if !changed {
+                break true;
+            }
+
+            let previous: Vec<NetState> = nets.iter().map(|n| n.state).collect();
             diagnostics = Diagnostics::new();
             resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
             let _ = resolver.route_pulses(&nets, &mut diagnostics);
             *states.lock().expect("never poisoned") = nets.iter().map(|n| n.state).collect();
+            let moved: Vec<usize> = (0..nets.len())
+                .filter(|&i| !same_state(&previous[i], &nets[i].state))
+                .collect();
+            unsettled = moved.iter().map(|&i| nets[i].name.clone()).collect();
+            if passes == BUILD_FIXED_POINT_BOUND {
+                // Resolved so the snapshot matches the drive table, but not
+                // delivered: the components would only answer again.
+                break false;
+            }
+            passes += 1;
+
+            // Deliver changed states in the order the live engine does: net
+            // index ascending, subscribers in registration order. No lock is
+            // held across a callback: it may sense (the states lock) and
+            // drive (the drive log); a sense it registers now is appended
+            // behind the ones that exist.
+            let senses = std::mem::take(&mut *recorded_senses.0.lock().expect("never poisoned"));
+            for &i in &moved {
+                for (net, callback) in &senses {
+                    if net.0 == i {
+                        callback(nets[i].state);
+                    }
+                }
+            }
+            let mut log = recorded_senses.0.lock().expect("never poisoned");
+            let late = std::mem::replace(&mut *log, senses);
+            log.extend(late);
+        };
+        if !settled {
+            diagnostics.report(Finding::BuildNotSettled {
+                passes,
+                nets: unsettled,
+            });
         }
+        // Build-time analysis: every component validated its facade and is
+        // dropped here, after the callbacks that reach into it; System::start
+        // keeps them. The sense log is the one strong owner of the recorded
+        // callbacks (the links in the handles they capture hold it weakly),
+        // so dropping it here frees them and everything they captured.
+        drop(recorded_senses);
+        drop(link);
+        drop(attached);
 
         let roots = resolver.identity_roots(nets.len());
+        let cluster_roots = resolver.cluster_roots(nets.len());
+        let escalated_solves = resolver.escalated_solves();
         // The build path resolves a fixed number of times, so logging the
         // standing set once here is the whole story (`Diagnostics::report` is
         // silent by design — see its type docs).
@@ -515,6 +617,8 @@ impl System {
             nets,
             diagnostics,
             roots,
+            cluster_roots,
+            escalated_solves,
         })
     }
 
@@ -646,6 +750,15 @@ impl System {
         // Per bench component, per declared pin: its global net index.
         let mut bench_pin_nets: Vec<Vec<usize>> = Vec::new();
         for bench in &self.bench {
+            // No netlist facade to validate, but the same declarations to
+            // honour: an idle drive on a pin without a slot is refused here
+            // exactly as `Board::from_netlist` refuses it for a netlist part.
+            validate_idle_drives(&bench.name, bench.component.pins()).map_err(|error| {
+                SystemError::Board {
+                    name: bench.name.clone(),
+                    error,
+                }
+            })?;
             let mut pin_nets = Vec::new();
             for pin in bench.component.pins() {
                 let idx = nets.len();
@@ -691,11 +804,19 @@ impl System {
         // -- scenario: BOM overrides + jumpers ----------------------------
         let mut detached: HashSet<(usize, PinRef)> = HashSet::new();
         {
-            let jumpers = self.scenario.jumpers().to_vec();
+            // Jumpers and switches share one mechanism: a jumper is a
+            // one-pole switch, so `jumper(ref, s)` is `switch(ref, 0, s)`.
+            let positions: Vec<(String, usize, JumperState)> = self
+                .scenario
+                .jumpers()
+                .iter()
+                .map(|(path, state)| (path.clone(), 0, *state))
+                .chain(self.scenario.switches().iter().cloned())
+                .collect();
             let dnp_overrides = self.scenario.dnp_overrides().to_vec();
             let value_overrides = self.scenario.value_overrides().to_vec();
 
-            for (path, state) in &jumpers {
+            for (path, pole, state) in &positions {
                 let (bi, reference) = split_board_ref(path, &board_index).ok_or_else(|| {
                     SystemError::UnknownEndpoint {
                         endpoint: path.clone(),
@@ -709,9 +830,28 @@ impl System {
                     .ok_or_else(|| SystemError::UnknownEndpoint {
                         endpoint: path.clone(),
                     })?;
-                if let PartClass::Jumper { state: s } = &mut record.class {
-                    *s = *state;
-                }
+                let poles = match &mut record.class {
+                    PartClass::Jumper { state: s } => {
+                        if *pole == 0 {
+                            *s = *state;
+                            continue;
+                        }
+                        1
+                    }
+                    PartClass::Switch { poles } => {
+                        if let Some(p) = poles.get_mut(*pole) {
+                            p.state = *state;
+                            continue;
+                        }
+                        poles.len()
+                    }
+                    _ => 0,
+                };
+                return Err(SystemError::UnknownSwitchPole {
+                    reference: path.clone(),
+                    pole: *pole,
+                    poles,
+                });
             }
             for (path, dnp) in &dnp_overrides {
                 let (bi, reference) = split_board_ref(path, &board_index).ok_or_else(|| {
@@ -805,6 +945,33 @@ impl System {
             }
         }
 
+        // -- closed switch poles: identity unions --------------------------
+        // A closed pole is the same merge a `pin_short` fault makes — its two
+        // pins' nets become one electrical node — and it honours a detached
+        // pin the same way a passive edge does: a lifted contact conducts
+        // nothing. Membership is fixed at build (`NODES.md` §2, rule 3), so
+        // this is the whole of a switch's electrical existence.
+        for (bi, (_, board)) in self.boards.iter().enumerate() {
+            for record in &board.records {
+                if !record.fitted {
+                    continue;
+                }
+                let PartClass::Switch { poles } = &record.class else {
+                    continue;
+                };
+                for pole in poles.iter().filter(|p| p.state == JumperState::Closed) {
+                    let a = (bi, PinRef::new(record.reference.clone(), pole.a.clone()));
+                    let b = (bi, PinRef::new(record.reference.clone(), pole.b.clone()));
+                    if detached.contains(&a) || detached.contains(&b) {
+                        continue;
+                    }
+                    if let (Some(&na), Some(&nb)) = (net_of_pin.get(&a), net_of_pin.get(&b)) {
+                        dsu.union(na, nb);
+                    }
+                }
+            }
+        }
+
         // -- electrical descriptors ----------------------------------------
         let mut resolver = Resolver::new(nets.len(), dsu);
         for (idx, volts) in power_sources {
@@ -815,7 +982,7 @@ impl System {
         }
 
         let mut endpoints: HashMap<(usize, PinRef), EndpointId> = HashMap::new();
-        for (bi, (_bname, board)) in self.boards.iter().enumerate() {
+        for (bi, (bname, board)) in self.boards.iter().enumerate() {
             for record in &board.records {
                 if !record.fitted {
                     continue;
@@ -885,7 +1052,32 @@ impl System {
                             }
                         }
                     }
-                    PartClass::Boundary | PartClass::Stubbed => {}
+                    // A piecewise-linear element's specification is the
+                    // placeholder until the elements land (`NODES.md` §8
+                    // phase 3): `register_pwl` declares intent, and a part
+                    // it covers builds only unfitted. Fitted, it would be a
+                    // node with nothing behind it — the facade rule 1 of
+                    // `DESIGN.md` exists to refuse — so the build refuses
+                    // it here, naming the part. Phase 3 replaces this arm
+                    // with the element stamp (`add_pwl`).
+                    PartClass::Pwl { .. } => {
+                        return Err(SystemError::Board {
+                            name: bname.clone(),
+                            error: BoardError::UnmodelledElement {
+                                reference: record.reference.clone(),
+                            },
+                        });
+                    }
+                    // A boundary's pins are where a harness attaches; a
+                    // switch's closed poles were unioned above and its open
+                    // ones are nothing; a mechanical part has pads and no
+                    // electrical existence; a probe senses through
+                    // `BuiltSystem::probe`, which lands with the first board
+                    // that carries a test point.
+                    PartClass::Boundary
+                    | PartClass::Switch { .. }
+                    | PartClass::Mechanical
+                    | PartClass::Probe => {}
                 }
             }
         }
@@ -1108,22 +1300,40 @@ fn add_pin_descriptor(
     pin: &PinDecl,
     pin_ref: &PinRef,
 ) -> Option<EndpointId> {
+    // A declared idle drive is honoured on every pin with a drive slot; a
+    // declaration that says nothing keeps the kind's documented default.
+    let declared_idle = match pin.idle {
+        IdleDrive::KindDefault => None,
+        IdleDrive::Released => Some(None),
+        IdleDrive::Thevenin(drive) => Some(Some(drive)),
+    };
     match pin.kind {
         PinKind::DigitalIn => {
             resolver.add_digital_sense(net);
             // Sense pins still get a released drive slot: the re-entrancy
             // contract allows a sense callback to drive.
-            Some(resolver.add_endpoint(net, pin_ref.clone(), None))
+            Some(resolver.add_endpoint(net, pin_ref.clone(), declared_idle.unwrap_or(None)))
         }
         PinKind::Analog => {
             resolver.add_analog_sense(net);
-            Some(resolver.add_endpoint(net, pin_ref.clone(), None))
+            Some(resolver.add_endpoint(net, pin_ref.clone(), declared_idle.unwrap_or(None)))
         }
+        // Power and passive pins have no drive slot, so there is nothing
+        // for a declared idle drive to set — `validate_idle_drives` refused
+        // such a declaration before any pin reached here.
         PinKind::PowerIn => {
+            debug_assert!(
+                declared_idle.is_none(),
+                "{pin_ref:?}: idle drive on a PowerIn pin"
+            );
             resolver.add_power_sense(net);
             None
         }
         PinKind::PowerOut => {
+            debug_assert!(
+                declared_idle.is_none(),
+                "{pin_ref:?}: idle drive on a PowerOut pin"
+            );
             // Component-declared rail voltage arrives with the regulator
             // models (a later slice); presence is what the build-time pass
             // needs. NaN marks "sourced at an unmodeled voltage".
@@ -1133,18 +1343,22 @@ fn add_pin_descriptor(
         PinKind::DigitalOut | PinKind::DigitalBidir => {
             // Idle default: stream producers idle Driven(High) per the
             // stream spec; plain outputs idle High as the documented default
-            // until the component drives otherwise.
+            // until the component drives otherwise — unless the declaration
+            // says what the pin idles at.
             let impedance = pin.drive_impedance.unwrap_or(DEFAULT_PUSH_PULL_IMPEDANCE);
-            Some(resolver.add_endpoint(
-                net,
-                pin_ref.clone(),
-                Some(TheveninDrive {
-                    volts: DEFAULT_HIGH_LEVEL_VOLTS,
-                    impedance,
-                }),
-            ))
+            let idle = declared_idle.unwrap_or(Some(TheveninDrive {
+                volts: DEFAULT_HIGH_LEVEL_VOLTS,
+                impedance,
+            }));
+            Some(resolver.add_endpoint(net, pin_ref.clone(), idle))
         }
-        PinKind::Passive => None,
+        PinKind::Passive => {
+            debug_assert!(
+                declared_idle.is_none(),
+                "{pin_ref:?}: idle drive on a Passive pin"
+            );
+            None
+        }
     }
 }
 
@@ -1173,6 +1387,11 @@ pub struct BuiltSystem {
     diagnostics: Diagnostics,
     /// Identity root per net index (harness/pin-short merges).
     roots: Vec<usize>,
+    /// The identity roots of every conduction cluster, in ascending
+    /// cluster-root order.
+    cluster_roots: Vec<Vec<NetId>>,
+    /// Cluster solves the build-time passes escalated to the solver.
+    escalated_solves: u64,
 }
 
 impl BuiltSystem {
@@ -1222,6 +1441,26 @@ impl BuiltSystem {
     /// engine).
     pub fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
+    }
+
+    /// The census of the system's conduction clusters: one entry per
+    /// cluster, the identity roots it holds, in ascending cluster-root
+    /// order (roots ascending within). A conduction cluster is what a
+    /// resistor, an inductor or a closed jumper joins and what nothing else
+    /// crosses; a root is one electrical node after harness and `pin_short`
+    /// merges, named by any of the nets merged into it (see
+    /// [`BuiltSystem::nets`]). So an entry's length is the size `m` of the
+    /// matrix an escalated solve of that cluster builds, and the longest
+    /// entry bounds every solve on the board — the number `DESIGN.md` rule 4
+    /// holds to `m ≤ 8`.
+    pub fn cluster_roots(&self) -> &[Vec<NetId>] {
+        &self.cluster_roots
+    }
+
+    /// How many cluster solves the build-time resolution passes escalated to
+    /// the solver (see [`SystemHandle::escalated_solves`] for the rule).
+    pub fn escalated_solves(&self) -> u64 {
+        self.escalated_solves
     }
 }
 
@@ -1277,6 +1516,16 @@ impl SystemHandle {
     /// panic-contained, so `false` means the engine itself failed.
     pub fn engine_is_alive(&self) -> bool {
         self.engine.is_alive()
+    }
+
+    /// How many cluster solves the engine has escalated to the solver so
+    /// far, the initial resolution pass included. A solve runs only where
+    /// sources within a factor of ten disagree or an analog sense asks;
+    /// everything else is a projection (`DESIGN.md` rule 8). A run on a
+    /// board with neither reads 0, and a test holds it there as the budget
+    /// it is (see [`crate::engine::EngineHandle::escalated_solves`]).
+    pub fn escalated_solves(&self) -> u64 {
+        self.engine.escalated_solves()
     }
 
     /// Handle to this system's engine event log (determinism Oracle 1 — see
@@ -1346,6 +1595,16 @@ pub enum SystemError {
         /// The dotted reference that failed to resolve.
         endpoint: String,
     },
+    /// A scenario set a switch pole the part does not have (a jumper has one
+    /// pole, index 0; a part that is neither a switch nor a jumper has none).
+    UnknownSwitchPole {
+        /// The dotted part reference (`"EC32MB.S301"`).
+        reference: String,
+        /// The pole index asked for.
+        pole: usize,
+        /// How many poles the part has.
+        poles: usize,
+    },
     /// A harness failed to validate.
     Harness(HarnessError),
     /// A board-level structural failure surfaced during assembly.
@@ -1367,6 +1626,11 @@ impl fmt::Display for SystemError {
             SystemError::UnknownEndpoint { endpoint } => {
                 write!(f, "unknown endpoint {endpoint:?}")
             }
+            SystemError::UnknownSwitchPole {
+                reference,
+                pole,
+                poles,
+            } => write!(f, "{reference} has no switch pole {pole} (it has {poles})"),
             SystemError::Harness(e) => write!(f, "harness: {e}"),
             SystemError::Board { name, error } => write!(f, "board {name:?}: {error}"),
         }

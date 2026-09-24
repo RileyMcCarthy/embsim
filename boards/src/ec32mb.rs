@@ -9,9 +9,12 @@
 //! **slot** the consumer fills — with an instruction-set simulator, a stub, or
 //! anything else implementing [`Component`] — because the CPU is the thing
 //! under test and the board is the fixture. Everything around it is here:
-//! the boot flash and the card socket as live models, the PSRAMs, regulators,
-//! oscillator and DIP switch as pin facades, and all 168 components validated
-//! against the vendor netlist.
+//! the boot flash and the card socket as live models, the DIP switch and the
+//! oscillator-option solder link as switches with poles, the mounting holes
+//! and the BOM-only lines as mechanical nodes, the PSRAMs, regulators and
+//! oscillator as pin facades (the parts `NODES.md` §8 phases 2–4 turn into
+//! models), and all 114 components classified and validated against the
+//! vendor netlist — every one a node.
 //!
 //! ```no_run
 //! # use embsim_boards::ec32mb::Ec32mb;
@@ -46,7 +49,8 @@
 //! `VIO_56_63`) and one side of `S301` switch 2, labelled "FLASH" in the
 //! netlist: closing it ties `P2_IO61` to the flash `~CS`, and leaving it open
 //! lets the pull-up hold the flash deselected so only the card is on the bus.
-//! [`FLASH_SELECT_SWITCH`] names it.
+//! [`FLASH_SELECT_SWITCH`] names the switch and [`FLASH_SELECT_POLE`] the
+//! pole: `Scenario::switch("EC32.S301", FLASH_SELECT_POLE, JumperState::Closed)`.
 //!
 //! # Sources
 //!
@@ -55,7 +59,9 @@
 //! `(libsource …)` entries, so the registry classifies by reference-designator
 //! prefix and keys parts on their `value` field.
 
-use embsim_board::{netlist, Board, BoardError, Component, ComponentDecl, PartRegistry, PinDecl};
+use embsim_board::{
+    netlist, Board, BoardError, Component, ComponentDecl, PartRegistry, PinDecl, SwitchPole,
+};
 use embsim_models::sd_card::SdCard;
 use embsim_models::sd_card_component::{SdCardComponent, SD_CARD_PINS_BY_FUNCTION};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -68,11 +74,6 @@ use crate::stub::{dig_in, passive, pwr_in, pwr_out, register_stub};
 /// The vendor netlist this board is built from.
 pub const NETLIST: &str = include_str!("../netlists/p2_ec32mb.net");
 
-/// Reference designators with no electrical existence: `PCB` is the raw board
-/// (no nodes at all) and `NC_Net` is a layout artefact with one. They are the
-/// documented escape rather than fake components.
-pub const STUB_REFS: [&str; 2] = ["PCB", "NC_Net"];
-
 /// Registry key for the processor slot — the `value` of `U100`.
 pub const P2_PART: &str = "P2X8C4M64P";
 /// Registry key for the boot flash, `U301` (Winbond `W25Q128JVSIM`).
@@ -83,9 +84,31 @@ pub const SOCKET_PART: &str = "MicroSD Socket";
 /// 128 M-bit = 16 MiB, the density the netlist states for `U301`.
 pub const FLASH_CAPACITY: usize = 16 * 1024 * 1024;
 
-/// `S301` position 2 — the netlist labels both its sides "FLASH". Closed, it
-/// ties `P2_IO61` to the flash `~CS`; open, `R301` holds the flash deselected.
+/// `S301` — the module's four-way option switch. Position 2 (both sides
+/// labelled "FLASH" in the netlist) closed ties `P2_IO61` to the flash `~CS`;
+/// open, `R301` holds the flash deselected. See [`dip_switch_poles`] for the
+/// pole each position is.
 pub const FLASH_SELECT_SWITCH: &str = "S301";
+
+/// The pole index of `S301` position 2, FLASH (positions are printed 1–4,
+/// poles are indexed from 0 in [`dip_switch_poles`] order).
+pub const FLASH_SELECT_POLE: usize = 1;
+/// The pole index of `S301` position 3, the P59 pull-up (`R302`).
+pub const P59_PULL_UP_POLE: usize = 2;
+/// The pole index of `S301` position 4, the P59 pull-down (`R303`) — the
+/// module's "boot from flash without waiting for a serial loader" setting.
+pub const P59_PULL_DOWN_POLE: usize = 3;
+
+/// Registry key for the DIP switch, `S301` (CTS `218-4LPSTJR`) — its `value`.
+pub const DIP_SWITCH_PART: &str = "DIP Switch 4 way";
+/// Registry key for the oscillator-option solder link, `J101` — its `value`.
+pub const SOLDER_LINK_PART: &str = "Solder Link Pads";
+/// The `value` of the mounting holes `J701`/`J702` (tied to `GND`).
+pub const MOUNTING_HOLE_PART: &str = "Mounting Hole Vss";
+/// The `value` of `PCB`, the raw board (a BOM line with no nodes).
+pub const RAW_PCB_PART: &str = "PCB for P2 EC Module";
+/// The `value` of `NC_Net`, the layout node terminating the `NC_Net` net.
+pub const LAYOUT_NODE_PART: &str = "Layout node";
 
 /// `74LVC2G04GW,125` — NXP dual inverter (U101 oscillator buffer, U601 LED
 /// buffer). Outputs are senses per the module docs' stub rule.
@@ -163,39 +186,55 @@ pub const LDO_PINS: [PinDecl; 5] = [
     pwr_out("OUT"),
 ];
 
-/// `DIP Switch 4 way` — the module's option switch (S301), pin ids
-/// `<position>_<OFF|ON>`.
+/// `DIP Switch 4 way` — the module's option switch (S301): four poles, one
+/// per printed position, each between the netlist's `<position>_ON` and
+/// `<position>_OFF` pin ids. The pairing is a registry declaration — the
+/// netlist carries none — and is what the pin-function labels say
+/// (`"FLASH (ON side)"` / `"FLASH (OFF side)"` on position 2). Every pole
+/// is open by default, the state a module ships in; a scenario closes one
+/// by index (`Scenario::switch("EC32.S301", pole, JumperState::Closed)`),
+/// and a closed pole joins its two nets into one node. Position *n* is pole
+/// `n - 1`: [`FLASH_SELECT_POLE`], [`P59_PULL_UP_POLE`] and
+/// [`P59_PULL_DOWN_POLE`] name the three the boot depends on.
 ///
-/// All eight terminals are passive: a four-gang switch is not a two-terminal
-/// jumper, so the auto tier cannot classify it and the engine has no
-/// scenario primitive for a ganged position yet. The consequence is visible
-/// and asserted — with every gang open, the `P59` pull-up/pull-down and the
-/// flash chip-select strap do not conduct.
-pub const DIP_SWITCH_PINS: [PinDecl; 8] = [
-    passive("1_ON"),
-    passive("1_OFF"),
-    passive("2_ON"),
-    passive("2_OFF"),
-    passive("3_ON"),
-    passive("3_OFF"),
-    passive("4_ON"),
-    passive("4_OFF"),
-];
+/// | pole | position | ON side ↔ OFF side | function (vendor labels) |
+/// |---|---|---|---|
+/// | 0 | 1 | `1_ON` ↔ `1_OFF` | LED ENABLE |
+/// | 1 | 2 | `2_ON` ↔ `2_OFF` | FLASH: `P2_IO61` to the flash `~CS` |
+/// | 2 | 3 | `3_ON` ↔ `3_OFF` | P59 pull-up (`R302`) |
+/// | 3 | 4 | `4_ON` ↔ `4_OFF` | P59 pull-down (`R303`) |
+pub fn dip_switch_poles() -> Vec<SwitchPole> {
+    (1..=4)
+        .map(|position| SwitchPole::open(format!("{position}_ON"), format!("{position}_OFF")))
+        .collect()
+}
 
-/// Reference designators the module netlist declares that have no electrical
-/// existence: `PCB` is the raw board (no nodes at all) and `NC_Net` a layout
-/// node. Passed to [`Board::from_netlist_with_stubs`].
-pub const EC32MB_STUB_REFS: [&str; 2] = ["PCB", "NC_Net"];
+/// `Solder Link Pads` — `J101`, the oscillator-option link between `P2_IO32`
+/// and the TCXO's `NC/GND` option pad: one pole across its two pads, open
+/// (the vendor ships it unbridged).
+pub fn solder_link_poles() -> Vec<SwitchPole> {
+    vec![SwitchPole::open("1", "2")]
+}
 
-/// Every part that is a pin facade and nothing more. [`Ec32mb::registry`]
+/// The class of every part that is not a live model. [`Ec32mb::registry`]
 /// layers the live models and the processor slot on top.
-fn stub_registry() -> PartRegistry {
+fn class_registry() -> PartRegistry {
     let mut registry = PartRegistry::new();
     // The netlist was transcribed from the vendor PDF and has no libsource, so
     // the auto tier keys on reference-designator prefixes and the registry on
     // the `value` field.
     registry.classify_unnamed_by_reference(true);
 
+    // Switches, by pole.
+    registry.register_switch(DIP_SWITCH_PART, dip_switch_poles());
+    registry.register_switch(SOLDER_LINK_PART, solder_link_poles());
+
+    // Mechanical parts: pads (or no pads at all), nothing electrical.
+    registry.register_mechanical(MOUNTING_HOLE_PART);
+    registry.register_mechanical(RAW_PCB_PART);
+    registry.register_mechanical(LAYOUT_NODE_PART);
+
+    // Pin facades, until the phases of `NODES.md` §8 give each its model.
     register_stub(&mut registry, "74LVC2G04GW,125", &INVERTER_2G04_PINS);
     register_stub(&mut registry, "TG2520SMN 20.0000M-ECGNNM3", &TCXO_PINS);
     register_stub(
@@ -208,7 +247,6 @@ fn stub_registry() -> PartRegistry {
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
     register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
     register_stub(&mut registry, "LDO 300mA, 3.3V", &LDO_PINS);
-    register_stub(&mut registry, "DIP Switch 4 way", &DIP_SWITCH_PINS);
     registry
 }
 
@@ -297,7 +335,7 @@ impl Ec32mb {
     /// The part registry this configuration produces, for a consumer that wants
     /// to add or replace entries before building.
     pub fn registry(self) -> PartRegistry {
-        let mut registry = stub_registry();
+        let mut registry = class_registry();
 
         // A programmed part was built in `with_flash_image` so its view could
         // be handed out; a blank one is built here. `U301` appears once in
@@ -332,6 +370,6 @@ impl Ec32mb {
     /// Build the module.
     pub fn build(self) -> Result<Board, BoardError> {
         let parsed = netlist::parse(NETLIST).expect("the bundled netlist parses");
-        Board::from_netlist_with_stubs(parsed, &self.registry(), &STUB_REFS)
+        Board::from_netlist(parsed, &self.registry())
     }
 }

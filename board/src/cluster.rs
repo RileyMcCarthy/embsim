@@ -42,7 +42,7 @@
 //! [`QuasiStaticMna`]; a transient SPICE-backed solver is a possible future
 //! implementation and is intentionally NOT part of this design.
 
-use crate::net::{NetId, NetState, Ohms, Volts};
+use crate::net::{Amps, NetId, NetState, Ohms, Volts};
 use std::collections::HashMap;
 
 // ============================================================
@@ -115,12 +115,30 @@ pub struct Cluster {
     pub resistors: Vec<ClusterResistor>,
 }
 
+/// A current injection into a cluster node ([`crate::Drive::Current`]): a
+/// Norton source with **no shunt**, stamped as `rhs += amps` at its node and
+/// nowhere else. It contributes no reachability — a node only current
+/// sources touch has no open-circuit voltage, is MNA-singular exactly like an
+/// unsourced one, and solves to [`NetState::Floating`] with the injection
+/// dropped. Positive `amps` flow *into* the node (KCL: `G · V = I` with `I`
+/// the injected current), so 1 mA into a node 1 kΩ above a 0 V terminal
+/// raises it to 1 V.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterInjection {
+    /// Node the current is injected into.
+    pub node: NetId,
+    /// Current into the node, amperes. Non-finite values are dropped.
+    pub amps: Amps,
+}
+
 /// Boundary inputs to a cluster solve — the values that change between
 /// recomputations (drives, rail states, transducer primitive values).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClusterInputs {
     /// Thevenin sources currently reaching the cluster.
     pub sources: Vec<ClusterSource>,
+    /// Current injections into cluster nodes.
+    pub injections: Vec<ClusterInjection>,
 }
 
 /// Result of one cluster solve: a state per member node, parallel to
@@ -162,7 +180,8 @@ pub trait ClusterSolver: Send + Sync {
 ///    [`IDEAL_SOURCE_FLOOR_OHMS`]);
 /// 3. find the source-reachable supernodes — the complement is exactly the
 ///    MNA-singular set and reports [`NetState::Floating`];
-/// 4. stamp conductances and Norton injections into `G · V = I` over the
+/// 4. stamp conductances, Norton injections and bare current injections
+///    ([`ClusterInjection`], right-hand side only) into `G · V = I` over the
 ///    reachable subgraph and solve by Gaussian elimination with partial
 ///    pivoting;
 /// 5. map supernode voltages back to every member node as
@@ -295,6 +314,23 @@ impl ClusterSolver for QuasiStaticMna {
             };
             matrix[c][c] += g;
             rhs[c] += i;
+        }
+        // Bare current injections: right-hand side only, no shunt, no
+        // reachability. An injection into an unreachable supernode has no
+        // return path and is dropped — the node stays Floating rather than
+        // acquiring an invented voltage. Stamped after the sources, in
+        // declaration order (the accumulation order is part of the deck).
+        for injection in &inputs.injections {
+            let Some(&node) = node_index.get(&injection.node) else {
+                continue;
+            };
+            if !injection.amps.is_finite() {
+                continue;
+            }
+            let Some(c) = compact[root_of[node]] else {
+                continue; // reached by no Thevenin source: Floating
+            };
+            rhs[c] += injection.amps;
         }
 
         let voltages = solve_dense(matrix, rhs);
@@ -449,6 +485,7 @@ mod tests {
                 volts: 3.3,
                 impedance: 25.0,
             }],
+            ..Default::default()
         };
         let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
         for (_, state) in &solution.node_states {
@@ -466,6 +503,7 @@ mod tests {
                 volts: 3.3,
                 impedance: 25.0,
             }],
+            ..Default::default()
         };
         let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
         for node in [NetId(0), NetId(1), NetId(2)] {
@@ -511,6 +549,7 @@ mod tests {
                     impedance: 0.0,
                 },
             ],
+            ..Default::default()
         };
         let solution = QuasiStaticMna.solve(&cluster, &inputs);
         assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-6);
@@ -549,6 +588,7 @@ mod tests {
                 volts: 3.3,
                 impedance: 25.0,
             }],
+            ..Default::default()
         };
         let solution = QuasiStaticMna.solve(&cluster, &inputs);
         assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-9);
@@ -584,6 +624,7 @@ mod tests {
                     impedance: 25.0,
                 },
             ],
+            ..Default::default()
         };
         let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
         for (_, state) in &solution.node_states {
@@ -603,8 +644,82 @@ mod tests {
                 volts: 3.3,
                 impedance: 0.0,
             }],
+            ..Default::default()
         };
         let solution = QuasiStaticMna.solve(&cluster, &inputs);
         assert!((analog_volts(&solution, NetId(0)) - 3.3).abs() < 1e-9);
+    }
+
+    /// A current injection is a right-hand-side stamp: a node held a
+    /// resistor away from a terminal rises by `I · R` above it. The terminal
+    /// is ideal (0 Ω, clamped to the 1 µΩ floor), so the drop across the
+    /// floor is a nanovolt against a 1 V answer.
+    #[rstest]
+    #[case::one_ma_into_1k(1e-3, 1_000.0, 1.0)]
+    #[case::hundred_ua_into_4k7(100e-6, 4_700.0, 0.47)]
+    #[case::sink_ten_ua_from_10k(-10e-6, 10_000.0, -0.1)]
+    fn a_current_injection_into_a_resistor_to_a_terminal_reads_i_times_r(
+        #[case] amps: f64,
+        #[case] ohms: f64,
+        #[case] expect: f64,
+    ) {
+        // 0 V terminal at n0 —R— n1 <- I
+        let cluster = Cluster {
+            nodes: vec![NetId(0), NetId(1)],
+            resistors: vec![ClusterResistor {
+                a: NetId(0),
+                b: NetId(1),
+                ohms,
+            }],
+        };
+        let inputs = ClusterInputs {
+            sources: vec![ClusterSource {
+                node: NetId(0),
+                volts: 0.0,
+                impedance: 0.0,
+            }],
+            injections: vec![ClusterInjection {
+                node: NetId(1),
+                amps,
+            }],
+        };
+        let solution = QuasiStaticMna.solve(&cluster, &inputs);
+        assert!((analog_volts(&solution, NetId(1)) - expect).abs() < 1e-6);
+        assert!(analog_volts(&solution, NetId(0)).abs() < 1e-6);
+    }
+
+    /// An injection reaches nothing on its own: with no Thevenin source in
+    /// the cluster every node is MNA-singular and stays Floating, the
+    /// current dropped rather than turned into a voltage; a non-finite
+    /// injection is dropped the same way even where a source exists.
+    #[rstest]
+    fn a_current_injection_alone_leaves_its_node_floating() {
+        let inputs = ClusterInputs {
+            sources: vec![],
+            injections: vec![ClusterInjection {
+                node: NetId(1),
+                amps: 1e-3,
+            }],
+        };
+        let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
+        for (_, state) in &solution.node_states {
+            assert_eq!(*state, NetState::Floating);
+        }
+
+        let inputs = ClusterInputs {
+            sources: vec![ClusterSource {
+                node: NetId(0),
+                volts: 3.3,
+                impedance: 25.0,
+            }],
+            injections: vec![ClusterInjection {
+                node: NetId(1),
+                amps: f64::NAN,
+            }],
+        };
+        let solution = QuasiStaticMna.solve(&three_node_cluster(), &inputs);
+        for node in [NetId(0), NetId(1), NetId(2)] {
+            assert!((analog_volts(&solution, node) - 3.3).abs() < 1e-9);
+        }
     }
 }

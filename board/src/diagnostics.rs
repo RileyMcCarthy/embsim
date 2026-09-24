@@ -46,8 +46,10 @@ pub enum PinMismatchDirection {
 /// One structured diagnostic finding. A finding, never a panic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Finding {
-    /// ≥ 2 push-pull sources fighting on one net (directly or through
-    /// collapsed low-value series resistance).
+    /// Strong sources (under [`crate::net::WEAK_DRIVE_OHMS`] in total)
+    /// fighting on one net: one lost to a source ten times stronger, or
+    /// comparable ones solved to a divided voltage. Names every strong pin
+    /// on the net; an ideal source (a rail, a `net_stuck`) has none to name.
     Contention {
         /// Net name.
         net: String,
@@ -62,12 +64,27 @@ pub enum Finding {
         /// Digital or analog sense domain.
         kind: SenseKind,
     },
-    /// A solved voltage inside a digital sense's `V_IL`/`V_IH` dead band.
+    /// Disagreeing sources of comparable strength solved to a node voltage
+    /// strictly inside the [`crate::net::V_IL`]/[`crate::net::V_IH`] dead
+    /// band: neither a valid low nor a valid high, so the net projects
+    /// [`crate::NetState::Contention`] and this names the voltage it
+    /// actually sits at. Reported beside the fight's `Contention` finding.
     AmbiguousLevel {
         /// Net name.
         net: String,
         /// The solved node voltage that fell inside the dead band.
         volts: Volts,
+    },
+    /// A [`crate::Drive::Current`] injected into a net no Thevenin source
+    /// reaches. A current source has no open-circuit voltage and no return
+    /// path here, so the net stays [`crate::NetState::Floating`] and the
+    /// injection goes nowhere — a modelling error, never an invented
+    /// voltage.
+    CurrentIntoFloatingNode {
+        /// Net name.
+        net: String,
+        /// The injecting pin.
+        pin: PinRef,
     },
     /// A power net with no `PowerOut` source anywhere (board or harness);
     /// presents as down (0 V into cluster solves).
@@ -149,6 +166,19 @@ pub enum Finding {
         pin: String,
         /// Which side declared the pin the other lacks.
         direction: PinMismatchDirection,
+    },
+    /// The build-time fixed point did not settle within its bound: after
+    /// `passes` rounds of replaying the drives components issued in response
+    /// to the states they were delivered, some component was still changing
+    /// its drive. The build snapshot then describes the last pass, not a
+    /// rest state, and cannot be relied on to equal the live system's
+    /// pre-wake state (`System::build`). Names the nets whose states were
+    /// still moving on the last pass.
+    BuildNotSettled {
+        /// Rounds of the fixed point that ran (the bound).
+        passes: usize,
+        /// Nets whose state changed on the last round, by name.
+        nets: Vec<String>,
     },
 }
 

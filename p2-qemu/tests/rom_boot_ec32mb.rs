@@ -27,10 +27,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    level_of, AttachError, Component, ComponentNetIo, Harness, Level, PinDecl, PinKind, Scenario,
-    System,
+    level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, JumperState, Level,
+    PinDecl, PinKind, Scenario, System,
 };
-use embsim_boards::ec32mb::Ec32mb;
+use embsim_boards::ec32mb::{Ec32mb, FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE};
 use embsim_core::virtual_clock;
 use embsim_p2_qemu::{flashimage, P2Qemu, P2QemuError};
 
@@ -65,6 +65,7 @@ impl Scope {
                 kind: PinKind::DigitalIn,
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             }],
             instants: Arc::clone(&instants),
         };
@@ -155,6 +156,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         .expect("the module builds");
 
     let (scope, clock_instants) = Scope::new();
+    let started = Instant::now();
     let system = System::new()
         .board("EC32", board)
         .component("SCOPE", Box::new(scope))
@@ -165,11 +167,23 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         )
         .scenario(
             Scenario::default()
-                // S301-2 closed: P61 reaches the flash's ~CS.
-                .pin_short("EC32.S301.2_ON", "EC32.S301.2_OFF")
-                // S301-4 closed: R303 pulls P59 down, so the ROM boots the
-                // program it loaded instead of waiting for a serial loader.
-                .pin_short("EC32.S301.4_ON", "EC32.S301.4_OFF")
+                // S301 position 2 (FLASH) closed: P61 reaches the flash's
+                // ~CS. A closed pole is a build-time identity union of its
+                // two nets — the same merge a `pin_short` makes, said as
+                // the switch position it is.
+                .switch(
+                    &format!("EC32.{FLASH_SELECT_SWITCH}"),
+                    FLASH_SELECT_POLE,
+                    JumperState::Closed,
+                )
+                // S301 position 4 closed: R303 pulls P59 down, so the ROM
+                // boots the program it loaded instead of waiting for a
+                // serial loader.
+                .switch(
+                    &format!("EC32.{FLASH_SELECT_SWITCH}"),
+                    P59_PULL_DOWN_POLE,
+                    JumperState::Closed,
+                )
                 // The bench supplies the rails: ground is 0 V and the I/O
                 // rail is up, so R301 pulls the select high (the boot strap)
                 // and R303 pulls P59 down. Neither is implicit — the engine
@@ -187,6 +201,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         || handle.console(DEBUG_TX).contains('B') || handle.halted(),
         Duration::from_secs(patience),
     );
+    let wall = started.elapsed();
     let nets: Vec<String> = [
         "EC32.P2_IO58",
         "EC32.P2_IO59",
@@ -265,6 +280,29 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     assert!(
         (ROM_INSTRUCTION_NS..=4 * ROM_INSTRUCTION_NS).contains(&median),
         "the typical gap is the ROM's own clock loop, not a slice; median {median} ns"
+    );
+
+    // The boot's cost, as the baseline `NODES.md` §8 phase 0 records and
+    // every later phase is measured against: edges the flash clock carried,
+    // yields and publishes the P2 made, wall time from `start` to the byte —
+    // and how many of those edges escalated a cluster to the solver. On this
+    // board every SPI edge is a 25 Ω pad against a 10.5 kΩ pull-up to a
+    // terminal, so nothing disagrees within a factor of ten and no analog
+    // sense asks: the whole boot is projections (`DESIGN.md` rule 8), and
+    // the count is held at 0 as the budget it is. A phase that changes it
+    // says so.
+    let escalated = system.escalated_solves();
+    eprintln!(
+        "baseline: edges={} yields={} publishes={} escalated_solves={escalated} wall={:.3}s ({:.2} us/edge)",
+        instants.len(),
+        handle.yields(),
+        handle.publishes(),
+        wall.as_secs_f64(),
+        wall.as_secs_f64() * 1e6 / instants.len() as f64,
+    );
+    assert_eq!(
+        escalated, 0,
+        "the ROM boot is projections only: no cluster escalated to the solver"
     );
     drop(system);
 }

@@ -5,9 +5,9 @@
 //! # What this binary is for
 //!
 //! 1. **A real mixed-signal board classifies and builds** — the auto tier's 86
-//!    passives, 24 boundaries, 5 jumpers and 4 ignored mechanicals, plus 49
-//!    registered components across 16 part types, each with a pin facade the
-//!    build validates against the netlist in both directions.
+//!    passives, 24 boundaries, 5 jumpers, 1 switch and 4 mechanical nodes,
+//!    plus 48 registered components across 15 part types, each with a pin
+//!    facade the build validates against the netlist in both directions.
 //! 2. **The power topology is honest about what the board cannot generate.** A
 //!    bare board reports exactly the domains that arrive over a cable, and
 //!    bench straps clear exactly those.
@@ -38,17 +38,17 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, JumperState, Level, NetState, PinDecl,
-    PinKind, PinRef, Scenario, SenseKind, System, SystemHandle,
+    AttachError, Board, Component, ComponentNetIo, Finding, IdleDrive, JumperState, Level,
+    NetState, PartClass, PinDecl, PinKind, PinRef, Scenario, SenseKind, System, SystemHandle,
 };
 use embsim_core::virtual_clock;
 use machine_parts::{
     bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed, ep, iso6731_pins,
 };
 
-/// Registered (non-passive, non-boundary, non-ignored) component count: the 16
-/// active part types' instances.
-const EXPECTED_REGISTERED: usize = 49;
+/// Registered component count: the 15 active part types' instances (the
+/// reset button is a switch, not a component).
+const EXPECTED_REGISTERED: usize = 48;
 
 /// The engine's timer wheel and any paced stream sample the process-global
 /// virtual clock, and `init` re-anchors it — so it runs once per binary.
@@ -98,10 +98,11 @@ fn net_named(map: &HashMap<PinRef, String>, reference: &str, pin: &str) -> Strin
 ///
 /// The census is the interesting half. 168 components resolve into 86
 /// auto-classified passives, 24 boundaries (23 standard connector symbols plus
-/// the declared `P2_EDGE_MODULE_SOCKET`), 5 jumpers, 4 ignored mounting holes
-/// and 49 registered components — and because every registered component's
-/// facade is checked against the netlist in both directions, this test failing
-/// after a schematic edit is the intended outcome, not a nuisance.
+/// the declared `P2_EDGE_MODULE_SOCKET`), 5 jumpers, 1 switch (the reset
+/// button), 4 mounting holes (mechanical nodes) and 48 registered components
+/// — and because every registered component's facade is checked against the
+/// netlist in both directions, this test failing after a schematic edit is
+/// the intended outcome, not a nuisance.
 #[rstest]
 fn the_edgeboard_builds_with_every_part_classified() {
     let board = edge_board();
@@ -128,7 +129,6 @@ fn the_edgeboard_builds_with_every_part_classified() {
         "U9",   // SN74LVC1G14DBV
         "U1",   // XL1509
         "U3",   // APM4953
-        "SW1",  // SW_Push
         "Q1",   // 2N3904
     ] {
         assert!(
@@ -137,14 +137,27 @@ fn the_edgeboard_builds_with_every_part_classified() {
         );
     }
 
-    // Boundaries, jumpers and mounting holes are NOT components — they are
-    // classified, not instantiated.
-    for reference in ["J3", "J9", "J20", "J21", "JP1", "JP4", "H5"] {
+    // Boundaries, jumpers, switches and mounting holes are NOT components —
+    // they are classified, not instantiated — and every one is a node.
+    for reference in ["J3", "J9", "J20", "J21", "JP1", "JP4", "SW1", "H5"] {
         assert!(
             !registered.contains(reference),
             "{reference} classifies in the auto tier, not the registry"
         );
     }
+    assert_eq!(board.nodes().count(), 168, "one node per netlist part");
+    for hole in ["H5", "H6", "H7", "H8"] {
+        assert_eq!(
+            board.node_class(hole),
+            Some(&PartClass::Mechanical),
+            "{hole}"
+        );
+    }
+    assert!(
+        matches!(board.node_class("SW1"), Some(PartClass::Switch { poles }) if poles.len() == 1),
+        "the reset button is a one-pole switch: {:?}",
+        board.node_class("SW1")
+    );
 }
 
 /// The board's own edge-socket symbol is a *boundary*, declared as one — so a
@@ -434,6 +447,7 @@ fn probe_pin() -> PinDecl {
         kind: PinKind::DigitalIn,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

@@ -119,6 +119,10 @@ pub struct PinDecl {
     pub kind: PinKind,
     pub stream: Option<StreamRole>,  // pulse-train role; see "Stream endpoints"
     pub drive_impedance: Option<Ohms>, // Thevenin source impedance; default per kind
+    pub idle: IdleDrive,             // the drive from attach until the component drives:
+                                     //   KindDefault (push-pull idles high), Released, or a Thevenin;
+                                     //   refused at build on a power or passive pin (no drive slot):
+                                     //   BoardError::IdleOnSlotlessPin
 }
 
 pub enum PinKind {
@@ -161,25 +165,68 @@ pub enum NetState {
 }
 ```
 
-Resolution and escalation rules:
+Resolution is **source-strength projection, in one form** (`NODES.md`
+"Three rules the taxonomy rests on", rule 2; `engine.rs` `project_root`).
+Every Thevenin source reaching a node — a pad, a rail, a `net_stuck` — is
+ranked by its **total ohms**: its own impedance plus the minimum series
+resistance from its net to the node (a rail or fault is ideal, so the path
+alone). Then, per node:
 
-- Purely digital nets (single push-pull driver, no passives) short-circuit the
-  solver: `Driven(level)`.
-- If a competing path's Thevenin impedance is within 10× of the strongest
-  driver's, the net escalates to the cluster solver and resolves to the actual
-  divided voltage. Digital senses then apply their declared `V_IH`/`V_IL`
-  thresholds; a solved voltage inside the dead band raises an
-  **`AmbiguousLevel`** finding. This is how a real mid-rail fight (25 Ω driver
-  low vs 3.3 V through 47 Ω) is representable *numerically*, not just as a flag.
-- Two disagreeing push-pull sources on one node — or coupled through series
-  resistance below the stream-collapse threshold — resolve to `Contention` plus
-  a structured diagnostic (net, drivers). A finding, never a panic.
+- A source at or above `WEAK_DRIVE_OHMS` (1 kΩ, one value with the stream
+  collapse threshold) in total is a **pull**. It sets the level only when
+  nothing stronger reaches the node, and it never contends: a 10.5 kΩ pull-up
+  against a 25 Ω pad is the pad's node, a 15 kΩ pad against a 30 Ω sink is
+  `Driven(Low)` with nothing reported.
+- Among the rest, a source `ESCALATION_IMPEDANCE_RATIO` (10×) the strongest's
+  total ohms or more **loses**: the node takes the strongest's state, and
+  because it lost through less than a kilohm it is a fight —
+  `Finding::Contention` names every strong pin on the node. A pad driving
+  low against a rail on its own net reads `Analog(rail)` *and* reports the
+  fight; the card behind the module's 240 Ω series resistor loses to the
+  flash on P58 (265 Ω against 25) and P58 reads the flash's level.
+- Disagreeing sources within 10× of each other **solve**: the cluster goes
+  through the `ClusterSolver` once for the pass and the node takes the
+  divided voltage, projected through the `V_IL`/`V_IH` dead band (0.8/2.0 V,
+  JESD8C.01): strictly inside it the node is `Contention` and an
+  **`AmbiguousLevel`** finding carries the voltage; outside it the node is
+  `Analog(v)` — either way `Contention` names the pins. Two 25 Ω push-pulls on
+  one net sit at 1.65 V, inside the band; a 25 Ω pad against a 100 Ω one
+  reads `Analog(2.64)` with the finding. Pulls alone disagreeing (a divider
+  between two rails) solve to `Analog(v)` with nothing reported.
+- Otherwise the winner sets the state: a strong pad on the node is
+  `Driven(level)`; a rail or fault on the node is `Analog(v)`; anything else
+  is `Pulled(level, ohms)` where `ohms` is the **winner's series path** (plus
+  the winner's own impedance when that is itself a kilohm or more — a 15 kΩ
+  pad is a resistor to its rail; a 25 Ω pad is a driver). A net one 10.5 kΩ
+  resistor from ground reports 10 500, whatever else shares its cluster.
+- A node an **analog sense** reads, or one a **current injection**
+  (`Drive::Current`) lands in, has its whole cluster solved — the sense wants
+  a voltage, and an injection has no projection form (its effect is `I · R`
+  along whatever the node is tied to) — and every root of that cluster
+  publishes the solved voltage. In such a cluster the fight findings above
+  are not raised: the reader is handed the operating point, and a
+  `Contention` state would hand it nothing. This precedence retires with
+  `NODES.md` §10's `Sense { volts }`. A current injected where no Thevenin
+  source reaches leaves the node `Floating` with
+  `Finding::CurrentIntoFloatingNode`.
+- A rail whose voltage no model declares yet (`PowerOut` at NaN) sources its
+  cluster as *up*: a node nothing numeric reaches reads `Pulled(High, path)`
+  through the path to the nearest such rail.
+- A `TheveninDrive` behind a non-finite impedance is normalised to
+  *released* at the drive slot (`Resolver::set_drive`), so it is never
+  ranked and never escalates a cluster.
 - `Floating` senses are reported to the sensing component, which chooses
   datasheet behavior (silent chip for a floating `~RESET`, noise policy for a
   floating ADC input). The engine never invents a value silently.
 - A **full resolution pass runs at `System::build()`**, so never-driven nets
   (the one-pin `~RESET` net) are reported `Floating` to their sensing
-  components immediately, before any traffic.
+  components immediately, before any traffic. The build then runs to a
+  **bounded fixed point**: the drives components issue in response to the
+  states they are delivered are replayed and the changed states delivered
+  again, until nothing moves (bound `BUILD_FIXED_POINT_BOUND`, past which
+  `Finding::BuildNotSettled` names the nets still changing), so the build
+  snapshot equals the live engine's state before its first wake
+  (`board/tests/build_fixed_point.rs`).
 
 ### Power domains
 
@@ -294,19 +341,30 @@ the leaf only; `net_short_label` is the display-only shortening, explicitly
 not an identity. The hierarchical reference fixture is the MaD EdgeBoard
 export (3 sheets, 168 components, 243 nets, 53 sheet-scoped names).
 
-Classification is three-tier and **keyed primarily on the libsource *part*
-name** — the lib name is best-effort only (real exports contain empty lib names
-and KiCad `*-rescue` libs; rescue mangling like
-`DS2_Addon-rescue::Jumper_NO_Small-Device` is normalized before matching):
+Classification is **one pipeline** (`DESIGN.md` rule 1): netlist part →
+registry class → node. Every netlist part gets a node of a class with
+behaviour, or the board refuses to build naming the part and its value; there
+is no stub list, no ignored tier and no allow-list. It is three-tier and
+**keyed primarily on the libsource *part* name** — the lib name is best-effort
+only (real exports contain empty lib names and KiCad `*-rescue` libs; rescue
+mangling like `DS2_Addon-rescue::Jumper_NO_Small-Device` is normalized before
+matching):
 
 | Tier | Match | Result |
 |---|---|---|
-| auto | part `R*`/`C*`/`L*`/`LED`/`D_*` from `Device` (or rescue thereof) | passive primitive; value parsed (`47R`, `4k7`, `0.1uF`); **pin-count validated** — a 2-terminal class with ≠2 pins is a hard classification error (resistor arrays etc. need a registry expansion entry) |
+| auto | part `R*`/`C*`/`L*`/`LED`/`D_*` from `Device` (or rescue thereof) | passive primitive; value parsed from the **first token** of the field (`47R`, `4k7`, `0.1uF`, `4.7uF 6.3V`, `47uH/3A`); **pin-count validated** — a 2-terminal class with ≠2 pins is a hard classification error |
 | auto | `Conn*`/`Screw_Terminal*` parts, plus any part name the consumer passes to `PartRegistry::register_boundary` | board boundary pins (harness attachment points) |
 | auto | `Jumper*` parts | stateful short; default from name (`_NO`/`_Open` → open, `_NC`/`_Bridged` → closed; 3-pin `Jumper_3_*` variants get a selectable position) |
-| auto | `MountingHole*`/`Logo*`/`TestPoint*` | ignored |
-| registry | anything else, keyed by part name, falling back to `value` | consumer-registered `Component` constructor; the registry API includes an **expansion hook** (one netlist component → N primitives, for arrays/multi-unit symbols) |
-| error | no registry match | system construction fails; per-board explicit stub list is the only escape |
+| auto | two-pin `SW_*` parts | a **switch** with one open pole across pins `1` and `2` (the KiCad `Switch` library's two-terminal pinout) — unless the part name is registered: the pairing is a guess from the library convention, and an explicit registration beats it |
+| auto | `TestPoint*` | one pin: a **probe** node (senses, never drives); no net: a **mechanical** node (a pad); more pins: whatever the registry says of the part name, else a pin-count error |
+| auto | `MountingHole*`/`Logo*`/`Fiducial*` | a **mechanical** node: pads recorded, nothing electrical |
+| registry | anything else, keyed by part name, falling back to `value` | a consumer-registered class: a `Component` constructor (`register`), a switch with declared poles by pin id (`register_switch`), a piecewise-linear element (`register_pwl`, declared ahead of its behaviour: a fitted one is refused at system build with `BoardError::UnmodelledElement` until the elements land, so the declaration classifies but cannot populate) or a mechanical part (`register_mechanical`). One table: a later registration of a key replaces the earlier, whatever its kind |
+| error | no registry match | `RegistryError::UnknownPart { reference, part, value }`; system construction fails |
+
+A closed switch pole is a **build-time identity union** of its two pins' nets —
+the merge `pin_short` makes — honouring `pin_detach` on either pin; an open pole
+is nothing. Poles are set by `Scenario::switch(reference, pole, state)`, indexed
+from 0 in declaration order; `Scenario::jumper` is the one-pole form (pole 0).
 
 Active parts come from standard *and* custom libraries alike (`74xGxx`,
 `Isolator`, `Interface`, `Transistor_BJT`, `Switch` are all standard-lib
@@ -319,15 +377,18 @@ schematic PDF has no symbol library to name, so every part name is empty and the
 entire board lands in the error tier. `PartRegistry::classify_unnamed_by_reference`
 opts such a board into a narrow fallback: **only** when a component's part name
 is empty, the auto tiers match a class synthesized from its reference-designator
-prefix (`R`/`C`/`L`/`D` → the passive primitives, `J`/`P` → boundary, `TP`/`H`/`MK`
-→ ignored), and the whole leading alphabetic run must match, so `RN7` and `PCB`
-still fall through. Active-silicon prefixes (`U`, `IC`, `Q`, `X`, `S`, …)
-deliberately map to nothing: the fallback classifies what the engine already
-knows how to be, and refuses to guess the rest, which then registers by `value`.
-It is opt-in because an empty part name in a real export means a damaged export,
-not a naming convention. Reference fixture: `board/tests/fixtures/p2_ec32mb.net`
-(Parallax P2-EC32MB module, 114 components, zero part names — 85 passives and 5
-pad/socket symbols classify, 22 active parts register).
+prefix (`R`/`C`/`L`/`D` → the passive primitives, `J`/`P` → boundary, `TP` →
+probe, `H`/`MK` → mechanical), and the whole leading alphabetic run must match,
+so `RN7` and `PCB` still fall through. Active-silicon prefixes (`U`, `IC`, `Q`,
+`X`, `S`, …) deliberately map to nothing: the fallback classifies what the engine
+already knows how to be, and refuses to guess the rest, which then registers by
+`value` — and an explicit registration for a value beats the synthesized class,
+so a `J`-prefixed solder link registers as the switch it is and a `J`-prefixed
+mounting hole as mechanical. It is opt-in because an empty part name in a real
+export means a damaged export, not a naming convention. Reference fixture:
+`board/tests/fixtures/p2_ec32mb.net` (Parallax P2-EC32MB module, 114
+components, zero part names — 85 passives and 2 pad/socket symbols classify, 2
+switches, 4 mechanical parts and 21 active parts register).
 
 DNP: a component with `value == "X"` (consumer convention) or the KiCad `dnp`
 property is absent from the built board. Jumper state and DNP overrides are
@@ -354,6 +415,8 @@ actually has (an N-pin net has no "where" for a generic open):
 - `pin_detach("Board.Ref.Pin")` — remove one node from its net (a lifted pin /
   cold joint; the floating-`~RESET` case);
 - `pin_short(a, b)` — union two nets (solder bridge, crossed probe);
+- `switch("Board.S1", pole, Closed)` — a switch pole, by index: the same
+  union, said as the position it is (`jumper` is the one-pole form);
 - `net_stuck(net, rail)` — add a Thevenin source to a net;
 - `value_override("Board.R5", "4k7")`, `dnp_override("Board.C7", Populated)` —
   scenario-time BOM changes;
@@ -469,16 +532,17 @@ a requirement, not a nicety:
 Structured findings on a diagnostics bus, mirrored to `tracing`, consumable by
 tests (assert a specific finding fired) and by trace tooling later:
 `Contention`, `FloatingSense` (digital and analog), `AmbiguousLevel`,
-`PowerNetUnsourced`, `StreamMismatch`, `ClassificationError`,
-`UnconnectedRegistryPin` (both directions: declared-but-absent and
-present-but-undeclared).
+`CurrentIntoFloatingNode`, `PowerNetUnsourced`, `StreamMismatch`,
+`ClassificationError`, `UnconnectedRegistryPin` (both directions:
+declared-but-absent and present-but-undeclared).
 
 ## Testing conventions
 
 - Parser: committed netlist fixtures per supported KiCad major (hand-written
   minimal + one real exported board) with golden component/net graphs.
 - Net resolution: truth-table tests per rule (driver combinations × expected
-  `NetState`), including the impedance-escalation boundary.
+  `NetState`), including the weak-drive and impedance-escalation boundaries
+  (`engine::tests::source_strength`).
 - MNA: hand-computed reference circuits (bridge, divider ladder, pull-up vs
   driver, source-free singular cluster) asserted to µV.
 - Pulse routes: routing through series passives, facing-`PulseSource`

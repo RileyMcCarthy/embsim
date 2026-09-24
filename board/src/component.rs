@@ -22,9 +22,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Weak;
 
 use crate::engine::{Command, ComponentId, EndpointId, EngineLink};
-use crate::net::{NetId, NetState, Ohms, TheveninDrive};
+use crate::net::{Amps, NetId, NetState, Ohms, TheveninDrive};
 
 pub use embsim_peripherals::pulse_out::PulseSegment;
 
@@ -252,6 +253,58 @@ impl PulseTrain {
     }
 }
 
+/// The one per-instant message a pin publishes onto its net (`NODES.md`
+/// §10/§11): what the pin *is* electrically at the instant it published,
+/// sequenced through the engine's drive queue like every other drive. Two
+/// encodings exist in this phase; the pulse train ([`PulseTrain`]) folds in
+/// as the third when the pulse channel retires.
+///
+/// A released pin (high-Z) is the absence of a drive — [`PinHandle::release`]
+/// — and a [`Drive::Thevenin`] with a non-finite impedance is normalised to
+/// exactly that at the drive slot, so it is never ranked against anything.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Drive {
+    /// A linear port: open-circuit voltage behind a source impedance. Push-
+    /// pull pads, sinks (open-drain low = `{0 V, R_on}`, high = released),
+    /// pull modes, rails, straps and stuck-at faults are all this.
+    Thevenin(TheveninDrive),
+    /// A Norton injection with no shunt: `amps` **into** the net, stamped
+    /// straight onto the right-hand side of the cluster solve. It carries no
+    /// open-circuit voltage and reaches nothing by itself — a node no
+    /// Thevenin source reaches stays [`NetState::Floating`] whatever is
+    /// injected into it, with a [`crate::Finding::CurrentIntoFloatingNode`].
+    /// An instrument (a current regulator, a pad's current-source pull
+    /// mode, a load), never the normal path.
+    Current {
+        /// Current into the net, amperes.
+        amps: Amps,
+    },
+}
+
+/// The drive a pin presents from attach until its component drives it — a
+/// static fact declared once on [`PinDecl`], so a model whose output rests
+/// released (an open-drain sink, an output nothing drives until the model
+/// does) no longer has to release it in `attach`.
+///
+/// This is the transitional shape of `NODES.md` §10's `idle:
+/// Option<Thevenin>`: [`IdleDrive::KindDefault`] keeps the engine's
+/// documented per-kind default for every declaration that does not set an
+/// idle drive, so no existing pin table moves; a declaration that sets one
+/// is honoured on every pin that has a drive slot (digital in/out/bidir and
+/// analog). Power and passive pins have no slot and no idle drive.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum IdleDrive {
+    /// The kind's documented default: push-pull digital
+    /// ([`PinKind::DigitalOut`], [`PinKind::DigitalBidir`]) idles driven
+    /// high at its declared impedance; every other kind idles released.
+    #[default]
+    KindDefault,
+    /// Released (high-Z) at attach.
+    Released,
+    /// A static Thevenin drive at attach.
+    Thevenin(TheveninDrive),
+}
+
 /// One declared pin of a [`Component`]. The set returned by
 /// [`Component::pins`] must cover the component's netlist pins exactly —
 /// build validates both directions.
@@ -268,6 +321,80 @@ pub struct PinDecl {
     /// Thevenin source impedance; default per kind
     /// ([`crate::net::DEFAULT_PUSH_PULL_IMPEDANCE`] for push-pull digital).
     pub drive_impedance: Option<Ohms>,
+    /// The drive the pin presents from attach until the component drives it
+    /// (see [`IdleDrive`]).
+    pub idle: IdleDrive,
+}
+
+impl PinDecl {
+    /// A pin of the given kind with no alias, no stream role, the kind's
+    /// default impedance and the kind's default idle drive.
+    pub const fn new(number: &'static str, kind: PinKind) -> Self {
+        Self {
+            number,
+            name: None,
+            kind,
+            stream: None,
+            drive_impedance: None,
+            idle: IdleDrive::KindDefault,
+        }
+    }
+
+    /// A pin the component senses and never drives.
+    pub const fn digital_in(number: &'static str) -> Self {
+        Self::new(number, PinKind::DigitalIn)
+    }
+
+    /// A push-pull output pin (idles driven high until the component drives
+    /// it, unless [`PinDecl::with_idle`] says otherwise).
+    pub const fn digital_out(number: &'static str) -> Self {
+        Self::new(number, PinKind::DigitalOut)
+    }
+
+    /// A pin whose *voltage* the component needs (participates in the
+    /// cluster solve) — a differential receiver input, an ADC input.
+    pub const fn analog(number: &'static str) -> Self {
+        Self::new(number, PinKind::Analog)
+    }
+
+    /// A rail the part consumes.
+    pub const fn power_in(number: &'static str) -> Self {
+        Self::new(number, PinKind::PowerIn)
+    }
+
+    /// A rail the part generates.
+    pub const fn power_out(number: &'static str) -> Self {
+        Self::new(number, PinKind::PowerOut)
+    }
+
+    /// A terminal that contributes nothing electrical of its own.
+    pub const fn passive(number: &'static str) -> Self {
+        Self::new(number, PinKind::Passive)
+    }
+
+    /// The same pin with an alias (`"RX"`).
+    pub const fn with_name(mut self, name: &'static str) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// The same pin with a pulse-train role.
+    pub const fn with_stream(mut self, stream: StreamRole) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// The same pin with a declared Thevenin source impedance.
+    pub const fn with_impedance(mut self, ohms: Ohms) -> Self {
+        self.drive_impedance = Some(ohms);
+        self
+    }
+
+    /// The same pin with a declared idle drive.
+    pub const fn with_idle(mut self, idle: IdleDrive) -> Self {
+        self.idle = idle;
+        self
+    }
 }
 
 // ============================================================
@@ -376,14 +503,30 @@ impl PinHandle {
             .unwrap_or(NetState::Floating)
     }
 
-    /// Enqueue a new drive for this pin (`None` releases to high-Z). Drives
-    /// are enqueued, never applied inline — the engine thread serializes
-    /// them by enqueue sequence and resolves each in a later iteration, so
-    /// calling this from a sense callback is safe by construction.
+    /// Publish a [`Drive`] on this pin. Drives are enqueued, never applied
+    /// inline — the engine thread serializes them by enqueue sequence and
+    /// resolves each in a later iteration, so calling this from a sense
+    /// callback is safe by construction.
     ///
-    /// On the inert build-time path (or for a pin without a drive slot) the
-    /// drive is traced and dropped.
+    /// On the inert build-time path the drive is recorded for the build's
+    /// fixed point; for a pin without a drive slot it is traced and dropped.
+    pub fn drive(&self, drive: Drive) {
+        self.publish(Some(drive));
+    }
+
+    /// Release this pin to high-Z: the absence of a drive, sequenced like one.
+    pub fn release(&self) {
+        self.publish(None);
+    }
+
+    /// [`Self::drive`] for the Thevenin encoding, `None` releasing —
+    /// the form every existing model publishes in; a thin alias kept until
+    /// the last caller moves to [`Self::drive`].
     pub fn set_drive(&self, drive: Option<TheveninDrive>) {
+        self.publish(drive.map(Drive::Thevenin));
+    }
+
+    fn publish(&self, drive: Option<Drive>) {
         let Some(endpoint) = self.endpoint else {
             tracing::debug!(
                 net = self.net.0,
@@ -497,9 +640,18 @@ impl ComponentNetIo {
             // contract synchronously against the build-resolved snapshot —
             // a component's floating-detection must behave identically on
             // `System::build` and `System::start` (the two-code-paths
-            // divergence the shared resolver exists to prevent). Later
-            // deliveries never happen on this path: the snapshot is final.
+            // divergence the shared resolver exists to prevent). The
+            // callback is then recorded so the build's fixed point can
+            // deliver the states its replayed attach drives change, the
+            // way the live engine would (`System::build`).
             callback(handle.sense());
+            // The build holds the log's one strong reference; a dead weak
+            // (a handle used after the build returned) records nothing.
+            if let Some(log) = self.link.recorded_senses.as_ref().and_then(Weak::upgrade) {
+                log.lock()
+                    .expect("sense log never poisoned")
+                    .push((handle.net(), Box::new(callback)));
+            }
             return Ok(());
         }
         self.link.send(Command::RegisterSense {
@@ -710,7 +862,11 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let states = Arc::new(Mutex::new(vec![NetState::Driven(Level::High)]));
-        let link = EngineLink::inert(states, Arc::new(Mutex::new(Vec::new())));
+        let link = EngineLink::inert(
+            states,
+            Arc::new(Mutex::new(Vec::new())),
+            &crate::engine::SenseLog::default(),
+        );
         let handle = PinHandle::wired(NetId(0), None, None, link.clone());
         let io = ComponentNetIo::wired([("1".to_string(), handle)], None, link);
 

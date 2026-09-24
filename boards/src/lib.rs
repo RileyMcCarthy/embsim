@@ -12,7 +12,9 @@
 //!
 //! - [`ec32mb`] — the Parallax P2-EC32MB Propeller 2 module
 //! - [`stub`] — pin facades for the parts of a board that are real but not
-//!   exercised, and the rule for choosing their pin directions
+//!   yet modelled, and the rule for choosing their pin directions (retiring:
+//!   `DESIGN.md` rule 1 admits no stub tier, and `NODES.md` §8 replaces each
+//!   facade with a model)
 
 pub mod ec32mb;
 pub mod stub;

@@ -45,8 +45,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Level, PinDecl, PinHandle,
-    PinKind,
+    digital_drive, level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, PinDecl,
+    PinHandle, PinKind,
 };
 
 mod ffi;
@@ -178,6 +178,7 @@ pub fn p2x8c4m64p_pins() -> Vec<PinDecl> {
             kind: PinKind::DigitalBidir,
             stream: None,
             drive_impedance: None,
+            idle: IdleDrive::KindDefault,
         });
     }
     for (name, kind) in PACKAGE_PINS {
@@ -187,6 +188,7 @@ pub fn p2x8c4m64p_pins() -> Vec<PinDecl> {
             kind,
             stream: None,
             drive_impedance: None,
+            idle: IdleDrive::KindDefault,
         });
     }
     pins

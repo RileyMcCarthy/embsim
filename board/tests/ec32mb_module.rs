@@ -37,11 +37,10 @@ use rstest::rstest;
 
 use embsim_board::netlist::parse;
 use embsim_board::{
-    Board, Component, Finding, Level, NetState, PinRef, Scenario, SenseKind, System,
+    Board, Component, Finding, Level, NetState, PartClass, PinRef, Scenario, SenseKind, System,
 };
 use machine_parts::{
     ec32mb_board, ec32mb_registry, edge_fingers, ep, module_polarity_fet_conducting, P2EdgeModule,
-    EC32MB_STUB_REFS,
 };
 
 const EC32MB: &str = include_str!("fixtures/p2_ec32mb.net");
@@ -92,11 +91,11 @@ fn members<'a>(board: &'a Board, net: &str) -> Vec<&'a PinRef> {
 // ============================================================
 
 /// The whole module classifies. With no libsource anywhere, this is the test
-/// that the reference-designator fallback plus a ten-entry value-keyed registry
-/// is enough to build a 114-component vendor board — and, because
-/// `Board::from_netlist_with_stubs` validates every registered component's
-/// facade against the netlist in both directions, that all 22 hand-written pin
-/// tables match the transcription exactly.
+/// that the reference-designator fallback plus a value-keyed registry is
+/// enough to build a 114-component vendor board with every part a node — and,
+/// because `Board::from_netlist` validates every registered component's
+/// facade and every switch's poles against the netlist in both directions,
+/// that all the hand-written pin tables match the transcription exactly.
 #[rstest]
 fn the_module_builds_with_no_unclassified_parts() {
     let parsed = parse(EC32MB).expect("the module fixture parses");
@@ -114,22 +113,37 @@ fn the_module_builds_with_no_unclassified_parts() {
         "the transcribed netlist carries no libsource part names"
     );
 
-    let board = Board::from_netlist_with_stubs(parsed, &ec32mb_registry(), &EC32MB_STUB_REFS)
+    let board = Board::from_netlist(parsed, &ec32mb_registry())
         .expect("the module builds with no unclassified-part errors");
 
-    // The 22 registered components: the P2, two inverters, the TCXO, the DIP
-    // switch, the flash, four PSRAMs, the polarity FET, two bucks, the
-    // brownout detector and eight LDOs. Everything else is an auto-classified
-    // primitive, a boundary, or one of the two BOM-only reference designators.
+    // The 21 registered components: the P2, two inverters, the TCXO, the
+    // flash, four PSRAMs, the polarity FET, two bucks, the brownout detector
+    // and eight LDOs. Everything else is an auto-classified primitive, a
+    // boundary, a switch or a mechanical node.
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert_eq!(
         registered,
         BTreeSet::from([
             "U100", "U101", "U301", "U302", "U303", "U304", "U305", "U401", "U402", "U403", "U404",
-            "U501", "U502", "U503", "U504", "U505", "U506", "U507", "U508", "U601", "X100", "S301",
+            "U501", "U502", "U503", "U504", "U505", "U506", "U507", "U508", "U601", "X100",
         ]),
         "exactly the module's active silicon is registered"
     );
+    // Every one of the 114 parts is a node.
+    assert_eq!(board.nodes().count(), EXPECTED_COMPONENTS);
+    assert!(
+        matches!(board.node_class("S301"), Some(PartClass::Switch { poles }) if poles.len() == 4)
+    );
+    assert!(
+        matches!(board.node_class("J101"), Some(PartClass::Switch { poles }) if poles.len() == 1)
+    );
+    for mechanical in ["J701", "J702", "PCB", "NC_Net"] {
+        assert_eq!(
+            board.node_class(mechanical),
+            Some(&PartClass::Mechanical),
+            "{mechanical}"
+        );
+    }
 }
 
 /// Without the fallback the same netlist is entirely unclassifiable — the
@@ -139,7 +153,7 @@ fn without_the_reference_fallback_the_module_does_not_build() {
     let mut registry = ec32mb_registry();
     registry.classify_unnamed_by_reference(false);
     let parsed = parse(EC32MB).expect("fixture parses");
-    let error = Board::from_netlist_with_stubs(parsed, &registry, &EC32MB_STUB_REFS)
+    let error = Board::from_netlist(parsed, &registry)
         .expect_err("no part names and no fallback cannot classify a resistor");
     assert!(
         error.to_string().contains("classification"),
@@ -561,9 +575,10 @@ fn the_reset_node_is_pulled_up_and_floats_without_the_pull_up() {
 ///   real silicon `XI` is driven by the TCXO chain and `XO` is unused (the
 ///   vendor's own note), so `XTAL_XO` is a one-pin net by design.
 /// - `P2_IO59`: the guide's P59 pull-up/pull-down is *selected by the DIP
-///   switch*, and with every gang open neither resistor conducts — so the boot
-///   strap floats. Turning a gang on is a switch-position scenario the engine
-///   does not model yet, and this assertion is what will change when it does.
+///   switch*, and with every pole open (as shipped) neither resistor reaches
+///   the pin — so the boot strap floats. Closing a pole is
+///   `Scenario::switch("EC32MB.S301", pole, JumperState::Closed)`
+///   (`one_pipeline.rs` closes each and reads the strap it selects).
 #[rstest]
 fn unmodeled_oscillator_and_open_dip_switch_float_their_nets() {
     let system = powered_module();
