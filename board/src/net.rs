@@ -19,6 +19,10 @@ pub type Ohms = f64;
 /// Voltage in volts.
 pub type Volts = f64;
 
+/// Current in amperes (a [`crate::Drive::Current`] injection, a branch
+/// current).
+pub type Amps = f64;
+
 /// Default push-pull digital drive impedance (overridable per
 /// [`crate::component::PinDecl::drive_impedance`]).
 pub const DEFAULT_PUSH_PULL_IMPEDANCE: Ohms = 25.0;
@@ -35,15 +39,41 @@ pub const LOGIC_HIGH_VOLTS: Volts = 3.3;
 pub const LOGIC_THRESHOLD_VOLTS: Volts = 1.5;
 
 /// Series-resistance collapse threshold: series passives whose accumulated
-/// resistance stays below this value collapse into a serial link route, and
-/// disagreeing push-pull drivers coupled below it resolve to
-/// [`NetState::Contention`] rather than a divided voltage.
+/// resistance stays below this value collapse into a pulse route — a step
+/// clock crosses them, an isolation resistor stops it. The same value is the
+/// weak-drive boundary of the projection ([`WEAK_DRIVE_OHMS`]).
 pub const STREAM_COLLAPSE_THRESHOLD: Ohms = 1_000.0;
 
-/// Impedance-escalation ratio: a competing path whose Thevenin impedance is
-/// within this factor of the strongest driver's escalates the net to the
-/// cluster solver instead of the digital short-circuit path.
+/// Impedance-escalation ratio: among the sources reaching one node, a source
+/// this many times weaker (by total ohms) than the strongest loses to it —
+/// the node takes the strongest's level and the fight is a
+/// [`crate::Finding::Contention`]; sources closer than this disagree
+/// *numerically*, and the node escalates to the cluster solver for its
+/// divided voltage (`NODES.md` "Three rules the taxonomy rests on", rule 2).
 pub const ESCALATION_IMPEDANCE_RATIO: f64 = 10.0;
+
+/// Weak-drive boundary: a source whose **total** ohms — its own impedance
+/// plus the series path to the node it reaches — is at or above this value
+/// is a *pull*. A pull sets a node's level only when nothing stronger
+/// reaches it, and it never contends: a 15 kΩ pad against a 30 Ω sink is a
+/// pull-up losing to a driver, and a 10.5 kΩ pull-up against a 25 Ω pad is
+/// the pad's node. One value with [`STREAM_COLLAPSE_THRESHOLD`] by design:
+/// the resistance below which two nets are one node for signalling is the
+/// resistance below which a source is a driver of that node.
+pub const WEAK_DRIVE_OHMS: Ohms = STREAM_COLLAPSE_THRESHOLD;
+
+/// Upper bound of a valid logic low at a 3.3 V LVCMOS input, `V_IL(max)`:
+/// JEDEC JESD8C.01 (3.3 V LVCMOS interface standard), DC input
+/// specifications, `V_IL` max = 0.8 V. With [`V_IH`] it bounds the dead
+/// band a solved node voltage is projected through: a divided voltage at or
+/// below this is a low, strictly between the two is
+/// [`NetState::Contention`] with a [`crate::Finding::AmbiguousLevel`].
+pub const V_IL: Volts = 0.8;
+
+/// Lower bound of a valid logic high at a 3.3 V LVCMOS input, `V_IH(min)`:
+/// JEDEC JESD8C.01, DC input specifications, `V_IH` min = 2.0 V. See
+/// [`V_IL`].
+pub const V_IH: Volts = 2.0;
 
 // ============================================================
 // Identity
@@ -91,14 +121,20 @@ pub enum Level {
 pub enum NetState {
     /// No source reaches this node (MNA singular for the node).
     Floating,
-    /// Solved V within `V_OL`/`V_OH` of a rail, dominated by one push-pull source.
+    /// A strong push-pull source (under [`WEAK_DRIVE_OHMS`]) on the node
+    /// itself wins it.
     Driven(Level),
-    /// Rail-adjacent V dominated by a resistive path of the given Thevenin impedance.
+    /// The winning source reaches the node through resistance: its level,
+    /// and the ohms of the winner's series path (a weak pad's own impedance
+    /// included — a 15 kΩ pad is a resistor to its rail).
     Pulled(Level, Ohms),
-    /// None of the above projections apply — raw node voltage.
+    /// None of the above projections apply — raw node voltage: an ideal
+    /// source on the node, a solved operating point, a divided voltage that
+    /// is a valid level.
     Analog(Volts),
-    /// ≥ 2 push-pull sources fighting (directly or through collapsed
-    /// low-value series resistance).
+    /// Sources of comparable strength disagree and the voltage they fight
+    /// to lies strictly inside the [`V_IL`]/[`V_IH`] dead band: neither
+    /// level. Always beside a [`crate::Finding::Contention`].
     Contention,
 }
 
@@ -256,8 +292,23 @@ mod tests {
     #[case::default_pp(DEFAULT_PUSH_PULL_IMPEDANCE, 25.0)]
     #[case::stream_collapse(STREAM_COLLAPSE_THRESHOLD, 1_000.0)]
     #[case::escalation(ESCALATION_IMPEDANCE_RATIO, 10.0)]
+    #[case::weak_drive(WEAK_DRIVE_OHMS, 1_000.0)]
+    #[case::v_il(V_IL, 0.8)]
+    #[case::v_ih(V_IH, 2.0)]
     fn published_thresholds_match_design_doc(#[case] actual: f64, #[case] expected: f64) {
         assert!((actual - expected).abs() < f64::EPSILON);
+    }
+
+    /// The dead band brackets the digital threshold: its low edge projects
+    /// low, its high edge high, and the threshold itself lies between them —
+    /// so a solved voltage the digital projection calls high can still be
+    /// an ambiguous level.
+    #[rstest]
+    #[case::low_edge(V_IL, Level::Low)]
+    #[case::threshold(LOGIC_THRESHOLD_VOLTS, Level::High)]
+    #[case::high_edge(V_IH, Level::High)]
+    fn the_dead_band_brackets_the_logic_threshold(#[case] volts: Volts, #[case] expect: Level) {
+        assert_eq!(level_of(NetState::Analog(volts)), Some(expect));
     }
 
     #[rstest]

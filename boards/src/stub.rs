@@ -1,5 +1,15 @@
 //! Pin facades with no behaviour, for the parts of a board that are real but
-//! not exercised.
+//! not yet modelled.
+//!
+//! **Retiring.** `DESIGN.md` rule 1 admits no stub tier: a part is a node
+//! whose class has behaviour. The facades here are the parts `NODES.md` §8
+//! phases 2–4 replace with models (the oscillator, the inverters, the
+//! PSRAMs, the FET, the rails, the detector, the isolators, the optos, the
+//! current regulators, the transistor), and the census in
+//! `board/tests/cluster_census.rs` counts them as a figure that may only
+//! fall; this module is deleted in phase 4 when it reads 0. The pin helpers
+//! are the [`PinDecl`] constructors by another name — a model still writes
+//! its table, with those.
 //!
 //! A board is only buildable when EVERY component declares a facade the netlist
 //! agrees with, in both directions — so the parts nothing drives still have to
@@ -15,51 +25,27 @@
 //! the engine would be right to complain. [`passive`] is for pins whose
 //! direction is genuinely topology-only.
 
-use embsim_board::{AttachError, Component, ComponentNetIo, PartRegistry, PinDecl, PinKind};
+use embsim_board::{AttachError, Component, ComponentNetIo, PartRegistry, PinDecl};
 
 /// A pin the component senses and never drives.
 pub const fn dig_in(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::digital_in(number)
 }
 
 /// A push-pull output pin (idles `Driven(High)` until the component drives).
 pub const fn dig_out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::digital_out(number)
 }
 
 /// A pin whose *voltage* the component needs (participates in the cluster
 /// solve) — a differential receiver input, an ADC input.
 pub const fn analog(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::Analog,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::analog(number)
 }
 
 /// A rail the part consumes.
 pub const fn pwr_in(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::PowerIn,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::power_in(number)
 }
 
 /// A rail the part generates (regulator/DC-DC output, isolated-domain
@@ -67,24 +53,12 @@ pub const fn pwr_in(number: &'static str) -> PinDecl {
 /// to clear [`embsim_board::Finding::PowerNetUnsourced`], not enough for a
 /// component that gates on a rail *voltage*; stick the rail with `Scenario::net_stuck`.
 pub const fn pwr_out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::PowerOut,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::power_out(number)
 }
 
 /// A terminal that contributes nothing electrical.
 pub const fn passive(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::Passive,
-        stream: None,
-        drive_impedance: None,
-    }
+    PinDecl::passive(number)
 }
 
 /// A pin the schematic marks no-connect. Spelled distinctly from [`passive`]

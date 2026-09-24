@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EventLog, Finding, Harness, PinDecl, PinHandle,
-    PinKind, System, TheveninDrive,
+    AttachError, Component, ComponentNetIo, EventLog, Finding, Harness, IdleDrive, PinDecl,
+    PinHandle, PinKind, System, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -74,6 +74,7 @@ const fn analog_pin(name: &'static str) -> PinDecl {
         kind: PinKind::Analog,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

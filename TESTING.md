@@ -34,6 +34,29 @@ cargo test -p embsim-board --test isolation_bridge -- --nocapture
 # Re-bless the golden traces after an INTENDED engine/model behavior change.
 # Review the diff: it is the wire behavior of the system.
 EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism
+
+# The phase-0 baselines of NODES.md (the numbers DESIGN.md rules 1, 4 and 8
+# are held to). The census asserts, per reference board, the cluster count,
+# the largest cluster's root count and the number of parts with nothing
+# behind them, as a committed fixture (the last a never-rises gate);
+# `--nocapture` prints the table with the largest cluster's nets, the node
+# classes and the stubs by name.
+cargo test -p embsim-board --test cluster_census -- --nocapture
+# The one pipeline (phase 1): every part a node, mechanical nodes, switch
+# poles as identity unions, the value parser over the whole module, the
+# error that names the value; and the build fixed point: build == live
+# before the first wake on the EC32MB and the Edge board, the bound.
+cargo test -p embsim-board --test one_pipeline --test build_fixed_point
+# Rule 2, source-strength projection (phase 1, engine half): a pull never
+# contends, ten times weaker loses with a finding, comparable sources solve
+# and project through the dead band, the pulled ohms are the winner's path,
+# ∞ Ω is a release, a current injection reads I·R or strands with a finding.
+cargo test -p embsim-board --lib source_strength
+# ns/solve of the MNA at m = 2, 4, 8, 11, 47 (not a test; run in release).
+cargo run -p embsim-board --release --example solve_bench
+# The ROM boot prints its edges / yields / publishes / wall time and holds
+# its escalated-solve count at 0 (needs a QEMU P2 tree).
+EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocapture
 ```
 
 Per-crate iteration:
@@ -134,6 +157,22 @@ cargo llvm-cov --workspace --summary-only
    free-running *does* diverge where stepped does not, and requires every named
    case to have a golden.
 
+9. **A model's proving tests run in stepped mode.** A free-running system
+   with no firmware in it can still settle two ways from one input:
+   `board/tests/rs422_determinism.rs` holds an open divergence of exactly
+   that kind (the receiver output rests `Floating` in about one run in twelve,
+   a drive release from a component's attach interleaving differently with a
+   sense delivery — reproduced 2026-09-23, see the test's docs for the
+   recipe). Until it is closed, a new model's proving test — the tests
+   `NODES.md` §8 lists as each phase's proof — starts its system in stepped
+   mode (`virtual_clock::init_mode(ClockMode::Stepped, …)`, the pattern in
+   `determinism.rs` and `pulse_bridge_stepped.rs`), where the engine quiesces
+   every actor before it advances and the interleaving is the engine's own.
+   A free-running case may still exist beside it to measure divergence, under
+   rule 8; it is not the proof. Every sense→drive cascade a new model adds is
+   one more place the open divergence can show, which is why the rule lands
+   before the models do.
+
 ## What each layer should cover
 
 | Layer | Happy path | Edge | Parameterized |
@@ -154,7 +193,6 @@ cargo llvm-cov --workspace --summary-only
 When these land, each needs a dedicated integration binary:
 
 - `Harness::from_toml`
-- `AmbiguousLevel` dead-band projection
 - Live topology mutation after `System::start`
 - Dual-MCU firmware entry inversion (one image per process still applies)
 

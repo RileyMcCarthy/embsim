@@ -46,9 +46,9 @@ use rstest::rstest;
 use embsim_board::netlist::{self, ComponentDecl};
 use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EventLog, Finding, Harness, Level, NetState,
-    PartRegistry, PinDecl, PinHandle, PinKind, PulseDirection, PulseSegment, PulseTrain, PulseTx,
-    Scenario, StreamRole, System, SystemHandle,
+    AttachError, Board, Component, ComponentNetIo, EventLog, Finding, Harness, IdleDrive, Level,
+    NetState, PartRegistry, PinDecl, PinHandle, PinKind, PulseDirection, PulseSegment, PulseTrain,
+    PulseTx, Scenario, StreamRole, System, SystemHandle,
 };
 use embsim_models::isolation::iso67xx;
 use embsim_models::isolation::{
@@ -149,6 +149,7 @@ fn settle_probe_pin() -> PinDecl {
         kind: PinKind::DigitalIn,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -351,6 +352,7 @@ impl FakePins {
                     kind: PinKind::DigitalOut,
                     stream: Some(StreamRole::PulseSource),
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
                 out("DIR"),
                 out("ENA"),
@@ -368,6 +370,7 @@ fn out(number: &'static str) -> PinDecl {
         kind: PinKind::DigitalOut,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -399,6 +402,7 @@ const STEP_SINK_PINS: [PinDecl; 1] = [PinDecl {
     kind: PinKind::DigitalIn,
     stream: Some(StreamRole::PulseSink),
     drive_impedance: None,
+    idle: IdleDrive::KindDefault,
 }];
 
 impl Component for FakeStepSink {

@@ -52,8 +52,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Level, PinDecl, PinHandle,
-    PinKind,
+    digital_drive, level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, PinDecl,
+    PinHandle, PinKind,
 };
 use tracing::trace;
 
@@ -66,6 +66,7 @@ const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -79,6 +80,7 @@ const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

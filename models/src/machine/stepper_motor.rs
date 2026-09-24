@@ -131,8 +131,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, PulseTrain,
-    StreamRole, Volts,
+    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, PinDecl, PinKind,
+    PulseTrain, StreamRole, Volts,
 };
 use embsim_core::event::Observers;
 use embsim_core::virtual_clock;
@@ -319,6 +319,7 @@ const fn input(number: &'static str) -> PinDecl {
         kind: PinKind::DigitalIn,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -337,6 +338,7 @@ pub const STEPPER_PINS: [PinDecl; 3] = [
         kind: PinKind::DigitalIn,
         stream: Some(StreamRole::PulseSink),
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     },
     input("DIR"),
     input("ENA"),

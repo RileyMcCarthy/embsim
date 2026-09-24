@@ -72,7 +72,7 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, NetState, Ohms, PinDecl, PinHandle, PinKind,
+    AttachError, Component, ComponentNetIo, IdleDrive, NetState, Ohms, PinDecl, PinHandle, PinKind,
     TheveninDrive, Volts,
 };
 use embsim_core::event::Observers;
@@ -138,6 +138,7 @@ pub const NSI50010_PINS: [PinDecl; 2] = [
         kind: PinKind::Analog,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     },
     PinDecl {
         number: "2",
@@ -145,6 +146,7 @@ pub const NSI50010_PINS: [PinDecl; 2] = [
         kind: PinKind::Analog,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     },
 ];
 

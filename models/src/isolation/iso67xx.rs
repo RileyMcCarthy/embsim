@@ -118,8 +118,8 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, NetState, Ohms, PinDecl, PinHandle, PinKind,
-    PulseTrain, PulseTx, StreamRole, TheveninDrive, Volts,
+    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms, PinDecl, PinHandle,
+    PinKind, PulseTrain, PulseTx, StreamRole, TheveninDrive, Volts,
 };
 
 use super::{
@@ -999,6 +999,7 @@ fn declare(spec: &PinSpec, config: &Config) -> PinDecl {
         // Applied per drive: the impedance is configuration, not a
         // `&'static` constant.
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

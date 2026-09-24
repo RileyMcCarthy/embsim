@@ -1,10 +1,10 @@
 //! The P2-EC32MB as a board: does it build, and is it the circuit the vendor
 //! drew?
 //!
-//! Two different claims here. The first is that every one of the netlist's 168
-//! components has something behind it whose pin facade the netlist agrees with
-//! — which `Board::from_netlist_with_stubs` checks in both directions, so a
-//! board that builds at all is a strong statement.
+//! Two different claims here. The first is that every one of the netlist's 114
+//! components is a node of a class the netlist agrees with — a component's pin
+//! facade, a switch's poles — which `Board::from_netlist` checks in both
+//! directions, so a board that builds at all is a strong statement.
 //!
 //! The second matters more. A board model is only worth having if it reproduces
 //! the things a hand-wired harness would quietly get wrong, and this module has
@@ -15,7 +15,9 @@
 
 use std::collections::BTreeSet;
 
-use embsim_board::{AttachError, Component, ComponentNetIo, PinDecl, PinKind};
+use embsim_board::{
+    AttachError, Component, ComponentNetIo, IdleDrive, PartClass, PinDecl, PinKind,
+};
 use embsim_boards::ec32mb::{Ec32mb, FLASH_CAPACITY, NETLIST};
 use embsim_models::sd_card::SdCard;
 
@@ -53,6 +55,7 @@ impl P2Slot {
                 },
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             })
             .collect();
         Self { pins }
@@ -82,10 +85,30 @@ fn the_module_builds_with_every_active_part_behind_a_facade() {
         "U302", "U303", "U304", "U305", // the four PSRAMs
         "U401", "U402", "U403", "U404", // power
         "X100", "U101", // oscillator and its buffer
-        "S301", // the DIP switch
     ] {
         assert!(refs.contains(expected), "{expected} is missing: {refs:?}");
     }
+    // The DIP switch and the solder link are switches with poles; the
+    // mounting holes and the BOM-only lines are mechanical nodes. Every part
+    // is a node.
+    assert!(
+        matches!(board.node_class("S301"), Some(PartClass::Switch { poles }) if poles.len() == 4),
+        "{:?}",
+        board.node_class("S301")
+    );
+    assert!(
+        matches!(board.node_class("J101"), Some(PartClass::Switch { poles }) if poles.len() == 1),
+        "{:?}",
+        board.node_class("J101")
+    );
+    for mechanical in ["J701", "J702", "PCB", "NC_Net"] {
+        assert_eq!(
+            board.node_class(mechanical),
+            Some(&PartClass::Mechanical),
+            "{mechanical}"
+        );
+    }
+    assert_eq!(board.nodes().count(), 114);
 }
 
 #[test]
