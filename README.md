@@ -17,6 +17,77 @@ and `tools` crates carry no project- or Propeller-2-specific assumptions. A new
 project supplies a *platform crate* and a *machine*, and gets a runnable
 emulator.
 
+## What embsim is for, and what it is not
+
+embsim validates a **PCBA with its firmware** before the board exists: the real
+firmware binary on an instruction-set simulator, every part on the board a node,
+and the nets between them resolved as circuits at the instants things happen.
+It sits between a unit test with a mocked HAL and the bench. It is not SPICE
+and it is not a transaction-level emulator; it is deliberately in between, and
+that is where it finds the bugs the two ends cannot: a fought line, a missing
+pull-up, a floating input, a strap on the wrong pin, a shared bus that clobbers
+itself, a boot that needs a switch position — while running fast enough to gate
+every pull request.
+
+**What it validates**
+
+- **The design as drawn.** The vendor netlist is the model. Every net, every
+  pin, every resistor, switch position, jumper, DNP and rail is what the
+  firmware sees; a part the registry cannot classify is a build error naming it.
+- **Every operating point.** Levels, drivers against pulls, two drivers on one
+  net, floating inputs, rails up or down, enable trees, brown-out and reset
+  order — resolved as a circuit (Thevenin sources, resistor networks, a nodal
+  solve where sources compete) at each event, and reported as findings.
+- **Protocols on the wires, bit by bit.** SPI on shared pins, I2C as open-drain
+  and pull-up (wired-AND, clock stretching, arbitration), UART framing at the
+  real baud, step/dir with exact counts, differential receivers with their
+  failsafe — carried as levels on nets, not as bytes handed across.
+- **Timing at the event level.** Each edge lands on the net at the guest's own
+  nanosecond; RC delays are single-pole closed forms; the CPU's clocks come
+  from the clock it set. Virtual time is stepped and deterministic, so a run
+  is reproducible bit for bit and a trace can be a golden.
+- **The firmware, whole.** The real ROM boot off the real flash, the real HAL,
+  all cogs interleaved, the shipped app end to end — in CI, on every push.
+- **What-ifs, cheaply.** Switch and jumper positions, DNP parts, shorts,
+  detached pins, stuck rails, missing parts: a line of scenario each, and the
+  same run again.
+
+**What it does not model** — the limits, so they are never a surprise
+
+- **Signal integrity.** No transmission lines, reflections, ringing, crosstalk
+  or ground bounce. An edge is instantaneous unless a capacitance is declared,
+  and then it is one RC pole.
+- **Transients beyond one pole.** No multi-pole filters (one stated exception,
+  the symmetric differential pair), no inductor dynamics, no resonance, no
+  switching-regulator ripple. A regulator is a DC source with a soft-start
+  instant.
+- **Nonlinear devices beyond regions.** A diode is on or off, a FET on or off,
+  a transistor saturated or active — piecewise-linear regions in one DC solve,
+  not curves. No amplifier loops or oscillator start-up beyond what a model
+  declares.
+- **Tolerances and corners.** Values are nominal. No temperature, aging or
+  Monte Carlo unless a scenario overrides a value.
+- **Power integrity.** No current budgets, IR drop, regulator current limits
+  or thermal, unless a model declares a load.
+- **Noise and metastability.** Digital levels are projected through declared
+  thresholds; there is no noise, no glitch filtering beyond a declared RC.
+- **The CPU below the instruction.** The P2 targets are instruction-accurate
+  and differentially checked against each other and against silicon captures,
+  not cycle-exact: two clocks per instruction, hub windows approximated,
+  interrupts and some smart-pin modes not yet modelled. Firmware timing
+  measurements are approximate.
+- **Faults you did not name.** A short, a detached pin or a stuck rail is
+  found only when a scenario injects it; the tool does not guess at
+  manufacturing defects.
+- **EMI/EMC, ESD, mechanical.** Out of scope.
+
+**Why it stays fast.** Nothing is integrated per tick: cost is per event, and a
+solve runs only where sources within a factor of ten disagree or an analog
+sense asks. Everything else is a projection. A ROM boot that bit-bangs 16 901
+flash edges through the net engine takes 0.2 s wall; a step train travels as a
+rate, one event per rate change, because 820 000 edges a second was measured
+and refused.
+
 ## Crate layering
 
 ```
