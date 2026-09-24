@@ -81,6 +81,20 @@ every pull request.
   manufacturing defects.
 - **EMI/EMC, ESD, mechanical.** Out of scope.
 
+**The path.** What can be simulated, today and by phase of [`NODES.md`](NODES.md); the last column is out of scope by design.
+
+| Area | Today | The plan adds | Not in scope |
+|---|---|---|---|
+| Connectivity | every net and pin from the vendor netlist, facade checked both ways; resistors as circuit edges; jumpers | switches, capacitors, diodes, FETs, regulators, oscillators, gates as nodes; unclassified part = build error (phases 1–4) | parasitics the netlist does not name |
+| DC operating point | drivers vs pulls, contention, floating, stuck rails, a nodal solve where sources compete | impedance-aware ranking (a 15 kΩ pull vs a sink is not contention), real rail voltages, ground as a declared terminal, LED lit, body diodes, the missing-pull-up lint (1, 3, 4) | current budgets, IR drop, thermal |
+| Protocols on wires | SPI on shared pins, UART as levels at real baud, step/dir as exact counts, RS-422 receivers, the ROM boot off the flash | I2C wired-AND with clock stretching and arbitration, the P2 pad reading the net in its pull modes (2, 6); CAN/USB only if a model is written | transaction-level bus models |
+| Timing | every edge at its own nanosecond; deterministic stepped clock; golden traces | RC delays as one pole with exact integer-ns crossings; rail soft-start instants; symmetric differential filters (5) | slew, setup/hold against slow edges, multi-pole transients, ringing |
+| Power | rails present or absent; enable trees as senses | rails as sources with soft-start and UVLO; supervisor with hysteresis; isolated domains; brown-out ordering (4) | regulator ripple, current limit, load transients |
+| Analog | ADS122U04 front end at settled values; force and encoder plants | RC settling at conversion instants; input ports on senses (5) | noise, amplifier loops, oscillator start-up |
+| CPU | P2 on QEMU or p2core, instruction-accurate, verified against each other and silicon captures; hub-exec and cog-exec; HUBSET clock | pad strengths from WRPIN, XI clock from the board's crystal, reset from RESN (2, 4) | cycle-exact hub timing, interrupts until modelled |
+| Faults and what-ifs | shorts, detached pins, stuck nets, DNP, value overrides, jumper states | switch positions by name, declared leaks, capacitance on a harness (1, 5) | faults nobody injects; tolerances and corners |
+| Speed | 16 901 flash edges in 0.2 s; step trains as rates | a census and a solve benchmark as CI gates; nothing added to the fast path (0, 6) | a timestep, ever |
+
 **Why it stays fast.** Nothing is integrated per tick: cost is per event, and a
 solve runs only where sources within a factor of ten disagree or an analog
 sense asks. Everything else is a projection. A ROM boot that bit-bangs 16 901
