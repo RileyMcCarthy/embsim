@@ -190,3 +190,80 @@ No `OpenDrain`/`PushPull` kinds. Open-drain is a behaviour of the node — a sin
 **Sequencing, so nothing regresses:** rule 2 before the pad pull modes are mapped (today a `{3.3 V, 15 kΩ}` pull against any sink is Contention because the fight rule ignores ohms); rails as real terminals (phase 4) before the sense becomes volts-only (every supply gate reads a NaN-sourced rail's `Pulled(High)` today); ∞ Ω normalised at the slot before it can be ranked; the pulse channel folded in per `sil-unified-drive.md` steps 1–4, since today it is a second interface with its own registration, routing and un-sequenced delivery.
 
 **What this is, in the vocabulary of other tools.** SPICE stamps every element as a Norton pair and solves KCL with a timestep; Proteus VSM keeps a strength-coded logic state per digital pin and bridges to SPICE with interface objects carrying an output resistance; Icarus and VHDL resolve by an ordinal strength table with no voltage; Renode and QEMU carry a `bool` or an `int` per line and bytes per bus, with no strength, no resistor and no conflict detection. embsim's interface is SPICE's linearisation at event instants with Proteus's ordinal shortcut where it is exact — which is why it can see the bugs the transaction-level tools cannot (a fought line, a missing pull-up, a floating input, a stretched clock) at a per-edge cost the timestep tools cannot afford.
+
+## 11. The interface between nodes, as code
+
+A node never sees another node. It sees its own pins: what it declared about them, the voltage the engine hands back, and the drives it publishes. Everything between two nodes is the engine's — resolution, timing, findings — so two nodes written a year apart on different boards agree by construction.
+
+```rust
+/// Declared once, at build. Static electrical facts the solver stamps and
+/// the engine never asks for again. (IBIS's decomposition.)
+pub struct PinDecl {
+    pub number: &'static str,
+    pub name: Option<&'static str>,
+    pub role: PinRole,                 // Signal | PowerIn | PowerOut(Terminal) | Passive
+    pub idle: Option<Thevenin>,        // the power-on drive; None = released
+    pub input: Option<InputPort>,      // { v_bias, r_in }: the pin's own load
+    pub clamps: &'static [Clamp],      // shunts to `supply`/`reference`, always on
+    pub capacitance_pf: Option<f64>,   // to `reference`; the RC pole the engine arms
+    pub thresholds: Option<Thresholds>,// { v_il, v_ih, hysteresis }, relative to `supply`
+    pub reference: Option<&'static str>, // the pin its voltages are measured against
+    pub supply: Option<&'static str>,
+    pub can_source: bool,              // false = sink-only: the missing-pull-up lint
+}
+
+/// A nonlinear element is a branch between two of the part's pins, with an
+/// optional control pin — never a per-pin curve.
+pub struct Branch {
+    pub a: &'static str,
+    pub b: &'static str,
+    pub curve: PwlCurve,               // off = GMIN; on = Vf + r_d, or R_ds(on)
+    pub control: Option<(&'static str, RegionTest)>,
+}
+
+pub trait Component: Send + Sync {
+    fn pins(&self) -> &[PinDecl];
+    fn branches(&self) -> &[Branch] { &[] }
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError>;
+    fn start(&mut self) {}
+}
+
+/// The one per-instant message. Three encodings, one command, sequenced,
+/// published at the producer's own instant (R1–R5).
+pub enum Drive {
+    Thevenin { volts: f64, ohms: f64 },        // ohms = ∞ is normalised to Released
+    Current  { amps: f64 },                    // a Norton injection, no shunt
+    Periodic { hi: Thevenin, lo: Thevenin, segment: PulseSegment },
+}
+impl PinHandle {
+    pub fn drive(&self, d: Drive);              // enqueue; resolved next pass
+    pub fn release(&self);                      // Thevenin { ohms: ∞ }
+    pub fn sense_current(&self) -> Amps;        // an instrument; escalates its cluster
+}
+
+/// What a sensing pin is handed: the node voltage relative to the pin's
+/// declared reference, or nothing if no source reaches the node.
+pub struct Sense { pub volts: Option<f64>, pub at_ns: u64 }
+impl Sense {
+    /// The receiver's own projection: its thresholds, its hysteresis, its last level.
+    pub fn level(&self, thresholds: &Thresholds, last: Option<Level>) -> Option<Level>;
+}
+impl ComponentNetIo {
+    pub fn pin(&self, id: &str) -> Result<PinHandle, AttachError>;
+    pub fn on_sense(&self, id: &str, f: impl Fn(Sense) + Send + 'static) -> Result<(), AttachError>;
+    pub fn on_branch(&self, id: &str, f: impl Fn(Amps) + Send + 'static) -> Result<(), AttachError>;
+    pub fn on_wake_ns(&self, f: impl Fn(u64) + Send + 'static);
+    pub fn schedule_at_ns(&self, at_ns: u64);
+}
+```
+
+**The contract, six lines.**
+
+1. A node publishes only what it drives on its own pin, at the instant it drove it, and reads only the voltage the engine hands it. It never publishes the net's result, never reads by differencing timestamps, and retracts by publishing again (R3–R5).
+2. A node never commits state ahead of virtual time; it schedules a wake and acts when the engine arrives (R1). The engine never advances past an undelivered publish (R2).
+3. Everything static is declared, everything dynamic is a `Drive`. A pin's strength is its published Thevenin; its clamps, capacitance, thresholds, input load and sourcing capability are declarations; a nonlinear device is a `Branch` on the component.
+4. The engine owns resolution: the impedance ranking, the nodal solve, the RC crossing instants, the region loop, contention and floating as findings. No node re-implements any of it, and no node can be given a shortcut around it.
+5. A rail is a node too: a `PowerOut` terminal driving a `Thevenin` from its own ground pin, with the same message as a pad.
+6. There is no second channel. The pulse train is `Drive::Periodic`, routed and sequenced like every other drive, kept only because 820 000 edges a second was measured; a node that consumes one integrates the segment itself.
+
+**What changes from today's trait**, in one column: `PinKind` (7 variants deciding electrical defaults) becomes `PinRole` plus declarations; `NetState` (5 variants, one global threshold) becomes `Sense { volts: Option }` plus the receiver's projection; `set_drive(Option<TheveninDrive>)` becomes `drive(Drive)` with `Current` and `Periodic`; `StreamRole`/`pulse_tx`/`on_pulse` fold into `Drive::Periodic`; `Component` gains `branches()`. The `Component`/`attach`/`start` shape and the wake scheduling are unchanged — the QEMU P2 node, the flash, the card and the ADC front end port by editing their tables, not their logic.
