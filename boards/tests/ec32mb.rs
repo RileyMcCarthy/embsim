@@ -15,66 +15,64 @@
 
 use std::collections::BTreeSet;
 
-use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, PartClass, PinDecl, PinKind,
-};
+use embsim_board::{Component, IdleDrive, PartClass, PinKind, StreamRole};
 use embsim_boards::ec32mb::{Ec32mb, FLASH_CAPACITY, NETLIST};
+use embsim_boards::p2::{HeldInReset, P2Package, NUM_PADS};
 use embsim_models::sd_card::SdCard;
 
-/// A processor-shaped placeholder: the netlist's own `U100` pins, and no
-/// behaviour. Enough to fill the slot for tests about the board rather than
-/// about the CPU.
-#[derive(Debug)]
-struct P2Slot {
-    pins: Vec<PinDecl>,
+/// The processor slot filled by a P2 package with no core: every pad
+/// released, the rails and reset sensed, `XI` accepting the board's rate —
+/// the state any P2 is in before it runs, and enough for tests about the
+/// board rather than about the CPU.
+fn in_reset() -> P2Package<HeldInReset> {
+    P2Package::held_in_reset()
 }
 
-impl P2Slot {
-    /// Built from the netlist, so it cannot drift from what `U100` declares.
-    fn new() -> Self {
-        let parsed = embsim_board::netlist::parse(NETLIST).expect("the netlist parses");
-        let mut names: BTreeSet<&str> = BTreeSet::new();
-        for net in &parsed.nets {
-            for node in &net.nodes {
-                if node.reference == "U100" {
-                    names.insert(node.pin.as_str());
-                }
+/// The package declares exactly the pins the netlist gives `U100`, in both
+/// directions — the build checks it, and this pins the facade down by name
+/// so a netlist edit and a package edit meet here first.
+#[test]
+fn the_package_declares_the_netlists_u100_pins() {
+    let parsed = embsim_board::netlist::parse(NETLIST).expect("the netlist parses");
+    let mut netlist: BTreeSet<&str> = BTreeSet::new();
+    for net in &parsed.nets {
+        for node in &net.nodes {
+            if node.reference == "U100" {
+                netlist.insert(node.pin.as_str());
             }
         }
-        let pins = names
-            .into_iter()
-            .map(|n| PinDecl {
-                // Leaked so the facade can be `&'static`, as `Component::pins`
-                // requires. One allocation per test process.
-                number: Box::leak(n.to_string().into_boxed_str()),
-                name: None,
-                kind: if n.starts_with("VIO") || n == "VDD" || n == "GND" || n == "TEST" {
-                    PinKind::PowerIn
-                } else {
-                    PinKind::DigitalIn
-                },
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            })
-            .collect();
-        Self { pins }
     }
-}
+    let package = in_reset();
+    let declared: BTreeSet<&str> = package.pins().iter().map(|p| p.number).collect();
+    assert_eq!(declared, netlist);
+    assert_eq!(package.pins().len(), 86);
 
-impl Component for P2Slot {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
+    // Every pad is a released bidirectional pin; XI takes a rate; XO is a
+    // released output; the supplies are supplies.
+    for pad in &package.pins()[..NUM_PADS] {
+        assert_eq!(pad.kind, PinKind::DigitalBidir, "{}", pad.number);
+        assert_eq!(pad.idle, IdleDrive::Released, "{}", pad.number);
     }
-    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
-        Ok(())
-    }
+    let pin = |name: &str| {
+        package
+            .pins()
+            .iter()
+            .find(|p| p.number == name)
+            .copied()
+            .unwrap_or_else(|| panic!("{name} declared"))
+    };
+    assert_eq!(pin("XI").stream, Some(StreamRole::PulseSink));
+    assert_eq!(pin("XO").kind, PinKind::DigitalOut);
+    assert_eq!(pin("XO").idle, IdleDrive::Released);
+    assert_eq!(pin("RESN").kind, PinKind::DigitalIn);
+    assert_eq!(pin("VDD").kind, PinKind::PowerIn);
+    assert_eq!(pin("VIO_60_63").kind, PinKind::PowerIn);
 }
 
 #[test]
 fn the_module_builds_with_every_active_part_behind_a_facade() {
     let board = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .build()
         .expect("the module builds");
 
@@ -114,7 +112,7 @@ fn the_module_builds_with_every_active_part_behind_a_facade() {
 #[test]
 fn a_card_in_the_socket_becomes_a_component_and_an_empty_socket_does_not() {
     let empty = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .build()
         .expect("builds");
     assert!(
@@ -124,7 +122,7 @@ fn a_card_in_the_socket_becomes_a_component_and_an_empty_socket_does_not() {
     );
 
     let populated = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .with_card(SdCard::blank(64 * 512))
         .build()
         .expect("builds");
@@ -173,7 +171,7 @@ fn nodes_on(board: &embsim_board::Board, net_name: &str) -> BTreeSet<String> {
 #[test]
 fn the_flash_clock_is_also_the_cards_chip_select() {
     let board = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .with_card(SdCard::blank(64 * 512))
         .build()
         .expect("builds");
@@ -190,7 +188,7 @@ fn the_flash_clock_is_also_the_cards_chip_select() {
 #[test]
 fn the_card_clock_and_the_flash_chip_select_share_a_pin_through_the_dip_switch() {
     let board = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .with_card(SdCard::blank(64 * 512))
         .build()
         .expect("builds");
@@ -214,7 +212,7 @@ fn the_card_clock_and_the_flash_chip_select_share_a_pin_through_the_dip_switch()
 #[test]
 fn the_two_devices_share_mosi_directly_and_miso_through_a_resistor() {
     let board = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .with_card(SdCard::blank(64 * 512))
         .build()
         .expect("builds");
@@ -250,7 +248,7 @@ fn a_flash_image_shorter_than_the_part_leaves_the_rest_erased() {
     // A boot image is kilobytes and the part is 16 MiB. A ROM that reads past
     // the image must see the $FF of an erased array, not run off the end.
     let board = Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(in_reset()))
         .with_flash_image(vec![0xA5; 1024])
         .build()
         .expect("builds");

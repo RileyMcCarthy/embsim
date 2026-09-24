@@ -132,12 +132,12 @@ pub enum Classification {
     /// Auto tier: a connector / screw terminal — board boundary pins that
     /// harnesses attach to.
     Boundary,
-    /// Auto tier: a jumper (stateful short).
+    /// Auto tier: a two-pad jumper (a stateful short). A three-pad
+    /// `Jumper_3_*` / `SolderJumper_3_*` symbol is a two-pole
+    /// [`Classification::Switch`] instead.
     Jumper {
         /// Default state from the part name.
         default: JumperState,
-        /// True for 3-pin `Jumper_3_*` variants with a selectable position.
-        selectable: bool,
     },
     /// A switch: poles by pin id, each open or closed at build. Auto tier for
     /// a two-pin `SW_*` symbol (one open pole across pins `1` and `2`, the
@@ -467,17 +467,40 @@ impl PartRegistry {
 
         // Tier 1c: jumpers — stateful shorts, default state from the name.
         if auto.starts_with("Jumper") || auto.starts_with("SolderJumper") {
+            // A three-pad jumper is two poles from the common pad: the
+            // KiCad `Jumper_3_*` / `SolderJumper_3_*` pinout is 1 = A,
+            // 2 = C (the common), 3 = B, so pole 0 is 1–2 and pole 1 is
+            // 2–3, each open unless the name bridges it (`_Bridged12`,
+            // `_Bridged23`, `_Bridged123`). A jumper with one closed pole
+            // per throw is what the symbol draws; one short across all
+            // three pads is what a single closed edge used to make of it.
+            // An explicit registration pairs the pads otherwise.
+            if auto.starts_with("Jumper_3") || auto.starts_with("SolderJumper_3") {
+                if let Some(entry) = self.entry(decl) {
+                    return Ok(entry.classification());
+                }
+                let bridged = |pole: &str| auto.contains("_Bridged123") || auto.contains(pole);
+                let pole = |a: &str, b: &str, closed: bool| {
+                    if closed {
+                        SwitchPole::closed(a, b)
+                    } else {
+                        SwitchPole::open(a, b)
+                    }
+                };
+                return Ok(Classification::Switch {
+                    poles: vec![
+                        pole("1", "2", bridged("_Bridged12")),
+                        pole("2", "3", bridged("_Bridged23")),
+                    ],
+                });
+            }
             let default = if auto.contains("_NC") || auto.contains("_Bridged") {
                 JumperState::Closed
             } else {
                 // `_NO` / `_Open` / unmarked jumpers default open.
                 JumperState::Open
             };
-            let selectable = auto.starts_with("Jumper_3") || auto.starts_with("SolderJumper_3");
-            return Ok(Classification::Jumper {
-                default,
-                selectable,
-            });
+            return Ok(Classification::Jumper { default });
         }
 
         // Tier 1d: two-pin switches — one open pole across pins 1 and 2, the
@@ -770,6 +793,7 @@ impl std::error::Error for RegistryError {}
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vibes_behaviour::{behaviour, expect, Test};
 
     use super::*;
     use crate::component::{AttachError, ComponentNetIo, PinDecl};
@@ -896,7 +920,6 @@ mod tests {
             ),
             Ok(Classification::Jumper {
                 default: JumperState::Open,
-                selectable: false
             })
         );
         // J1 — generic connector = boundary.
@@ -953,19 +976,81 @@ mod tests {
                 found: 3
             })
         );
-        // EdgeBoard jumpers: Jumper_2_Open / Jumper_3_Open.
+        // EdgeBoard jumpers: Jumper_2_Open is a jumper, Jumper_3_Open a
+        // two-pole switch from its common pad 2 (see the three-pad case).
         assert_eq!(
             registry.classify(&decl_with_lib("Jumper", "Jumper_2_Open", "JP"), 2),
             Ok(Classification::Jumper {
                 default: JumperState::Open,
-                selectable: false
             })
         );
         assert_eq!(
             registry.classify(&decl_with_lib("Jumper", "Jumper_3_Open", "JP"), 3),
-            Ok(Classification::Jumper {
-                default: JumperState::Open,
-                selectable: true
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("1", "2"), SwitchPole::open("2", "3")]
+            })
+        );
+    }
+
+    /// A three-pad jumper is two poles from its common pad, open or bridged
+    /// as the symbol name says; a registration for the part name pairs the
+    /// pads its own way.
+    #[rstest]
+    #[case::open("Jumper_3_Open", false, false)]
+    #[case::bridged12("Jumper_3_Bridged12", true, false)]
+    #[case::bridged23("SolderJumper_3_Bridged23", false, true)]
+    #[case::bridged123("SolderJumper_3_Bridged123", true, true)]
+    fn a_three_pad_jumper_is_a_two_pole_switch(
+        #[case] part: &str,
+        #[case] pole0_closed: bool,
+        #[case] pole1_closed: bool,
+    ) {
+        behaviour!(Test {
+            id: "registry.three-pad-jumper-two-poles",
+            covers: Some("board/src/registry.rs#PartRegistry::classify"),
+            given: "a three-pad jumper symbol, open or bridged on one or both throws by its name",
+        });
+        expect!(
+            "two-poles",
+            "the part is a switch with two poles, each from the common pad to one throw, \
+             closed exactly where the symbol name bridges it",
+            "a three-pad jumper selects one throw at a time, and a single short across all \
+             three pads would tie the throws to each other"
+        );
+        let registry = PartRegistry::new();
+        let state = |closed: bool| {
+            if closed {
+                JumperState::Closed
+            } else {
+                JumperState::Open
+            }
+        };
+        assert_eq!(
+            registry.classify(&decl_with_lib("Jumper", part, "JP1"), 3),
+            Ok(Classification::Switch {
+                poles: vec![
+                    SwitchPole {
+                        a: "1".into(),
+                        b: "2".into(),
+                        state: state(pole0_closed)
+                    },
+                    SwitchPole {
+                        a: "2".into(),
+                        b: "3".into(),
+                        state: state(pole1_closed)
+                    },
+                ]
+            })
+        );
+        let mut registry = PartRegistry::new();
+        registry.register_switch(
+            "Jumper_3_Open",
+            vec![SwitchPole::open("A", "C"), SwitchPole::open("C", "B")],
+        );
+        assert_eq!(
+            registry.classify(&decl_with_lib("Jumper", "Jumper_3_Open", "JP1"), 3),
+            Ok(Classification::Switch {
+                poles: vec![SwitchPole::open("A", "C"), SwitchPole::open("C", "B")]
             })
         );
     }

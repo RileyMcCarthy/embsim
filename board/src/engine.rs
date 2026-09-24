@@ -118,8 +118,8 @@ use crate::component::{Drive, PulseTrain, StreamRole};
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
 use crate::event_log::{EngineEvent, EventLog};
 use crate::net::{
-    Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, ESCALATION_IMPEDANCE_RATIO,
-    STREAM_COLLAPSE_THRESHOLD, V_IH, V_IL, WEAK_DRIVE_OHMS,
+    Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, COUPLING_REACTANCE_RATIO,
+    ESCALATION_IMPEDANCE_RATIO, STREAM_COLLAPSE_THRESHOLD, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
 
 // ============================================================
@@ -245,6 +245,16 @@ pub(crate) enum Command {
         /// Delivery callback.
         callback: SenseCallback,
     },
+    /// The pin subscribing to `net` is a released bidirectional pad
+    /// (`DigitalBidir` declared `IdleDrive::Released`): from this
+    /// subscription on the net is **read**, so it joins the digital senses
+    /// and a floating one is a [`Finding::FloatingSense`]. Sent ahead of the
+    /// pin's [`Command::RegisterSense`]; the engine re-resolves once per
+    /// drain batch after handling any.
+    DeclareRead {
+        /// The net the pad reads.
+        net: NetId,
+    },
     /// Register the wakeup handler for a component (last registration wins).
     RegisterWake {
         /// Owning component.
@@ -321,11 +331,21 @@ pub(crate) type IdleDriveLog = Arc<Mutex<Vec<(EndpointId, Option<Drive>)>>>;
 /// pins every model's captured state (the flash model's image among it)
 /// for the life of the process.
 #[derive(Clone, Default)]
-pub(crate) struct SenseLog(pub(crate) Arc<Mutex<Vec<(NetId, SenseCallback)>>>);
+pub(crate) struct SenseLog(pub(crate) Arc<Mutex<Vec<RecordedSense>>>);
+
+/// One sense subscription the inert build link recorded: the net, whether
+/// the subscribing pin is a released bidirectional pad that now reads it
+/// (the build declares such a net a digital sense, as the live engine's
+/// [`Command::DeclareRead`] does), and the callback.
+pub(crate) struct RecordedSense {
+    pub(crate) net: NetId,
+    pub(crate) reads: bool,
+    pub(crate) callback: SenseCallback,
+}
 
 /// The inert link's view of a [`SenseLog`]: alive while the build runs,
 /// dead — and a recording silently skipped — once the build has dropped it.
-pub(crate) type WeakSenseLog = Weak<Mutex<Vec<(NetId, SenseCallback)>>>;
+pub(crate) type WeakSenseLog = Weak<Mutex<Vec<RecordedSense>>>;
 
 impl std::fmt::Debug for SenseLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -537,15 +557,63 @@ struct StreamPin {
     pin: PinRef,
 }
 
+/// One coupling capacitor between two nets — an **AC** path a rate crosses
+/// and a DC open (`NODES.md` §2, the Crystal / oscillator row: "rate routing
+/// crosses a capacitor at 0 Ω; DC resolution keeps it open"). Never a
+/// conduction edge.
+struct CouplingCapacitor {
+    a: usize,
+    b: usize,
+    farads: f64,
+    /// The capacitor's reference designator, for the finding that names it.
+    reference: String,
+}
+
+/// One coupling capacitor a routed train crosses on its way to a sink, with
+/// the far node's resistance the reactance is judged against at delivery.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CouplingCrossing {
+    /// The capacitor's reference designator.
+    pub(crate) capacitor: String,
+    /// Identity root of the net on the far side of the capacitor.
+    pub(crate) far_root: usize,
+    /// The capacitor's parsed value.
+    pub(crate) farads: f64,
+    /// The far node's resistance estimate: the smallest conduction edge
+    /// incident to its root, or `+∞` when nothing resistive touches it (a
+    /// lone CMOS input, whose input resistance is what the datasheet says
+    /// it is — large). See [`Resolver::route_pulses`] for why an estimate.
+    pub(crate) far_ohms: f64,
+}
+
+/// A pulse sink reached only across one or more coupling capacitors.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CoupledSink {
+    /// The sink endpoint.
+    pub(crate) sink: EndpointId,
+    /// Identity roots of the sink's own conduction segment — the nets on the
+    /// far side of the last capacitor, within the collapse radius. The
+    /// delivery gate for a coupled sink spans these alone: the capacitor is
+    /// what sources the far node, so a `Floating` DC state there is not a
+    /// barrier, while `Contention` (a fought node clamps the coupled
+    /// signal) is.
+    pub(crate) gate_roots: Vec<usize>,
+    /// The capacitors crossed, source side first.
+    pub(crate) couplings: Vec<CouplingCrossing>,
+}
+
 /// One derived source→sinks pulse route (see [`Resolver::route_pulses`]).
 pub(crate) struct PulseRouteSpec {
     /// Pulse source endpoint the route originates at.
     pub(crate) source: EndpointId,
-    /// Sink endpoints reachable through the collapsed link.
+    /// Sink endpoints reachable through the collapsed conduction link.
     pub(crate) sinks: Vec<EndpointId>,
     /// Identity roots of every net the collapsed link spans — delivery is
     /// gated on their resolved state, exactly as stream bytes are.
     pub(crate) path_roots: Vec<usize>,
+    /// Sinks reached across a coupling capacitor: delivered per sink, after
+    /// the reactance rule and their own gate ([`CoupledSink`]).
+    pub(crate) coupled: Vec<CoupledSink>,
 }
 
 /// Resolution state shared by the build-time pass and the live engine:
@@ -558,6 +626,9 @@ pub(crate) struct Resolver {
     identity: Dsu,
     /// Conduction edges (resistors, inductors, closed jumpers): (a, b, ohms).
     edges: Vec<(usize, usize, f64)>,
+    /// Coupling capacitors: AC paths for rate routing only, never
+    /// conduction (see [`CouplingCapacitor`]).
+    couplings: Vec<CouplingCapacitor>,
     /// Drive-capable endpoints, indexed by [`EndpointId`].
     slots: Vec<DriveSlot>,
     power_sources: Vec<(usize, Volts)>,
@@ -692,6 +763,7 @@ impl Resolver {
         Self {
             identity,
             edges: Vec::new(),
+            couplings: Vec::new(),
             slots: Vec::new(),
             power_sources: Vec::new(),
             stuck_sources: Vec::new(),
@@ -741,6 +813,18 @@ impl Resolver {
     pub(crate) fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
         self.topology_version += 1;
         self.edges.push((a, b, ohms));
+    }
+
+    /// Add a coupling capacitor between two nets: an AC path for rate
+    /// routing ([`Resolver::route_pulses`]), never a conduction edge.
+    pub(crate) fn add_coupling(&mut self, a: usize, b: usize, farads: f64, reference: String) {
+        self.topology_version += 1;
+        self.couplings.push(CouplingCapacitor {
+            a,
+            b,
+            farads,
+            reference,
+        });
     }
 
     /// Register a drive-capable endpoint with its initial Thevenin
@@ -1673,6 +1757,37 @@ impl Resolver {
     /// transmitters, and the underlying net additionally resolves
     /// `Contention` on its own.
     ///
+    /// # Across a coupling capacitor
+    ///
+    /// A rate also crosses a **coupling capacitor** ([`Resolver::add_coupling`]:
+    /// the module's TCXO reaches its buffer only through `C132`, and a
+    /// capacitor is a DC open in every solve). Such a sink is a
+    /// [`CoupledSink`]: the capacitors on its path are recorded with the far
+    /// node's resistance estimate, and the crossing is judged **at delivery**,
+    /// when the train's rate is known — the AC-coupling rule is
+    /// `1/(2π·f·C) ≤ R_far / `[`COUPLING_REACTANCE_RATIO`], else the train
+    /// stops at the capacitor with [`Finding::PulseNotCoupled`]. `R_far` is an
+    /// estimate, deliberately cheap: the smallest conduction edge incident to
+    /// the far node (the resistor that biases it, which is the Thevenin
+    /// resistance of a self-biased stage to within its driver's few ohms), or
+    /// `+∞` when nothing resistive touches it — a lone CMOS input. A strong
+    /// driver on the far node is not in the estimate: that is a DC fight the
+    /// resolution already reports on the node itself. The far side's own
+    /// conduction segment is the coupled sink's delivery gate; the DC state
+    /// of the source side is not, because the capacitor decouples it.
+    ///
+    /// # A terminal is a barrier here too
+    ///
+    /// Both reaches — the conduction path and the capacitor walk — end at a
+    /// declared terminal and never continue past one, exactly as
+    /// [`min_path_ohms`] does for projection (phase 1's decision (b) in
+    /// `NODES.md` §8). Physically a terminal is an AC short to its own
+    /// reference: a rate coupled into a stuck ground or a rail is shunted
+    /// there, not forwarded through the next decoupling capacitor to
+    /// whatever else hangs off that rail, and two sources that merely share
+    /// decoupling to one terminal do not face each other. The source's own
+    /// root is never a barrier, as in the path matrix.
+    ///
     /// Rebuild on every topology-affecting change so pulse routes can never
     /// outlive the graph they were derived from.
     pub(crate) fn route_pulses(
@@ -1689,6 +1804,33 @@ impl Resolver {
             .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
             .filter(|(a, b, _)| a != b)
             .collect();
+        // Coupling capacitors between roots; one across a single root (both
+        // ends merged) couples nothing.
+        let root_couplings: Vec<(usize, usize, usize)> = self
+            .couplings
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| (root_of[c.a], root_of[c.b], ci))
+            .filter(|(a, b, _)| a != b)
+            .collect();
+        // The declared terminals — rails (modelled or not) and stuck
+        // faults — as the roots neither reach continues past (the same
+        // list `resolve` ranks sources against).
+        let terminal_roots: Vec<usize> = self
+            .power_sources
+            .iter()
+            .chain(self.stuck_sources.iter())
+            .map(|(net, _)| root_of[*net])
+            .collect();
+        // The far-node resistance estimate, per root: the smallest
+        // conduction edge touching it.
+        let smallest_edge_at = |root: usize| -> f64 {
+            root_edges
+                .iter()
+                .filter(|(a, b, _)| *a == root || *b == root)
+                .map(|(_, _, ohms)| *ohms)
+                .fold(f64::INFINITY, f64::min)
+        };
 
         let mut routes = Vec::new();
         // hash-order shape 3: dedup gate for the paired mismatch report.
@@ -1698,18 +1840,33 @@ impl Resolver {
                 continue;
             }
             let origin = root_of[source.net];
-            let dist = min_path_ohms(&root_edges, origin, &[]);
+            let dist = min_path_ohms(&root_edges, origin, &terminal_roots);
             let reachable = |net: usize| {
                 dist.get(&root_of[net])
                     .is_some_and(|&ohms| ohms < STREAM_COLLAPSE_THRESHOLD)
             };
+            // Reachability with the coupling capacitors as 0 Ω AC links:
+            // a superset of `dist`, each entry carrying the capacitors on
+            // its path with the root each was crossed into.
+            let coupled_reach =
+                coupled_reach(&root_edges, &root_couplings, origin, &terminal_roots);
+            let coupled_to = |net: usize| -> Option<&Vec<(usize, usize)>> {
+                coupled_reach
+                    .get(&root_of[net])
+                    .filter(|(ohms, path)| *ohms < STREAM_COLLAPSE_THRESHOLD && !path.is_empty())
+                    .map(|(_, path)| path)
+            };
 
+            // Two sources that reach each other — by conduction or across
+            // a capacitor — face each other.
             let facing: Vec<usize> = self
                 .streams
                 .iter()
                 .enumerate()
                 .filter(|(oi, other)| {
-                    *oi != si && other.role == StreamRole::PulseSource && reachable(other.net)
+                    *oi != si
+                        && other.role == StreamRole::PulseSource
+                        && (reachable(other.net) || coupled_to(other.net).is_some())
                 })
                 .map(|(oi, _)| oi)
                 .collect();
@@ -1745,14 +1902,117 @@ impl Resolver {
                 .map(|(&root, _)| root)
                 .collect();
             path_roots.sort_unstable();
+
+            // Sinks reached only across a capacitor, each with the crossings
+            // on its path and the gate of its own conduction segment.
+            let coupled: Vec<CoupledSink> = self
+                .streams
+                .iter()
+                .filter(|s| s.role == StreamRole::PulseSink && !reachable(s.net))
+                .filter_map(|s| {
+                    let path = coupled_to(s.net)?;
+                    let couplings: Vec<CouplingCrossing> = path
+                        .iter()
+                        .map(|&(ci, far_root)| {
+                            // The far side is the root the walk crossed
+                            // this capacitor into, recorded at the crossing.
+                            let capacitor = &self.couplings[ci];
+                            CouplingCrossing {
+                                capacitor: capacitor.reference.clone(),
+                                far_root,
+                                farads: capacitor.farads,
+                                far_ohms: smallest_edge_at(far_root),
+                            }
+                        })
+                        .collect();
+                    let last_far = couplings.last().map(|c| c.far_root)?;
+                    let mut gate_roots: Vec<usize> =
+                        min_path_ohms(&root_edges, last_far, &terminal_roots)
+                            .iter()
+                            .filter(|(_, &ohms)| ohms < STREAM_COLLAPSE_THRESHOLD)
+                            .map(|(&root, _)| root)
+                            .collect();
+                    gate_roots.sort_unstable();
+                    Some(CoupledSink {
+                        sink: s.endpoint,
+                        gate_roots,
+                        couplings,
+                    })
+                })
+                .collect();
             routes.push(PulseRouteSpec {
                 source: source.endpoint,
                 sinks,
                 path_roots,
+                coupled,
             });
         }
         routes
     }
+}
+
+/// Reachability from `from` over the conduction root-edges **and** the
+/// coupling capacitors as 0 Ω links: for every reached root, the series ohms
+/// of its cheapest path and the capacitors that path crossed, source side
+/// first, each with the root it was crossed **into** — the far side, fixed
+/// at the crossing rather than reconstructed afterwards from depths (a
+/// capacitor reached from both ends at equal depth has no depth-defined far
+/// side). A root in `terminals` may be reached but is never relaxed out of,
+/// over either kind of link (`from` itself excepted), as in
+/// [`min_path_ohms`]. Relaxation to a fixpoint; a strictly cheaper path
+/// replaces, an equal one does not, so the result is a function of the edge
+/// lists' order alone.
+fn coupled_reach(
+    root_edges: &[(usize, usize, f64)],
+    root_couplings: &[(usize, usize, usize)],
+    from: usize,
+    terminals: &[usize],
+) -> HashMap<usize, (f64, Vec<(usize, usize)>)> {
+    let passable = |root: usize| root == from || !terminals.contains(&root);
+    let mut reach: HashMap<usize, (f64, Vec<(usize, usize)>)> = HashMap::new();
+    reach.insert(from, (0.0, Vec::new()));
+    loop {
+        let mut changed = false;
+        for (a, b, ohms) in root_edges {
+            for (x, y) in [(*a, *b), (*b, *a)] {
+                if !passable(x) {
+                    continue;
+                }
+                let Some((dx, path)) = reach.get(&x).cloned() else {
+                    continue;
+                };
+                let candidate = dx + ohms;
+                if reach.get(&y).is_none_or(|(dy, _)| candidate < *dy) {
+                    reach.insert(y, (candidate, path));
+                    changed = true;
+                }
+            }
+        }
+        for (a, b, ci) in root_couplings {
+            for (x, y) in [(*a, *b), (*b, *a)] {
+                if !passable(x) {
+                    continue;
+                }
+                let Some((dx, path)) = reach.get(&x).cloned() else {
+                    continue;
+                };
+                // A path never crosses the same capacitor twice.
+                if path.iter().any(|(crossed, _)| crossed == ci) {
+                    continue;
+                }
+                if reach.get(&y).is_none_or(|(dy, _)| dx < *dy) {
+                    let mut crossed = path;
+                    crossed.push((*ci, y));
+                    reach.insert(y, (dx, crossed));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reach
 }
 
 /// NaN-robust state equality for the sense change gate. [`NetState`]'s
@@ -1858,6 +2118,10 @@ struct RootOutcome {
 ///    `Driven(level)`, a terminal on the root `Analog(volts)`, anything
 ///    else `Pulled(level, ohms)` with the winner's series path (plus its own
 ///    impedance when that is itself weak, [`ReachingSource::pulled_ohms`]).
+///    A slot source whose open-circuit voltage lies strictly inside the
+///    [`V_IL`]/[`V_IH`] dead band has no level to project and is
+///    `Analog(volts)` either way — the time-average a rate-mode gate drives,
+///    the mid-rail rest of a self-biased stage.
 /// 5. The contest disagrees → the root solves. Among strong sources, a
 ///    voltage strictly inside the [`V_IL`]/[`V_IH`] dead band is
 ///    `Contention` with `AmbiguousLevel`, outside it `Analog(v)`, either
@@ -1898,6 +2162,11 @@ fn project_root(
                 .iter()
                 .any(|s| loses(s) && !s.is_pull() && s.level() != level);
         let state = if strongest.on_root() && strongest.slot.is_none() {
+            NetState::Analog(strongest.volts)
+        } else if V_IL < strongest.volts && strongest.volts < V_IH {
+            // A slot source resting inside the dead band — a clock's
+            // time-average, a self-biased stage — has no level to project:
+            // the node is at its open-circuit voltage, and says so.
             NetState::Analog(strongest.volts)
         } else if strongest.on_root() && strongest.impedance < WEAK_DRIVE_OHMS {
             NetState::Driven(level)
@@ -2038,6 +2307,8 @@ struct LivePulseRoute {
     sinks: Vec<EndpointId>,
     /// Identity roots of the nets the link spans (delivery gate).
     path_roots: Vec<usize>,
+    /// Sinks reached across a coupling capacitor, judged per delivery.
+    coupled: Vec<CoupledSink>,
 }
 
 /// All net state, owned exclusively by the engine thread. The only shared
@@ -2087,10 +2358,19 @@ struct EngineCore {
     /// in flight); applied strictly in seq order.
     pending_drives: BTreeMap<u64, (EndpointId, Option<Drive>)>,
     next_drive_seq: u64,
-    /// Stepped mode: has [`Command::ReleaseTime`] arrived? Virtual time is held
-    /// at its initial value until it does, so every component's first schedule
-    /// is anchored at the same instant.
+    /// Has [`Command::ReleaseTime`] arrived? Virtual time is held at its
+    /// initial value until it does, so every component's first schedule is
+    /// anchored at the same instant. In both pacing modes: virtual time is
+    /// only the counter this engine advances, and the gate sits before its
+    /// only advance.
     clock_released: bool,
+    /// Nets [`Command::DeclareRead`] declared read since the last full pass.
+    /// Applied to the resolver together, after the drain batch, and answered
+    /// with one full pass: a declaration is a topology input, so applying
+    /// each as it arrived would leave the cache stale for every drive
+    /// handled after it in the same batch — a full resolution and a
+    /// topology rebuild per attach-time drive on a board with 64 pads.
+    pending_reads: Vec<usize>,
     /// Scheduling requests sent but not yet handled — see
     /// [`EngineLink::pending_schedules`]. Time does not advance while it is
     /// non-zero.
@@ -2247,6 +2527,7 @@ impl EngineCore {
                     LivePulseRoute {
                         sinks: spec.sinks,
                         path_roots: spec.path_roots,
+                        coupled: spec.coupled,
                     },
                 )
             })
@@ -2271,16 +2552,66 @@ impl EngineCore {
         };
         let sinks = route.sinks.clone();
         let path_roots = route.path_roots.clone();
-        if !self.route_is_signal_capable(&path_roots) {
+        let coupled = route.coupled.clone();
+        if self.route_is_signal_capable(&path_roots) {
+            for sink in sinks {
+                self.deliver_pulse_to(source, sink, train);
+            }
+        } else {
             tracing::debug!(
                 endpoint = source.0,
                 "pulse train not delivered: a net on the route is not signal-capable"
             );
+        }
+        for sink in &coupled {
+            self.deliver_coupled(source, sink, train);
+        }
+    }
+
+    /// Deliver a train to a sink on the far side of one or more coupling
+    /// capacitors: every crossing must pass the AC-coupling rule at the
+    /// train's rate, and the sink's own segment must not be fought over.
+    ///
+    /// A held train (no rate) crosses unconditionally — a capacitor cannot
+    /// refuse a stop, and the sink must learn of it.
+    fn deliver_coupled(&self, source: EndpointId, sink: &CoupledSink, train: PulseTrain) {
+        let hz = f64::from(train.pulses.freq_hz);
+        if hz > 0.0 {
+            for crossing in &sink.couplings {
+                let reactance_ohms = 1.0 / (2.0 * std::f64::consts::PI * hz * crossing.farads);
+                if reactance_ohms > crossing.far_ohms / COUPLING_REACTANCE_RATIO {
+                    let net = self
+                        .nets
+                        .get(crossing.far_root)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    self.report_finding(Finding::PulseNotCoupled {
+                        net,
+                        capacitor: crossing.capacitor.clone(),
+                        hz: train.pulses.freq_hz,
+                        reactance_ohms,
+                        far_ohms: crossing.far_ohms,
+                    });
+                    return;
+                }
+            }
+        }
+        // The far side of a capacitor may float at DC — the capacitor is
+        // what sources it — but a fought node clamps what crosses.
+        let clamped = sink.gate_roots.iter().any(|&root| {
+            matches!(
+                self.nets.get(root).map(|net| net.state),
+                Some(NetState::Contention)
+            )
+        });
+        if clamped {
+            tracing::debug!(
+                endpoint = source.0,
+                "pulse train not delivered across a capacitor: the far side is fought over"
+            );
             return;
         }
-        for sink in sinks {
-            self.deliver_pulse_to(source, sink, train);
-        }
+        self.deliver_pulse_to(source, sink.sink, train);
     }
 
     /// Deliver one train to one sink's callbacks, panic-contained, recording
@@ -2489,6 +2820,9 @@ impl EngineCore {
                 self.deliver_contained(CallbackKind::Sense, &subscriber, || callback(state));
                 self.sense_subs.entry(net.0).or_default().push(callback);
             }
+            Command::DeclareRead { net } => {
+                self.pending_reads.push(net.0);
+            }
             Command::RegisterWake {
                 component,
                 callback,
@@ -2543,13 +2877,22 @@ impl EngineCore {
                 let mut sources: Vec<usize> = self
                     .pulse_routes
                     .iter()
-                    .filter(|(_, route)| route.sinks.contains(&endpoint))
+                    .filter(|(_, route)| {
+                        route.sinks.contains(&endpoint)
+                            || route.coupled.iter().any(|c| c.sink == endpoint)
+                    })
                     .map(|(&source, _)| source)
                     .collect();
                 sources.sort_unstable();
                 for source in sources {
-                    if let Some(&train) = self.pulse_state.get(&source) {
+                    let Some(&train) = self.pulse_state.get(&source) else {
+                        continue;
+                    };
+                    let route = &self.pulse_routes[&source];
+                    if route.sinks.contains(&endpoint) {
                         self.deliver_pulse_to(EndpointId(source), endpoint, train);
+                    } else if let Some(sink) = route.coupled.iter().find(|c| c.sink == endpoint) {
+                        self.deliver_coupled(EndpointId(source), sink, train);
                     }
                 }
             }
@@ -2645,6 +2988,15 @@ impl EngineCore {
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return true,
                 }
+            }
+            // Nets declared read since the last pass: declared together,
+            // then one full resolution reports what floats under them.
+            if !self.pending_reads.is_empty() {
+                for net in std::mem::take(&mut self.pending_reads) {
+                    self.resolver.add_digital_sense(net);
+                }
+                self.resolve_and_publish();
+                work += 1;
             }
             work += self.fire_due_timers();
             if work == 0 {
@@ -2871,6 +3223,7 @@ impl EngineHandle {
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
             clock_released: false,
+            pending_reads: Vec::new(),
             pending_schedules: Arc::clone(&pending_schedules),
             quiescence_stalled: false,
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
@@ -5126,6 +5479,46 @@ mod tests {
             resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
             assert_eq!(net_table[0].state, NetState::Pulled(Level::High, 15_000.0));
             assert!(diags.is_empty(), "{:?}", diags.findings());
+        }
+
+        /// A source resting inside the dead band — a rate-mode gate driving
+        /// a clock's average, a self-biased stage — has no level to
+        /// project: its node reads the voltage, on the root and through a
+        /// resistor alike.
+        #[rstest]
+        #[case::on_the_root(0.0, NetState::Analog(1.65))]
+        #[case::through_a_resistor(100_000.0, NetState::Analog(1.65))]
+        fn a_source_inside_the_dead_band_projects_its_voltage(
+            #[case] series_ohms: Ohms,
+            #[case] expected: NetState,
+        ) {
+            behaviour!(Test {
+                id: "engine.mid-band-source-is-analog",
+                covers: Some("board/src/engine.rs#project_root"),
+                given: "a pin driving 1.65 volts through 29 ohms as the only source of a net, on the net itself or through a 100 kilohm resistor",
+            });
+            expect!(
+                "analog-not-a-level",
+                "the net reads 1.65 volts, neither driven nor pulled to a level",
+                "a voltage strictly between the low and high input thresholds is not a logic level, so the node reports its open-circuit voltage",
+            );
+            expect!("nothing-reported", "nothing is reported");
+            expect!("zero-solves", "the pass costs no cluster solve");
+            let count = if series_ohms > 0.0 { 2 } else { 1 };
+            let mut resolver = Resolver::new(count, Dsu::new(count));
+            resolver.add_endpoint(0, PinRef::new("U101", "2Y"), thevenin(1.65, 29.0));
+            let read = if series_ohms > 0.0 {
+                resolver.add_edge(0, 1, series_ohms);
+                1
+            } else {
+                0
+            };
+            let mut net_table = nets(count);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            assert_eq!(net_table[read].state, expected);
+            assert!(diags.is_empty(), "{:?}", diags.findings());
+            assert_eq!(resolver.escalated_solves(), 0);
         }
 
         /// Two drivers within a factor of ten of each other disagreeing:

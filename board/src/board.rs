@@ -145,7 +145,7 @@ impl Board {
                 Classification::Boundary => PartClass::Boundary,
                 Classification::Probe => PartClass::Probe,
                 Classification::Mechanical => PartClass::Mechanical,
-                Classification::Jumper { default, .. } => PartClass::Jumper { state: default },
+                Classification::Jumper { default } => PartClass::Jumper { state: default },
                 Classification::Passive { kind, value } => PartClass::Passive { kind, value },
                 Classification::Switch { poles } => {
                     let declared: Vec<&str> = poles

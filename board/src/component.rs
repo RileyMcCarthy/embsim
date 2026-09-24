@@ -443,6 +443,13 @@ pub struct PinHandle {
     net: NetId,
     endpoint: Option<EndpointId>,
     stream: Option<StreamRole>,
+    /// The pin is a `DigitalBidir` declared `IdleDrive::Released`: a pad
+    /// that is an input until its owner drives it, so a sense subscription
+    /// through it declares the net **read** (`Command::DeclareRead`) and a
+    /// floating one becomes a reported finding. A `DigitalIn` is a sense
+    /// from its declaration; this is the bidirectional pad's equivalent,
+    /// made at the subscription that reads it.
+    reads_when_released: bool,
     link: EngineLink,
 }
 
@@ -462,6 +469,7 @@ impl PinHandle {
             net,
             endpoint: None,
             stream: None,
+            reads_when_released: false,
             link: EngineLink::default(),
         }
     }
@@ -480,8 +488,17 @@ impl PinHandle {
             net,
             endpoint,
             stream,
+            reads_when_released: false,
             link,
         }
+    }
+
+    /// Mark the handle as a released bidirectional pad's: a sense
+    /// subscription through it declares the net read (system-build internal
+    /// use; see the field).
+    pub(crate) fn reading_when_released(mut self, reads: bool) -> Self {
+        self.reads_when_released = reads;
+        self
     }
 
     /// The net this pin is attached to.
@@ -628,6 +645,13 @@ impl ComponentNetIo {
     /// is delivered once at registration (so a floating net is reported
     /// before any traffic), then on every change. A callback MAY drive a
     /// pin — the drive is enqueued and resolved in a later engine iteration.
+    ///
+    /// Through a released bidirectional pad (`DigitalBidir` declared
+    /// `IdleDrive::Released`) the subscription is also the declaration that
+    /// the pad **reads** its net: the net joins the digital senses, and a
+    /// floating one is reported as [`crate::Finding::FloatingSense`] — on
+    /// the build path and the live path alike. A pad nothing subscribes to
+    /// is read by nothing and floats without a finding.
     pub fn on_sense(
         &self,
         id: &str,
@@ -650,9 +674,16 @@ impl ComponentNetIo {
             if let Some(log) = self.link.recorded_senses.as_ref().and_then(Weak::upgrade) {
                 log.lock()
                     .expect("sense log never poisoned")
-                    .push((handle.net(), Box::new(callback)));
+                    .push(crate::engine::RecordedSense {
+                        net: handle.net(),
+                        reads: handle.reads_when_released,
+                        callback: Box::new(callback),
+                    });
             }
             return Ok(());
+        }
+        if handle.reads_when_released {
+            self.link.send(Command::DeclareRead { net: handle.net() });
         }
         self.link.send(Command::RegisterSense {
             net: handle.net(),

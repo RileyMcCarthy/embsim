@@ -49,6 +49,7 @@ mod linked {
         pub fn p2host_cog_running(cog: c_uint) -> bool;
         pub fn p2host_cog_clocks(cog: c_uint) -> u64;
         pub fn p2host_cog_pc(cog: c_uint) -> u32;
+        pub fn p2host_current_cog() -> c_uint;
         pub fn p2host_clock_mode() -> u32;
         pub fn p2host_clock_mode_at() -> u64;
         pub fn p2host_request_yield();
@@ -86,6 +87,9 @@ mod stub {
         unreachable!("{MSG}")
     }
     pub unsafe fn p2host_cog_pc(_cog: c_uint) -> u32 {
+        unreachable!("{MSG}")
+    }
+    pub unsafe fn p2host_current_cog() -> c_uint {
         unreachable!("{MSG}")
     }
     pub unsafe fn p2host_clock_mode() -> u32 {

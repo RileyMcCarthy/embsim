@@ -5,7 +5,7 @@
 //! tooling can consume the same bus later. The [`Diagnostics`] collector is
 //! Vec-based; every reported finding is also emitted as a `tracing` warning.
 
-use crate::net::{PinRef, Volts};
+use crate::net::{Ohms, PinRef, Volts};
 
 // ============================================================
 // Findings
@@ -85,6 +85,28 @@ pub enum Finding {
         net: String,
         /// The injecting pin.
         pin: PinRef,
+    },
+    /// A pulse train reached a coupling capacitor whose reactance at the
+    /// train's rate is not small against the far node's resistance
+    /// (`1/(2π·f·C) > R_far /` [`crate::net::COUPLING_REACTANCE_RATIO`]), so
+    /// the rate does not cross: the train stops at the capacitor and the
+    /// sink beyond it is not delivered. Live only — the rate is known at
+    /// delivery, not at build. Reported once per distinct occurrence like
+    /// every live finding (the bus dedups on equality): a train re-published
+    /// segment after segment at one rate raises it once, and a rate that
+    /// changes is a new verdict with its own reactance.
+    PulseNotCoupled {
+        /// The net on the far side of the capacitor.
+        net: String,
+        /// The capacitor's reference designator.
+        capacitor: String,
+        /// The train's rate.
+        hz: u32,
+        /// The capacitor's reactance at that rate.
+        reactance_ohms: Ohms,
+        /// The far node's resistance estimate the reactance was judged
+        /// against (the smallest resistor touching the node; `+∞` for none).
+        far_ohms: Ohms,
     },
     /// A power net with no `PowerOut` source anywhere (board or harness);
     /// presents as down (0 V into cluster solves).

@@ -515,7 +515,8 @@ fn the_build_snapshot_is_the_live_systems_state_before_its_first_wake(
         id: "build.snapshot-equals-live-pre-wake",
         covers: Some("board/src/system.rs#System::build"),
         given: "a board — the P2-EC32MB module, the MaD EdgeBoard, or a chain of sense-to-\
-                drive parts — analyzed at build and then started live with nothing scheduled",
+                drive parts — analyzed at build and then started live with virtual time held, \
+                so no scheduled wake has fired",
     });
     expect!(
         "same-states",
@@ -542,7 +543,13 @@ fn the_build_snapshot_is_the_live_systems_state_before_its_first_wake(
         built.diagnostics().findings()
     );
 
-    let live = System::new().board("B", build()).start().unwrap();
+    // Time held: the module's TCXO arms its start-up wake at attach, and
+    // the state the build describes is the one before it fires.
+    let live = System::new()
+        .board("B", build())
+        .hold_time()
+        .start()
+        .unwrap();
     let mismatches = || -> Vec<(String, NetState, Option<NetState>)> {
         built
             .nets()
@@ -561,5 +568,6 @@ fn the_build_snapshot_is_the_live_systems_state_before_its_first_wake(
         "the live system rests where the build said, on every net; still differing: {:?}",
         mismatches()
     );
+    live.release_time();
     drop(live);
 }

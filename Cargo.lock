@@ -214,6 +214,7 @@ version = "0.1.0"
 dependencies = [
  "embsim-board",
  "embsim-models",
+ "rstest",
 ]
 
 [[package]]
