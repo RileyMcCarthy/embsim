@@ -32,15 +32,18 @@ use std::time::Duration;
 use crate::board::{validate_idle_drives, Board, BoardError, PartClass};
 use crate::cluster::QuasiStaticMna;
 use crate::component::{
-    Component, ComponentNetIo, IdleDrive, PinDecl, PinHandle, PinKind, StreamRole,
+    Component, ComponentNetIo, IdleDrive, PinDecl, PinHandle, PinKind, PwlCurve, RegionTest,
+    StreamRole,
 };
 use crate::diagnostics::{Diagnostics, Finding};
 use crate::engine::{
-    same_state, ComponentId, Dsu, EndpointId, EngineHandle, EngineLink, Resolver, SenseLog,
-    DEFAULT_HIGH_LEVEL_VOLTS,
+    same_state, ComponentId, CurrentTable, Dsu, EndpointId, EngineHandle, EngineLink, ReadKind,
+    RecordedCallback, Resolver, SenseLog, DEFAULT_HIGH_LEVEL_VOLTS,
 };
 use crate::event_log::EventLog;
-use crate::net::{Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
+use crate::net::{
+    Amps, Net, NetId, NetState, PinRef, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE,
+};
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
 
 /// How many rounds the build-time fixed point runs before it gives up and
@@ -394,6 +397,9 @@ struct PreparedPin {
     /// its owner drives it, whose sense subscription declares its net read
     /// (see [`crate::PinHandle`]'s field of the same name).
     reads_when_released: bool,
+    /// The elements this pin terminates, as `(element index, sign)` (see
+    /// [`crate::PinHandle::sense_current`]).
+    branch_terms: Vec<(usize, f64)>,
 }
 
 /// Whether a declared pin is a released bidirectional pad — the one kind
@@ -403,13 +409,83 @@ fn reads_when_released(pin: &PinDecl) -> bool {
     pin.kind == PinKind::DigitalBidir && pin.idle == IdleDrive::Released
 }
 
+/// One pin whose current the solve accounts for — it has a drive slot or
+/// terminates a declared branch — addressable by its `Board.Ref.Pin` path
+/// from [`BuiltSystem::pin_current`] / [`SystemHandle::pin_current`].
+#[derive(Debug, Clone)]
+struct CurrentPort {
+    path: String,
+    endpoint: Option<EndpointId>,
+    branch_terms: Vec<(usize, f64)>,
+}
+
+impl CurrentPort {
+    /// The current into the port from a published table: the slot's own
+    /// current plus the branch currents into the pin — the same sum
+    /// [`crate::PinHandle::sense_current`] makes.
+    fn read(&self, table: &CurrentTable) -> Option<Amps> {
+        let mut total: Option<Amps> = None;
+        if let Some(endpoint) = self.endpoint {
+            if let Some(Some(amps)) = table.endpoints.get(endpoint.0) {
+                total = Some(*amps);
+            }
+        }
+        for (element, sign) in &self.branch_terms {
+            if let Some(Some(amps)) = table.elements.get(*element) {
+                total = Some(total.unwrap_or(0.0) + sign * amps);
+            }
+        }
+        total
+    }
+}
+
+/// The elements and current ports a system carries, by path, so a built
+/// system and a live one answer [`BuiltSystem::branch_current`] and
+/// [`BuiltSystem::pin_current`] the same way.
+#[derive(Debug, Clone, Default)]
+struct CurrentPaths {
+    /// `Board.Reference` of the part declaring each element, by element
+    /// index.
+    elements: Vec<String>,
+    /// Every pin with a current.
+    ports: Vec<CurrentPort>,
+}
+
+impl CurrentPaths {
+    /// The current through the one branch of the part at `path` — a diode,
+    /// an LED — from `table`; `None` for a part with no branch or more than
+    /// one, or one whose cluster the last pass did not solve.
+    fn branch_current(&self, table: &CurrentTable, path: &str) -> Option<Amps> {
+        let mut matches = self
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.as_str() == path)
+            .map(|(index, _)| index);
+        let index = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        table.elements.get(index).copied().flatten()
+    }
+
+    /// The current into the pin at `path` from `table`.
+    fn pin_current(&self, table: &CurrentTable, path: &str) -> Option<Amps> {
+        self.ports
+            .iter()
+            .find(|port| port.path == path)
+            .and_then(|port| port.read(table))
+    }
+}
+
 /// Output of the shared assembly pass: the merged net table, the populated
 /// resolver (one code path for build-time analysis and live resolution),
-/// and the components ready to attach.
+/// the components ready to attach, and the current paths.
 struct Assembly {
     nets: Vec<Net>,
     resolver: Resolver,
     components: Vec<PreparedComponent>,
+    paths: CurrentPaths,
 }
 
 impl System {
@@ -518,6 +594,7 @@ impl System {
             mut nets,
             mut resolver,
             components,
+            paths,
         } = self.assemble()?;
 
         let mut diagnostics = Diagnostics::new();
@@ -533,6 +610,7 @@ impl System {
         // schedules are traced and dropped.
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
+        let currents: Arc<Mutex<CurrentTable>> = Arc::new(Mutex::new(resolver.current_table()));
         let recorded_drives = Arc::new(Mutex::new(Vec::new()));
         let recorded_senses = SenseLog::default();
         // The build holds the sense log's one strong reference: the inert
@@ -541,6 +619,7 @@ impl System {
         // freed with the log when the build is done (`SenseLog`).
         let link = EngineLink::inert(
             Arc::clone(&states),
+            Arc::clone(&currents),
             Arc::clone(&recorded_drives),
             &recorded_senses,
         );
@@ -586,27 +665,39 @@ impl System {
         // that subscription on: each is declared a digital sense once, the
         // way the live engine's `Command::DeclareRead` does, and the
         // declaration is a change the next pass reports (a floating one is
-        // `Finding::FloatingSense`). Subscriptions made from inside a
+        // `Finding::FloatingSense`). A current instrument's net is declared
+        // an instrument the same way, so its cluster solves and the
+        // current it reads is the one the live engine would produce — and
+        // nothing is reported for it. Subscriptions made from inside a
         // delivered callback are caught on the round after.
-        let mut declared_reads: Vec<usize> = Vec::new();
+        let mut declared_reads: Vec<(usize, ReadKind)> = Vec::new();
         let settled = loop {
             let idle_drives = std::mem::take(&mut *recorded_drives.lock().expect("never poisoned"));
             let mut changed = false;
             for (endpoint, drive) in idle_drives {
                 changed |= resolver.set_drive(endpoint, drive);
             }
-            let reads: Vec<usize> = recorded_senses
+            let reads: Vec<(usize, ReadKind)> = recorded_senses
                 .0
                 .lock()
                 .expect("never poisoned")
                 .iter()
-                .filter(|sense| sense.reads && !declared_reads.contains(&sense.net.0))
-                .map(|sense| sense.net.0)
+                .filter_map(|sense| match &sense.callback {
+                    RecordedCallback::State(_) if sense.reads => {
+                        Some((sense.net.0, ReadKind::Digital))
+                    }
+                    RecordedCallback::State(_) => None,
+                    RecordedCallback::Current { .. } => Some((sense.net.0, ReadKind::Instrument)),
+                })
                 .collect();
-            for net in reads {
-                if !declared_reads.contains(&net) {
-                    declared_reads.push(net);
-                    resolver.add_digital_sense(net);
+            for read in reads {
+                if !declared_reads.contains(&read) {
+                    declared_reads.push(read);
+                    let (net, kind) = read;
+                    match kind {
+                        ReadKind::Digital => resolver.add_digital_sense(net),
+                        ReadKind::Instrument => resolver.add_current_instrument(net),
+                    }
                     changed = true;
                 }
             }
@@ -619,6 +710,7 @@ impl System {
             resolver.resolve(&mut nets, &mut diagnostics, &QuasiStaticMna);
             let _ = resolver.route_pulses(&nets, &mut diagnostics);
             *states.lock().expect("never poisoned") = nets.iter().map(|n| n.state).collect();
+            *currents.lock().expect("never poisoned") = resolver.current_table();
             let moved: Vec<usize> = (0..nets.len())
                 .filter(|&i| !same_state(&previous[i], &nets[i].state))
                 .collect();
@@ -631,15 +723,40 @@ impl System {
             passes += 1;
 
             // Deliver changed states in the order the live engine does: net
-            // index ascending, subscribers in registration order. No lock is
-            // held across a callback: it may sense (the states lock) and
-            // drive (the drive log); a sense it registers now is appended
-            // behind the ones that exist.
-            let senses = std::mem::take(&mut *recorded_senses.0.lock().expect("never poisoned"));
+            // index ascending, subscribers in registration order, then the
+            // current instruments whose reading changed. No lock is held
+            // across a callback: it may sense (the states lock) and drive
+            // (the drive log); a sense it registers now is appended behind
+            // the ones that exist.
+            let mut senses =
+                std::mem::take(&mut *recorded_senses.0.lock().expect("never poisoned"));
             for &i in &moved {
                 for sense in &senses {
-                    if sense.net.0 == i {
-                        (sense.callback)(nets[i].state);
+                    if let (true, RecordedCallback::State(callback)) =
+                        (sense.net.0 == i, &sense.callback)
+                    {
+                        callback(nets[i].state);
+                    }
+                }
+            }
+            for sense in &mut senses {
+                if let RecordedCallback::Current {
+                    handle,
+                    callback,
+                    last,
+                } = &mut sense.callback
+                {
+                    let now = handle.sense_current();
+                    // Bitwise after folding -0.0 to 0.0, as the live engine
+                    // compares (`engine.rs` `same_current`).
+                    let same = match (*last, now) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => (a + 0.0).total_cmp(&(b + 0.0)).is_eq(),
+                        _ => false,
+                    };
+                    if !same {
+                        *last = now;
+                        callback(now);
                     }
                 }
             }
@@ -665,6 +782,7 @@ impl System {
         let roots = resolver.identity_roots(nets.len());
         let cluster_roots = resolver.cluster_roots(nets.len());
         let escalated_solves = resolver.escalated_solves();
+        let currents = resolver.current_table();
         // The build path resolves a fixed number of times, so logging the
         // standing set once here is the whole story (`Diagnostics::report` is
         // silent by design — see its type docs).
@@ -675,6 +793,8 @@ impl System {
             roots,
             cluster_roots,
             escalated_solves,
+            currents,
+            paths,
         })
     }
 
@@ -696,6 +816,7 @@ impl System {
             nets,
             resolver,
             components,
+            paths,
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
@@ -759,6 +880,7 @@ impl System {
             engine,
             net_names,
             components: attached,
+            paths,
         })
     }
 
@@ -1042,6 +1164,30 @@ impl System {
         }
 
         let mut endpoints: HashMap<(usize, PinRef), EndpointId> = HashMap::new();
+        // The elements each pin terminates, as `(element index, sign)`, and
+        // the paths of every element and current port (`CurrentPaths`).
+        let mut branch_terms: HashMap<(usize, PinRef), Vec<(usize, f64)>> = HashMap::new();
+        let mut paths = CurrentPaths::default();
+        // Register one declared branch of a part: its pins resolved to nets
+        // through `net_of`, a detached terminal opening the branch and a
+        // detached control leaving the channel uncontrolled (always off).
+        // Returns the element index, or nothing when a terminal is missing.
+        let register_branch = |resolver: &mut Resolver,
+                               paths: &mut CurrentPaths,
+                               path: &str,
+                               a: &str,
+                               b: &str,
+                               curve: PwlCurve,
+                               control: Option<(&str, RegionTest)>,
+                               net_of: &dyn Fn(&str) -> Option<usize>|
+         -> Option<(usize, String, String)> {
+            let (a_net, b_net) = (net_of(a)?, net_of(b)?);
+            let control = control.and_then(|(pin, test)| net_of(pin).map(|net| (net, test)));
+            let index = resolver.add_element(a_net, b_net, curve, control, path.to_string());
+            debug_assert_eq!(index, paths.elements.len());
+            paths.elements.push(path.to_string());
+            Some((index, a.to_string(), b.to_string()))
+        };
         for (bi, (bname, board)) in self.boards.iter().enumerate() {
             for record in &board.records {
                 if !record.fitted {
@@ -1099,7 +1245,7 @@ impl System {
                             );
                         }
                     }
-                    PartClass::Registered { pins } => {
+                    PartClass::Registered { pins, branches } => {
                         for pin in pins {
                             let key = (bi, PinRef::new(record.reference.clone(), pin.number));
                             if detached.contains(&key) {
@@ -1127,22 +1273,83 @@ impl System {
                                 );
                             }
                         }
+                        // The component's declared branches, by the pin
+                        // names its facade gives them (number or alias).
+                        let path = format!("{bname}.{}", record.reference);
+                        let number_of = |id: &str| -> Option<&'static str> {
+                            pins.iter()
+                                .find(|p| p.number == id || p.name == Some(id))
+                                .map(|p| p.number)
+                        };
+                        let net_of = |id: &str| -> Option<usize> {
+                            let key = (bi, PinRef::new(record.reference.clone(), number_of(id)?));
+                            (!detached.contains(&key))
+                                .then(|| net_of_pin.get(&key).copied())
+                                .flatten()
+                        };
+                        for branch in branches {
+                            if let Some((index, a, b)) = register_branch(
+                                &mut resolver,
+                                &mut paths,
+                                &path,
+                                branch.a,
+                                branch.b,
+                                branch.curve,
+                                branch.control,
+                                &net_of,
+                            ) {
+                                for (pin, sign) in [(a, 1.0), (b, -1.0)] {
+                                    let number = number_of(&pin).expect("validated at build");
+                                    let key = (bi, PinRef::new(record.reference.clone(), number));
+                                    branch_terms.entry(key).or_default().push((index, sign));
+                                }
+                            }
+                        }
                     }
-                    // A piecewise-linear element's specification is the
-                    // placeholder until the elements land (`NODES.md` §8
-                    // phase 3): `register_pwl` declares intent, and a part
-                    // it covers builds only unfitted. Fitted, it would be a
-                    // node with nothing behind it — the facade rule 1 of
-                    // `DESIGN.md` exists to refuse — so the build refuses
-                    // it here, naming the part. Phase 3 replaces this arm
-                    // with the element stamp (`add_pwl`).
-                    PartClass::Pwl { .. } => {
-                        return Err(SystemError::Board {
-                            name: bname.clone(),
-                            error: BoardError::UnmodelledElement {
-                                reference: record.reference.clone(),
-                            },
-                        });
+                    // An element registered by spec: its branches stamp
+                    // into the cluster solve like a component's, and each
+                    // of its pins is a current port.
+                    PartClass::Pwl { spec } => {
+                        let path = format!("{bname}.{}", record.reference);
+                        let net_of = |id: &str| -> Option<usize> {
+                            let key = (bi, PinRef::new(record.reference.clone(), id));
+                            (!detached.contains(&key))
+                                .then(|| net_of_pin.get(&key).copied())
+                                .flatten()
+                        };
+                        let mut terms: Vec<(String, usize, f64)> = Vec::new();
+                        for branch in &spec.branches {
+                            if let Some((index, a, b)) = register_branch(
+                                &mut resolver,
+                                &mut paths,
+                                &path,
+                                &branch.a,
+                                &branch.b,
+                                branch.curve,
+                                branch
+                                    .control
+                                    .as_ref()
+                                    .map(|(pin, test)| (pin.as_str(), *test)),
+                                &net_of,
+                            ) {
+                                terms.push((a, index, 1.0));
+                                terms.push((b, index, -1.0));
+                            }
+                        }
+                        for pin in &spec.pins {
+                            let branch_terms: Vec<(usize, f64)> = terms
+                                .iter()
+                                .filter(|(p, _, _)| p == pin)
+                                .map(|(_, index, sign)| (*index, *sign))
+                                .collect();
+                            if !branch_terms.is_empty() {
+                                paths.ports.push(CurrentPort {
+                                    path: format!("{path}.{pin}"),
+                                    endpoint: None,
+                                    branch_terms,
+                                });
+                            }
+                        }
                     }
                     // A boundary's pins are where a harness attaches; a
                     // switch's closed poles were unioned above and its open
@@ -1162,9 +1369,12 @@ impl System {
         // netlist-registered pins. There is no netlist facade to validate —
         // the declaration is the truth the nets were synthesized from.
         let mut bench_endpoints: Vec<Vec<Option<EndpointId>>> = Vec::new();
+        // Per bench component, per declared pin: the branch terms.
+        let mut bench_terms: Vec<Vec<Vec<(usize, f64)>>> = Vec::new();
         for (bench, pin_nets) in self.bench.iter().zip(&bench_pin_nets) {
             let mut eps = Vec::new();
-            for (pin, &net) in bench.component.pins().iter().zip(pin_nets) {
+            let pins = bench.component.pins();
+            for (pin, &net) in pins.iter().zip(pin_nets) {
                 let pin_ref = PinRef::new(bench.name.clone(), pin.number);
                 let endpoint = add_pin_descriptor(&mut resolver, net, pin, &pin_ref);
                 if let Some(ep) = endpoint {
@@ -1181,6 +1391,33 @@ impl System {
                 eps.push(endpoint);
             }
             bench_endpoints.push(eps);
+            // The bench component's declared branches. A bench pin is never
+            // detached (the fault algebra names board pins), so every
+            // declared branch registers.
+            let position_of = |id: &str| -> Option<usize> {
+                pins.iter()
+                    .position(|p| p.number == id || p.name == Some(id))
+            };
+            let net_of = |id: &str| -> Option<usize> { position_of(id).map(|i| pin_nets[i]) };
+            let mut terms: Vec<Vec<(usize, f64)>> = vec![Vec::new(); pins.len()];
+            for branch in bench.component.branches() {
+                if let Some((index, a, b)) = register_branch(
+                    &mut resolver,
+                    &mut paths,
+                    &bench.name,
+                    branch.a,
+                    branch.b,
+                    branch.curve,
+                    branch.control,
+                    &net_of,
+                ) {
+                    for (pin, sign) in [(a, 1.0), (b, -1.0)] {
+                        let position = position_of(&pin).expect("validated at build");
+                        terms[position].push((index, sign));
+                    }
+                }
+            }
+            bench_terms.push(terms);
         }
 
         // -- prepare registered components for attach ------------------------
@@ -1197,17 +1434,27 @@ impl System {
                     continue;
                 }
                 let mut prepared_pins: Vec<PreparedPin> = Vec::new();
-                if let PartClass::Registered { pins } = &record.class {
+                if let PartClass::Registered { pins, .. } = &record.class {
                     for pin in pins {
                         let key = (bi, PinRef::new(reference.clone(), pin.number));
                         if let Some(&net) = net_of_pin.get(&key) {
+                            let endpoint = endpoints.get(&key).copied();
+                            let terms = branch_terms.get(&key).cloned().unwrap_or_default();
+                            if endpoint.is_some() || !terms.is_empty() {
+                                paths.ports.push(CurrentPort {
+                                    path: format!("{bname}.{reference}.{}", pin.number),
+                                    endpoint,
+                                    branch_terms: terms.clone(),
+                                });
+                            }
                             prepared_pins.push(PreparedPin {
                                 number: pin.number.to_string(),
                                 name: pin.name.map(str::to_string),
                                 net,
-                                endpoint: endpoints.get(&key).copied(),
+                                endpoint,
                                 stream: pin.stream,
                                 reads_when_released: reads_when_released(pin),
+                                branch_terms: terms,
                             });
                         }
                     }
@@ -1223,8 +1470,11 @@ impl System {
 
         // Bench components attach after board components, in add order.
         let bench = std::mem::take(&mut self.bench);
-        for ((bench, pin_nets), endpoints) in
-            bench.into_iter().zip(bench_pin_nets).zip(bench_endpoints)
+        for (((bench, pin_nets), endpoints), terms) in bench
+            .into_iter()
+            .zip(bench_pin_nets)
+            .zip(bench_endpoints)
+            .zip(bench_terms)
         {
             let prepared_pins: Vec<PreparedPin> = bench
                 .component
@@ -1232,13 +1482,24 @@ impl System {
                 .iter()
                 .zip(&pin_nets)
                 .zip(endpoints)
-                .map(|((pin, &net), endpoint)| PreparedPin {
-                    number: pin.number.to_string(),
-                    name: pin.name.map(str::to_string),
-                    net,
-                    endpoint,
-                    stream: pin.stream,
-                    reads_when_released: reads_when_released(pin),
+                .zip(terms)
+                .map(|(((pin, &net), endpoint), branch_terms)| {
+                    if endpoint.is_some() || !branch_terms.is_empty() {
+                        paths.ports.push(CurrentPort {
+                            path: format!("{}.{}", bench.name, pin.number),
+                            endpoint,
+                            branch_terms: branch_terms.clone(),
+                        });
+                    }
+                    PreparedPin {
+                        number: pin.number.to_string(),
+                        name: pin.name.map(str::to_string),
+                        net,
+                        endpoint,
+                        stream: pin.stream,
+                        reads_when_released: reads_when_released(pin),
+                        branch_terms,
+                    }
                 })
                 .collect();
             components.push(PreparedComponent {
@@ -1253,6 +1514,7 @@ impl System {
             nets,
             resolver,
             components,
+            paths,
         })
     }
 
@@ -1472,7 +1734,8 @@ fn handle_entries(pins: &[PreparedPin], link: &EngineLink) -> Vec<(String, PinHa
     let mut entries = Vec::new();
     for pin in pins {
         let handle = PinHandle::wired(NetId(pin.net), pin.endpoint, pin.stream, link.clone())
-            .reading_when_released(pin.reads_when_released);
+            .reading_when_released(pin.reads_when_released)
+            .with_branch_terms(pin.branch_terms.clone());
         entries.push((pin.number.clone(), handle.clone()));
         if let Some(name) = &pin.name {
             entries.push((name.clone(), handle));
@@ -1498,6 +1761,10 @@ pub struct BuiltSystem {
     cluster_roots: Vec<Vec<NetId>>,
     /// Cluster solves the build-time passes escalated to the solver.
     escalated_solves: u64,
+    /// The currents the build's last pass produced.
+    currents: CurrentTable,
+    /// The elements and current ports, by path.
+    paths: CurrentPaths,
 }
 
 impl BuiltSystem {
@@ -1568,6 +1835,27 @@ impl BuiltSystem {
     pub fn escalated_solves(&self) -> u64 {
         self.escalated_solves
     }
+
+    /// The current through the one branch of the piecewise-linear element
+    /// at `"Board.Reference"` — a diode, an LED — positive from its anode to
+    /// its cathode, from the build's last pass. `None` for a part with no
+    /// branch or more than one, or one whose cluster no solve reached (a
+    /// cluster with an element always solves, so that is a part nothing
+    /// sources). An LED is lit when this is at or above its threshold
+    /// (`NODES.md` §2).
+    pub fn branch_current(&self, part: &str) -> Option<Amps> {
+        self.paths.branch_current(&self.currents, part)
+    }
+
+    /// The current **into** the pin at `"Board.Reference.Pin"` from its net
+    /// — the sum [`crate::PinHandle::sense_current`] makes — from the
+    /// build's last pass. `None` where no solve produced one: the pin has
+    /// no drive slot and terminates no branch, or its cluster resolved by
+    /// projection alone (a current instrument on it,
+    /// [`crate::ComponentNetIo::on_branch`], is what escalates it).
+    pub fn pin_current(&self, pin: &str) -> Option<Amps> {
+        self.paths.pin_current(&self.currents, pin)
+    }
 }
 
 /// A running live system: the net-engine thread plus the attached
@@ -1582,6 +1870,8 @@ pub struct SystemHandle {
     engine: EngineHandle,
     net_names: Vec<String>,
     components: Vec<(String, Box<dyn Component>)>,
+    /// The elements and current ports, by path.
+    paths: CurrentPaths,
 }
 
 impl fmt::Debug for SystemHandle {
@@ -1608,6 +1898,20 @@ impl SystemHandle {
     /// Most recently engine-published state of a net, by id.
     pub fn net_state_of(&self, net: NetId) -> Option<NetState> {
         self.engine.net_state(net)
+    }
+
+    /// The current through the one branch of the element at
+    /// `"Board.Reference"`, from the engine's last solve of its cluster
+    /// (see [`BuiltSystem::branch_current`]).
+    pub fn branch_current(&self, part: &str) -> Option<Amps> {
+        self.paths.branch_current(&self.engine.currents(), part)
+    }
+
+    /// The current into the pin at `"Board.Reference.Pin"` (or `"Bench.Pin"`
+    /// for a bench component), from the engine's last solve of its cluster
+    /// (see [`BuiltSystem::pin_current`]).
+    pub fn pin_current(&self, pin: &str) -> Option<Amps> {
+        self.paths.pin_current(&self.engine.currents(), pin)
     }
 
     /// Snapshot of the cumulative live findings (the initial resolution pass

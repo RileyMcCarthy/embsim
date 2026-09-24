@@ -26,9 +26,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use embsim_board::{Level, NetState, Scenario, System, SystemHandle};
-use machine_parts::{
-    bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed,
-};
+use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed};
 use vibes_behaviour::{behaviour, expect, Test};
 
 /// The isolator input the P2 reads as P9 — the receiver's channel-1 output.
@@ -55,11 +53,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 /// closed jumper, so the receiver should decode a logic high.
 fn start_forward() -> SystemHandle {
     ensure_clock();
-    let scenario = encoder_jumpers_closed(
-        edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard"),
-        "EdgeBoard",
-    )
-    .net_stuck(A_PLUS, 3.3);
+    let scenario = encoder_jumpers_closed(Scenario::default(), "EdgeBoard").net_stuck(A_PLUS, 3.3);
     System::new()
         .board("EdgeBoard", edge_board())
         .harness(bench_rails("EdgeBoard"))

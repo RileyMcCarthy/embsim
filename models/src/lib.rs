@@ -6,8 +6,8 @@
 //! - [`ads122u04_component`] — that model as a live `embsim-board` component
 //!   (pin facade, power/reset gate, stream pump)
 //! - [`isolation`] — the parts between an MCU pin and the machine: the TI
-//!   ISO67xx digital isolator family, a dual optocoupler, a constant-current
-//!   LED driver, and a small NPN switch
+//!   ISO67xx digital isolator family, and the supply-gating and projection
+//!   helpers the interface models share
 //! - [`limit_switch`] — position-threshold limit switch
 //! - [`sd_card`] — an SD card, device side, in SPI mode: a byte-level protocol
 //!   model that knows nothing about who is clocking it
@@ -26,10 +26,17 @@
 //!   inverter, the TI SN74LVC1G14 Schmitt inverter): thresholds with
 //!   hysteresis, the datasheet output impedance, `t_pd` as a scheduled
 //!   instant, and a rate mode that relays a routed clock
+//! - [`opto`] — an optocoupler (the Vishay VO2631, the Lite-On 6N137): an
+//!   LED branch the part declares and the engine solves, and an
+//!   open-collector output that sinks while the LED carries its threshold
 //! - [`oscillator`] — a clock oscillator (the EPSON TG2520SMN TCXO) whose
 //!   output is a rate published once at its start-up instant
 //! - [`psram`] — the AP Memory APS6404L QSPI PSRAM in its SPI mode, on the
 //!   same shift engine as the flash
+//! - [`pwl_library`] — the diodes, LEDs, polarity FETs, transistor and
+//!   current regulators registered by specification rather than modelled:
+//!   a datasheet's curve as piecewise-linear branches, keyed on the
+//!   netlist's manufacturer part number
 //! - [`spi_shift`] — the byte-wide shift register every SPI-mode device
 //!   model here is built on
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
@@ -51,8 +58,10 @@ pub mod isolation;
 pub mod limit_switch;
 pub mod logic_gate;
 pub mod machine;
+pub mod opto;
 pub mod oscillator;
 pub mod psram;
+pub mod pwl_library;
 pub mod sd_card;
 pub mod sd_card_component;
 pub mod spi_flash;

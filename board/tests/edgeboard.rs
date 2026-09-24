@@ -42,13 +42,13 @@ use embsim_board::{
     NetState, PartClass, PinDecl, PinKind, PinRef, Scenario, SenseKind, System, SystemHandle,
 };
 use embsim_core::virtual_clock;
-use machine_parts::{
-    bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed, ep, iso6731_pins,
-};
+use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731_pins};
 
-/// Registered component count: the 15 active part types' instances (the
-/// reset button is a switch, not a component).
-const EXPECTED_REGISTERED: usize = 48;
+/// Registered component count: the instances of the active part types
+/// that are components (the reset button is a switch; the polarity FET,
+/// the transistor and the eight current regulators are elements by
+/// specification, not components).
+const EXPECTED_REGISTERED: usize = 38;
 
 /// The engine's timer wheel and any paced stream sample the process-global
 /// virtual clock, and `init` re-anchors it — so it runs once per binary.
@@ -124,17 +124,33 @@ fn the_edgeboard_builds_with_every_part_classified() {
         "IC14", // ISO6741DWR  — isolator family model, STEP as a rate
         "IC15", // ISO6721BDR  — isolator family model
         "IC16", // ISO6740FDWR — isolator family model, fail-safe low
-        "IC6",  // NSI50010YT1G
-        "U4",   // 6N137
-        "U5",   // VO2631
+        "U4",   // 6N137 — optocoupler model
+        "U5",   // VO2631 — optocoupler model
         "U9",   // SN74LVC1G14DBV — Schmitt inverter model
         "U1",   // XL1509
-        "U3",   // APM4953
-        "Q1",   // 2N3904
     ] {
         assert!(
             registered.contains(reference),
             "{reference} must be a registered component"
+        );
+    }
+    // The nonlinear parts are elements by specification — nodes with
+    // branches, not components.
+    for reference in [
+        "IC6", // NSI50010YT1G — current regulator
+        "U3",  // APM4953 — polarity FET with its body diode
+        "Q1",  // 2N3904 — the servo-enable sink
+        "D1",  // SS36 — the buck's catch diode
+        "D3",  // LTST-C190KGKT — an indicator LED
+    ] {
+        assert!(
+            !registered.contains(reference),
+            "{reference} is an element, not a component"
+        );
+        assert!(
+            matches!(board.node_class(reference), Some(PartClass::Pwl { .. })),
+            "{reference}: {:?}",
+            board.node_class(reference)
         );
     }
 
@@ -270,10 +286,6 @@ fn bench_straps_clear_the_domains_they_feed() {
     let system = System::new()
         .board("EdgeBoard", edge_board())
         .harness(bench_rails("EdgeBoard"))
-        .scenario(edge_polarity_fet_conducting(
-            Scenario::default(),
-            "EdgeBoard",
-        ))
         .build()
         .expect("the strapped board builds");
 
@@ -291,16 +303,41 @@ fn bench_straps_clear_the_domains_they_feed() {
         ])
     );
 
-    // The main input reaches V_IN only because the polarity FET is expressed as
-    // conducting; without that scenario the board is dark behind it.
-    let dark = System::new()
+    // The main input reaches V_IN through the polarity FET `U3`, an element
+    // the solve turns on: the 12 V strap is its drain, its gate is on the
+    // bench ground, so the channel conducts (`NODES.md` §8 phase 3; the
+    // `pin_short` that stood in for it is gone). Reverse the input — the
+    // strap 12 V *below* the bench ground — and the FET blocks: the gate
+    // is above the source, the body diode is reverse-biased, and V_IN is a
+    // rail nothing reaches.
+    assert!(
+        matches!(
+            system.nets()[system.net_id("EdgeBoard.V_IN").unwrap().0].state,
+            NetState::Analog(v) if (v - 12.0).abs() < 1e-3
+        ),
+        "V_IN through the conducting FET: {:?}",
+        system.nets()[system.net_id("EdgeBoard.V_IN").unwrap().0].state
+    );
+    let reversed = System::new()
         .board("EdgeBoard", edge_board())
-        .harness(bench_rails("EdgeBoard"))
+        .harness(
+            embsim_board::Harness::new()
+                .power(ep("BENCH.12V"), ep("EdgeBoard.J2.1"), -12.0)
+                .power(ep("BENCH.GND"), ep("EdgeBoard.J2.2"), 0.0)
+                .power(ep("BENCH.3V3"), ep("EdgeBoard.J19.1"), 3.3)
+                .power(ep("BENCH.5V"), ep("EdgeBoard.J22.1"), 5.0)
+                .power(ep("BENCH.SERVO5V"), ep("EdgeBoard.J21.1"), 5.0)
+                .power(ep("BENCH.SERVOGND"), ep("EdgeBoard.J21.8"), 0.0),
+        )
         .build()
         .expect("builds");
     assert!(
-        unsourced_domains(dark.diagnostics()).contains("EdgeBoard.V_IN"),
-        "with the polarity FET off, V_IN must stay unsourced"
+        unsourced_domains(reversed.diagnostics()).contains("EdgeBoard.V_IN"),
+        "with the input reversed the polarity FET blocks and V_IN is unsourced"
+    );
+    assert_eq!(
+        reversed.nets()[reversed.net_id("EdgeBoard.V_IN").unwrap().0].state,
+        NetState::Floating
     );
 }
 
@@ -382,7 +419,7 @@ fn every_isolator_channel_is_a_plain_level_repeater() {
 /// the isolators or the encoder would drive).
 fn start_servo_domain(jumpers_closed: bool, sources: &[(&str, f64)]) -> SystemHandle {
     ensure_clock();
-    let mut scenario = edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard");
+    let mut scenario = Scenario::default();
     if jumpers_closed {
         scenario = encoder_jumpers_closed(scenario, "EdgeBoard");
     }
@@ -490,7 +527,7 @@ fn start_servo_settled(scenario: Scenario) -> NetState {
 }
 
 fn encoder_scenario(jumpers_closed: bool, sources: &[(&str, f64)]) -> Scenario {
-    let mut scenario = edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard");
+    let mut scenario = Scenario::default();
     if jumpers_closed {
         scenario = encoder_jumpers_closed(scenario, "EdgeBoard");
     }
@@ -727,10 +764,6 @@ fn isolated_inputs_float_until_the_module_supplies_their_bank_rail() {
     let system = System::new()
         .board("EdgeBoard", edge_board())
         .harness(bench_rails("EdgeBoard"))
-        .scenario(edge_polarity_fet_conducting(
-            Scenario::default(),
-            "EdgeBoard",
-        ))
         .build()
         .expect("builds");
 
@@ -813,10 +846,6 @@ fn the_servo_isolator_secondary_ground_is_unconnected() {
     let system = System::new()
         .board("EdgeBoard", edge_board())
         .harness(bench_rails("EdgeBoard"))
-        .scenario(edge_polarity_fet_conducting(
-            Scenario::default(),
-            "EdgeBoard",
-        ))
         .build()
         .expect("builds");
     assert!(
@@ -829,10 +858,7 @@ fn the_servo_isolator_secondary_ground_is_unconnected() {
     let fixed = System::new()
         .board("EdgeBoard", edge_board())
         .harness(bench_rails("EdgeBoard"))
-        .scenario(
-            edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard")
-                .pin_short("EdgeBoard.IC14.9", "EdgeBoard.U24.8"),
-        )
+        .scenario(Scenario::default().pin_short("EdgeBoard.IC14.9", "EdgeBoard.U24.8"))
         .build()
         .expect("builds");
     assert!(

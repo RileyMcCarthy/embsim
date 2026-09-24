@@ -268,6 +268,18 @@ integration).
   whose values are driven by the consumer's physics plant. Common-mode and
   differential voltages then fall out of the same MNA as everything else,
   rather than being hand-computed inside a model.
+- **Nonlinear elements are branches**, never drives: a component declares
+  them through `Component::branches()` (`Branch { a, b, curve, control }`,
+  `NODES.md` §11) and a netlist part with no model through a `PwlSpec`
+  (`register_pwl`). An element joins its two nets — and its control net —
+  into one cluster, which then always solves; the engine chooses each
+  element's region in a cold-started, ordered, bounded flip loop inside the
+  solve (`board/src/cluster.rs`), never the component. A pin's current, from
+  the same solve, is an instrument: `PinHandle::sense_current`,
+  `ComponentNetIo::on_branch` (which escalates the cluster and nothing
+  else — no floating-sense finding for an open loop, and the fight findings
+  above still raised beside the operating point), and
+  `BuiltSystem::branch_current` / `pin_current` by path.
 
 ```rust
 pub trait ClusterSolver: Send + Sync {
@@ -352,13 +364,13 @@ matching):
 
 | Tier | Match | Result |
 |---|---|---|
-| auto | part `R*`/`C*`/`L*`/`LED`/`D_*` from `Device` (or rescue thereof) | passive primitive; value parsed from the **first token** of the field (`47R`, `4k7`, `0.1uF`, `4.7uF 6.3V`, `47uH/3A`); **pin-count validated** — a 2-terminal class with ≠2 pins is a hard classification error |
+| auto | part `R*`/`C*`/`L*`/`LED`/`D_*` from `Device` (or rescue thereof) | passive primitive; value parsed from the **first token** of the field (`47R`, `4k7`, `0.1uF`, `4.7uF 6.3V`, `47uH/3A`); **pin-count validated** — a 2-terminal class with ≠2 pins is a hard classification error. A `LED`/`D_*` symbol **yields to a registry entry** (by part name, manufacturer part number or value): the symbol is a guess that the part is DC-open, an entry a statement about the purchasable part; with no entry it stays the DC-open passive |
 | auto | `Conn*`/`Screw_Terminal*` parts, plus any part name the consumer passes to `PartRegistry::register_boundary` | board boundary pins (harness attachment points) |
 | auto | `Jumper*` parts | stateful short; default from name (`_NO`/`_Open` → open, `_NC`/`_Bridged` → closed; 3-pin `Jumper_3_*` variants get a selectable position) |
 | auto | two-pin `SW_*` parts | a **switch** with one open pole across pins `1` and `2` (the KiCad `Switch` library's two-terminal pinout) — unless the part name is registered: the pairing is a guess from the library convention, and an explicit registration beats it |
 | auto | `TestPoint*` | one pin: a **probe** node (senses, never drives); no net: a **mechanical** node (a pad); more pins: whatever the registry says of the part name, else a pin-count error |
 | auto | `MountingHole*`/`Logo*`/`Fiducial*` | a **mechanical** node: pads recorded, nothing electrical |
-| registry | anything else, keyed by part name, falling back to `value` | a consumer-registered class: a `Component` constructor (`register`), a switch with declared poles by pin id (`register_switch`), a piecewise-linear element (`register_pwl`, declared ahead of its behaviour: a fitted one is refused at system build with `BoardError::UnmodelledElement` until the elements land, so the declaration classifies but cannot populate) or a mechanical part (`register_mechanical`). One table: a later registration of a key replaces the earlier, whatever its kind |
+| registry | anything else, keyed by part name, then by the **manufacturer part number** the export carries (`Manufacturer_Part_Number`/`MPN`, `ComponentDecl::mpn`), falling back to `value` | a consumer-registered class: a `Component` constructor (`register`), a switch with declared poles by pin id (`register_switch`), a piecewise-linear element (`register_pwl`: a `PwlSpec` of pins and the branches between them — a diode's knee, a channel and its control — which the system build stamps into the cluster solve; `embsim_models::pwl_library` is the library of such entries with their datasheets) or a mechanical part (`register_mechanical`). One table: a later registration of a key replaces the earlier, whatever its kind |
 | error | no registry match | `RegistryError::UnknownPart { reference, part, value }`; system construction fails |
 
 A closed switch pole is a **build-time identity union** of its two pins' nets —
@@ -532,7 +544,11 @@ a requirement, not a nicety:
 Structured findings on a diagnostics bus, mirrored to `tracing`, consumable by
 tests (assert a specific finding fired) and by trace tooling later:
 `Contention`, `FloatingSense` (digital and analog), `AmbiguousLevel`,
-`CurrentIntoFloatingNode`, `PowerNetUnsourced`, `StreamMismatch`,
+`CurrentIntoFloatingNode`, `NonConvergent` (an element cluster's region loop
+ran its bound without a consistent set of regions: its nodes float and the
+finding names the elements), `PowerNetUnsourced` (a power pin on a net no
+source reaches — or one that floats behind an off element, a rail blocked by
+a reversed polarity FET), `StreamMismatch`,
 `ClassificationError`, `UnconnectedRegistryPin` (both directions:
 declared-but-absent and present-but-undeclared).
 

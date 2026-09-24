@@ -34,14 +34,13 @@ mod machine_parts;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rstest::rstest;
+use vibes_behaviour::{behaviour, expect, Test};
 
 use embsim_board::netlist::parse;
 use embsim_board::{
     Board, Component, Finding, Level, NetState, PartClass, PinRef, Scenario, SenseKind, System,
 };
-use machine_parts::{
-    ec32mb_board, ec32mb_registry, edge_fingers, ep, module_polarity_fet_conducting, p2_edge_module,
-};
+use machine_parts::{ec32mb_board, ec32mb_registry, edge_fingers, ep, p2_edge_module};
 
 const EC32MB: &str = include_str!("fixtures/p2_ec32mb.net");
 
@@ -116,20 +115,28 @@ fn the_module_builds_with_no_unclassified_parts() {
     let board = Board::from_netlist(parsed, &ec32mb_registry())
         .expect("the module builds with no unclassified-part errors");
 
-    // The 21 registered components: the P2, two inverters, the TCXO, the
-    // flash, four PSRAMs (models), the polarity FET, two bucks, the brownout
-    // detector and eight LDOs (facades until phases 3–4). Everything else is
-    // an auto-classified primitive, a boundary, a switch or a mechanical
-    // node.
+    // The 20 registered components: the P2, two inverters, the TCXO, the
+    // flash, four PSRAMs (models), two bucks, the brownout detector and
+    // eight LDOs (facades until phase 4). The polarity FET `U401` and the
+    // white LEDs `D601`/`D602` are elements by specification, not
+    // components. Everything else is an auto-classified primitive, a
+    // boundary, a switch or a mechanical node.
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert_eq!(
         registered,
         BTreeSet::from([
-            "U100", "U101", "U301", "U302", "U303", "U304", "U305", "U401", "U402", "U403", "U404",
-            "U501", "U502", "U503", "U504", "U505", "U506", "U507", "U508", "U601", "X100",
+            "U100", "U101", "U301", "U302", "U303", "U304", "U305", "U402", "U403", "U404", "U501",
+            "U502", "U503", "U504", "U505", "U506", "U507", "U508", "U601", "X100",
         ]),
         "exactly the module's active silicon is registered"
     );
+    for element in ["U401", "D601", "D602"] {
+        assert!(
+            matches!(board.node_class(element), Some(PartClass::Pwl { .. })),
+            "{element} is an element by specification: {:?}",
+            board.node_class(element)
+        );
+    }
     // Every one of the 114 parts is a node.
     assert_eq!(board.nodes().count(), EXPECTED_COMPONENTS);
     assert!(
@@ -472,9 +479,12 @@ fn p38_and_p39_also_reach_the_on_module_led_buffer() {
 // ============================================================
 
 /// Build the module alone as a system, powered the way a carrier powers it:
-/// 5 V into the two `5V` fingers, 0 V into the three `GND` fingers, and the
-/// reverse-polarity FET conducting. Everything else — bucks, inductors,
-/// eight LDOs, sixteen bank rails — comes from the netlist.
+/// 5 V into the two `5V` fingers and 0 V into the three `GND` fingers.
+/// Everything else — the reverse-polarity FET, bucks, inductors, eight
+/// LDOs, sixteen bank rails — comes from the netlist: the FET is an
+/// element whose channel the solve turns on (its gate is on the carrier's
+/// ground, 5 V below its source), so nothing in the scenario says it
+/// conducts.
 fn powered_module() -> embsim_board::BuiltSystem {
     let harness = embsim_board::Harness::new()
         .power(ep("CARRIER.5V"), ep("EC32MB.J203.41"), 5.0)
@@ -486,12 +496,45 @@ fn powered_module() -> embsim_board::BuiltSystem {
     System::new()
         .board("EC32MB", ec32mb_board())
         .harness(harness)
-        .scenario(module_polarity_fet_conducting(
-            Scenario::default(),
-            "EC32MB",
-        ))
         .build()
         .expect("the powered module resolves")
+}
+
+/// The polarity FET passes the carrier's 5 V to the protected input on its
+/// own: with the drain on the 5 V fingers and the gate on the carrier's
+/// ground, the gate sits 5 V below the source once the body diode has
+/// lifted it, the channel turns on, and the protected rail reads the
+/// input less nothing (no load draws through the 36 mΩ channel yet — the
+/// bucks are facades until phase 4). No `pin_short` stands in for it.
+#[rstest]
+fn the_polarity_fet_passes_the_carrier_input_to_the_protected_rail() {
+    behaviour!(Test {
+        id: "ec32mb.polarity-fet-passes-the-input",
+        covers: Some("board/src/cluster.rs#QuasiStaticMna::solve"),
+        given: "the P2-EC32MB module built with 5 volts on its 5V edge fingers and 0 volts on \
+                its GND fingers, and no scenario line about its reverse-polarity FET",
+    });
+    expect!(
+        "protected-rail-at-the-input",
+        "the protected input rail behind the FET reads the carrier's 5 volts",
+        "the FET's gate is on the carrier's ground, 5 volts below the source the body diode \
+         lifts, so the channel conducts and only its on-resistance stands between the two"
+    );
+    expect!(
+        "no-current-without-a-load",
+        "the FET carries no current",
+        "the bucks behind the rail are facades that draw nothing until phase 4"
+    );
+    let system = powered_module();
+    let protected = system.nets()[system.net_id("EC32MB.VIN_Edge_Protected").unwrap().0].state;
+    assert!(
+        matches!(protected, NetState::Analog(v) if (v - 5.0).abs() < 1e-6),
+        "{protected:?}"
+    );
+    let channel = system
+        .pin_current("EC32MB.U401.S")
+        .expect("the FET's cluster solved");
+    assert!(channel.abs() < 1e-9, "{channel}");
 }
 
 /// The whole power tree resolves from two fingers: no supply pin anywhere on
@@ -557,10 +600,7 @@ fn the_reset_node_is_pulled_up_and_floats_without_the_pull_up() {
     let broken = System::new()
         .board("EC32MB", ec32mb_board())
         .harness(harness)
-        .scenario(
-            module_polarity_fet_conducting(Scenario::default(), "EC32MB")
-                .pin_detach("EC32MB.R100.1"),
-        )
+        .scenario(Scenario::default().pin_detach("EC32MB.R100.1"))
         .build()
         .expect("the module still builds with a lifted pad");
     assert!(

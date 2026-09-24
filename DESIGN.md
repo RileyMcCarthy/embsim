@@ -94,7 +94,12 @@ form; cluster membership is fixed at build and the only runtime-mutable
 conductance is the plant's.
 *Enforced by:* the incremental-versus-full resolution property test, the
 cluster census bound (m ≤ 8 on every board), and the fact that no node API
-can union nets or read another net.
+can union nets or read another net. The bound is not yet met — phase 3's
+census reads 29 (Edge) and 10 (EC32MB) bare, and 20 on the Edge board's
+`+3.3V` cluster under the bench rails, because a resistor edge still unions
+through a terminal — and becomes the gate when phase 4 makes terminals
+boundaries for resistor edges as they are for elements (`NODES.md` §8,
+the phase-3 records and `cluster_census.rs`).
 
 **Rule 5 — No timestep, ever.** Time enters only as scheduled instants and
 closed forms: a single-pole RC, a linear ramp, a periodic segment. Regions

@@ -73,6 +73,7 @@ use embsim_board::{
 use embsim_models::logic_gate::{self, LogicGate, LVC2G04_PINS_BY_FUNCTION};
 use embsim_models::oscillator::{self, Oscillator};
 use embsim_models::psram::{Psram, PsramComponent};
+use embsim_models::pwl_library;
 use embsim_models::sd_card::SdCard;
 use embsim_models::sd_card_component::{SdCardComponent, SD_CARD_PINS_BY_FUNCTION};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -132,11 +133,6 @@ pub const PSRAM_PART: &str = "PSRAM 64Mbit";
 
 /// The TCXO's frequency, as its value names it: 20 MHz.
 pub const TCXO_HZ: u32 = 20_000_000;
-
-/// `P Mosfet 30V 8A` — Vishay SI3417DV reverse-polarity pass FET (U401). Its
-/// conducting channel is not modeled; the system description expresses it with
-/// a `pin_short` (a `pin_short` in the scenario).
-pub const POLARITY_FET_PINS: [PinDecl; 3] = [dig_in("G"), passive("D"), passive("S")];
 
 /// `DCDC 3A SOT563` — Diodes AP62301Z buck (U402, U403). `SW` is declared
 /// `PinKind::PowerOut`: it is the switching node the output inductor
@@ -232,8 +228,13 @@ fn class_registry() -> PartRegistry {
         Box::new(PsramComponent::new(Psram::new()))
     });
 
-    // Pin facades, until the phases of `NODES.md` §8 give each its model.
-    register_stub(&mut registry, "P Mosfet 30V 8A", &POLARITY_FET_PINS);
+    // The elements registered by specification (`NODES.md` §8 phase 3):
+    // the polarity FET `U401` — a Si3417DV by its `MPN` field, its channel
+    // and body diode — and the two white LEDs `D601`/`D602`, keyed on
+    // their number, all from the element library.
+    pwl_library::register(&mut registry);
+
+    // Pin facades, until phase 4 gives each its rail model.
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
     register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
     register_stub(&mut registry, "LDO 300mA, 3.3V", &LDO_PINS);

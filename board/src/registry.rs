@@ -38,7 +38,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::component::Component;
+use crate::component::{Component, PwlCurve, RegionTest};
+use crate::net::{Ohms, Volts};
 use crate::netlist::ComponentDecl;
 
 // ============================================================
@@ -106,13 +107,100 @@ impl SwitchPole {
     }
 }
 
-/// The specification of a piecewise-linear element (a diode, an LED, a FET
-/// or BJT channel, a current regulator) — **a placeholder**: the class
-/// exists so a part can be declared one now; the curves, regions and their
-/// provenance land with the elements themselves (`NODES.md` §8 phase 3).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub struct PwlSpec {}
+/// One branch of a [`PwlSpec`]: a [`crate::Branch`] with its pins as the
+/// netlist names them (owned, since a registry entry is built at run time
+/// from a library), between two of the spec's pins with an optional control
+/// pin. The current is reported positive from `a` to `b`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PwlBranch {
+    /// The anode / drain pin.
+    pub a: String,
+    /// The cathode / source pin — the reference of the control test.
+    pub b: String,
+    /// The two-region curve.
+    pub curve: PwlCurve,
+    /// The control pin and its test on `V(control) − V(b)`, for a channel.
+    pub control: Option<(String, RegionTest)>,
+}
+
+/// The specification of a piecewise-linear element registered **by spec**
+/// — a netlist part with no Rust model behind it: a diode, an LED, a FET or
+/// BJT channel. It carries the pins the part declares (validated against the
+/// netlist both ways, like a component's facade) and the branches between
+/// them; the engine stamps the branches and chooses their regions exactly as
+/// it does a [`crate::Component::branches`] declaration. Every number in a
+/// spec cites a datasheet — `embsim_models::pwl_library` is the library of
+/// such entries, keyed on the netlist's manufacturer part number.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PwlSpec {
+    /// The pins the element declares, by netlist pin id, in declaration
+    /// order.
+    pub pins: Vec<String>,
+    /// The branches, in declaration order — the order the flip loop
+    /// evaluates their region tests in.
+    pub branches: Vec<PwlBranch>,
+}
+
+impl PwlSpec {
+    /// A spec declaring `pins` and no branch yet (see [`PwlSpec::with_branch`]).
+    pub fn new(pins: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            pins: pins.into_iter().map(Into::into).collect(),
+            branches: Vec::new(),
+        }
+    }
+
+    /// The spec with one more branch from `a` to `b`, no control.
+    pub fn with_branch(
+        mut self,
+        a: impl Into<String>,
+        b: impl Into<String>,
+        curve: PwlCurve,
+    ) -> Self {
+        self.branches.push(PwlBranch {
+            a: a.into(),
+            b: b.into(),
+            curve,
+            control: None,
+        });
+        self
+    }
+
+    /// The spec with one more branch from `a` to `b`, switched by
+    /// `control` through `test` (a [`PwlCurve::Channel`]).
+    pub fn with_controlled_branch(
+        mut self,
+        a: impl Into<String>,
+        b: impl Into<String>,
+        curve: PwlCurve,
+        control: impl Into<String>,
+        test: RegionTest,
+    ) -> Self {
+        self.branches.push(PwlBranch {
+            a: a.into(),
+            b: b.into(),
+            curve,
+            control: Some((control.into(), test)),
+        });
+        self
+    }
+
+    /// A two-pin diode: one [`PwlCurve::Diode`] branch from `anode` to
+    /// `cathode`.
+    pub fn diode(
+        anode: impl Into<String>,
+        cathode: impl Into<String>,
+        vf: Volts,
+        r_d: Ohms,
+    ) -> Self {
+        let (anode, cathode) = (anode.into(), cathode.into());
+        Self::new([anode.clone(), cathode.clone()]).with_branch(
+            anode,
+            cathode,
+            PwlCurve::Diode { vf, r_d },
+        )
+    }
+}
 
 /// Result of classifying one netlist component. Every variant is a node
 /// class with behaviour (or, for the types phase 1 declares ahead of their
@@ -151,10 +239,8 @@ pub enum Classification {
     /// [`PartRegistry::register_pwl`]. Its pins are validated against the
     /// netlist in both directions, like a registered component's facade.
     Pwl {
-        /// The element's specification.
+        /// The element's specification: its pins and branches.
         spec: PwlSpec,
-        /// The pins the element declares, by netlist pin id.
-        pins: Vec<String>,
     },
     /// Auto tier: a test point — a one-pin probe node that senses and never
     /// drives. A `TestPoint*` symbol on no net is [`Classification::Mechanical`]
@@ -185,7 +271,7 @@ enum RegistryEntry {
     /// A switch with declared poles.
     Switch(Vec<SwitchPole>),
     /// A piecewise-linear element.
-    Pwl { spec: PwlSpec, pins: Vec<String> },
+    Pwl(PwlSpec),
     /// A mechanical part.
     Mechanical,
 }
@@ -198,10 +284,7 @@ impl RegistryEntry {
             RegistryEntry::Switch(poles) => Classification::Switch {
                 poles: poles.clone(),
             },
-            RegistryEntry::Pwl { spec, pins } => Classification::Pwl {
-                spec: spec.clone(),
-                pins: pins.clone(),
-            },
+            RegistryEntry::Pwl(spec) => Classification::Pwl { spec: spec.clone() },
             RegistryEntry::Mechanical => Classification::Mechanical,
         }
     }
@@ -211,7 +294,7 @@ impl RegistryEntry {
         match self {
             RegistryEntry::Component(_) => "component",
             RegistryEntry::Switch(_) => "switch",
-            RegistryEntry::Pwl { .. } => "pwl",
+            RegistryEntry::Pwl(_) => "pwl",
             RegistryEntry::Mechanical => "mechanical",
         }
     }
@@ -219,7 +302,8 @@ impl RegistryEntry {
 
 /// Consumer part registry: maps part identity to a class — a component
 /// constructor, a switch's poles, a piecewise-linear element, a mechanical
-/// part. Lookup keys on the rescue-normalized part name, falling back to the
+/// part. Lookup keys on the rescue-normalized part name, then on the
+/// netlist's manufacturer part number ([`ComponentDecl::mpn`]), then on the
 /// component `value`; one table, so a later registration of the same key
 /// replaces the earlier one whatever its kind.
 #[derive(Default)]
@@ -287,23 +371,17 @@ impl PartRegistry {
             .insert(part.into(), RegistryEntry::Switch(poles));
     }
 
-    /// Declare a part name to be a **piecewise-linear element** with the
-    /// given pins (validated against the netlist in both directions) and
-    /// specification. The class is declared ahead of its behaviour: see
-    /// [`PwlSpec`].
-    pub fn register_pwl(
-        &mut self,
-        part: impl Into<String>,
-        pins: impl IntoIterator<Item = impl Into<String>>,
-        spec: PwlSpec,
-    ) {
-        self.entries.insert(
-            part.into(),
-            RegistryEntry::Pwl {
-                spec,
-                pins: pins.into_iter().map(Into::into).collect(),
-            },
-        );
+    /// Declare a part name — or a manufacturer part number, or a value — to
+    /// be a **piecewise-linear element** with the given specification: its
+    /// pins (validated against the netlist in both directions) and the
+    /// branches between them ([`PwlSpec`]). A diode, an LED, a FET or BJT
+    /// channel with no Rust model behind it. The key is looked up like any
+    /// other: part name first, then the netlist's manufacturer part number,
+    /// then the value — so a library entry keyed `LTST-C190KGKT` classifies
+    /// the LEDs whose value is the bare `LED` once the auto tier yields to
+    /// it, and one keyed `SS36` classifies by value.
+    pub fn register_pwl(&mut self, key: impl Into<String>, spec: PwlSpec) {
+        self.entries.insert(key.into(), RegistryEntry::Pwl(spec));
     }
 
     /// Declare a part name — or, on a netlist with no libsource, a value —
@@ -365,18 +443,20 @@ impl PartRegistry {
         self.entries.contains_key(part)
     }
 
-    /// The registry entry for a declaration, keyed by normalized part name
-    /// with fallback to `value`.
+    /// The registry entry for a declaration, keyed by normalized part name,
+    /// then by the netlist's manufacturer part number, then by `value`.
     fn entry(&self, decl: &ComponentDecl) -> Option<&RegistryEntry> {
         let part = normalize_part(decl);
         self.entries
             .get(part.as_str())
+            .or_else(|| decl.mpn.as_deref().and_then(|mpn| self.entries.get(mpn)))
             .or_else(|| self.entries.get(decl.value.as_str()))
     }
 
     /// Construct the registered component for a declaration, keyed by
-    /// normalized part name with fallback to `value`. `None` when no
-    /// component constructor matches (an entry of another kind, or none).
+    /// normalized part name, manufacturer part number, then `value`. `None`
+    /// when no component constructor matches (an entry of another kind, or
+    /// none).
     pub fn construct(&self, decl: &ComponentDecl) -> Option<Box<dyn Component>> {
         match self.entry(decl) {
             Some(RegistryEntry::Component(ctor)) => Some(ctor(decl)),
@@ -526,7 +606,26 @@ impl PartRegistry {
 
         // Tier 1e: passive primitives — the part-name class is anchored so
         // e.g. "RJ45" never classifies as a resistor.
+        //
+        // A diode or LED symbol says nothing about the purchasable part's
+        // knee: the part is the registration — by part name, by the
+        // manufacturer part number the export carries, or by value — that
+        // carries its datasheet's forward drop (`NODES.md` §2, the Diode /
+        // LED row: "no resolvable Vf = build error naming the part, like
+        // any other unmodelled part"). A diode with none is an unknown
+        // part, and the error names the number the export gave it.
         if let Some(kind) = passive_kind(auto) {
+            if matches!(kind, PassiveKind::Diode | PassiveKind::Led) {
+                return match self.entry(decl) {
+                    Some(entry) => Ok(entry.classification()),
+                    None => Err(RegistryError::UnknownPart {
+                        reference: decl.reference.clone(),
+                        part,
+                        value: decl.value.clone(),
+                        mpn: decl.mpn.clone(),
+                    }),
+                };
+            }
             if pin_count != 2 {
                 return Err(RegistryError::BadPinCount {
                     reference: decl.reference.clone(),
@@ -541,8 +640,8 @@ impl PartRegistry {
             });
         }
 
-        // Tier 2: consumer registry, keyed on normalized part name with a
-        // fallback to the value field.
+        // Tier 2: consumer registry, keyed on normalized part name, then
+        // the manufacturer part number, then the value field.
         if let Some(entry) = self.entry(decl) {
             return Ok(entry.classification());
         }
@@ -554,6 +653,7 @@ impl PartRegistry {
             reference: decl.reference.clone(),
             part,
             value: decl.value.clone(),
+            mpn: decl.mpn.clone(),
         })
     }
 }
@@ -744,7 +844,8 @@ pub enum RegistryError {
     /// No auto-tier match and no registry entry — the board does not build.
     /// Names the reference, the part and the value, because on a netlist
     /// with no libsource the part is empty and the value is the only name
-    /// the part has.
+    /// the part has; and the manufacturer part number where the export
+    /// carries one, because that is the key a library entry would take.
     UnknownPart {
         /// Component reference designator.
         reference: String,
@@ -752,6 +853,8 @@ pub enum RegistryError {
         part: String,
         /// The component's value field.
         value: String,
+        /// The manufacturer part number the export carries, if any.
+        mpn: Option<String>,
     },
     /// An auto-classified class with a different netlist pin count than it
     /// requires (a 2-terminal primitive, a 1-pin test point).
@@ -774,11 +877,16 @@ impl fmt::Display for RegistryError {
                 reference,
                 part,
                 value,
+                mpn,
             } => {
                 write!(
                     f,
                     "{reference}: no classification or registry entry for part {part:?} with value {value:?}"
-                )
+                )?;
+                match mpn {
+                    Some(mpn) => write!(f, " (manufacturer part number {mpn:?})"),
+                    None => Ok(()),
+                }
             }
             RegistryError::BadPinCount { reference, part, expected, found } => write!(
                 f,
@@ -818,6 +926,7 @@ mod tests {
             part: part.to_string(),
             sheetpath: "/".to_string(),
             dnp: false,
+            mpn: None,
         }
     }
 
@@ -940,6 +1049,7 @@ mod tests {
                 reference: "U1".to_string(),
                 part: "FrobulatorX".to_string(),
                 value: "?".to_string(),
+                mpn: None,
             })
         );
     }
@@ -1201,18 +1311,106 @@ mod tests {
             .is_none());
     }
 
-    /// A registered piecewise-linear element classifies with its pins and
-    /// specification.
+    /// A registered piecewise-linear element classifies with its
+    /// specification — its pins and branches.
     #[rstest]
-    fn a_registered_pwl_element_carries_its_pins_and_spec() {
+    fn a_registered_pwl_element_carries_its_spec() {
         let mut registry = PartRegistry::new();
-        registry.register_pwl("SS36", ["K", "A"], PwlSpec::default());
+        let spec = PwlSpec::diode("A", "K", 0.75, 0.0);
+        registry.register_pwl("SS36", spec.clone());
         assert_eq!(
             registry.classify(&decl_with_lib("Diode", "SS36", "SS36"), 2),
-            Ok(Classification::Pwl {
-                spec: PwlSpec::default(),
-                pins: vec!["K".to_string(), "A".to_string()],
+            Ok(Classification::Pwl { spec: spec.clone() })
+        );
+        assert_eq!(spec.pins, vec!["A".to_string(), "K".to_string()]);
+        assert_eq!(spec.branches.len(), 1);
+    }
+
+    /// A diode or LED symbol yields to an explicit registration — by the
+    /// manufacturer part number the export carries, or by value — and
+    /// stays the open passive it always was when there is none; a resistor
+    /// symbol never yields.
+    #[rstest]
+    fn a_diode_symbol_yields_to_a_registered_element_and_stays_open_otherwise() {
+        let mut registry = PartRegistry::new();
+        registry.register_pwl("LTST-C190KGKT", PwlSpec::diode("2", "1", 2.0, 0.0));
+        registry.register_pwl("SS36", PwlSpec::diode("2", "1", 0.75, 0.0));
+        let mut led = decl_with_lib("Device", "LED", "LED");
+        led.mpn = Some("LTST-C190KGKT".to_string());
+        assert!(matches!(
+            registry.classify(&led, 2),
+            Ok(Classification::Pwl { .. })
+        ));
+        // An LED or diode symbol with no entry is an unknown part — the
+        // symbol carries no knee — and the error names the number the
+        // export gave it, the key an entry would take.
+        assert_eq!(
+            registry.classify(&decl_with_lib("Device", "LED", "LED"), 2),
+            Err(RegistryError::UnknownPart {
+                reference: "U1".to_string(),
+                part: "LED".to_string(),
+                value: "LED".to_string(),
+                mpn: None,
             })
+        );
+        assert!(matches!(
+            registry.classify(&decl_with_lib("Device", "D_Schottky_Small", "SS36"), 2),
+            Ok(Classification::Pwl { .. })
+        ));
+        let mut unknown = decl_with_lib("Device", "D_Schottky_Small", "1N5819");
+        unknown.mpn = Some("1N5819HW-7-F".to_string());
+        let error = registry
+            .classify(&unknown, 2)
+            .expect_err("no entry keys the part, its number or its value");
+        assert_eq!(
+            error,
+            RegistryError::UnknownPart {
+                reference: "U1".to_string(),
+                part: "D_Schottky_Small".to_string(),
+                value: "1N5819".to_string(),
+                mpn: Some("1N5819HW-7-F".to_string()),
+            }
+        );
+        assert!(
+            error.to_string().contains("1N5819HW-7-F"),
+            "the message names the number: {error}"
+        );
+        // A resistor symbol is a resistor whatever is registered for its value.
+        registry.register_mechanical("220");
+        assert_eq!(
+            registry.classify(&decl_with_lib("Device", "R", "220"), 2),
+            Ok(Classification::Passive {
+                kind: PassiveKind::Resistor,
+                value: Some(220.0)
+            })
+        );
+    }
+
+    /// The netlist's manufacturer part number is a registry key between the
+    /// part name and the value: an entry keyed on it classifies a part
+    /// whose part name matches nothing, and the part name still wins over
+    /// it.
+    #[rstest]
+    fn a_manufacturer_part_number_is_looked_up_between_the_part_name_and_the_value() {
+        let mut registry = PartRegistry::new();
+        registry.register_pwl("SS36-E3/57T", PwlSpec::diode("2", "1", 0.75, 0.0));
+        registry.register_mechanical("SS36");
+        let mut with_mpn = decl_with_lib("Diode", "Schottky", "SS36");
+        with_mpn.mpn = Some("SS36-E3/57T".to_string());
+        assert!(matches!(
+            registry.classify(&with_mpn, 2),
+            Ok(Classification::Pwl { .. })
+        ));
+        // Without the number the value is the fallback.
+        assert_eq!(
+            registry.classify(&decl_with_lib("Diode", "Schottky", "SS36"), 2),
+            Ok(Classification::Mechanical)
+        );
+        // The part name beats the number.
+        registry.register_mechanical("Schottky");
+        assert_eq!(
+            registry.classify(&with_mpn, 2),
+            Ok(Classification::Mechanical)
         );
     }
 
@@ -1335,6 +1533,7 @@ mod tests {
             part: String::new(),
             sheetpath: "/".to_string(),
             dnp: false,
+            mpn: None,
         }
     }
 
@@ -1349,6 +1548,7 @@ mod tests {
                 reference: "R100".to_string(),
                 part: String::new(),
                 value: "10.5K".to_string(),
+                mpn: None,
             })
         );
         assert!(matches!(
@@ -1392,13 +1592,16 @@ mod tests {
         let (kind, henries) = parsed_passive("L401", "3.3uH 6.6A 28.6mOhm");
         assert_eq!(kind, PassiveKind::Inductor);
         assert!(((henries - 3.3e-6) / 3.3e-6).abs() < 1e-12, "{henries}");
-        // D601 is a white LED; the `D` prefix cannot tell LED from diode, and
-        // both are DC-open in the build pass.
+        // D601 is a white LED; the `D` prefix says diode and nothing of its
+        // knee, so without the library entry that keys its number it is an
+        // unknown part like any active silicon.
         assert_eq!(
             registry.classify(&unnamed("D601", "White"), 2),
-            Ok(Classification::Passive {
-                kind: PassiveKind::Diode,
-                value: None
+            Err(RegistryError::UnknownPart {
+                reference: "D601".to_string(),
+                part: String::new(),
+                value: "White".to_string(),
+                mpn: None,
             })
         );
         // The 80-finger edge socket is a boundary.
@@ -1431,6 +1634,7 @@ mod tests {
                 reference: "U301".to_string(),
                 part: String::new(),
                 value: "SPI Flash 16MB (128Mb)".to_string(),
+                mpn: None,
             })
         );
         // A BOM-only refdes has no class until its value is declared

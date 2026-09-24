@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::component::{AttachError, Component, IdleDrive, PinDecl, PinKind};
+use crate::component::{AttachError, Branch, Component, IdleDrive, PinDecl, PinKind};
 use crate::net::{Net, NetId, NetState, PinRef};
 use crate::netlist::{normalize_net_name, NetlistError, ParsedNetlist};
 use crate::registry::{
@@ -50,13 +50,13 @@ pub enum PartClass {
         /// addresses).
         poles: Vec<SwitchPole>,
     },
-    /// A piecewise-linear element — declared ahead of its behaviour (see
-    /// [`PwlSpec`]); DC-open until the elements land.
+    /// A piecewise-linear element registered by specification
+    /// ([`PwlSpec`]): its pins, validated against the netlist both ways,
+    /// and the branches between them, which the system build stamps into
+    /// the cluster solve.
     Pwl {
         /// The element's specification.
         spec: PwlSpec,
-        /// Its pins, validated against the netlist both ways.
-        pins: Vec<String>,
     },
     /// Connector — harness attachment boundary.
     Boundary,
@@ -69,6 +69,8 @@ pub enum PartClass {
     Registered {
         /// Declared pins (validated against the netlist both directions).
         pins: Vec<PinDecl>,
+        /// Declared nonlinear branches, each naming declared pins only.
+        branches: Vec<Branch>,
     },
 }
 
@@ -155,10 +157,18 @@ impl Board {
                     validate_pins(&decl.reference, &declared, &netlist_pins)?;
                     PartClass::Switch { poles }
                 }
-                Classification::Pwl { spec, pins } => {
-                    let declared: Vec<&str> = pins.iter().map(String::as_str).collect();
+                Classification::Pwl { spec } => {
+                    let declared: Vec<&str> = spec.pins.iter().map(String::as_str).collect();
                     validate_pins(&decl.reference, &declared, &netlist_pins)?;
-                    PartClass::Pwl { spec, pins }
+                    let branch_pins = spec.branches.iter().flat_map(|branch| {
+                        [branch.a.as_str(), branch.b.as_str()]
+                            .into_iter()
+                            .chain(branch.control.as_ref().map(|(pin, _)| pin.as_str()))
+                    });
+                    validate_branch_pins(&decl.reference, branch_pins, |pin| {
+                        declared.contains(&pin)
+                    })?;
+                    PartClass::Pwl { spec }
                 }
                 Classification::Registered => {
                     let component = registry
@@ -166,10 +176,19 @@ impl Board {
                         .expect("classify() returned Registered, so construct() must succeed");
                     let pins = component.pins().to_vec();
                     validate_facade(&decl.reference, &pins, &netlist_pins)?;
+                    let branches = component.branches().to_vec();
+                    let branch_pins = branches.iter().flat_map(|branch| {
+                        [branch.a, branch.b]
+                            .into_iter()
+                            .chain(branch.control.map(|(pin, _)| pin))
+                    });
+                    validate_branch_pins(&decl.reference, branch_pins, |pin| {
+                        pins.iter().any(|p| p.number == pin || p.name == Some(pin))
+                    })?;
                     // attach() runs at system build, once final (merged) net
                     // ids exist — still pre-share.
                     components.push((decl.reference.clone(), component));
-                    PartClass::Registered { pins }
+                    PartClass::Registered { pins, branches }
                 }
             };
 
@@ -316,6 +335,26 @@ fn validate_pins(
     Ok(())
 }
 
+/// Every pin a declared branch names — its two terminals and its control —
+/// must be a pin the part declares (`is_declared`), or the branch would
+/// stamp onto nothing: the first that is not is a facade mismatch naming
+/// the pin, in declaration order.
+fn validate_branch_pins<'a>(
+    reference: &str,
+    branch_pins: impl IntoIterator<Item = &'a str>,
+    is_declared: impl Fn(&str) -> bool,
+) -> Result<(), BoardError> {
+    for pin in branch_pins {
+        if !is_declared(pin) {
+            return Err(BoardError::PinFacadeMismatch {
+                reference: reference.to_string(),
+                pin: pin.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 // ============================================================
 // Errors
 // ============================================================
@@ -331,7 +370,8 @@ pub enum BoardError {
     /// A declared pin facade — a registered component's pins, a switch's
     /// pole pins, a piecewise-linear element's pins — does not match the
     /// netlist (either direction — declared-but-absent or
-    /// present-but-undeclared).
+    /// present-but-undeclared), or a declared branch names a pin the facade
+    /// does not declare.
     PinFacadeMismatch {
         /// Component reference designator.
         reference: String,
@@ -346,16 +386,6 @@ pub enum BoardError {
         reference: String,
         /// The pin carrying the declaration.
         pin: String,
-    },
-    /// A fitted piecewise-linear element whose specification is the
-    /// placeholder ([`PwlSpec`]) — a class declared ahead of its behaviour.
-    /// `register_pwl` is a declaration of intent until the elements land
-    /// (`NODES.md` §8 phase 3); a part it covers builds only unfitted (DNP,
-    /// or unpopulated by the scenario), like any other part without
-    /// behaviour (`DESIGN.md` rule 1).
-    UnmodelledElement {
-        /// Component reference designator.
-        reference: String,
     },
     /// A component's `attach()` failed.
     Attach {
@@ -379,12 +409,6 @@ impl fmt::Display for BoardError {
                 "{reference}: pin {pin:?} declares an idle drive but has no drive slot \
                  (power and passive pins idle at nothing)"
             ),
-            BoardError::UnmodelledElement { reference } => write!(
-                f,
-                "{reference}: a piecewise-linear element declared ahead of its behaviour \
-                 cannot be fitted until the elements land; leave it unpopulated or register \
-                 a model"
-            ),
             BoardError::Attach { reference, error } => write!(f, "{reference}: {error}"),
         }
     }
@@ -396,9 +420,7 @@ impl std::error::Error for BoardError {
             BoardError::Netlist(e) => Some(e),
             BoardError::Classification(e) => Some(e),
             BoardError::Attach { error, .. } => Some(error),
-            BoardError::PinFacadeMismatch { .. }
-            | BoardError::IdleOnSlotlessPin { .. }
-            | BoardError::UnmodelledElement { .. } => None,
+            BoardError::PinFacadeMismatch { .. } | BoardError::IdleOnSlotlessPin { .. } => None,
         }
     }
 }
@@ -459,9 +481,14 @@ mod tests {
                 SwitchPole::closed("2_ON", "2_OFF"),
             ],
         );
-        registry.register_pwl("SS36", ["A", "K"], PwlSpec::default());
+        registry.register_pwl("SS36", diode_spec());
         registry.register_mechanical("Frobulator 9000");
         registry
+    }
+
+    /// The fixture's diode: anode `A`, cathode `K`, a 0.75 V knee.
+    fn diode_spec() -> PwlSpec {
+        PwlSpec::diode("A", "K", 0.75, 0.0)
     }
 
     /// Every netlist part is a node of the class the registry gave it.
@@ -481,10 +508,7 @@ mod tests {
         );
         assert_eq!(
             board.node_class("D1"),
-            Some(&PartClass::Pwl {
-                spec: PwlSpec::default(),
-                pins: vec!["A".to_string(), "K".to_string()],
-            })
+            Some(&PartClass::Pwl { spec: diode_spec() })
         );
         assert_eq!(board.node_class("TP1"), Some(&PartClass::Probe));
         assert_eq!(board.node_class("H1"), Some(&PartClass::Mechanical));
@@ -507,7 +531,7 @@ mod tests {
                 SwitchPole::closed("2_ON", "2_OFF"),
             ],
         );
-        registry.register_pwl("SS36", ["A", "K"], PwlSpec::default());
+        registry.register_pwl("SS36", diode_spec());
         let error =
             Board::from_netlist(parse(NETLIST).unwrap(), &registry).expect_err("U9 has no class");
         match &error {
@@ -515,10 +539,12 @@ mod tests {
                 reference,
                 part,
                 value,
+                mpn,
             }) => {
                 assert_eq!(reference, "U9");
                 assert_eq!(part, "");
                 assert_eq!(value, "Frobulator 9000");
+                assert_eq!(mpn, &None);
             }
             other => panic!("expected UnknownPart, got {other:?}"),
         }
@@ -556,11 +582,33 @@ mod tests {
     #[rstest]
     fn pwl_pins_are_validated_against_the_netlist_both_ways() {
         let mut registry = registry();
-        registry.register_pwl("SS36", ["A"], PwlSpec::default());
+        registry.register_pwl("SS36", PwlSpec::new(["A"]));
         let error = Board::from_netlist(parse(NETLIST).unwrap(), &registry)
             .expect_err("K is a pin no declaration names");
         assert!(
             matches!(&error, BoardError::PinFacadeMismatch { reference, pin } if reference == "D1" && pin == "K"),
+            "{error:?}"
+        );
+    }
+
+    /// A branch names the pins it runs between, and a control pin; each
+    /// must be a pin the element declares, or the build refuses it naming
+    /// the pin.
+    #[rstest]
+    fn a_branch_naming_an_undeclared_pin_is_a_facade_mismatch() {
+        let mut registry = registry();
+        registry.register_pwl(
+            "SS36",
+            PwlSpec::new(["A", "K"]).with_branch(
+                "A",
+                "G",
+                crate::PwlCurve::Diode { vf: 0.75, r_d: 0.0 },
+            ),
+        );
+        let error = Board::from_netlist(parse(NETLIST).unwrap(), &registry)
+            .expect_err("G is a pin the element does not declare");
+        assert!(
+            matches!(&error, BoardError::PinFacadeMismatch { reference, pin } if reference == "D1" && pin == "G"),
             "{error:?}"
         );
     }
