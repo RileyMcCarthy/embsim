@@ -28,7 +28,7 @@
 //! real pin facade (which the board build validates against the netlist in
 //! both directions, so a symbol change breaks a test instead of going
 //! unnoticed) and no behavior. `DESIGN.md` rule 1 admits no stub tier, so
-//! each is a part `NODES.md` §8 phases 3–4 replace with a model, and
+//! each is a part `NODES.md` §8 phase 4 replaces with a model, and
 //! `cluster_census.rs` counts them as a figure that may only fall. Until
 //! then their pin kinds are not a stylistic choice:
 //!
@@ -65,16 +65,21 @@
 //!
 //! The rest come from `embsim-models`: the other four ISO67xx isolators
 //! (`IC1`, `IC2`, `IC14` with its STEP channel carrying a rate, `IC15`,
-//! `IC16`) and the 21 SN74LVC1G14 LED drivers on the Edge board; the
-//! TCXO, the two 74LVC2G04 inverters, the four PSRAMs and the boot flash
-//! `U301` (blank, the 16 MiB part `embsim-boards` ships the module with;
-//! `w25q128jv.rs` re-registers it with each case's own image) on the module.
-//! Everything else on both boards is a stub or an auto-classified primitive:
-//! on the module the polarity FET `U401`, the bucks `U402`/`U403`, the
-//! detector `U404` and the LDOs `U501`–`U508`; on the Edge board the
-//! isolated DC/DCs, the current regulators, the optos, the bucks, the
-//! polarity FET and the transistor — the parts `NODES.md` §8 phases 3–4
-//! turn into models.
+//! `IC16`), the 21 SN74LVC1G14 LED drivers and the five optocouplers
+//! (`U4` a 6N137, `U5`–`U8` VO2631s) on the Edge board; the TCXO, the two
+//! 74LVC2G04 inverters, the four PSRAMs and the boot flash `U301` (blank,
+//! the 16 MiB part `embsim-boards` ships the module with; `w25q128jv.rs`
+//! re-registers it with each case's own image) on the module. The
+//! nonlinear parts are elements registered by specification from
+//! `embsim_models::pwl_library`, keyed on the manufacturer part number the
+//! netlists carry: on the Edge board the polarity FET `U3` with its body
+//! diode, the transistor `Q1`, the eight current regulators `IC6`–`IC13`,
+//! the Schottky diodes `D1`/`D2` and the 21 indicator LEDs; on the module
+//! the polarity FET `U401` and the white LEDs `D601`/`D602`. Everything
+//! else on both boards is a stub or an auto-classified primitive: on the
+//! module the bucks `U402`/`U403`, the detector `U404` and the LDOs
+//! `U501`–`U508`; on the Edge board the isolated DC/DCs `IC3`/`IC4` and the
+//! bucks `U1`/`U2` — the parts `NODES.md` §8 phase 4 turns into rail models.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -89,8 +94,10 @@ use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
 use embsim_models::isolation::{iso67xx, Channel, Iso67xx};
 use embsim_models::logic_gate::{self, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION};
+use embsim_models::opto::Opto;
 use embsim_models::oscillator::{self, Oscillator};
 use embsim_models::psram::{Psram, PsramComponent};
+use embsim_models::pwl_library;
 use embsim_models::spi_flash::SpiNorFlash;
 use embsim_models::spi_flash_component::{SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION};
 
@@ -907,18 +914,18 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 //   mechanical (by value)    J701/J702 (mounting holes, tied to GND), PCB
 //                            (the raw board, no nodes) and NC_Net (a layout
 //                            node): pads and nothing electrical.
+//   element (by MPN)         U401, the Si3417DV polarity FET: its channel
+//                            and body diode as piecewise-linear branches;
+//                            D601/D602, the IN-S63AS5UW white LEDs — from
+//                            `embsim_models::pwl_library`, keyed on the
+//                            `MPN` field the transcription carries.
 //   stub                     every other active part, below.
 //
-// Why the power parts are still stubs and not models: the LDOs, bucks,
-// polarity FET and brownout detector matter as *power topology*, which
-// their PowerIn/PowerOut declarations already express. Each becomes a model
-// in `NODES.md` §8 phases 3–4 — the facades below are already the
+// Why the power parts are still stubs and not models: the LDOs, bucks and
+// brownout detector matter as *power topology*, which their
+// PowerIn/PowerOut declarations already express. Each becomes a model in
+// `NODES.md` §8 phase 4 — the facades below are already the
 // netlist-validated boundary.
-
-/// `P Mosfet 30V 8A` — Vishay SI3417DV reverse-polarity pass FET (U401). Its
-/// conducting channel is not modeled; the system description expresses it with
-/// a `pin_short` (see [`module_polarity_fet_conducting`]).
-pub const POLARITY_FET_PINS: [PinDecl; 3] = [dig_in("G"), passive("D"), passive("S")];
 
 /// `DCDC 3A SOT563` — Diodes AP62301Z buck (U402, U403). `SW` is declared
 /// [`embsim_board::PinKind::PowerOut`]: it is the switching node the output inductor
@@ -1004,7 +1011,10 @@ pub fn ec32mb_registry() -> PartRegistry {
                 .with_pins(&SPI_FLASH_PINS_BY_FUNCTION),
         )
     });
-    register_stub(&mut registry, "P Mosfet 30V 8A", &POLARITY_FET_PINS);
+    // The elements by specification: `U401` (a Si3417DV by its `MPN`
+    // field) and the white LEDs `D601`/`D602`, from the element library —
+    // as `embsim-boards` registers them.
+    pwl_library::register(&mut registry);
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
     register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
     register_stub(&mut registry, "LDO 300mA, 3.3V", &LDO_PINS);
@@ -1087,40 +1097,6 @@ pub const UCC12040_PINS: [PinDecl; 16] = [
     pwr_out("16"), // GNDS_3
 ];
 
-/// `NSI50010YT1G` — OnSemi 10 mA constant-current LED driver (IC6..IC13), one
-/// per isolated digital input loop. A two-terminal current regulator with no
-/// DC path modeled.
-pub const NSI50010_PINS: [PinDecl; 2] = [passive("1"), passive("2")];
-
-/// `6N137` — high-speed optocoupler (U4: the charge-pump drive). `VO` is
-/// open-collector and unmodeled, hence a sense.
-#[rustfmt::skip]
-pub const OPTO_6N137_PINS: [PinDecl; 7] = [
-    nc("1"),      // NC
-    passive("2"), // A  — LED anode
-    passive("3"), // C  — LED cathode
-    pwr_in("5"),  // GND
-    dig_in("6"),  // VO (open collector)
-    dig_in("7"),  // EN
-    pwr_in("8"),  // VCC
-];
-
-/// `VO2631` — Vishay dual high-speed optocoupler (U5..U8), receiving the eight
-/// isolated digital-input loops. `VO1`/`VO2` are open-collector: declaring
-/// them senses lets the board's own pull-up resistors set the idle level,
-/// which is what the netlist actually describes.
-#[rustfmt::skip]
-pub const VO2631_PINS: [PinDecl; 8] = [
-    passive("1"), // A1
-    passive("2"), // C1
-    passive("3"), // C2
-    passive("4"), // A2
-    pwr_in("5"),  // GND
-    dig_in("6"),  // VO2 (open collector)
-    dig_in("7"),  // VO1 (open collector)
-    pwr_in("8"),  // VCC
-];
-
 /// `XL1509` — 2 A step-down converter (U1: +5 V, U2: +3.3 V).
 ///
 /// This facade **corrects the schematic symbol**, which draws all eight pins
@@ -1140,20 +1116,6 @@ pub const XL1509_PINS: [PinDecl; 8] = [
     pwr_in("7"),  // GND
     pwr_in("8"),  // GND
 ];
-
-/// `APM4953` — dual P-channel MOSFET (U3), the board's reverse-polarity pass
-/// element. Only one half is wired, its two drain fingers joined.
-#[rustfmt::skip]
-pub const APM4953_PINS: [PinDecl; 4] = [
-    passive("1"), // S1
-    dig_in("2"),  // G1
-    passive("7"), // D1
-    passive("8"), // D1
-];
-
-/// `2N3904` — NPN transistor (Q1), the open-collector sink half of the servo
-/// enable's `TTL-SINK` option.
-pub const NPN_PINS: [PinDecl; 3] = [passive("1"), passive("2"), passive("3")];
 
 /// Baud the EdgeBoard's isolated force-gauge UART runs at — the ADS122U04's
 /// fixed 115.2 kbaud, which is also [`FORCE_GAUGE_CHANNEL`]'s.
@@ -1213,14 +1175,21 @@ pub fn edge_registry_without_socket() -> PartRegistry {
         )
     });
 
-    // Topology-only stubs.
+    // The optocouplers: `U4` (a Lite-On 6N137, the charge-pump drive) and
+    // `U5`–`U8` (Vishay VO2631, the eight isolated digital-input loops),
+    // each an LED branch the engine solves and a sink that releases.
+    registry.register("6N137", |_decl| Box::new(Opto::lite_on_6n137()));
+    registry.register("VO2631", |_decl| Box::new(Opto::vo2631()));
+    // The elements by specification (`NODES.md` §8 phase 3): the polarity
+    // FET `U3` with its body diode, the transistor `Q1`, the eight
+    // current regulators `IC6`–`IC13`, the two Schottky diodes `D1`/`D2`
+    // and the 21 indicator LEDs, every one keyed on the manufacturer part
+    // number the export carries.
+    pwl_library::register(&mut registry);
+
+    // Topology-only stubs, until phase 4 gives each its rail model.
     register_stub(&mut registry, "UCC12040DVER", &UCC12040_PINS);
-    register_stub(&mut registry, "NSI50010YT1G_1", &NSI50010_PINS);
-    register_stub(&mut registry, "6N137", &OPTO_6N137_PINS);
-    register_stub(&mut registry, "VO2631", &VO2631_PINS);
     register_stub(&mut registry, "XL1509", &XL1509_PINS);
-    register_stub(&mut registry, "APM4953", &APM4953_PINS);
-    register_stub(&mut registry, "2N3904", &NPN_PINS);
     registry
 }
 
@@ -1412,25 +1381,6 @@ pub fn bench_rails(edge: &str) -> Harness {
 // ============================================================
 // Scenario fragments
 // ============================================================
-
-/// The module's reverse-polarity pass FET (`U401`), conducting.
-///
-/// A P-channel FET in a polarity-protection position is a *switch*, and the
-/// fault algebra's `pin_short` — "union these two pins' nets" — is exactly the
-/// primitive for a closed switch. Without it the module's whole power tree is
-/// unreachable from the 5 V edge fingers, which is also the correct answer for
-/// a board whose protection FET is off.
-pub fn module_polarity_fet_conducting(scenario: Scenario, module: &str) -> Scenario {
-    scenario.pin_short(&format!("{module}.U401.S"), &format!("{module}.U401.D"))
-}
-
-/// The EdgeBoard's reverse-polarity pass FET (`U3`, an APM4953 half),
-/// conducting — the same primitive as [`module_polarity_fet_conducting`],
-/// between `S1` (pin 1, on `V_IN`) and one of the joined drain fingers (pin 7,
-/// on the J2 input net).
-pub fn edge_polarity_fet_conducting(scenario: Scenario, edge: &str) -> Scenario {
-    scenario.pin_short(&format!("{edge}.U3.1"), &format!("{edge}.U3.7"))
-}
 
 /// Close the encoder's ground/enable jumpers: JP2 (`A_GND`), JP3 (`B_GND`) and
 /// JP4 (`Z_GND`).

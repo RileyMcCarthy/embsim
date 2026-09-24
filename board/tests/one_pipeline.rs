@@ -25,13 +25,14 @@ mod machine_parts;
 
 use embsim_board::registry::parse_passive_value;
 use embsim_board::{
-    AttachError, Board, BoardError, DnpState, EndpointRef, Finding, Harness, JumperState, Level,
-    NetState, PartClass, PartRegistry, PwlSpec, Scenario, SenseKind, System, SystemError,
+    AttachError, Board, DnpState, EndpointRef, Finding, Harness, JumperState, Level, NetState,
+    PartClass, PartRegistry, PwlSpec, Scenario, SenseKind, System, SystemError,
 };
 use embsim_boards::ec32mb::{
     Ec32mb, FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE, P59_PULL_UP_POLE,
 };
 use embsim_boards::p2::{P2Core, P2Package, P2Pads};
+use embsim_models::pwl_library::{SS36_R_D_OHMS, SS36_VF_VOLTS};
 use machine_parts::{edge_board, shipped_ec32mb_board};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
@@ -811,30 +812,32 @@ fn an_unmodelled_part_fails_the_build_naming_reference_part_and_value() {
     }
 }
 
-/// A piecewise-linear element is a class declared ahead of its behaviour:
-/// its specification is the placeholder until the elements land, so a
-/// fitted one would be a node with nothing behind it. The build refuses
-/// it and names the part; the same part unpopulated builds, like any
-/// other absent part.
+/// A piecewise-linear element registered by specification is a node with
+/// behaviour: fitted, its branch stamps into the cluster solve and carries
+/// the current the circuit around it sets; made absent by the scenario, the
+/// part contributes nothing, like any other absent part.
 #[rstest]
 #[case::fitted(false)]
 #[case::unpopulated(true)]
-fn a_declared_element_without_behaviour_builds_only_unpopulated(#[case] absent: bool) {
+fn an_element_registered_by_specification_is_a_node_when_fitted(#[case] absent: bool) {
     behaviour!(Test {
-        id: "pipeline.element-declared-ahead-of-behaviour",
+        id: "pipeline.element-registered-by-spec",
         covers: Some("board/src/system.rs#System::assemble"),
-        given: "a board whose diode is registered as a piecewise-linear element with the \
-                placeholder specification, fitted or made absent by the scenario",
+        given: "a board whose diode is registered by its datasheet specification, its anode fed \
+                from 3.3 volts through 220 ohms and its cathode on 0 volts, fitted or made \
+                absent by the scenario",
     });
     expect!(
-        "fitted-refused",
-        "fitted, the system does not build and the error names the diode",
-        "a part is a node whose class has behaviour, and a declaration of intent is not \
-         behaviour"
+        "fitted-conducts",
+        "fitted, the diode carries the supply less its knee divided by the resistor, within one \
+         percent, and its anode sits at the knee",
+        "a part is a node whose class has behaviour; an element's behaviour is its branch in \
+         the solve"
     );
     expect!(
-        "absent-builds",
-        "made absent by the scenario, the system builds",
+        "absent-contributes-nothing",
+        "made absent by the scenario, the system builds with no current through the part and \
+         the anode net pulled to the supply through the resistor alone",
         "an unpopulated part contributes nothing, whatever its class"
     );
 
@@ -852,31 +855,43 @@ fn a_declared_element_without_behaviour_builds_only_unpopulated(#[case] absent: 
       (node (ref "R1") (pin "2") (pintype "passive")))))"#;
 
     let mut registry = PartRegistry::new();
-    registry.register_pwl("SS36", ["A", "K"], PwlSpec::default());
+    registry.register_pwl(
+        "SS36",
+        PwlSpec::diode("A", "K", SS36_VF_VOLTS, SS36_R_D_OHMS),
+    );
     let board = Board::from_netlist(
         embsim_board::netlist::parse(NETLIST).expect("the fixture parses"),
         &registry,
     )
     .expect("the class is declared, so the board builds");
-    let mut scenario = Scenario::default();
+    let mut scenario = Scenario::default()
+        .net_stuck("B.S", 3.3)
+        .net_stuck("B.K", 0.0);
     if absent {
         scenario = scenario.dnp_override("B.D1", DnpState::Absent);
     }
-    let result = System::new().board("B", board).scenario(scenario).build();
+    let built = System::new()
+        .board("B", board)
+        .scenario(scenario)
+        .build()
+        .expect("an element registered by specification builds");
+    let anode = built.nets()[built.net_id("B.A").unwrap().0].state;
     if absent {
-        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(built.branch_current("B.D1"), None);
+        // A terminal reached through a resistor, nothing else on the net.
+        assert_eq!(anode, NetState::Pulled(Level::High, 220.0));
     } else {
-        let error = result.expect_err("a fitted element with no behaviour is refused");
+        let expected = (3.3 - SS36_VF_VOLTS) / 220.0;
+        let current = built
+            .branch_current("B.D1")
+            .expect("a fitted diode carries a current");
         assert!(
-            matches!(
-                &error,
-                SystemError::Board {
-                    name,
-                    error: BoardError::UnmodelledElement { reference }
-                } if name == "B" && reference == "D1"
-            ),
-            "{error:?}"
+            (current - expected).abs() < expected * 0.01,
+            "{current} vs {expected}"
         );
-        assert!(error.to_string().contains("D1"), "{error}");
+        match anode {
+            NetState::Analog(v) => assert!((v - SS36_VF_VOLTS).abs() < 1e-3, "{v}"),
+            other => panic!("the anode sits at the knee, not {other:?}"),
+        }
     }
 }

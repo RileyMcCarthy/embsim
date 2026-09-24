@@ -34,9 +34,10 @@
 //!   component's own [`crate::component::PinDecl`] facade, not from the
 //!   schematic symbol, so the symbol's `(pin (num …) (name …) (type …))` rows
 //!   are not authoritative here.
-//! - comp `(datasheet …)`, `(description …)`, `(fields …)`, and every
-//!   `(property …)` except `dnp` — BOM and documentation metadata
-//!   (`LCSC`, `DIGIKEY`, `Height`, `ki_keywords`, …).
+//! - comp `(datasheet …)`, `(description …)`, and every `(fields …)` entry
+//!   and `(property …)` except `dnp` and the manufacturer part number
+//!   ([`ComponentDecl::mpn`]) — BOM and documentation metadata (`LCSC`,
+//!   `DIGIKEY`, `Height`, `ki_keywords`, …).
 //! - `(tstamps …)`, both at comp level and inside `(sheetpath …)` — UUID
 //!   instance paths. Sheet *names* are already unique per sheet instance, so
 //!   the UUIDs add nothing structural.
@@ -69,6 +70,14 @@ pub struct ComponentDecl {
     /// True when the KiCad `dnp` property is set (the `value == "X"` consumer
     /// convention is applied at classification time, not here).
     pub dnp: bool,
+    /// The manufacturer part number the export carries for the part — a
+    /// `Manufacturer_Part_Number` (or `MPN`) property or field, matched
+    /// case-insensitively, when present. The registry looks a part up by
+    /// it between the part name and the value
+    /// ([`crate::registry::PartRegistry`]): it is the identity a purchasable
+    /// part has when its symbol is generic (`LED`, `D_Schottky_Small`) and
+    /// the key the piecewise-linear element library is written against.
+    pub mpn: Option<String>,
 }
 
 /// One `(node …)` membership entry of a net.
@@ -215,6 +224,18 @@ impl Sexp {
     /// Convenience: the atom argument of the first child named `name`.
     fn child_arg(&self, name: &str) -> Option<&str> {
         self.child(name).and_then(Sexp::arg)
+    }
+
+    /// The last atom of a list — the value of a `(field (name "X") "value")`
+    /// form, whose value follows its child lists as a bare atom.
+    fn trailing_arg(&self) -> Option<&str> {
+        match self {
+            Sexp::List(items) => match items.last() {
+                Some(Sexp::Atom(a)) if items.len() > 1 => Some(a.as_str()),
+                _ => None,
+            },
+            Sexp::Atom(_) => None,
+        }
     }
 }
 
@@ -405,6 +426,28 @@ fn parse_component(comp: &Sexp) -> Result<ComponentDecl, NetlistError> {
             .is_some_and(|n| n.eq_ignore_ascii_case("dnp"))
     });
 
+    // The manufacturer part number: a `(property (name …) (value …))` in
+    // KiCad 8+ exports, a `(fields (field (name …) …))` in older ones; the
+    // first that names it wins. Everything else in those forms is ignored.
+    let names_mpn = |name: &str| MPN_FIELD_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n));
+    let mpn = comp
+        .children("property")
+        .iter()
+        .find(|p| p.child_arg("name").is_some_and(names_mpn))
+        .and_then(|p| p.child_arg("value"))
+        .or_else(|| {
+            comp.child("fields").and_then(|fields| {
+                fields
+                    .children("field")
+                    .iter()
+                    .find(|f| f.child_arg("name").is_some_and(names_mpn))
+                    .and_then(|f| f.trailing_arg())
+            })
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     Ok(ComponentDecl {
         reference,
         value,
@@ -413,8 +456,17 @@ fn parse_component(comp: &Sexp) -> Result<ComponentDecl, NetlistError> {
         part,
         sheetpath,
         dnp,
+        mpn,
     })
 }
+
+/// The property / field names an export spells the manufacturer part
+/// number under, compared case-insensitively.
+const MPN_FIELD_NAMES: &[&str] = &[
+    "Manufacturer_Part_Number",
+    "Manufacturer Part Number",
+    "MPN",
+];
 
 fn parse_net(net: &Sexp) -> Result<NetDecl, NetlistError> {
     let code = net
@@ -802,6 +854,41 @@ mod tests {
             crate::registry::parse_passive_value(&comp.value),
             Some(4.7e-6)
         );
+    }
+
+    /// The manufacturer part number is read from a KiCad 8+ `(property …)`
+    /// or an older `(fields (field …))`, under any spelling of the name,
+    /// and is absent when the export carries none.
+    #[rstest]
+    #[case::property(
+        r#"(comp (ref "D1") (value "SS36")
+             (property (name "Manufacturer_Part_Number") (value "SS36-E3/57T")))"#,
+        Some("SS36-E3/57T")
+    )]
+    #[case::field(
+        r#"(comp (ref "D1") (value "SS36")
+             (fields (field (name "DIGIKEY") "SS36-E3/57TGICT-ND")
+                     (field (name "Manufacturer_Part_Number") "SS36-E3/57T")))"#,
+        Some("SS36-E3/57T")
+    )]
+    #[case::mpn_spelling(
+        r#"(comp (ref "D3") (value "LED") (property (name "mpn") (value "LTST-C190KGKT")))"#,
+        Some("LTST-C190KGKT")
+    )]
+    #[case::none(
+        r#"(comp (ref "R1") (value "10k") (property (name "LCSC") (value "C25804")))"#,
+        None
+    )]
+    #[case::blank(
+        r#"(comp (ref "R1") (value "10k") (property (name "MPN") (value " ")))"#,
+        None
+    )]
+    fn the_manufacturer_part_number_is_captured_when_present(
+        #[case] comp: &str,
+        #[case] expect: Option<&str>,
+    ) {
+        let input = format!(r#"(export (version "E") (components {comp}) (nets))"#);
+        assert_eq!(parse(&input).unwrap().components[0].mpn.as_deref(), expect);
     }
 
     /// An empty libsource `lib` is normal in real exports (project-local /

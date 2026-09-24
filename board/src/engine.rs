@@ -111,15 +111,16 @@ use std::time::Duration;
 use embsim_core::virtual_clock;
 
 use crate::cluster::{
-    Cluster, ClusterInjection, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver,
-    ClusterSource,
+    Cluster, ClusterElement, ClusterInjection, ClusterInputs, ClusterResistor, ClusterSolution,
+    ClusterSolver, ClusterSource, ClusterTerminal, IDEAL_SOURCE_FLOOR_OHMS,
 };
-use crate::component::{Drive, PulseTrain, StreamRole};
+use crate::component::{Drive, PinHandle, PulseTrain, PwlCurve, RegionTest, StreamRole};
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
 use crate::event_log::{EngineEvent, EventLog};
 use crate::net::{
-    Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts, COUPLING_REACTANCE_RATIO,
-    ESCALATION_IMPEDANCE_RATIO, STREAM_COLLAPSE_THRESHOLD, V_IH, V_IL, WEAK_DRIVE_OHMS,
+    Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
+    COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO, STREAM_COLLAPSE_THRESHOLD, V_IH, V_IL,
+    WEAK_DRIVE_OHMS,
 };
 
 // ============================================================
@@ -224,6 +225,12 @@ pub(crate) type TopologyCallback = Box<dyn Fn(u64) + Send>;
 /// ([`crate::component::StreamRole::PulseSource`]).
 pub(crate) type PulseCallback = Box<dyn Fn(PulseTrain) + Send>;
 
+/// Pin-current delivery callback ([`crate::ComponentNetIo::on_branch`]):
+/// called from the engine thread with no lock held, once at registration
+/// and then whenever a solve changes the current
+/// ([`PinHandle::sense_current`]).
+pub(crate) type CurrentCallback = Box<dyn Fn(Option<Amps>) + Send>;
+
 /// One message on the engine's MPSC command queue.
 pub(crate) enum Command {
     /// A pin drive (`None` releases to high-Z), stamped with its enqueue
@@ -245,15 +252,31 @@ pub(crate) enum Command {
         /// Delivery callback.
         callback: SenseCallback,
     },
-    /// The pin subscribing to `net` is a released bidirectional pad
-    /// (`DigitalBidir` declared `IdleDrive::Released`): from this
-    /// subscription on the net is **read**, so it joins the digital senses
-    /// and a floating one is a [`Finding::FloatingSense`]. Sent ahead of the
-    /// pin's [`Command::RegisterSense`]; the engine re-resolves once per
-    /// drain batch after handling any.
+    /// A subscription declares `net` **read**: as a digital sense, by a
+    /// released bidirectional pad (`DigitalBidir` declared
+    /// `IdleDrive::Released`, an input until its owner drives it) ahead of
+    /// its [`Command::RegisterSense`]; or as a current instrument
+    /// ([`Command::RegisterCurrent`]), whose cluster must solve to have a
+    /// current at all. A sense joins the senses of its kind — a floating
+    /// one is a [`Finding::FloatingSense`]; an instrument joins the
+    /// instruments, which escalate their cluster and report nothing
+    /// ([`ReadKind`]). Either way the engine re-resolves once per drain
+    /// batch after handling any.
     DeclareRead {
-        /// The net the pad reads.
+        /// The net the pin reads.
         net: NetId,
+        /// What the net is read as.
+        kind: ReadKind,
+    },
+    /// Subscribe a current callback to a pin ([`crate::ComponentNetIo::on_branch`]).
+    /// The current is delivered once at registration, then whenever a solve
+    /// changes it.
+    RegisterCurrent {
+        /// The pin, carrying the endpoint and branch terms the current is
+        /// summed from.
+        handle: PinHandle,
+        /// Delivery callback.
+        callback: CurrentCallback,
     },
     /// Register the wakeup handler for a component (last registration wins).
     RegisterWake {
@@ -333,14 +356,55 @@ pub(crate) type IdleDriveLog = Arc<Mutex<Vec<(EndpointId, Option<Drive>)>>>;
 #[derive(Clone, Default)]
 pub(crate) struct SenseLog(pub(crate) Arc<Mutex<Vec<RecordedSense>>>);
 
+/// What a [`Command::DeclareRead`] declares a net read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadKind {
+    /// A digital sense (a pad's level): a floating one is reported. (An
+    /// analog sense is declared by its pin's kind at build, never live.)
+    Digital,
+    /// A current instrument ([`crate::ComponentNetIo::on_branch`]):
+    /// escalates its cluster to a solve — only a solved cluster has a
+    /// current — and nothing else. No floating-sense finding (an open loop
+    /// is not a floating input), and rule 2's fights are still reported.
+    Instrument,
+}
+
 /// One sense subscription the inert build link recorded: the net, whether
 /// the subscribing pin is a released bidirectional pad that now reads it
 /// (the build declares such a net a digital sense, as the live engine's
-/// [`Command::DeclareRead`] does), and the callback.
+/// [`Command::DeclareRead`] does), and the callback — a state callback, or
+/// a current instrument's, which declares the net an instrument
+/// ([`ReadKind::Instrument`]).
 pub(crate) struct RecordedSense {
     pub(crate) net: NetId,
     pub(crate) reads: bool,
-    pub(crate) callback: SenseCallback,
+    pub(crate) callback: RecordedCallback,
+}
+
+/// What a recorded subscription delivers.
+pub(crate) enum RecordedCallback {
+    /// A net-state sense ([`crate::ComponentNetIo::on_sense`]).
+    State(SenseCallback),
+    /// A pin-current instrument ([`crate::ComponentNetIo::on_branch`]): the
+    /// handle it reads through, the callback, and the reading it was last
+    /// delivered, so the build's fixed point delivers changes only.
+    Current {
+        handle: PinHandle,
+        callback: CurrentCallback,
+        last: Option<Amps>,
+    },
+}
+
+/// The currents the last solves produced, per drive endpoint and per
+/// element, published beside the net states: `None` where no solve has one
+/// (a cluster resolved by projection alone). Indexed by [`EndpointId`] and
+/// element index; read by [`PinHandle::sense_current`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct CurrentTable {
+    /// Current **into** each drive endpoint from its net.
+    pub(crate) endpoints: Vec<Option<Amps>>,
+    /// Current through each element, from its `a` to its `b`.
+    pub(crate) elements: Vec<Option<Amps>>,
 }
 
 /// The inert link's view of a [`SenseLog`]: alive while the build runs,
@@ -399,6 +463,9 @@ pub(crate) struct EngineLink {
     pub(crate) pending_schedules: Arc<AtomicUsize>,
     /// Engine-published resolved state per net (build snapshot when inert).
     pub(crate) states: Arc<Mutex<Vec<NetState>>>,
+    /// Engine-published currents ([`CurrentTable`]; build snapshot when
+    /// inert).
+    pub(crate) currents: Arc<Mutex<CurrentTable>>,
     /// Inert path only: drives issued during attach, in issue order, for the
     /// build pass to apply before it resolves for real.
     pub(crate) recorded_drives: Option<IdleDriveLog>,
@@ -415,6 +482,7 @@ impl EngineLink {
     /// for as long as it wants recordings.
     pub(crate) fn inert(
         states: Arc<Mutex<Vec<NetState>>>,
+        currents: Arc<Mutex<CurrentTable>>,
         recorded_drives: IdleDriveLog,
         recorded_senses: &SenseLog,
     ) -> Self {
@@ -424,6 +492,7 @@ impl EngineLink {
             drive_seq: Arc::new(AtomicU64::new(0)),
             pending_schedules: Arc::new(AtomicUsize::new(0)),
             states,
+            currents,
             recorded_drives: Some(recorded_drives),
             recorded_senses: Some(Arc::downgrade(&recorded_senses.0)),
         }
@@ -549,6 +618,78 @@ struct DriveSlot {
     drive: Option<Drive>,
 }
 
+/// One piecewise-linear element: a [`crate::Branch`] with its pins resolved
+/// to nets, and the part it belongs to, for the finding that names it.
+struct Element {
+    a: usize,
+    b: usize,
+    curve: PwlCurve,
+    control: Option<(usize, RegionTest)>,
+    /// `Board.Reference` of the part declaring the branch.
+    reference: String,
+}
+
+impl Element {
+    /// The nets the element touches, in `a`, `b`, control order.
+    fn nets(&self) -> impl Iterator<Item = usize> {
+        [Some(self.a), Some(self.b), self.control.map(|(net, _)| net)]
+            .into_iter()
+            .flatten()
+    }
+}
+
+/// Where an element lives, given which identity roots are declared
+/// terminals: the cluster of its **first non-terminal** net (`a`, `b`,
+/// control order), and the terminal roots it names that are not that
+/// cluster's own — its *foreign* constants, the conducting ends apart
+/// from the control. A terminal on a conducting end sources the cluster
+/// (a rail behind a diode is a rail); a terminal on the control alone
+/// is read by the region test and sources nothing (a gate is a sense).
+/// An element whose every net is a terminal has no home: it sits between
+/// constants, changes no voltage, and is in no solve.
+struct ElementHome {
+    /// The identity root the element's cluster is found by.
+    root: usize,
+    /// The terminal roots among the element's two ends, in `a`, `b` order.
+    terminal_ends: Vec<usize>,
+    /// The control's root, when it is a terminal.
+    terminal_control: Option<usize>,
+}
+
+fn element_home(
+    element: &Element,
+    root_of: &[usize],
+    is_terminal: impl Fn(usize) -> bool,
+) -> Option<ElementHome> {
+    let root = element
+        .nets()
+        .map(|net| root_of[net])
+        .find(|&r| !is_terminal(r))?;
+    let terminal_ends = [element.a, element.b]
+        .into_iter()
+        .map(|net| root_of[net])
+        .filter(|&r| is_terminal(r))
+        .collect();
+    let terminal_control = element
+        .control
+        .map(|(net, _)| root_of[net])
+        .filter(|&r| is_terminal(r));
+    Some(ElementHome {
+        root,
+        terminal_ends,
+        terminal_control,
+    })
+}
+
+/// The currents one pass computed, per endpoint and per element in the
+/// clusters it touched — `None` for a cluster resolved by projection alone.
+/// Applied to the resolver's tables after the pass ([`Resolver::apply_currents`]).
+#[derive(Default)]
+struct PassCurrents {
+    endpoints: Vec<(usize, Option<Amps>)>,
+    elements: Vec<(usize, Option<Amps>)>,
+}
+
 /// One serial-capable pin registered for stream routing.
 struct StreamPin {
     endpoint: EndpointId,
@@ -631,11 +772,28 @@ pub(crate) struct Resolver {
     couplings: Vec<CouplingCapacitor>,
     /// Drive-capable endpoints, indexed by [`EndpointId`].
     slots: Vec<DriveSlot>,
+    /// Piecewise-linear elements, in declaration order — the order their
+    /// region tests are evaluated in within a cluster.
+    elements: Vec<Element>,
+    /// The current into each endpoint from the last solve of its cluster
+    /// (`None` where the cluster resolved by projection).
+    endpoint_currents: Vec<Option<Amps>>,
+    /// The current through each element from the last solve of its cluster.
+    element_currents: Vec<Option<Amps>>,
     power_sources: Vec<(usize, Volts)>,
     stuck_sources: Vec<(usize, Volts)>,
     digital_senses: Vec<usize>,
     analog_senses: Vec<usize>,
+    /// Current instruments' nets ([`ReadKind::Instrument`]): each
+    /// escalates its cluster to a solve and is otherwise invisible — no
+    /// floating-sense finding, no precedence over rule 2's fight findings.
+    current_instruments: Vec<usize>,
     power_senses: Vec<usize>,
+    /// Whether a pass since the last publication stored a current that
+    /// differs from the one it replaced — the only time the shared table
+    /// is worth copying (`DESIGN.md` rule 8: a boot that never solves
+    /// publishes no current table).
+    currents_changed: bool,
     /// Pulse-capable pins, in registration order (pulse routing).
     streams: Vec<StreamPin>,
     net_count: usize,
@@ -682,6 +840,18 @@ struct ClusterTopo {
     edges: Vec<(usize, usize, f64)>,
     /// Drive-capable endpoints in the cluster, ascending.
     slots: Vec<usize>,
+    /// Piecewise-linear elements in the cluster, in declaration order.
+    elements: Vec<usize>,
+    /// The declared terminals **outside** the cluster that its elements'
+    /// conducting ends stamp against, as `(root, volts)` in source
+    /// declaration order — the foreign constants of the solve, which
+    /// source the cluster (NaN for an unmodelled rail). Empty for a cluster
+    /// without elements.
+    foreign: Vec<(usize, Volts)>,
+    /// The declared terminals outside the cluster that its elements'
+    /// **controls alone** read — constants for the region tests, sourcing
+    /// nothing.
+    foreign_controls: Vec<(usize, Volts)>,
     /// Power-rail sources in the cluster as `(root, volts)`, in declaration order.
     power: Vec<(usize, Volts)>,
     /// `net_stuck` sources in the cluster as `(root, volts)`, in declaration order.
@@ -690,6 +860,8 @@ struct ClusterTopo {
     digital_senses: Vec<(usize, usize)>,
     /// Analog sense pins in the cluster as `(registration position, net)`.
     analog_senses: Vec<(usize, usize)>,
+    /// Current instruments in the cluster as `(registration position, net)`.
+    current_instruments: Vec<(usize, usize)>,
     /// Power sense pins in the cluster as `(registration position, net)`.
     power_senses: Vec<(usize, usize)>,
     /// Minimum series resistance between roots, `roots.len()` square,
@@ -709,6 +881,8 @@ struct PassFindings {
     floating: Vec<((usize, usize), Finding)>,
     power: Vec<(usize, Finding)>,
     injection: Vec<(usize, Finding)>,
+    /// Non-convergent element clusters, by first net index.
+    nonconvergent: Vec<(usize, Finding)>,
 }
 
 impl PassFindings {
@@ -719,11 +893,18 @@ impl PassFindings {
         self.floating.sort_by_key(|(key, _)| *key);
         self.power.sort_by_key(|(key, _)| *key);
         self.injection.sort_by_key(|(key, _)| *key);
+        self.nonconvergent.sort_by_key(|(key, _)| *key);
         let contention = self.contention.into_iter().map(|(_, f)| f);
         let floating = self.floating.into_iter().map(|(_, f)| f);
         let power = self.power.into_iter().map(|(_, f)| f);
         let injection = self.injection.into_iter().map(|(_, f)| f);
-        for finding in contention.chain(floating).chain(power).chain(injection) {
+        let nonconvergent = self.nonconvergent.into_iter().map(|(_, f)| f);
+        for finding in contention
+            .chain(floating)
+            .chain(power)
+            .chain(injection)
+            .chain(nonconvergent)
+        {
             diagnostics.report(finding);
         }
     }
@@ -765,11 +946,16 @@ impl Resolver {
             edges: Vec::new(),
             couplings: Vec::new(),
             slots: Vec::new(),
+            elements: Vec::new(),
+            endpoint_currents: Vec::new(),
+            element_currents: Vec::new(),
             power_sources: Vec::new(),
             stuck_sources: Vec::new(),
             digital_senses: Vec::new(),
             analog_senses: Vec::new(),
+            current_instruments: Vec::new(),
             power_senses: Vec::new(),
+            currents_changed: false,
             streams: Vec::new(),
             net_count,
             topology: None,
@@ -813,6 +999,87 @@ impl Resolver {
     pub(crate) fn add_edge(&mut self, a: usize, b: usize, ohms: f64) {
         self.topology_version += 1;
         self.edges.push((a, b, ohms));
+    }
+
+    /// Add a piecewise-linear element between two nets, with an optional
+    /// control net ([`crate::Branch`] resolved to nets), returning its
+    /// index. An element is a **membership edge among its non-terminal
+    /// nets**: its two ends and its control net — so a gate is in-cluster
+    /// and no cross-cluster dirtying is needed — join one conduction
+    /// cluster, a declared terminal among them stays outside as a foreign
+    /// constant of that cluster's solve (`build_topology`), and a cluster
+    /// holding an element always solves (its regions have no projection
+    /// form). It is not a path for source-strength ranking: the linear
+    /// sources around it rank as they do, and the solve decides the rest.
+    pub(crate) fn add_element(
+        &mut self,
+        a: usize,
+        b: usize,
+        curve: PwlCurve,
+        control: Option<(usize, RegionTest)>,
+        reference: String,
+    ) -> usize {
+        self.topology_version += 1;
+        self.elements.push(Element {
+            a,
+            b,
+            curve,
+            control,
+            reference,
+        });
+        self.element_currents.push(None);
+        self.elements.len() - 1
+    }
+
+    /// The currents the last passes produced ([`CurrentTable`]), for the
+    /// engine to publish beside the net states.
+    pub(crate) fn current_table(&self) -> CurrentTable {
+        let mut endpoints = self.endpoint_currents.clone();
+        endpoints.resize(self.slots.len(), None);
+        CurrentTable {
+            endpoints,
+            elements: self.element_currents.clone(),
+        }
+    }
+
+    /// Copy the current table into `table` — no allocation once the table
+    /// has its size, which is every publication after the first.
+    pub(crate) fn copy_current_table_into(&self, table: &mut CurrentTable) {
+        table.endpoints.clear();
+        table.endpoints.extend_from_slice(&self.endpoint_currents);
+        table.endpoints.resize(self.slots.len(), None);
+        table.elements.clear();
+        table.elements.extend_from_slice(&self.element_currents);
+    }
+
+    /// Whether a pass since the last call stored a current different from
+    /// the one it replaced; clears the flag.
+    pub(crate) fn take_currents_changed(&mut self) -> bool {
+        std::mem::take(&mut self.currents_changed)
+    }
+
+    /// Store the currents one pass computed, noting whether any differs
+    /// from what was stored. A pass over clusters that resolved by
+    /// projection alone carries nothing here and costs nothing.
+    fn apply_currents(&mut self, pass: PassCurrents) {
+        if pass.endpoints.is_empty() && pass.elements.is_empty() {
+            return;
+        }
+        if self.endpoint_currents.len() < self.slots.len() {
+            self.endpoint_currents.resize(self.slots.len(), None);
+        }
+        for (endpoint, amps) in pass.endpoints {
+            if !same_current(&self.endpoint_currents[endpoint], &amps) {
+                self.endpoint_currents[endpoint] = amps;
+                self.currents_changed = true;
+            }
+        }
+        for (element, amps) in pass.elements {
+            if !same_current(&self.element_currents[element], &amps) {
+                self.element_currents[element] = amps;
+                self.currents_changed = true;
+            }
+        }
     }
 
     /// Add a coupling capacitor between two nets: an AC path for rate
@@ -911,6 +1178,13 @@ impl Resolver {
         self.analog_senses.push(net);
     }
 
+    /// Register a current instrument's net: its cluster solves on every
+    /// pass that touches it, and nothing is reported for it.
+    pub(crate) fn add_current_instrument(&mut self, net: usize) {
+        self.topology_version += 1;
+        self.current_instruments.push(net);
+    }
+
     /// Register a power sense pin (`PowerNetUnsourced` findings).
     pub(crate) fn add_power_sense(&mut self, net: usize) {
         self.topology_version += 1;
@@ -970,14 +1244,48 @@ impl Resolver {
     fn build_topology(&mut self, n: usize) -> Topology {
         let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
 
+        // The declared terminals — rails (modelled or not) and stuck
+        // faults — as the roots no path continues past, and no element
+        // unions through.
+        let terminal_roots: Vec<usize> = self
+            .power_sources
+            .iter()
+            .chain(self.stuck_sources.iter())
+            .map(|(net, _)| root_of[*net])
+            .collect();
+        let is_terminal = |root: usize| terminal_roots.contains(&root);
+
         // Conduction clusters: identity merges are 0-ohm, conduction edges
-        // connect within a cluster without merging identity.
+        // connect within a cluster without merging identity, and an
+        // element is a membership edge among its **non-terminal** nets —
+        // its two ends and its control, so a gate is in-cluster. A
+        // declared terminal is a constant, and a constant is a boundary: an
+        // element touching one stamps against it as a foreign constant of
+        // its own cluster rather than joining the terminal's (`NODES.md`
+        // §8 phase 3, the parts record — what keeps a polarity FET whose
+        // gate is on the stuck ground out of the ground cluster's solves).
         let mut conduction = Dsu::new(n);
         for (i, &root) in root_of.iter().enumerate() {
             conduction.union(root, i);
         }
         for (a, b, _ohms) in &self.edges {
             conduction.union(root_of[*a], root_of[*b]);
+        }
+        let homes: Vec<Option<ElementHome>> = self
+            .elements
+            .iter()
+            .map(|element| element_home(element, &root_of, is_terminal))
+            .collect();
+        for (element, home) in self.elements.iter().zip(&homes) {
+            let Some(home) = home else {
+                continue;
+            };
+            for net in element.nets() {
+                let root = root_of[net];
+                if !is_terminal(root) {
+                    conduction.union(home.root, root);
+                }
+            }
         }
         let cluster_of: Vec<usize> = (0..n).map(|i| conduction.find(i)).collect();
         let mut cluster_roots: Vec<usize> = cluster_of.clone();
@@ -1000,15 +1308,6 @@ impl Resolver {
             .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
             .filter(|(a, b, _)| a != b)
             .collect();
-        // The declared terminals — rails (modelled or not) and stuck
-        // faults — as the roots no path continues past.
-        let terminal_roots: Vec<usize> = self
-            .power_sources
-            .iter()
-            .chain(self.stuck_sources.iter())
-            .map(|(net, _)| root_of[*net])
-            .collect();
-
         let clusters = (0..cluster_roots.len())
             .map(|cid| {
                 let nets: Vec<usize> = (0..n).filter(|&i| cluster_index[i] == cid).collect();
@@ -1021,6 +1320,49 @@ impl Resolver {
                 let slots: Vec<usize> = (0..self.slots.len())
                     .filter(|&si| cluster_index[self.slots[si].net] == cid)
                     .collect();
+                let elements: Vec<usize> = (0..self.elements.len())
+                    .filter(|&ei| {
+                        homes[ei]
+                            .as_ref()
+                            .is_some_and(|home| cluster_index[home.root] == cid)
+                    })
+                    .collect();
+                // The terminal roots the cluster's elements name outside
+                // it — conducting ends, and controls that are not also an
+                // end — each with every source declared on it, in the
+                // sources' own order (a fought terminal arrives as the
+                // fight it is).
+                let mut foreign_roots: Vec<usize> = Vec::new();
+                let mut control_roots: Vec<usize> = Vec::new();
+                for &ei in &elements {
+                    let home = homes[ei].as_ref().expect("a homed element");
+                    for &root in &home.terminal_ends {
+                        if cluster_index[root] != cid && !foreign_roots.contains(&root) {
+                            foreign_roots.push(root);
+                        }
+                    }
+                    if let Some(root) = home.terminal_control {
+                        if cluster_index[root] != cid && !control_roots.contains(&root) {
+                            control_roots.push(root);
+                        }
+                    }
+                }
+                let sources_on = |roots: &[usize]| -> Vec<(usize, Volts)> {
+                    self.power_sources
+                        .iter()
+                        .chain(self.stuck_sources.iter())
+                        .map(|(net, volts)| (root_of[*net], *volts))
+                        .filter(|(root, _)| roots.contains(root))
+                        .collect()
+                };
+                let foreign = sources_on(&foreign_roots);
+                let foreign_controls = sources_on(
+                    &control_roots
+                        .iter()
+                        .copied()
+                        .filter(|root| !foreign_roots.contains(root))
+                        .collect::<Vec<_>>(),
+                );
                 let sources_in = |list: &[(usize, Volts)]| -> Vec<(usize, Volts)> {
                     list.iter()
                         .filter(|(net, _)| cluster_index[*net] == cid)
@@ -1052,10 +1394,14 @@ impl Resolver {
                     roots,
                     edges,
                     slots,
+                    elements,
+                    foreign,
+                    foreign_controls,
                     power: sources_in(&self.power_sources),
                     stuck: sources_in(&self.stuck_sources),
                     digital_senses: senses_in(&self.digital_senses),
                     analog_senses: senses_in(&self.analog_senses),
+                    current_instruments: senses_in(&self.current_instruments),
                     power_senses: senses_in(&self.power_senses),
                     dist,
                 }
@@ -1092,10 +1438,12 @@ impl Resolver {
         self.ensure_topology(n);
         let topology = self.topology.take().expect("ensure_topology built it");
         let mut findings = PassFindings::default();
+        let mut currents = PassCurrents::default();
         for cid in 0..topology.clusters.len() {
-            self.resolve_cluster(&topology, cid, nets, &mut findings, solver);
+            self.resolve_cluster(&topology, cid, nets, &mut findings, &mut currents, solver);
         }
         findings.emit(diagnostics);
+        self.apply_currents(currents);
         self.topology = Some(topology);
         self.dirty.clear();
     }
@@ -1141,18 +1489,21 @@ impl Resolver {
         dirty.sort_unstable();
         dirty.dedup();
         let mut findings = PassFindings::default();
+        let mut currents = PassCurrents::default();
         for &cid in &dirty {
-            self.resolve_cluster(&topology, cid, nets, &mut findings, solver);
+            self.resolve_cluster(&topology, cid, nets, &mut findings, &mut currents, solver);
         }
         findings.emit(diagnostics);
+        self.apply_currents(currents);
         self.topology = Some(topology);
     }
 
     /// Resolve one conduction cluster from the current drive table: the
     /// sources each root is reached by, rule 2's ranking of them
-    /// ([`project_root`]), the cluster solve where the ranking or an analog
-    /// sense or a current injection asks for it, state assignment for the
-    /// cluster's nets, and the cluster's findings.
+    /// ([`project_root`]), the cluster solve where the ranking, an analog
+    /// sense, a current injection or an element asks for it, state
+    /// assignment for the cluster's nets, the cluster's findings and the
+    /// currents its solve produced.
     ///
     /// Everything here is cluster-local by construction — every cross-net
     /// rule walks conduction edges or identity roots, and neither crosses a
@@ -1165,11 +1516,13 @@ impl Resolver {
         cid: usize,
         nets: &mut [Net],
         findings: &mut PassFindings,
+        currents: &mut PassCurrents,
         solver: &dyn ClusterSolver,
     ) {
         let c = &topology.clusters[cid];
         let root_of = &topology.root_of;
         let k = c.roots.len();
+        let has_elements = !c.elements.is_empty();
         let pos_of_root = |root: usize| -> usize {
             c.roots
                 .iter()
@@ -1186,10 +1539,13 @@ impl Resolver {
         // — a PowerIn on it is not unsourced — but carry no voltage to rank:
         // they are the fallback presentation of a root nothing numeric
         // reaches. Current injections are collected apart: they reach
-        // nothing and rank nowhere; they are stamped into the solve.
+        // nothing and rank nowhere; they are stamped into the solve. The
+        // numeric terminals are collected apart too: they rank as ideal
+        // sources and enter the solve as constants.
         let mut cluster_sourced = false;
         let mut sources: Vec<ClusterSource> = Vec::new();
         let mut source_slots: Vec<Option<usize>> = Vec::new();
+        let mut terminals: Vec<ClusterTerminal> = Vec::new();
         let mut injections: Vec<ClusterInjection> = Vec::new();
         let mut injection_slots: Vec<usize> = Vec::new();
         for &si in &c.slots {
@@ -1214,6 +1570,7 @@ impl Resolver {
                 None => {}
             }
         }
+        let slot_source_count = sources.len();
         let mut unmodelled_roots: Vec<usize> = Vec::new();
         for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
             cluster_sourced = true;
@@ -1227,25 +1584,106 @@ impl Resolver {
                 impedance: 0.0,
             });
             source_slots.push(None);
+            // A constant of the solve only in a cluster with elements; a
+            // linear cluster's terminals stay the ideal sources above and
+            // no table is built for them (`cluster.rs`, "Terminals are
+            // constants").
+            if has_elements {
+                terminals.push(ClusterTerminal {
+                    node: NetId(*root),
+                    volts: *volts,
+                });
+            }
         }
+        // The terminals outside the cluster its elements stamp against:
+        // they source the cluster (a rail behind a diode is a rail) and
+        // enter the solve as constants, but rank nowhere — no resistive
+        // path leads to them, so no root is "reached" by one — and an
+        // unmodelled rail behind an element reaches nothing at all. A
+        // terminal a control alone reads is a constant for its region
+        // test and sources nothing.
+        let mut foreign_numeric = false;
+        for &(root, volts) in &c.foreign {
+            cluster_sourced = true;
+            if volts.is_nan() {
+                continue;
+            }
+            foreign_numeric = true;
+            terminals.push(ClusterTerminal {
+                node: NetId(root),
+                volts,
+            });
+        }
+        for &(root, volts) in &c.foreign_controls {
+            if volts.is_finite() {
+                terminals.push(ClusterTerminal {
+                    node: NetId(root),
+                    volts,
+                });
+            }
+        }
+        // The cluster's elements, with their nets as roots, in declaration
+        // order — the order the flip loop evaluates them in.
+        let elements: Vec<ClusterElement> = c
+            .elements
+            .iter()
+            .map(|&ei| {
+                let element = &self.elements[ei];
+                ClusterElement {
+                    a: NetId(root_of[element.a]),
+                    b: NetId(root_of[element.b]),
+                    curve: element.curve,
+                    control: element
+                        .control
+                        .map(|(net, test)| (NetId(root_of[net]), test)),
+                }
+            })
+            .collect();
+        debug_assert_eq!(has_elements, !elements.is_empty());
 
-        // The cluster solve — built at most once per pass, on demand.
+        // The cluster solve — built at most once per pass, on demand. In a
+        // cluster with elements the terminals enter as constants; in a
+        // linear cluster they stay the ideal sources they always were (see
+        // `cluster.rs`, "Terminals are constants", for why the split).
         let mut solution: Option<ClusterSolution> = None;
+        let solve = |this: &Self| -> ClusterSolution {
+            if has_elements {
+                this.solve_cluster(
+                    c,
+                    &sources[..slot_source_count],
+                    &terminals,
+                    &injections,
+                    &elements,
+                    solver,
+                )
+            } else {
+                this.solve_cluster(c, &sources, &[], &injections, &elements, solver)
+            }
+        };
 
-        // Operating-point precedence. An analog sense reads a voltage, and a
+        // Operating-point precedence. An analog sense reads a voltage, a
         // current injection has no projection form (its effect is `I · R`
-        // along whatever the node is tied to), so either asks for the
-        // cluster's operating point: every root reached by a numeric source
-        // publishes the solved voltage. Rule 2's fight findings are not
-        // raised in such a cluster — the fight is visible as the voltage the
-        // analog reader is handed, and `NetState::Contention` would hand it
-        // nothing (the `nominal_analog_cluster` and `net_stuck_shared_node`
-        // goldens pin this; it retires with `NODES.md` §10's
-        // `Sense { volts }`).
-        let on_request = !sources.is_empty()
-            && (!c.analog_senses.is_empty() || injections.iter().any(|i| i.amps != 0.0));
+        // along whatever the node is tied to), and an element's region has
+        // none either — so any of them asks for the cluster's operating
+        // point: every root reached by a numeric source publishes the solved
+        // voltage. Rule 2's fight findings are not raised in a cluster an
+        // analog sense or an injection escalated — the fight is visible as
+        // the voltage the analog reader is handed, and `NetState::Contention`
+        // would hand it nothing (the `nominal_analog_cluster` and
+        // `net_stuck_shared_node` goldens pin this; it retires with
+        // `NODES.md` §10's `Sense { volts }`). In a cluster with elements
+        // the ranking still applies to the linear sources around them: the
+        // states are the solve's, and the fights among the strong sources
+        // are reported. A current instrument escalates the cluster too —
+        // only a solved cluster has a current — and nothing else: it takes
+        // no precedence, so the fights are reported beside the operating
+        // point it is handed, as in an element cluster.
+        let injected = injections.iter().any(|i| i.amps != 0.0);
+        let precedence = !c.analog_senses.is_empty() || injected;
+        let on_request = (!sources.is_empty() || foreign_numeric)
+            && (precedence || !c.current_instruments.is_empty() || has_elements);
         if on_request {
-            solution = Some(self.solve_cluster(c, &sources, &injections, solver));
+            solution = Some(solve(self));
         }
 
         // Per root, by position in `c.roots`: the state, and rule 2's
@@ -1268,11 +1706,11 @@ impl Resolver {
                     path,
                 });
             }
-            let state = if reaching.is_empty() {
-                // Nothing numeric reaches the root. An unmodelled rail that
-                // does presents as up through the path to it (the supply
-                // gates read `Pulled(High)` as a rail that is there);
-                // otherwise the root floats.
+            // Nothing numeric reaches the root: an unmodelled rail that does
+            // presents as up through the path to it (the supply gates read
+            // `Pulled(High)` as a rail that is there); otherwise the root
+            // floats.
+            let unmodelled_or_floating = || {
                 let nearest = unmodelled_roots
                     .iter()
                     .map(|&r| c.dist[pr * k + pos_of_root(r)])
@@ -1283,19 +1721,58 @@ impl Resolver {
                 } else {
                     NetState::Floating
                 }
-            } else if on_request {
-                solution
-                    .as_ref()
-                    .and_then(|solution| solution.state_of(NetId(root)))
-                    .unwrap_or_else(|| {
-                        tracing::warn!(net = %nets[root].name, "cluster solver omitted a node; reporting Floating");
-                        NetState::Floating
-                    })
+            };
+            let state = if let (true, Some(solution)) = (has_elements, solution.as_ref()) {
+                // An element cluster: the solve decided every root, the
+                // elements' far sides included (no resistive path reaches
+                // those, so the ranking has nothing to say about them). The
+                // ranking's fights among the linear sources are still
+                // reported.
+                if !reaching.is_empty() {
+                    let mut solved = || match solution.state_of(NetId(root)) {
+                        Some(NetState::Analog(v)) => Some(v),
+                        _ => None,
+                    };
+                    let outcome = project_root(&reaching, &mut solved);
+                    if let Some(fighting) = outcome.fight {
+                        root_fights.push((root, fighting));
+                    }
+                    if let Some(volts) = outcome.ambiguous {
+                        root_ambiguous.push((root, volts));
+                    }
+                }
+                // No operating point: every non-terminal root floats
+                // (`NODES.md` §7), an unmodelled rail's path notwithstanding.
+                match solution.state_of(NetId(root)) {
+                    Some(NetState::Analog(v)) => NetState::Analog(v),
+                    _ if !solution.converged => NetState::Floating,
+                    _ => unmodelled_or_floating(),
+                }
+            } else if reaching.is_empty() {
+                unmodelled_or_floating()
+            } else if let (true, Some(solution)) = (on_request, solution.as_ref()) {
+                // Escalated by an instrument alone: the operating point is
+                // published and rule 2's fights are reported beside it.
+                if !precedence {
+                    let mut solved = || match solution.state_of(NetId(root)) {
+                        Some(NetState::Analog(v)) => Some(v),
+                        _ => None,
+                    };
+                    let outcome = project_root(&reaching, &mut solved);
+                    if let Some(fighting) = outcome.fight {
+                        root_fights.push((root, fighting));
+                    }
+                    if let Some(volts) = outcome.ambiguous {
+                        root_ambiguous.push((root, volts));
+                    }
+                }
+                solution.state_of(NetId(root)).unwrap_or_else(|| {
+                    tracing::warn!(net = %nets[root].name, "cluster solver omitted a node; reporting Floating");
+                    NetState::Floating
+                })
             } else {
                 let mut solved = || -> Option<Volts> {
-                    let solution = solution.get_or_insert_with(|| {
-                        self.solve_cluster(c, &sources, &injections, solver)
-                    });
+                    let solution = solution.get_or_insert_with(|| solve(self));
                     match solution.state_of(NetId(root)) {
                         Some(NetState::Analog(v)) => Some(v),
                         _ => None,
@@ -1311,6 +1788,45 @@ impl Resolver {
                 outcome.state
             };
             root_states.push(state);
+        }
+
+        // -- currents -------------------------------------------------------
+        // What the solve, when there was one, says flows into every
+        // endpoint and through every element of the cluster. A cluster
+        // resolved by projection alone clears a stale reading once and is
+        // otherwise silent here: the ROM boot's every pass is such a
+        // cluster, and it must pay nothing for a table it never fills
+        // (`DESIGN.md` rule 8).
+        for &si in &c.slots {
+            let amps = solution.as_ref().and_then(|solution| {
+                let slot = &self.slots[si];
+                match slot.drive {
+                    Some(Drive::Thevenin(drive)) => {
+                        match solution.state_of(NetId(root_of[slot.net])) {
+                            Some(NetState::Analog(v)) => Some(
+                                (v - drive.volts) / drive.impedance.max(IDEAL_SOURCE_FLOOR_OHMS),
+                            ),
+                            _ => None,
+                        }
+                    }
+                    Some(Drive::Current { amps }) => Some(-amps),
+                    None => match solution.state_of(NetId(root_of[slot.net])) {
+                        Some(NetState::Analog(_)) => Some(0.0),
+                        _ => None,
+                    },
+                }
+            });
+            if amps.is_some() || self.endpoint_currents.get(si).is_some_and(Option::is_some) {
+                currents.endpoints.push((si, amps));
+            }
+        }
+        for (position, &ei) in c.elements.iter().enumerate() {
+            let amps = solution
+                .as_ref()
+                .and_then(|solution| solution.branch_currents.get(position).copied().flatten());
+            if amps.is_some() || self.element_currents.get(ei).is_some_and(Option::is_some) {
+                currents.elements.push((ei, amps));
+            }
         }
 
         // -- state assignment -----------------------------------------------
@@ -1376,11 +1892,20 @@ impl Resolver {
                 }
             }
         }
-        // Power senses on an unsourced cluster (deduped per identity root).
+        // Power senses on an unsourced cluster, or floating behind an
+        // element in a sourced one — a rail blocked by an off diode or an
+        // off channel is no rail at the pin (deduped per identity root). A
+        // cluster whose solve found no operating point floats every node
+        // and is named once, by `NonConvergent`, not once more per power
+        // pin (a cluster that never solved — sourced by an unmodelled rail
+        // alone — reports as before).
+        let non_convergent = solution.as_ref().is_some_and(|s| !s.converged);
         let mut reported_power: Vec<usize> = Vec::new();
         for &(pos, net) in &c.power_senses {
             let root = root_of[net];
-            if !cluster_sourced && !reported_power.contains(&root) {
+            let unsourced = !cluster_sourced
+                || (has_elements && !non_convergent && nets[net].state == NetState::Floating);
+            if unsourced && !reported_power.contains(&root) {
                 reported_power.push(root);
                 findings.power.push((
                     pos,
@@ -1411,20 +1936,51 @@ impl Resolver {
                 ));
             }
         }
+        // An element cluster whose flip loop found no consistent regions:
+        // its nodes float (assigned above, from the solution) and the
+        // finding names the elements, keyed by the cluster's first net.
+        if let Some(solution) = solution.as_ref().filter(|s| has_elements && !s.converged) {
+            let first = c.nets[0];
+            findings.nonconvergent.push((
+                first,
+                Finding::NonConvergent {
+                    cluster: nets[first].name.clone(),
+                    elements: c
+                        .elements
+                        .iter()
+                        .map(|&ei| self.elements[ei].reference.clone())
+                        .collect(),
+                    solves: solution.solves,
+                },
+            ));
+        }
     }
 
     /// Escalate one cluster to the [`ClusterSolver`]: its roots as nodes,
-    /// its identity-collapsed edges, the sources in canonical order and the
-    /// current injections. Counted, because every solve is a cost the fast
-    /// path did not pay ([`Self::escalated_solves`]).
+    /// its identity-collapsed edges, the slot sources in canonical order,
+    /// the terminals as constants, the current injections and the elements.
+    /// Counted, because every solve is a cost the fast path did not pay
+    /// ([`Self::escalated_solves`]).
     fn solve_cluster(
         &self,
         c: &ClusterTopo,
         sources: &[ClusterSource],
+        terminals: &[ClusterTerminal],
         injections: &[ClusterInjection],
+        elements: &[ClusterElement],
         solver: &dyn ClusterSolver,
     ) -> ClusterSolution {
-        let nodes: Vec<NetId> = c.roots.iter().map(|&r| NetId(r)).collect();
+        // The cluster's roots, then the numeric foreign terminals its
+        // elements stamp against — nodes of the solve, constants by the
+        // terminals handed over, never members whose state this cluster
+        // publishes. An unmodelled rail stays outside: an element naming
+        // it is dropped by the solver, as a branch to no voltage is.
+        let mut nodes: Vec<NetId> = c.roots.iter().map(|&r| NetId(r)).collect();
+        for &(root, volts) in &c.foreign {
+            if volts.is_finite() && !nodes.contains(&NetId(root)) {
+                nodes.push(NetId(root));
+            }
+        }
         let resistors: Vec<ClusterResistor> = c
             .edges
             .iter()
@@ -1437,6 +1993,8 @@ impl Resolver {
         let inputs = ClusterInputs {
             sources: sources.to_vec(),
             injections: injections.to_vec(),
+            terminals: terminals.to_vec(),
+            elements: elements.to_vec(),
         };
         // Sequentially consistent on purpose: the count is read from another
         // thread (`EngineHandle::escalated_solves`, the ROM boot's budget
@@ -1466,14 +2024,42 @@ impl Resolver {
         // Pre-resolve identity roots so the remaining passes are pure lookups.
         let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
 
+        // The declared terminals: path barriers, and what no element
+        // unions through.
+        let terminal_roots: Vec<usize> = self
+            .power_sources
+            .iter()
+            .chain(self.stuck_sources.iter())
+            .map(|(net, _)| root_of[*net])
+            .collect();
+        let is_terminal = |root: usize| terminal_roots.contains(&root);
+
         // Conduction clusters: identity merges are 0-ohm, conduction edges
-        // connect within a cluster without merging identity.
+        // connect within a cluster without merging identity, elements are
+        // membership edges among their non-terminal nets (ends and
+        // control), as `build_topology` has it.
         let mut conduction = Dsu::new(n);
         for (i, &root) in root_of.iter().enumerate() {
             conduction.union(root, i);
         }
         for (a, b, _ohms) in &self.edges {
             conduction.union(root_of[*a], root_of[*b]);
+        }
+        let homes: Vec<Option<ElementHome>> = self
+            .elements
+            .iter()
+            .map(|element| element_home(element, &root_of, is_terminal))
+            .collect();
+        for (element, home) in self.elements.iter().zip(&homes) {
+            let Some(home) = home else {
+                continue;
+            };
+            for net in element.nets() {
+                let root = root_of[net];
+                if !is_terminal(root) {
+                    conduction.union(home.root, root);
+                }
+            }
         }
         let cluster_of: Vec<usize> = (0..n).map(|i| conduction.find(i)).collect();
 
@@ -1488,7 +2074,8 @@ impl Resolver {
 
         // Sources per cluster in canonical order — a dense walk of the slot
         // table, then rails, then faults — each beside the slot it came from;
-        // injections likewise; the roots of NaN rails; the sourced clusters.
+        // injections likewise; the roots of NaN rails; the sourced clusters;
+        // the numeric terminals and the elements per cluster.
         //
         // **Determinism (load-bearing):** iterate the DENSE drive table. This
         // `Vec`'s order is the SPICE card order
@@ -1499,8 +2086,48 @@ impl Resolver {
         let mut cluster_sources: HashMap<usize, Vec<(ClusterSource, Option<usize>)>> =
             HashMap::new();
         let mut cluster_injections: HashMap<usize, Vec<(ClusterInjection, usize)>> = HashMap::new();
+        let mut cluster_terminals: HashMap<usize, Vec<ClusterTerminal>> = HashMap::new();
+        let mut cluster_elements: HashMap<usize, Vec<(ClusterElement, usize)>> = HashMap::new();
         let mut cluster_sourced: HashSet<usize> = HashSet::new();
         let mut unmodelled_roots: Vec<usize> = Vec::new();
+        // The foreign terminal roots per cluster — conducting ends, and
+        // controls — in first-appearance order (keyed access only; walked
+        // in element order below).
+        let mut cluster_foreign: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut cluster_foreign_controls: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ei, element) in self.elements.iter().enumerate() {
+            let Some(home) = &homes[ei] else {
+                continue;
+            };
+            let cluster = cluster_of[home.root];
+            cluster_elements.entry(cluster).or_default().push((
+                ClusterElement {
+                    a: NetId(root_of[element.a]),
+                    b: NetId(root_of[element.b]),
+                    curve: element.curve,
+                    control: element
+                        .control
+                        .map(|(net, test)| (NetId(root_of[net]), test)),
+                },
+                ei,
+            ));
+            for &root in &home.terminal_ends {
+                if cluster_of[root] != cluster {
+                    let foreign = cluster_foreign.entry(cluster).or_default();
+                    if !foreign.contains(&root) {
+                        foreign.push(root);
+                    }
+                }
+            }
+            if let Some(root) = home.terminal_control {
+                if cluster_of[root] != cluster {
+                    let controls = cluster_foreign_controls.entry(cluster).or_default();
+                    if !controls.contains(&root) {
+                        controls.push(root);
+                    }
+                }
+            }
+        }
         for (si, slot) in self.slots.iter().enumerate() {
             match slot.drive {
                 Some(Drive::Thevenin(drive)) => {
@@ -1546,10 +2173,69 @@ impl Resolver {
                 },
                 None,
             ));
+            cluster_terminals
+                .entry(cluster_of[*net])
+                .or_default()
+                .push(ClusterTerminal {
+                    node: NetId(root_of[*net]),
+                    volts: *volts,
+                });
+        }
+        // The foreign constants: every source declared on a terminal root
+        // an element cluster names outside itself, in source order. A
+        // conducting end's sources the cluster and enters its solve; a
+        // control's alone is a constant for the region test. Neither
+        // ranks anywhere.
+        let mut cluster_foreign_nodes: HashMap<usize, Vec<NetId>> = HashMap::new();
+        let mut foreign_numeric: HashSet<usize> = HashSet::new();
+        for cluster in cluster_elements.keys().copied() {
+            let foreign = cluster_foreign.get(&cluster).cloned().unwrap_or_default();
+            let controls: Vec<usize> = cluster_foreign_controls
+                .get(&cluster)
+                .map(|controls| {
+                    controls
+                        .iter()
+                        .copied()
+                        .filter(|root| !foreign.contains(root))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
+                let root = root_of[*net];
+                let conducting = foreign.contains(&root);
+                if !conducting && !controls.contains(&root) {
+                    continue;
+                }
+                if conducting {
+                    cluster_sourced.insert(cluster);
+                }
+                if volts.is_nan() {
+                    continue;
+                }
+                cluster_terminals
+                    .entry(cluster)
+                    .or_default()
+                    .push(ClusterTerminal {
+                        node: NetId(root),
+                        volts: *volts,
+                    });
+                if conducting {
+                    foreign_numeric.insert(cluster);
+                    let nodes = cluster_foreign_nodes.entry(cluster).or_default();
+                    if !nodes.contains(&NetId(root)) {
+                        nodes.push(NetId(root));
+                    }
+                }
+            }
         }
         // hash-order shape 3: membership only.
         let analog_clusters: HashSet<usize> = self
             .analog_senses
+            .iter()
+            .map(|&net| cluster_of[net])
+            .collect();
+        let instrument_clusters: HashSet<usize> = self
+            .current_instruments
             .iter()
             .map(|&net| cluster_of[net])
             .collect();
@@ -1561,10 +2247,13 @@ impl Resolver {
             .collect();
 
         let solve_cluster = |cluster: usize| -> ClusterSolution {
-            let nodes: Vec<NetId> = (0..n)
+            let mut nodes: Vec<NetId> = (0..n)
                 .filter(|&i| root_of[i] == i && cluster_of[i] == cluster)
                 .map(NetId)
                 .collect();
+            if let Some(foreign) = cluster_foreign_nodes.get(&cluster) {
+                nodes.extend(foreign.iter().copied());
+            }
             let resistors: Vec<ClusterResistor> = root_edges
                 .iter()
                 .filter(|(a, _, _)| cluster_of[*a] == cluster)
@@ -1574,24 +2263,50 @@ impl Resolver {
                     ohms: *ohms,
                 })
                 .collect();
+            // Terminals are constants in a cluster with elements and ideal
+            // sources in a linear one, as `resolve_cluster` hands them.
+            let with_elements = cluster_elements.contains_key(&cluster);
             let inputs = ClusterInputs {
                 sources: cluster_sources
                     .get(&cluster)
-                    .map(|sources| sources.iter().map(|(s, _)| *s).collect())
+                    .map(|sources| {
+                        sources
+                            .iter()
+                            .filter(|(_, slot)| !with_elements || slot.is_some())
+                            .map(|(s, _)| *s)
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 injections: cluster_injections
                     .get(&cluster)
                     .map(|injections| injections.iter().map(|(i, _)| *i).collect())
                     .unwrap_or_default(),
+                terminals: if with_elements {
+                    cluster_terminals.get(&cluster).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                elements: cluster_elements
+                    .get(&cluster)
+                    .map(|elements| elements.iter().map(|(e, _)| *e).collect())
+                    .unwrap_or_default(),
             };
             solver.solve(&Cluster { nodes, resistors }, &inputs)
         };
+        let has_elements = |cluster: usize| -> bool { cluster_elements.contains_key(&cluster) };
+        // Operating-point precedence: an analog sense or an injection
+        // silences rule 2's fights; an instrument or an element does not.
+        let precedence = |cluster: usize| -> bool {
+            analog_clusters.contains(&cluster)
+                || cluster_injections
+                    .get(&cluster)
+                    .is_some_and(|injections| injections.iter().any(|(i, _)| i.amps != 0.0))
+        };
         let on_request = |cluster: usize| -> bool {
-            cluster_sources.contains_key(&cluster)
-                && (analog_clusters.contains(&cluster)
-                    || cluster_injections
-                        .get(&cluster)
-                        .is_some_and(|injections| injections.iter().any(|(i, _)| i.amps != 0.0)))
+            (cluster_sources.contains_key(&cluster) || foreign_numeric.contains(&cluster))
+                && (precedence(cluster)
+                    || instrument_clusters.contains(&cluster)
+                    || has_elements(cluster))
         };
         // hash-order: `escalated`, `root_state`, `root_fights` and
         // `root_ambiguous` are keyed access only (`entry`, `get`, index) —
@@ -1620,7 +2335,7 @@ impl Resolver {
                         .collect()
                 })
                 .unwrap_or_default();
-            let state = if reaching.is_empty() {
+            let unmodelled_or_floating = || {
                 let nearest = unmodelled_roots
                     .iter()
                     .filter(|&&r| cluster_of[r] == cluster)
@@ -1632,12 +2347,49 @@ impl Resolver {
                 } else {
                     NetState::Floating
                 }
-            } else if on_request(cluster) {
-                escalated
+            };
+            let state = if has_elements(cluster) && on_request(cluster) {
+                let solution = escalated
                     .entry(cluster)
-                    .or_insert_with(|| solve_cluster(cluster))
-                    .state_of(NetId(root))
-                    .unwrap_or(NetState::Floating)
+                    .or_insert_with(|| solve_cluster(cluster));
+                if !reaching.is_empty() {
+                    let mut solved = || match solution.state_of(NetId(root)) {
+                        Some(NetState::Analog(v)) => Some(v),
+                        _ => None,
+                    };
+                    let outcome = project_root(&reaching, &mut solved);
+                    if let Some(fighting) = outcome.fight {
+                        root_fights.insert(root, fighting);
+                    }
+                    if let Some(volts) = outcome.ambiguous {
+                        root_ambiguous.insert(root, volts);
+                    }
+                }
+                match solution.state_of(NetId(root)) {
+                    Some(NetState::Analog(v)) => NetState::Analog(v),
+                    _ if !solution.converged => NetState::Floating,
+                    _ => unmodelled_or_floating(),
+                }
+            } else if reaching.is_empty() {
+                unmodelled_or_floating()
+            } else if on_request(cluster) {
+                let solution = escalated
+                    .entry(cluster)
+                    .or_insert_with(|| solve_cluster(cluster));
+                if !precedence(cluster) {
+                    let mut solved = || match solution.state_of(NetId(root)) {
+                        Some(NetState::Analog(v)) => Some(v),
+                        _ => None,
+                    };
+                    let outcome = project_root(&reaching, &mut solved);
+                    if let Some(fighting) = outcome.fight {
+                        root_fights.insert(root, fighting);
+                    }
+                    if let Some(volts) = outcome.ambiguous {
+                        root_ambiguous.insert(root, volts);
+                    }
+                }
+                solution.state_of(NetId(root)).unwrap_or(NetState::Floating)
             } else {
                 let mut solved = || -> Option<Volts> {
                     match escalated
@@ -1710,11 +2462,18 @@ impl Resolver {
             }
         }
 
-        // Power senses: unsourced clusters (deduped per identity root).
+        // Power senses: unsourced clusters, or floating behind an element
+        // in a sourced one (deduped per identity root).
         let mut reported_power: HashSet<usize> = HashSet::new();
         for &net in &self.power_senses {
             let root = root_of[net];
-            if !cluster_sourced.contains(&cluster_of[net]) && reported_power.insert(root) {
+            let cluster = cluster_of[net];
+            let non_convergent = escalated.get(&cluster).is_some_and(|s| !s.converged);
+            let unsourced = !cluster_sourced.contains(&cluster)
+                || (has_elements(cluster)
+                    && !non_convergent
+                    && nets[net].state == NetState::Floating);
+            if unsourced && reported_power.insert(root) {
                 diagnostics.report(Finding::PowerNetUnsourced {
                     net: nets[net].name.clone(),
                 });
@@ -1743,6 +2502,36 @@ impl Resolver {
                     pin: slot.pin.clone(),
                 });
             }
+        }
+
+        // Non-convergent element clusters, in order of their first net.
+        let mut nonconvergent: Vec<(usize, Finding)> = Vec::new();
+        for (cluster, solution) in &escalated {
+            if solution.converged {
+                continue;
+            }
+            let Some(elements) = cluster_elements.get(cluster) else {
+                continue;
+            };
+            let first = (0..n)
+                .find(|&i| cluster_of[i] == *cluster)
+                .expect("a cluster has a net");
+            nonconvergent.push((
+                first,
+                Finding::NonConvergent {
+                    cluster: nets[first].name.clone(),
+                    elements: elements
+                        .iter()
+                        .map(|(_, ei)| self.elements[*ei].reference.clone())
+                        .collect(),
+                    solves: solution.solves,
+                },
+            ));
+        }
+        // hash-order shape 2: collected from a map walk, sorted here.
+        nonconvergent.sort_by_key(|(first, _)| *first);
+        for (_, finding) in nonconvergent {
+            diagnostics.report(finding);
         }
     }
 
@@ -2298,6 +3087,26 @@ impl PartialOrd for TimerEntry {
 // Engine core (owned by the engine thread)
 // ============================================================
 
+/// One current instrument: the pin it reads through, its callback, and the
+/// current it was last delivered (bitwise, so a repeat is not a change).
+struct CurrentSub {
+    handle: PinHandle,
+    callback: CurrentCallback,
+    last: Option<Amps>,
+}
+
+/// Whether two current readings are the same: bitwise on the value, so
+/// `NaN` cannot read as a change forever, after folding `-0.0` to `0.0` —
+/// the zero of a released slot and the negated zero of a `Drive::Current
+/// { amps: 0.0 }` are one reading.
+fn same_current(a: &Option<Amps>, b: &Option<Amps>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => (x + 0.0).total_cmp(&(y + 0.0)).is_eq(),
+        _ => false,
+    }
+}
+
 /// Live per-source pulse route: the derived sinks and the delivery gate.
 ///
 /// Deliberately has no queue and no pacing slot — a pulse channel carries a
@@ -2320,6 +3129,12 @@ struct EngineCore {
     nets: Vec<Net>,
     solver: Box<dyn ClusterSolver>,
     states: Arc<Mutex<Vec<NetState>>>,
+    /// The currents the last solves produced, published beside `states`
+    /// after every pass ([`CurrentTable`]).
+    currents: Arc<Mutex<CurrentTable>>,
+    /// Current instruments ([`Command::RegisterCurrent`]), in registration
+    /// order, each with the value it was last delivered.
+    current_subs: Vec<CurrentSub>,
     diagnostics: Arc<Mutex<Diagnostics>>,
     // hash-order: every map below is **keyed access only** — `get`, `entry`,
     // `insert`, `contains_key`. None is iterated. Sense delivery walks
@@ -2364,13 +3179,14 @@ struct EngineCore {
     /// only the counter this engine advances, and the gate sits before its
     /// only advance.
     clock_released: bool,
-    /// Nets [`Command::DeclareRead`] declared read since the last full pass.
-    /// Applied to the resolver together, after the drain batch, and answered
-    /// with one full pass: a declaration is a topology input, so applying
-    /// each as it arrived would leave the cache stale for every drive
-    /// handled after it in the same batch — a full resolution and a
-    /// topology rebuild per attach-time drive on a board with 64 pads.
-    pending_reads: Vec<usize>,
+    /// Nets [`Command::DeclareRead`] declared read since the last full pass,
+    /// with the kind of sense each becomes. Applied to the resolver
+    /// together, after the drain batch, and answered with one full pass: a
+    /// declaration is a topology input, so applying each as it arrived
+    /// would leave the cache stale for every drive handled after it in the
+    /// same batch — a full resolution and a topology rebuild per
+    /// attach-time drive on a board with 64 pads.
+    pending_reads: Vec<(usize, ReadKind)>,
     /// Scheduling requests sent but not yet handled — see
     /// [`EngineLink::pending_schedules`]. Time does not advance while it is
     /// non-zero.
@@ -2453,6 +3269,7 @@ impl EngineCore {
             shared.clear();
             shared.extend(self.nets.iter().map(|n| n.state));
         }
+        let currents_published = self.publish_currents();
         self.merge_findings(&pass);
 
         // Sense delivery: engine thread, no lock held. A callback that
@@ -2481,6 +3298,45 @@ impl EngineCore {
                     }
                 }
             }
+        }
+        if currents_published {
+            self.deliver_currents();
+        }
+    }
+
+    /// Publish the currents the resolver's last passes produced beside the
+    /// net states — only when a pass changed one, so a pass over clusters
+    /// that resolved by projection alone (every pass of the ROM boot)
+    /// copies nothing and locks nothing. Returns whether it published.
+    fn publish_currents(&mut self) -> bool {
+        if !self.resolver.take_currents_changed() {
+            return false;
+        }
+        self.resolver
+            .copy_current_table_into(&mut self.currents.lock().unwrap());
+        true
+    }
+
+    /// Deliver every current instrument whose reading changed on the table
+    /// just published, in registration order, with no lock held. Nothing
+    /// to walk when nothing subscribed.
+    fn deliver_currents(&mut self) {
+        if self.current_subs.is_empty() {
+            return;
+        }
+        for index in 0..self.current_subs.len() {
+            let now = self.current_subs[index].handle.sense_current();
+            if same_current(&self.current_subs[index].last, &now) {
+                continue;
+            }
+            self.current_subs[index].last = now;
+            let subscriber = self
+                .nets
+                .get(self.current_subs[index].handle.net().0)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| format!("net {}", self.current_subs[index].handle.net().0));
+            let callback = &self.current_subs[index].callback;
+            self.deliver_contained(CallbackKind::Sense, &subscriber, || callback(now));
         }
     }
 
@@ -2693,6 +3549,7 @@ impl EngineCore {
                 shared.extend(self.nets.iter().map(|n| n.state));
             }
         }
+        let currents_published = self.publish_currents();
         self.merge_findings(&pass);
 
         // Changed nets in ascending index order, per-net callbacks in
@@ -2717,6 +3574,9 @@ impl EngineCore {
                     });
                 }
             }
+        }
+        if currents_published {
+            self.deliver_currents();
         }
     }
 
@@ -2820,8 +3680,24 @@ impl EngineCore {
                 self.deliver_contained(CallbackKind::Sense, &subscriber, || callback(state));
                 self.sense_subs.entry(net.0).or_default().push(callback);
             }
-            Command::DeclareRead { net } => {
-                self.pending_reads.push(net.0);
+            Command::DeclareRead { net, kind } => {
+                self.pending_reads.push((net.0, kind));
+            }
+            Command::RegisterCurrent { handle, callback } => {
+                // Once at registration, like a sense; the value it read is
+                // what later passes are compared against.
+                let now = handle.sense_current();
+                let subscriber = self
+                    .nets
+                    .get(handle.net().0)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| format!("net {}", handle.net().0));
+                self.deliver_contained(CallbackKind::Sense, &subscriber, || callback(now));
+                self.current_subs.push(CurrentSub {
+                    handle,
+                    callback,
+                    last: now,
+                });
             }
             Command::RegisterWake {
                 component,
@@ -2992,8 +3868,11 @@ impl EngineCore {
             // Nets declared read since the last pass: declared together,
             // then one full resolution reports what floats under them.
             if !self.pending_reads.is_empty() {
-                for net in std::mem::take(&mut self.pending_reads) {
-                    self.resolver.add_digital_sense(net);
+                for (net, kind) in std::mem::take(&mut self.pending_reads) {
+                    match kind {
+                        ReadKind::Digital => self.resolver.add_digital_sense(net),
+                        ReadKind::Instrument => self.resolver.add_current_instrument(net),
+                    }
                 }
                 self.resolve_and_publish();
                 work += 1;
@@ -3198,6 +4077,7 @@ impl EngineHandle {
     ) -> Self {
         let states: Arc<Mutex<Vec<NetState>>> =
             Arc::new(Mutex::new(nets.iter().map(|n| n.state).collect()));
+        let currents: Arc<Mutex<CurrentTable>> = Arc::new(Mutex::new(resolver.current_table()));
         let diagnostics = Arc::new(Mutex::new(Diagnostics::new()));
         let pending_schedules: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel();
@@ -3209,6 +4089,8 @@ impl EngineHandle {
             nets,
             solver,
             states: Arc::clone(&states),
+            currents: Arc::clone(&currents),
+            current_subs: Vec::new(),
             diagnostics: Arc::clone(&diagnostics),
             sense_subs: HashMap::new(),
             wake_subs: HashMap::new(),
@@ -3249,6 +4131,7 @@ impl EngineHandle {
                 drive_seq: Arc::new(AtomicU64::new(0)),
                 pending_schedules,
                 states,
+                currents,
                 // Live path: drives and senses go to the engine, never to a
                 // log.
                 recorded_drives: None,
@@ -3283,6 +4166,11 @@ impl EngineHandle {
     /// Most recently published state of one net.
     pub fn net_state(&self, net: NetId) -> Option<NetState> {
         self.link.states.lock().unwrap().get(net.0).copied()
+    }
+
+    /// The currents the engine's last solves produced ([`CurrentTable`]).
+    pub(crate) fn currents(&self) -> CurrentTable {
+        self.link.currents.lock().unwrap().clone()
     }
 
     /// Snapshot of the cumulative live findings (initial resolution pass
@@ -3752,7 +4640,7 @@ mod tests {
     }
 
     impl ClusterSolver for RecordingSolver {
-        fn solve(&self, cluster: &Cluster, _inputs: &ClusterInputs) -> ClusterSolution {
+        fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
             self.calls.lock().unwrap().push(cluster.nodes.clone());
             ClusterSolution {
                 node_states: cluster
@@ -3760,6 +4648,11 @@ mod tests {
                     .iter()
                     .map(|&n| (n, NetState::Analog(42.0)))
                     .collect(),
+                regions: vec![crate::cluster::Region::Off; inputs.elements.len()],
+                branch_currents: vec![None; inputs.elements.len()],
+                converged: true,
+                solves: 1,
+                unknowns: cluster.nodes.len(),
             }
         }
     }
@@ -3852,12 +4745,16 @@ mod tests {
     }
 
     impl ClusterSolver for SourceOrderSolver {
+        /// Records the slot sources in the order handed over, then the
+        /// terminals — the constants a rail or a fault enters the solve as —
+        /// each as the `(volts, 0 Ω)` ideal source it ranks as.
         fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
             self.seen.lock().unwrap().push(
                 inputs
                     .sources
                     .iter()
                     .map(|s| (s.volts, s.impedance))
+                    .chain(inputs.terminals.iter().map(|t| (t.volts, 0.0)))
                     .collect(),
             );
             QuasiStaticMna.solve(cluster, inputs)
@@ -5206,7 +6103,37 @@ mod tests {
             stuck: Vec<(usize, Volts)>,
             digital_senses: Vec<usize>,
             analog_senses: Vec<usize>,
+            /// Current instruments' nets.
+            instruments: Vec<usize>,
             power_senses: Vec<usize>,
+            /// Piecewise-linear elements: `(a, b, curve, control)`.
+            elements: Vec<RandomElement>,
+        }
+
+        /// One random element: `(a, b, curve, control)`.
+        type RandomElement = (usize, usize, PwlCurve, Option<(usize, RegionTest)>);
+
+        fn element_strategy(n: usize) -> impl Strategy<Value = RandomElement> {
+            let curve = prop_oneof![
+                Just(PwlCurve::Diode { vf: 0.75, r_d: 0.0 }),
+                Just(PwlCurve::Diode { vf: 2.0, r_d: 5.0 }),
+                Just(PwlCurve::Channel { r_on: 1.0 }),
+                Just(PwlCurve::Channel { r_on: 20.0 }),
+            ];
+            let control = prop_oneof![
+                1 => Just(None),
+                3 => (
+                    0..n,
+                    prop_oneof![
+                        Just(RegionTest::AtLeast(2.0)),
+                        Just(RegionTest::AtLeast(1.5)),
+                        Just(RegionTest::AtMost(-2.0)),
+                        Just(RegionTest::AtMost(1.5)),
+                    ]
+                )
+                    .prop_map(Some),
+            ];
+            (0..n, 0..n, curve, control)
         }
 
         fn drive_strategy() -> impl Strategy<Value = Option<Drive>> {
@@ -5259,6 +6186,8 @@ mod tests {
                     prop::collection::vec(0..n, 0..3),
                     prop::collection::vec(0..n, 0..3),
                     prop::collection::vec(0..n, 0..2),
+                    prop::collection::vec(0..n, 0..2),
+                    prop::collection::vec(element_strategy(n), 0..3),
                 )
                     .prop_map(
                         move |(
@@ -5269,7 +6198,9 @@ mod tests {
                             stuck,
                             digital_senses,
                             analog_senses,
+                            instruments,
                             power_senses,
+                            elements,
                         )| Spec {
                             n,
                             merges,
@@ -5279,7 +6210,9 @@ mod tests {
                             stuck,
                             digital_senses,
                             analog_senses,
+                            instruments,
                             power_senses,
+                            elements,
                         },
                     )
             })
@@ -5314,8 +6247,14 @@ mod tests {
             for &net in &spec.analog_senses {
                 resolver.add_analog_sense(net);
             }
+            for &net in &spec.instruments {
+                resolver.add_current_instrument(net);
+            }
             for &net in &spec.power_senses {
                 resolver.add_power_sense(net);
+            }
+            for (i, &(a, b, curve, control)) in spec.elements.iter().enumerate() {
+                resolver.add_element(a, b, curve, control, format!("B.D{i}"));
             }
             (resolver, ids)
         }
@@ -5339,7 +6278,7 @@ mod tests {
             behaviour!(Test {
                 id: "engine.incremental-resolve-matches-full-pass",
                 covers: Some("board/src/engine.rs#Resolver::resolve_dirty"),
-                given: "a random board of up to nine nets with shorts, resistors, drivers at assorted impedances including released and infinite ones, current injections, rails, injected faults and senses, under a random sequence of drive changes",
+                given: "a random board of up to nine nets with shorts, resistors, drivers at assorted impedances including released and infinite ones, current injections, rails, injected faults, senses, and diodes and switched channels with random control pins, under a random sequence of drive changes",
             });
             expect!(
                 "states-match",
@@ -5404,6 +6343,147 @@ mod tests {
                     prop_assert_eq!(bus_of(&bus_inc), bus_of(&bus_full), "findings after step {}", step);
                 }
             }
+        }
+    }
+
+    // Piecewise-linear elements at the resolver (`NODES.md` §8 phase 3):
+    // what the resolver hands the solver for an element cluster, and what
+    // it publishes back.
+    mod elements {
+        use super::*;
+        use crate::cluster::{ClusterTerminal, GMIN_OHMS};
+
+        /// A solver that records what it is handed and answers with the
+        /// real one.
+        struct Spy {
+            inputs: Arc<StdMutex<Vec<ClusterInputs>>>,
+            unknowns: Arc<StdMutex<Vec<usize>>>,
+        }
+
+        impl ClusterSolver for Spy {
+            fn solve(&self, cluster: &Cluster, inputs: &ClusterInputs) -> ClusterSolution {
+                self.inputs.lock().unwrap().push(inputs.clone());
+                let solution = QuasiStaticMna.solve(cluster, inputs);
+                self.unknowns.lock().unwrap().push(solution.unknowns);
+                solution
+            }
+        }
+
+        /// The LED chain of `NODES.md` §2 rule 1 at the resolver: an
+        /// inverter's output pad (net 0), 220 Ω to the anode (net 1), the
+        /// LED to ground (net 2, a declared rail at 0 V). The resolver hands
+        /// the rail to the solver as a constant, so the matrix has two
+        /// unknowns, and publishes the solve on every net.
+        #[rstest]
+        fn an_led_chain_to_a_terminal_solves_with_two_unknowns() {
+            behaviour!(Test {
+                id: "engine.led-chain-solves-with-two-unknowns",
+                covers: Some("board/src/engine.rs#Resolver::resolve_cluster"),
+                given: "a pad driving 3.3 volts through 25 ohms, joined by 220 ohms to an LED's \
+                        anode, the LED's cathode on a declared 0 volt rail",
+            });
+            expect!(
+                "two-unknowns",
+                "the solve builds a matrix of two unknowns, the pad's net and the anode",
+                "a declared terminal enters an element cluster's solve as a constant, so only \
+                 the nodes between the terminals are solved for"
+            );
+            expect!(
+                "rail-handed-as-a-constant",
+                "the rail reaches the solver as a constant, and the pad is the only source it is \
+                 handed",
+            );
+            expect!(
+                "chain-published",
+                "the pad's net reads its driven voltage less the pad's own drop, the anode reads \
+                 the LED's knee and the rail reads exactly 0 volts",
+            );
+            expect!(
+                "one-escalation",
+                "the pass escalates the cluster once",
+                "an element cluster always solves, and once per pass"
+            );
+            let mut resolver = Resolver::new(3, Dsu::new(3));
+            resolver.add_endpoint(0, PinRef::new("U9", "Y"), Some(high()));
+            resolver.add_edge(0, 1, 220.0);
+            resolver.add_element(
+                1,
+                2,
+                PwlCurve::Diode { vf: 2.0, r_d: 0.0 },
+                None,
+                "B.D3".into(),
+            );
+            resolver.add_power_source(2, 0.0);
+            let spy = Spy {
+                inputs: Arc::new(StdMutex::new(Vec::new())),
+                unknowns: Arc::new(StdMutex::new(Vec::new())),
+            };
+            let mut net_table = nets(3);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &spy);
+            assert_eq!(*spy.unknowns.lock().unwrap(), vec![2]);
+            let handed = spy.inputs.lock().unwrap();
+            assert_eq!(handed.len(), 1);
+            assert_eq!(
+                handed[0].terminals,
+                vec![ClusterTerminal {
+                    node: NetId(2),
+                    volts: 0.0
+                }]
+            );
+            assert_eq!(handed[0].sources.len(), 1, "the pad alone is a source");
+            assert_eq!(handed[0].elements.len(), 1);
+            // I = (3.3 − 2.0) / (25 + 220).
+            let current = 1.3 / 245.0;
+            let NetState::Analog(y) = net_table[0].state else {
+                panic!("{:?}", net_table[0].state);
+            };
+            assert!((y - (3.3 - 25.0 * current)).abs() < 1e-6, "{y}");
+            let NetState::Analog(anode) = net_table[1].state else {
+                panic!("{:?}", net_table[1].state);
+            };
+            assert!((anode - 2.0).abs() < 1e-6, "{anode}");
+            assert_eq!(net_table[2].state, NetState::Analog(0.0));
+            assert_eq!(resolver.escalated_solves(), 1);
+            assert!(diags.is_empty(), "{:?}", diags.findings());
+        }
+
+        /// The far side of an off diode is joined to the cluster by the
+        /// element — the solve reaches it through the leakage — and floats.
+        #[rstest]
+        fn the_far_side_of_an_off_diode_is_in_the_cluster_and_floats() {
+            behaviour!(Test {
+                id: "engine.off-diode-far-side-floats",
+                covers: Some("board/src/engine.rs#Resolver::build_topology"),
+                given: "a diode whose anode net a pad drives high and whose cathode net carries \
+                        nothing else",
+            });
+            expect!(
+                "one-cluster",
+                "the two nets are one conduction cluster",
+                "an element is a membership edge: its far side is solved with its near side"
+            );
+            expect!(
+                "cathode-floats",
+                "the cathode net floats and the anode net reads the pad's voltage",
+                "only the diode's gigaohm of leakage reaches the cathode, which is no source"
+            );
+            let mut resolver = Resolver::new(2, Dsu::new(2));
+            resolver.add_endpoint(0, PinRef::new("U9", "Y"), Some(high()));
+            resolver.add_element(
+                0,
+                1,
+                PwlCurve::Diode { vf: 0.75, r_d: 0.0 },
+                None,
+                "B.D1".into(),
+            );
+            assert_eq!(resolver.cluster_roots(2), vec![vec![NetId(0), NetId(1)]]);
+            let mut net_table = nets(2);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            assert_eq!(net_table[0].state, NetState::Analog(3.3));
+            assert_eq!(net_table[1].state, NetState::Floating);
+            let _ = GMIN_OHMS;
         }
     }
 

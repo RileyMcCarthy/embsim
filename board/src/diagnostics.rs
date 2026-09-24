@@ -108,6 +108,26 @@ pub enum Finding {
         /// against (the smallest resistor touching the node; `+∞` for none).
         far_ohms: Ohms,
     },
+    /// A cluster's piecewise-linear elements found no consistent set of
+    /// regions: the flip loop — every element off, then the first element
+    /// whose region test disagrees with its state flipped, one per solve,
+    /// in declaration order — ran its bound of
+    /// [`crate::cluster::PWL_SOLVES_PER_ELEMENT`] solves per element and a
+    /// test still disagreed. Two elements whose tests chase each other (an
+    /// inverting loop with no rest state) do this. The cluster then has no
+    /// operating point: every node of it publishes
+    /// [`crate::NetState::Floating`] (a terminal keeps its constant) — never
+    /// `NaN`, never the last set of regions tried — and this names the
+    /// elements and the solve count (`NODES.md` §7).
+    NonConvergent {
+        /// The cluster, named by its lowest-indexed net.
+        cluster: String,
+        /// The elements in the cluster, in declaration order, as
+        /// `Board.Reference`.
+        elements: Vec<String>,
+        /// Linear solves the loop ran before giving up: the bound.
+        solves: usize,
+    },
     /// A power net with no `PowerOut` source anywhere (board or harness);
     /// presents as down (0 V into cluster solves).
     PowerNetUnsourced {

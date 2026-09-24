@@ -68,6 +68,38 @@ cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --te
 # crystal the package reports, the reset inputs as it projects them, every
 # pad released with no core so a bench pin takes one without a fight.
 cargo test -p embsim-board --test p2_package
+# Phase 3, the solver half (stepped, own binary): a diode from the element
+# library conducts at (V − V_F)/R and blocks reversed, a switched channel
+# follows its gate both ways, two elements that chase each other are
+# reported non-convergent at exactly two solves per element with their
+# nodes floating, two histories reaching one drive table publish identical
+# states (every solve starts cold), a node only leakage reaches floats, and
+# the current instrument on a sink reads the pull-up's current to a nanoamp.
+cargo test -p embsim-board --test pwl_elements
+# The resolver's side of it: the LED chain solving with two unknowns (the
+# rail handed over as a constant), the far side of an off diode in its
+# cluster and floating, and the incremental-vs-full oracle with random
+# diodes and channels in its boards.
+cargo test -p embsim-board --lib elements
+cargo test -p embsim-board --lib incremental_oracle
+# Phase 3, the parts half (stepped, own binary): on the real EdgeBoard the
+# indicator LED D3 lit by its inverter at (V_CC − V_F) / (220 Ω + R_OH) and
+# dark when the output is low; the polarity FET passing the input forward
+# and blocking it reversed with no `pin_short`; the end-switch loop
+# regulated at the current regulator's 10 mA with the opto sinking P19; an
+# opto output sinking only above its input threshold; the servo-enable
+# transistor saturating under a 1 kΩ drive input and sagging under 220 Ω at
+# exactly a hundred times its base current.
+cargo test -p embsim-board --test board_elements
+# The solver's three-region curves on hand-computed circuits: the polarity
+# FET's start-up in exactly four solves (body diode on, channel on, diode
+# off), the regulator ohmic below its knee and a source above it, the
+# transistor saturated under a light load and active under a heavy one.
+cargo test -p embsim-board --lib cluster::tests
+# The module's polarity FET passing the carrier's 5 V to the protected rail
+# from its fingers alone, and the isolation seam on the elements (the base
+# at its knee, the loop at 10 mA).
+cargo test -p embsim-board --test ec32mb_module --test isolation_bridge
 # ns/solve of the MNA at m = 2, 4, 8, 11, 47 (not a test; run in release).
 cargo run -p embsim-board --release --example solve_bench
 # The QEMU core inside the package (needs a QEMU P2 tree): the ROM boot

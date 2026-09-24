@@ -14,9 +14,9 @@
 //! |---|---|---|
 //! | `P8` STEP → the stepper driver | `IC14` `ISO6741DWR` | a level, and a rate-carried train |
 //! | `P7` DIR → the stepper driver | `IC14`, same part | a level, independently of `P8` |
-//! | `P6` ENA → the enable sink | `IC14`, then `Q1` `NPN` | a level through both |
+//! | `P6` ENA → the enable sink | `IC14`, then `Q1` `NPN` | the base at its knee, and its current |
 //! | encoder → `P9`..`P12` | `IC16` `ISO6740FDWR` | the receiver's output, and the fail-safe |
-//! | end switch → `P19` | `IC9` `NSI50010` + `U6` `VO2631` | a closed contact lighting the opto |
+//! | end switch → `P19` | `IC9` `NSI50010` + `U6` `VO2631` | a closed contact regulating the loop and lighting the opto |
 //!
 //! Plus the load-bearing budget: [`a_step_train_crosses_the_barrier_at_a_bounded_engine_cost`].
 //!
@@ -51,12 +51,11 @@ use embsim_board::{
     PulseTx, Scenario, StreamRole, System, SystemHandle,
 };
 use embsim_models::isolation::iso67xx;
-use embsim_models::isolation::{
-    npn_switch, nsi50010, vo2631, Channel, Iso67xx, Iso67xxMonitor, NpnSwitch, NpnSwitchMonitor,
-    Nsi50010, Nsi50010Regulator, Vo2631, Vo2631Monitor,
-};
+use embsim_models::isolation::{Channel, Iso67xx, Iso67xxMonitor};
 use embsim_models::machine::{end_switch, ActuationSense, EndSwitch, EndSwitchActuator};
-use machine_parts::{bench_rails, edge_polarity_fet_conducting, edge_registry, ep};
+use embsim_models::opto::{Opto, OptoChannel, OptoMonitor};
+use embsim_models::pwl_library::{MMBT3904_VBE_VOLTS, NSI50010_I_REG_AMPS};
+use machine_parts::{bench_rails, edge_registry, ep};
 
 // ============================================================
 // Shared fixtures
@@ -104,13 +103,13 @@ struct EndSwitchSettled {
     current_ma: f64,
 }
 
-/// High-impedance probe on `P19` that also snapshots the opto/regulator
-/// monitors at the settle wake. Re-armable so open → closed → open cycles
-/// can each capture a virtual-time settled sample.
+/// High-impedance probe on `P19` that also snapshots the opto monitor at
+/// the settle wake — the loop current is the opto's LED current, which the
+/// engine delivers it from the loop's solve. Re-armable so open → closed →
+/// open cycles can each capture a virtual-time settled sample.
 struct EndSwitchSettleProbe {
     pins: [PinDecl; 1],
-    opto: Vo2631Monitor,
-    ccr: Nsi50010Regulator,
+    opto: OptoMonitor,
     capture: Arc<Mutex<Option<EndSwitchSettled>>>,
     done: Arc<AtomicBool>,
     io: Arc<Mutex<Option<ComponentNetIo>>>,
@@ -124,15 +123,16 @@ impl Component for EndSwitchSettleProbe {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let y = io.pin("Y")?;
         let opto = self.opto.clone();
-        let ccr = self.ccr.clone();
         let capture = Arc::clone(&self.capture);
         let done = Arc::clone(&self.done);
         io.on_wake(move |_now_us| {
             *capture.lock().unwrap() = Some(EndSwitchSettled {
                 p19: y.sense(),
-                lit: opto.is_lit(vo2631::OptoChannel::Two),
-                sinking: opto.is_sinking(vo2631::OptoChannel::Two),
-                current_ma: ccr.current_ma(),
+                lit: opto.is_lit(OptoChannel::Two),
+                sinking: opto.is_sinking(OptoChannel::Two),
+                current_ma: opto
+                    .forward_amps(OptoChannel::Two)
+                    .map_or(0.0, |amps| amps * 1e3),
             });
             done.store(true, Ordering::SeqCst);
         });
@@ -187,13 +187,14 @@ fn capture_end_switch_settled(
 /// A `PartRegistry` constructor is handed a [`ComponentDecl`] and returns a
 /// boxed component the system then owns, so the only way to keep a handle on
 /// a *particular* instance is to record it as it is built. That is what this
-/// is: `IC14`'s monitor, `U6`'s, `Q1`'s, each under its own reference.
+/// is: `IC14`'s monitor and `U6`'s, each under its own reference. The
+/// regulator `IC9` and the transistor `Q1` are elements by specification
+/// with no instance to hold: their currents are read from the system
+/// (`branch_current`, `pin_current`).
 #[derive(Clone, Default)]
 struct Promoted {
     isolators: Arc<Mutex<HashMap<String, Iso67xxMonitor>>>,
-    optos: Arc<Mutex<HashMap<String, Vo2631Monitor>>>,
-    regulators: Arc<Mutex<HashMap<String, Nsi50010Regulator>>>,
-    switches: Arc<Mutex<HashMap<String, NpnSwitchMonitor>>>,
+    optos: Arc<Mutex<HashMap<String, OptoMonitor>>>,
 }
 
 impl Promoted {
@@ -206,26 +207,8 @@ impl Promoted {
             .unwrap_or_else(|| panic!("{reference} was promoted"))
     }
 
-    fn opto(&self, reference: &str) -> Vo2631Monitor {
+    fn opto(&self, reference: &str) -> OptoMonitor {
         self.optos
-            .lock()
-            .unwrap()
-            .get(reference)
-            .cloned()
-            .unwrap_or_else(|| panic!("{reference} was promoted"))
-    }
-
-    fn regulator(&self, reference: &str) -> Nsi50010Regulator {
-        self.regulators
-            .lock()
-            .unwrap()
-            .get(reference)
-            .cloned()
-            .unwrap_or_else(|| panic!("{reference} was promoted"))
-    }
-
-    fn switch(&self, reference: &str) -> NpnSwitchMonitor {
-        self.switches
             .lock()
             .unwrap()
             .get(reference)
@@ -238,20 +221,14 @@ impl Promoted {
 /// to `OUTA` (pin 14).
 const STEP_CHANNEL: Channel = Channel::A;
 
-/// [`machine_parts::edge_registry`] with the isolation parts re-registered
-/// so this binary holds a monitor on each instance, and the opto, current
-/// regulator and transistor promoted from topology-only stubs to real
-/// models.
+/// [`machine_parts::edge_registry`] with the isolators and the optocouplers
+/// re-registered so this binary holds a monitor on each instance.
 ///
-/// The ISO67xx registrations here mirror the board's own
-/// (`machine_parts::edge_registry` registers the same model from the same
-/// part names since `NODES.md` §8 phase 2); the re-registration exists only
-/// to capture each instance's monitor as it is built. For the other three
-/// parts this function is still the promotion instruction: a consumer
-/// replaces its own `register_stub` lines with these `register` calls and
-/// nothing else changes — the pin facades come from the models' own
-/// datasheet tables, so the build validates against the same netlist it
-/// always did.
+/// The registrations mirror the board's own (`machine_parts::edge_registry`
+/// registers the same models from the same part names; the regulator and
+/// the transistor come from the element library there too, since `NODES.md`
+/// §8 phase 3); the re-registration exists only to capture each instance's
+/// monitor as it is built.
 fn promoted_registry(promoted: &Promoted) -> PartRegistry {
     let mut registry = edge_registry();
 
@@ -278,41 +255,19 @@ fn promoted_registry(promoted: &Promoted) -> PartRegistry {
         });
     }
 
-    {
+    for (part, build) in [
+        ("VO2631", Opto::vo2631 as fn() -> Opto),
+        ("6N137", Opto::lite_on_6n137 as fn() -> Opto),
+    ] {
         let promoted = promoted.clone();
-        registry.register("VO2631", move |decl: &ComponentDecl| {
-            let opto = Vo2631::new(vo2631::Config::new()).expect("a valid optocoupler");
+        registry.register(part, move |decl: &ComponentDecl| {
+            let opto = build();
             promoted
                 .optos
                 .lock()
                 .unwrap()
                 .insert(decl.reference.clone(), opto.monitor());
             Box::new(opto)
-        });
-    }
-    {
-        let promoted = promoted.clone();
-        registry.register("NSI50010YT1G_1", move |decl: &ComponentDecl| {
-            let ccr = Nsi50010::new(nsi50010::Config::new()).expect("a valid regulator");
-            promoted
-                .regulators
-                .lock()
-                .unwrap()
-                .insert(decl.reference.clone(), ccr.regulator());
-            Box::new(ccr)
-        });
-    }
-    {
-        let promoted = promoted.clone();
-        registry.register("2N3904", move |decl: &ComponentDecl| {
-            // `Q1`'s netlist pins are 1 `E`, 2 `B`, 3 `C` — the package order.
-            let switch = NpnSwitch::new(npn_switch::Config::new()).expect("a valid switch");
-            promoted
-                .switches
-                .lock()
-                .unwrap()
-                .insert(decl.reference.clone(), switch.monitor());
-            Box::new(switch)
         });
     }
     registry
@@ -563,8 +518,7 @@ fn start_inner(
         .expect("a valid end switch");
     let end_switch = switch.actuator();
 
-    let mut scenario = edge_polarity_fet_conducting(Scenario::default(), EDGE);
-    scenario = machine_parts::encoder_jumpers_closed(scenario, EDGE);
+    let mut scenario = machine_parts::encoder_jumpers_closed(Scenario::default(), EDGE);
     for (net, volts) in sources {
         scenario = scenario.net_stuck(net, *volts);
     }
@@ -588,7 +542,6 @@ fn start_inner(
         let probe = EndSwitchSettleProbe {
             pins: [settle_probe_pin()],
             opto: promoted.opto("U6"),
-            ccr: promoted.regulator("IC9"),
             capture: Arc::clone(&capture),
             done: Arc::clone(&done),
             io: Arc::clone(&io),
@@ -721,8 +674,9 @@ fn an_unpowered_isolated_side_stops_the_step_path() {
     );
 
     // The enable path dies with it, all the way through the transistor: a
-    // released `OUTC` leaves the base network unsourced, so `Q1` is off and
-    // its collector is an open circuit rather than a plausible enable.
+    // released `OUTC` leaves the base network unsourced, so `Q1`'s junction
+    // carries nothing and its collector is an open circuit rather than a
+    // plausible enable.
     rig.drive("ENA", 3.3);
     assert_eq!(
         settled_state(
@@ -732,7 +686,17 @@ fn an_unpowered_isolated_side_stops_the_step_path() {
         ),
         NetState::Floating
     );
-    assert!(!rig.promoted.switch("Q1").is_on());
+    // The transistor's cluster still solves — its emitter is on the bench
+    // ground, a terminal that sources it — and the solve says the base
+    // carries nothing: a reading of zero, not the absence of one.
+    let into_base = rig
+        .system
+        .pin_current(&format!("{EDGE}.Q1.2"))
+        .expect("the transistor's cluster solves from its grounded emitter");
+    assert!(
+        into_base.abs() < 1e-9,
+        "an unsourced base carries nothing: {into_base}"
+    );
     assert_eq!(
         settled_state(
             &rig.system,
@@ -757,65 +721,98 @@ fn an_unpowered_isolated_side_stops_the_step_path() {
 /// the switch's "short to the emitter, not to ground" rule against a real
 /// netlist.
 ///
-/// # The base network carries the driver's level
+/// # The transistor is an element
 ///
-/// `Net-(Q1-B)` is reached only through `R24` (43 kΩ). The resolver's
-/// projection for such a net used to take its level from the cluster's
-/// **power** source alone, so a cluster fed by a signal driver rather than a
-/// rail projected `Pulled(High)` whichever way the driver was pointing — and
-/// an earlier revision of this test pinned that, saying "the day the
-/// projection learns to carry a driver's level, this test fails and says so".
-///
-/// It did. `engine.rs`'s "Reached only through conduction edges" arm now falls
-/// back to the level the cluster's drivers agree on, so releasing `P6` reaches
-/// the base and turns `Q1` off — which is what the transistor does on the
-/// bench, and what this test now asserts.
+/// `Q1` is a base–emitter diode and a gated collector from the element
+/// library (`NODES.md` §8 phase 3), solved with the base network around
+/// it: `Net-(Q1-B)` is reached only through `R24` (43 kΩ) from the
+/// isolator's `OUTC`, so with `P6` high the base sits at the datasheet's
+/// knee and carries `(V_OUTC − V_BE) / 43 kΩ`, and with `P6` low the
+/// junction is off and the base follows `OUTC` down. An earlier revision
+/// read the base as `Pulled(Low, 43 000)` and the collector as a switch
+/// closed by a model: the base is a solved voltage now — the whole base
+/// network is an element cluster — and the collector on `Net-(JP1-B)` has
+/// no load with `JP1` open, so it is reached only through the transistor
+/// and floats; the loaded collector (a saturated switch under a light
+/// load, a sagging one under a heavy load) is `board_elements.rs`'s proof.
 #[rstest]
 fn the_enable_path_crosses_the_isolator_and_the_transistor() {
     let rig = start(true, false, &[]);
     let outc = format!("{EDGE}.Net-(IC14-OUTC)");
+    let base = format!("{EDGE}.Net-(Q1-B)");
     let collector = format!("{EDGE}.Net-(JP1-B)");
-    let switch = rig.promoted.switch("Q1");
+    let base_pin = format!("{EDGE}.Q1.2");
     assert!(wait_for(
         || rig.promoted.isolator("IC14").is_passing(Channel::C),
         SETTLE
     ));
+    let volts = |net: &str| match rig.system.net_state(net) {
+        Some(NetState::Analog(v)) => Some(v),
+        _ => None,
+    };
 
-    // Enable asserted: the isolator drives OUTC high, the base resistor takes
-    // it to Q1, and the collector sinks.
+    // Enable asserted: the isolator drives OUTC high, the base resistor
+    // takes it to Q1, and the base–emitter junction turns on at its knee.
     rig.drive("ENA", 3.3);
-    assert_eq!(
-        settled_state(&rig.system, &outc, NetState::Driven(Level::High)),
-        NetState::Driven(Level::High),
-        "P6 must reach the base-drive network across IC14"
+    assert!(
+        wait_for(
+            || volts(&base).is_some_and(|v| (MMBT3904_VBE_VOLTS..=0.75).contains(&v)),
+            SETTLE
+        ),
+        "P6 must reach the base across IC14 and R24, and the junction sit at its knee; got {:?}",
+        rig.system.net_state(&base)
     );
-    assert!(wait_for(|| switch.is_on(), SETTLE), "Q1 must saturate");
-    assert_eq!(
-        settled_state(&rig.system, &collector, NetState::Driven(Level::Low)),
-        NetState::Driven(Level::Low),
-        "a saturated Q1 sinks its collector to the isolated ground"
+    let v_outc = volts(&outc).expect("OUTC is solved with the base network");
+    assert!(v_outc > 4.0, "OUTC high in the servo domain: {v_outc}");
+    let i_b = rig
+        .system
+        .pin_current(&base_pin)
+        .expect("the base is a branch terminal");
+    let expected = (v_outc - volts(&base).unwrap()) / 43_000.0;
+    assert!(
+        (i_b - expected).abs() < expected * 0.01,
+        "the base current is the drop across R24: {i_b} vs {expected}"
+    );
+    // The unloaded collector: nothing draws through it, so the saturated
+    // channel holds it at the emitter — the isolated ground — and it
+    // carries nothing.
+    assert!(
+        matches!(rig.system.net_state(&collector), Some(NetState::Analog(v)) if v.abs() < 1e-3),
+        "a saturated collector with no load sits at its emitter: {:?}",
+        rig.system.net_state(&collector)
+    );
+    assert!(
+        rig.system
+            .pin_current(&format!("{EDGE}.Q1.3"))
+            .is_some_and(|amps| amps.abs() < 1e-9),
+        "and carries nothing: {:?}",
+        rig.system.pin_current(&format!("{EDGE}.Q1.3"))
     );
 
-    // Enable released: the isolator follows P6 down...
+    // Enable released: the isolator follows P6 down, the base with it, and
+    // the junction is off; the collector is reached only through the off
+    // transistor and floats.
     rig.drive("ENA", 0.0);
-    assert_eq!(
-        settled_state(&rig.system, &outc, NetState::Driven(Level::Low)),
-        NetState::Driven(Level::Low),
-        "and back down again — the channel is a repeater, not a latch"
-    );
-    // ...and the low reaches the base through R24, so the transistor lets go.
-    let base = format!("{EDGE}.Net-(Q1-B)");
     assert!(
-        matches!(
-            settled_state(&rig.system, &base, NetState::Pulled(Level::Low, 43_000.0)),
-            NetState::Pulled(Level::Low, _)
-        ),
-        "a 43 kOhm base resistor carries the driver's level, not a default; got {:?}",
+        wait_for(|| volts(&base).is_some_and(|v| v < 0.1), SETTLE),
+        "a released P6 reaches the base through R24; got {:?}",
         rig.system.net_state(&base)
     );
     assert!(
-        wait_for(|| !switch.is_on(), SETTLE),
-        "Q1 must come out of saturation once its base goes low"
+        wait_for(
+            || rig
+                .system
+                .pin_current(&base_pin)
+                .is_some_and(|i| i.abs() < 1e-9),
+            SETTLE
+        ),
+        "an off junction carries only leakage: {:?}",
+        rig.system.pin_current(&base_pin)
+    );
+    assert_eq!(
+        settled_state(&rig.system, &collector, NetState::Floating),
+        NetState::Floating,
+        "an off transistor's unloaded collector is an open circuit"
     );
     rig.system.shutdown();
 }
@@ -885,11 +882,16 @@ fn the_encoder_isolator_fails_safe_low_when_its_input_side_dies() {
 
 /// The end-switch path, which no engine event could cross before: a closed
 /// contact completes the current loop, the constant-current regulator sees
-/// overhead, the optocoupler's LED lights, and its open-collector output pulls
-/// `P19` down against the board's own 1 kΩ pull-up.
+/// overhead and regulates, the optocoupler's LED lights, and its
+/// open-collector output pulls `P19` down against the board's own 1 kΩ
+/// pull-up.
 ///
-/// Open, every one of those is false — and `P19` sits at the pull-up, which is
-/// exactly what "pulled to its rail, not floating" means.
+/// The loop is one cluster solve since `NODES.md` §8 phase 3: `IC9` is a
+/// two-region regulating branch and `U6`'s LED a diode branch, so the loop
+/// current is the regulator's 10 mA — an earlier revision's resistive
+/// stand-ins carried 27 mA from the 24 V bench rail and *reported* 10 mA.
+/// Open, every one of those is false — and `P19` sits at the pull-up, which
+/// is exactly what "pulled to its rail, not floating" means.
 #[rstest]
 fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
     // Engine-hosted settle probe (see edgeboard `SettleProbe`): open/closed
@@ -898,8 +900,9 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
     // then fail the lit/current asserts (ubuntu release smoke flake on
     // #50 / run 35007027583).
     let (rig, settle) = start_end_switch_loop(&[]);
-    let ccr = rig.promoted.regulator("IC9");
     let opto = rig.promoted.opto("U6");
+    let regulator = format!("{EDGE}.IC9");
+    let regulation_ma = NSI50010_I_REG_AMPS * 1e3;
 
     // Open contact: no return path, so the loop carries nothing.
     rig.end_switch.set_position_mm(0.0);
@@ -912,12 +915,22 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
     assert_eq!(open.current_ma, 0.0, "an open loop regulates nothing");
     assert!(!open.lit, "open loop must leave the opto dark");
     assert!(!open.sinking, "open loop must release the open-collector");
-    // Monitors agree with the engine-thread snapshot (still strong asserts).
-    assert_eq!(ccr.current_ma(), 0.0, "an open loop regulates nothing");
-    assert!(!opto.is_lit(vo2631::OptoChannel::Two));
-    assert!(!opto.is_sinking(vo2631::OptoChannel::Two));
+    // The monitor and the system agree with the engine-thread snapshot.
+    assert!(!opto.is_lit(OptoChannel::Two));
+    assert!(!opto.is_sinking(OptoChannel::Two));
+    // The loop's cluster solves — the 24 V bench supply on its anode is a
+    // terminal that sources it — and the solve reads nothing through the
+    // regulator: a zero, not the absence of a reading.
+    let through_regulator = rig
+        .system
+        .branch_current(&regulator)
+        .expect("the loop's cluster solves from the 24 V supply on its anode");
+    assert!(
+        through_regulator.abs() < 1e-9,
+        "an open loop carries nothing through the regulator: {through_regulator}"
+    );
 
-    // Closed contact: the loop completes.
+    // Closed contact: the loop completes and the regulator holds it.
     rig.end_switch.set_position_mm(150.0);
     let closed = settle.capture();
     assert!(
@@ -926,23 +939,26 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
         closed.p19
     );
     assert!(
-        (closed.current_ma - nsi50010::DEFAULT_REGULATION_MA).abs() < 1e-9,
-        "the regulator holds its regulation current, got {} mA",
+        (closed.current_ma - regulation_ma).abs() < regulation_ma * 0.01,
+        "the regulator holds the loop at its regulation current, got {} mA",
         closed.current_ma
     );
     assert!(closed.lit, "the LED must be lit past ITH");
     assert!(closed.sinking, "a lit, powered detector must sink");
+    let through_regulator = rig
+        .system
+        .branch_current(&regulator)
+        .expect("the loop solved");
     assert!(
-        (ccr.current_ma() - nsi50010::DEFAULT_REGULATION_MA).abs() < 1e-9,
-        "the regulator holds its regulation current, got {} mA",
-        ccr.current_ma()
+        (through_regulator - NSI50010_I_REG_AMPS).abs() < NSI50010_I_REG_AMPS * 0.01,
+        "the regulator's own branch carries the loop current: {through_regulator}"
     );
+    let through_led = opto.forward_amps(OptoChannel::Two).expect("delivered");
     assert!(
-        opto.forward_ma(vo2631::OptoChannel::Two) >= vo2631::DEFAULT_THRESHOLD_MA,
-        "the LED must be lit past ITH, got {} mA",
-        opto.forward_ma(vo2631::OptoChannel::Two)
+        (through_led - through_regulator).abs() < 1e-9,
+        "a series loop carries one current: {through_led} vs {through_regulator}"
     );
-    assert!(opto.is_sinking(vo2631::OptoChannel::Two));
+    assert!(opto.is_sinking(OptoChannel::Two));
 
     // And back: the path is not one-way.
     rig.end_switch.set_position_mm(0.0);
@@ -973,11 +989,11 @@ fn an_unpowered_optocoupler_leaves_p19_at_its_pull_up() {
 
     rig.end_switch.set_position_mm(150.0);
     assert!(
-        wait_for(|| opto.is_lit(vo2631::OptoChannel::Two), SETTLE),
+        wait_for(|| opto.is_lit(OptoChannel::Two), SETTLE),
         "the LED loop is still powered and the contact is closed"
     );
     assert!(!opto.is_powered(), "but the detector is not");
-    assert!(!opto.is_sinking(vo2631::OptoChannel::Two));
+    assert!(!opto.is_sinking(OptoChannel::Two));
     assert!(
         wait_for(
             || matches!(

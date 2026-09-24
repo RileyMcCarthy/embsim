@@ -58,12 +58,13 @@ pub mod uart;
 
 pub use board::{Board, BoardError, PartClass};
 pub use cluster::{
-    Cluster, ClusterInjection, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver,
-    ClusterSource, QuasiStaticMna,
+    Cluster, ClusterElement, ClusterInjection, ClusterInputs, ClusterResistor, ClusterSolution,
+    ClusterSolver, ClusterSource, ClusterTerminal, QuasiStaticMna, GMIN_OHMS,
+    PWL_SOLVES_PER_ELEMENT,
 };
 pub use component::{
-    AttachError, Component, ComponentNetIo, Drive, IdleDrive, PinDecl, PinHandle, PinKind,
-    PulseDirection, PulseSegment, PulseTrain, PulseTx, StreamRole,
+    AttachError, Branch, Component, ComponentNetIo, Drive, IdleDrive, PinDecl, PinHandle, PinKind,
+    PulseDirection, PulseSegment, PulseTrain, PulseTx, PwlCurve, RegionTest, StreamRole,
 };
 pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
@@ -76,8 +77,8 @@ pub use net::{
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use registry::{
-    reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind, PwlSpec,
-    RegistryError, SwitchPole,
+    reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind, PwlBranch,
+    PwlSpec, RegistryError, SwitchPole,
 };
 pub use serial_levels::SerialLevelBridge;
 pub use system::{

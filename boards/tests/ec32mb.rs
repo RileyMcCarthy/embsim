@@ -81,7 +81,7 @@ fn the_module_builds_with_every_active_part_behind_a_facade() {
         "U100", // the processor slot
         "U301", // boot flash, live
         "U302", "U303", "U304", "U305", // the four PSRAMs
-        "U401", "U402", "U403", "U404", // power
+        "U402", "U403", "U404", // power
         "X100", "U101", // oscillator and its buffer
     ] {
         assert!(refs.contains(expected), "{expected} is missing: {refs:?}");

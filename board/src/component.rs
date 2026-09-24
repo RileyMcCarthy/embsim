@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Weak;
 
-use crate::engine::{Command, ComponentId, EndpointId, EngineLink};
-use crate::net::{Amps, NetId, NetState, Ohms, TheveninDrive};
+use crate::engine::{Command, ComponentId, EndpointId, EngineLink, ReadKind};
+use crate::net::{Amps, NetId, NetState, Ohms, TheveninDrive, Volts};
 
 pub use embsim_peripherals::pulse_out::PulseSegment;
 
@@ -398,6 +398,133 @@ impl PinDecl {
 }
 
 // ============================================================
+// Nonlinear branches (piecewise-linear elements)
+// ============================================================
+
+/// The piecewise-linear curve of a [`Branch`]: a few regions, each one
+/// linear stamp in the cluster solve (`NODES.md` §2, the Diode / LED, FET /
+/// BJT and CCR rows) — **off** and **on** for a diode, a channel and a
+/// regulator, plus **active** for a transistor's collector
+/// ([`crate::cluster::Region`]). Off is the leakage conductance
+/// [`crate::cluster::GMIN_OHMS`] (the regulator's ohmic segment excepted),
+/// never an open — so the far side of an off element stays reachable and
+/// its region test has an operand. The region is chosen by the engine's
+/// bounded, ordered flip loop, cold-started on every solve
+/// ([`crate::cluster::QuasiStaticMna`]); a node never chooses its own
+/// region.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PwlCurve {
+    /// A diode, an LED, a body diode: on when the forward drop from
+    /// [`Branch::a`] (anode) to [`Branch::b`] (cathode) reaches `vf`, and
+    /// then a `vf` source in series with `r_d` — the branch carries
+    /// `(V(a) − V(b) − vf) / r_d`. Off below the knee.
+    Diode {
+        /// Forward voltage at the knee, volts — a datasheet number.
+        vf: Volts,
+        /// Dynamic resistance of the on segment, ohms. Zero is a vertical
+        /// segment (the drop is `vf` at any current), stamped at the ideal
+        /// floor ([`crate::cluster::IDEAL_SOURCE_FLOOR_OHMS`]).
+        r_d: Ohms,
+    },
+    /// A switched channel — a FET's drain–source: `r_on` between
+    /// [`Branch::a`] and [`Branch::b`] while the branch's [`Branch::control`]
+    /// test passes, the leakage conductance otherwise. A channel with no
+    /// control is a declared-open switch: always off.
+    Channel {
+        /// On-state resistance, ohms (`R_DS(on)`).
+        r_on: Ohms,
+    },
+    /// A two-terminal constant-current regulator (the NSI50010 family): the
+    /// datasheet's I–V curve as two regions. Below the knee — `V(a) − V(b)`
+    /// under `v_reg` — the branch is the ohmic segment from the origin to
+    /// the knee, a resistor of `v_reg / i_reg`; at or above it the branch
+    /// carries `i_reg` from `a` to `b` whatever the voltage across it (a
+    /// current source with the leakage conductance in parallel). Reverse
+    /// bias conducts through the ohmic segment, a stated simplification of
+    /// a part whose reverse rating is a few hundred millivolts. Its cold
+    /// start is the ohmic segment, not a leakage.
+    Regulator {
+        /// Regulation current, amperes, from `a` to `b`.
+        i_reg: Amps,
+        /// The knee: the anode–cathode voltage at which regulation begins
+        /// (the datasheet's overhead voltage).
+        v_reg: Volts,
+    },
+    /// A bipolar transistor's collector–emitter branch, `a` the collector
+    /// and `b` the emitter, whose [`Branch::control`] is the base with the
+    /// base–emitter knee as its test ([`RegionTest::AtLeast`]`(v_be)`); the
+    /// base–emitter junction itself is a [`PwlCurve::Diode`] branch from
+    /// the base to the emitter, declared **before** this one. Three
+    /// regions ([`crate::cluster::Region`]): off (leakage) while the base
+    /// test fails; **on** — saturated, `r_sat` between collector and
+    /// emitter — while the base current supports the collector current the
+    /// load draws, `I_C ≤ hfe · I_B`; **active** — a current source of
+    /// `hfe · I_B` from collector to emitter — when it does not, so an
+    /// under-driven base reads as a sagging collector rather than a closed
+    /// switch. A collector branch whose base diode is not declared carries
+    /// nothing: its gain has no base current to multiply.
+    Bjt {
+        /// The minimum DC current gain the load current is judged against
+        /// (`h_FE` min at the load's collector current).
+        hfe: f64,
+        /// Saturated collector–emitter resistance, ohms (`V_CE(sat) / I_C`).
+        r_sat: Ohms,
+    },
+}
+
+/// The test a [`Branch`]'s control pin applies to decide the on region: it
+/// compares `V(control) − V(b)` — the control terminal against the
+/// branch's own `b` terminal (a FET's gate against its source, a
+/// transistor's base against its emitter) — with a threshold. A control
+/// terminal no source reaches has no voltage, and the test evaluates as
+/// **off**; a control terminal on a declared terminal (a rail, a harness
+/// supply, a stuck net) reads that terminal's constant and joins no cluster
+/// (`NODES.md` §8 phase 3, the parts record).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RegionTest {
+    /// On while `V(control) − V(b)` is at or above the threshold — an
+    /// N-channel's positive `V_GS(th)`.
+    AtLeast(Volts),
+    /// On while `V(control) − V(b)` is at or below the threshold — a
+    /// P-channel's negative `V_GS(th)`.
+    AtMost(Volts),
+}
+
+impl RegionTest {
+    /// Whether a control-to-`b` voltage puts the branch in its on region.
+    pub fn passes(self, control_minus_b: Volts) -> bool {
+        match self {
+            RegionTest::AtLeast(threshold) => control_minus_b >= threshold,
+            RegionTest::AtMost(threshold) => control_minus_b <= threshold,
+        }
+    }
+}
+
+/// A nonlinear element declared by a [`Component`]: a branch between two of
+/// its pins with a piecewise-linear curve, and an optional control pin
+/// (`NODES.md` §11). Never a per-pin curve to a reference — a diode is a
+/// branch between two pins, a channel a branch decided by a third. Pins are
+/// named as the component's [`PinDecl`]s name them (number or alias); a
+/// branch naming a pin the facade does not declare fails the board build.
+///
+/// The current through a branch is reported positive from `a` to `b`
+/// ([`PinHandle::sense_current`], [`ComponentNetIo::on_branch`],
+/// `BuiltSystem::branch_current`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Branch {
+    /// The anode / drain side.
+    pub a: &'static str,
+    /// The cathode / source side — the reference of the control test.
+    pub b: &'static str,
+    /// The two-region curve.
+    pub curve: PwlCurve,
+    /// The control pin and the test on `V(control) − V(b)`, for a
+    /// [`PwlCurve::Channel`] or the base of a [`PwlCurve::Bjt`]; a diode's
+    /// and a regulator's test is its own forward drop.
+    pub control: Option<(&'static str, RegionTest)>,
+}
+
+// ============================================================
 // Component trait
 // ============================================================
 
@@ -413,6 +540,14 @@ pub trait Component: Send + Sync {
     /// build validates BOTH directions (declared-but-absent and
     /// present-but-undeclared netlist pins are hard errors).
     fn pins(&self) -> &[PinDecl];
+
+    /// The component's nonlinear elements: piecewise-linear branches
+    /// between two of its declared pins ([`Branch`]). The engine stamps
+    /// them into the cluster solve and chooses their regions; the
+    /// component never publishes a drive for them. Default: none.
+    fn branches(&self) -> &[Branch] {
+        &[]
+    }
 
     /// Runs once at build, BEFORE the component is shared (pre-`Arc`), so
     /// components store typed pin handles without interior mutability and
@@ -450,6 +585,11 @@ pub struct PinHandle {
     /// from its declaration; this is the bidirectional pad's equivalent,
     /// made at the subscription that reads it.
     reads_when_released: bool,
+    /// The elements this pin terminates, as `(element index, sign)`: `+1`
+    /// where the pin is the branch's `a` (the branch current flows from the
+    /// net into the pin), `−1` where it is `b`. Summed with the pin's own
+    /// drive current by [`PinHandle::sense_current`].
+    branch_terms: Vec<(usize, f64)>,
     link: EngineLink,
 }
 
@@ -470,6 +610,7 @@ impl PinHandle {
             endpoint: None,
             stream: None,
             reads_when_released: false,
+            branch_terms: Vec::new(),
             link: EngineLink::default(),
         }
     }
@@ -489,6 +630,7 @@ impl PinHandle {
             endpoint,
             stream,
             reads_when_released: false,
+            branch_terms: Vec::new(),
             link,
         }
     }
@@ -501,9 +643,54 @@ impl PinHandle {
         self
     }
 
+    /// Record the elements this pin terminates (system-build internal use;
+    /// see the field).
+    pub(crate) fn with_branch_terms(mut self, terms: Vec<(usize, f64)>) -> Self {
+        self.branch_terms = terms;
+        self
+    }
+
+    /// Whether the engine can report a current into this pin at all: it
+    /// has a drive slot, or it terminates a declared branch. A power or
+    /// passive pin on no branch carries nothing the solve accounts for,
+    /// and a terminal's current spans clusters.
+    pub(crate) fn carries_current(&self) -> bool {
+        self.endpoint.is_some() || !self.branch_terms.is_empty()
+    }
+
     /// The net this pin is attached to.
     pub fn net(&self) -> NetId {
         self.net
+    }
+
+    /// The current flowing **into** this pin from its net, from the last
+    /// solve of the pin's cluster — an instrument, not the normal path
+    /// (`NODES.md` §2: every pin is also an I-V port). For a pin with a drive
+    /// slot it is the current the pin's own Thevenin source sinks,
+    /// `(V(net) − V_oc) / Z` (a sink holding a pulled-up line low reads
+    /// positive); for a current drive, the negative of the injection; for a
+    /// pin terminating a declared [`Branch`], the branch current into it
+    /// (positive at `a`, negative at `b`), added to the above.
+    ///
+    /// `None` when no solve has produced one: the cluster resolved by
+    /// projection alone (only an escalated cluster has node voltages —
+    /// subscribe through [`ComponentNetIo::on_branch`] to escalate it), the
+    /// net floats, or the pin has no slot and no branch. On the build path
+    /// this reads the build snapshot.
+    pub fn sense_current(&self) -> Option<Amps> {
+        let table = self.link.currents.lock().unwrap();
+        let mut total: Option<Amps> = None;
+        if let Some(endpoint) = self.endpoint {
+            if let Some(Some(amps)) = table.endpoints.get(endpoint.0) {
+                total = Some(*amps);
+            }
+        }
+        for (element, sign) in &self.branch_terms {
+            if let Some(Some(amps)) = table.elements.get(*element) {
+                total = Some(total.unwrap_or(0.0) + sign * amps);
+            }
+        }
+        total
     }
 
     /// Read the current resolved state of the attached net: the live
@@ -677,16 +864,80 @@ impl ComponentNetIo {
                     .push(crate::engine::RecordedSense {
                         net: handle.net(),
                         reads: handle.reads_when_released,
-                        callback: Box::new(callback),
+                        callback: crate::engine::RecordedCallback::State(Box::new(callback)),
                     });
             }
             return Ok(());
         }
         if handle.reads_when_released {
-            self.link.send(Command::DeclareRead { net: handle.net() });
+            self.link.send(Command::DeclareRead {
+                net: handle.net(),
+                kind: ReadKind::Digital,
+            });
         }
         self.link.send(Command::RegisterSense {
             net: handle.net(),
+            callback: Box::new(callback),
+        });
+        Ok(())
+    }
+
+    /// Subscribe to the current into a pin ([`PinHandle::sense_current`]):
+    /// the bench instrument of `NODES.md` §2, delivered like a sense — once
+    /// at registration, then whenever a solve changes it — on the engine
+    /// thread with no lock held.
+    ///
+    /// Subscribing **escalates the pin's cluster**, and nothing else: only
+    /// a solved cluster has node voltages, so the net joins the current
+    /// instruments and every pass over that cluster from now on solves it;
+    /// an instrument on an open loop is not a floating input (no
+    /// [`crate::Finding::FloatingSense`]), and rule 2's fight findings are
+    /// still reported in its cluster. Refused, at attach,
+    /// on a pin the engine cannot account a current for — a power or
+    /// passive pin that terminates no declared [`Branch`], a terminal whose
+    /// current spans clusters.
+    pub fn on_branch(
+        &self,
+        id: &str,
+        callback: impl Fn(Option<Amps>) + Send + 'static,
+    ) -> Result<(), AttachError> {
+        let handle = self.pin(id)?;
+        if !handle.carries_current() {
+            return Err(AttachError::Failed {
+                message: format!(
+                    "pin {id:?} carries no current the solve accounts for: it has no drive \
+                     slot and terminates no declared branch"
+                ),
+            });
+        }
+        if self.link.tx.is_none() {
+            // Inert build path: the same once-at-registration delivery,
+            // synchronously against the snapshot, then recorded so the
+            // build's fixed point can escalate the cluster and deliver the
+            // current its solve produces (`System::build`).
+            let last = handle.sense_current();
+            callback(last);
+            if let Some(log) = self.link.recorded_senses.as_ref().and_then(Weak::upgrade) {
+                log.lock()
+                    .expect("sense log never poisoned")
+                    .push(crate::engine::RecordedSense {
+                        net: handle.net(),
+                        reads: false,
+                        callback: crate::engine::RecordedCallback::Current {
+                            handle,
+                            callback: Box::new(callback),
+                            last,
+                        },
+                    });
+            }
+            return Ok(());
+        }
+        self.link.send(Command::DeclareRead {
+            net: handle.net(),
+            kind: ReadKind::Instrument,
+        });
+        self.link.send(Command::RegisterCurrent {
+            handle,
             callback: Box::new(callback),
         });
         Ok(())
@@ -895,6 +1146,7 @@ mod tests {
         let states = Arc::new(Mutex::new(vec![NetState::Driven(Level::High)]));
         let link = EngineLink::inert(
             states,
+            Arc::new(Mutex::new(crate::engine::CurrentTable::default())),
             Arc::new(Mutex::new(Vec::new())),
             &crate::engine::SenseLog::default(),
         );

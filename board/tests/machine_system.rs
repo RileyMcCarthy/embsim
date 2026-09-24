@@ -64,9 +64,8 @@ use embsim_models::machine::{
 };
 use embsim_peripherals::serial;
 use machine_parts::{
-    bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, edge_polarity_fet_conducting,
-    encoder_jumpers_closed, force_domain_rails, force_gauge_harness, machine_harness,
-    module_polarity_fet_conducting, module_socket_harness,
+    bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, encoder_jumpers_closed,
+    force_domain_rails, force_gauge_harness, machine_harness, module_socket_harness,
 };
 
 /// Board names used throughout.
@@ -95,15 +94,14 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 // The machine, assembled
 // ============================================================
 
-/// The scenario every assembly shares: both boards' reverse-polarity pass FETs
-/// conducting, the encoder's ground/enable jumpers closed, the DS2 add-on's
-/// input jumpers closed, and the reset bodge the DS2 board needs (its `~RESET`
-/// net has exactly one pin — the July 2026 bench bug, still true of the
-/// netlist).
+/// The scenario every assembly shares: the encoder's ground/enable jumpers
+/// closed, the DS2 add-on's input jumpers closed, and the reset bodge the
+/// DS2 board needs (its `~RESET` net has exactly one pin — the July 2026
+/// bench bug, still true of the netlist). Both boards' reverse-polarity
+/// pass FETs are elements the solve turns on from the bench supplies
+/// (`NODES.md` §8 phase 3); nothing here says they conduct.
 fn machine_scenario() -> Scenario {
-    let scenario = module_polarity_fet_conducting(Scenario::default(), MODULE);
-    let scenario = edge_polarity_fet_conducting(scenario, EDGE);
-    let scenario = encoder_jumpers_closed(scenario, EDGE);
+    let scenario = encoder_jumpers_closed(Scenario::default(), EDGE);
     scenario
         .jumper(&format!("{DS2}.JP1"), JumperState::Closed)
         .jumper(&format!("{DS2}.JP2"), JumperState::Closed)
@@ -751,13 +749,7 @@ fn moving_the_shaft_changes_the_encoder_nets_the_board_reads() {
             machine_parts::ep("ENC.A"),
             machine_parts::ep("EdgeBoard.J20.1"),
         ))
-        .scenario(encoder_jumpers_closed(
-            edge_polarity_fet_conducting(
-                module_polarity_fet_conducting(Scenario::default(), MODULE),
-                EDGE,
-            ),
-            EDGE,
-        ))
+        .scenario(encoder_jumpers_closed(Scenario::default(), EDGE))
         .component("ENC", Box::new(encoder))
         .start()
         .expect("the axis starts");

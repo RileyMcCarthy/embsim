@@ -3,13 +3,14 @@
 //!
 //! **Retiring.** `DESIGN.md` rule 1 admits no stub tier: a part is a node
 //! whose class has behaviour. The facades left are the parts `NODES.md` §8
-//! phases 3–4 replace with models (the FET, the rails, the detector, the
-//! optos, the current regulators, the transistor — phase 2 took the
-//! oscillator, the inverters, the PSRAMs and the isolators), and the census
-//! in `board/tests/cluster_census.rs` counts them as a figure that may only
-//! fall; this module is deleted in phase 4 when it reads 0. The pin helpers
-//! are the [`PinDecl`] constructors by another name — a model still writes
-//! its table, with those.
+//! phase 4 replaces with rail models (the bucks, the LDOs, the detector, the
+//! isolated DC/DCs — phase 2 took the oscillator, the inverters, the PSRAMs
+//! and the isolators; phase 3 the polarity FETs, the optos, the current
+//! regulators, the transistor, the diodes and the LEDs as elements), and
+//! the census in `board/tests/cluster_census.rs` counts them as a figure
+//! that may only fall; this module is deleted in phase 4 when it reads 0.
+//! The pin helpers are the [`PinDecl`] constructors by another name — a
+//! model still writes its table, with those.
 //!
 //! A board is only buildable when EVERY component declares a facade the netlist
 //! agrees with, in both directions — so the parts nothing drives still have to
