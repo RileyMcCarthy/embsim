@@ -43,20 +43,45 @@ EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism
 # classes and the stubs by name.
 cargo test -p embsim-board --test cluster_census -- --nocapture
 # The one pipeline (phase 1): every part a node, mechanical nodes, switch
-# poles as identity unions, the value parser over the whole module, the
-# error that names the value; and the build fixed point: build == live
-# before the first wake on the EC32MB and the Edge board, the bound.
+# poles as identity unions (the three-pad jumper's two poles among them),
+# the value parser over the whole module, the error that names the value;
+# and the build fixed point: build == live before the first wake on the
+# EC32MB and the Edge board — the live system started with time held
+# (`System::hold_time`), since the module's oscillator arms a wake at
+# attach — and the bound.
 cargo test -p embsim-board --test one_pipeline --test build_fixed_point
 # Rule 2, source-strength projection (phase 1, engine half): a pull never
 # contends, ten times weaker loses with a finding, comparable sources solve
 # and project through the dead band, the pulled ohms are the winner's path,
-# ∞ Ω is a release, a current injection reads I·R or strands with a finding.
+# ∞ Ω is a release, a current injection reads I·R or strands with a finding,
+# a lone source inside the dead band reads its voltage.
 cargo test -p embsim-board --lib source_strength
+# Phase 2, the models on the boards (each in stepped mode, its own binary):
+# the TCXO's 20 MHz reaching the P2's XI as a rate across the coupling
+# capacitor with the buffer's self-biased stage at its mid-rail fixed point,
+# and the AC-coupling rule stopping a rate at a capacitor too small for it;
+# a gate's output moving exactly t_pd after its input through the datasheet
+# output resistance, and a Schmitt input holding inside its band; a PSRAM
+# Read ID answered over the module's own nets.
+cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --test psram_spi
+# Phase 2, the P2 package (stepped, own binary): the rate on XI is the
+# crystal the package reports, the reset inputs as it projects them, every
+# pad released with no core so a bench pin takes one without a fight.
+cargo test -p embsim-board --test p2_package
 # ns/solve of the MNA at m = 2, 4, 8, 11, 47 (not a test; run in release).
 cargo run -p embsim-board --release --example solve_bench
-# The ROM boot prints its edges / yields / publishes / wall time and holds
-# its escalated-solve count at 0 (needs a QEMU P2 tree).
+# The QEMU core inside the package (needs a QEMU P2 tree): the ROM boot
+# prints its edges / yields / publishes / wall time and holds its
+# escalated-solve count at 0; `pad_modes` runs a hand-assembled guest whose
+# 15 kΩ pull-up reads the sink holding its net low through `testp`;
+# `crystal_pll` stalls a guest that selected the PLL with nothing on XI,
+# then clocks it at 160 MHz from the 20 MHz that arrives — the scope reads
+# its pad writes 12–13 ns apart, and one yield per pad write.
 EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocapture
+# The p2core differential behind "60 000 states identical" is a manual run
+# against MaD's `SIL/p2core`; the exact commands (flash image, reference,
+# traced boot, comparison) are in `p2-qemu/README.md`, "The state trace and
+# the p2core differential". Run it when the node's instruction path moves.
 ```
 
 Per-crate iteration:

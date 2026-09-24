@@ -40,7 +40,7 @@ use embsim_board::{
     Board, Component, Finding, Level, NetState, PartClass, PinRef, Scenario, SenseKind, System,
 };
 use machine_parts::{
-    ec32mb_board, ec32mb_registry, edge_fingers, ep, module_polarity_fet_conducting, P2EdgeModule,
+    ec32mb_board, ec32mb_registry, edge_fingers, ep, module_polarity_fet_conducting, p2_edge_module,
 };
 
 const EC32MB: &str = include_str!("fixtures/p2_ec32mb.net");
@@ -117,9 +117,10 @@ fn the_module_builds_with_no_unclassified_parts() {
         .expect("the module builds with no unclassified-part errors");
 
     // The 21 registered components: the P2, two inverters, the TCXO, the
-    // flash, four PSRAMs, the polarity FET, two bucks, the brownout detector
-    // and eight LDOs. Everything else is an auto-classified primitive, a
-    // boundary, a switch or a mechanical node.
+    // flash, four PSRAMs (models), the polarity FET, two bucks, the brownout
+    // detector and eight LDOs (facades until phases 3–4). Everything else is
+    // an auto-classified primitive, a boundary, a switch or a mechanical
+    // node.
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert_eq!(
         registered,
@@ -203,8 +204,10 @@ fn every_p2_io_pin_is_reachable() {
         "the P2 package facade is 64 I/O + VDD + GND + TEST + RESN + XI + XO + 16 bank supplies"
     );
 
-    // The bridged force-gauge channel, as `P2EdgeModule` declares it.
-    let p2 = P2EdgeModule::new("p2");
+    // The bridged force-gauge channel sits on two of the package's pads,
+    // which the package declares like every other pad: bidirectional and
+    // released until the core drives one.
+    let p2 = p2_edge_module("p2");
     let rx = p2
         .pins()
         .iter()
@@ -218,12 +221,15 @@ fn every_p2_io_pin_is_reachable() {
     // The channel carries levels, so neither pin declares a byte route: the
     // framing lives in the MCU component, and what is on the net is edges.
     assert_eq!(rx.stream, None, "P0 reads edges, not routed bytes");
-    assert_eq!(rx.kind, embsim_board::PinKind::DigitalIn);
+    assert_eq!(rx.kind, embsim_board::PinKind::DigitalBidir);
+    assert_eq!(rx.idle, embsim_board::IdleDrive::Released);
     assert_eq!(tx.stream, None, "P2 clocks out edges, not a byte route");
+    assert_eq!(tx.kind, embsim_board::PinKind::DigitalBidir);
     assert_eq!(
-        tx.kind,
-        embsim_board::PinKind::DigitalOut,
-        "P2 is the force-gauge TX pin, and the only one this slice drives"
+        tx.idle,
+        embsim_board::IdleDrive::Released,
+        "P2 is the force-gauge TX pin: the bridge drives it at attach, the package declares \
+         it released like every pad"
     );
 }
 
@@ -567,31 +573,51 @@ fn the_reset_node_is_pulled_up_and_floats_without_the_pull_up() {
     );
 }
 
-/// Two honest floating reports the module *should* produce, and one the DIP
-/// switch explains.
+/// Three honest floating nets the build analysis *should* produce: two
+/// the clock chain explains, one the DIP switch does.
 ///
-/// - `XTAL_XI` / `XTAL_XO`: the emulator models no oscillator, so the TCXO and
-///   its inverter buffer are stubs and the P2's crystal pins see nothing. On
-///   real silicon `XI` is driven by the TCXO chain and `XO` is unused (the
-///   vendor's own note), so `XTAL_XO` is a one-pin net by design.
+/// - `XTAL_XI`: the TCXO publishes its 20 MHz as a rate one millisecond
+///   after its supply comes up — a scheduled wake, which the build analysis
+///   (the state before any wake) has not reached — so at build the buffer
+///   has nothing to relay and the P2's `XI` net floats, and since `XI` is
+///   a sense the package declares, the float is a reported finding. Live,
+///   once time runs, `XI` carries the rate: `oscillator_chain.rs` proves it.
+/// - `XTAL_XO`: unused (the vendor's own note), a one-pin net by design;
+///   the package's `XO` is the crystal driver, a released output, so the
+///   net floats and nothing senses it.
 /// - `P2_IO59`: the guide's P59 pull-up/pull-down is *selected by the DIP
 ///   switch*, and with every pole open (as shipped) neither resistor reaches
-///   the pin — so the boot strap floats. Closing a pole is
+///   the pin — so the boot strap floats. A pad is a released bidirectional
+///   pin, so the float is the net's state, read by the core when it
+///   samples the strap. Closing a pole is
 ///   `Scenario::switch("EC32MB.S301", pole, JumperState::Closed)`
 ///   (`one_pipeline.rs` closes each and reads the strap it selects).
 #[rstest]
-fn unmodeled_oscillator_and_open_dip_switch_float_their_nets() {
+fn the_clock_chain_rests_before_start_up_and_the_open_dip_switch_floats_its_strap() {
     let system = powered_module();
-    let floating = |net: &str| {
-        system.diagnostics().contains(&Finding::FloatingSense {
-            net: net.to_string(),
-            kind: SenseKind::Digital,
-        })
+    let state = |net: &str| {
+        system
+            .nets()
+            .iter()
+            .find(|n| n.name == net)
+            .map(|n| n.state)
+            .unwrap_or_else(|| panic!("{net} exists"))
     };
-    assert!(floating("EC32MB.XTAL_XI"), "the oscillator chain is a stub");
-    assert!(floating("EC32MB.XTAL_XO"), "XO is unused on this module");
     assert!(
-        floating("EC32MB.P2_IO59"),
+        system.diagnostics().contains(&Finding::FloatingSense {
+            net: "EC32MB.XTAL_XI".to_string(),
+            kind: SenseKind::Digital,
+        }),
+        "before the TCXO's start-up instant the buffer relays nothing"
+    );
+    assert_eq!(
+        state("EC32MB.XTAL_XO"),
+        NetState::Floating,
+        "XO is unused on this module"
+    );
+    assert_eq!(
+        state("EC32MB.P2_IO59"),
+        NetState::Floating,
         "with every DIP gang open the P59 strap floats; got {:?}",
         system.diagnostics().findings()
     );
@@ -599,8 +625,11 @@ fn unmodeled_oscillator_and_open_dip_switch_float_their_nets() {
 
 /// The P2's bridged transmit pin is the module's only driver, and it idles high
 /// — a UART line at rest — while the debug-serial pins next to it sit at their
-/// pull-ups. Nothing else on 114 components drives a net, which is the point of
-/// the stub pin-kind rule.
+/// pull-ups. Nothing else on 114 components drives a net: the live parts rest
+/// released (the boot flash's data-out is at high impedance while its `~CS`
+/// sits at the pull-up, W25Q128JV §4.1; the gates have no level to answer; the
+/// PSRAMs are deselected), and the facades declare senses, which is the point
+/// of the stub pin-kind rule.
 #[rstest]
 fn the_bridged_tx_pin_is_the_only_driver() {
     let system = powered_module();

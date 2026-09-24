@@ -2,11 +2,11 @@
 //! not yet modelled.
 //!
 //! **Retiring.** `DESIGN.md` rule 1 admits no stub tier: a part is a node
-//! whose class has behaviour. The facades here are the parts `NODES.md` §8
-//! phases 2–4 replace with models (the oscillator, the inverters, the
-//! PSRAMs, the FET, the rails, the detector, the isolators, the optos, the
-//! current regulators, the transistor), and the census in
-//! `board/tests/cluster_census.rs` counts them as a figure that may only
+//! whose class has behaviour. The facades left are the parts `NODES.md` §8
+//! phases 3–4 replace with models (the FET, the rails, the detector, the
+//! optos, the current regulators, the transistor — phase 2 took the
+//! oscillator, the inverters, the PSRAMs and the isolators), and the census
+//! in `board/tests/cluster_census.rs` counts them as a figure that may only
 //! fall; this module is deleted in phase 4 when it reads 0. The pin helpers
 //! are the [`PinDecl`] constructors by another name — a model still writes
 //! its table, with those.

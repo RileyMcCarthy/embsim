@@ -6,21 +6,29 @@
 //! topology rather than by a harness someone invented.
 //!
 //! What this crate supplies is the module minus its processor. `U100` is a
-//! **slot** the consumer fills — with an instruction-set simulator, a stub, or
-//! anything else implementing [`Component`] — because the CPU is the thing
-//! under test and the board is the fixture. Everything around it is here:
-//! the boot flash and the card socket as live models, the DIP switch and the
-//! oscillator-option solder link as switches with poles, the mounting holes
-//! and the BOM-only lines as mechanical nodes, the PSRAMs, regulators and
-//! oscillator as pin facades (the parts `NODES.md` §8 phases 2–4 turn into
+//! **slot** the consumer fills with a [`crate::p2::P2Package`] — the P2's
+//! 86-pin package around a core: QEMU's target, an instruction-set
+//! simulator, the native firmware behind `McuComponent`, or no core at all
+//! ([`crate::p2::P2Package::held_in_reset`], the state any P2 is in before
+//! it runs) — because the CPU is the thing under test and the board is the
+//! fixture. Everything around it is here:
+//! the boot flash and the card socket as live models, the TCXO as an
+//! oscillator publishing its 20 MHz as a rate, the two dual inverters as
+//! gates (the oscillator buffer relaying that rate to `XI`, the LED buffer
+//! sinking the cathodes), the four PSRAMs as memories answering the SPI
+//! command set, the DIP switch and the oscillator-option solder link as
+//! switches with poles, the mounting holes and the BOM-only lines as
+//! mechanical nodes, the regulators, the polarity FET and the brownout
+//! detector as pin facades (the parts `NODES.md` §8 phases 3–4 turn into
 //! models), and all 114 components classified and validated against the
 //! vendor netlist — every one a node.
 //!
 //! ```no_run
 //! # use embsim_boards::ec32mb::Ec32mb;
+//! # use embsim_boards::p2::P2Package;
 //! let board = Ec32mb::new()
 //!     .with_flash_image(std::fs::read("firmware.bin").unwrap())
-//!     .with_p2(|_decl| Box::new(my_cpu()))
+//!     .with_p2(|_decl| Box::new(P2Package::native(my_cpu())))
 //!     .build()
 //!     .expect("the module builds");
 //! # fn my_cpu() -> embsim_board::McuComponent { unimplemented!() }
@@ -62,6 +70,9 @@
 use embsim_board::{
     netlist, Board, BoardError, Component, ComponentDecl, PartRegistry, PinDecl, SwitchPole,
 };
+use embsim_models::logic_gate::{self, LogicGate, LVC2G04_PINS_BY_FUNCTION};
+use embsim_models::oscillator::{self, Oscillator};
+use embsim_models::psram::{Psram, PsramComponent};
 use embsim_models::sd_card::SdCard;
 use embsim_models::sd_card_component::{SdCardComponent, SD_CARD_PINS_BY_FUNCTION};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -110,51 +121,17 @@ pub const RAW_PCB_PART: &str = "PCB for P2 EC Module";
 /// The `value` of `NC_Net`, the layout node terminating the `NC_Net` net.
 pub const LAYOUT_NODE_PART: &str = "Layout node";
 
-/// `74LVC2G04GW,125` — NXP dual inverter (U101 oscillator buffer, U601 LED
-/// buffer). Outputs are senses per the module docs' stub rule.
-pub const INVERTER_2G04_PINS: [PinDecl; 6] = [
-    pwr_in("GND"),
-    dig_in("1A"),
-    dig_in("1Y"),
-    dig_in("2A"),
-    dig_in("2Y"),
-    pwr_in("VCC"),
-];
+/// Registry key for the dual inverters `U101` (the oscillator buffer) and
+/// `U601` (the LED buffer) — their `value`, NXP `74LVC2G04GW,125`.
+pub const INVERTER_PART: &str = "74LVC2G04GW,125";
+/// Registry key for the TCXO `X100` — its `value`, EPSON
+/// `TG2520SMN 20.0000M-ECGNNM3`, which also names its frequency.
+pub const TCXO_PART: &str = "TG2520SMN 20.0000M-ECGNNM3";
+/// Registry key for the four PSRAMs `U302`–`U305` — their `value`.
+pub const PSRAM_PART: &str = "PSRAM 64Mbit";
 
-/// `TG2520SMN 20.0000M-ECGNNM3` — EPSON 20 MHz TCXO (X100). `NC_GND` is the
-/// vendor's option pad, brought to the `J101` solder link.
-pub const TCXO_PINS: [PinDecl; 4] = [
-    pwr_in("VCC"),
-    pwr_in("GND"),
-    dig_in("OUT"),
-    passive("NC_GND"),
-];
-
-/// `SPI Flash 16MB (128Mb)` — Winbond W25Q128JV (U301).
-pub const SPI_FLASH_STUB_PINS: [PinDecl; 8] = [
-    pwr_in("VSS"),
-    pwr_in("VCC"),
-    dig_in("CLK"),
-    dig_in("CSn"),
-    dig_in("DI_IO0"),
-    dig_in("DO_IO1"),
-    dig_in("HOLDn"),
-    dig_in("WPn"),
-];
-
-/// `PSRAM 64Mbit` — AP Memory APS6404L (U302..U305). `NC_EP` is the exposed
-/// pad, tied per the vendor's asymmetric routing note.
-pub const PSRAM_PINS: [PinDecl; 9] = [
-    pwr_in("VSS"),
-    pwr_in("VDD"),
-    passive("NC_EP"),
-    dig_in("SCLK"),
-    dig_in("CEn"),
-    dig_in("SI_SIO0"),
-    dig_in("SO_SIO1"),
-    dig_in("SIO2"),
-    dig_in("SIO3"),
-];
+/// The TCXO's frequency, as its value names it: 20 MHz.
+pub const TCXO_HZ: u32 = 20_000_000;
 
 /// `P Mosfet 30V 8A` — Vishay SI3417DV reverse-polarity pass FET (U401). Its
 /// conducting channel is not modeled; the system description expresses it with
@@ -234,15 +211,28 @@ fn class_registry() -> PartRegistry {
     registry.register_mechanical(RAW_PCB_PART);
     registry.register_mechanical(LAYOUT_NODE_PART);
 
+    // Models. The TCXO publishes the rate its value names, one event, at
+    // its datasheet start-up instant; the oscillator buffer `U101` relays
+    // it across the AC-coupling capacitor `C132` to `XI` and rests its
+    // self-biased stage mid-rail; the LED buffer `U601` sinks the cathodes
+    // of `D601`/`D602` from `P38`/`P39`; the PSRAMs answer the SPI command
+    // set from an 8 MiB array each.
+    registry.register(TCXO_PART, |decl| {
+        let config = oscillator::Config::from_value(&decl.value)
+            .unwrap_or_else(|| oscillator::Config::tg2520smn(TCXO_HZ));
+        Box::new(Oscillator::new(config))
+    });
+    registry.register(INVERTER_PART, |_decl| {
+        Box::new(
+            LogicGate::new(logic_gate::Config::lvc2g04(), &LVC2G04_PINS_BY_FUNCTION)
+                .expect("the 74LVC2G04 configuration is the datasheet's"),
+        )
+    });
+    registry.register(PSRAM_PART, |_decl| {
+        Box::new(PsramComponent::new(Psram::new()))
+    });
+
     // Pin facades, until the phases of `NODES.md` §8 give each its model.
-    register_stub(&mut registry, "74LVC2G04GW,125", &INVERTER_2G04_PINS);
-    register_stub(&mut registry, "TG2520SMN 20.0000M-ECGNNM3", &TCXO_PINS);
-    register_stub(
-        &mut registry,
-        "SPI Flash 16MB (128Mb)",
-        &SPI_FLASH_STUB_PINS,
-    );
-    register_stub(&mut registry, "PSRAM 64Mbit", &PSRAM_PINS);
     register_stub(&mut registry, "P Mosfet 30V 8A", &POLARITY_FET_PINS);
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
     register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
@@ -318,7 +308,9 @@ impl Ec32mb {
         self
     }
 
-    /// Fill the processor slot.
+    /// Fill the processor slot — with a [`crate::p2::P2Package`] around the
+    /// core under test, or [`crate::p2::P2Package::held_in_reset`] for a
+    /// test about the board.
     ///
     /// Left empty, `U100` classifies as an unregistered part and the board
     /// refuses to build — deliberately, because a module whose processor

@@ -24,11 +24,11 @@
 //!
 //! # Stub pin kinds — the rule this module follows everywhere
 //!
-//! Most active parts here are still **topology-only stubs**: they declare a
+//! The power parts here are still **topology-only stubs**: they declare a
 //! real pin facade (which the board build validates against the netlist in
 //! both directions, so a symbol change breaks a test instead of going
 //! unnoticed) and no behavior. `DESIGN.md` rule 1 admits no stub tier, so
-//! each is a part `NODES.md` §8 phases 2–4 replace with a model, and
+//! each is a part `NODES.md` §8 phases 3–4 replace with a model, and
 //! `cluster_census.rs` counts them as a figure that may only fall. Until
 //! then their pin kinds are not a stylistic choice:
 //!
@@ -56,23 +56,43 @@
 //!
 //! # Modeled parts (real behavior)
 //!
-//! Three parts carry behavior, each with the datasheet header
+//! Three parts carry behavior here, each with the datasheet header
 //! `BOARD_ENGINE.md` ("Model provenance convention") requires:
 //!
 //! - [`Rs422Driver`] — TI AM26LS31, the servo step/direction pair;
 //! - [`Rs422Receiver`] — TI AM26LV32, the encoder A/B/ZI pairs;
 //! - [`SerialIsolator`] — TI ISO6731, the isolated force-gauge UART.
 //!
-//! Everything else on both boards is a stub or an auto-classified primitive.
+//! The rest come from `embsim-models`: the other four ISO67xx isolators
+//! (`IC1`, `IC2`, `IC14` with its STEP channel carrying a rate, `IC15`,
+//! `IC16`) and the 21 SN74LVC1G14 LED drivers on the Edge board; the
+//! TCXO, the two 74LVC2G04 inverters, the four PSRAMs and the boot flash
+//! `U301` (blank, the 16 MiB part `embsim-boards` ships the module with;
+//! `w25q128jv.rs` re-registers it with each case's own image) on the module.
+//! Everything else on both boards is a stub or an auto-classified primitive:
+//! on the module the polarity FET `U401`, the bucks `U402`/`U403`, the
+//! detector `U404` and the LDOs `U501`–`U508`; on the Edge board the
+//! isolated DC/DCs, the current regulators, the optos, the bucks, the
+//! polarity FET and the transistor — the parts `NODES.md` §8 phases 3–4
+//! turn into models.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::mcu::SerialChannelConfig;
+use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EndpointRef, Harness, JumperState, Level,
-    McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, Scenario, SwitchPole,
-    TheveninDrive, Volts,
+    AttachError, Board, Component, ComponentDecl, ComponentNetIo, EndpointRef, Harness,
+    JumperState, Level, McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, Scenario,
+    SwitchPole, TheveninDrive, Volts,
 };
+use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
+use embsim_boards::p2::P2Package;
+use embsim_models::isolation::{iso67xx, Channel, Iso67xx};
+use embsim_models::logic_gate::{self, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION};
+use embsim_models::oscillator::{self, Oscillator};
+use embsim_models::psram::{Psram, PsramComponent};
+use embsim_models::spi_flash::SpiNorFlash;
+use embsim_models::spi_flash_component::{SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION};
 
 // ============================================================
 // Pin-declaration helpers
@@ -824,118 +844,30 @@ pub const FORCE_GAUGE_CHANNEL: SerialChannelConfig = SerialChannelConfig {
 /// The 64 `"P{n}"` pin names. `PinDecl` needs `&'static str`, so they are
 /// spelled out (the same table [`McuComponent`] keeps privately).
 #[rustfmt::skip]
-const P2_IO_NAMES: [&str; 64] = [
-    "P0",  "P1",  "P2",  "P3",  "P4",  "P5",  "P6",  "P7",
-    "P8",  "P9",  "P10", "P11", "P12", "P13", "P14", "P15",
-    "P16", "P17", "P18", "P19", "P20", "P21", "P22", "P23",
-    "P24", "P25", "P26", "P27", "P28", "P29", "P30", "P31",
-    "P32", "P33", "P34", "P35", "P36", "P37", "P38", "P39",
-    "P40", "P41", "P42", "P43", "P44", "P45", "P46", "P47",
-    "P48", "P49", "P50", "P51", "P52", "P53", "P54", "P55",
-    "P56", "P57", "P58", "P59", "P60", "P61", "P62", "P63",
-];
-
-/// The 16 per-bank I/O supply pins the P2 package brings out, as the module
-/// netlist names them (each bank's eight pins are drawn as two symbol pins).
-#[rustfmt::skip]
-const P2_VIO_NAMES: [&str; 16] = [
-    "VIO_0_3",   "VIO_4_7",   "VIO_8_11",  "VIO_12_15",
-    "VIO_16_19", "VIO_20_23", "VIO_24_27", "VIO_28_31",
-    "VIO_32_35", "VIO_36_39", "VIO_40_43", "VIO_44_47",
-    "VIO_48_51", "VIO_52_55", "VIO_56_59", "VIO_60_63",
-];
-
-/// The P2 as the EC32MB module's `U100`: an [`McuComponent`] wearing the full
-/// physical pin facade the vendor symbol draws.
+/// The P2 as the EC32MB module's `U100`: the [`P2Package`] around the
+/// native [`McuComponent`].
 ///
-/// The two live at different altitudes and this adapter is the seam between
+/// The two live at different altitudes and the package is the seam between
 /// them. `McuComponent` declares exactly the pins its emulated peripherals
 /// bridge — two, for the bridged force-gauge UART — because that is what it
-/// knows. The *board* knows the package: 64 I/O pins, a core supply, sixteen
+/// knows. The *board* knows the package: 64 pads, a core supply, sixteen
 /// bank supplies, `RESN`, `TEST`, and the crystal pair, all of which the
 /// netlist has nodes for and all of which the build validates in both
-/// directions. So this component declares the package and delegates behavior:
-///
-/// - [`Component::pins`] is the union — the MCU's two bridged UART pins (plain
-///   digital: the channel carries levels, so there is no byte route to
-///   declare), every other I/O pin as a sense (a P2 pin is high-Z out of reset,
-///   and nothing in this slice drives it), the supplies as
-///   [`embsim_board::PinKind::PowerIn`];
-/// - [`Component::attach`] and [`Component::start`] hand straight through to
-///   the `McuComponent`, which finds `"P2"` and `"P0"` in the handle table it
-///   is given and bridges them exactly as it would on a board of its own.
-///
-/// `XO` is declared a *sense*, not an output: the emulator models no
-/// oscillator, and on this module the pin is unused anyway (the vendor drives
-/// `XI` from an external TCXO). The resulting `FloatingSense` on `XTAL_XO` is
-/// the honest report, and `ec32mb_module.rs` asserts it.
-pub struct P2EdgeModule {
-    pins: Vec<PinDecl>,
-    mcu: McuComponent,
-}
+/// directions. The package declares those (every pad a released
+/// bidirectional pin, `XI` a rate sink, `XO` a released output) and hands
+/// the MCU the pads' net I/O, so it finds `"P2"` and `"P0"` in the handle
+/// table and bridges them exactly as it would on a board of its own.
+pub type P2EdgeModule = P2Package<McuComponent>;
 
-impl P2EdgeModule {
-    /// Build the adapter with the force-gauge channel bridged.
-    pub fn new(name: &str) -> Self {
-        let channel = FORCE_GAUGE_CHANNEL;
-        let mut pins = Vec::with_capacity(86);
-        for (index, number) in P2_IO_NAMES.into_iter().enumerate() {
-            let index = index as u32;
-            // The UART's TX pin is the only one this slice drives; the RX pin
-            // reads levels like every other I/O.
-            if index == channel.tx_pin {
-                pins.push(dig_out(number));
-            } else {
-                pins.push(dig_in(number));
-            }
-        }
-        pins.push(pwr_in("VDD"));
-        pins.push(pwr_in("GND"));
-        pins.extend(P2_VIO_NAMES.into_iter().map(pwr_in));
-        // TEST is a mode strap (tied to GND on this module) and RESN an
-        // active-low input; XI is driven by the module's oscillator chain and
-        // XO is unused — all four are senses.
-        pins.push(dig_in("TEST"));
-        pins.push(dig_in("RESN"));
-        pins.push(dig_in("XI"));
-        pins.push(dig_in("XO"));
-
-        let mcu = McuComponent::builder(name)
-            .serial_table(vec![channel])
-            .bridge_serial(0)
-            .build()
-            .expect("the force-gauge channel is in the table and inside P63");
-
-        Self { pins, mcu }
-    }
-
-    /// The wrapped MCU component (peripheral instance, entry state).
-    pub fn mcu(&self) -> &McuComponent {
-        &self.mcu
-    }
-}
-
-impl std::fmt::Debug for P2EdgeModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("P2EdgeModule")
-            .field("pins", &self.pins.len())
-            .field("mcu", &self.mcu)
-            .finish()
-    }
-}
-
-impl Component for P2EdgeModule {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        self.mcu.attach(io)
-    }
-
-    fn start(&mut self) {
-        self.mcu.start();
-    }
+/// Build the module's P2 with the force-gauge channel bridged.
+pub fn p2_edge_module(name: &str) -> P2EdgeModule {
+    let channel = FORCE_GAUGE_CHANNEL;
+    let mcu = McuComponent::builder(name)
+        .serial_table(vec![channel])
+        .bridge_serial(0)
+        .build()
+        .expect("the force-gauge channel is in the table and inside P63");
+    P2Package::native(mcu)
 }
 
 /// A [`P2EdgeModule`] in facade mode bridges HAL serial channel 0 into the
@@ -962,7 +894,12 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 //                            two J-prefixed pad/socket symbols the fallback
 //                            can name — J203 (the 80-finger card edge) and
 //                            J301 (microSD socket) — as boundaries.
-//   real model               U100, the P2 (see `P2EdgeModule`).
+//   real model               U100, the P2 (see `P2EdgeModule`); U301, the
+//                            boot flash (`embsim_models::spi_flash`, blank);
+//                            X100, the TCXO (`embsim_models::oscillator`);
+//                            U101 and U601, the dual inverters
+//                            (`embsim_models::logic_gate`); U302–U305, the
+//                            PSRAMs (`embsim_models::psram`).
 //   switch (by value)        S301, the four-way DIP switch, four poles by
 //                            `<position>_ON`/`<position>_OFF`; J101, the
 //                            oscillator-option solder link, one pole. Every
@@ -972,59 +909,11 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 //                            node): pads and nothing electrical.
 //   stub                     every other active part, below.
 //
-// Why the rest are still stubs and not models: none of them is on a signal
-// path any consumer test drives yet. The PSRAMs answer a QSPI controller the
-// firmware does not exercise in SIL; the LDOs, bucks, polarity FET and
-// brownout detector matter as *power topology*, which their PowerIn/PowerOut
-// declarations already express; the TCXO and its inverter buffer matter only
-// as the reason XTAL_XI exists. Each becomes a model in `NODES.md` §8 phases
-// 2–4 — the facades below are already the netlist-validated boundary.
-
-/// `74LVC2G04GW,125` — NXP dual inverter (U101 oscillator buffer, U601 LED
-/// buffer). Outputs are senses per the module docs' stub rule.
-pub const INVERTER_2G04_PINS: [PinDecl; 6] = [
-    pwr_in("GND"),
-    dig_in("1A"),
-    dig_in("1Y"),
-    dig_in("2A"),
-    dig_in("2Y"),
-    pwr_in("VCC"),
-];
-
-/// `TG2520SMN 20.0000M-ECGNNM3` — EPSON 20 MHz TCXO (X100). `NC_GND` is the
-/// vendor's option pad, brought to the `J101` solder link.
-pub const TCXO_PINS: [PinDecl; 4] = [
-    pwr_in("VCC"),
-    pwr_in("GND"),
-    dig_in("OUT"),
-    passive("NC_GND"),
-];
-
-/// `SPI Flash 16MB (128Mb)` — Winbond W25Q128JV (U301).
-pub const SPI_FLASH_PINS: [PinDecl; 8] = [
-    pwr_in("VSS"),
-    pwr_in("VCC"),
-    dig_in("CLK"),
-    dig_in("CSn"),
-    dig_in("DI_IO0"),
-    dig_in("DO_IO1"),
-    dig_in("HOLDn"),
-    dig_in("WPn"),
-];
-
-/// `PSRAM 64Mbit` — AP Memory APS6404L (U302..U305). `NC_EP` is the exposed
-/// pad, tied per the vendor's asymmetric routing note.
-pub const PSRAM_PINS: [PinDecl; 9] = [
-    pwr_in("VSS"),
-    pwr_in("VDD"),
-    passive("NC_EP"),
-    dig_in("SCLK"),
-    dig_in("CEn"),
-    dig_in("SI_SIO0"),
-    dig_in("SO_SIO1"),
-    dig_in("SIO2"),
-    dig_in("SIO3"),
-];
+// Why the power parts are still stubs and not models: the LDOs, bucks,
+// polarity FET and brownout detector matter as *power topology*, which
+// their PowerIn/PowerOut declarations already express. Each becomes a model
+// in `NODES.md` §8 phases 3–4 — the facades below are already the
+// netlist-validated boundary.
 
 /// `P Mosfet 30V 8A` — Vishay SI3417DV reverse-polarity pass FET (U401). Its
 /// conducting channel is not modeled; the system description expresses it with
@@ -1083,16 +972,38 @@ pub fn ec32mb_registry() -> PartRegistry {
     // the `value` field.
     registry.classify_unnamed_by_reference(true);
 
-    registry.register("P2X8C4M64P", |_decl| Box::new(P2EdgeModule::new("p2")));
+    registry.register("P2X8C4M64P", |_decl| Box::new(p2_edge_module("p2")));
     registry.register_switch("DIP Switch 4 way", dip_switch_poles());
     registry.register_switch("Solder Link Pads", solder_link_poles());
     registry.register_mechanical("Mounting Hole Vss");
     registry.register_mechanical("PCB for P2 EC Module");
     registry.register_mechanical("Layout node");
-    register_stub(&mut registry, "74LVC2G04GW,125", &INVERTER_2G04_PINS);
-    register_stub(&mut registry, "TG2520SMN 20.0000M-ECGNNM3", &TCXO_PINS);
-    register_stub(&mut registry, "SPI Flash 16MB (128Mb)", &SPI_FLASH_PINS);
-    register_stub(&mut registry, "PSRAM 64Mbit", &PSRAM_PINS);
+    // The TCXO at the frequency its value names, the two dual inverters,
+    // the four PSRAMs — the same models `embsim-boards` ships the module
+    // with.
+    registry.register("TG2520SMN 20.0000M-ECGNNM3", |decl: &ComponentDecl| {
+        let config = oscillator::Config::from_value(&decl.value)
+            .unwrap_or_else(|| panic!("{}: the TCXO value names no frequency", decl.reference));
+        Box::new(Oscillator::new(config))
+    });
+    registry.register("74LVC2G04GW,125", |_decl| {
+        Box::new(
+            LogicGate::new(logic_gate::Config::lvc2g04(), &LVC2G04_PINS_BY_FUNCTION)
+                .expect("the datasheet configuration is valid"),
+        )
+    });
+    registry.register("PSRAM 64Mbit", |_decl| {
+        Box::new(PsramComponent::new(Psram::new()))
+    });
+    // The boot flash, live and blank — the same part `embsim-boards`
+    // registers, so the two registries agree about `U301`; a test that
+    // wants an image re-registers the key with its own (`w25q128jv.rs`).
+    registry.register(FLASH_PART, |_decl| {
+        Box::new(
+            SpiNorFlashComponent::new(SpiNorFlash::blank(FLASH_CAPACITY))
+                .with_pins(&SPI_FLASH_PINS_BY_FUNCTION),
+        )
+    });
     register_stub(&mut registry, "P Mosfet 30V 8A", &POLARITY_FET_PINS);
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
     register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
@@ -1107,71 +1018,16 @@ pub fn ec32mb_board() -> Board {
     Board::from_netlist(parsed, &ec32mb_registry()).expect("the EC32MB module builds")
 }
 
-/// A processor-shaped placeholder for the module's `U100` slot: the
-/// netlist's own pins — supplies as [`embsim_board::PinKind::PowerIn`],
-/// everything else a sense — and no behaviour, built from the netlist so it
-/// cannot drift from what `U100` declares. It touches no process-global
-/// peripheral bank, unlike [`P2EdgeModule`], so a test that wants the
-/// module as `embsim-boards` ships it and nothing running in it can use
-/// [`shipped_ec32mb_board`] without the module-instance lock. The same
-/// shape `boards/tests/ec32mb.rs` fills the slot with;
-/// `P2Package::held_in_reset()` replaces both in `NODES.md` §8 phase 2.
-#[derive(Debug)]
-pub struct P2Slot {
-    pins: Vec<PinDecl>,
-}
-
-impl P2Slot {
-    /// The placeholder, its pins read from the module netlist.
-    pub fn new() -> Self {
-        let parsed = embsim_board::netlist::parse(include_str!("../fixtures/p2_ec32mb.net"))
-            .expect("the EC32MB fixture parses");
-        let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for net in &parsed.nets {
-            for node in &net.nodes {
-                if node.reference == "U100" {
-                    names.insert(node.pin.as_str());
-                }
-            }
-        }
-        let pins = names
-            .into_iter()
-            .map(|n| {
-                // Leaked so the facade can be `&'static`, as `Component::pins`
-                // requires. One allocation per test process.
-                let number: &'static str = Box::leak(n.to_string().into_boxed_str());
-                if n.starts_with("VIO") || n == "VDD" || n == "GND" || n == "TEST" {
-                    pwr_in(number)
-                } else {
-                    dig_in(number)
-                }
-            })
-            .collect();
-        Self { pins }
-    }
-}
-
-impl Default for P2Slot {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Component for P2Slot {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
-        Ok(())
-    }
-}
-
 /// The P2-EC32MB as `embsim-boards` ships it — its own registry, a blank
 /// boot flash, an empty card socket — with the processor slot filled by a
-/// [`P2Slot`].
+/// P2 package held in reset ([`P2Package::held_in_reset`]): every pad
+/// released, the rails and `RESN` sensed, `XI` accepting the rate, and no
+/// core. It touches no process-global peripheral bank, unlike
+/// [`P2EdgeModule`], so a test that wants the module as shipped and nothing
+/// running in it can use this without the module-instance lock.
 pub fn shipped_ec32mb_board() -> Board {
     embsim_boards::ec32mb::Ec32mb::new()
-        .with_p2(|_decl| Box::new(P2Slot::new()))
+        .with_p2(|_decl| Box::new(P2Package::held_in_reset()))
         .build()
         .expect("the module builds")
 }
@@ -1191,95 +1047,17 @@ pub fn shipped_ec32mb_board() -> Board {
 //               MountingHole_Pad ×4 — mechanical nodes.
 //               (86 + 24 + 5 + 1 + 4 + 48 registered = the netlist's 168.)
 //   real model  AM26LS31CD (U24) and AM26LV32xD (U25), the encoder/servo
-//               RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator.
-//   stub        the other 12 active types, below.
-//
-// The ISO674x/ISO672x symbols draw every pin as `passive`; their facades here
-// keep that (topology-only) rather than inventing directions, because on this
-// board they are all *transparent* barriers between an MCU pin and a connector
-// pin, and topology is exactly what a build test needs from them. Promoting
-// one to a repeater is a two-line change against `SerialIsolator`'s shape.
+//               RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator;
+//               ISO6742DWR (IC1, IC2), ISO6741DWR (IC14), ISO6721BDR (IC15)
+//               and ISO6740FDWR (IC16), the `embsim_models::isolation`
+//               family model configured from each part name; SN74LVC1G14DBV
+//               ×21 (U9–U34), the Schmitt inverters driving the front-panel
+//               LEDs (`embsim_models::logic_gate`).
+//   stub        the other 7 active types, below.
 
-/// `ISO6742DWR` — TI quad digital isolator, 2 forward + 2 reverse (IC1: the
-/// isolated GPIO block; IC2: the Raspberry-Pi UART/GPIO block).
-#[rustfmt::skip]
-pub const ISO6742_PINS: [PinDecl; 16] = [
-    pwr_in("1"),  // VCC1
-    pwr_in("2"),  // GND1_1
-    dig_in("3"),  // INA
-    dig_in("4"),  // INB
-    dig_in("5"),  // OUTC
-    dig_in("6"),  // OUTD
-    nc("7"),      // EN1
-    pwr_in("8"),  // GND1_2
-    pwr_in("9"),  // GND2_1
-    nc("10"),     // EN2
-    dig_in("11"), // IND
-    dig_in("12"), // INC
-    dig_in("13"), // OUTB
-    dig_in("14"), // OUTA
-    pwr_in("15"), // GND2_2
-    pwr_in("16"), // VCC2
-];
-
-/// `ISO6741DWR` — TI quad digital isolator, 3 forward + 1 reverse (IC14: the
-/// servo control block on sheet 3).
-#[rustfmt::skip]
-pub const ISO6741_PINS: [PinDecl; 16] = [
-    pwr_in("1"),  // VCC1
-    pwr_in("2"),  // GND1_1
-    dig_in("3"),  // INA
-    dig_in("4"),  // INB
-    dig_in("5"),  // INC
-    dig_in("6"),  // OUTD
-    nc("7"),      // EN1
-    pwr_in("8"),  // GND1_2
-    pwr_in("9"),  // GND2_1
-    nc("10"),     // EN2
-    dig_in("11"), // IND
-    dig_in("12"), // OUTC
-    dig_in("13"), // OUTB
-    dig_in("14"), // OUTA
-    pwr_in("15"), // GND2_2
-    pwr_in("16"), // VCC2
-];
-
-/// `ISO6740FDWR` — TI quad digital isolator, 4 forward with fail-safe
-/// (IC16: the encoder block, carrying the RS-422 receiver's outputs across to
-/// the P2).
-#[rustfmt::skip]
-pub const ISO6740_PINS: [PinDecl; 16] = [
-    pwr_in("1"),  // VCC1
-    pwr_in("2"),  // GND1_1
-    dig_in("3"),  // INA
-    dig_in("4"),  // INB
-    dig_in("5"),  // INC
-    dig_in("6"),  // IND
-    nc("7"),      // NC
-    pwr_in("8"),  // GND1_2
-    pwr_in("9"),  // GND2_1
-    nc("10"),     // EN2
-    dig_in("11"), // OUTD
-    dig_in("12"), // OUTC
-    dig_in("13"), // OUTB
-    dig_in("14"), // OUTA
-    pwr_in("15"), // GND2_2
-    pwr_in("16"), // VCC2
-];
-
-/// `ISO6721BDR` — TI dual digital isolator, 1 forward + 1 reverse (IC15: the
-/// isolated servo-serial UART on sheet 3).
-#[rustfmt::skip]
-pub const ISO6721_PINS: [PinDecl; 8] = [
-    pwr_in("1"), // VCC1
-    dig_in("2"), // OUTA
-    dig_in("3"), // INB
-    pwr_in("4"), // GND1
-    pwr_in("5"), // GND2
-    dig_in("6"), // OUTB
-    dig_in("7"), // INA
-    pwr_in("8"), // VCC2
-];
+/// Which of `IC14`'s channels carries the servo step clock: `INA` (pin 3,
+/// on `P8`) to `OUTA` (pin 14) — a rate crosses the barrier, not edges.
+pub const SERVO_STEP_CHANNEL: Channel = Channel::A;
 
 /// `UCC12040DVER` — TI isolated 500 mW DC/DC module (IC3: the isolated I/O
 /// domain; IC4: the force-gauge domain).
@@ -1341,17 +1119,6 @@ pub const VO2631_PINS: [PinDecl; 8] = [
     dig_in("6"),  // VO2 (open collector)
     dig_in("7"),  // VO1 (open collector)
     pwr_in("8"),  // VCC
-];
-
-/// `SN74LVC1G14DBV` — TI single Schmitt-trigger inverter (21 instances, one
-/// per front-panel status LED).
-#[rustfmt::skip]
-pub const SN74LVC1G14_PINS: [PinDecl; 5] = [
-    nc("1"),     // NC
-    dig_in("2"), // A
-    pwr_in("3"), // GND
-    dig_in("4"), // Y
-    pwr_in("5"), // VCC
 ];
 
 /// `XL1509` — 2 A step-down converter (U1: +5 V, U2: +3.3 V).
@@ -1423,16 +1190,34 @@ pub fn edge_registry_without_socket() -> PartRegistry {
         Box::new(SerialIsolator::new(LOGIC_RAIL_VOLTS))
     });
 
+    // The other ISO67xx isolators, configured straight from their part
+    // names — `ISO6740FDWR` picks up its fail-safe-low default without
+    // anyone re-deriving it from the suffix. `IC14`'s STEP channel carries
+    // the servo step clock as a rate.
+    for part in ["ISO6742DWR", "ISO6741DWR", "ISO6740FDWR", "ISO6721BDR"] {
+        registry.register(part, move |decl: &ComponentDecl| {
+            let name = normalize_part(decl);
+            let mut config = iso67xx::Config::from_part_name(&name)
+                .unwrap_or_else(|| panic!("{name} is an ISO67xx"));
+            if decl.reference == "IC14" {
+                config = config.with_pulse_channel(SERVO_STEP_CHANNEL);
+            }
+            Box::new(Iso67xx::new(config).expect("a valid isolator configuration"))
+        });
+    }
+    // The 21 Schmitt inverters driving the front-panel LEDs.
+    registry.register("SN74LVC1G14DBV", |_decl| {
+        Box::new(
+            LogicGate::new(logic_gate::Config::lvc1g14(), &LVC1G14_PINS_SOT23)
+                .expect("the datasheet configuration is valid"),
+        )
+    });
+
     // Topology-only stubs.
-    register_stub(&mut registry, "ISO6742DWR", &ISO6742_PINS);
-    register_stub(&mut registry, "ISO6741DWR", &ISO6741_PINS);
-    register_stub(&mut registry, "ISO6740FDWR", &ISO6740_PINS);
-    register_stub(&mut registry, "ISO6721BDR", &ISO6721_PINS);
     register_stub(&mut registry, "UCC12040DVER", &UCC12040_PINS);
     register_stub(&mut registry, "NSI50010YT1G_1", &NSI50010_PINS);
     register_stub(&mut registry, "6N137", &OPTO_6N137_PINS);
     register_stub(&mut registry, "VO2631", &VO2631_PINS);
-    register_stub(&mut registry, "SN74LVC1G14DBV", &SN74LVC1G14_PINS);
     register_stub(&mut registry, "XL1509", &XL1509_PINS);
     register_stub(&mut registry, "APM4953", &APM4953_PINS);
     register_stub(&mut registry, "2N3904", &NPN_PINS);

@@ -351,6 +351,8 @@ pub struct System {
     /// Stepped-clock quiescence timeout override; `None` uses the engine
     /// default. See [`System::quiescence_timeout`].
     quiescence_timeout: Option<Duration>,
+    /// Keep virtual time held after `start` (see [`System::hold_time`]).
+    hold_time: bool,
 }
 
 /// A bench component: a bare [`Component`] added to the system without a
@@ -388,6 +390,17 @@ struct PreparedPin {
     net: usize,
     endpoint: Option<EndpointId>,
     stream: Option<StreamRole>,
+    /// A `DigitalBidir` pin declared `IdleDrive::Released`: an input until
+    /// its owner drives it, whose sense subscription declares its net read
+    /// (see [`crate::PinHandle`]'s field of the same name).
+    reads_when_released: bool,
+}
+
+/// Whether a declared pin is a released bidirectional pad — the one kind
+/// whose sense subscription, rather than its declaration, makes its net a
+/// digital sense.
+fn reads_when_released(pin: &PinDecl) -> bool {
+    pin.kind == PinKind::DigitalBidir && pin.idle == IdleDrive::Released
 }
 
 /// Output of the shared assembly pass: the merged net table, the populated
@@ -457,6 +470,27 @@ impl System {
     /// stall.
     pub fn quiescence_timeout(mut self, timeout: Duration) -> Self {
         self.quiescence_timeout = Some(timeout);
+        self
+    }
+
+    /// Keep virtual time **held** after [`System::start`] returns, until
+    /// [`SystemHandle::release_time`] is called.
+    ///
+    /// With the hold kept, the live engine still applies every attach-time
+    /// drive and delivers every sense — the system rests where its parts
+    /// left it — but no scheduled wake fires, so the state the handle reads
+    /// is the system's **before its first wake**: what a rail with a
+    /// soft-start, an oscillator with a start-up time or a gate with a
+    /// propagation delay has not yet changed. That is the state
+    /// [`System::build`] analyzes, and the two are compared with the hold
+    /// in place (`board/tests/build_fixed_point.rs`). Release it to run.
+    ///
+    /// The hold is the same in both pacing modes: virtual time is only the
+    /// counter the engine advances (never wall time), and the release gate
+    /// sits before the engine's one advance, so a paced (free-running)
+    /// system started held is held exactly as an unpaced one is.
+    pub fn hold_time(mut self) -> Self {
+        self.hold_time = true;
         self
     }
 
@@ -548,11 +582,33 @@ impl System {
         // it gets is the last round's, marked `Finding::BuildNotSettled`.
         let mut passes = 0;
         let mut unsettled: Vec<String> = Vec::new();
+        // Nets a released bidirectional pad subscribed to are read from
+        // that subscription on: each is declared a digital sense once, the
+        // way the live engine's `Command::DeclareRead` does, and the
+        // declaration is a change the next pass reports (a floating one is
+        // `Finding::FloatingSense`). Subscriptions made from inside a
+        // delivered callback are caught on the round after.
+        let mut declared_reads: Vec<usize> = Vec::new();
         let settled = loop {
             let idle_drives = std::mem::take(&mut *recorded_drives.lock().expect("never poisoned"));
             let mut changed = false;
             for (endpoint, drive) in idle_drives {
                 changed |= resolver.set_drive(endpoint, drive);
+            }
+            let reads: Vec<usize> = recorded_senses
+                .0
+                .lock()
+                .expect("never poisoned")
+                .iter()
+                .filter(|sense| sense.reads && !declared_reads.contains(&sense.net.0))
+                .map(|sense| sense.net.0)
+                .collect();
+            for net in reads {
+                if !declared_reads.contains(&net) {
+                    declared_reads.push(net);
+                    resolver.add_digital_sense(net);
+                    changed = true;
+                }
             }
             if !changed {
                 break true;
@@ -581,9 +637,9 @@ impl System {
             // behind the ones that exist.
             let senses = std::mem::take(&mut *recorded_senses.0.lock().expect("never poisoned"));
             for &i in &moved {
-                for (net, callback) in &senses {
-                    if net.0 == i {
-                        callback(nets[i].state);
+                for sense in &senses {
+                    if sense.net.0 == i {
+                        (sense.callback)(nets[i].state);
                     }
                 }
             }
@@ -635,6 +691,7 @@ impl System {
     pub fn start(self) -> Result<SystemHandle, SystemError> {
         let event_log = self.event_log.clone();
         let quiescence_timeout = self.quiescence_timeout;
+        let hold_time = self.hold_time;
         let Assembly {
             nets,
             resolver,
@@ -692,8 +749,11 @@ impl System {
         // The system is assembled. Release the engine's hold on virtual time:
         // nothing may advance until every component has registered its
         // schedules, or a second component's period would be anchored at a
-        // different instant from run to run.
-        engine.release_time();
+        // different instant from run to run. A caller that asked to keep
+        // the hold releases it through `SystemHandle::release_time`.
+        if !hold_time {
+            engine.release_time();
+        }
 
         Ok(SystemHandle {
             engine,
@@ -996,6 +1056,22 @@ impl System {
                             // DC open in the build-time pass.
                             PassiveKind::Capacitor | PassiveKind::Diode | PassiveKind::Led => false,
                         };
+                        // A capacitor with a parsed value is an AC path for
+                        // rate routing — a step clock or an oscillator's
+                        // output crosses it — and a DC open everywhere else
+                        // (`NODES.md` §2; it is never a conduction edge).
+                        if *kind == PassiveKind::Capacitor && record.pins.len() == 2 {
+                            if let Some(farads) = value {
+                                self.coupling_capacitor(
+                                    bi,
+                                    record,
+                                    *farads,
+                                    &net_of_pin,
+                                    &detached,
+                                    &mut resolver,
+                                );
+                            }
+                        }
                         if conducts && record.pins.len() == 2 {
                             let ohms = match kind {
                                 PassiveKind::Resistor => value.unwrap_or(0.0),
@@ -1131,6 +1207,7 @@ impl System {
                                 net,
                                 endpoint: endpoints.get(&key).copied(),
                                 stream: pin.stream,
+                                reads_when_released: reads_when_released(pin),
                             });
                         }
                     }
@@ -1161,6 +1238,7 @@ impl System {
                     net,
                     endpoint,
                     stream: pin.stream,
+                    reads_when_released: reads_when_released(pin),
                 })
                 .collect();
             components.push(PreparedComponent {
@@ -1251,6 +1329,33 @@ impl System {
 
     /// Add a two-terminal passive/jumper conduction edge between the nets of
     /// a record's pins, respecting detached pins.
+    /// Register a two-terminal capacitor as a coupling for rate routing,
+    /// honouring a detached pad the way a passive edge does.
+    fn coupling_capacitor(
+        &self,
+        bi: usize,
+        record: &crate::board::PartRecord,
+        farads: f64,
+        net_of_pin: &HashMap<(usize, PinRef), usize>,
+        detached: &HashSet<(usize, PinRef)>,
+        resolver: &mut Resolver,
+    ) {
+        let a_key = (
+            bi,
+            PinRef::new(record.reference.clone(), record.pins[0].clone()),
+        );
+        let b_key = (
+            bi,
+            PinRef::new(record.reference.clone(), record.pins[1].clone()),
+        );
+        if detached.contains(&a_key) || detached.contains(&b_key) {
+            return;
+        }
+        if let (Some(&a), Some(&b)) = (net_of_pin.get(&a_key), net_of_pin.get(&b_key)) {
+            resolver.add_coupling(a, b, farads, record.reference.clone());
+        }
+    }
+
     fn passive_edge(
         &self,
         bi: usize,
@@ -1366,7 +1471,8 @@ fn add_pin_descriptor(
 fn handle_entries(pins: &[PreparedPin], link: &EngineLink) -> Vec<(String, PinHandle)> {
     let mut entries = Vec::new();
     for pin in pins {
-        let handle = PinHandle::wired(NetId(pin.net), pin.endpoint, pin.stream, link.clone());
+        let handle = PinHandle::wired(NetId(pin.net), pin.endpoint, pin.stream, link.clone())
+            .reading_when_released(pin.reads_when_released);
         entries.push((pin.number.clone(), handle.clone()));
         if let Some(name) = &pin.name {
             entries.push((name.clone(), handle));
@@ -1540,6 +1646,14 @@ impl SystemHandle {
         self.components
             .iter()
             .map(|(reference, _)| reference.as_str())
+    }
+
+    /// Release the engine's hold on virtual time, for a system started with
+    /// [`System::hold_time`]. Idempotent; a system started without the
+    /// hold has already released it. Paced or unpaced alike — see
+    /// [`System::hold_time`].
+    pub fn release_time(&self) {
+        self.engine.release_time();
     }
 
     /// Shut the live system down explicitly (equivalent to dropping it).

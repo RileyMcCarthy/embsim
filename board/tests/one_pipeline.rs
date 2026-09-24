@@ -25,12 +25,13 @@ mod machine_parts;
 
 use embsim_board::registry::parse_passive_value;
 use embsim_board::{
-    Board, BoardError, DnpState, EndpointRef, Finding, Harness, JumperState, Level, NetState,
-    PartClass, PartRegistry, PwlSpec, Scenario, SenseKind, System, SystemError,
+    AttachError, Board, BoardError, DnpState, EndpointRef, Finding, Harness, JumperState, Level,
+    NetState, PartClass, PartRegistry, PwlSpec, Scenario, SenseKind, System, SystemError,
 };
 use embsim_boards::ec32mb::{
-    FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE, P59_PULL_UP_POLE,
+    Ec32mb, FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE, P59_PULL_UP_POLE,
 };
+use embsim_boards::p2::{P2Core, P2Package, P2Pads};
 use machine_parts::{edge_board, shipped_ec32mb_board};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
@@ -272,10 +273,10 @@ fn closing_a_dip_switch_pole_joins_its_two_nets(
     );
     expect!(
         "strap-selected",
-        "the P59 boot strap reads pulled high with the pull-up position closed, pulled low \
-         with the pull-down position closed, and floats with every position open",
-        "the switch selects which of the two resistors reaches the strap, which is how the \
-         module's boot mode is set"
+        "the P59 boot strap is pulled high or low through the selected position's 10.5 \
+         kilohms, and floats with every position open",
+        "the switch selects which of the two 10.5 kilohm resistors reaches the strap, which \
+         is how the module's boot mode is set"
     );
 
     let scenario = match closed {
@@ -305,18 +306,132 @@ fn closing_a_dip_switch_pole_joins_its_two_nets(
         .map(|id| system.nets()[id.0].state)
         .expect("the strap net exists");
     match strap {
-        Some(level) => assert!(
-            matches!(state, NetState::Pulled(l, _) if l == level),
-            "P2_IO59 pulled {level:?}; got {state:?}"
+        Some(level) => assert_eq!(
+            state,
+            NetState::Pulled(level, 10_500.0),
+            "P2_IO59 pulled {level:?} through the selected 10.5 kΩ resistor"
         ),
         None => {
             assert_eq!(state, NetState::Floating, "with every pole open");
+            // The boot flash's data-in sits on this net — an input that
+            // reads it whatever fills the processor slot — so the float is
+            // a reported finding.
             assert!(system.diagnostics().contains(&Finding::FloatingSense {
                 net: strap_net.clone(),
                 kind: SenseKind::Digital,
             }));
         }
     }
+}
+
+/// A core that samples one pad and nothing else: it subscribes to that pad,
+/// as the ROM does to the P59 boot strap when it decides between booting
+/// the program it loaded and waiting for a serial loader.
+struct PadReader(u8);
+
+impl P2Core for PadReader {
+    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
+        pads.on_pad_sense(self.0, |_state| {})
+    }
+}
+
+/// The module with a [`PadReader`] on `pad` in its processor slot, built
+/// bare with the bench rails [`module_with`] supplies.
+fn module_read_by_a_core(pad: u8, scenario: Scenario) -> embsim_board::BuiltSystem {
+    let board = Ec32mb::new()
+        .with_p2(move |_decl| Box::new(P2Package::new(PadReader(pad))))
+        .build()
+        .expect("the module builds");
+    System::new()
+        .board(MODULE, board)
+        .scenario(
+            scenario
+                .net_stuck(&format!("{MODULE}.GND"), 0.0)
+                .net_stuck(&format!("{MODULE}.VIO_56_63"), 3.3),
+        )
+        .build()
+        .expect("the module builds")
+}
+
+/// A pad is an input to the core that samples it. `P0` sits on a bare
+/// card-edge finger — nothing else on the module has an input on that net
+/// — so it floats either way and is a *floating input*, the finding
+/// `DESIGN.md` §1 exists to raise, only when a core reads it. (`P59` is
+/// different: the boot flash's data-in reads that net, so its float is
+/// reported whatever is in the slot — the two switch cases above.) A pad the
+/// core reads that a resistor reaches is an input with a level, and silent.
+#[rstest]
+#[case::read_bare_pad(Some(0), "P2_IO0", None, NetState::Floating, true)]
+#[case::unread_bare_pad(None, "P2_IO0", None, NetState::Floating, false)]
+#[case::read_pulled_strap(
+    Some(59),
+    "P2_IO59",
+    Some(P59_PULL_DOWN_POLE),
+    NetState::Pulled(Level::Low, 10_500.0),
+    false
+)]
+fn a_pad_is_a_floating_input_only_to_the_core_that_samples_it(
+    #[case] reader: Option<u8>,
+    #[case] net: &str,
+    #[case] closed: Option<usize>,
+    #[case] state: NetState,
+    #[case] reported: bool,
+) {
+    behaviour!(Test {
+        id: "pad.floating-input-only-when-sampled",
+        covers: Some("board/src/system.rs#System::build"),
+        given: "the P2-EC32MB module with its ground and I/O rail supplied by the bench, and \
+                in the processor slot a core that samples one pad — P0 on a bare card-edge \
+                finger, or P59 with the DIP switch's pull-down closed — or a core that \
+                samples none",
+    });
+    expect!(
+        "reported-when-sampled-open",
+        "a core that samples the bare P0 pad is told its net floats, and the run reports \
+         that net as a floating input",
+        "a released pad is an input to whatever samples it, and an input with no level is \
+         what the tool is there to see"
+    );
+    expect!(
+        "silent-when-unsampled",
+        "with a core that samples no pad the bare P0 pad's net floats and the run's \
+         findings name no input on it",
+        "a released pad nobody samples is an open pad, which is the drawing"
+    );
+    expect!(
+        "silent-when-sourced",
+        "a core that samples P59 with the pull-down position closed reads it low, and the \
+         run's findings name no input on it",
+        "the selected resistor is a source that reaches the pad"
+    );
+
+    let scenario = match closed {
+        Some(pole) => Scenario::default().switch(
+            &format!("{MODULE}.{FLASH_SELECT_SWITCH}"),
+            pole,
+            JumperState::Closed,
+        ),
+        None => Scenario::default(),
+    };
+    let system = match reader {
+        Some(pad) => module_read_by_a_core(pad, scenario),
+        None => module_with(scenario),
+    };
+    let net = format!("{MODULE}.{net}");
+    let actual = system
+        .net_id(&net)
+        .map(|id| system.nets()[id.0].state)
+        .expect("the net exists");
+    assert_eq!(actual, state, "{net}");
+    assert_eq!(
+        system.diagnostics().contains(&Finding::FloatingSense {
+            net: net.clone(),
+            kind: SenseKind::Digital,
+        }),
+        reported,
+        "floating-input finding on {net}; findings {:?}",
+        system.diagnostics().findings()
+    );
 }
 
 /// A detached contact on a closed pole conducts nothing: the pole honours
@@ -348,42 +463,181 @@ fn a_detached_contact_leaves_a_closed_pole_open(#[case] lifted: &str) {
     );
     let strap_net = format!("{MODULE}.P2_IO59");
     assert!(!system.names_are_merged(&strap_net, &format!("{MODULE}.Net-(S301-3_OFF)")));
+    let state = system
+        .net_id(&strap_net)
+        .map(|id| system.nets()[id.0].state)
+        .expect("the strap net exists");
+    assert_eq!(state, NetState::Floating);
+    // Read by the flash's data-in, so reported.
     assert!(system.diagnostics().contains(&Finding::FloatingSense {
         net: strap_net,
         kind: SenseKind::Digital,
     }));
 }
 
+/// A bench pin resting driven low at attach — what a P2 asserting the
+/// flash select does — attachable to any pin of the module.
+struct LowDriver {
+    pins: [embsim_board::PinDecl; 1],
+}
+
+impl LowDriver {
+    fn new() -> Self {
+        Self {
+            pins: [embsim_board::PinDecl::digital_out("Q").with_idle(
+                embsim_board::IdleDrive::Thevenin(embsim_board::digital_drive(Level::Low)),
+            )],
+        }
+    }
+}
+
+impl embsim_board::Component for LowDriver {
+    fn pins(&self) -> &[embsim_board::PinDecl] {
+        &self.pins
+    }
+
+    fn attach(
+        &mut self,
+        _io: embsim_board::ComponentNetIo,
+    ) -> Result<(), embsim_board::AttachError> {
+        Ok(())
+    }
+}
+
 /// The FLASH position is the one the ROM boot depends on: closed, the
-/// P2's `P61` and the flash's `~CS` are one node, and the pull-up on the
-/// select reaches the pin.
+/// P2's `P61` and the flash's `~CS` are one node — pulled high by the
+/// select's pull-up when nothing drives `P61`, driven low when the P2 does.
 #[rstest]
-fn the_flash_position_puts_the_chip_select_on_p61() {
+#[case::pulled_up(false)]
+#[case::driven_low(true)]
+fn the_flash_position_puts_the_chip_select_on_p61(#[case] p61_driven_low: bool) {
     behaviour!(Test {
         id: "switch.flash-position-selects-the-flash",
         covers: Some("board/src/system.rs#System::assemble"),
-        given: "the module with the DIP switch's FLASH position closed and the I/O rail up",
+        given: "the module with the DIP switch's FLASH position closed and the I/O rail up, \
+                with the P2's pin 61 left alone or driven low",
     });
     expect!(
         "select-on-p61",
         "the P2's pin 61 and the flash's chip select are one node, pulled high by the \
-         select's pull-up",
+         select's pull-up while nothing drives the pin",
         "the FLASH position is the module's switch between the flash and the card on the \
          shared bus"
     );
+    expect!(
+        "select-follows-the-driver",
+        "with pin 61 driven low the flash's chip select reads driven low",
+        "a driver on the pin wins the node against the 10.5 kilohm pull-up through the \
+         closed contact, which is how the P2 asserts the flash"
+    );
 
-    let system = module_with(Scenario::default().switch(
-        &format!("{MODULE}.{FLASH_SELECT_SWITCH}"),
-        FLASH_SELECT_POLE,
-        JumperState::Closed,
-    ));
+    let scenario = Scenario::default()
+        .switch(
+            &format!("{MODULE}.{FLASH_SELECT_SWITCH}"),
+            FLASH_SELECT_POLE,
+            JumperState::Closed,
+        )
+        .net_stuck(&format!("{MODULE}.GND"), 0.0)
+        .net_stuck(&format!("{MODULE}.VIO_56_63"), 3.3);
+    let mut system = System::new()
+        .board(MODULE, shipped_ec32mb_board())
+        .scenario(scenario);
+    if p61_driven_low {
+        system =
+            system
+                .component("P2", Box::new(LowDriver::new()))
+                .harness(Harness::new().connect(
+                    EndpointRef::parse("P2.Q").expect("endpoint"),
+                    EndpointRef::parse(&format!("{MODULE}.U100.P61")).expect("endpoint"),
+                ));
+    }
+    let system = system.build().expect("the module builds");
     let p61 = format!("{MODULE}.P2_IO61");
     let cs = format!("{MODULE}.SPI_CS");
     assert!(system.names_are_merged(&p61, &cs));
-    let state = system.nets()[system.net_id(&p61).unwrap().0].state;
+    let state = system.nets()[system.net_id(&cs).unwrap().0].state;
+    if p61_driven_low {
+        assert_eq!(
+            state,
+            NetState::Driven(Level::Low),
+            "the P2 asserts the select"
+        );
+    } else {
+        assert_eq!(
+            state,
+            NetState::Pulled(Level::High, 10_500.0),
+            "P61 is pulled high through the select's pull-up"
+        );
+    }
+}
+
+/// The Edge board's `JP1` (`TTL-SINK`, a three-pad jumper) puts one of two
+/// sources on the servo enable line `SC_ENA`: the isolator's `OUTC`
+/// straight through, or the transistor `Q1`'s collector. Two poles from the
+/// common pad; each is a net merge the scenario makes, and a throw-to-throw
+/// short is something a scenario has to ask for.
+#[rstest]
+#[case::open(&[], false, false)]
+#[case::ttl(&[0], true, false)]
+#[case::sink(&[1], false, true)]
+#[case::both(&[0, 1], true, true)]
+fn the_three_pad_jumper_selects_which_source_sits_on_the_servo_enable(
+    #[case] closed: &[usize],
+    #[case] outc_on_ena: bool,
+    #[case] collector_on_ena: bool,
+) {
+    behaviour!(Test {
+        id: "switch.three-pad-jumper-selects-a-throw",
+        covers: Some("board/src/registry.rs#PartRegistry::classify"),
+        given: "the MaD EdgeBoard with its servo-enable jumper JP1 open, closed on the \
+                isolator side, closed on the transistor side, or closed on both",
+    });
+    expect!(
+        "throw-selected",
+        "each closed pole puts its own source on the servo enable line: the isolator's \
+         output for one pole, the transistor's collector for the other",
+        "a three-pad jumper is two poles from its common pad, each a build-time merge of \
+         the two nets it joins"
+    );
+    expect!(
+        "throws-independent",
+        "with both poles open the isolator's output and the transistor's collector are \
+         separate nodes, and with both closed the three are one",
+        "the two throws only meet through the common pad, so joining them takes both poles"
+    );
+
+    let board = edge_board();
     assert!(
-        matches!(state, NetState::Pulled(Level::High, _)),
-        "P61 is pulled high through the select's pull-up; got {state:?}"
+        matches!(board.node_class("JP1"), Some(PartClass::Switch { poles }) if poles.len() == 2),
+        "{:?}",
+        board.node_class("JP1")
+    );
+    let mut scenario = Scenario::default();
+    for &pole in closed {
+        scenario = scenario.switch("EdgeBoard.JP1", pole, JumperState::Closed);
+    }
+    let system = System::new()
+        .board("EdgeBoard", board)
+        .scenario(scenario)
+        .build()
+        .expect("the board builds");
+    let ena = "EdgeBoard./MaD_Edge_Sheet3/SC_ENA";
+    let outc = "EdgeBoard.Net-(IC14-OUTC)";
+    let collector = "EdgeBoard.Net-(JP1-B)";
+    assert_eq!(
+        system.names_are_merged(ena, outc),
+        outc_on_ena,
+        "OUTC on SC_ENA?"
+    );
+    assert_eq!(
+        system.names_are_merged(ena, collector),
+        collector_on_ena,
+        "Q1's collector on SC_ENA?"
+    );
+    assert_eq!(
+        system.names_are_merged(outc, collector),
+        outc_on_ena && collector_on_ena,
+        "the throws meet only through the common pad"
     );
 }
 

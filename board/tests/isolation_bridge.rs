@@ -238,13 +238,20 @@ impl Promoted {
 /// to `OUTA` (pin 14).
 const STEP_CHANNEL: Channel = Channel::A;
 
-/// [`machine_parts::edge_registry`] with the five blocking parts promoted from
-/// topology-only stubs to real models.
+/// [`machine_parts::edge_registry`] with the isolation parts re-registered
+/// so this binary holds a monitor on each instance, and the opto, current
+/// regulator and transistor promoted from topology-only stubs to real
+/// models.
 ///
-/// **This function is the promotion instruction.** A consumer replaces its own
-/// `register_stub` lines with these four `register` calls and nothing else
-/// changes: the pin facades come from the models' own datasheet tables, so the
-/// build validates against the same netlist it always did.
+/// The ISO67xx registrations here mirror the board's own
+/// (`machine_parts::edge_registry` registers the same model from the same
+/// part names since `NODES.md` §8 phase 2); the re-registration exists only
+/// to capture each instance's monitor as it is built. For the other three
+/// parts this function is still the promotion instruction: a consumer
+/// replaces its own `register_stub` lines with these `register` calls and
+/// nothing else changes — the pin facades come from the models' own
+/// datasheet tables, so the build validates against the same netlist it
+/// always did.
 fn promoted_registry(promoted: &Promoted) -> PartRegistry {
     let mut registry = edge_registry();
 

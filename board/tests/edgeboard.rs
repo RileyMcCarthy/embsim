@@ -113,20 +113,21 @@ fn the_edgeboard_builds_with_every_part_classified() {
         "registered components: {registered:?}"
     );
 
-    // The three modeled parts and one instance of each stub type.
+    // One instance of each registered type: the modeled parts and the
+    // remaining facades.
     for reference in [
         "U24",  // AM26LS31CD  — RS-422 driver (modeled)
         "U25",  // AM26LV32xD  — RS-422 receiver (modeled)
         "IC5",  // ISO6731DWR  — force-gauge UART isolator (modeled)
-        "IC1",  // ISO6742DWR
+        "IC1",  // ISO6742DWR  — isolator family model
         "IC3",  // UCC12040DVER
-        "IC14", // ISO6741DWR
-        "IC15", // ISO6721BDR
-        "IC16", // ISO6740FDWR
+        "IC14", // ISO6741DWR  — isolator family model, STEP as a rate
+        "IC15", // ISO6721BDR  — isolator family model
+        "IC16", // ISO6740FDWR — isolator family model, fail-safe low
         "IC6",  // NSI50010YT1G
         "U4",   // 6N137
         "U5",   // VO2631
-        "U9",   // SN74LVC1G14DBV
+        "U9",   // SN74LVC1G14DBV — Schmitt inverter model
         "U1",   // XL1509
         "U3",   // APM4953
         "Q1",   // 2N3904

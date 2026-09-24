@@ -62,6 +62,25 @@ pub const ESCALATION_IMPEDANCE_RATIO: f64 = 10.0;
 /// resistance below which a source is a driver of that node.
 pub const WEAK_DRIVE_OHMS: Ohms = STREAM_COLLAPSE_THRESHOLD;
 
+/// AC-coupling margin: a rate crosses a coupling capacitor only while the
+/// capacitor's reactance at that rate, `1/(2π·f·C)`, is at most the far
+/// node's resistance divided by this — the same factor of ten that decides
+/// a source has lost ([`ESCALATION_IMPEDANCE_RATIO`]), applied to the
+/// impedance divider a series capacitor forms with the node it feeds. A
+/// crossing that fails is [`crate::Finding::PulseNotCoupled`] and the train
+/// stops at the capacitor.
+///
+/// The physical bound is the divider's −3 dB point, `X_C ≤ R_far` (a ratio
+/// of 1): there `|H| = R / √(R² + X_C²)` is 0.71 and a 3.3 V swing arrives
+/// as 2.3 V, above any LVCMOS hysteresis band. Ten is embsim's conservative
+/// constant, borrowed from the strength ranking rather than derived — at
+/// this margin a 10 pF capacitor into 1 kΩ at 20 MHz (`X_C` = 796 Ω,
+/// `|H|` ≈ 0.78, 2.6 V of swing) is refused although a Schmitt input would
+/// pass it. Phase 5 (`NODES.md` §8) may derive the margin from the
+/// receiver's declared thresholds instead (pass fraction ≥ hysteresis /
+/// `V_pp`); until then the number is a stated choice, not a measurement.
+pub const COUPLING_REACTANCE_RATIO: f64 = ESCALATION_IMPEDANCE_RATIO;
+
 /// Upper bound of a valid logic low at a 3.3 V LVCMOS input, `V_IL(max)`:
 /// JEDEC JESD8C.01 (3.3 V LVCMOS interface standard), DC input
 /// specifications, `V_IL` max = 0.8 V. With [`V_IH`] it bounds the dead
@@ -293,6 +312,7 @@ mod tests {
     #[case::stream_collapse(STREAM_COLLAPSE_THRESHOLD, 1_000.0)]
     #[case::escalation(ESCALATION_IMPEDANCE_RATIO, 10.0)]
     #[case::weak_drive(WEAK_DRIVE_OHMS, 1_000.0)]
+    #[case::coupling(COUPLING_REACTANCE_RATIO, 10.0)]
     #[case::v_il(V_IL, 0.8)]
     #[case::v_ih(V_IH, 2.0)]
     fn published_thresholds_match_design_doc(#[case] actual: f64, #[case] expected: f64) {

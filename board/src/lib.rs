@@ -72,7 +72,7 @@ pub use host_pty::HostPty;
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};
 pub use net::{
     digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
-    ESCALATION_IMPEDANCE_RATIO, V_IH, V_IL, WEAK_DRIVE_OHMS,
+    COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use registry::{

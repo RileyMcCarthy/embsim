@@ -22,6 +22,16 @@
 //! - [`edge`] — edge-detection primitive shared by threshold models
 //! - [`fat16`] — a FAT16 card image built in memory, so a guest filesystem has
 //!   something to mount on [`sd_card`]
+//! - [`logic_gate`] — single-input CMOS gates (the NXP 74LVC2G04 dual
+//!   inverter, the TI SN74LVC1G14 Schmitt inverter): thresholds with
+//!   hysteresis, the datasheet output impedance, `t_pd` as a scheduled
+//!   instant, and a rate mode that relays a routed clock
+//! - [`oscillator`] — a clock oscillator (the EPSON TG2520SMN TCXO) whose
+//!   output is a rate published once at its start-up instant
+//! - [`psram`] — the AP Memory APS6404L QSPI PSRAM in its SPI mode, on the
+//!   same shift engine as the flash
+//! - [`spi_shift`] — the byte-wide shift register every SPI-mode device
+//!   model here is built on
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
 //!   components: a step/direction motor drive, a quadrature encoder, and an
 //!   end-of-travel switch, each with a real pin facade
@@ -39,8 +49,12 @@ pub mod edge;
 pub mod fat16;
 pub mod isolation;
 pub mod limit_switch;
+pub mod logic_gate;
 pub mod machine;
+pub mod oscillator;
+pub mod psram;
 pub mod sd_card;
 pub mod sd_card_component;
 pub mod spi_flash;
 pub mod spi_flash_component;
+pub mod spi_shift;

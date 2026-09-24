@@ -335,13 +335,18 @@ fn every_declared_finger_is_one_node_across_the_socket() {
     );
 }
 
-/// The socket pins for signals the module keeps for itself stay dark: the
-/// EdgeBoard breaks out all 80 fingers, the module connects 58, and every
-/// position in the P40..P57 / V40 / V48 block the PSRAMs own resolves floating.
-/// Asserting it makes the absence deliberate — a consumer wiring something to
-/// socket pin 76 gets a finding, not silence.
+/// The socket pins for signals the module keeps for itself get nothing
+/// from the module: the EdgeBoard breaks out all 80 fingers, the module
+/// connects 58, and every position in the P40..P57 / V40 / V48 block the
+/// PSRAMs own resolves to what the EdgeBoard alone makes of it — floating,
+/// except the two the Raspberry-Pi block's isolator `IC2` drives from its
+/// P2 side: with nothing on the Pi header its far side is unpowered, and the
+/// ISO6742's function table puts its outputs at their default high (TI
+/// SLLSFJ6G §9.4 Table 9-2, `VCCI` PD / `VCCO` PU). Asserting it makes the
+/// absence deliberate — a consumer wiring something to socket pin 76 gets a
+/// finding, not silence, and one wiring pin 61 meets the isolator.
 #[rstest]
-fn socket_pins_the_module_never_connects_stay_floating() {
+fn socket_pins_the_module_never_connects_get_nothing_from_it() {
     let system = build_machine();
     let map = net_of_pin(&system);
     let harnessed: BTreeSet<u32> = edge_fingers().collect();
@@ -353,12 +358,17 @@ fn socket_pins_the_module_never_connects_stay_floating() {
         }
         let net = net_named(&map, EDGE, "J3", &finger.to_string());
         // Fingers 1/2 are the socket's own no-connect pads (their EdgeBoard net
-        // is an `unconnected-(…)` stub); everything else in the block is a
-        // broken-out signal or bank supply with nothing behind it.
+        // is an `unconnected-(…)` stub); 61/62 are `IC2`'s `OUTC`/`OUTD`;
+        // everything else in the block is a broken-out signal or bank supply
+        // with nothing behind it.
+        let expected = match finger {
+            61 | 62 => NetState::Driven(Level::High),
+            _ => NetState::Floating,
+        };
         assert_eq!(
             state_of(&system, &net),
-            NetState::Floating,
-            "socket pin {finger} ({net}) has nothing behind it"
+            expected,
+            "socket pin {finger} ({net}) gets nothing from the module"
         );
         checked += 1;
     }

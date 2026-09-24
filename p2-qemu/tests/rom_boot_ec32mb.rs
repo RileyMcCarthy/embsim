@@ -17,6 +17,13 @@
 //! at, high, and the ROM goes looking for a loader instead. That was the
 //! first divergence from p2core this test found, and it was the board's.
 //!
+//! The P2 is the QEMU core inside the P2 **package** (`embsim_boards::p2`):
+//! the package declares the 86 pins the netlist gives `U100`, and the
+//! crystal the core's PLL would multiply is the rate the board delivers on
+//! `XI` — the module's TCXO through its buffer, not a number handed to the
+//! node. The boot itself runs on RCFAST and never selects it, and on this
+//! bench the TCXO's own rail is still a facade (see the end of the test).
+//!
 //! What is asserted is what the boot DID: the flash served reads at `0` and
 //! `$400` (stage-1, then the application), and the application's one byte
 //! reached the debug pin. And that every edge was the P2's own: the flash saw
@@ -28,9 +35,10 @@ use std::time::{Duration, Instant};
 
 use embsim_board::{
     level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, JumperState, Level,
-    PinDecl, PinKind, Scenario, System,
+    NetState, PinDecl, PinKind, Scenario, System,
 };
 use embsim_boards::ec32mb::{Ec32mb, FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE};
+use embsim_boards::p2::P2Package;
 use embsim_core::virtual_clock;
 use embsim_p2_qemu::{flashimage, P2Qemu, P2QemuError};
 
@@ -140,6 +148,9 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         Err(e) => panic!("{e}"),
     };
     let handle = p2.handle();
+    // The core goes inside the package: the package is what the board sees.
+    let package = P2Package::new(p2);
+    let package_handle = package.handle();
 
     virtual_clock::init(0.0, 160_000_000);
 
@@ -147,7 +158,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     let flash = board.flash_view().expect("a programmed flash has a view");
     // The slot is filled once; a netlist with two U100s would be a different
     // board, and QEMU is one machine per process anyway.
-    let slot = std::sync::Mutex::new(Some(p2));
+    let slot = std::sync::Mutex::new(Some(package));
     let board = board
         .with_p2(move |_decl| -> Box<dyn Component> {
             Box::new(slot.lock().unwrap().take().expect("one P2 per board"))
@@ -202,6 +213,12 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         Duration::from_secs(patience),
     );
     let wall = started.elapsed();
+    if trace.is_some() {
+        // The p2core differential compares 60 000 states and the byte
+        // arrives after ~44 000; let the payload spin a little longer so
+        // the trace carries them (bounded: a few seconds of traced spin).
+        std::thread::sleep(Duration::from_secs(3));
+    }
     let nets: Vec<String> = [
         "EC32.P2_IO58",
         "EC32.P2_IO59",
@@ -304,5 +321,46 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         escalated, 0,
         "the ROM boot is projections only: no cluster escalated to the solver"
     );
+
+    // The crystal is the rate the board delivers on XI, and on this bench
+    // none arrives: the module's TCXO runs from `Common_VDD`, the 1.8 V
+    // core rail, and `U402`, the buck that sources it, is a pin facade
+    // until the rails land (`NODES.md` §8 phase 4) — so the TCXO sees its
+    // supply pulled low through the feedback divider by the stuck ground
+    // and never starts. Holding `Common_VDD` from the bench instead was
+    // measured and refused: a second real terminal across that divider
+    // inside the ground cluster re-solves it on every P59 edge (30
+    // escalated solves against the 0 this boot is held to). The ROM runs
+    // on RCFAST and never selects the crystal, so the boot is the same
+    // either way; `crystal_pll.rs` proves the XI → HUBSET → PLL path on a
+    // bench where the clock reaches the pin. What is asserted here is the
+    // CAUSE — the core rail as the divider pulls it — and beside it the
+    // consequence, that the package told the core the truth: nothing on
+    // XI. TODO(phase 4): when `U402` is a rail the cause assertion fails
+    // first; move the crystal assertion onto the module's own TCXO,
+    // `Some(20_000_000)` on both handles, and delete the cause.
+    let clock_nets: Vec<String> = [
+        "EC32.Common_VDD",
+        "EC32.Net-(X100-OUT)",
+        "EC32.Net-(U101-2A)",
+        "EC32.XTAL_XI",
+    ]
+    .iter()
+    .map(|n| format!("{n}={:?}", system.net_state(n)))
+    .collect();
+    assert_eq!(
+        system.net_state("EC32.Common_VDD"),
+        Some(NetState::Pulled(Level::Low, 23_800.0)),
+        "the TCXO's rail reads the stuck ground through U402's feedback divider (R401 13.3 kΩ + \
+         R403 10.5 kΩ = 23.8 kΩ) while the buck is a facade — the cause of the silent XI; clock \
+         chain={clock_nets:?}"
+    );
+    assert_eq!(
+        handle.crystal_hz(),
+        None,
+        "no rate reaches XI while the TCXO's rail is a facade; clock chain={clock_nets:?}"
+    );
+    assert_eq!(package_handle.crystal_hz(), None);
+    assert!(!handle.stalled(), "the boot runs on RCFAST");
     drop(system);
 }

@@ -22,9 +22,9 @@
 //! * **largest cluster** — identity roots in the biggest one: the size `m`
 //!   of the largest matrix an escalated solve on that board can build;
 //! * **stub count** — parts with nothing behind them: the registered pin
-//!   facades with no behaviour (`StubPart`s, and the processor placeholder
-//!   that fills the EC32MB's slot). Since phase 1 every netlist part is a
-//!   node ([`Board::nodes`]) and there is no stub list and no ignored tier,
+//!   facades with no behaviour (`StubPart`s). Since phase 1 every netlist
+//!   part is a node ([`Board::nodes`]) and there is no stub list and no
+//!   ignored tier,
 //!   so the only stub left is a facade the board cannot tell from a model:
 //!   the census names each board's modelled parts and counts the other
 //!   registered components;
@@ -69,36 +69,41 @@ struct Census {
 }
 
 /// The P2-EC32MB as `embsim-boards` ships it, its processor slot filled by
-/// the pin-only placeholder `machine_parts::P2Slot`. 114 netlist parts, every one a node: the
-/// boot flash is the one modelled part; the placeholder, the four PSRAMs,
-/// the two inverters, the oscillator, the polarity FET, the two bucks, the
-/// eight LDOs and the detector are 20 registered facades; the DIP switch
-/// and the solder link are switches, the mounting holes, `PCB` and `NC_Net`
-/// mechanical nodes. The 8-root cluster is the one `NODES.md` §6 sized
-/// offline: `GND`, `Common_VDD` and `Common_LDOin`, the two bucks' `SW` and
-/// `FB` nodes joined to them through the output inductors and the feedback
-/// dividers, and the P59 pull-down net `R303` ties to ground.
+/// a P2 package held in reset (`P2Package::held_in_reset`: every pad
+/// released, the rails and reset sensed, `XI` taking the board's rate — a
+/// node with the package's behaviour and no core). 114 netlist parts,
+/// every one a node: the P2 package, the boot flash, the TCXO, the two
+/// inverters and the four PSRAMs are modelled; the polarity FET, the two
+/// bucks, the eight LDOs and the detector are 12 registered facades (phase
+/// 2 took the count from 20 to 13 with the models, then to 12 with the
+/// package); the DIP switch and the solder link are
+/// switches, the mounting holes, `PCB` and `NC_Net` mechanical nodes. The
+/// 8-root cluster is the one `NODES.md` §6 sized offline: `GND`,
+/// `Common_VDD` and `Common_LDOin`, the two bucks' `SW` and `FB` nodes
+/// joined to them through the output inductors and the feedback dividers,
+/// and the P59 pull-down net `R303` ties to ground.
 const EC32MB: Census = Census {
     clusters: 83,
     largest_cluster_roots: 8,
-    stub_count: 20,
+    stub_count: 12,
     mechanical: &["J701", "J702", "NC_Net", "PCB"],
     pwl: 0,
 };
 
 /// The MaD EdgeBoard from `fixtures/mad_edge.net`. 168 netlist parts: the
-/// RS-422 driver and receiver and the force-gauge isolator are modelled; 45
-/// registered facades (the other isolators, the isolated DC/DCs, the eight
-/// current regulators, the optos, the 21 Schmitt inverters, the two bucks,
-/// the polarity FET, the transistor); the push button is a switch and the
-/// four mounting holes mechanical nodes. The 11-root cluster is `+3.3V`
-/// with the nine LED anodes that reach it through their 220 Ω series
-/// resistors and the `D2` cathode the buck's output inductor `L2` ties to
-/// the rail, as §6 sized it.
+/// RS-422 driver and receiver, the five isolators and the 21 Schmitt
+/// inverters are modelled; 19 registered facades (the isolated DC/DCs, the
+/// eight current regulators, the optos, the two bucks, the polarity FET,
+/// the transistor — phase 2 took the count from 45); the push button is a
+/// switch, the three-pad jumper `JP1` a two-pole switch, and the four
+/// mounting holes mechanical nodes. The 11-root cluster is `+3.3V` with
+/// the nine LED anodes that reach it through their 220 Ω series resistors
+/// and the `D2` cathode the buck's output inductor `L2` ties to the rail,
+/// as §6 sized it.
 const EDGE: Census = Census {
     clusters: 209,
     largest_cluster_roots: 11,
-    stub_count: 45,
+    stub_count: 19,
     mechanical: &["H5", "H6", "H7", "H8"],
     pwl: 0,
 };
@@ -117,8 +122,16 @@ const DS2: Census = Census {
 /// The reference designators behind which a real model sits, per board.
 /// Every other registered component is a facade with no behaviour and is
 /// counted as a stub.
-const EC32MB_MODELLED: &[&str] = &["U301"];
-const EDGE_MODELLED: &[&str] = &["U24", "U25", "IC5"];
+const EC32MB_MODELLED: &[&str] = &[
+    "U100", "U301", "X100", "U101", "U601", "U302", "U303", "U304", "U305",
+];
+#[rustfmt::skip]
+const EDGE_MODELLED: &[&str] = &[
+    "U24", "U25", "IC5", "IC1", "IC2", "IC14", "IC15", "IC16",
+    // The 21 SN74LVC1G14 LED drivers.
+    "U9", "U10", "U11", "U12", "U13", "U14", "U15", "U16", "U17", "U18", "U19", "U21", "U22",
+    "U27", "U28", "U29", "U30", "U31", "U32", "U33", "U34",
+];
 const DS2_MODELLED: &[&str] = &["U1"];
 
 // ============================================================
