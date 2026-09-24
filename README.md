@@ -70,6 +70,8 @@ reference consumer.
 | `embsim-minimal-example` | [`examples/minimal/`](examples/minimal) | Complete runnable firmware-free template |
 | `embsim-cpu-oracle` | [`cpu-oracle/`](cpu-oracle) | ISS-vs-silicon golden records (parse, diff). CPU adapters supply the image and ISS. |
 
+The plan for making every netlist part a node in one pipeline — switches, capacitors, diodes, rails, the P2 package — is [`NODES.md`](NODES.md).
+
 ## What a new project provides
 
 Just two things:
