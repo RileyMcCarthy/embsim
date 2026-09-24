@@ -267,3 +267,18 @@ impl ComponentNetIo {
 6. There is no second channel. The pulse train is `Drive::Periodic`, routed and sequenced like every other drive, kept only because 820 000 edges a second was measured; a node that consumes one integrates the segment itself.
 
 **What changes from today's trait**, in one column: `PinKind` (7 variants deciding electrical defaults) becomes `PinRole` plus declarations; `NetState` (5 variants, one global threshold) becomes `Sense { volts: Option }` plus the receiver's projection; `set_drive(Option<TheveninDrive>)` becomes `drive(Drive)` with `Current` and `Periodic`; `StreamRole`/`pulse_tx`/`on_pulse` fold into `Drive::Periodic`; `Component` gains `branches()`. The `Component`/`attach`/`start` shape and the wake scheduling are unchanged — the QEMU P2 node, the flash, the card and the ADC front end port by editing their tables, not their logic.
+
+
+## 12. Execution order
+
+§8's phases were written before §10 and §11 settled the interface; this is the order the work is done in, and where the interface lands.
+
+0. **Census, baseline, gates** (§8 phase 0).
+1. **One pipeline groundwork** (§8 phase 1): registry classes, the deletions, `UnknownPart` with the value, the `stub_count` gate, the value parser, **rule 2** (source-strength projection — required before anything publishes a weak drive), `PinDecl::idle`, the build fixed point. Plus from §11: `Drive::Current` and the `drive(Drive)` entry point, with `set_drive` kept as a thin alias until the last caller moves.
+2. **Switches, oscillator, gates, memory, the P2 package, pad strengths** (§8 phase 2).
+3. **PWL branches and branch current** (§8 phase 3), with `Component::branches()` from §11 as their declaration.
+4. **Terminals, rails, supervisor, isolated domains; `stub.rs` deleted** (§8 phase 4).
+5. **The interface** (§11): `Sense { volts: Option }` replacing `NetState` for delivery, the receiver-side projection with hysteresis, `PinRole` plus declarations replacing `PinKind`, `Drive::Periodic` replacing the pulse channel (`sil-unified-drive.md` steps 1–4). After phase 4 because every supply gate today reads a rail's projection, and a volts-only sense before real rails would read every rail as down.
+6. **Capacitors** (§8 phase 5). 7. **I2C bench** (§8 phase 6). 8. **Plant-driven edges** (§8 phase 7).
+
+Each phase is one pull request, gated by its proof list and by the goldens passing without re-blessing; `DESIGN.md` §5 is the review checklist for every one of them.
