@@ -17,47 +17,68 @@
 //!
 //! # What the package declares (`NODES.md` §2, "MCU node (P2)")
 //!
-//! | Pins | Kind | Idle |
+//! | Pins | Role and declarations | Idle |
 //! |---|---|---|
-//! | `P0`..`P63` | `DigitalBidir` | **released** — a pad out of reset floats |
-//! | `VDD`, `GND`, the 16 `VIO_a_b` | `PowerIn` (sensed) | — |
-//! | `RESN`, `TEST` | `DigitalIn` (`RESN` sensed) | — |
-//! | `XI` | `DigitalIn` + [`StreamRole::PulseSink`]: the rate delivered here **is the crystal** | — |
-//! | `XO` | `DigitalOut`, released | the crystal driver, unused with an external clock |
+//! | `P0`..`P63` | `Signal`, bidirectional: sources and sinks, reads through [`P2_PAD_THRESHOLDS`] (0.3/0.7 × its bank's `VIO_a_b`) against `GND` | **released** — a pad out of reset floats |
+//! | `VDD`, the 16 `VIO_a_b` | `PowerIn` (sensed), measured against `GND` | — |
+//! | `GND` | `PowerIn` | — |
+//! | `RESN`, `TEST` | `Signal` senses through [`P2_UNBANKED_INPUT_THRESHOLDS`] (`RESN` read by the START gate) | — |
+//! | `XI` | a `Signal` sense: the segment a periodic net carries here **is the crystal** | — |
+//! | `XO` | `Signal` output, released | the crystal driver, unused with an external clock |
 //!
 //! # The START gate
 //!
-//! A core does not run until the chip can: the package holds the core's
-//! start — [`P2Core::start`] and every wake the core asks for through
-//! [`P2Pads`] — until `RESN` reads released **and** `VDD` reads a voltage
-//! inside the datasheet's core-supply window ([`P2_VDD_MIN_VOLTS`] to
-//! [`P2_VDD_MAX_VOLTS`]). The instant both hold is the START instant:
-//! the core is started there (its clock counts from it), its held wakes
-//! land there, and [`P2PackageHandle::start_state`] reports it. While the
-//! gate is closed the handle reports `Held` with the two inputs as last
-//! read — the reason — and the package says so once at `tracing::info`
-//! level (the shape the crystal stall in `embsim-p2-qemu` reports in). A
-//! `VDD` that names a level and no voltage (a strong digital source, a
-//! pull) is outside the window: the package invents no voltage for it.
-//! The gate is the package's, so the QEMU core, an ISS and the native
-//! firmware image are all held the same way; the reset state a core
+//! A core does not run until the chip can. The chip's reset **releases**
+//! the instant `RESN` reads released **and** `VDD` reads a voltage inside
+//! the datasheet's core-supply window ([`P2_VDD_MIN_VOLTS`] to
+//! [`P2_VDD_MAX_VOLTS`]); the chip starts the datasheet's restart delay
+//! later ([`P2_RESTART_DELAY_NS`], 3 ms: "Propeller restarts 3 ms after
+//! RESn transitions from low to high", Pin Descriptions, p. 6), if the
+//! reset has stayed released the whole time — a release shorter than the
+//! delay starts nothing, and the delay counts again from the next one.
+//! That instant is the START instant: the package counts the delay on a
+//! wake of its **own**, starts the core there (its clock counts from it),
+//! lands the wakes it held there, and [`P2PackageHandle::start_state`]
+//! reports it. Before it the handle reports `Held` with the two inputs as
+//! last read — the reason — or `Restarting` with the release instant and
+//! the start it leads to, and the package says so at `tracing::info` level
+//! (the shape the crystal stall in `embsim-p2-qemu` reports in). A `VDD`
+//! that names a level and no voltage (a strong digital source, a pull) is
+//! outside the window: the package invents no voltage for it.
+//!
+//! The gate is the package's, and it holds **every** core the same way —
+//! the QEMU core, an ISS, the native firmware image: a core's wake handler
+//! and its schedules go through one entry point, the package's
+//! [`WakeGate`] behind the net I/O every core is handed
+//! ([`ComponentNetIo::with_wake_gate`]), whether the core schedules
+//! through [`P2Pads`] or on the net I/O itself. The engine holds one wake
+//! handler for the package, the package's, which counts the restart delay
+//! and forwards the core's wakes once it runs. The reset state a core
 //! records through [`P2Pads::on_reset`] is information, never its own
 //! gate.
 //!
-//! The gate also waits for the package's own knowledge of the banks: it
-//! does not open until every one of the sixteen `VIO_a_b` senses has
-//! delivered at least once ([`BankSupplies::all_delivered`]), so a core
-//! that publishes a pad at its START instant reads a populated bank table,
-//! never the "nothing has told me yet" every bank starts in. The senses
-//! deliver once at registration, on the engine thread, in registration
-//! order, while `System::start` runs [`Component::start`] on the caller's
-//! thread; the package registers the sixteen bank senses **before** the
-//! two the gate reads, so the gate opens at the reset delivery with the
-//! table already told, and it checks the table as well, so neither thread
-//! can start a core against an empty one (without both, one run in five
-//! of `p2_package` read an unpowered bank at START; the phase-4 review
-//! record in `NODES.md` §8 has the measurements). Every bank delivery
+//! The gate also waits for the package's own knowledge of the banks: the
+//! reset is not counted released until every one of the sixteen `VIO_a_b`
+//! senses has delivered at least once ([`BankSupplies::all_delivered`]),
+//! so a core that publishes a pad at its START instant reads a populated
+//! bank table, never the "nothing has told me yet" every bank starts in.
+//! The senses deliver once at registration, on the engine thread, and the
+//! package registers the sixteen bank senses **before** the two the gate
+//! reads, so the release is counted at the reset delivery with the table
+//! already told (the phase-4 review record in `NODES.md` §8 has the
+//! measurements of the race this ordering closed). Every bank delivery
 //! gives the gate its chance, so the condition can never stall it.
+//!
+//! # A brownout without a reset
+//!
+//! Once the core runs, the package watches its supply: `VDD` leaving its
+//! window while `RESN` is not asserted — the fault a reset supervisor
+//! exists to prevent — is reported as
+//! [`StartState::BrownoutWithoutReset`] (with a `tracing::warn`, once) and
+//! the core is held from that instant ([`P2Core::reset`]): no wake reaches
+//! it again, and its pads keep what they last published. A `RESN`
+//! asserted first is a reset the chip was told about, and the package
+//! delivers it to the core as information.
 //!
 //! # Pads drive high at their bank's supply
 //!
@@ -72,7 +93,10 @@
 //! (released), and the package reports the bank once, by its supply pin
 //! (`tracing::warn`, and [`P2PackageHandle::unpowered_banks_driven`]).
 //! The build already names such a pin: an unsourced `VIO_a_b` is a
-//! [`embsim_board::Finding::PowerNetUnsourced`] on its net.
+//! [`embsim_board::Finding::PowerNetUnsourced`] on its net. The native
+//! core's bridged pads drive the same way, through
+//! [`McuComponent::host_pads`] (its `P2Core` impl), in the fast mode
+//! [`NATIVE_PAD_MODE`], from the START instant on.
 //!
 //! # Pad drive strength (the `WRPIN` pin-configuration field)
 //!
@@ -84,11 +108,11 @@
 //!
 //! | field | mode | here |
 //! |---|---|---|
-//! | `%000` | fast | [`P2_FAST_OHMS`] (a named placeholder, see its TODO) |
+//! | `%000` | fast | [`P2_FAST_OHMS`], 17.99 Ω (fitted to the datasheet's `Voh`/`Vol` rows) |
 //! | `%001` | 1.5 kΩ | [`P2_PULL_1K5_OHMS`] |
 //! | `%010` | 15 kΩ | [`P2_PULL_15K_OHMS`] |
 //! | `%011` | 150 kΩ | [`P2_PULL_150K_OHMS`] |
-//! | `%100` | 1 mA | not mapped ([`PadDrive::CurrentSource`]) |
+//! | `%100` | 1 mA | not mapped ([`PadDrive::CurrentSource`], see below) |
 //! | `%101` | 100 µA | not mapped |
 //! | `%110` | 10 µA | not mapped |
 //! | `%111` | float | released |
@@ -97,11 +121,18 @@
 //! rev. v35, "Smart Pins" → "Pin Configuration Modes" — the
 //! `%0000_CIO_HHH_LLL` logic-mode word and its `HHH`/`LLL` drive table
 //! (fast, 1.5k, 15k, 150k, 1mA, 100uA, 10uA, float). The three resistive
-//! modes are the resistances the document names; the current-source modes
-//! are **not** mapped to a resistor (a V/I approximation would be an
-//! invention, `DESIGN.md` rule 6) and reach a core as
-//! [`PadDrive::CurrentSource`], an unimplemented path the core logs once.
-//! `Drive::Current` is the encoding they take when a caller exists.
+//! modes are the resistances the document names; the fast mode is fitted
+//! to the datasheet's output table ([`P2_FAST_OHMS`]).
+//!
+//! The current-source modes are **not** mapped: they reach a core as
+//! [`PadDrive::CurrentSource`], an unimplemented path the core logs once,
+//! and the pad presents nothing. The datasheet names their currents — 1 mA,
+//! 100 µA, 10 µA (P2X8C4M64P Datasheet, Features, p. 2, and the smart-pin
+//! mode table, p. 24) — but no compliance: how close to its bank rail the
+//! source can pull its pad. `Drive::Current`, the encoding a current takes
+//! (`NODES.md` §10), is an ideal injection with no shunt, so a 1 mA pad
+//! into a 10 kΩ pull-down would put 10 V on a 3.3 V pad; mapping one needs
+//! a compliance figure no document gives, and no caller asks for one.
 //!
 //! # Datasheet
 //!
@@ -111,46 +142,39 @@
 //! window, and "Pin Descriptions" (p. 6) for the bank grouping and the
 //! `RESN` pin.
 //!
-//! # What this package does not do yet
+//! # What this package does not do
 //!
-//! - **The restart delay after reset.** The datasheet's `RESN` row (Pin
-//!   Descriptions, p. 6) says the chip "restarts 3 ms after RESn
-//!   transitions from low to high". The gate opens the instant its
-//!   conditions hold, with no delay: the package has no wake of its own
-//!   on every core (a native core registers its wake handler directly on
-//!   the net I/O), so the delay would hold one kind of core and not
-//!   another. `NODES.md` §8, the phase-4 record, carries the decision.
-//! - **A rail dropping mid-run.** A `VDD` that leaves its window or a
-//!   `RESN` that falls after the START instant is delivered to the core
-//!   as a reset state and changes nothing else: no core has a reset entry
-//!   yet, and a pad change would be an invention. The plan's
-//!   `Finding::BrownoutWithoutReset` lands with that entry.
+//! - **A reset asserted after START.** A `RESN` that falls once the core
+//!   runs is delivered to the core as a reset state and changes nothing
+//!   else: a restart needs a core entry that re-runs the boot from the ROM
+//!   (the QEMU core's machine state, a native image's statics), which no
+//!   core has. The datasheet's own restart (Rebooting, p. 35) is the entry
+//!   it would implement.
 //! - **A bank supply changing after START.** A `VIO_a_b` that rises,
 //!   drops or moves once the core runs updates the [`BankSupplies`] table
 //!   and nothing else: a pad the core already drives keeps the drive it
 //!   published, at the old voltage, until the core next publishes it (a
-//!   guest's next pad write reads the table then). Re-publishing every
-//!   driven pad of the bank at the new voltage is the same entry point
-//!   as the native core's pads, phase 5's.
-//! - **The native core's pads** ([`McuComponent`]) drive through the HAL
-//!   bridges at the crate's nominal [`LOGIC_HIGH_VOLTS`], not through
-//!   [`BankSupplies`]: the bridges publish on the pads' handles directly.
-//!   Phase 5's interface (`NODES.md` §11) routes every drive through one
-//!   entry point, where the bank voltage applies to it too.
+//!   guest's next pad write, a native bridge's next level, reads the table
+//!   then). Re-publishing a bank's driven pads at the new voltage is a
+//!   core-side re-publish of what it last drove; no board moves a bank
+//!   rail after START.
+//! - **The current-source pad modes** (above): no compliance figure, and
+//!   no caller.
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, McuComponent, NetState,
-    Ohms, PinDecl, PinHandle, PinKind, PulseTrain, StreamRole, TheveninDrive, Volts,
+    jesd8c01_lvcmos_thresholds, Amps, AttachError, Component, ComponentNetIo, DeadBand,
+    DigitalReceiver, Level, McuComponent, Ohms, PinDecl, PinHandle, Sense, TheveninDrive,
+    Thresholds, Volts, WakeGate, WakeHandler,
 };
 use embsim_core::virtual_clock;
 
 /// The crate's nominal logic high, [`embsim_board::net::LOGIC_HIGH_VOLTS`]:
-/// what the native core's HAL bridges drive at (see the module docs). A
-/// pad a core publishes through [`BankSupplies`] drives at its bank's
-/// supply instead.
+/// what an [`McuComponent`] on a board of its own drives at. A pad any
+/// core publishes inside the package — the native core's included —
+/// drives at its bank's supply instead ([`BankSupplies`]).
 pub const LOGIC_HIGH_VOLTS: Volts = embsim_board::net::LOGIC_HIGH_VOLTS;
 
 /// I/O pads on the package.
@@ -177,22 +201,103 @@ pub const P2_VDD_MIN_VOLTS: Volts = 1.7;
 /// **max 1.9 V** (the same table row, p. 47).
 pub const P2_VDD_MAX_VOLTS: Volts = 1.9;
 
+/// How long after its reset releases the chip starts: "Propeller restarts
+/// 3 ms after RESn transitions from low to high" — P2X8C4M64P Datasheet,
+/// "Pin Descriptions", p. 6, the `RESN` row. The package counts it from
+/// the instant its reset releases — `RESN` reads released with `VDD`
+/// inside its window — and starts the core at the end of it, if the reset
+/// has stayed released the whole time.
+pub const P2_RESTART_DELAY_NS: u64 = 3_000_000;
+
+/// A pad's input logic threshold, **relative** to its bank's supply and
+/// measured against `GND`: `Vih`, Input Logic Threshold, min `Vxxyy` ×
+/// 0.3, typ × 0.5, max × 0.7 (P2X8C4M64P Datasheet, DC Characteristics,
+/// p. 47) — the threshold lies somewhere in the band, so an input at or
+/// below 0.3 × `Vxxyy` reads low on every part and one at or above 0.7 ×
+/// `Vxxyy` high. The logic input mode names no hysteresis (the Schmitt
+/// modes are a `WRPIN` choice the declaration does not see), so between
+/// the two the pad reads no level ([`DeadBand::Unknown`]) and the core
+/// keeps the input bit it has — what it does with a floating or fought pad.
+pub const P2_PAD_THRESHOLDS: Thresholds = Thresholds::new(0.3, 0.7, 0.0, DeadBand::Unknown);
+
+/// `RESN`'s, `TEST`'s and `XI`'s thresholds: the JEDEC JESD8C.01 3.3 V
+/// LVCMOS pair ([`jesd8c01_lvcmos_thresholds`]), absolute. The datasheet's
+/// one threshold row (DC Characteristics, p. 47) is given as a fraction of
+/// a bank's `Vxxyy`, and these three pins belong to no bank (Pin
+/// Descriptions, p. 6: `RESN` is pulled up "to 3.3 V", `TEST` tied to
+/// ground, `XI` takes a crystal or an oscillator's output), so the pair
+/// the engine's own dead band projects a net through stands in, stated.
+pub const P2_UNBANKED_INPUT_THRESHOLDS: Thresholds = jesd8c01_lvcmos_thresholds(DeadBand::Unknown);
+
 // ============================================================
 // Pad drive strengths
 // ============================================================
 
-/// A pad in **fast** drive mode (`%000`), as a Thevenin impedance.
+/// The fast driver sourcing, as `(current, drop below Vxxyy)` pairs:
+/// `Voh` (relative to `Vxxyy`) −6 / −170 / −580 mV sourcing 1 / 10 /
+/// 30 mA — P2X8C4M64P Datasheet, "DC Characteristics" (the table's
+/// continuation), p. 48, the "Typ" column (25 °C) at a 3.3 V supply.
+pub const P2_FAST_SOURCE_POINTS: [(Amps, Volts); 3] =
+    [(0.001, 0.006), (0.010, 0.170), (0.030, 0.580)];
+
+/// The fast driver sinking, as `(current, rise above GND)` pairs: `Vol`
+/// (relative to GND) 15 / 160 / 510 mV sinking 1 / 10 / 30 mA — the same
+/// table, p. 48, "Typ".
+pub const P2_FAST_SINK_POINTS: [(Amps, Volts); 3] =
+    [(0.001, 0.015), (0.010, 0.160), (0.030, 0.510)];
+
+/// The least-squares resistance through the origin of a set of
+/// `(current, drop)` points, `Σ V·I / Σ I²`: the one `R` of `V = I·R`
+/// that fits them best — a Thevenin port whose open-circuit voltage is the
+/// rail it drives to has that `R` as its only parameter.
+pub const fn fitted_ohms(points: &[(Amps, Volts)]) -> Ohms {
+    let mut volt_amps = 0.0;
+    let mut amps_squared = 0.0;
+    let mut k = 0;
+    while k < points.len() {
+        let (amps, volts) = points[k];
+        volt_amps += volts * amps;
+        amps_squared += amps * amps;
+        k += 1;
+    }
+    volt_amps / amps_squared
+}
+
+/// Both of the fast driver's tables in one list, sourcing then sinking:
+/// what [`P2_FAST_OHMS`] is fitted to.
+const P2_FAST_POINTS: [(Amps, Volts); 6] = [
+    P2_FAST_SOURCE_POINTS[0],
+    P2_FAST_SOURCE_POINTS[1],
+    P2_FAST_SOURCE_POINTS[2],
+    P2_FAST_SINK_POINTS[0],
+    P2_FAST_SINK_POINTS[1],
+    P2_FAST_SINK_POINTS[2],
+];
+
+/// A pad in **fast** drive mode (`%000`), as a Thevenin impedance:
+/// **17.99 Ω**, derived, not chosen.
 ///
-/// TODO(provenance): a placeholder, the crate's default push-pull
-/// impedance. The value to derive is in the P2X8C4M64P Datasheet's "DC
-/// Characteristics" table (p. 47): `Voh` relative to `Vxxyy` is −6 / −170
-/// / −580 mV sourcing 1 / 10 / 30 mA and `Vol` 15 / 160 / 510 mV sinking
-/// the same, so the fast driver's effective source resistance is 17–19 Ω
-/// across the rated range. Every projection on the three reference boards
-/// ranks a fast pad against pulls of 10 kΩ and more, so the placeholder
-/// decides nothing today; the figure moves with phase 5's `PinDecl`
-/// rewrite, where the pad's strength is a declaration.
-pub const P2_FAST_OHMS: Ohms = embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE;
+/// A pad is a Thevenin port — high at its bank's `Vxxyy`, low at `GND` —
+/// so its open-circuit voltages are the rails and its impedance is the one
+/// parameter left. The datasheet gives the fast driver's output voltage
+/// at three currents each way ([`P2_FAST_SOURCE_POINTS`],
+/// [`P2_FAST_SINK_POINTS`]: P2X8C4M64P Datasheet, "DC Characteristics",
+/// p. 48); the impedance is the least-squares fit of `V = I·R` to all six
+/// ([`fitted_ohms`]): `Σ V·I / Σ I²` = 0.036021 W ÷ 0.002002 A² = 17.99 Ω.
+/// The individual ratios run 6–19.3 Ω (a MOSFET driver is not a
+/// resistor; the 1 mA points are the low end, the 30 mA source point the
+/// high one) and the fit weights the larger currents where the figure
+/// matters. One figure serves both levels: the pad-mode table names one
+/// "fast" mode, and the two sides' own fits (19.09 Ω sourcing, 16.90 Ω
+/// sinking) differ by less than the table's own spread. The ranking it
+/// feeds is by factors of ten — a fast pad against the boards' 10 kΩ and
+/// larger pulls, or a fight between two pads within the ratio either way
+/// — so no projection on the reference boards moves from the 25 Ω
+/// placeholder this replaced. The six points are the table's typical
+/// column at a 3.3 V supply, and the one figure serves a 1.8 V bank too:
+/// the datasheet gives no 1.8 V row, and nothing is invented for one
+/// (`NODES.md` §12 item 5, the P2 task's decision (7)).
+pub const P2_FAST_OHMS: Ohms = fitted_ohms(&P2_FAST_POINTS);
 
 /// The `%001` drive mode: 1.5 kΩ (Silicon Doc, pin configuration table).
 pub const P2_PULL_1K5_OHMS: Ohms = 1_500.0;
@@ -258,11 +363,12 @@ pub enum PadMode {
     Ohms15k,
     /// `%011`: 150 kΩ.
     Ohms150k,
-    /// `%100`: a 1 mA current source (not mapped).
+    /// `%100`: a 1 mA current source (P2X8C4M64P Datasheet, p. 24; not
+    /// mapped — the module docs say why).
     Current1mA,
-    /// `%101`: a 100 µA current source (not mapped).
+    /// `%101`: a 100 µA current source (the same table; not mapped).
     Current100uA,
-    /// `%110`: a 10 µA current source (not mapped).
+    /// `%110`: a 10 µA current source (the same table; not mapped).
     Current10uA,
     /// `%111`: the pad floats.
     Float,
@@ -375,6 +481,22 @@ pub fn pin_name(pin: u8) -> &'static str {
     PAD_NAMES[usize::from(pin & 63)]
 }
 
+/// The pad a facade name (`"P0"`..`"P63"`) names, or `None` for any other
+/// pin.
+pub fn pad_of(name: &str) -> Option<u8> {
+    PAD_NAMES
+        .iter()
+        .position(|pad| *pad == name)
+        .and_then(|pad| u8::try_from(pad).ok())
+}
+
+/// The pin-configuration word the native core's pads drive in: `0`, fast
+/// both ways (`%0000_CIO_HHH_LLL` with `HHH` = `LLL` = `%000`, Silicon
+/// Documentation v35, "Pin Configuration Modes") — the word a pad holds
+/// until a `WRPIN` changes it, and the HAL tables the native core bridges
+/// name no drive mode that would.
+pub const NATIVE_PAD_MODE: u32 = P_HIGH_FAST | P_LOW_FAST;
+
 /// The sixteen bank supply pins, in bank order: `VIO_0_3` powers `P0`–`P3`,
 /// `VIO_4_7` the next four, and so on ([`PADS_PER_BANK`]).
 static BANK_PINS: [&str; NUM_BANKS] = [
@@ -410,35 +532,37 @@ pub fn bank_pin_name(bank: usize) -> &'static str {
 /// The package's pins beside the pads and the bank supplies, as the
 /// P2-EC32MB netlist normalises them: the core rail and ground, the reset
 /// and test inputs, and the crystal pair.
-const OTHER_PINS: [(&str, PinKind); 6] = [
-    ("GND", PinKind::PowerIn),
-    ("VDD", PinKind::PowerIn),
-    ("RESN", PinKind::DigitalIn),
-    ("TEST", PinKind::DigitalIn),
-    ("XI", PinKind::DigitalIn),
-    ("XO", PinKind::DigitalOut),
+const OTHER_PINS: [PinDecl; 6] = [
+    PinDecl::power_in("GND"),
+    // "All VDD and all Vxxyy pins must have closely-located bypass caps to
+    // GND" (Minimal Connections, p. 7).
+    PinDecl::power_in("VDD").with_reference("GND"),
+    PinDecl::digital_in("RESN", P2_UNBANKED_INPUT_THRESHOLDS).with_reference("GND"),
+    PinDecl::digital_in("TEST", P2_UNBANKED_INPUT_THRESHOLDS).with_reference("GND"),
+    PinDecl::digital_in("XI", P2_UNBANKED_INPUT_THRESHOLDS).with_reference("GND"),
+    PinDecl::digital_out("XO").with_idle(None),
 ];
 
-/// The chip's facade: 64 bidirectional pads that idle released, and the 22
-/// package pins — the supplies as `PowerIn`, `RESN` and `TEST` sensed, `XI`
-/// a pulse sink whose delivered rate is the crystal, `XO` a released
-/// output. This is what the P2-EC32MB's `U100` slot expects, in both
-/// directions.
+/// The chip's facade: 64 bidirectional pads that idle released, each
+/// reading through [`P2_PAD_THRESHOLDS`] of its own bank's `VIO_a_b` pin
+/// against `GND`, and the 22 package pins — the supplies as power-in pins
+/// measured against `GND`, `RESN` and `TEST` sensed, `XI` sensed (the rate
+/// of the square wave on it the crystal), `XO` a released output. This is
+/// what the P2-EC32MB's `U100` slot expects, in both directions.
 pub fn p2x8c4m64p_pins() -> Vec<PinDecl> {
     let mut pins = Vec::with_capacity(NUM_PINS);
-    for name in PAD_NAMES {
-        pins.push(PinDecl::new(name, PinKind::DigitalBidir).with_idle(IdleDrive::Released));
+    for (pad, name) in PAD_NAMES.iter().enumerate() {
+        pins.push(
+            PinDecl::digital_out(name)
+                .with_idle(None)
+                .with_thresholds(P2_PAD_THRESHOLDS)
+                .with_supply(bank_pin_name(pad / PADS_PER_BANK))
+                .with_reference("GND"),
+        );
     }
-    for (name, kind) in OTHER_PINS {
-        let pin = PinDecl::new(name, kind);
-        pins.push(match name {
-            "XI" => pin.with_stream(StreamRole::PulseSink),
-            "XO" => pin.with_idle(IdleDrive::Released),
-            _ => pin,
-        });
-    }
+    pins.extend(OTHER_PINS);
     for name in BANK_PINS {
-        pins.push(PinDecl::new(name, PinKind::PowerIn));
+        pins.push(PinDecl::power_in(name).with_reference("GND"));
     }
     pins
 }
@@ -447,30 +571,18 @@ pub fn p2x8c4m64p_pins() -> Vec<PinDecl> {
 // What the package delivers to its core
 // ============================================================
 
-/// The voltage a supply pin's net names, or nothing: an `Analog(v)` is a
-/// voltage — a terminal at the pin, or a solved operating point; a
-/// digital projection (`Driven`, `Pulled`) names a level and no voltage;
-/// `Floating` and `Contention` name nothing. The package invents none.
-fn named_volts(state: NetState) -> Option<Volts> {
-    match state {
-        NetState::Analog(v) if v.is_finite() => Some(v),
-        _ => None,
-    }
-}
-
 /// The reset inputs as the package reads them: `RESN` projected through
-/// the engine's own level rule ([`level_of`]) — `Some(High)` a released
-/// reset, `Some(Low)` a held one, `None` nothing reaching the pin — and
-/// `VDD` both as that level and as the voltage its net names, which is
-/// what the START gate holds the core to.
+/// its declared thresholds ([`P2_UNBANKED_INPUT_THRESHOLDS`]) — `Some(High)`
+/// a released reset, `Some(Low)` a held one, `None` nothing reaching the
+/// pin or a voltage the pair guarantees neither level at — and `VDD` as the
+/// voltage it is handed against `GND`, which is what the START gate holds
+/// the core to. `VDD` declares no thresholds: it is handed volts only.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct P2ResetState {
     /// `RESN` (active low).
     pub resn: Option<Level>,
-    /// `VDD`, the core supply, as a level.
-    pub vdd: Option<Level>,
-    /// `VDD` as the voltage its net names, `None` when it names no voltage
-    /// (nothing reaches the pin, or a source with a level and no voltage).
+    /// `VDD` against `GND`, `None` when it names no voltage (nothing
+    /// reaches the pin, nothing holds `GND`, a clock).
     pub vdd_volts: Option<Volts>,
 }
 
@@ -499,17 +611,43 @@ pub enum StartState {
         /// The inputs the gate is waiting on.
         reset: P2ResetState,
     },
+    /// The reset released and the chip is counting out the datasheet's
+    /// restart delay ([`P2_RESTART_DELAY_NS`]): the core starts at
+    /// `starts_at_ns` if the reset stays released until then.
+    Restarting {
+        /// The instant `RESN` read released with `VDD` inside its window.
+        released_at_ns: u64,
+        /// The START instant it leads to.
+        starts_at_ns: u64,
+    },
     /// The core was started at this virtual instant, and runs from it.
     Started {
         /// The START instant, nanoseconds.
         at_ns: u64,
     },
+    /// The core was started, then `VDD` left its window at `at_ns` with
+    /// `RESN` not asserted — a brownout without a reset, the fault a reset
+    /// supervisor exists to prevent. The package holds the core from that
+    /// instant ([`P2Core::reset`]) and reports it once (`tracing::warn`).
+    BrownoutWithoutReset {
+        /// The START instant the core ran from.
+        started_at_ns: u64,
+        /// The instant `VDD` left its window.
+        at_ns: u64,
+        /// The reset inputs as the package read them then.
+        reset: P2ResetState,
+    },
 }
 
-/// The crystal a delivered train on `XI` is: its rate, or `None` for a
-/// held train (no clock reaches the pin).
-pub fn crystal_of(train: &PulseTrain) -> Option<u64> {
-    (train.pulses.freq_hz > 0).then(|| u64::from(train.pulses.freq_hz))
+/// The crystal `XI` is handed: the rate of the square wave it carries
+/// ([`Sense::periodic`]), or `None` for anything else — a held segment, a
+/// level, a floating or fought pin (no clock reaches it).
+pub fn crystal_of(sense: &Sense) -> Option<u64> {
+    sense
+        .periodic
+        .map(|clock| clock.segment.freq_hz)
+        .filter(|&hz| hz > 0)
+        .map(u64::from)
 }
 
 // ============================================================
@@ -517,7 +655,7 @@ pub fn crystal_of(train: &PulseTrain) -> Option<u64> {
 // ============================================================
 
 /// A bank's supply as an `f64`'s bits: NaN is no voltage, which no supply
-/// can name (`named_volts` passes finite voltages only).
+/// can name (a sense's voltage is finite or absent).
 const NO_SUPPLY_BITS: u64 = f64::NAN.to_bits();
 
 /// Every bank's bit in the table's masks.
@@ -660,7 +798,9 @@ impl BankSupplies {
 
 type CrystalCallback = Box<dyn Fn(Option<u64>) + Send + Sync>;
 type ResetCallback = Box<dyn Fn(P2ResetState) + Send + Sync>;
-type WakeCallback = Arc<dyn Fn(u64) + Send + Sync>;
+/// The core's wake handler, shared with the package's forwarder. The lock
+/// is never contended: the engine thread is the only caller.
+type CoreWake = Arc<Mutex<WakeHandler>>;
 
 /// What a core subscribed to through [`P2Pads`], collected during its
 /// attach and frozen when the package installs its own senses.
@@ -682,24 +822,86 @@ struct PackageState {
 /// whether it runs.
 #[derive(Default)]
 struct Gate {
-    /// [`Component::start`] has run: the system is live and the core may
-    /// be started the moment the inputs allow.
+    /// [`Component::start`] has run: the system is live, and the reset
+    /// counts as released — the restart delay starts — the moment the
+    /// inputs allow.
     start_requested: bool,
+    /// The instant the reset released — `RESN` released and `VDD` inside
+    /// its window, with the system live and every bank told — while the
+    /// core waits out the restart delay; `None` while the reset holds, and
+    /// cleared if it re-asserts before the delay is out.
+    released_at_ns: Option<u64>,
     /// The START instant, once the core was started.
     started_at_ns: Option<u64>,
-    /// The core's wake handler, registered through [`P2Pads::on_wake_ns`].
-    core_wake: Option<WakeCallback>,
-    /// Wakes the core asked for through [`P2Pads::schedule_at_ns`] before
-    /// it was started; forwarded at the START instant, no earlier.
+    /// The instant `VDD` left its window after the START instant with
+    /// `RESN` not asserted, and the inputs then: the core is held from it.
+    brownout: Option<(u64, P2ResetState)>,
+    /// The core's wake handler, however it registered it: through
+    /// [`P2Pads::on_wake_ns`], or on the net I/O the package handed it
+    /// ([`CoreWakes`]).
+    core_wake: Option<CoreWake>,
+    /// Wakes the core asked for before it was started; forwarded at the
+    /// START instant, no earlier.
     held_wakes: Vec<u64>,
+    /// Periodic wakes the core asked for before it was started; armed at
+    /// the START instant, their periods counted from there.
+    held_periods: Vec<u64>,
+}
+
+/// The core's time, as the package hosts it: the [`WakeGate`] behind the
+/// net I/O every core is handed ([`P2Pads`], and the native core's
+/// [`ComponentNetIo`]). A wake handler is the core's, delivered by the
+/// package's own forwarder once the core is started; a wake asked for
+/// before the START instant is held and lands there (or at its own instant
+/// if that is later); one asked for after goes to the engine at once. One
+/// entry point, so every core — the QEMU target, an ISS, the native
+/// firmware image — is held the same way.
+struct CoreWakes {
+    gate: Arc<Mutex<Gate>>,
+    /// The package's own net I/O: where a wake goes once the core runs.
+    io: ComponentNetIo,
+}
+
+impl WakeGate for CoreWakes {
+    fn on_wake_ns(&self, handler: WakeHandler) {
+        self.gate
+            .lock()
+            .expect("start gate never poisoned")
+            .core_wake = Some(Arc::new(Mutex::new(handler)));
+    }
+
+    fn schedule_at_ns(&self, at_ns: u64) {
+        let mut gate = self.gate.lock().expect("start gate never poisoned");
+        if gate.brownout.is_some() {
+            // A held core is woken no more.
+        } else if gate.started_at_ns.is_some() {
+            drop(gate);
+            self.io.schedule_at_ns(at_ns);
+        } else {
+            gate.held_wakes.push(at_ns);
+        }
+    }
+
+    fn schedule_every_ns(&self, period_ns: u64) {
+        let mut gate = self.gate.lock().expect("start gate never poisoned");
+        if gate.brownout.is_some() {
+            // A held core is woken no more.
+        } else if gate.started_at_ns.is_some() {
+            drop(gate);
+            self.io.schedule_every_ns(period_ns);
+        } else {
+            gate.held_periods.push(period_ns);
+        }
+    }
 }
 
 /// A core's whole surface: its 64 pads, the package's two facts (the
-/// crystal on `XI`, the reset inputs), the bank supplies, and the engine's
-/// wake scheduling. Handed to [`P2Core::attach`] once, by the package; a
-/// core keeps the handles it needs and subscribes to what it wants
-/// delivered. (The native core is the exception that takes the underlying
-/// net I/O whole — see [`McuComponent`]'s `P2Core` impl.)
+/// crystal on `XI`, the reset inputs), the bank supplies, and wake
+/// scheduling through the package's START gate. Handed to
+/// [`P2Core::attach`] once, by the package; a core keeps the handles it
+/// needs and subscribes to what it wants delivered. (The native core takes
+/// the underlying net I/O whole — see [`McuComponent`]'s `P2Core` impl —
+/// and that I/O's wakes go through the same gate.)
 ///
 /// A pad sense is also the declaration that the core **reads** that pad:
 /// every pad is a released bidirectional pin, an input until driven, and a
@@ -713,6 +915,9 @@ struct Gate {
 /// started is held and lands at the START instant; one asked for after
 /// is the engine's at once. The wake handler is registered once, through
 /// [`P2Pads::on_wake_ns`], and delivered only after the core was started.
+/// The same holds for a core that schedules on the net I/O it was handed:
+/// that I/O is the package's, its wakes routed through the gate
+/// ([`ComponentNetIo::with_wake_gate`]).
 ///
 /// Everything here goes through the one interface a node has
 /// (`NODES.md` §11): pad handles publish drives, pad senses deliver the
@@ -721,9 +926,10 @@ struct Gate {
 /// pad on.
 #[derive(Clone)]
 pub struct P2Pads {
+    /// The package's net I/O, its wakes routed through the START gate
+    /// ([`CoreWakes`]).
     io: ComponentNetIo,
     subscribers: Arc<Mutex<Subscribers>>,
-    gate: Arc<Mutex<Gate>>,
     banks: BankSupplies,
 }
 
@@ -745,14 +951,21 @@ impl P2Pads {
         self.banks.clone()
     }
 
-    /// Subscribe to the resolved state of pad `pin`'s net: delivered once
-    /// at registration and on every change, on the engine thread.
+    /// Subscribe to the level pad `pin` reads: its sense projected through
+    /// the pad's declared thresholds, [`P2_PAD_THRESHOLDS`] of its bank's
+    /// `VIO_a_b` at the instant, chosen by the level it last read —
+    /// delivered once at registration and on every change of the pad's
+    /// net, on the engine thread. `None` is a pad that reads no level: a
+    /// floating net, a voltage inside the band the datasheet guarantees
+    /// neither level in, a bank whose supply names no voltage, a clock.
     pub fn on_pad_sense(
         &self,
         pin: u8,
-        callback: impl Fn(NetState) + Send + 'static,
+        callback: impl Fn(Option<Level>) + Send + 'static,
     ) -> Result<(), AttachError> {
-        self.io.on_sense(pin_name(pin), callback)
+        let receiver = DigitalReceiver::new(self.io.pin(pin_name(pin))?);
+        self.io
+            .on_sense(pin_name(pin), move |sense| callback(receiver.read(&sense)))
     }
 
     /// Subscribe to the crystal: the rate delivered on `XI`, `Some(hz)`
@@ -781,23 +994,14 @@ impl P2Pads {
     /// see [`ComponentNetIo::on_wake_ns`]). Delivered on the engine thread
     /// with the current virtual nanosecond, only once the core is started.
     pub fn on_wake_ns(&self, callback: impl Fn(u64) + Send + Sync + 'static) {
-        self.gate
-            .lock()
-            .expect("start gate never poisoned")
-            .core_wake = Some(Arc::new(callback));
+        self.io.on_wake_ns(callback);
     }
 
     /// Arm a one-shot wake at an absolute virtual nanosecond. Before the
     /// core is started the request is held and lands at the START instant
     /// (or at `at_ns` if that is later); after, it is the engine's at once.
     pub fn schedule_at_ns(&self, at_ns: u64) {
-        let mut gate = self.gate.lock().expect("start gate never poisoned");
-        if gate.started_at_ns.is_some() {
-            drop(gate);
-            self.io.schedule_at_ns(at_ns);
-        } else {
-            gate.held_wakes.push(at_ns);
-        }
+        self.io.schedule_at_ns(at_ns);
     }
 }
 
@@ -814,13 +1018,25 @@ pub trait P2Core: Send + Sync {
 
     /// Begin execution the core owns, at the START instant: after every
     /// component has attached and started ([`Component::start`], the live
-    /// path only) **and** the package's gate has opened — `RESN` released
-    /// and `VDD` inside its window. The current virtual nanosecond is the
-    /// START instant the core's clock counts from. Runs before any wake
-    /// the core asked for is delivered, on the thread the gate opened on:
-    /// the engine thread when a sense opened it, the starting thread when
-    /// the inputs already allowed it at start.
+    /// path only) **and** the datasheet's restart delay
+    /// ([`P2_RESTART_DELAY_NS`]) has run out since the reset released —
+    /// `RESN` released and `VDD` inside its window the whole time. The
+    /// current virtual nanosecond is the START instant the core's clock
+    /// counts from. Runs before any wake the core asked for is delivered,
+    /// on the engine thread, inside the package's own wake.
     fn start(&mut self) {}
+
+    /// Stop executing: the chip left its operating conditions while this
+    /// core ran — `VDD` out of its window with `RESN` not asserted, the
+    /// brownout a reset supervisor exists to prevent
+    /// ([`StartState::BrownoutWithoutReset`]). Called once, on the engine
+    /// thread, at the instant the package reads it; the package delivers
+    /// no wake to the core after it and never starts it again. What the
+    /// silicon does out of its window the datasheet does not say, so a
+    /// core changes nothing it has published — its pads keep their drives
+    /// — and runs nothing more. A core that cannot stop (the native
+    /// firmware image, on a thread of its own) says so.
+    fn reset(&mut self) {}
 }
 
 /// A package with no core: the state any P2 is in before it runs. Every
@@ -839,8 +1055,8 @@ impl P2Core for HeldInReset {
 /// and it bridges the channels its HAL tables name, exactly as it would
 /// on a board of its own. The package still declares every pin and still
 /// runs its own `XI`/`RESN`/`VDD`/`VIO` senses beside it, and its START
-/// gate holds the firmware entry ([`McuComponent`]'s `start`) as it holds
-/// any core's.
+/// gate holds the firmware entry ([`McuComponent`]'s `start`) and every
+/// wake the core asks for, as it holds any core's.
 ///
 /// What it is handed is the package's **whole** net I/O — the handle table
 /// carries `XI`, `XO`, `RESN`, `VDD` and the `VIO` pins beside the 64 pads
@@ -849,16 +1065,41 @@ impl P2Core for HeldInReset {
 /// interface is the same one every node has, so nothing is reachable that
 /// a node could not reach; the package-level facts still arrive through
 /// the package's own senses, as for any core. Its wake handler and its
-/// schedules go to the engine directly, so the gate holds its start and
-/// nothing else, and its pads drive at [`LOGIC_HIGH_VOLTS`] through the
-/// HAL bridges (the module docs say why).
+/// schedules go through the START gate ([`ComponentNetIo::with_wake_gate`]).
+///
+/// Its pads are the package's like any core's ([`McuComponent::host_pads`]):
+/// a bridged pad drives through [`BankSupplies::pad_drive`] in
+/// [`NATIVE_PAD_MODE`] — high at its bank's `VIO_a_b`, at
+/// [`P2_FAST_OHMS`], nothing in a bank whose supply names no voltage, the
+/// bank reported once — and nothing before the START instant, where the
+/// package runs the core's `start` and the bridged outputs present their
+/// power-on state (a chip in reset floats every pad).
 impl P2Core for McuComponent {
     fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
+        let banks = pads.bank_supplies();
+        self.host_pads(Arc::new(move |pin, level| {
+            let pad = pad_of(pin)?;
+            match banks.pad_drive(pad, NATIVE_PAD_MODE, true, level == Level::High) {
+                PadDrive::Thevenin(drive) => Some(drive),
+                PadDrive::Released | PadDrive::CurrentSource(_) => None,
+            }
+        }));
         Component::attach(self, pads.io)
     }
 
     fn start(&mut self) {
         Component::start(self);
+    }
+
+    /// The native firmware runs on a thread of its own and cannot be
+    /// stopped from here: the package stops delivering its wakes, and says
+    /// that the firmware itself runs on.
+    fn reset(&mut self) {
+        tracing::warn!(
+            mcu = self.name(),
+            "p2: the native core cannot be held — its firmware runs on its own thread and \
+             keeps running; only its wakes stop"
+        );
     }
 }
 
@@ -902,24 +1143,38 @@ impl P2PackageHandle {
 
     /// Whether the core has been started, and when — or why not yet.
     pub fn start_state(&self) -> StartState {
-        match self
-            .gate
-            .lock()
-            .expect("start gate never poisoned")
-            .started_at_ns
-        {
-            Some(at_ns) => StartState::Started { at_ns },
-            None => StartState::Held {
+        let (started, released, brownout) = {
+            let gate = self.gate.lock().expect("start gate never poisoned");
+            (gate.started_at_ns, gate.released_at_ns, gate.brownout)
+        };
+        match (started, released) {
+            (Some(started_at_ns), _) => match brownout {
+                Some((at_ns, reset)) => StartState::BrownoutWithoutReset {
+                    started_at_ns,
+                    at_ns,
+                    reset,
+                },
+                None => StartState::Started {
+                    at_ns: started_at_ns,
+                },
+            },
+            (None, Some(released_at_ns)) => StartState::Restarting {
+                released_at_ns,
+                starts_at_ns: released_at_ns.saturating_add(P2_RESTART_DELAY_NS),
+            },
+            (None, None) => StartState::Held {
                 reset: self.reset(),
             },
         }
     }
 
-    /// The START instant, once the core was started.
+    /// The START instant, once the core was started (whether or not it
+    /// was held by a brownout since).
     pub fn started_at_ns(&self) -> Option<u64> {
         match self.start_state() {
             StartState::Started { at_ns } => Some(at_ns),
-            StartState::Held { .. } => None,
+            StartState::BrownoutWithoutReset { started_at_ns, .. } => Some(started_at_ns),
+            StartState::Held { .. } | StartState::Restarting { .. } => None,
         }
     }
 
@@ -996,17 +1251,101 @@ impl<C: P2Core + 'static> P2Package<C> {
         }
     }
 
-    /// Open the gate if it can be opened: the system is live
-    /// (`start_requested`), the core is not yet started, the inputs allow
-    /// it, and every bank sense has delivered ([`BankSupplies::all_delivered`],
-    /// so the core's first pad publish reads a populated table). Starts the
-    /// core at `now`, then forwards every wake it held. Returns whether the
-    /// core is started (now or before).
-    ///
-    /// Both conditions are read under the gate's lock, on whichever thread
-    /// asks — the engine thread from a `RESN`, `VDD` or bank delivery, the
-    /// caller's from `Component::start` — so the gate opens exactly once,
-    /// at the first delivery after which all of them hold.
+    /// Whether the reset is released as far as the gate is concerned: the
+    /// system is live, `RESN` reads released with `VDD` inside its window,
+    /// and every bank sense has delivered ([`BankSupplies::all_delivered`],
+    /// so the core's first pad publish reads a populated table).
+    fn released(gate: &Gate, state: &Mutex<PackageState>, banks: &BankSupplies) -> bool {
+        let reset = state.lock().expect("package state never poisoned").reset;
+        gate.start_requested && reset.out_of_reset() && banks.all_delivered()
+    }
+
+    /// Follow the reset inputs before the START instant: the instant the
+    /// reset releases, count out the restart delay — arm the package's own
+    /// wake at `now + P2_RESTART_DELAY_NS` — and if the reset re-asserts
+    /// before it is out, forget the release, so a glitch shorter than the
+    /// delay starts nothing. Called on every `RESN`, `VDD` and bank
+    /// delivery (the engine thread) and at `Component::start` (the
+    /// starting thread), under the gate's lock, so a release is counted
+    /// exactly once.
+    fn follow_reset(
+        gate: &Mutex<Gate>,
+        state: &Mutex<PackageState>,
+        banks: &BankSupplies,
+        io: &ComponentNetIo,
+        now: u64,
+    ) {
+        let arm_at = {
+            let mut gate = gate.lock().expect("start gate never poisoned");
+            if gate.started_at_ns.is_some() {
+                return;
+            }
+            match (Self::released(&gate, state, banks), gate.released_at_ns) {
+                (true, None) => {
+                    gate.released_at_ns = Some(now);
+                    Some(now.saturating_add(P2_RESTART_DELAY_NS))
+                }
+                (false, Some(released_at_ns)) => {
+                    gate.released_at_ns = None;
+                    tracing::info!(
+                        released_at_ns,
+                        at_ns = now,
+                        "p2: the reset re-asserted inside the restart delay; the chip does not \
+                         start until it releases again"
+                    );
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(at_ns) = arm_at {
+            tracing::info!(
+                released_at_ns = now,
+                starts_at_ns = at_ns,
+                "p2: the reset released; the chip restarts after the datasheet's 3 ms delay"
+            );
+            if virtual_clock::is_initialized() {
+                io.schedule_at_ns(at_ns);
+            } else {
+                tracing::warn!(
+                    "p2: no virtual clock to count the restart delay on; the core stays held"
+                );
+            }
+        }
+    }
+
+    /// Watch the running chip's supply: `VDD` leaving its window after the
+    /// START instant while `RESN` is not asserted (it reads high or
+    /// nothing) is a brownout without a reset. Record it once, say so, and
+    /// hold the core ([`P2Core::reset`]): no wake reaches it again. A
+    /// `RESN` asserted first is a reset the chip was told about, and the
+    /// package does nothing with it after START but deliver it.
+    fn watch_brownout(gate: &Mutex<Gate>, core: &Mutex<C>, reset: P2ResetState, now: u64) {
+        {
+            let mut gate = gate.lock().expect("start gate never poisoned");
+            if gate.started_at_ns.is_none()
+                || gate.brownout.is_some()
+                || reset.vdd_in_window()
+                || reset.resn == Some(Level::Low)
+            {
+                return;
+            }
+            gate.brownout = Some((now, reset));
+        }
+        tracing::warn!(
+            at_ns = now,
+            ?reset,
+            vdd_window = format_args!("{P2_VDD_MIN_VOLTS}..={P2_VDD_MAX_VOLTS} V"),
+            "p2: brownout without reset — VDD left its window while the core ran and RESN was \
+             not asserted; the core is held from here"
+        );
+        core.lock().expect("core never poisoned").reset();
+    }
+
+    /// The package's own wake, before the START instant: if the reset
+    /// released at least the restart delay ago and is released still,
+    /// start the core at `now` and forward every wake it held. Returns
+    /// whether the core is started (now or before).
     fn try_begin(
         gate: &Mutex<Gate>,
         core: &Mutex<C>,
@@ -1015,27 +1354,38 @@ impl<C: P2Core + 'static> P2Package<C> {
         io: &ComponentNetIo,
         now: u64,
     ) -> bool {
-        let held = {
+        let (held, periods) = {
             let mut gate = gate.lock().expect("start gate never poisoned");
             if gate.started_at_ns.is_some() {
                 return true;
             }
-            let reset = state.lock().expect("package state never poisoned").reset;
-            if !gate.start_requested || !reset.out_of_reset() || !banks.all_delivered() {
+            let Some(released_at_ns) = gate.released_at_ns else {
+                return false;
+            };
+            if now < released_at_ns.saturating_add(P2_RESTART_DELAY_NS)
+                || !Self::released(&gate, state, banks)
+            {
                 return false;
             }
             gate.started_at_ns = Some(now);
-            std::mem::take(&mut gate.held_wakes)
+            (
+                std::mem::take(&mut gate.held_wakes),
+                std::mem::take(&mut gate.held_periods),
+            )
         };
         tracing::info!(
             at_ns = now,
-            "p2: START — RESN released and VDD inside its window; the core runs from here"
+            "p2: START — the restart delay after the reset released is out; the core runs \
+             from here"
         );
         // Before any wake the core asked for is delivered: the core's
         // clock counts from this instant.
         core.lock().expect("core never poisoned").start();
         for at_ns in held {
             io.schedule_at_ns(at_ns.max(now));
+        }
+        for period_ns in periods {
+            io.schedule_every_ns(period_ns);
         }
         true
     }
@@ -1049,32 +1399,47 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         self.io = Some(io.clone());
 
-        // The gate's wake forwarder, registered ahead of the core: a core
-        // that routes its handler through `P2Pads::on_wake_ns` is delivered
-        // from here once started; a core that registers its own handler
-        // directly on the net I/O (the native core) replaces this one —
-        // last registration wins — and keeps its wakes as they are.
+        // The package's wake: the one handler the engine holds for this
+        // node. Before the START instant every wake is the package's own —
+        // the end of a restart delay — since the gate holds the core's;
+        // from it on every wake is the core's. The core's handler — however
+        // the core registered it, through `P2Pads` or on the net I/O it was
+        // handed, both of which route through the gate (`CoreWakes`) — is
+        // delivered from here.
         {
             let gate = Arc::clone(&self.gate);
+            let core = Arc::clone(&self.core);
+            let state = Arc::clone(&self.state);
+            let banks = self.banks.clone();
+            let io_for_gate = io.clone();
             io.on_wake_ns(move |now| {
                 let callback = {
                     let gate = gate.lock().expect("start gate never poisoned");
+                    if gate.brownout.is_some() {
+                        return;
+                    }
                     gate.started_at_ns.and(gate.core_wake.clone())
                 };
-                if let Some(callback) = callback {
-                    callback(now);
+                match callback {
+                    Some(callback) => (callback.lock().expect("core wake never poisoned"))(now),
+                    None => {
+                        Self::try_begin(&gate, &core, &state, &banks, &io_for_gate, now);
+                    }
                 }
             });
         }
 
+        let core_io = io.clone().with_wake_gate(Arc::new(CoreWakes {
+            gate: Arc::clone(&self.gate),
+            io: io.clone(),
+        }));
         let subscribers = Arc::new(Mutex::new(Subscribers::default()));
         self.core
             .lock()
             .expect("core never poisoned")
             .attach(P2Pads {
-                io: io.clone(),
+                io: core_io,
                 subscribers: Arc::clone(&subscribers),
-                gate: Arc::clone(&self.gate),
                 banks: self.banks.clone(),
             })?;
         // The core has subscribed to what it wants; freeze the lists so
@@ -1084,16 +1449,20 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
         let crystal: Arc<[CrystalCallback]> = crystal.into();
         let reset: Arc<[ResetCallback]> = reset.into();
 
-        // XI: the rate delivered here is the crystal. One projection, then
-        // every subscriber.
+        // XI: the rate of the square wave here is the crystal. One
+        // projection, then every subscriber — on a change of crystal only,
+        // so a net whose levels move under one segment tells no one.
         {
             let state = Arc::clone(&self.state);
-            io.on_pulse("XI", move |train| {
-                let hz = crystal_of(&train);
-                state
-                    .lock()
-                    .expect("package state never poisoned")
-                    .crystal_hz = hz;
+            io.on_sense("XI", move |sensed| {
+                let hz = crystal_of(&sensed);
+                {
+                    let mut state = state.lock().expect("package state never poisoned");
+                    if state.crystal_hz == hz {
+                        return;
+                    }
+                    state.crystal_hz = hz;
+                }
                 for callback in crystal.iter() {
                     callback(hz);
                 }
@@ -1116,13 +1485,11 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
             let banks = self.banks.clone();
             let state = Arc::clone(&self.state);
             let gate = Arc::clone(&self.gate);
-            let core = Arc::clone(&self.core);
             let io_for_gate = io.clone();
             io.on_sense(name, move |sensed| {
-                banks.set(bank, named_volts(sensed));
-                Self::try_begin(
+                banks.set(bank, sensed.volts);
+                Self::follow_reset(
                     &gate,
-                    &core,
                     &state,
                     &banks,
                     &io_for_gate,
@@ -1132,7 +1499,8 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
         }
 
         // RESN and VDD: each sense updates its half, delivers the pair,
-        // and gives the START gate its chance.
+        // and the gate follows it — a release starts the restart delay, a
+        // re-assertion inside it cancels it.
         for (pin, is_resn) in [("RESN", true), ("VDD", false)] {
             let state = Arc::clone(&self.state);
             let reset = Arc::clone(&reset);
@@ -1140,29 +1508,23 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
             let core = Arc::clone(&self.core);
             let banks = self.banks.clone();
             let io_for_gate = io.clone();
+            let receiver = DigitalReceiver::new(io.pin(pin)?);
             io.on_sense(pin, move |sensed| {
-                let level = level_of(sensed);
                 let snapshot = {
                     let mut state = state.lock().expect("package state never poisoned");
                     if is_resn {
-                        state.reset.resn = level;
+                        state.reset.resn = receiver.read(&sensed);
                     } else {
-                        state.reset.vdd = level;
-                        state.reset.vdd_volts = named_volts(sensed);
+                        state.reset.vdd_volts = sensed.volts;
                     }
                     state.reset
                 };
                 for callback in reset.iter() {
                     callback(snapshot);
                 }
-                Self::try_begin(
-                    &gate,
-                    &core,
-                    &state,
-                    &banks,
-                    &io_for_gate,
-                    virtual_clock::virtual_ns(),
-                );
+                let now = virtual_clock::virtual_ns();
+                Self::follow_reset(&gate, &state, &banks, &io_for_gate, now);
+                Self::watch_brownout(&gate, &core, snapshot, now);
             })?;
         }
         Ok(())
@@ -1179,7 +1541,14 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
         } else {
             0
         };
-        if !Self::try_begin(&self.gate, &self.core, &self.state, &self.banks, &io, now) {
+        Self::follow_reset(&self.gate, &self.state, &self.banks, &io, now);
+        let released = self
+            .gate
+            .lock()
+            .expect("start gate never poisoned")
+            .released_at_ns
+            .is_some();
+        if !released {
             let reset = self
                 .state
                 .lock()
@@ -1189,7 +1558,7 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
                 ?reset,
                 vdd_window = format_args!("{P2_VDD_MIN_VOLTS}..={P2_VDD_MAX_VOLTS} V"),
                 "p2: the core is held at start: RESN must read released and VDD a voltage \
-                 inside its window; the START gate opens when they do"
+                 inside its window; the chip restarts 3 ms after they do"
             );
         }
     }
@@ -1198,7 +1567,7 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embsim_board::{PulseDirection, PulseSegment};
+    use embsim_board::PeriodicSchedule;
     use rstest::rstest;
 
     #[test]
@@ -1209,20 +1578,29 @@ mod tests {
         assert_eq!(NUM_BANKS, 16);
         assert_eq!(pins[0].number, "P0");
         assert_eq!(pins[63].number, "P63");
-        for pad in &pins[..NUM_PADS] {
-            assert_eq!(pad.kind, PinKind::DigitalBidir, "{}", pad.number);
-            assert_eq!(pad.idle, IdleDrive::Released, "{}", pad.number);
-            assert_eq!(pad.stream, None, "{}", pad.number);
+        for (index, pad) in pins[..NUM_PADS].iter().enumerate() {
+            assert!(
+                pad.reads_when_subscribed(),
+                "{} is bidirectional",
+                pad.number
+            );
+            assert_eq!(pad.idle, None, "{}", pad.number);
+            assert_eq!(pad.thresholds, Some(P2_PAD_THRESHOLDS), "{}", pad.number);
+            assert_eq!(pad.supply, Some(bank_pin_name(index / PADS_PER_BANK)));
+            assert_eq!(pad.reference, Some("GND"));
         }
         let pin = |name: &str| pins.iter().find(|p| p.number == name).copied().unwrap();
-        assert_eq!(pin("XI").kind, PinKind::DigitalIn);
-        assert_eq!(pin("XI").stream, Some(StreamRole::PulseSink));
-        assert_eq!(pin("XO").kind, PinKind::DigitalOut);
-        assert_eq!(pin("XO").idle, IdleDrive::Released);
-        assert_eq!(pin("RESN").kind, PinKind::DigitalIn);
-        assert_eq!(pin("TEST").kind, PinKind::DigitalIn);
+        let digital = Some(embsim_board::SenseKind::Digital);
+        assert_eq!(pin("XI").senses_at_build(), digital);
+        assert!(pin("XO").drives());
+        assert_eq!(pin("XO").idle, None);
+        assert_eq!(pin("RESN").senses_at_build(), digital);
+        assert_eq!(pin("TEST").senses_at_build(), digital);
         for rail in ["VDD", "GND", "VIO_0_3", "VIO_56_59", "VIO_60_63"] {
-            assert_eq!(pin(rail).kind, PinKind::PowerIn, "{rail}");
+            assert_eq!(pin(rail).role, embsim_board::PinRole::PowerIn, "{rail}");
+        }
+        for rail in ["VDD", "VIO_0_3", "VIO_60_63"] {
+            assert_eq!(pin(rail).reference, Some("GND"), "{rail}");
         }
         assert_eq!(pin_name(0), "P0");
         assert_eq!(pin_name(63), "P63");
@@ -1255,7 +1633,7 @@ mod tests {
 
     /// Bits 13:11 select the drive while `OUT` = 1 and bits 10:8 while
     /// `OUT` = 0; the three resistive modes are their resistances, fast is
-    /// the placeholder, float is released, and a current source is the
+    /// the datasheet fit, float is released, and a current source is the
     /// unmapped variant.
     #[rstest]
     #[case::fast_high(P_HIGH_FAST | P_LOW_FAST, true, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: P2_FAST_OHMS }))]
@@ -1362,6 +1740,28 @@ mod tests {
         assert_eq!(ALL_BANKS_MASK, 0xFFFF);
     }
 
+    /// The fast pad's impedance is the least-squares fit of the
+    /// datasheet's six output figures, and it lies inside the span of
+    /// their individual ratios at the 10 and 30 mA rows.
+    #[test]
+    fn the_fast_impedance_is_the_fit_of_the_datasheet_figures() {
+        let ratio = |(amps, volts): (Amps, Volts)| volts / amps;
+        assert!((P2_FAST_OHMS - 0.036_021 / 0.002_002).abs() < 1e-12);
+        assert!((P2_FAST_OHMS - 17.9925).abs() < 1e-4, "{P2_FAST_OHMS}");
+        let rows: Vec<Ohms> = P2_FAST_SOURCE_POINTS[1..]
+            .iter()
+            .chain(&P2_FAST_SINK_POINTS[1..])
+            .map(|&p| ratio(p))
+            .collect();
+        let (lo, hi) = rows
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+        assert!((16.0..=19.34).contains(&lo) && (16.0..=19.34).contains(&hi));
+        assert!(lo <= P2_FAST_OHMS && P2_FAST_OHMS <= hi);
+        assert!((fitted_ohms(&P2_FAST_SOURCE_POINTS) - 19.0869).abs() < 1e-4);
+        assert!((fitted_ohms(&P2_FAST_SINK_POINTS) - 16.8981).abs() < 1e-4);
+    }
+
     #[test]
     fn the_spin2_constants_land_in_their_fields() {
         assert_eq!(P_HIGH_15K, 0x1000);
@@ -1375,18 +1775,30 @@ mod tests {
     }
 
     #[test]
-    fn a_train_with_a_rate_is_the_crystal_and_a_held_one_is_none() {
-        let train = PulseTrain {
-            pulses: PulseSegment {
-                emitted: 0,
-                freq_hz: 20_000_000,
-                total: None,
-                since_us: 1_000,
-            },
-            direction: PulseDirection::Forward,
+    fn a_square_wave_with_a_rate_is_the_crystal_and_a_held_one_is_none() {
+        let clock = |freq_hz| Sense {
+            volts: None,
+            periodic: Some(embsim_board::PeriodicSense {
+                hi: Some(0.8),
+                lo: Some(0.0),
+                segment: PeriodicSchedule {
+                    emitted: 0,
+                    freq_hz,
+                    total: None,
+                    since_ns: 1_000_000,
+                },
+            }),
+            at_ns: 0,
         };
-        assert_eq!(crystal_of(&train), Some(20_000_000));
-        assert_eq!(crystal_of(&PulseTrain::IDLE), None);
+        let at = |volts| Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        };
+        assert_eq!(crystal_of(&clock(20_000_000)), Some(20_000_000));
+        assert_eq!(crystal_of(&clock(0)), None);
+        assert_eq!(crystal_of(&at(Some(3.3))), None);
+        assert_eq!(crystal_of(&at(None)), None);
     }
 
     /// The core-supply window is the datasheet's `Vdd` row, 1.7 V to 1.9 V
@@ -1409,7 +1821,6 @@ mod tests {
         assert_eq!(P2_VDD_MAX_VOLTS, 1.9);
         let state = P2ResetState {
             resn: Some(Level::High),
-            vdd: vdd_volts.map(|v| if v >= 1.65 { Level::High } else { Level::Low }),
             vdd_volts,
         };
         assert_eq!(state.vdd_in_window(), in_window);
@@ -1433,7 +1844,6 @@ mod tests {
     fn out_of_reset_needs_resn_released_and_vdd_in_window() {
         let both = P2ResetState {
             resn: Some(Level::High),
-            vdd: Some(Level::High),
             vdd_volts: Some(1.8),
         };
         assert!(both.out_of_reset());
@@ -1442,18 +1852,13 @@ mod tests {
             ..both
         }
         .out_of_reset());
-        // A level with no voltage names nothing the window can be read
-        // against.
+        // A `VDD` that names no voltage names nothing the window can be
+        // read against.
         assert!(!P2ResetState {
             vdd_volts: None,
             ..both
         }
         .out_of_reset());
         assert!(!P2ResetState::default().out_of_reset());
-        assert_eq!(named_volts(NetState::Analog(1.8)), Some(1.8));
-        assert_eq!(named_volts(NetState::Driven(Level::High)), None);
-        assert_eq!(named_volts(NetState::Pulled(Level::High, 10_500.0)), None);
-        assert_eq!(named_volts(NetState::Floating), None);
-        assert_eq!(named_volts(NetState::Analog(f64::NAN)), None);
     }
 }

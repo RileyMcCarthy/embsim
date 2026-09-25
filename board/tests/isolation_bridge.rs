@@ -30,7 +30,14 @@
 //! - a rail on the end-switch loop, which the schematic genuinely does not
 //!   have — `IEND_U+` reaches only `IC9`'s anode and the `J16` screw terminal,
 //!   so the loop is drawn closed and unpowered. The strap says out loud what a
-//!   working machine has to provide.
+//!   working machine has to provide;
+//! - a wire from `IC14`'s secondary ground to `EN_GND`: the rework the
+//!   schematic defect `edgeboard.rs` asserts
+//!   (`the_servo_isolator_secondary_ground_is_unconnected`) needs. A part
+//!   measures its supply against its own ground pin (`NODES.md` §12 item 5,
+//!   the sense task), and as drawn `IC14`'s `GND2` pins reach only `C26`, so
+//!   its secondary side is down and nothing crosses it — the bench
+//!   behaviour the defect predicts. The wire is the fix, said out loud.
 
 mod machine_parts;
 
@@ -46,9 +53,9 @@ use rstest::rstest;
 use embsim_board::netlist::{self, ComponentDecl};
 use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EventLog, Finding, Harness, IdleDrive, Level,
-    NetState, PartRegistry, PinDecl, PinHandle, PinKind, PulseDirection, PulseSegment, PulseTrain,
-    PulseTx, Scenario, StreamRole, System, SystemHandle,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, Drive,
+    EventLog, Finding, Harness, Level, NetState, PartRegistry, PeriodicSchedule, PinDecl,
+    PinHandle, Scenario, System, SystemHandle, TheveninDrive,
 };
 use embsim_models::isolation::iso67xx;
 use embsim_models::isolation::{Channel, Iso67xx, Iso67xxMonitor};
@@ -127,7 +134,7 @@ impl Component for EndSwitchSettleProbe {
         let done = Arc::clone(&self.done);
         io.on_wake(move |_now_us| {
             *capture.lock().unwrap() = Some(EndSwitchSettled {
-                p19: y.sense(),
+                p19: y.net_report(),
                 lit: opto.is_lit(OptoChannel::Two),
                 sinking: opto.is_sinking(OptoChannel::Two),
                 current_ma: opto
@@ -143,14 +150,7 @@ impl Component for EndSwitchSettleProbe {
 }
 
 fn settle_probe_pin() -> PinDecl {
-    PinDecl {
-        number: "Y",
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_in("Y", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
 }
 
 /// Re-arm the end-switch settle probe and wait for the engine-thread capture.
@@ -239,12 +239,8 @@ fn promoted_registry(promoted: &Promoted) -> PartRegistry {
         let promoted = promoted.clone();
         registry.register(part, move |decl: &ComponentDecl| {
             let name = normalize_part(decl);
-            let mut config = iso67xx::Config::from_part_name(&name)
+            let config = iso67xx::Config::from_part_name(&name)
                 .unwrap_or_else(|| panic!("{name} is an ISO67xx"));
-            // The servo isolator's STEP channel carries a rate, not edges.
-            if decl.reference == "IC14" {
-                config = config.with_pulse_channel(STEP_CHANNEL);
-            }
             let isolator = Iso67xx::new(config).expect("a valid isolator configuration");
             promoted
                 .isolators
@@ -290,9 +286,8 @@ const STEP_FINGER: &str = "32";
 const DIR_FINGER: &str = "33";
 const ENA_FINGER: &str = "34";
 
-/// A stand-in for the P2's driven pins: three push-pull outputs, with `STEP`
-/// additionally a [`StreamRole::PulseSource`] so a rate-carried train can
-/// reach the isolator.
+/// A stand-in for the P2's driven pins: three push-pull outputs, `STEP`
+/// driven with a periodic drive when a test clocks it.
 ///
 /// Deliberately not an [`embsim_board::McuComponent`]: this binary needs no
 /// firmware and no peripheral banks, and a component that claimed the
@@ -301,39 +296,19 @@ const ENA_FINGER: &str = "34";
 struct FakePins {
     pins: Vec<PinDecl>,
     handles: Arc<Mutex<HashMap<&'static str, PinHandle>>>,
-    step_tx: Arc<Mutex<Option<PulseTx>>>,
 }
 
 impl FakePins {
     fn new() -> Self {
         Self {
-            pins: vec![
-                PinDecl {
-                    number: "STEP",
-                    name: None,
-                    kind: PinKind::DigitalOut,
-                    stream: Some(StreamRole::PulseSource),
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
-                out("DIR"),
-                out("ENA"),
-            ],
+            pins: vec![out("STEP"), out("DIR"), out("ENA")],
             handles: Arc::new(Mutex::new(HashMap::new())),
-            step_tx: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 fn out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_out(number)
 }
 
 impl Component for FakePins {
@@ -346,26 +321,22 @@ impl Component for FakePins {
         for number in ["STEP", "DIR", "ENA"] {
             handles.insert(number, io.pin(number)?);
         }
-        *self.step_tx.lock().unwrap() = Some(io.pulse_tx("STEP")?);
         Ok(())
     }
 }
 
 /// A stand-in for whatever consumes the step clock on the isolated side. It is
 /// harnessed onto the RS-422 driver's own `1A` input pin, so it watches the
-/// exact net the schematic feeds the stepper driver from.
+/// exact net the schematic feeds the stepper driver from, and records every
+/// segment that net carries.
 struct FakeStepSink {
-    trains: Arc<Mutex<Vec<PulseTrain>>>,
+    trains: Arc<Mutex<Vec<PeriodicSchedule>>>,
 }
 
-const STEP_SINK_PINS: [PinDecl; 1] = [PinDecl {
-    number: "IN",
-    name: None,
-    kind: PinKind::DigitalIn,
-    stream: Some(StreamRole::PulseSink),
-    drive_impedance: None,
-    idle: IdleDrive::KindDefault,
-}];
+const STEP_SINK_PINS: [PinDecl; 1] = [PinDecl::digital_in(
+    "IN",
+    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+)];
 
 impl Component for FakeStepSink {
     fn pins(&self) -> &[PinDecl] {
@@ -374,7 +345,11 @@ impl Component for FakeStepSink {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let trains = Arc::clone(&self.trains);
-        io.on_pulse("IN", move |train| trains.lock().unwrap().push(train))
+        io.on_sense("IN", move |sense| {
+            if let Some(clock) = sense.periodic {
+                trains.lock().unwrap().push(clock.segment);
+            }
+        })
     }
 }
 
@@ -387,8 +362,7 @@ struct Rig {
     system: SystemHandle,
     promoted: Promoted,
     handles: Arc<Mutex<HashMap<&'static str, PinHandle>>>,
-    step_tx: Arc<Mutex<Option<PulseTx>>>,
-    trains: Arc<Mutex<Vec<PulseTrain>>>,
+    trains: Arc<Mutex<Vec<PeriodicSchedule>>>,
     end_switch: EndSwitchActuator,
 }
 
@@ -410,13 +384,19 @@ impl Rig {
             }));
     }
 
-    fn publish_step(&self, train: PulseTrain) {
-        self.step_tx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("the pulse source attached")
-            .set_train(train);
+    /// Clock `STEP` with `segment`, rail to rail at the pad's 25 Ω.
+    fn publish_step(&self, segment: PeriodicSchedule) {
+        self.pin("STEP").drive(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: 25.0,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: 25.0,
+            },
+            segment,
+        });
     }
 }
 
@@ -438,6 +418,9 @@ fn extra_rails() -> Harness {
 /// RS-422 driver's input, and the end switch to the `J16` screw terminal.
 fn rig_harness() -> Harness {
     Harness::new()
+        // The rework: `IC14`'s orphaned `GND2_1`/`GND2_2` net onto `EN_GND`
+        // (`J21.8`), the isolated ground its own supply `SC_5V` returns to.
+        .connect(ep(&format!("{EDGE}.IC14.9")), ep(&format!("{EDGE}.J21.8")))
         .connect(ep("MCU.STEP"), ep(&format!("{EDGE}.J3.{STEP_FINGER}")))
         .connect(ep("MCU.DIR"), ep(&format!("{EDGE}.J3.{DIR_FINGER}")))
         .connect(ep("MCU.ENA"), ep(&format!("{EDGE}.J3.{ENA_FINGER}")))
@@ -508,8 +491,7 @@ fn start_inner(
 
     let mcu = FakePins::new();
     let handles = Arc::clone(&mcu.handles);
-    let step_tx = Arc::clone(&mcu.step_tx);
-    let trains: Arc<Mutex<Vec<PulseTrain>>> = Arc::new(Mutex::new(Vec::new()));
+    let trains: Arc<Mutex<Vec<PeriodicSchedule>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = FakeStepSink {
         trains: Arc::clone(&trains),
     };
@@ -579,7 +561,6 @@ fn start_inner(
             system,
             promoted,
             handles,
-            step_tx,
             trains,
             end_switch,
         },
@@ -1017,10 +998,46 @@ fn an_unpowered_optocoupler_leaves_p19_at_its_pull_up() {
 ///
 /// The alternative — an isolator that re-drove its output pin per STEP edge —
 /// is ~8192 events per millimetre at the reference machine's resolution, so a
-/// regression would miss this ceiling by orders of magnitude. The measured
-/// number is printed by the test; the ceiling is headroom over it for
-/// incidental engine bookkeeping, not for per-pulse traffic.
-const RELAY_EVENT_CEILING: usize = 32;
+/// regression would miss this ceiling by orders of magnitude.
+///
+/// **Measured, and the ceiling is the measurement: 57 events per
+/// four-change profile, at 8 192 Hz and at 819 200 Hz alike** (the test
+/// prints it). The step clock is a periodic drive on the STEP net, so a rate
+/// change is a drive like any other, and it reaches everything on the net
+/// that reads it — 12 records per running rate change: the source's drive
+/// with its net resolved (two identity nets) and handed to `IC14`'s input
+/// and to the `P8` indicator's SN74LVC1G14 (5); `IC14`'s relay, one periodic
+/// drive, with the isolated net resolved (two identity nets) and handed to
+/// the sink and to `U24`'s `1A` (5); and the indicator inverter's own relay
+/// onto its LED net (2). `U24` re-issues nothing it already drives (the
+/// harness model publishes a changed pair only, as the isolator and the
+/// gates do), so it costs only where its input changes meaning: the first
+/// rate change turns the resting line it drove from into a running clock it
+/// reads no level from, and it releases its pair (2 drives, 2 resolutions:
+/// 16); the stop hands it the held clock's resting low (the node names its
+/// low phase's voltage, `NODES.md` §12 item 5, the review) and it drives the
+/// pair again (4), while the inverter, out of rate mode, reads the same
+/// resting low and drives its LED high `t_pd` later (a wake, a drive and a
+/// resolution in place of its relay's two: 5 + 5 + 4 + 3 = 17). 16 + 12 +
+/// 12 + 17 = 57. While the train rode a pulse channel beside the net the
+/// same profile cost 19 events (the phase-4 tree, measured) and the ceiling
+/// was 32 — the ~7× per rate change `sil-unified-drive.md` measured for a
+/// drive on this rig ("level (drive) 14"; the two relays beyond it are the
+/// readers the channel never reached), bounded, and still independent of
+/// the rate, which is the property this guards.
+const RELAY_EVENT_CEILING: usize = 57;
+
+/// Engine events the one level-to-clock change costs: the STEP line, held
+/// at a level, becomes a clock at rest (a held segment) before a profile
+/// is measured. **Measured, and the ceiling is the measurement: 18.** The
+/// source's drive, its net resolved, handed to `IC14` and the indicator,
+/// its identity net resolved (5); `IC14`'s first relay onto the isolated
+/// net, resolved and handed on (5); `U24`, handed the held clock's resting
+/// low where it read the level's high, re-drives its pair (4); the
+/// inverter, reading the same low, drives its LED `t_pd` later (a wake, a
+/// drive, its two LED nets resolved: 4). Paid once per line, not per
+/// profile, and bounded here so the level path's cost stays under test.
+const PRIME_EVENT_CEILING: usize = 18;
 
 /// Virtual time each constant-rate segment runs for.
 const SEGMENT_US: u64 = 200_000;
@@ -1056,14 +1073,11 @@ fn run_profile(
 
     for (index, multiplier) in [1u32, 2, 1, 0].into_iter().enumerate() {
         let freq_hz = base_hz * multiplier;
-        rig.publish_step(PulseTrain {
-            pulses: PulseSegment {
-                emitted: *published,
-                freq_hz,
-                total: None,
-                since_us: embsim_core::virtual_clock::virtual_us(),
-            },
-            direction: PulseDirection::Forward,
+        rig.publish_step(PeriodicSchedule {
+            emitted: *published,
+            freq_hz,
+            total: None,
+            since_ns: embsim_core::virtual_clock::virtual_ns(),
         });
         assert!(
             wait_for(
@@ -1107,26 +1121,42 @@ fn a_step_train_crosses_the_barrier_at_a_bounded_engine_cost() {
             == Some(NetState::Driven(Level::High)),
         SETTLE
     ));
-    // Nothing has published a train yet, so nothing has been relayed: a pulse
-    // route delivers at registration only when its source already has a
-    // segment, and an isolator relays only what it has received.
+    // Nothing has clocked the line yet, so nothing has been relayed: the
+    // STEP net carries a level, and an isolator relays a clock only when its
+    // input carries one.
     assert!(rig.trains.lock().unwrap().is_empty());
+    // The line becomes a clock at rest — a held segment — before anything
+    // is measured: the level-to-clock change is the level path's cost, paid
+    // once here, so both profiles below start from the same line.
     settle_log(&log);
+    let before_prime = log.records().len();
+    rig.publish_step(PeriodicSchedule::IDLE);
+    assert!(
+        wait_for(|| rig.trains.lock().unwrap().len() == 1, SETTLE),
+        "the held clock must reach the isolated side"
+    );
+    settle_log(&log);
+    let prime = log.records().len() - before_prime;
+    assert!(
+        prime <= PRIME_EVENT_CEILING,
+        "the level-to-clock change costs {prime} engine events (ceiling {PRIME_EVENT_CEILING})"
+    );
 
     let mut published = 0u64;
     let slow = run_profile(&rig, &log, &monitor, 8_192, &mut published);
     let fast = run_profile(&rig, &log, &monitor, 819_200, &mut published);
 
-    // The isolated side saw every segment, unaltered.
-    let received = rig.trains.lock().unwrap().clone();
-    let rates: Vec<u32> = received.iter().map(|t| t.pulses.freq_hz).collect();
+    // The isolated side saw every segment, unaltered (after the held one it
+    // was primed with).
+    let received = rig.trains.lock().unwrap()[1..].to_vec();
+    let rates: Vec<u32> = received.iter().map(|t| t.freq_hz).collect();
     assert_eq!(
         rates,
         vec![8_192, 16_384, 8_192, 0, 819_200, 1_638_400, 819_200, 0],
         "every rate change crossed the barrier, and only rate changes did"
     );
     assert_eq!(
-        received.last().expect("segments arrived").pulses.emitted,
+        received.last().expect("segments arrived").emitted,
         published,
         "the relayed count is the source's own, verbatim"
     );

@@ -24,21 +24,21 @@
 //! So the contact is modeled exactly that way, and the idle level is decided
 //! by whatever the board provides, not by this component:
 //!
-//! - **Closed**: `NO` is driven to the level `COM` presents, through
-//!   [`Config::contact_resistance_ohms`] of Thevenin source impedance. When the
-//!   engine has a numeric solve for `COM` ([`NetState::Analog`]) that exact node
-//!   voltage is reproduced; when it only has a digital projection the nominal
-//!   [`Config::high_volts`] (or 0 V) stands in.
+//! - **Closed**: `NO` is driven to the voltage `COM` is handed
+//!   ([`embsim_board::Sense::volts`]), through
+//!   [`Config::contact_resistance_ohms`] of Thevenin source impedance — a
+//!   short reproduces the voltage, it reads no level.
 //! - **Open**: `NO` releases to high impedance and contributes nothing, so an
 //!   external pull-up (or pull-down, or nothing at all) decides the idle level.
 //!   A sense net with no pull-up therefore resolves
-//!   [`NetState::Floating`] and raises
+//!   [`embsim_board::NetState::Floating`] and raises
 //!   [`embsim_board::Finding::FloatingSense`] — the physically honest result,
 //!   and a real finding about the board rather than an invented level.
-//! - **`COM` with no level of its own** (floating, or fought over): a closed
+//! - **`COM` with no voltage of its own** (floating, or a clock): a closed
 //!   contact conducts, but there is nothing to conduct. `NO` stays released and
 //!   the situation is traced. The engine never invents a value for an unsourced
-//!   node and neither does the switch.
+//!   node and neither does the switch. A fought-over `COM` is handed the
+//!   voltage the fight settled at, and the contact reproduces it.
 //!
 //! Only the normally-open (`NO`) terminal is declared. A normally-closed switch
 //! is the same component with the actuation sense inverted in the system
@@ -108,16 +108,13 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms, PinDecl, PinHandle,
-    PinKind, TheveninDrive, Volts,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, Ohms, PinDecl,
+    PinHandle, Sense, TheveninDrive, Volts,
 };
 use embsim_core::event::Observers;
 use embsim_core::virtual_clock;
 
-use super::{
-    digital_level, require_positive, MachineConfigError, DEFAULT_HIGH_VOLTS,
-    DEFAULT_INPUT_THRESHOLD_VOLTS,
-};
+use super::{require_positive, MachineConfigError};
 
 // ============================================================
 // Configuration
@@ -125,7 +122,7 @@ use super::{
 
 /// Default closed-contact resistance (Ω). Small enough to dominate any
 /// practical pull-up (so the closed contact projects a clean
-/// [`NetState::Driven`] rather than escalating to a divided voltage), and
+/// [`embsim_board::NetState::Driven`] rather than escalating to a divided voltage), and
 /// non-zero because a real contact is not a perfect short.
 pub const DEFAULT_CONTACT_RESISTANCE_OHMS: Ohms = 0.1;
 
@@ -178,11 +175,6 @@ pub struct Config {
     pub contact_resistance_ohms: Ohms,
     /// Contact-bounce burst, or `None` for a clean edge.
     pub bounce: Option<BounceConfig>,
-    /// Logic threshold used to read `COM` ([`DEFAULT_INPUT_THRESHOLD_VOLTS`]).
-    pub input_threshold_volts: Volts,
-    /// Voltage driven for a `COM` known only as a digital high
-    /// ([`DEFAULT_HIGH_VOLTS`]).
-    pub high_volts: Volts,
 }
 
 impl Config {
@@ -196,8 +188,6 @@ impl Config {
             sense,
             contact_resistance_ohms: DEFAULT_CONTACT_RESISTANCE_OHMS,
             bounce: None,
-            input_threshold_volts: DEFAULT_INPUT_THRESHOLD_VOLTS,
-            high_volts: DEFAULT_HIGH_VOLTS,
         }
     }
 
@@ -216,8 +206,6 @@ impl Config {
     /// Reject a configuration that cannot describe a switch.
     fn validate(&self) -> Result<(), MachineConfigError> {
         require_positive("contact_resistance_ohms", self.contact_resistance_ohms)?;
-        require_positive("input_threshold_volts", self.input_threshold_volts)?;
-        require_positive("high_volts", self.high_volts)?;
         if !self.operate_mm.is_finite() {
             return Err(MachineConfigError::NotPositive {
                 field: "operate_mm",
@@ -270,34 +258,29 @@ impl Config {
 /// `COM` senses whatever the board biases the common terminal to; `NO` is the
 /// normally-open terminal the contact drives onto the sense net.
 ///
-/// `NO` is declared [`PinKind::DigitalOut`] because it is the only kind that
-/// can source a net at all — but a switch **idles open**, and the engine
-/// assigns every `DigitalOut` an idle-high drive at assembly (the UART-TX
-/// convention). [`EndSwitch::attach`] therefore releases `NO` as its first
-/// action. On the live path that release lands in the first resolution pass
-/// after attach, before any harness traffic; the
-/// [`embsim_board::System::build`] analysis snapshot, which resolves *before*
-/// attach, still shows the pin idle-high. Read build-time findings for this
-/// net with that in mind.
+/// `NO` is declared a push-pull output ([`PinDecl::digital_out`]) because it
+/// sources and sinks whatever `COM` presents — but a switch **idles open**,
+/// and the declaration keeps the push-pull constructor's idle-high (the
+/// UART-TX convention). [`EndSwitch::attach`] therefore releases `NO` as its
+/// first action. On the live path that release lands in the first
+/// resolution pass after attach, before any harness traffic; the
+/// [`embsim_board::System::build`] analysis snapshot, which resolves
+/// *before* attach, still shows the pin idle-high. Read build-time findings
+/// for this net with that in mind.
+///
+/// `COM` reads through the JEDEC JESD8C.01 3.3 V LVCMOS pair
+/// ([`jesd8c01_lvcmos_thresholds`]): a dry contact has no receiver and no
+/// datasheet — it reads `COM` only to reproduce it — so the pair the
+/// engine's own dead band projects a net through is declared for it,
+/// stated, with the standard's no-level answer between its figures. The
+/// contact reads no level from it: a closed contact reproduces the voltage
+/// `COM` is handed.
 pub const END_SWITCH_PINS: [PinDecl; 2] = [
-    PinDecl {
-        number: "COM",
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    },
-    PinDecl {
-        number: "NO",
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        // The contact resistance is applied per drive (it is configuration,
-        // not a `&'static` constant), so the declaration carries no default.
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    },
+    PinDecl::digital_in("COM", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)),
+    // The contact resistance is applied per drive (it is configuration,
+    // not a `&'static` constant), so the declaration keeps the push-pull
+    // default.
+    PinDecl::digital_out("NO"),
 ];
 
 // ============================================================
@@ -315,8 +298,8 @@ struct Contact {
     driven: bool,
     /// Last fed carriage position (mm).
     position_mm: Option<f64>,
-    /// Last engine-published state of the `COM` net.
-    com: NetState,
+    /// What `COM` was last handed.
+    com: Sense,
     /// `NO` pin handle, `None` until attach.
     no: Option<PinHandle>,
     /// Engine I/O handle, kept for `schedule_at` during a bounce burst.
@@ -344,19 +327,13 @@ impl fmt::Debug for SwitchCore {
 }
 
 impl SwitchCore {
-    /// The voltage a closed contact reproduces from a `COM` state, or `None`
-    /// when `COM` offers no level at all.
+    /// The voltage a closed contact reproduces from what `COM` is handed,
+    /// or `None` when `COM` names no voltage at all.
     ///
-    /// A closed contact is a short, not a level shifter: a numeric solve is
-    /// reproduced exactly, and only a `COM` known solely as a digital
-    /// projection falls back to the nominal rail.
-    fn contact_volts(&self, com: NetState) -> Option<Volts> {
-        let level = digital_level(com, self.config.input_threshold_volts)?;
-        Some(match (level, com) {
-            (_, NetState::Analog(volts)) => volts,
-            (Level::High, _) => self.config.high_volts,
-            (Level::Low, _) => 0.0,
-        })
+    /// A closed contact is a short, not a level shifter: the voltage is
+    /// reproduced exactly.
+    fn contact_volts(com: &Sense) -> Option<Volts> {
+        com.volts
     }
 
     /// Drive (or release) `NO` for a contact state. Closed reproduces `COM`'s
@@ -367,7 +344,7 @@ impl SwitchCore {
             return;
         };
         let drive = closed
-            .then(|| self.contact_volts(contact.com))
+            .then(|| Self::contact_volts(&contact.com))
             .flatten()
             .map(|volts| TheveninDrive {
                 volts,
@@ -484,7 +461,7 @@ impl SwitchCore {
 
     /// A new `COM` state: record it, and re-apply if the contact is currently
     /// conducting (a `COM` that comes up late must reach the sense net).
-    fn set_com(&self, state: NetState) {
+    fn set_com(&self, state: Sense) {
         let mut contact = self.contact.lock().unwrap();
         contact.com = state;
         if contact.driven {
@@ -581,7 +558,11 @@ impl EndSwitch {
                     closed: false,
                     driven: false,
                     position_mm: None,
-                    com: NetState::Floating,
+                    com: Sense {
+                        volts: None,
+                        periodic: None,
+                        at_ns: 0,
+                    },
                     no: None,
                     io: None,
                     burst: VecDeque::new(),
@@ -614,15 +595,15 @@ impl Component for EndSwitch {
             let mut contact = self.core.contact.lock().unwrap();
             contact.no = Some(io.pin("NO")?);
             contact.io = Some(io.clone());
-            // A switch idles OPEN. The engine gave this `DigitalOut` an
-            // idle-high drive at assembly, so releasing it is the first thing
-            // that must happen — see the `END_SWITCH_PINS` docs.
+            // A switch idles OPEN. `NO` is declared push-pull and idles high
+            // from assembly, so releasing it is the first thing that must
+            // happen — see the `END_SWITCH_PINS` docs.
             let closed = contact.closed;
             self.core.apply(&mut contact, closed);
         }
         {
             let core = Arc::clone(&self.core);
-            io.on_sense("COM", move |state| core.set_com(state))?;
+            io.on_sense("COM", move |sense| core.set_com(sense))?;
         }
         {
             let core = Arc::clone(&self.core);
@@ -878,36 +859,28 @@ mod tests {
     // Contact drive decision
     // ========================================================
 
-    /// The voltage a closed contact reproduces: an exact numeric solve when
-    /// the engine has one, the nominal rail when it only has a level, and
-    /// nothing at all when `COM` has no level.
-    #[rstest]
-    #[case::analog(NetState::Analog(2.5), Some(2.5))]
-    #[case::analog_ground(NetState::Analog(0.0), Some(0.0))]
-    #[case::driven_high(NetState::Driven(Level::High), Some(DEFAULT_HIGH_VOLTS))]
-    #[case::driven_low(NetState::Driven(Level::Low), Some(0.0))]
-    #[case::pulled_high(NetState::Pulled(Level::High, 10_000.0), Some(DEFAULT_HIGH_VOLTS))]
-    #[case::floating(NetState::Floating, None)]
-    #[case::contention(NetState::Contention, None)]
-    fn closed_contact_reproduces_com(#[case] com: NetState, #[case] expect: Option<Volts>) {
-        let sw = switch(Config::new(10.0, ActuationSense::Increasing));
-        assert_eq!(sw.core.contact_volts(com), expect);
-        sw.core.set_com(com);
-        assert_eq!(sw.core.contact.lock().unwrap().com, com);
+    /// A `COM` handed `volts`.
+    fn com(volts: Option<Volts>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
     }
 
-    /// The nominal rail used for a level-only `COM` is configuration, so a 5 V
-    /// sense loop reproduces 5 V rather than 3.3 V.
+    /// The voltage a closed contact reproduces: exactly the one `COM` is
+    /// handed — a 5 V sense loop's 5 V, ground's 0 V — and nothing at all
+    /// when `COM` names none.
     #[rstest]
-    fn nominal_rail_for_a_level_only_com_is_configurable() {
-        let sw = switch(Config {
-            high_volts: 5.0,
-            ..Config::new(10.0, ActuationSense::Increasing)
-        });
-        assert_eq!(
-            sw.core.contact_volts(NetState::Driven(Level::High)),
-            Some(5.0)
-        );
+    #[case::three_volts_three(Some(3.3), Some(3.3))]
+    #[case::five_volts(Some(5.0), Some(5.0))]
+    #[case::ground(Some(0.0), Some(0.0))]
+    #[case::floating(None, None)]
+    fn closed_contact_reproduces_com(#[case] volts: Option<Volts>, #[case] expect: Option<Volts>) {
+        let sw = switch(Config::new(10.0, ActuationSense::Increasing));
+        assert_eq!(SwitchCore::contact_volts(&com(volts)), expect);
+        sw.core.set_com(com(volts));
+        assert_eq!(sw.core.contact.lock().unwrap().com, com(volts));
     }
 
     /// A `COM` that comes up after the contact closed still reaches the sense
@@ -918,7 +891,7 @@ mod tests {
         let actuator = sw.actuator();
         actuator.set_position_mm(11.0);
         assert!(actuator.driving_closed());
-        sw.core.set_com(NetState::Analog(0.0));
+        sw.core.set_com(com(Some(0.0)));
         assert!(
             actuator.driving_closed(),
             "the contact stays closed across a COM update"
@@ -972,9 +945,12 @@ mod tests {
         let sw = switch(Config::new(10.0, ActuationSense::Increasing));
         assert_eq!(sw.pins().len(), 2);
         assert_eq!(sw.pins()[0].number, "COM");
-        assert_eq!(sw.pins()[0].kind, PinKind::DigitalIn);
+        assert_eq!(
+            sw.pins()[0].senses_at_build(),
+            Some(embsim_board::SenseKind::Digital)
+        );
         assert_eq!(sw.pins()[1].number, "NO");
-        assert_eq!(sw.pins()[1].kind, PinKind::DigitalOut);
+        assert!(sw.pins()[1].drives());
         assert!(!sw.actuator().is_closed(), "a switch starts open");
         assert!(!sw.actuator().driving_closed());
         assert_eq!(sw.actuator().position_mm(), None);

@@ -3,19 +3,20 @@
 //! (`NODES.md` §2 "MCU node (P2)", §8 phase 2).
 //!
 //! Three facts a board puts on the package and the package hands to its
-//! core: the rate on `XI` is the crystal; `RESN` and `VDD` are the reset
+//! core: the rate of the square wave on `XI` is the crystal; `RESN` and
+//! `VDD` are the reset
 //! inputs; and every pad is a released bidirectional pin that a bench
 //! driver can take without a fight. Each is asserted from outside — the
 //! package's handle and the nets — never from inside a core.
 //!
-//! And two things the package does with them (`NODES.md` §8 phase 4): the
-//! **START gate** — a core is started, and its first wake delivered, at
-//! the instant `RESN` reads released and `VDD` reads a voltage inside the
-//! datasheet's 1.7–1.9 V window, and is held with the reason readable
-//! while either does not hold — and **pads at their bank's supply** — a
-//! pad driven high is a source at the voltage its `VIO_a_b` pin reads,
-//! and a pad in a bank whose supply names no voltage presents nothing,
-//! the bank named once.
+//! And two things the package does with them (`NODES.md` §8 phase 4, §12
+//! item 5): the **START gate** — a core is started, and its first wake
+//! delivered, the datasheet's 3 ms restart delay after the instant `RESN`
+//! reads released with `VDD` inside the datasheet's 1.7–1.9 V window, and
+//! is held with the reason readable while either does not hold — and
+//! **pads at their bank's supply** — a pad driven high is a source at the
+//! voltage its `VIO_a_b` pin reads, and a pad in a bank whose supply names
+//! no voltage presents nothing, the bank named once.
 //!
 //! Every case runs in stepped mode (`TESTING.md` rule 9), in its own
 //! binary (rule 5): the cases pin the process-global clock and its mode.
@@ -26,14 +27,13 @@ use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EndpointRef, Finding, Harness, IdleDrive, Level,
-    NetState, PinDecl, PinHandle, PinKind, PulseDirection, PulseSegment, PulseTrain, PulseTx,
-    StreamRole, System, SystemHandle, TheveninDrive,
+    AttachError, Component, ComponentNetIo, Drive, EndpointRef, Finding, Harness, Level, NetState,
+    PeriodicSchedule, PinDecl, PinHandle, System, SystemHandle, TheveninDrive,
 };
 use embsim_boards::p2::{
     bank_of, bank_pin_name, pin_name, P2Core, P2Package, P2Pads, P2ResetState, PadDrive,
-    StartState, NUM_PADS, P2_FAST_OHMS, P2_VDD_MAX_VOLTS, P2_VDD_MIN_VOLTS, P_HIGH_FAST,
-    P_LOW_FAST,
+    StartState, NUM_PADS, P2_FAST_OHMS, P2_FAST_SINK_POINTS, P2_FAST_SOURCE_POINTS,
+    P2_RESTART_DELAY_NS, P2_VDD_MAX_VOLTS, P2_VDD_MIN_VOLTS, P_HIGH_FAST, P_LOW_FAST,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use rstest::rstest;
@@ -78,6 +78,13 @@ fn state(system: &SystemHandle, net: &str) -> NetState {
         .unwrap_or_else(|| panic!("net {net} exists"))
 }
 
+/// The bench's return: `GND` held at 0 V. Ground is not implicit
+/// (`DESIGN.md` rule 6), and every package pin's sense is its voltage
+/// against `GND` — a bench that held none would hand the package nothing.
+fn grounded(harness: Harness) -> Harness {
+    harness.power(ep("BENCH.GND"), ep("P2.GND"), 0.0)
+}
+
 fn ep(endpoint: &str) -> EndpointRef {
     EndpointRef::parse(endpoint).expect("endpoint parses")
 }
@@ -93,7 +100,7 @@ struct BenchRail {
 impl BenchRail {
     fn rising_to(volts: f64, at_ns: u64) -> Self {
         Self {
-            pins: [PinDecl::power_out("V").with_idle(IdleDrive::Released)],
+            pins: [PinDecl::power_out("V").with_idle(None)],
             volts,
             at_ns,
         }
@@ -133,7 +140,7 @@ struct Tick {
 impl Tick {
     fn at(at_ns: u64) -> Self {
         Self {
-            pins: [PinDecl::digital_out("T").with_idle(IdleDrive::Released)],
+            pins: [PinDecl::digital_out("T").with_idle(None)],
             at_ns,
             fired: Arc::default(),
         }
@@ -149,6 +156,43 @@ impl Component for Tick {
         let fired = Arc::clone(&self.fired);
         io.on_wake_ns(move |now| {
             *fired.lock().unwrap() = Some(now);
+        });
+        io.schedule_at_ns(self.at_ns);
+        Ok(())
+    }
+}
+
+/// A bench tick that reads something at its instant, on the engine thread
+/// inside its own wake: the value as it stood at exactly `at_ns`, whatever
+/// the engine does after.
+struct ReadAt<T> {
+    pins: [PinDecl; 1],
+    at_ns: u64,
+    read: Arc<dyn Fn() -> T + Send + Sync>,
+    got: Arc<StdMutex<Option<(u64, T)>>>,
+}
+
+impl<T: Send + 'static> ReadAt<T> {
+    fn new(at_ns: u64, read: impl Fn() -> T + Send + Sync + 'static) -> Self {
+        Self {
+            pins: [PinDecl::digital_out("T").with_idle(None)],
+            at_ns,
+            read: Arc::new(read),
+            got: Arc::default(),
+        }
+    }
+}
+
+impl<T: Send + 'static> Component for ReadAt<T> {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let read = Arc::clone(&self.read);
+        let got = Arc::clone(&self.got);
+        io.on_wake_ns(move |now| {
+            *got.lock().unwrap() = Some((now, read()));
         });
         io.schedule_at_ns(self.at_ns);
         Ok(())
@@ -236,20 +280,20 @@ impl P2Core for PadDriver {
     }
 }
 
-/// A bench clock: one push-pull pulse source (a clock buffer's output,
-/// resting at a level, unlike a TCXO's capacitor-coupled clipped sine)
-/// that publishes a 20 MHz train when the system starts, or a held train.
+/// A bench clock: one push-pull output (a clock buffer's, swinging rail to
+/// rail at its own 25 Ω, unlike a TCXO's capacitor-coupled clipped sine)
+/// that drives a 20 MHz square wave when the system starts, or a held one.
 struct BenchClock {
     pins: [PinDecl; 1],
-    tx: Option<PulseTx>,
+    out: Option<PinHandle>,
     hz: u32,
 }
 
 impl BenchClock {
     fn new(hz: u32) -> Self {
         Self {
-            pins: [PinDecl::digital_out("OUT").with_stream(StreamRole::PulseSource)],
-            tx: None,
+            pins: [PinDecl::digital_out("OUT")],
+            out: None,
             hz,
         }
     }
@@ -261,25 +305,32 @@ impl Component for BenchClock {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        self.tx = Some(io.pulse_tx("OUT")?);
+        self.out = Some(io.pin("OUT")?);
         Ok(())
     }
 
     fn start(&mut self) {
-        let train = if self.hz == 0 {
-            PulseTrain::IDLE
+        let segment = if self.hz == 0 {
+            PeriodicSchedule::IDLE
         } else {
-            PulseTrain {
-                pulses: PulseSegment {
-                    emitted: 0,
-                    freq_hz: self.hz,
-                    total: None,
-                    since_us: 0,
-                },
-                direction: PulseDirection::Forward,
+            PeriodicSchedule {
+                emitted: 0,
+                freq_hz: self.hz,
+                total: None,
+                since_ns: 0,
             }
         };
-        self.tx.as_ref().expect("attached").set_train(train);
+        self.out.as_ref().expect("attached").drive(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: 25.0,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: 25.0,
+            },
+            segment,
+        });
     }
 }
 
@@ -292,8 +343,7 @@ struct BenchDriver {
 impl BenchDriver {
     fn holding(level: Level) -> Self {
         Self {
-            pins: [PinDecl::digital_out("A")
-                .with_idle(IdleDrive::Thevenin(embsim_board::digital_drive(level)))],
+            pins: [PinDecl::digital_out("A").with_idle(Some(embsim_board::digital_drive(level)))],
         }
     }
 }
@@ -308,12 +358,49 @@ impl Component for BenchDriver {
     }
 }
 
+/// A bench logic line that steps through a schedule: driven at the first
+/// level from the build, then at each `(instant, level)` from its wake at
+/// that instant — a reset button, a supervisor's output.
+struct BenchLine {
+    pins: [PinDecl; 1],
+    steps: Vec<(u64, Level)>,
+}
+
+impl BenchLine {
+    fn stepping(first: Level, steps: &[(u64, Level)]) -> Self {
+        Self {
+            pins: [PinDecl::digital_out("A").with_idle(Some(embsim_board::digital_drive(first)))],
+            steps: steps.to_vec(),
+        }
+    }
+}
+
+impl Component for BenchLine {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let out = io.pin("A")?;
+        let steps = self.steps.clone();
+        io.on_wake_ns(move |now| {
+            if let Some(&(_, level)) = steps.iter().find(|(at, _)| *at == now) {
+                out.set_drive(Some(embsim_board::digital_drive(level)));
+            }
+        });
+        for &(at_ns, _) in &self.steps {
+            io.schedule_at_ns(at_ns);
+        }
+        Ok(())
+    }
+}
+
 // ============================================================
 // The crystal
 // ============================================================
 
 /// A bench clock on `XI`: the package reports its rate as the crystal, and
-/// a held train as no crystal.
+/// a held clock as no crystal.
 #[rstest]
 #[case::twenty_megahertz(CRYSTAL_HZ, Some(20_000_000))]
 #[case::held(0, None)]
@@ -324,13 +411,13 @@ fn the_rate_on_xi_is_the_crystal_the_package_reports(
     behaviour!(Test {
         id: "p2-package.xi-rate-is-the-crystal",
         covers: Some("boards/src/p2.rs#P2Package"),
-        given: "a P2 package with no core, its XI pin wired to a bench clock that publishes \
-                either a 20 megahertz train or a held train when the system starts",
+        given: "a P2 package with no core, its XI pin wired to a bench clock that drives \
+                either a 20 megahertz square wave or a held one when the system starts",
     });
     expect!(
         "crystal-is-the-delivered-rate",
-        "the package reports the train's rate as the crystal, and no crystal for a held \
-         train",
+        "the package reports the clock's rate as the crystal, and no crystal for a held \
+         clock",
         "the crystal a P2 multiplies is whatever rate the board puts on XI; a package \
          invents none of its own"
     );
@@ -342,11 +429,11 @@ fn the_rate_on_xi_is_the_crystal_the_package_reports(
     let system = System::new()
         .component("P2", Box::new(package))
         .component("CLK", Box::new(BenchClock::new(hz)))
-        .harness(
+        .harness(grounded(
             Harness::new()
                 .connect_str("CLK.OUT", "P2.XI")
                 .expect("endpoints parse"),
-        )
+        ))
         .start()
         .expect("the bench starts");
 
@@ -367,21 +454,20 @@ fn the_rate_on_xi_is_the_crystal_the_package_reports(
 // Reset
 // ============================================================
 
-/// The reset inputs as the package projects them: `RESN` released and
+/// The reset inputs as the package reads them: `RESN` released and
 /// `VDD` at a voltage inside its window is out of reset; a held `RESN`,
 /// an unsourced `VDD`, or a `VDD` outside the window is not.
 #[rstest]
-#[case::released_and_powered(Some(3.3), Some(1.8), Some(Level::High), Some(Level::High), true)]
-#[case::reset_held(Some(0.0), Some(1.8), Some(Level::Low), Some(Level::High), false)]
-#[case::core_unpowered(Some(3.3), None, Some(Level::High), None, false)]
-#[case::core_under_its_window(Some(3.3), Some(1.2), Some(Level::High), Some(Level::Low), false)]
-#[case::core_over_its_window(Some(3.3), Some(3.3), Some(Level::High), Some(Level::High), false)]
-#[case::nothing_connected(None, None, None, None, false)]
+#[case::released_and_powered(Some(3.3), Some(1.8), Some(Level::High), true)]
+#[case::reset_held(Some(0.0), Some(1.8), Some(Level::Low), false)]
+#[case::core_unpowered(Some(3.3), None, Some(Level::High), false)]
+#[case::core_under_its_window(Some(3.3), Some(1.2), Some(Level::High), false)]
+#[case::core_over_its_window(Some(3.3), Some(3.3), Some(Level::High), false)]
+#[case::nothing_connected(None, None, None, false)]
 fn the_reset_state_is_resn_and_vdd_as_the_package_reads_them(
     #[case] resn_volts: Option<f64>,
     #[case] vdd_volts: Option<f64>,
     #[case] resn: Option<Level>,
-    #[case] vdd: Option<Level>,
     #[case] out_of_reset: bool,
 ) {
     behaviour!(Test {
@@ -392,10 +478,10 @@ fn the_reset_state_is_resn_and_vdd_as_the_package_reads_them(
     });
     expect!(
         "resn-and-vdd-projected",
-        "the package reports RESN and VDD each as high, low, or nothing reaching the pin, \
-         and VDD's voltage as the net names it",
-        "a level is the engine's own projection; the voltage is what the START gate's \
-         window is read against"
+        "the package reports RESN as high, low, or nothing reaching the pin, and VDD as the \
+         voltage it is handed against GND",
+        "RESN's level is the package's own projection through its declared thresholds; VDD \
+         declares none, and its voltage is what the START gate's window is read against"
     );
     expect!(
         "out-of-reset-needs-both",
@@ -409,7 +495,7 @@ fn the_reset_state_is_resn_and_vdd_as_the_package_reads_them(
     stepped();
     let package = P2Package::held_in_reset();
     let handle = package.handle();
-    let mut harness = Harness::new();
+    let mut harness = grounded(Harness::new());
     if let Some(volts) = resn_volts {
         harness = harness.power(
             embsim_board::EndpointRef::parse("BENCH.RESN").unwrap(),
@@ -430,26 +516,31 @@ fn the_reset_state_is_resn_and_vdd_as_the_package_reads_them(
         .start()
         .expect("the bench starts");
 
-    let expected = P2ResetState {
-        resn,
-        vdd,
-        vdd_volts,
-    };
+    let expected = P2ResetState { resn, vdd_volts };
     assert!(
         wait_for(|| handle.reset() == expected, SETTLE),
         "the package reads {expected:?}; got {:?}",
         handle.reset()
     );
     assert_eq!(handle.reset().out_of_reset(), out_of_reset);
+    if out_of_reset {
+        assert!(
+            wait_for(|| handle.started_at_ns().is_some(), SETTLE),
+            "{:?}",
+            handle.start_state()
+        );
+    }
     assert_eq!(
         handle.start_state(),
         if out_of_reset {
-            StartState::Started { at_ns: 0 }
+            StartState::Started {
+                at_ns: P2_RESTART_DELAY_NS,
+            }
         } else {
             StartState::Held { reset: expected }
         },
-        "a core with no run of its own is still gated: started at the build when the inputs \
-         allow it, held with the inputs as the reason when they do not"
+        "a core with no run of its own is still gated: started the restart delay after the \
+         build when the inputs allow it, held with the inputs as the reason when they do not"
     );
     drop(system);
 }
@@ -473,7 +564,7 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
 ) {
     behaviour!(Test {
         id: "p2-package.start-gate-vdd-window",
-        covers: Some("boards/src/p2.rs#P2Package::try_begin"),
+        covers: Some("boards/src/p2.rs#P2Package::follow_reset"),
         given: "a P2 package around a core asking for its first wake, RESN released from the \
                 bench, and a bench VDD rail rising to a set voltage at two milliseconds",
     });
@@ -486,15 +577,15 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
     );
     expect!(
         "started-at-the-instant",
-        "a rail inside the window starts the core at exactly the instant it came up, and the \
-         core's first wake lands at that same instant",
-        "a wake asked for before the chip could run is held and lands at the start, never \
-         earlier"
+        "a rail inside the window starts the core exactly three milliseconds after it came \
+         up, and the core's first wake lands at that instant",
+        "the chip restarts 3 ms after its reset releases, and a wake asked for before it could \
+         run is held and lands at the start, never earlier"
     );
     expect!(
         "held-outside-the-window",
-        "a millisecond past a rail under or over the window the core is unstarted, its wake \
-         undelivered, and the rail's voltage readable as the reason",
+        "a rail outside the window leaves the core unstarted and unwoken past the instant one \
+         inside it would have started it, its voltage the reason",
         "the proof is made at a bench wake the engine has fired, so the clock is known to \
          have reached that instant"
     );
@@ -508,8 +599,9 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
     let handle = package.handle();
     const RAIL_AT_NS: u64 = 2_000_000;
     // The instant the negative cases are proved at: a millisecond past
-    // the rail's rise, with nothing else scheduled between.
-    const PROOF_AT_NS: u64 = RAIL_AT_NS + 1_000_000;
+    // the end of the restart delay a rail inside the window would have
+    // started, with nothing else scheduled between.
+    const PROOF_AT_NS: u64 = RAIL_AT_NS + P2_RESTART_DELAY_NS + 1_000_000;
     let tick = Tick::at(PROOF_AT_NS);
     let ticked = Arc::clone(&tick.fired);
     let system = System::new()
@@ -519,12 +611,12 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
             Box::new(BenchRail::rising_to(vdd_volts, RAIL_AT_NS)),
         )
         .component("TICK", Box::new(tick))
-        .harness(
+        .harness(grounded(
             Harness::new()
                 .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
                 .connect_str("RAIL.V", "P2.VDD")
                 .expect("endpoints parse"),
-        )
+        ))
         .hold_time()
         .start()
         .expect("the bench starts");
@@ -539,7 +631,6 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
         StartState::Held {
             reset: P2ResetState {
                 resn: Some(Level::High),
-                vdd: None,
                 vdd_volts: None,
             }
         }
@@ -558,16 +649,17 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
             wait_for(|| !woke_at.lock().unwrap().is_empty(), SETTLE),
             "the core's held wake lands at the start"
         );
+        let start_ns = RAIL_AT_NS + P2_RESTART_DELAY_NS;
         assert_eq!(
             handle.start_state(),
-            StartState::Started { at_ns: RAIL_AT_NS }
+            StartState::Started { at_ns: start_ns }
         );
-        assert_eq!(*started_at.lock().unwrap(), Some(RAIL_AT_NS));
-        assert_eq!(*woke_at.lock().unwrap(), vec![RAIL_AT_NS]);
+        assert_eq!(*started_at.lock().unwrap(), Some(start_ns));
+        assert_eq!(*woke_at.lock().unwrap(), vec![start_ns]);
     } else {
-        // No START by a millisecond past the rail's rise: the clock is
-        // known to have reached the tick, and the gate opens only at a
-        // delivery, of which there is none between.
+        // No START by a millisecond past the delay a released reset would
+        // have counted out: the clock is known to have reached the tick,
+        // and no release was ever counted.
         assert!(
             wait_for(|| ticked.lock().unwrap().is_some(), SETTLE),
             "the bench tick at {PROOF_AT_NS} ns fires"
@@ -578,11 +670,6 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
             StartState::Held {
                 reset: P2ResetState {
                     resn: Some(Level::High),
-                    vdd: Some(if vdd_volts >= 1.65 {
-                        Level::High
-                    } else {
-                        Level::Low
-                    }),
                     vdd_volts: Some(vdd_volts),
                 }
             },
@@ -599,7 +686,7 @@ fn the_core_is_started_when_vdd_enters_its_window_and_held_outside_it(
 fn the_core_is_held_while_resn_is_low_with_vdd_in_its_window() {
     behaviour!(Test {
         id: "p2-package.start-gate-resn",
-        covers: Some("boards/src/p2.rs#P2Package::try_begin"),
+        covers: Some("boards/src/p2.rs#P2Package::follow_reset"),
         given: "a P2 package around a core that asks for a wake at its first nanosecond, VDD \
                 held at 1.8 volts and RESN held low from the bench",
     });
@@ -626,11 +713,11 @@ fn the_core_is_held_while_resn_is_low_with_vdd_in_its_window() {
     let system = System::new()
         .component("P2", Box::new(package))
         .component("TICK", Box::new(tick))
-        .harness(
+        .harness(grounded(
             Harness::new()
                 .power(ep("BENCH.RESN"), ep("P2.RESN"), 0.0)
                 .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8),
-        )
+        ))
         .start()
         .expect("the bench starts");
     assert!(
@@ -648,7 +735,6 @@ fn the_core_is_held_while_resn_is_low_with_vdd_in_its_window() {
         StartState::Held {
             reset: P2ResetState {
                 resn: Some(Level::Low),
-                vdd: Some(Level::High),
                 vdd_volts: Some(1.8),
             }
         },
@@ -656,6 +742,388 @@ fn the_core_is_held_while_resn_is_low_with_vdd_in_its_window() {
     );
     assert_eq!(*started_at.lock().unwrap(), None);
     assert_eq!(*woke_at.lock().unwrap(), Vec::<u64>::new());
+    drop(system);
+}
+
+/// The chip restarts the datasheet's 3 ms after `RESN` rises: a core is
+/// started there, its first wake landing with it, and reads as restarting
+/// in between.
+#[rstest]
+fn the_core_starts_three_milliseconds_after_resn_rises() {
+    behaviour!(Test {
+        id: "p2-package.restart-delay",
+        covers: Some("boards/src/p2.rs#P2Package::try_begin"),
+        given: "a P2 package around a core asking for its first wake, VDD held at 1.8 volts \
+                from the bench, and RESN driven low from the build and released at two \
+                milliseconds",
+    });
+    expect!(
+        "restarting-inside-the-delay",
+        "a millisecond after the release the core is unstarted and the package reports the \
+         release instant and the start it leads to",
+        "the datasheet's RESN row: the Propeller restarts 3 ms after RESN goes from low to \
+         high"
+    );
+    expect!(
+        "started-three-milliseconds-on",
+        "the core is started exactly three milliseconds after the release, and its first wake \
+         lands at that instant"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let core = Recorder::default();
+    let started_at = Arc::clone(&core.started_at_ns);
+    let woke_at = Arc::clone(&core.woke_at_ns);
+    let package = P2Package::new(core);
+    let handle = package.handle();
+    const RISE_AT_NS: u64 = 2_000_000;
+    const PROOF_AT_NS: u64 = RISE_AT_NS + 1_000_000;
+    let reader = {
+        let handle = handle.clone();
+        let started_at = Arc::clone(&started_at);
+        ReadAt::new(PROOF_AT_NS, move || {
+            (handle.start_state(), *started_at.lock().unwrap())
+        })
+    };
+    let read = Arc::clone(&reader.got);
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component(
+            "RST",
+            Box::new(BenchLine::stepping(
+                Level::Low,
+                &[(RISE_AT_NS, Level::High)],
+            )),
+        )
+        .component("READ", Box::new(reader))
+        .harness(grounded(
+            Harness::new()
+                .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+                .connect_str("RST.A", "P2.RESN")
+                .expect("endpoints parse"),
+        ))
+        .start()
+        .expect("the bench starts");
+
+    let start_ns = RISE_AT_NS + P2_RESTART_DELAY_NS;
+    assert!(
+        wait_for(|| !woke_at.lock().unwrap().is_empty(), SETTLE),
+        "the core's held wake lands at the start; {:?}",
+        handle.start_state()
+    );
+    assert_eq!(
+        *read.lock().unwrap(),
+        Some((
+            PROOF_AT_NS,
+            (
+                StartState::Restarting {
+                    released_at_ns: RISE_AT_NS,
+                    starts_at_ns: start_ns,
+                },
+                None
+            )
+        )),
+        "a millisecond into the delay"
+    );
+    assert_eq!(
+        handle.start_state(),
+        StartState::Started { at_ns: start_ns }
+    );
+    assert_eq!(*started_at.lock().unwrap(), Some(start_ns));
+    assert_eq!(*woke_at.lock().unwrap(), vec![start_ns]);
+    drop(system);
+}
+
+/// A release shorter than the restart delay starts nothing: the delay is
+/// counted again from the next release.
+#[rstest]
+fn a_reset_release_shorter_than_the_restart_delay_starts_nothing() {
+    behaviour!(Test {
+        id: "p2-package.restart-glitch",
+        covers: Some("boards/src/p2.rs#P2Package::follow_reset"),
+        given: "a P2 core asking for its first wake, VDD at 1.8 volts, and RESN low from the \
+                build, released at one millisecond, low again at two, and released for good at \
+                six",
+    });
+    expect!(
+        "glitch-starts-nothing",
+        "at 4.5 milliseconds, past the end of a delay counted from the first release, the \
+         core is unstarted, unwoken, and reported held with RESN low",
+        "a reset that re-asserts before the restart delay is out cancels the restart"
+    );
+    expect!(
+        "counted-from-the-last-release",
+        "the core is started three milliseconds after the final release, at nine milliseconds"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let core = Recorder::default();
+    let started_at = Arc::clone(&core.started_at_ns);
+    let woke_at = Arc::clone(&core.woke_at_ns);
+    let package = P2Package::new(core);
+    let handle = package.handle();
+    const PROOF_AT_NS: u64 = 4_500_000;
+    const FINAL_RISE_NS: u64 = 6_000_000;
+    let reader = {
+        let handle = handle.clone();
+        let started_at = Arc::clone(&started_at);
+        let woke_at = Arc::clone(&woke_at);
+        ReadAt::new(PROOF_AT_NS, move || {
+            (
+                handle.start_state(),
+                *started_at.lock().unwrap(),
+                woke_at.lock().unwrap().len(),
+            )
+        })
+    };
+    let read = Arc::clone(&reader.got);
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component(
+            "RST",
+            Box::new(BenchLine::stepping(
+                Level::Low,
+                &[
+                    (1_000_000, Level::High),
+                    (2_000_000, Level::Low),
+                    (FINAL_RISE_NS, Level::High),
+                ],
+            )),
+        )
+        .component("READ", Box::new(reader))
+        .harness(grounded(
+            Harness::new()
+                .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+                .connect_str("RST.A", "P2.RESN")
+                .expect("endpoints parse"),
+        ))
+        .start()
+        .expect("the bench starts");
+
+    assert!(
+        wait_for(|| !woke_at.lock().unwrap().is_empty(), SETTLE),
+        "the core starts after the final release; {:?}",
+        handle.start_state()
+    );
+    assert_eq!(
+        *read.lock().unwrap(),
+        Some((
+            PROOF_AT_NS,
+            (
+                StartState::Held {
+                    reset: P2ResetState {
+                        resn: Some(Level::Low),
+                        vdd_volts: Some(1.8),
+                    }
+                },
+                None,
+                0
+            )
+        )),
+        "held at {PROOF_AT_NS} ns, past the end of a delay counted from the first release"
+    );
+    let start_ns = FINAL_RISE_NS + P2_RESTART_DELAY_NS;
+    assert_eq!(start_ns, 9_000_000);
+    assert_eq!(
+        handle.start_state(),
+        StartState::Started { at_ns: start_ns }
+    );
+    assert_eq!(*started_at.lock().unwrap(), Some(start_ns));
+    assert_eq!(*woke_at.lock().unwrap(), vec![start_ns]);
+    drop(system);
+}
+
+/// A bench supply that steps: a `PowerOut` pin held at the first voltage
+/// from the build, then at each `(instant, volts)` from its wake there.
+struct BenchSupply {
+    pins: [PinDecl; 1],
+    steps: Vec<(u64, f64)>,
+}
+
+impl BenchSupply {
+    fn stepping(first: f64, steps: &[(u64, f64)]) -> Self {
+        Self {
+            pins: [PinDecl::power_out("V").with_idle(Some(TheveninDrive {
+                volts: first,
+                impedance: 0.1,
+            }))],
+            steps: steps.to_vec(),
+        }
+    }
+}
+
+impl Component for BenchSupply {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let out = io.pin("V")?;
+        let steps = self.steps.clone();
+        io.on_wake_ns(move |now| {
+            if let Some(&(_, volts)) = steps.iter().find(|(at, _)| *at == now) {
+                out.set_drive(Some(TheveninDrive {
+                    volts,
+                    impedance: 0.1,
+                }));
+            }
+        });
+        for &(at_ns, _) in &self.steps {
+            io.schedule_at_ns(at_ns);
+        }
+        Ok(())
+    }
+}
+
+/// A core that runs: woken every millisecond from its start until
+/// `until_ns`, recording each wake and the instant the package held it.
+struct Ticking {
+    until_ns: u64,
+    woke_at_ns: Arc<StdMutex<Vec<u64>>>,
+    held_at_ns: Arc<StdMutex<Option<u64>>>,
+}
+
+impl Ticking {
+    fn until(until_ns: u64) -> Self {
+        Self {
+            until_ns,
+            woke_at_ns: Arc::default(),
+            held_at_ns: Arc::default(),
+        }
+    }
+}
+
+impl P2Core for Ticking {
+    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
+        let woke = Arc::clone(&self.woke_at_ns);
+        let until = self.until_ns;
+        let arm = pads.clone();
+        pads.on_wake_ns(move |now| {
+            woke.lock().unwrap().push(now);
+            if now < until {
+                arm.schedule_at_ns(now + 1_000_000);
+            }
+        });
+        pads.schedule_at_ns(1);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        *self.held_at_ns.lock().unwrap() = Some(virtual_clock::virtual_ns());
+    }
+}
+
+/// `VDD` leaving its window while the core runs and `RESN` is not asserted
+/// is a brownout without a reset: the package reports it and holds the
+/// core. A `RESN` asserted first is a reset, and holds nothing.
+#[rstest]
+#[case::resn_released(false)]
+#[case::resn_asserted_first(true)]
+fn a_core_rail_that_leaves_its_window_while_running_holds_the_core(
+    #[case] resn_asserted_first: bool,
+) {
+    behaviour!(Test {
+        id: "p2-package.brownout-without-reset",
+        covers: Some("boards/src/p2.rs#P2Package::watch_brownout"),
+        given: "a running P2 core woken every millisecond whose VDD falls from 1.8 to 1.2 \
+                volts at six and a half milliseconds, RESN either released throughout or pulled \
+                low just before",
+    });
+    expect!(
+        "reported-with-reset-released",
+        "with RESN released the package reports a brownout without a reset at the instant \
+         VDD left its window, with the voltage it read",
+        "the datasheet's core supply window is 1.7 to 1.9 volts, and a chip run outside it \
+         without its reset asserted is what a reset supervisor exists to prevent"
+    );
+    expect!(
+        "core-held",
+        "with RESN released the core is held at that instant and woken no more after it"
+    );
+    expect!(
+        "reset-first-holds-nothing",
+        "with RESN pulled low first the package reports no brownout and the core keeps being \
+         woken"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    const MS: u64 = 1_000_000;
+    let core = Ticking::until(10 * MS);
+    let woke_at = Arc::clone(&core.woke_at_ns);
+    let held_at = Arc::clone(&core.held_at_ns);
+    let package = P2Package::new(core);
+    let handle = package.handle();
+    let late = {
+        let woke_at = Arc::clone(&woke_at);
+        ReadAt::new(8 * MS, move || woke_at.lock().unwrap().clone())
+    };
+    let late_read = Arc::clone(&late.got);
+    let resn_steps: &[(u64, Level)] = if resn_asserted_first {
+        &[(6_200_000, Level::Low)]
+    } else {
+        &[]
+    };
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component(
+            "VDD",
+            Box::new(BenchSupply::stepping(1.8, &[(6_500_000, 1.2)])),
+        )
+        .component(
+            "RST",
+            Box::new(BenchLine::stepping(Level::High, resn_steps)),
+        )
+        .component("LATE", Box::new(late))
+        .harness(grounded(
+            Harness::new()
+                .connect_str("VDD.V", "P2.VDD")
+                .expect("endpoints parse")
+                .connect_str("RST.A", "P2.RESN")
+                .expect("endpoints parse"),
+        ))
+        .start()
+        .expect("the bench starts");
+
+    assert!(
+        wait_for(|| late_read.lock().unwrap().is_some(), SETTLE),
+        "the bench tick at 8 ms fires; {:?}",
+        handle.start_state()
+    );
+    let (at, woke_by_8ms) = late_read.lock().unwrap().clone().unwrap();
+    assert_eq!(at, 8 * MS);
+    if resn_asserted_first {
+        assert_eq!(
+            handle.start_state(),
+            StartState::Started {
+                at_ns: P2_RESTART_DELAY_NS
+            }
+        );
+        assert_eq!(*held_at.lock().unwrap(), None);
+        // Woken past the drop (the 8 ms wake shares the reading's instant
+        // and may land after it).
+        assert!(
+            woke_by_8ms.starts_with(&[3 * MS, 4 * MS, 5 * MS, 6 * MS, 7 * MS]),
+            "{woke_by_8ms:?}"
+        );
+    } else {
+        assert_eq!(
+            handle.start_state(),
+            StartState::BrownoutWithoutReset {
+                started_at_ns: P2_RESTART_DELAY_NS,
+                at_ns: 6_500_000,
+                reset: P2ResetState {
+                    resn: Some(Level::High),
+                    vdd_volts: Some(1.2),
+                },
+            }
+        );
+        assert_eq!(handle.started_at_ns(), Some(P2_RESTART_DELAY_NS));
+        assert_eq!(*held_at.lock().unwrap(), Some(6_500_000));
+        assert_eq!(woke_by_8ms, vec![3 * MS, 4 * MS, 5 * MS, 6 * MS]);
+    }
     drop(system);
 }
 
@@ -688,13 +1156,15 @@ fn a_pad_drives_high_at_its_banks_supply_and_nothing_in_an_unpowered_bank() {
     );
 
     let _lock = suite_lock();
-    stepped();
     let powered: u8 = 4;
     let unpowered: u8 = 8;
     for (pin, volts) in [(powered, Some(1.8)), (unpowered, None)] {
+        // Each bench from virtual zero: the first one's clock ran to its
+        // START instant.
+        stepped();
         let package = P2Package::new(PadDriver::on(pin));
         let handle = package.handle();
-        let mut harness = Harness::new()
+        let mut harness = grounded(Harness::new())
             .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
             .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
             .connect_str("PROBE.A", &format!("P2.{}", pin_name(pin)))
@@ -737,10 +1207,226 @@ fn a_pad_drives_high_at_its_banks_supply_and_nothing_in_an_unpowered_bank() {
                 assert_eq!(bank_pin_name(bank_of(pin)), "VIO_8_11");
             }
         }
-        assert_eq!(handle.start_state(), StartState::Started { at_ns: 0 });
+        assert_eq!(
+            handle.start_state(),
+            StartState::Started {
+                at_ns: P2_RESTART_DELAY_NS
+            }
+        );
         let _ = P2_FAST_OHMS;
         drop(system);
     }
+}
+
+/// The fast drive mode's strength is fitted to the datasheet's output
+/// table, and the fit is what a fast pad presents.
+#[rstest]
+fn the_fast_pad_strength_is_fitted_to_the_datasheet_output_table() {
+    behaviour!(Test {
+        id: "p2-package.fast-pad-strength",
+        covers: Some("boards/src/p2.rs#P2_FAST_OHMS"),
+        given: "the P2 datasheet's typical output voltages for the fast driver at 1, 10 and \
+                30 milliamps, sourcing below the bank supply and sinking above ground",
+    });
+    expect!(
+        "least-squares-fit",
+        "a fast pad's source impedance is the single resistance that best fits all six \
+         figures, 17.99 ohms",
+        "a pad drives to its rails, so its impedance is the one figure left to fit, and the \
+         fit weights the larger currents where the figure decides anything"
+    );
+    expect!(
+        "inside-the-rated-rows",
+        "the fitted impedance lies between the smallest and largest voltage-per-current \
+         ratio of the 10 and 30 milliamp rows",
+        "those rows span 16 to 19.3 ohms"
+    );
+    expect!(
+        "a-fast-pad-presents-it",
+        "a pad driven high in fast mode in a 3.3 volt bank presents 3.3 volts through that \
+         impedance"
+    );
+
+    let points: Vec<(f64, f64)> = P2_FAST_SOURCE_POINTS
+        .iter()
+        .chain(&P2_FAST_SINK_POINTS)
+        .copied()
+        .collect();
+    let volt_amps: f64 = points.iter().map(|(i, v)| v * i).sum();
+    let amps_squared: f64 = points.iter().map(|(i, _)| i * i).sum();
+    assert!((P2_FAST_OHMS - volt_amps / amps_squared).abs() < 1e-12);
+    assert!(
+        (P2_FAST_OHMS - 17.99).abs() < 0.005,
+        "the fit is 17.99 ohms; got {P2_FAST_OHMS}"
+    );
+
+    let ratios: Vec<f64> = P2_FAST_SOURCE_POINTS[1..]
+        .iter()
+        .chain(&P2_FAST_SINK_POINTS[1..])
+        .map(|(i, v)| v / i)
+        .collect();
+    let smallest = ratios.iter().copied().fold(f64::MAX, f64::min);
+    let largest = ratios.iter().copied().fold(f64::MIN, f64::max);
+    assert!((smallest - 16.0).abs() < 1e-9 && (largest - 0.580 / 0.030).abs() < 1e-9);
+    assert!(smallest <= P2_FAST_OHMS && P2_FAST_OHMS <= largest);
+
+    let banks = embsim_boards::p2::BankSupplies::held_at(3.3);
+    assert_eq!(
+        banks.pad_drive(0, P_HIGH_FAST | P_LOW_FAST, true, true),
+        PadDrive::Thevenin(TheveninDrive {
+            volts: 3.3,
+            impedance: P2_FAST_OHMS,
+        })
+    );
+}
+
+/// An analog probe that keeps its pin, so a bench tick can read the
+/// engine's report of the net at an instant ([`ReadAt`]).
+struct HeldProbe {
+    pins: [PinDecl; 1],
+    pin: Arc<StdMutex<Option<PinHandle>>>,
+}
+
+impl HeldProbe {
+    fn new() -> Self {
+        Self {
+            pins: [PinDecl::analog("A")],
+            pin: Arc::default(),
+        }
+    }
+}
+
+impl Component for HeldProbe {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        *self.pin.lock().unwrap() = Some(io.pin("A")?);
+        Ok(())
+    }
+}
+
+/// The native firmware image inside the package drives its pads through
+/// the package's bank supplies, like any core: nothing before the START
+/// instant, then high at its bank's `VIO_a_b` — and nothing in a bank
+/// whose supply names no voltage.
+#[rstest]
+#[case::a_1v8_bank(Some(1.8))]
+#[case::a_3v3_bank(Some(3.3))]
+#[case::an_unsupplied_bank(None)]
+fn the_native_cores_pads_drive_at_their_banks_supply_from_the_start(#[case] vio: Option<f64>) {
+    use embsim_board::mcu::{GpioChannelConfig, GpioDirection};
+    use embsim_board::McuComponent;
+
+    behaviour!(Test {
+        id: "p2-package.native-core-pad-at-bank-supply",
+        covers: Some("boards/src/p2.rs#P2Core for McuComponent"),
+        given: "the native firmware in a P2 package setting a bridged output high once it \
+                runs, supplies up from the build, that pin's bank at 1.8 volts, 3.3 volts or \
+                unsupplied",
+    });
+    expect!(
+        "floats-before-start",
+        "a millisecond in — before the datasheet's restart delay is out — the pin's net \
+         floats",
+        "a chip in reset floats every pad, whatever core runs inside it"
+    );
+    expect!(
+        "high-is-the-bank-voltage",
+        "once the firmware runs, a pin in a supplied bank sits at exactly that bank's voltage",
+        "the native core's pads drive through the package's bank supplies, as the QEMU core's \
+         do"
+    );
+    expect!(
+        "unsupplied-bank-drives-nothing",
+        "a pin in the unsupplied bank floats and the package names that bank as driven \
+         without a supply"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    const PAD: u8 = 4;
+    let mcu = McuComponent::builder("native")
+        .gpio_table(vec![GpioChannelConfig {
+            pin: u32::from(PAD),
+            active_low: false,
+        }])
+        .bridge_gpio(0, GpioDirection::Output)
+        .entry(|| embsim_peripherals::gpio::set_active(0, true))
+        .build()
+        .expect("the channel is in the table and inside P63");
+    // The firmware's bank sizing, done before the bridge is wired (sizing
+    // a GPIO bank clears its callbacks).
+    mcu.instance()
+        .expect("an entry gives the MCU its own instance")
+        .gpio
+        .init(1, None);
+    let package = P2Package::native(mcu);
+    let handle = package.handle();
+    let probe = HeldProbe::new();
+    let probe_pin = Arc::clone(&probe.pin);
+    let early = ReadAt::new(1_000_000, move || {
+        probe_pin
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(PinHandle::net_report)
+    });
+    let early_read = Arc::clone(&early.got);
+    let mut harness = grounded(Harness::new())
+        .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
+        .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+        .connect_str("PROBE.A", &format!("P2.{}", pin_name(PAD)))
+        .expect("endpoints parse");
+    if let Some(volts) = vio {
+        harness = harness.power(
+            ep("BENCH.VIO"),
+            ep(&format!("P2.{}", bank_pin_name(bank_of(PAD)))),
+            volts,
+        );
+    }
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component("PROBE", Box::new(probe))
+        .component("EARLY", Box::new(early))
+        .harness(harness)
+        .start()
+        .expect("the bench starts");
+    let net = format!("P2.{}", pin_name(PAD));
+    assert!(
+        wait_for(|| handle.started_at_ns().is_some(), SETTLE),
+        "{:?}",
+        handle.start_state()
+    );
+    assert_eq!(handle.started_at_ns(), Some(P2_RESTART_DELAY_NS));
+    assert_eq!(
+        *early_read.lock().unwrap(),
+        Some((1_000_000, Some(NetState::Floating))),
+        "{net} floats before the START instant"
+    );
+    match vio {
+        Some(volts) => {
+            assert!(
+                wait_for(
+                    || matches!(state(&system, &net), NetState::Analog(v) if (v - volts).abs() < 1e-9),
+                    SETTLE
+                ),
+                "{net} sits at the bank's {volts} V; got {:?}",
+                state(&system, &net)
+            );
+            assert_eq!(handle.unpowered_banks_driven(), Vec::<usize>::new());
+        }
+        None => {
+            assert!(
+                wait_for(|| !handle.unpowered_banks_driven().is_empty(), SETTLE),
+                "the bank is reported"
+            );
+            assert_eq!(state(&system, &net), NetState::Floating, "{net}");
+            assert_eq!(handle.unpowered_banks_driven(), vec![bank_of(PAD)]);
+        }
+    }
+    drop(system);
 }
 
 // ============================================================
@@ -827,8 +1513,7 @@ fn the_package_declares_every_pad_released() {
     let pads = &package.pins()[..NUM_PADS];
     assert_eq!(pads.len(), 64);
     for pad in pads {
-        assert_eq!(pad.kind, PinKind::DigitalBidir, "{}", pad.number);
-        assert_eq!(pad.idle, IdleDrive::Released, "{}", pad.number);
-        assert_eq!(pad.stream, None, "{}", pad.number);
+        assert!(pad.reads_when_subscribed(), "{}", pad.number);
+        assert_eq!(pad.idle, None, "{}", pad.number);
     }
 }

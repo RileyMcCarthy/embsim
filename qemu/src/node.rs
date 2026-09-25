@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::{FramingError, UartFraming};
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, SerialLevelBridge,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, PinDecl,
+    SerialLevelBridge,
 };
 use embsim_core::virtual_clock;
 
@@ -245,22 +246,11 @@ impl QemuNode {
     pub fn new(guest: Box<dyn Guest>, baud_hz: u32) -> Self {
         Self {
             pins: [
-                PinDecl {
-                    number: "TX",
-                    name: None,
-                    kind: PinKind::DigitalOut,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
-                PinDecl {
-                    number: "RX",
-                    name: None,
-                    kind: PinKind::DigitalIn,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
+                PinDecl::digital_out("TX"),
+                // The guest's serial line stands for a host's adapter, which
+                // no datasheet here describes: its receiver reads at the
+                // 3.3 V LVCMOS pair the link signals at.
+                PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)),
             ],
             framing: UartFraming::new_8n1(baud_hz),
             slice_ns: DEFAULT_SLICE.as_nanos() as u64,
@@ -330,11 +320,12 @@ impl Component for QemuNode {
                 Arc::clone(&self.stats),
                 Arc::clone(&self.shutdown),
             );
-            io.on_sense("RX", move |state| {
+            let rx = io.pin("RX")?;
+            io.on_sense("RX", move |sense| {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                deliver(&outbound, &stats, bridge.receive_sense(state));
+                deliver(&outbound, &stats, bridge.receive_sense(&rx, &sense));
             })?;
         }
         {

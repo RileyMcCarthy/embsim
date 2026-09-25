@@ -30,8 +30,8 @@
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, AttachError, Component, ComponentNetIo, EndpointRef, Finding, Harness,
-    IdleDrive, Level, NetState, PinDecl, System,
+    digital_drive, AttachError, Component, ComponentNetIo, EndpointRef, Finding, Harness, Level,
+    NetState, PinDecl, System,
 };
 use embsim_boards::p2::{P2Package, P2_PULL_15K_OHMS};
 use embsim_core::virtual_clock;
@@ -88,9 +88,7 @@ struct Sink {
 impl Sink {
     fn new() -> Self {
         Self {
-            pins: [
-                PinDecl::digital_out("A").with_idle(IdleDrive::Thevenin(digital_drive(Level::Low)))
-            ],
+            pins: [PinDecl::digital_out("A").with_idle(Some(digital_drive(Level::Low)))],
         }
     }
 }
@@ -109,9 +107,13 @@ fn ep(endpoint: &str) -> EndpointRef {
 }
 
 /// The bench supplies: the core rail inside its window and reset
-/// released (the START gate), and the bank the guest drives pads in.
+/// released (the START gate), and the bank the guest drives pads in — each
+/// measured against the ground the bench holds at 0 V, which is not
+/// implicit (`DESIGN.md` rule 6): a pin's sense is its voltage against its
+/// reference pin, `GND`.
 fn supplies(harness: Harness) -> Harness {
     harness
+        .power(ep("BENCH.GND"), ep("P2.GND"), 0.0)
         .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
         .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
         .power(ep("BENCH.VIO_0_3"), ep("P2.VIO_0_3"), 3.3)

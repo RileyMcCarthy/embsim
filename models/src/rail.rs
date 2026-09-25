@@ -145,8 +145,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    Amps, AttachError, Component, ComponentNetIo, IdleDrive, Level, NetId, NetState, Ohms, PinDecl,
-    PinHandle, PinKind, PinReference, TheveninDrive, Volts,
+    Amps, AttachError, Component, ComponentNetIo, DeadBand, Level, NetId, Ohms, PinDecl, PinHandle,
+    Sense, TheveninDrive, Thresholds, Volts,
 };
 use embsim_core::virtual_clock;
 
@@ -535,14 +535,14 @@ pub enum RailRole {
     /// part never drives: the isolated domain's reference, held by
     /// whatever the board or the harness ties it to.
     IsolatedGround,
-    /// The enable (`DigitalIn`), read through [`EnableSpec`].
+    /// The enable (a digital input), read through [`EnableSpec`].
     Enable,
     /// The feedback pin (`Passive`): the divider on it is read once at
     /// attach; the part senses and drives nothing on it live.
     Feedback,
     /// The select pin (`Passive`): its strap is read once at attach.
     Select,
-    /// An open-drain status output (`DigitalOut`, released, not modelled).
+    /// An open-drain status output (sinks only, released, not modelled).
     StatusOut,
     /// A pin the model reads nothing from (`Passive`): a bootstrap node, a
     /// sync input tied off, a no-connect.
@@ -646,28 +646,61 @@ pub const UCC12040_PINS_SOIC16: [RailPin; 16] = [
     rail_pin("16", Some("GNDS_3"), RailRole::ExtraGround),
 ];
 
-/// Turn one pin-table row into a [`PinDecl`].
-fn declare(pin: &RailPin) -> PinDecl {
-    let (kind, idle) = match pin.role {
-        RailRole::Input | RailRole::Ground | RailRole::ExtraGround => {
-            (PinKind::PowerIn, IdleDrive::KindDefault)
-        }
+/// An enable pin's thresholds, absolute against the ground pin: the lower
+/// of the spec's two figures as `V_IL`, the higher as `V_IH`, hysteresis 0 —
+/// none of the AP62301, NCP114, XL1509 and UCC12040 sheets names one apart
+/// from the pair — and between them the comparator keeps the state it is
+/// in ([`DeadBand::HoldLast`]).
+fn enable_thresholds(spec: EnableSpec) -> Thresholds {
+    Thresholds::new(
+        spec.assert_volts.min(spec.deassert_volts),
+        spec.assert_volts.max(spec.deassert_volts),
+        0.0,
+        DeadBand::HoldLast,
+    )
+}
+
+/// Turn one pin-table row into a [`PinDecl`]: the input measured against
+/// the ground pin and the output against the isolated ground where the
+/// part has one, else the ground — the references the build's domain
+/// lints read (`embsim_board::Finding::UnreferencedDomain`,
+/// `embsim_board::Finding::RailDown`'s reason); the enable reading through
+/// the configuration's own thresholds ([`EnableSpec`], each part's
+/// datasheet figure), absolute against the ground pin, the lower of the
+/// two its `V_IL` and the higher its `V_IH` (none of the four datasheets
+/// names a hysteresis figure apart from the pair); the status output an
+/// open drain.
+fn declare(pin: &RailPin, table: &[RailPin], config: &Config) -> PinDecl {
+    let of = |role: RailRole| table.iter().find(|p| p.role == role).map(|p| p.number);
+    let ground = of(RailRole::Ground).expect("checked at new");
+    let decl = match pin.role {
+        RailRole::Input => PinDecl::power_in(pin.number).with_reference(ground),
+        RailRole::Ground | RailRole::ExtraGround => PinDecl::power_in(pin.number),
         // Released until the part publishes: a rail that is down floats
         // (`NODES.md` §2), and the build snapshot says so.
-        RailRole::Output | RailRole::IsolatedGround => (PinKind::PowerOut, IdleDrive::Released),
-        RailRole::Enable => (PinKind::DigitalIn, IdleDrive::KindDefault),
-        RailRole::Feedback | RailRole::Select | RailRole::Passive => {
-            (PinKind::Passive, IdleDrive::KindDefault)
-        }
-        RailRole::StatusOut => (PinKind::DigitalOut, IdleDrive::Released),
+        RailRole::Output => PinDecl::power_out(pin.number)
+            .with_idle(None)
+            .with_reference(match of(RailRole::IsolatedGround) {
+                Some(isolated) => isolated,
+                None => ground,
+            }),
+        RailRole::IsolatedGround => PinDecl::power_out(pin.number).with_idle(None),
+        RailRole::Enable => match config.enable {
+            Some(spec) => {
+                PinDecl::digital_in(pin.number, enable_thresholds(spec)).with_reference(ground)
+            }
+            // A table with an enable pin behind a configuration that names
+            // no enable: nothing the model does reads the pin, so it
+            // declares nothing — no thresholds stand in for a projection no
+            // one makes, and an open one is no floating input.
+            None => PinDecl::passive(pin.number),
+        },
+        RailRole::Feedback | RailRole::Select | RailRole::Passive => PinDecl::passive(pin.number),
+        RailRole::StatusOut => PinDecl::digital_out(pin.number).sink_only(),
     };
-    PinDecl {
-        number: pin.number,
-        name: pin.name,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle,
+    match pin.name {
+        Some(name) => decl.with_name(name),
+        None => decl,
     }
 }
 
@@ -748,45 +781,28 @@ pub enum RailState {
     Discharging,
 }
 
-/// What the input pin reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum InputRead {
-    /// A solved voltage.
-    Volts(Volts),
-    /// A high level with no voltage: above any threshold.
-    Up,
-    /// A low level with no voltage: below any threshold.
-    Down,
-    /// Nothing reaches the pin.
-    None,
-}
-
-fn read_input(state: NetState) -> InputRead {
-    match state {
-        NetState::Analog(v) if v.is_finite() => InputRead::Volts(v),
-        NetState::Driven(Level::High) | NetState::Pulled(Level::High, _) => InputRead::Up,
-        NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => InputRead::Down,
-        NetState::Analog(_) | NetState::Floating | NetState::Contention => InputRead::None,
-    }
-}
-
-/// The voltage a reference pin reads: a solved voltage, 0 V for a low
-/// level, nothing for a high level or a node no source reaches.
-fn read_reference(state: NetState) -> Option<Volts> {
-    match state {
-        NetState::Analog(v) if v.is_finite() => Some(v),
-        NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => Some(0.0),
-        _ => None,
-    }
-}
+/// A pin nothing has been handed yet: no voltage, no clock.
+const NOTHING: Sense = Sense {
+    volts: None,
+    periodic: None,
+    at_ns: 0,
+};
 
 #[derive(Debug)]
 struct State {
-    input: NetState,
-    ground: NetState,
-    /// The isolated ground's net, when the part declares one.
-    isolated_ground: Option<NetState>,
-    enable: Option<NetState>,
+    /// The input pin's sense: against the ground pin.
+    input: Sense,
+    /// The ground pin's sense: in the engine's frame (it declares no
+    /// reference) — the voltage the output is published above.
+    ground: Sense,
+    /// The isolated ground's sense, when the part declares one: in the
+    /// engine's frame.
+    isolated_ground: Option<Sense>,
+    /// The enable pin's sense: against the ground pin.
+    enable: Option<Sense>,
+    /// The level the enable last read — its receiver's last level, which
+    /// the next projection is chosen by (its hysteresis).
+    enable_level: Option<Level>,
     /// The input's hysteresis latch.
     input_up: bool,
     /// The enable's hysteresis latch (`None`: not yet decided).
@@ -809,34 +825,32 @@ struct Core {
 }
 
 impl Core {
-    /// Fold a new input reading into the hysteresis latch. A voltage is
-    /// taken relative to the ground pin; with no reference to take it
-    /// relative to, the input is not up (no assumed 0 V).
+    /// Fold a new input reading into the hysteresis latch. The input is
+    /// handed its voltage against the ground pin; one that names no
+    /// voltage — nothing reaches the input, or nothing holds the ground to
+    /// take it against (no assumed 0 V) — is not up.
     fn latch_input(&self, state: &mut State) {
-        state.input_up = match read_input(state.input) {
-            InputRead::Volts(v) => match read_reference(state.ground) {
-                Some(reference) => {
-                    let relative = v - reference;
-                    if relative >= self.config.input_on_volts {
-                        true
-                    } else if relative < self.config.input_off_volts {
-                        false
-                    } else {
-                        state.input_up
-                    }
-                }
-                None => false,
-            },
-            InputRead::Up => true,
-            InputRead::Down | InputRead::None => false,
+        state.input_up = match state.input.volts {
+            Some(relative) if relative >= self.config.input_on_volts => true,
+            Some(relative) if relative < self.config.input_off_volts => false,
+            Some(_) => state.input_up,
+            None => false,
         };
     }
 
-    /// Fold a new enable reading into the hysteresis latch. A level needs
-    /// no reference; a voltage is taken relative to the ground pin, and
-    /// with no reference to take it relative to the enable is undecided
-    /// (`None`, which evaluates as disabled) rather than read against an
-    /// assumed 0 V.
+    /// Fold a new enable reading into the hysteresis latch: the enable
+    /// pin's projection through its declared thresholds — the lower of the
+    /// spec's two figures as `V_IL`, the higher as `V_IH`, holding its last
+    /// level between them ([`DeadBand::HoldLast`], the comparator's
+    /// hysteresis) — read as asserting per [`EnableSpec::sense`].
+    ///
+    /// An enable in its band that has read nothing yet is not asserted. One
+    /// handed no voltage while the ground names one has no source: the
+    /// part's own open-pin answer ([`EnableSpec::floating_enables`]) — a
+    /// clock on EN has no single level either and takes it too (the
+    /// wildcard audit, `NODES.md` §12 item 5). With no ground to measure
+    /// against the enable is undecided (`None`, which evaluates as
+    /// disabled) rather than read against an assumed 0 V.
     fn latch_enable(&self, state: &mut State) {
         let Some(spec) = self.config.enable else {
             state.enabled = Some(true);
@@ -847,46 +861,26 @@ impl Core {
             state.enabled = Some(spec.floating_enables);
             return;
         };
-        let level = |asserting: bool| match spec.sense {
-            EnableSense::High => asserting,
-            EnableSense::Low => !asserting,
+        let asserting = |level: Level| match spec.sense {
+            EnableSense::High => level == Level::High,
+            EnableSense::Low => level == Level::Low,
         };
-        state.enabled = match pin {
-            NetState::Driven(Level::High) | NetState::Pulled(Level::High, _) => Some(level(true)),
-            NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => Some(level(false)),
-            NetState::Analog(v) if v.is_finite() => match read_reference(state.ground) {
-                Some(reference) => {
-                    let relative = v - reference;
-                    let (asserts, deasserts) = match spec.sense {
-                        EnableSense::High => (
-                            relative >= spec.assert_volts,
-                            relative <= spec.deassert_volts,
-                        ),
-                        EnableSense::Low => (
-                            relative <= spec.assert_volts,
-                            relative >= spec.deassert_volts,
-                        ),
-                    };
-                    if asserts {
-                        Some(true)
-                    } else if deasserts {
-                        Some(false)
-                    } else {
-                        Some(state.enabled.unwrap_or(false))
-                    }
-                }
-                None => None,
-            },
-            NetState::Analog(_) | NetState::Floating | NetState::Contention => {
-                Some(spec.floating_enables)
+        state.enabled = match pin.volts {
+            Some(_) => {
+                state.enable_level = pin.level(&enable_thresholds(spec), state.enable_level);
+                Some(state.enable_level.is_some_and(asserting))
             }
+            None if pin.periodic.is_some() => Some(spec.floating_enables),
+            None if state.ground.volts.is_some() => Some(spec.floating_enables),
+            None => None,
         };
     }
 
     /// The output's reference voltage: the isolated ground where the part
-    /// declares one, its own ground otherwise.
+    /// declares one, its own ground otherwise — in the engine's frame, the
+    /// frame the output is published in.
     fn output_reference(state: &State) -> Option<Volts> {
-        read_reference(state.isolated_ground.unwrap_or(state.ground))
+        state.isolated_ground.unwrap_or(state.ground).volts
     }
 
     fn publish(&self, state: &mut State, drive: Option<TheveninDrive>, now_ns: u64) {
@@ -1052,7 +1046,6 @@ impl RailMonitor {
 #[derive(Debug)]
 pub struct Rail {
     pins: Vec<PinDecl>,
-    references: Vec<PinReference>,
     table: &'static [RailPin],
     core: Arc<Core>,
 }
@@ -1096,31 +1089,20 @@ impl Rail {
             _ => {}
         }
         let pin_of = |role: RailRole| table.iter().find(|p| p.role == role).map(|p| p.number);
-        let input = pin_of(RailRole::Input).expect("counted");
-        let ground = pin_of(RailRole::Ground).expect("counted");
-        let output = pin_of(RailRole::Output).expect("counted");
-        let output_reference = pin_of(RailRole::IsolatedGround).unwrap_or(ground);
-        let references = vec![
-            PinReference {
-                pin: input,
-                reference: ground,
-            },
-            PinReference {
-                pin: output,
-                reference: output_reference,
-            },
-        ];
         Ok(Self {
-            pins: table.iter().map(declare).collect(),
-            references,
+            pins: table
+                .iter()
+                .map(|pin| declare(pin, table, &config))
+                .collect(),
             table,
             core: Arc::new(Core {
                 config,
                 state: Mutex::new(State {
-                    input: NetState::Floating,
-                    ground: NetState::Floating,
-                    isolated_ground: pin_of(RailRole::IsolatedGround).map(|_| NetState::Floating),
-                    enable: pin_of(RailRole::Enable).map(|_| NetState::Floating),
+                    input: NOTHING,
+                    ground: NOTHING,
+                    isolated_ground: pin_of(RailRole::IsolatedGround).map(|_| NOTHING),
+                    enable: pin_of(RailRole::Enable).map(|_| NOTHING),
+                    enable_level: None,
                     input_up: false,
                     enabled: None,
                     v_set: None,
@@ -1218,10 +1200,6 @@ impl Component for Rail {
         &self.pins
     }
 
-    fn references(&self) -> &[PinReference] {
-        &self.references
-    }
-
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let v_set = self.resolve_v_set(&io)?;
         let output = self.pin_number(RailRole::Output).expect("checked at new");
@@ -1287,9 +1265,19 @@ impl Component for Rail {
 
 #[cfg(test)]
 mod tests {
+    use embsim_board::{PinRole, SenseKind};
     use rstest::rstest;
 
     use super::*;
+
+    /// A sense handed `volts` (the instant plays no part in the rail).
+    fn handed(volts: Option<Volts>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
+    }
 
     #[rstest]
     #[case::module_ldo("LDO 300mA, 3.3V", Some(3.3))]
@@ -1340,26 +1328,30 @@ mod tests {
     fn the_output_is_a_released_terminal_and_the_references_name_the_grounds() {
         let rail = Rail::new(Config::ucc12040(), &UCC12040_PINS_SOIC16).unwrap();
         let pin = |n: &str| rail.pins().iter().find(|p| p.number == n).copied().unwrap();
-        assert_eq!(pin("14").kind, PinKind::PowerOut);
-        assert_eq!(pin("14").idle, IdleDrive::Released);
-        assert_eq!(pin("15").kind, PinKind::PowerOut);
-        assert_eq!(pin("15").idle, IdleDrive::Released);
-        assert_eq!(pin("9").kind, PinKind::PowerIn);
-        assert_eq!(pin("1").kind, PinKind::DigitalIn);
-        assert_eq!(pin("13").kind, PinKind::Passive);
+        assert_eq!(pin("14").role, PinRole::PowerOut);
+        assert_eq!(pin("14").idle, None);
+        assert_eq!(pin("15").role, PinRole::PowerOut);
+        assert_eq!(pin("15").idle, None);
+        assert_eq!(pin("9").role, PinRole::PowerIn);
+        assert_eq!(pin("1").senses_at_build(), Some(SenseKind::Digital));
         assert_eq!(
-            rail.references(),
-            &[
-                PinReference {
-                    pin: "3",
-                    reference: "2"
-                },
-                PinReference {
-                    pin: "14",
-                    reference: "15"
-                }
-            ]
+            pin("1").thresholds,
+            Some(Thresholds::new(
+                UCC12040_EN_LOW_VOLTS,
+                UCC12040_EN_HIGH_VOLTS,
+                0.0,
+                DeadBand::HoldLast,
+            )),
+            "EN reads through the datasheet's V_IF/V_IR"
         );
+        assert_eq!(pin("13").role, PinRole::Passive);
+        let references: Vec<(&str, &str)> = rail
+            .pins()
+            .iter()
+            .filter(|p| matches!(p.role, PinRole::PowerIn | PinRole::PowerOut))
+            .filter_map(|p| Some((p.number, p.reference?)))
+            .collect();
+        assert_eq!(references, [("3", "2"), ("14", "15")]);
     }
 
     /// The core without an engine: the module's LDO (no soft-start) comes
@@ -1372,10 +1364,10 @@ mod tests {
         let core = Arc::clone(&rail.core);
         let mut state = core.state.lock().unwrap();
         state.v_set = Some(3.3);
-        state.ground = NetState::Analog(0.0);
-        state.input = NetState::Analog(3.649);
+        state.ground = handed(Some(0.0));
+        state.input = handed(Some(3.649));
         core.latch_input(&mut state);
-        state.enable = Some(NetState::Analog(3.649));
+        state.enable = Some(handed(Some(3.649)));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 7);
         assert_eq!(
@@ -1388,13 +1380,13 @@ mod tests {
         assert_eq!(state.publishes, 1);
 
         // Inside the enable band: held.
-        state.enable = Some(NetState::Analog(0.6));
+        state.enable = Some(handed(Some(0.6)));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 8);
         assert_eq!(state.publishes, 1, "0.6 V is between 0.4 V and 0.9 V");
 
         // Below it: the discharge holds the output at ground through 100 Ω.
-        state.enable = Some(NetState::Analog(0.3));
+        state.enable = Some(handed(Some(0.3)));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 9);
         assert_eq!(core.rail_state(&state), RailState::Discharging);
@@ -1407,7 +1399,7 @@ mod tests {
         );
 
         // The input gone: released, no discharge without a supply.
-        state.input = NetState::Floating;
+        state.input = handed(None);
         core.latch_input(&mut state);
         core.evaluate(&mut state, 10);
         assert_eq!(state.published, None);
@@ -1421,26 +1413,27 @@ mod tests {
         );
     }
 
-    /// A ground pin no source reaches decides nothing: an input voltage
-    /// and an analog enable voltage read against no reference leave the
-    /// input not up and the enable undecided, and the monitor says so;
-    /// the ground arriving decides both from the same readings.
+    /// A ground pin no source reaches decides nothing: the input and the
+    /// enable, measured against no reference, are handed no voltage — the
+    /// input is not up and the enable undecided, a driven enable included,
+    /// and the monitor says so; the ground arriving decides both from the
+    /// voltages they are then handed.
     #[rstest]
     fn an_unreferenced_ground_reads_the_input_as_not_up_and_the_enable_as_undecided() {
         let rail = Rail::new(Config::ncp114(3.3), &NCP114_PINS_BY_FUNCTION).unwrap();
         let core = Arc::clone(&rail.core);
         let mut state = core.state.lock().unwrap();
         state.v_set = Some(3.3);
-        state.ground = NetState::Floating;
-        state.input = NetState::Analog(3.649);
+        state.ground = handed(None);
+        state.input = handed(None);
         core.latch_input(&mut state);
-        state.enable = Some(NetState::Analog(3.649));
+        state.enable = Some(handed(None));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 5);
-        assert!(!state.input_up, "3.649 V relative to nothing is not up");
+        assert!(!state.input_up, "a voltage relative to nothing is not up");
         assert_eq!(
             state.enabled, None,
-            "3.649 V relative to nothing decides no enable"
+            "a voltage relative to nothing decides no enable"
         );
         assert_eq!(state.published, None);
         assert_eq!(
@@ -1452,15 +1445,10 @@ mod tests {
             }
         );
 
-        // A level on the enable needs no reference.
-        state.enable = Some(NetState::Driven(Level::High));
-        core.latch_enable(&mut state);
-        assert_eq!(state.enabled, Some(true));
-        assert!(!state.input_up);
-
-        // The ground arrives: the same readings now decide.
-        state.ground = NetState::Analog(0.0);
-        state.enable = Some(NetState::Analog(3.649));
+        // The ground arrives: the readings against it now decide.
+        state.ground = handed(Some(0.0));
+        state.input = handed(Some(3.649));
+        state.enable = Some(handed(Some(3.649)));
         core.latch_input(&mut state);
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 6);
@@ -1485,16 +1473,16 @@ mod tests {
         let core = Arc::clone(&rail.core);
         let mut state = core.state.lock().unwrap();
         state.v_set = Some(1.813);
-        state.ground = NetState::Analog(0.0);
+        state.ground = handed(Some(0.0));
         core.latch_enable(&mut state);
         assert_eq!(state.enabled, Some(true), "EN left floating enables");
 
-        state.input = NetState::Analog(3.8);
+        state.input = handed(Some(3.8));
         core.latch_input(&mut state);
         core.evaluate(&mut state, 1_000);
         assert!(!state.input_up, "3.8 V is under the 3.90 V POR");
 
-        state.input = NetState::Analog(5.0);
+        state.input = handed(Some(5.0));
         core.latch_input(&mut state);
         core.evaluate(&mut state, 1_000);
         assert_eq!(
@@ -1517,27 +1505,27 @@ mod tests {
         assert!((published.impedance - AP62301_Z_OUT_OHMS).abs() < 1e-12);
 
         // 3.7 V: under the POR, over the UVLO — still up (hysteresis).
-        state.input = NetState::Analog(3.7);
+        state.input = handed(Some(3.7));
         core.latch_input(&mut state);
         core.evaluate(&mut state, 5_000_000);
         assert!(state.input_up);
         assert_eq!(state.publishes, 1);
 
         // Under the UVLO: released.
-        state.input = NetState::Analog(3.5);
+        state.input = handed(Some(3.5));
         core.latch_input(&mut state);
         core.evaluate(&mut state, 5_000_001);
         assert_eq!(state.published, None);
 
         // Up again, then down during the soft-start: the wake fires into a
         // part whose input is down and publishes nothing.
-        state.input = NetState::Analog(5.0);
+        state.input = handed(Some(5.0));
         core.latch_input(&mut state);
         core.evaluate(&mut state, 6_000_000);
         let RailState::Rising { at_ns } = core.rail_state(&state) else {
             panic!("rising");
         };
-        state.input = NetState::Floating;
+        state.input = handed(None);
         core.latch_input(&mut state);
         core.evaluate(&mut state, 6_000_001);
         core.on_wake(&mut state, at_ns);
@@ -1554,10 +1542,10 @@ mod tests {
         let core = Arc::clone(&rail.core);
         let mut state = core.state.lock().unwrap();
         state.v_set = Some(UCC12040_VISO_SEL_TO_VISO_VOLTS);
-        state.ground = NetState::Analog(0.0);
-        state.input = NetState::Analog(5.0);
+        state.ground = handed(Some(0.0));
+        state.input = handed(Some(5.0));
         core.latch_input(&mut state);
-        state.enable = Some(NetState::Analog(5.0));
+        state.enable = Some(handed(Some(5.0)));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 0);
         assert_eq!(
@@ -1568,7 +1556,7 @@ mod tests {
                 referenced: false
             }
         );
-        state.isolated_ground = Some(NetState::Analog(0.0));
+        state.isolated_ground = Some(handed(Some(0.0)));
         core.evaluate(&mut state, 0);
         assert_eq!(
             core.rail_state(&state),
@@ -1584,7 +1572,7 @@ mod tests {
                 since_ns: UCC12040_RISE_NS
             }
         );
-        state.isolated_ground = Some(NetState::Analog(2.0));
+        state.isolated_ground = Some(handed(Some(2.0)));
         core.evaluate(&mut state, 900_000);
         assert_eq!(
             core.rail_state(&state),
@@ -1604,10 +1592,10 @@ mod tests {
         let core = Arc::clone(&rail.core);
         let mut state = core.state.lock().unwrap();
         state.v_set = Some(5.0);
-        state.ground = NetState::Analog(0.0);
-        state.input = NetState::Analog(12.0);
+        state.ground = handed(Some(0.0));
+        state.input = handed(Some(12.0));
         core.latch_input(&mut state);
-        state.enable = Some(NetState::Floating);
+        state.enable = Some(handed(None));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 3);
         assert_eq!(
@@ -1618,11 +1606,11 @@ mod tests {
             }
         );
         assert_eq!(state.published.unwrap().impedance, 0.0);
-        state.enable = Some(NetState::Analog(2.0));
+        state.enable = Some(handed(Some(2.0)));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 4);
         assert_eq!(state.published, None, "2 V is over the 1.4 V OFF threshold");
-        state.enable = Some(NetState::Driven(Level::Low));
+        state.enable = Some(handed(Some(0.0)));
         core.latch_enable(&mut state);
         core.evaluate(&mut state, 5);
         assert!(matches!(core.rail_state(&state), RailState::Up { .. }));

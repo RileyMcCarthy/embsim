@@ -66,56 +66,19 @@ pub use stepper_motor::{MotorShaft, StepEdge, StepperMotor};
 
 use std::fmt;
 
-use embsim_board::{Level, NetState, Volts};
+use embsim_board::{Level, Volts};
 
 // ============================================================
 // Shared electrical constants
 // ============================================================
-
-/// Default logic-input threshold: a sensed node voltage at or above this
-/// projects to [`Level::High`], below it to [`Level::Low`].
-///
-/// 1.5 V is the mid-rail of a 3.3 V system and matches the net engine's own
-/// digital projection threshold, so a component's own reading of an
-/// [`NetState::Analog`] node agrees with the engine's `Driven`/`Pulled`
-/// projection of the same node. Real parts specify asymmetric `V_IL`/`V_IH`
-/// with a dead band; that projection (and its
-/// [`embsim_board::Finding::AmbiguousLevel`]) is an engine-side slice, so
-/// every component here takes the threshold as configuration rather than
-/// hard-coding a family.
-pub const DEFAULT_INPUT_THRESHOLD_VOLTS: Volts = 1.5;
 
 /// Default open-circuit voltage a machine component drives for a logic high
 /// (3.3 V logic — the reference consumer's I/O rail).
 pub const DEFAULT_HIGH_VOLTS: Volts = 3.3;
 
 // ============================================================
-// Level projection
+// Levels
 // ============================================================
-
-/// Project a resolved [`NetState`] onto a logic level, or `None` when the
-/// engine offers no defensible one.
-///
-/// The engine never invents a value for an unsourced or fought-over node
-/// (`BOARD_ENGINE.md`, "Net state model"), and neither does this helper:
-/// [`NetState::Floating`] and [`NetState::Contention`] return `None` so each
-/// component can choose its own documented behavior (a stepper drive holds
-/// the last DIR it latched; a floating ENA is *not* an enable).
-///
-/// - [`NetState::Driven`] / [`NetState::Pulled`] carry the level directly.
-/// - [`NetState::Analog`] is compared against `threshold_volts`. A NaN node
-///   voltage — which the resolver filters before publication, so this is
-///   defense in depth — is treated as no level at all rather than silently
-///   projecting low.
-pub fn digital_level(state: NetState, threshold_volts: Volts) -> Option<Level> {
-    match state {
-        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
-        NetState::Analog(volts) if volts.is_nan() => None,
-        NetState::Analog(volts) if volts >= threshold_volts => Some(Level::High),
-        NetState::Analog(_) => Some(Level::Low),
-        NetState::Floating | NetState::Contention => None,
-    }
-}
 
 /// The other logic level.
 pub(crate) fn invert(level: Level) -> Level {
@@ -221,32 +184,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-
-    /// Digital projections carry their level through unchanged; analog nodes
-    /// are compared against the declared threshold.
-    #[rstest]
-    #[case::driven_high(NetState::Driven(Level::High), Some(Level::High))]
-    #[case::driven_low(NetState::Driven(Level::Low), Some(Level::Low))]
-    #[case::pulled_high(NetState::Pulled(Level::High, 10_000.0), Some(Level::High))]
-    #[case::pulled_low(NetState::Pulled(Level::Low, 4_700.0), Some(Level::Low))]
-    #[case::analog_above(NetState::Analog(3.3), Some(Level::High))]
-    #[case::analog_at_threshold(NetState::Analog(1.5), Some(Level::High))]
-    #[case::analog_below(NetState::Analog(1.49), Some(Level::Low))]
-    #[case::analog_zero(NetState::Analog(0.0), Some(Level::Low))]
-    fn digital_level_projects_sourced_nets(#[case] state: NetState, #[case] expect: Option<Level>) {
-        assert_eq!(digital_level(state, DEFAULT_INPUT_THRESHOLD_VOLTS), expect);
-    }
-
-    /// The engine never invents a value for an unsourced or fought-over node,
-    /// so neither does the projection — each component picks its own
-    /// documented behavior for `None`.
-    #[rstest]
-    #[case::floating(NetState::Floating)]
-    #[case::contention(NetState::Contention)]
-    #[case::nan(NetState::Analog(f64::NAN))]
-    fn digital_level_refuses_to_guess(#[case] state: NetState) {
-        assert_eq!(digital_level(state, DEFAULT_INPUT_THRESHOLD_VOLTS), None);
-    }
 
     #[rstest]
     fn invert_swaps_levels() {

@@ -52,36 +52,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, PinDecl,
-    PinHandle, PinKind,
+    digital_drive, AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver, Level,
+    PinDecl, PinHandle, Thresholds, Volts,
 };
 use tracing::trace;
 
 use crate::sd_card::SdCard;
 
-const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: Some(name),
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
-}
+/// `V_IL` max as a fraction of `VDD`: 0.25 · VDD (SD Specifications Part 1,
+/// Physical Layer Specification Version 2.00, §6.6.1 "Threshold Level for
+/// High Voltage Range", Table 6-2 — the 3.3 V signalling range SPI mode
+/// uses; the Simplified Specification leaves §6.6 blank).
+pub const SD_VIL_VDD_RATIO: f64 = 0.25;
 
-/// A pin whose netlist identifier already IS the name the adapter uses, so it
-/// needs no alias. Declaring one anyway makes the handle table insert the same
-/// key twice, which a bench system rejects as a duplicate endpoint.
-const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+/// `V_IH` min as a fraction of `VDD`: 0.625 · VDD (the same Table 6-2).
+pub const SD_VIH_VDD_RATIO: f64 = 0.625;
+
+/// The supply range of the high-voltage range, 2.7 V to 3.6 V (the same
+/// Table 6-2, "Supply Voltage").
+pub const SD_VDD_MIN_VOLTS: Volts = 2.7;
+/// See [`SD_VDD_MIN_VOLTS`].
+pub const SD_VDD_MAX_VOLTS: Volts = 3.6;
+
+/// The card's input thresholds, **relative** to `VDD` and measured against
+/// `VSS`: 0.25 · VDD / 0.625 · VDD; no hysteresis is named, so between the
+/// two the specification guarantees neither level ([`DeadBand::Unknown`]).
+pub const SD_INPUT_THRESHOLDS: Thresholds =
+    Thresholds::new(SD_VIL_VDD_RATIO, SD_VIH_VDD_RATIO, 0.0, DeadBand::Unknown);
+
+/// The same thresholds **absolute**, for a facade that declares no supply
+/// pin: each ratio evaluated at the corner of the supply range where it
+/// holds at every supply — `V_IL` 0.25 × 2.7 = 0.675 V, `V_IH` 0.625 × 3.6
+/// = 2.25 V.
+pub const SD_INPUT_THRESHOLDS_ANY_VDD: Thresholds = Thresholds::new(
+    SD_VIL_VDD_RATIO * SD_VDD_MIN_VOLTS,
+    SD_VIH_VDD_RATIO * SD_VDD_MAX_VOLTS,
+    0.0,
+    DeadBand::Unknown,
+);
+
+/// An input reading through the specification's ratios of the supply pin
+/// `vdd`, against the ground pin `vss` (identifiers as the table names
+/// them).
+const fn input(number: &'static str, vdd: &'static str, vss: &'static str) -> PinDecl {
+    PinDecl::digital_in(number, SD_INPUT_THRESHOLDS)
+        .with_supply(vdd)
+        .with_reference(vss)
 }
 
 /// The 8-pin microSD facade with card pin NUMBERS as identifiers, for a
@@ -90,16 +106,19 @@ const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
 /// The SPI-mode roles are the SD Physical Layer Simplified Specification's:
 /// `CD/DAT3` becomes chip select, `CMD` becomes DI, `DAT0` becomes DO, and
 /// `DAT1`/`DAT2` are unused. Both are declared and **never driven**, which is
-/// what a card in SPI mode does with them.
+/// what a card in SPI mode does with them. A pin whose identifier already
+/// IS the name the adapter uses takes no alias: declaring one anyway makes
+/// the handle table insert the same key twice, which a bench system rejects
+/// as a duplicate endpoint.
 pub const SD_CARD_PINS_MICROSD: [PinDecl; 8] = [
-    pin("1", "DAT2", PinKind::DigitalIn),
-    pin("2", "CS", PinKind::DigitalIn),
-    pin("3", "DI", PinKind::DigitalIn),
-    pin("4", "VDD", PinKind::PowerIn),
-    pin_unaliased("5", PinKind::DigitalIn), // CLK, aliased below
-    pin("6", "VSS", PinKind::PowerIn),
-    pin("7", "DO", PinKind::DigitalOut),
-    pin("8", "DAT1", PinKind::DigitalIn),
+    input("1", "4", "6").with_name("DAT2"),
+    input("2", "4", "6").with_name("CS"),
+    input("3", "4", "6").with_name("DI"),
+    PinDecl::power_in("4").with_name("VDD").with_reference("6"),
+    input("5", "4", "6"), // CLK, aliased below
+    PinDecl::power_in("6").with_name("VSS"),
+    PinDecl::digital_out("7").with_name("DO"),
+    input("8", "4", "6").with_name("DAT1"),
 ];
 
 /// The same card keyed by FUNCTION, which is how a netlist transcribed from a
@@ -110,23 +129,24 @@ pub const SD_CARD_PINS_MICROSD: [PinDecl; 8] = [
 /// omits `DAT1`/`DAT2`, which a socket wired for SPI leaves unconnected — and
 /// an unconnected pin has no node, so declaring it would fail validation.
 pub const SD_CARD_PINS_BY_FUNCTION: [PinDecl; 8] = [
-    pin("CD_DAT3_CS", "CS", PinKind::DigitalIn),
-    pin("CMD_MOSI", "DI", PinKind::DigitalIn),
-    pin("DAT0_MISO", "DO", PinKind::DigitalOut),
-    pin_unaliased("CLK", PinKind::DigitalIn),
-    pin_unaliased("VDD", PinKind::PowerIn),
-    pin_unaliased("VSS", PinKind::PowerIn),
-    pin_unaliased("GND1", PinKind::PowerIn),
-    pin_unaliased("GND2", PinKind::PowerIn),
+    input("CD_DAT3_CS", "VDD", "VSS").with_name("CS"),
+    input("CMD_MOSI", "VDD", "VSS").with_name("DI"),
+    PinDecl::digital_out("DAT0_MISO").with_name("DO"),
+    input("CLK", "VDD", "VSS"),
+    PinDecl::power_in("VDD").with_reference("VSS"),
+    PinDecl::power_in("VSS"),
+    PinDecl::power_in("GND1"),
+    PinDecl::power_in("GND2"),
 ];
 
 /// A bare four-wire facade, for a bench netlist that names the SPI signals and
-/// nothing else.
+/// nothing else. With no supply pin to scale by, the inputs read through
+/// the absolute pair ([`SD_INPUT_THRESHOLDS_ANY_VDD`]).
 pub const SD_CARD_PINS_SPI_ONLY: [PinDecl; 4] = [
-    pin_unaliased("CLK", PinKind::DigitalIn),
-    pin_unaliased("CS", PinKind::DigitalIn),
-    pin("MOSI", "DI", PinKind::DigitalIn),
-    pin("MISO", "DO", PinKind::DigitalOut),
+    PinDecl::digital_in("CLK", SD_INPUT_THRESHOLDS_ANY_VDD),
+    PinDecl::digital_in("CS", SD_INPUT_THRESHOLDS_ANY_VDD),
+    PinDecl::digital_in("MOSI", SD_INPUT_THRESHOLDS_ANY_VDD).with_name("DI"),
+    PinDecl::digital_out("MISO").with_name("DO"),
 ];
 
 /// What the card has seen and is saying.
@@ -276,11 +296,12 @@ impl Component for SdCardComponent {
                 Arc::clone(&self.wire),
                 data_out.clone(),
             );
-            io.on_sense("CS", move |state| {
-                let Some(level) = level_of(state) else {
+            let rx_cs = DigitalReceiver::new(io.pin("CS")?);
+            io.on_sense("CS", move |sense| {
+                let Some(level) = rx_cs.read(&sense) else {
                     // Floating chip select is not a state a card can act on;
                     // hold, and let the engine's diagnostics report it.
-                    trace!(?state, "SD card: CS has no level; holding selection");
+                    trace!(?sense, "SD card: CS has no level; holding selection");
                     return;
                 };
                 let selected = level == Level::Low;
@@ -305,8 +326,9 @@ impl Component for SdCardComponent {
         // drive it again.
         {
             let wire = Arc::clone(&self.wire);
-            io.on_sense("DI", move |state| {
-                if let Some(level) = level_of(state) {
+            let rx_di = DigitalReceiver::new(io.pin("DI")?);
+            io.on_sense("DI", move |sense| {
+                if let Some(level) = rx_di.read(&sense) {
                     wire.lock().expect("wire mutex").mosi = level == Level::High;
                 }
             })?;
@@ -320,8 +342,9 @@ impl Component for SdCardComponent {
                 Arc::clone(&self.counters),
                 data_out.clone(),
             );
-            io.on_sense("CLK", move |state| {
-                let Some(level) = level_of(state) else {
+            let rx_clk = DigitalReceiver::new(io.pin("CLK")?);
+            io.on_sense("CLK", move |sense| {
+                let Some(level) = rx_clk.read(&sense) else {
                     return;
                 };
                 let high = level == Level::High;

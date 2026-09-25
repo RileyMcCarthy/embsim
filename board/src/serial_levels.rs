@@ -1,9 +1,10 @@
 //! The serial byte↔level bridge: a UART that actually puts its bits on a net.
 //!
-//! A byte becomes ten timed edges on a plain [`crate::PinKind::DigitalOut`],
-//! and the peer reads it back off a plain [`crate::PinKind::DigitalIn`].
+//! A byte becomes ten timed edges on a plain push-pull output
+//! ([`crate::PinDecl::digital_out`]), and the peer reads it back off a plain
+//! digital input ([`crate::PinDecl::digital_in`]).
 //!
-//! There used to be a byte *route* instead: a `StreamRole::Producer` pin
+//! There used to be a byte *route* instead: a stream `Producer` pin
 //! handed whole bytes to reachable consumers. The net decided who was
 //! connected, but the payload never became a level — so it could not
 //! experience contention, could not be corrupted by a fighting driver, and
@@ -48,13 +49,13 @@
 //! this firmware uses.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use embsim_core::virtual_clock;
 
-use crate::component::{ComponentNetIo, PinHandle};
-use crate::net::{digital_drive, level_of, Level, NetState};
+use crate::component::{ComponentNetIo, PinHandle, Sense};
+use crate::net::{Level, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE, LOGIC_HIGH_VOLTS};
 use crate::uart::{FramingError, UartDecoder, UartEncoder, UartFraming};
 
 /// How many bytes may queue for transmission before the newest are shed.
@@ -86,6 +87,16 @@ impl TxState {
     }
 }
 
+/// The ports a line drives its levels through, when its owner names them
+/// ([`SerialLevelBridge::with_ports`]).
+struct Ports(Box<dyn Fn(Level) -> Option<TheveninDrive> + Send + Sync>);
+
+impl std::fmt::Debug for Ports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Ports")
+    }
+}
+
 /// One serial channel carried as levels rather than as bytes.
 ///
 /// The owner supplies the time: call [`Self::receive_sense`] from the RX pin's
@@ -114,6 +125,14 @@ pub struct SerialLevelBridge {
     armed_ns: Mutex<Option<u64>>,
     /// Whether the output driver is powered. Cleared, the pin goes high-Z.
     output_enabled: AtomicBool,
+    /// The voltage the TX pin drives a high at, as an `f64`'s bits: the
+    /// crate's logic rail until the owner names its own supply
+    /// ([`Self::set_high_volts`]).
+    high_volts: AtomicU64,
+    /// The owner's own ports for the two levels, read at every bit
+    /// ([`Self::with_ports`]); `None` drives at `high_volts` and 0 V behind
+    /// the push-pull default.
+    ports: Option<Ports>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -138,8 +157,23 @@ impl SerialLevelBridge {
             io,
             armed_ns: Mutex::new(None),
             output_enabled: AtomicBool::new(true),
+            high_volts: AtomicU64::new(LOGIC_HIGH_VOLTS.to_bits()),
+            ports: None,
             shutdown,
         }
+    }
+
+    /// Drive each level through the owner's own port, read at every bit:
+    /// `ports(level)` is the Thevenin the TX pin presents for it, `None` a
+    /// line whose driver has no supply (the pin is released). What a pad
+    /// whose strength and rail its package decides uses — the native P2
+    /// core's pads, at their bank's supply (`embsim-boards`' P2 package).
+    pub fn with_ports(
+        mut self,
+        ports: impl Fn(Level) -> Option<TheveninDrive> + Send + Sync + 'static,
+    ) -> Self {
+        self.ports = Some(Ports(Box::new(ports)));
+        self
     }
 
     /// The framing this bridge encodes and decodes with.
@@ -162,6 +196,41 @@ impl SerialLevelBridge {
         self.io.schedule_at_ns(at_ns);
     }
 
+    /// Drive a high at `volts` from now on: a part whose output high is its
+    /// own supply (the ADS122U04's `V_OH` is a fraction of `DVDD`) names it
+    /// here, and the line re-drives at it. The low stays 0 V; the
+    /// impedance is the push-pull default either way.
+    pub fn set_high_volts(&self, volts: Volts) {
+        if self.high_volts.swap(volts.to_bits(), Ordering::Relaxed) != volts.to_bits() {
+            self.idle_if_quiet();
+        }
+    }
+
+    /// The drive for `level`: the owner's port for it, or the level at the
+    /// bridge's high voltage behind the push-pull default.
+    fn drive_of(&self, level: Level) -> Option<TheveninDrive> {
+        if let Some(Ports(ports)) = &self.ports {
+            return ports(level);
+        }
+        Some(TheveninDrive {
+            volts: match level {
+                Level::High => f64::from_bits(self.high_volts.load(Ordering::Relaxed)),
+                Level::Low => 0.0,
+            },
+            impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
+        })
+    }
+
+    /// Re-drive the idle level when no frame is on the line, so a new high
+    /// voltage reaches the net; a frame in flight picks it up at its next
+    /// bit.
+    fn idle_if_quiet(&self) {
+        let quiet = self.tx.lock().expect("tx state never poisoned").is_idle();
+        if quiet {
+            self.idle();
+        }
+    }
+
     /// Hold the line at its idle level.
     ///
     /// Call once the owner is ready to be seen: an asynchronous line that has
@@ -171,7 +240,7 @@ impl SerialLevelBridge {
     pub fn idle(&self) {
         if self.output_enabled.load(Ordering::Relaxed) {
             self.tx_pin
-                .set_drive(Some(digital_drive(self.encoder.idle_level())));
+                .set_drive(self.drive_of(self.encoder.idle_level()));
         } else {
             self.tx_pin.set_drive(None);
         }
@@ -235,17 +304,25 @@ impl SerialLevelBridge {
         TX_QUEUE_MAX.saturating_sub(tx.pending.len())
     }
 
-    /// Feed one observed net state to the receiver and arm the frame deadline.
+    /// Feed one sense of the RX pin `rx_pin` to the receiver, at the
+    /// instant it was delivered, and arm the frame deadline.
     ///
-    /// A state with no logic level ([`NetState::Floating`] /
-    /// [`NetState::Contention`]) is deliberately *not* forced to a bit: the
-    /// decoder holds its last level, the frame in flight still completes on
-    /// its deadline, and it fails its stop-bit check if the line never
-    /// recovered. That is what the far end of a contended wire really sees.
-    pub fn receive_sense(&self, state: NetState) -> Vec<Result<u8, FramingError>> {
-        let now = virtual_clock::virtual_ns();
+    /// The receiver projects the sense itself, through the RX pin's declared
+    /// thresholds and its policy for their dead band, the decoder's held
+    /// level as its last ([`PinHandle::level`]). A sense with no level — a
+    /// floating line, a voltage the receiver's datasheet guarantees neither
+    /// level at — is deliberately *not* forced to a bit: the decoder holds
+    /// its last level, the frame in flight still completes on its deadline,
+    /// and it fails its stop-bit check if the line never recovered. That is
+    /// what the far end of a contended wire really sees.
+    pub fn receive_sense(
+        &self,
+        rx_pin: &PinHandle,
+        sense: &Sense,
+    ) -> Vec<Result<u8, FramingError>> {
+        let now = sense.at_ns;
         let mut rx = self.rx.lock().expect("rx state never poisoned");
-        if let Some(level) = level_of(state) {
+        if let Some(level) = rx_pin.level(sense, Some(rx.level())) {
             rx.on_level(level, now);
         }
         let out = drain(&mut rx, now);
@@ -341,7 +418,7 @@ impl SerialLevelBridge {
         let next = due + self.framing.bit_period_ns;
         tx.next_edge_ns = Some(next);
         drop(tx);
-        self.tx_pin.set_drive(Some(digital_drive(level)));
+        self.tx_pin.set_drive(self.drive_of(level));
         Some(next)
     }
 }

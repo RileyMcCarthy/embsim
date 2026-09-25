@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, IdleDrive, JumperState, Level,
-    NetState, PartClass, PinDecl, PinKind, PinRef, RailDownReason, Scenario, SenseKind, System,
-    SystemHandle,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, Finding,
+    JumperState, Level, NetState, PartClass, PinDecl, PinRef, RailDownReason, Scenario, SenseKind,
+    System, SystemHandle,
 };
 use embsim_core::virtual_clock;
 use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731_pins};
@@ -475,10 +475,12 @@ fn every_isolator_channel_is_a_plain_level_repeater() {
     };
 
     for (input, output) in [("12", "5"), ("3", "14"), ("4", "13")] {
-        assert_eq!(pin(input).kind, PinKind::DigitalIn, "{input} senses");
-        assert_eq!(pin(output).kind, PinKind::DigitalOut, "{output} drives");
-        assert_eq!(pin(input).stream, None, "{input} carries no byte route");
-        assert_eq!(pin(output).stream, None, "{output} carries no byte route");
+        assert_eq!(
+            pin(input).senses_at_build(),
+            Some(embsim_board::SenseKind::Digital),
+            "{input} senses"
+        );
+        assert!(pin(output).drives(), "{output} drives");
     }
     assert_eq!(pins.len(), 16);
 }
@@ -543,7 +545,7 @@ impl Component for SettleProbe {
         let capture = Arc::clone(&self.capture);
         let done = Arc::clone(&self.done);
         io.on_wake(move |_now_us| {
-            *capture.lock().unwrap() = Some(y.sense());
+            *capture.lock().unwrap() = Some(y.net_report());
             done.store(true, Ordering::SeqCst);
         });
         io.schedule_at(virtual_clock::virtual_us() + SETTLE_WAKE_US);
@@ -552,14 +554,7 @@ impl Component for SettleProbe {
 }
 
 fn probe_pin() -> PinDecl {
-    PinDecl {
-        number: "Y",
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_in("Y", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
 }
 
 /// Start the servo-domain board with an engine-hosted settle probe on the

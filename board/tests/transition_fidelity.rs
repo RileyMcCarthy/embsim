@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level,
-    PinDecl, PinHandle, PinKind, System,
+    digital_drive, jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand,
+    DigitalReceiver, Harness, Level, PinDecl, PinHandle, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -165,8 +165,11 @@ impl Component for Consumer {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let counts = Arc::clone(&self.counts);
         let last: Mutex<Option<Level>> = Mutex::new(None);
-        io.on_sense("IN", move |state| {
-            let Some(level) = level_of(state) else { return };
+        let receiver = DigitalReceiver::new(io.pin("IN")?);
+        io.on_sense("IN", move |sense| {
+            let Some(level) = receiver.read(&sense) else {
+                return;
+            };
             let mut last = last.lock().unwrap();
             if *last != Some(level) {
                 *last = Some(level);
@@ -174,17 +177,6 @@ impl Component for Consumer {
             }
         })?;
         Ok(())
-    }
-}
-
-fn decl(number: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -197,7 +189,7 @@ fn run(placement: Placement) -> (u64, u64) {
         .component(
             "P",
             Box::new(Producer {
-                pins: [decl("OUT", PinKind::DigitalOut)],
+                pins: [PinDecl::digital_out("OUT")],
                 counts: Arc::clone(&counts),
                 pin: Arc::new(Mutex::new(None)),
                 placement,
@@ -206,7 +198,10 @@ fn run(placement: Placement) -> (u64, u64) {
         .component(
             "C",
             Box::new(Consumer {
-                pins: [decl("IN", PinKind::DigitalIn)],
+                pins: [PinDecl::digital_in(
+                    "IN",
+                    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+                )],
                 counts: Arc::clone(&counts),
             }),
         )
@@ -308,8 +303,11 @@ impl Component for StampingConsumer {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let stamps = Arc::clone(&self.stamps);
         let last: Mutex<Option<Level>> = Mutex::new(None);
-        io.on_sense("IN", move |state| {
-            let Some(level) = level_of(state) else { return };
+        let receiver = DigitalReceiver::new(io.pin("IN")?);
+        io.on_sense("IN", move |sense| {
+            let Some(level) = receiver.read(&sense) else {
+                return;
+            };
             let mut last = last.lock().unwrap();
             if *last != Some(level) {
                 *last = Some(level);
@@ -394,7 +392,7 @@ fn stamped_run(n: u64, apart_ns: u64) -> (usize, usize) {
         .component(
             "P",
             Box::new(SpacedProducer {
-                pins: [decl("OUT", PinKind::DigitalOut)],
+                pins: [PinDecl::digital_out("OUT")],
                 pin: Arc::new(Mutex::new(None)),
                 stamps: Arc::clone(&stamps),
                 n,
@@ -404,7 +402,10 @@ fn stamped_run(n: u64, apart_ns: u64) -> (usize, usize) {
         .component(
             "C",
             Box::new(StampingConsumer {
-                pins: [decl("IN", PinKind::DigitalIn)],
+                pins: [PinDecl::digital_in(
+                    "IN",
+                    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+                )],
                 stamps: Arc::clone(&stamps),
             }),
         )

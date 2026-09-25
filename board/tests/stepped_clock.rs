@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EventLog, Finding, Harness, IdleDrive, PinDecl,
-    PinHandle, PinKind, System, TheveninDrive,
+    AttachError, Component, ComponentNetIo, EventLog, Finding, Harness, PinDecl, PinHandle, System,
+    TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -68,14 +68,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 const fn analog_pin(name: &'static str) -> PinDecl {
-    PinDecl {
-        number: name,
-        name: None,
-        kind: PinKind::Analog,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::analog(name)
 }
 
 type PinSlot = Arc<Mutex<Option<PinHandle>>>;
@@ -178,7 +171,7 @@ fn a_registered_actor_drives_at_exactly_the_instants_it_parked_for() {
             .component(
                 "T",
                 Box::new(Terminal {
-                    pins: [analog_pin("P")],
+                    pins: [PinDecl::analog_source("P")],
                     handle: Arc::clone(&slot),
                 }),
             )

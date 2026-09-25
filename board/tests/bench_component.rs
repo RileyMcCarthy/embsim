@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::UartFraming;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Harness, IdleDrive, NetState, PartRegistry,
-    PinDecl, PinHandle, PinKind, System, SystemError, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, Harness, NetState, PartRegistry, PinDecl,
+    PinHandle, System, SystemError, TheveninDrive,
 };
 use embsim_core::virtual_clock;
 
@@ -83,20 +83,13 @@ impl Component for AnalogProbe {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let slot = Arc::clone(&self.state);
-        io.on_sense("A", move |state| *slot.lock().unwrap() = Some(state))?;
+        io.on_net_report("A", move |state| *slot.lock().unwrap() = Some(state))?;
         Ok(())
     }
 }
 
 const fn analog_pin(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::Analog,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::analog(number)
 }
 
 // ============================================================
@@ -185,7 +178,7 @@ fn live_analog_drive_is_sensed_across_the_harness() {
         .component(
             "CELL",
             Box::new(AnalogSource {
-                pins: [analog_pin("S+")],
+                pins: [PinDecl::analog_source("S+")],
                 handle: Arc::clone(&handle),
             }),
         )

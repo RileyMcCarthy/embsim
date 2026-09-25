@@ -12,15 +12,20 @@ sensed, `XI` a rate sink, `XO` released), hands the core its pads, and
 delivers the package-level facts — the crystal, which is whatever rate the
 board puts on `XI`; the `RESN`/`VDD` state; and the sixteen bank supplies,
 which are what a pad drives high at. The package's **START gate** holds
-the core until `RESN` reads released and `VDD` a voltage inside the
-datasheet's 1.7–1.9 V window; the instant it opens is where the guest's
-clock begins. A board fills its processor slot with
+the core — its start and every wake it asks for — until the datasheet's
+3 ms restart delay has run out after `RESN` read released with `VDD` inside
+its 1.7–1.9 V window; that instant is where the guest's clock begins. A
+`VDD` that leaves its window while the guest runs, with `RESN` not asserted,
+holds the guest for good (`P2Core::reset`: no further slice, the pads as
+they were) and the package reports the brownout. A board fills its processor
+slot with
 `P2Package::new(P2Qemu::with_boot_rom(…)?)`.
 
 `tests/rom_boot_ec32mb.rs` is the whole claim in one test: the ROM, on the
 P2-EC32MB board from its vendor netlist powered from its carrier's `J203`
-fingers — its own bucks, LDOs and brownout detector raising the rails, the
-core started by the package at the instant they allow it, 2.5 ms in —
+fingers — its own bucks, LDOs and brownout detector raising the rails and
+releasing the reset 2.5 ms in, the core started by the package the
+datasheet's 3 ms later, at 5.5 ms —
 bit-bangs the module's SPI flash (`embsim_models`' generic part) over four
 shared nets, loads stage-1, which loads and runs a program — and every one
 of the ~16 600 clock edges lands on the net at the guest's own instant, two
@@ -110,9 +115,10 @@ flash edge at fourteen seconds.
 
 - `DIRx`/`OUTx` are per-cog registers and the pad sees the OR across all
   eight. A pad the guest drives is a Thevenin source at the strength its
-  `WRPIN` word configured (`embsim_boards::p2::pad_drive`: fast, 1.5 k /
-  15 k / 150 kΩ, float; the current-source modes are not mapped and present
-  nothing), and a `WRPIN` on a driven pad republishes it at its new
+  `WRPIN` word configured (`embsim_boards::p2::pad_drive`: fast at
+  `P2_FAST_OHMS`, 17.99 Ω fitted to the datasheet's `Voh`/`Vol` table,
+  1.5 k / 15 k / 150 kΩ, float; the current-source modes are not mapped and
+  present nothing), and a `WRPIN` on a driven pad republishes it at its new
   strength. A bank reads the guest's own `OUT` bit where the pad's published
   drive is fast, and the **net** everywhere else — released pads and pads
   pulling through a resistive mode alike. That is why the ROM can use P61 as
@@ -203,7 +209,17 @@ rm -rf "$W"
 Recorded runs: 2026-09-23 (the node's first boot), 2026-09-24 (the phase-2
 review pass), and 2026-09-24 again with the module powered from its `J203`
 fingers and the core started by the package's START gate at 2.5 ms (phase
-4) — `compared 60000, identical` each time.
+4), 2026-09-25 with every pad read through the package's own projection
+(the interface phase's sense task, `NODES.md` §12 item 5), 2026-09-25 again
+with the fights reported beside an analog reader's operating point, the
+single-source rule and the stamped input ports and clamps (its rules task),
+and 2026-09-25 once more with the core started 3 ms after the reset releases
+(5.5 ms), the fast pads at 17.99 Ω and the pulse schedule in nanoseconds
+(its P2 task; the p2core reference reused, p2core not having moved), and
+2026-09-25 after that phase's review (a clock's phases combined on their
+voltages, a supply's move re-delivering its pads, the resolver's scratch
+buffers; the reference reused again) — `compared 60000, identical` each
+time.
 
 ## Facts of the board the boot test states as scenario
 

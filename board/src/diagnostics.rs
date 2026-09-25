@@ -27,8 +27,6 @@ pub enum CallbackKind {
     Sense,
     /// A timer-wheel wakeup delivery.
     Wake,
-    /// A pulse-train (rate-change) delivery.
-    Pulse,
     /// A topology-epoch notification.
     Topology,
 }
@@ -114,21 +112,22 @@ pub enum Finding {
         /// The injecting pin.
         pin: PinRef,
     },
-    /// A pulse train reached a coupling capacitor whose reactance at the
-    /// train's rate is not small against the far node's resistance
+    /// A periodic drive's rate reached a coupling capacitor whose reactance
+    /// at that rate is not small against the far node's resistance
     /// (`1/(2π·f·C) > R_far /` [`crate::net::COUPLING_REACTANCE_RATIO`]), so
-    /// the rate does not cross: the train stops at the capacitor and the
-    /// sink beyond it is not delivered. Live only — the rate is known at
-    /// delivery, not at build. Reported once per distinct occurrence like
-    /// every live finding (the bus dedups on equality): a train re-published
-    /// segment after segment at one rate raises it once, and a rate that
-    /// changes is a new verdict with its own reactance.
-    PulseNotCoupled {
+    /// the rate does not cross: it stops at the capacitor and the node
+    /// beyond it keeps the state its own sources give it. Raised by the pass
+    /// that resolves the far node while the rate is on the source's pin, at
+    /// build or live. Reported once per distinct occurrence like every
+    /// finding (the bus dedups on equality): a segment re-published at one
+    /// rate raises it once, and a rate that changes is a new verdict with
+    /// its own reactance.
+    PeriodicNotCoupled {
         /// The net on the far side of the capacitor.
         net: String,
         /// The capacitor's reference designator.
         capacitor: String,
-        /// The train's rate.
+        /// The rate.
         hz: u32,
         /// The capacitor's reactance at that rate.
         reactance_ohms: Ohms,
@@ -161,15 +160,6 @@ pub enum Finding {
     PowerNetUnsourced {
         /// Net name.
         net: String,
-    },
-    /// Two [`crate::StreamRole::PulseSource`] pins facing each other: two
-    /// step clocks on one line. The underlying net resolves `Contention` on
-    /// its own; this names the pins.
-    StreamMismatch {
-        /// Name of the net carrying the invalid route.
-        net: String,
-        /// The source pins facing each other.
-        producers: Vec<PinRef>,
     },
     /// A netlist component could not be classified (no auto tier match, no
     /// registry entry, pin-count violation, …).
@@ -252,7 +242,7 @@ pub enum Finding {
         reason: RailDownReason,
     },
     /// A pin whose net a source reaches while the net of its declared
-    /// reference pin ([`crate::PinReference`]) reaches none: the domain is
+    /// reference pin ([`crate::PinDecl::reference`]) reaches none: the domain is
     /// live and its voltages are measured against nothing. An isolator
     /// whose secondary ground is unwired, an isolated supply whose
     /// return nothing ties down.
@@ -274,6 +264,25 @@ pub enum Finding {
         pin: String,
         /// Its reference pin.
         reference: String,
+    },
+    /// An open-drain pin — a signal pin that sinks and cannot source
+    /// ([`crate::PinDecl::can_source`]) — on a net no pull-up reaches: no
+    /// resistive path, a declared terminal ending it, leads from the net
+    /// to a rail, a supply above 0 V, a pin that sources, or an input port
+    /// biased above 0 V. Released, the pin leaves its net floating: a
+    /// supervisor's reset, a regulator's power-good or an opto's collector
+    /// that nothing pulls up reads no level at all. An open drain whose
+    /// path reaches no other part's pin — a no-connect, or a net that
+    /// leaves the board only through a connector — raises nothing: nothing
+    /// on the board reads it, and its pull-up is the far side's. Raised by
+    /// the build (`NODES.md` §10).
+    OpenDrainWithoutPullUp {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The open-drain pin.
+        pin: String,
+        /// Its net.
+        net: String,
     },
     /// A mechanical node's pad — a mounting hole, a fiducial, a layout node
     /// — shares a net with a pin that drives it: a driver is loaded by a

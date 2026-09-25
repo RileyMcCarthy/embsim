@@ -15,7 +15,8 @@
 //! * a `PowerOut` pin's declared idle drive is what its rail holds before
 //!   the part publishes — released (floating, its loads unsourced), a
 //!   voltage (exact on the rail, a pull through the resistor to it), or the
-//!   kind's default, the unmodelled rail a facade still declares;
+//!   `PinDecl::power_out`'s default, the unmodelled rail a facade still
+//!   declares;
 //! * a part that drives its `PowerOut` pin live re-resolves the nets that
 //!   read the rail through a resistor **and** through a diode — the
 //!   fan-out the phase-3 element clusters' foreign constants were missing;
@@ -36,9 +37,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    AttachError, Board, BoardError, Component, ComponentNetIo, EndpointRef, Finding, Harness,
-    IdleDrive, JumperState, Level, NetState, PartRegistry, PinDecl, PinHandle, PwlSpec, Scenario,
-    SenseKind, System, SystemError, TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, BoardError, Component, ComponentNetIo,
+    DeadBand, EndpointRef, Finding, Harness, JumperState, Level, NetState, PartRegistry, PinDecl,
+    PinHandle, PwlSpec, Scenario, SenseKind, System, SystemError, TheveninDrive,
 };
 use embsim_boards::ec32mb::{FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE};
 use embsim_core::virtual_clock::{self, ClockMode};
@@ -104,10 +105,23 @@ struct Rail {
     handle: Arc<Mutex<Option<PinHandle>>>,
 }
 
+/// What a rail's declaration says it idles at: a declared idle drive
+/// (`None` released), or what [`PinDecl::power_out`] declares when the
+/// declaration names none.
+#[derive(Debug, Clone, Copy)]
+enum Idle {
+    Declared(Option<TheveninDrive>),
+    ConstructorDefault,
+}
+
 impl Rail {
-    fn new(idle: IdleDrive, script: Vec<(u64, Option<TheveninDrive>)>) -> Self {
+    fn new(idle: Idle, script: Vec<(u64, Option<TheveninDrive>)>) -> Self {
+        let pin = PinDecl::power_out("OUT");
         Self {
-            pins: [PinDecl::power_out("OUT").with_idle(idle)],
+            pins: [match idle {
+                Idle::Declared(drive) => pin.with_idle(drive),
+                Idle::ConstructorDefault => pin,
+            }],
             script,
             handle: Arc::new(Mutex::new(None)),
         }
@@ -163,7 +177,7 @@ impl Component for Sensor {
     }
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let seen = Arc::clone(&self.seen);
-        io.on_sense("1", move |state| seen.lock().unwrap().push(state))
+        io.on_net_report("1", move |state| seen.lock().unwrap().push(state))
     }
 }
 
@@ -225,7 +239,10 @@ fn rail_board(rail: Rail) -> (Board, Seen, Seen, Arc<Mutex<Option<PinHandle>>>) 
         let (load, led) = (Arc::clone(&load), Arc::clone(&led));
         registry.register("SENSOR", move |decl| {
             Box::new(Sensor {
-                pins: [PinDecl::digital_in("1")],
+                pins: [PinDecl::digital_in(
+                    "1",
+                    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+                )],
                 seen: if decl.reference == "U2" {
                     Arc::clone(&load)
                 } else {
@@ -250,17 +267,17 @@ fn grounded() -> Scenario {
 /// What a `PowerOut` pin's declared idle drive makes of its rail before
 /// the part publishes anything.
 #[rstest]
-#[case::released(IdleDrive::Released)]
-#[case::three_volts_three(IdleDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 0.1 }))]
-#[case::kind_default(IdleDrive::KindDefault)]
+#[case::released(Idle::Declared(None))]
+#[case::three_volts_three(Idle::Declared(Some(TheveninDrive { volts: 3.3, impedance: 0.1 })))]
+#[case::kind_default(Idle::ConstructorDefault)]
 fn a_power_out_pins_idle_drive_is_what_its_rail_holds_before_the_part_publishes(
-    #[case] idle: IdleDrive,
+    #[case] idle: Idle,
 ) {
     behaviour!(Test {
         id: "terminal.power-out-idle-drive",
         covers: Some("board/src/system.rs#add_pin_descriptor"),
-        given: "a power-out pin declaring an idle drive — released, 3.3 volts, or the kind's \
-                default — feeding one sensed node through 10 kilohms and another through a \
+        given: "a power-out pin declaring an idle drive — released, 3.3 volts, or the \
+                constructor's default — feeding one sensed node through 10 kilohms and another through a \
                 diode to a declared ground",
     });
     expect!(
@@ -293,7 +310,7 @@ fn a_power_out_pins_idle_drive_is_what_its_rail_holds_before_the_part_publishes(
     let state = |name: &str| built.nets()[built.net_id(name).unwrap().0].state;
     let findings = built.diagnostics().findings();
     match idle {
-        IdleDrive::Released => {
+        Idle::Declared(None) => {
             assert_eq!(state("B.RAIL"), NetState::Floating);
             assert_eq!(state("B.LOAD"), NetState::Floating);
             assert!(
@@ -309,7 +326,7 @@ fn a_power_out_pins_idle_drive_is_what_its_rail_holds_before_the_part_publishes(
                 state("B.LED")
             );
         }
-        IdleDrive::Thevenin(drive) => {
+        Idle::Declared(Some(drive)) => {
             assert_eq!(state("B.RAIL"), NetState::Analog(drive.volts));
             assert_eq!(state("B.LOAD"), NetState::Pulled(Level::High, 10_000.0));
             let led = volts(Some(state("B.LED")));
@@ -321,7 +338,7 @@ fn a_power_out_pins_idle_drive_is_what_its_rail_holds_before_the_part_publishes(
                 "{findings:?}"
             );
         }
-        IdleDrive::KindDefault => {
+        Idle::ConstructorDefault => {
             assert_eq!(state("B.RAIL"), NetState::Pulled(Level::High, 0.0));
             assert_eq!(state("B.LOAD"), NetState::Pulled(Level::High, 10_000.0));
             assert!(
@@ -376,7 +393,7 @@ fn a_rail_that_publishes_live_re_resolves_every_cluster_that_reads_it() {
         impedance: 0.1,
     };
     let (board, load, led, _) = rail_board(Rail::new(
-        IdleDrive::Released,
+        Idle::Declared(None),
         vec![(1_000_000, Some(high)), (2_000_000, None)],
     ));
     let live = System::new()
@@ -417,9 +434,9 @@ fn a_rail_that_publishes_live_re_resolves_every_cluster_that_reads_it() {
 /// A released rail and a bench strap on its net: the strap sources it and
 /// nothing fights.
 #[rstest]
-#[case::released(IdleDrive::Released)]
-#[case::unmodelled(IdleDrive::KindDefault)]
-fn a_released_rail_accepts_a_bench_strap_without_a_fight(#[case] idle: IdleDrive) {
+#[case::released(Idle::Declared(None))]
+#[case::unmodelled(Idle::ConstructorDefault)]
+fn a_released_rail_accepts_a_bench_strap_without_a_fight(#[case] idle: Idle) {
     behaviour!(Test {
         id: "terminal.released-rail-takes-a-strap",
         covers: Some("board/src/engine.rs#decide_terminal"),
@@ -484,10 +501,10 @@ fn two_sources_that_disagree_on_a_terminal_fight_once() {
          cluster solves as every element cluster does; the resistor-fed node projects"
     );
     let (board, _, _, _) = rail_board(Rail::new(
-        IdleDrive::Thevenin(TheveninDrive {
+        Idle::Declared(Some(TheveninDrive {
             volts: 3.3,
             impedance: 0.1,
-        }),
+        })),
         Vec::new(),
     ));
     let built = System::new()
@@ -550,7 +567,10 @@ fn a_current_instrument_is_refused_on_a_power_out_pin() {
     });
     registry.register("SENSOR", |_| {
         Box::new(Sensor {
-            pins: [PinDecl::digital_in("1")],
+            pins: [PinDecl::digital_in(
+                "1",
+                jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+            )],
             seen: Arc::default(),
         })
     });

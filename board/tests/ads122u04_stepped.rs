@@ -91,6 +91,10 @@ fn rdata_round_trip_completes_under_a_stepped_clock() {
         .expect("endpoints parse")
         .connect_str("ADC.TX", "HOST.RX")
         .expect("endpoints parse")
+        // The two grounds every other pin is measured against: not
+        // implicit (`DESIGN.md` rule 6).
+        .power(ep("BENCH.DGND"), ep("ADC.DGND"), 0.0)
+        .power(ep("BENCH.AVSS"), ep("ADC.AVSS"), 0.0)
         // Supplies and the reset strap: both rails up and ~RESET high is the
         // chip's power-on envelope (SBAS752B).
         .power(ep("BENCH.3V3"), ep("ADC.AVDD"), 3.3)

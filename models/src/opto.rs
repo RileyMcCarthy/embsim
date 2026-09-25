@@ -76,8 +76,8 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    Amps, AttachError, Branch, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms,
-    PinDecl, PinHandle, PinKind, PwlCurve, TheveninDrive, Volts,
+    Amps, AttachError, Branch, Component, ComponentNetIo, DeadBand, Level, Ohms, PinDecl,
+    PinHandle, PwlCurve, Sense, TheveninDrive, Thresholds, Volts,
 };
 
 use crate::isolation::{require_positive, supply_up, PartConfigError};
@@ -211,35 +211,43 @@ pub struct Config {
     pub supply_min_volts: Volts,
     /// Output sink impedance, ohms.
     pub output_impedance_ohms: Ohms,
-    /// The enable pin's guaranteed high level, volts: an enable voltage at
-    /// or above it lets the outputs follow the LEDs; below it — the low
-    /// level and the band above it alike — holds them released.
-    pub enable_high_min_volts: Volts,
 }
 
-const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: Some(name),
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
-}
+/// 6N137: the enable input's thresholds, **absolute** against `GND`:
+/// `V_EL` 0.8 V max and `V_EH` 2.0 V min (Lite-On 6N137,
+/// "Electrical–Optical Characteristics", Output —
+/// [`LITE_ON_6N137_ENABLE_LOW_MAX_VOLTS`],
+/// [`LITE_ON_6N137_ENABLE_HIGH_MIN_VOLTS`]); the sheet names no
+/// hysteresis, so between the two it guarantees neither level
+/// ([`DeadBand::Unknown`]).
+pub const LITE_ON_6N137_ENABLE_THRESHOLDS: Thresholds = Thresholds::new(
+    LITE_ON_6N137_ENABLE_LOW_MAX_VOLTS,
+    LITE_ON_6N137_ENABLE_HIGH_MIN_VOLTS,
+    0.0,
+    DeadBand::Unknown,
+);
 
 /// An LED terminal: a passive terminal of the branch the part declares.
 const fn led(number: &'static str, name: &'static str) -> PinDecl {
-    pin(number, name, PinKind::Passive)
+    PinDecl::passive(number).with_name(name)
 }
 
-/// An open-collector output: the one kind that can source a net, released
-/// at attach because a sink that is not sinking drives nothing.
+/// The detector's ground.
+const fn ground(number: &'static str) -> PinDecl {
+    PinDecl::power_in(number).with_name("GND")
+}
+
+/// The detector's supply, measured against its ground pin.
+const fn supply(number: &'static str, ground: &'static str) -> PinDecl {
+    PinDecl::power_in(number)
+        .with_name("VCC")
+        .with_reference(ground)
+}
+
+/// An open-collector output: it sinks and cannot source, and rests
+/// released — a sink that is not sinking drives nothing.
 const fn open_collector(number: &'static str, name: &'static str) -> PinDecl {
-    PinDecl {
-        idle: IdleDrive::Released,
-        ..pin(number, name, PinKind::DigitalOut)
-    }
+    PinDecl::digital_out(number).with_name(name).sink_only()
 }
 
 impl Config {
@@ -255,10 +263,10 @@ impl Config {
                 led("2", "C1"),
                 led("3", "C2"),
                 led("4", "A2"),
-                pin("5", "GND", PinKind::PowerIn),
+                ground("5"),
                 open_collector("6", "VO2"),
                 open_collector("7", "VO1"),
-                pin("8", "VCC", PinKind::PowerIn),
+                supply("8", "5"),
             ],
             channels: vec![
                 ChannelPins {
@@ -279,7 +287,6 @@ impl Config {
             threshold_amps: VO2631_THRESHOLD_AMPS,
             supply_min_volts: VO2631_SUPPLY_MIN_VOLTS,
             output_impedance_ohms: VO2631_OUTPUT_IMPEDANCE_OHMS,
-            enable_high_min_volts: 0.0,
         }
     }
 
@@ -292,13 +299,15 @@ impl Config {
         Self {
             part: "6N137",
             pins: vec![
-                pin("1", "NC", PinKind::Passive),
+                PinDecl::passive("1").with_name("NC"),
                 led("2", "A"),
                 led("3", "C"),
-                pin("5", "GND", PinKind::PowerIn),
+                ground("5"),
                 open_collector("6", "VO"),
-                pin("7", "EN", PinKind::DigitalIn),
-                pin("8", "VCC", PinKind::PowerIn),
+                PinDecl::digital_in("7", LITE_ON_6N137_ENABLE_THRESHOLDS)
+                    .with_name("EN")
+                    .with_reference("5"),
+                supply("8", "5"),
             ],
             channels: vec![ChannelPins {
                 anode: "2",
@@ -312,7 +321,6 @@ impl Config {
             threshold_amps: LITE_ON_6N137_THRESHOLD_AMPS,
             supply_min_volts: LITE_ON_6N137_SUPPLY_MIN_VOLTS,
             output_impedance_ohms: LITE_ON_6N137_OUTPUT_IMPEDANCE_OHMS,
-            enable_high_min_volts: LITE_ON_6N137_ENABLE_HIGH_MIN_VOLTS,
         }
     }
 
@@ -353,10 +361,12 @@ impl Config {
 
 #[derive(Debug)]
 struct OptoState {
-    /// Detector-side supply.
-    vcc: NetState,
-    /// The enable pin's net, for a part with one.
-    enable: Option<NetState>,
+    /// Detector-side supply, as last handed (against the part's ground).
+    vcc: Sense,
+    /// The enable pin's sense, for a part with one, once handed.
+    enable: Option<Sense>,
+    /// The level the enable last read — its receiver's last level.
+    enable_level: Option<Level>,
     /// Per channel: the LED's branch current as last delivered.
     led: Vec<Option<Amps>>,
     /// Per channel: the output pin.
@@ -376,20 +386,37 @@ struct Core {
 
 impl Core {
     fn powered(&self, state: &OptoState) -> bool {
-        supply_up(state.vcc, self.config.supply_min_volts)
+        supply_up(&state.vcc, self.config.supply_min_volts)
     }
 
     /// Whether the enable lets the outputs follow the LEDs: a part with
-    /// no enable always does; an enable that reads low, or a voltage under
-    /// the guaranteed high level `V_EH`, holds them released; a high level
-    /// or an open one follows (the 6N137 truth table's `NC` row).
+    /// no enable always does; an enable handed no voltage follows — open
+    /// is the 6N137 truth table's `NC` row, and a clock names no voltage
+    /// either (the wildcard audit's no-level answer, `NODES.md` §12 item
+    /// 5); an enable handed a voltage follows only when it reads high
+    /// through `V_EL`/`V_EH`, so a low one, or one in the band between that
+    /// the sheet guarantees neither level in, holds them released.
     fn enabled(&self, state: &OptoState) -> bool {
         match state.enable {
             None => true,
-            Some(NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _)) => false,
-            Some(NetState::Analog(volts)) => volts >= self.config.enable_high_min_volts,
-            Some(_) => true,
+            Some(Sense { volts: None, .. }) => true,
+            Some(Sense { volts: Some(_), .. }) => state.enable_level == Some(Level::High),
         }
+    }
+
+    /// The enable was handed `sensed`: project it through the enable
+    /// pin's declared thresholds (the 6N137's `V_EL`/`V_EH`), chosen by the
+    /// level it last read.
+    fn set_enable(&self, state: &mut OptoState, sensed: Sense) {
+        let thresholds = self.config.enable.and_then(|enable| {
+            self.config
+                .pins
+                .iter()
+                .find(|pin| pin.answers_to(enable))
+                .and_then(|pin| pin.thresholds)
+        });
+        state.enable_level = thresholds.and_then(|t| sensed.level(&t, state.enable_level));
+        state.enable = Some(sensed);
     }
 
     fn lit(&self, state: &OptoState, index: usize) -> bool {
@@ -531,8 +558,13 @@ impl Opto {
             core: Arc::new(Core {
                 config,
                 state: Mutex::new(OptoState {
-                    vcc: NetState::Floating,
+                    vcc: Sense {
+                        volts: None,
+                        periodic: None,
+                        at_ns: 0,
+                    },
                     enable: None,
+                    enable_level: None,
                     led: vec![None; channels],
                     output: vec![None; channels],
                     applied: vec![None; channels],
@@ -598,7 +630,7 @@ impl Component for Opto {
             let core = Arc::clone(&self.core);
             io.on_sense(enable, move |sensed| {
                 let mut state = core.state.lock().unwrap();
-                state.enable = Some(sensed);
+                core.set_enable(&mut state, sensed);
                 core.refresh_all(&mut state);
             })?;
         }
@@ -631,9 +663,18 @@ mod tests {
         (opto, monitor)
     }
 
-    fn set_vcc(opto: &Opto, vcc: NetState) {
+    /// A sense handed `volts`.
+    fn handed(volts: Option<f64>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
+    }
+
+    fn set_vcc(opto: &Opto, vcc: Option<f64>) {
         let mut state = opto.core.state.lock().unwrap();
-        state.vcc = vcc;
+        state.vcc = handed(vcc);
         opto.core.refresh_all(&mut state);
     }
 
@@ -643,9 +684,9 @@ mod tests {
         opto.core.refresh(&mut state, channel.index());
     }
 
-    fn set_enable(opto: &Opto, enable: NetState) {
+    fn set_enable(opto: &Opto, enable: Option<f64>) {
         let mut state = opto.core.state.lock().unwrap();
-        state.enable = Some(enable);
+        opto.core.set_enable(&mut state, handed(enable));
         opto.core.refresh_all(&mut state);
     }
 
@@ -680,8 +721,8 @@ mod tests {
         }
         for output in ["6", "7"] {
             let pin = opto.pins().iter().find(|p| p.number == output).unwrap();
-            assert_eq!(pin.kind, PinKind::DigitalOut);
-            assert_eq!(pin.idle, IdleDrive::Released);
+            assert!(pin.can_sink && !pin.can_source, "open collector");
+            assert_eq!(pin.idle, None);
         }
     }
 
@@ -698,17 +739,16 @@ mod tests {
     /// The truth table: the output sinks only with the LED at or above
     /// threshold and the detector powered.
     #[rstest]
-    #[case::dark_unpowered(None, NetState::Floating, false)]
-    #[case::dark_powered(Some(0.0), NetState::Analog(5.0), false)]
-    #[case::under_threshold(Some(4.9e-3), NetState::Analog(5.0), false)]
-    #[case::at_threshold(Some(5e-3), NetState::Analog(5.0), true)]
-    #[case::lit_unpowered(Some(10e-3), NetState::Floating, false)]
-    #[case::lit_supply_low(Some(10e-3), NetState::Analog(4.0), false)]
-    #[case::lit_powered(Some(10e-3), NetState::Analog(5.0), true)]
-    #[case::lit_projected_rail(Some(10e-3), NetState::Pulled(Level::High, 100.0), true)]
+    #[case::dark_unpowered(None, None, false)]
+    #[case::dark_powered(Some(0.0), Some(5.0), false)]
+    #[case::under_threshold(Some(4.9e-3), Some(5.0), false)]
+    #[case::at_threshold(Some(5e-3), Some(5.0), true)]
+    #[case::lit_unpowered(Some(10e-3), None, false)]
+    #[case::lit_supply_low(Some(10e-3), Some(4.0), false)]
+    #[case::lit_powered(Some(10e-3), Some(5.0), true)]
     fn the_output_sinks_only_lit_and_powered(
         #[case] amps: Option<Amps>,
-        #[case] vcc: NetState,
+        #[case] vcc: Option<f64>,
         #[case] sinks: bool,
     ) {
         let (opto, monitor) = vo2631();
@@ -730,20 +770,19 @@ mod tests {
     /// The 6N137's enable: low holds the output released, high or open
     /// lets it follow the LED.
     #[rstest]
-    #[case::low(NetState::Driven(Level::Low), false)]
-    #[case::analog_low(NetState::Analog(0.5), false)]
-    #[case::analog_in_the_band(NetState::Analog(1.5), false)]
-    #[case::analog_at_v_eh(NetState::Analog(LITE_ON_6N137_ENABLE_HIGH_MIN_VOLTS), true)]
-    #[case::high(NetState::Driven(Level::High), true)]
-    #[case::analog_high(NetState::Analog(5.0), true)]
-    #[case::open(NetState::Floating, true)]
+    #[case::low(Some(0.0), false)]
+    #[case::below_v_el(Some(0.5), false)]
+    #[case::in_the_band(Some(1.5), false)]
+    #[case::at_v_eh(Some(LITE_ON_6N137_ENABLE_HIGH_MIN_VOLTS), true)]
+    #[case::high(Some(5.0), true)]
+    #[case::open(None, true)]
     fn the_enable_holds_the_output_released_only_when_low(
-        #[case] enable: NetState,
+        #[case] enable: Option<f64>,
         #[case] sinks: bool,
     ) {
         let opto = Opto::lite_on_6n137();
         let monitor = opto.monitor();
-        set_vcc(&opto, NetState::Analog(5.0));
+        set_vcc(&opto, Some(5.0));
         set_led(&opto, OptoChannel::One, Some(10e-3));
         assert!(
             monitor.is_sinking(OptoChannel::One),
@@ -758,7 +797,7 @@ mod tests {
     #[rstest]
     fn a_repeated_delivery_costs_no_drive() {
         let (opto, monitor) = vo2631();
-        set_vcc(&opto, NetState::Analog(5.0));
+        set_vcc(&opto, Some(5.0));
         set_led(&opto, OptoChannel::One, Some(10e-3));
         let after_on = monitor.drive_count();
         set_led(&opto, OptoChannel::One, Some(10e-3));

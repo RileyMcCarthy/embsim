@@ -19,7 +19,7 @@ the decision record for why this is netlist-structural rather than SPICE.
 ```
 board/                    # new workspace member: embsim-board
 ├── src/netlist.rs        # KiCad s-expression netlist parser → ComponentDecl/NetDecl graph
-├── src/component.rs      # Component trait, PinDecl, PinKind, StreamRole, ComponentNetIo
+├── src/component.rs      # Component trait, PinDecl, PinRole, Drive, ComponentNetIo
 ├── src/registry.rs       # PartRegistry: identity → constructor; auto-classification tiers
 ├── src/engine.rs         # net-engine thread: drive queue, resolution, timer wheel, diagnostics
 ├── src/net.rs            # net state model, Thevenin drive resolution, digital projection
@@ -114,28 +114,130 @@ pub trait Component: Send + Sync {
 }
 
 pub struct PinDecl {
-    pub number: &'static str,        // netlist pin number ("3")
-    pub name: Option<&'static str>,  // alias ("RX") — matches KiCad pinfunction when present
-    pub kind: PinKind,
-    pub stream: Option<StreamRole>,  // pulse-train role; see "Stream endpoints"
-    pub drive_impedance: Option<Ohms>, // Thevenin source impedance; default per kind
-    pub idle: IdleDrive,             // the drive from attach until the component drives:
-                                     //   KindDefault (push-pull idles high), Released, or a Thevenin;
-                                     //   refused at build on a power or passive pin (no drive slot):
-                                     //   BoardError::IdleOnSlotlessPin
+    pub number: &'static str,          // netlist pin number ("3")
+    pub name: Option<&'static str>,    // alias ("RX") — matches KiCad pinfunction when present
+    pub role: PinRole,                 // Signal | PowerIn | PowerOut | Passive
+    pub idle: Option<TheveninDrive>,   // the drive from attach until the component drives
+                                       //   (None = released); refused at build on a power-in
+                                       //   or passive pin (no slot): BoardError::IdleOnSlotlessPin
+    pub input: Option<InputPort>,      // { v_bias, r_in }: the pin's own load, stamped as a
+                                       //   permanent weak source at the pin
+    pub clamps: &'static [Clamp],      // shunts to the supply/reference pin, stamped as
+                                       //   diode branches
+    pub capacitance_pf: Option<f64>,   // to the reference (declared; armed in phase 6)
+    pub thresholds: Option<Thresholds>,// { v_il, v_ih, hysteresis }: fractions of the supply
+                                       //   when the pin names one, else volts
+    pub reference: Option<&'static str>, // the pin its voltages are measured against
+    pub supply: Option<&'static str>,  // the pin its relative thresholds scale with
+    pub can_source: bool,              // drives high
+    pub can_sink: bool,                // drives low; neither = an input
 }
 
-pub enum PinKind {
-    DigitalIn,     // senses net level; contributes no drive
-    DigitalOut,    // push-pull Thevenin driver (default 25 Ω)
-    DigitalBidir,  // driver with runtime direction (GPIO)
-    Analog,        // participates in cluster solve (high-Z sense, source, or
-                   //   parameterized primitive — see "Transducer components")
-    PowerIn,       // consumes a power domain
-    PowerOut,      // sources a power domain at a declared voltage
-    Passive,       // terminal of a passive primitive (R/C/L/jumper)
+pub enum PinRole { Signal, PowerIn, PowerOut, Passive }
+```
+
+There are no pin kinds (`NODES.md` §11 and §12 item 5): what a
+pin reads and drives follows from its role and its declarations. A pin is
+built from one of eight constructors and the `with_*` builders — a
+constructor that needs thresholds takes them, and there are no crate
+default thresholds (a part cites its datasheet's; `jesd8c01_lvcmos_thresholds`,
+the 3.3 V LVCMOS pair, is a named constant a caller passes with its reason):
+
+| Declaration | Role | Declared | What the engine does with it |
+|---|---|---|---|
+| `digital_in(n, thresholds)` | `Signal` | thresholds; neither sources nor sinks | a **digital sense** from the build (a floating one is `FloatingSense`), and a released slot a sense callback may drive through |
+| `analog(n)` | `Signal` | no thresholds; neither sources nor sinks | an **analog reader**: its cluster is solved whenever it resolves; a drive through it contradicts its declaration and is traced |
+| `analog_source(n)` | `Signal` | no thresholds; sources and sinks; rests released | a **linear source** — a bench supply's output, a bridge's excitation, a pull a bench part stands in for (`with_idle` declares a static one): a drive slot, no sense |
+| `digital_out(n)` | `Signal` | idles high at 3.3 V behind 25 Ω; sources and sinks | a drive slot holding its idle until the part drives (`with_impedance`, `with_idle` override) |
+| `digital_out(n).sink_only()` | `Signal` | sinks, cannot source; rests released | an open drain: a sink that releases — a build finding, `OpenDrainWithoutPullUp`, when no pull-up reaches its net |
+| `digital_io(n, t)` | `Signal` | sources and sinks, thresholds, rests released | a **bidirectional pad**: its net is read once the part subscribes to it |
+| `power_in(n)` | `PowerIn` | optionally a reference | sensed as a supply; no slot |
+| `power_out(n)` | `PowerOut` | idles at an unmodelled voltage unless `with_idle` names one (`None`: released, what every regulator model declares) | a **declared terminal**: its own one-node cluster, holding what its slot publishes |
+| `passive(n)` | `Passive` | — | nothing |
+
+The build refuses a declaration the engine could not keep: an idle drive on
+a power-in or passive pin (`IdleOnSlotlessPin`), a reference or supply
+naming a pin the part does not declare (`PinFacadeMismatch`, as a branch
+naming one is), thresholds that are not fractions on a pin naming a supply
+or not volts on one naming none, a clamp to a rail the pin does not declare
+or with a negative knee or resistance, an input port on a pin that is
+neither a signal nor a power input or without a finite bias and a finite
+positive resistance (`InvalidDeclaration`).
+
+Two declarations are stamped into the solve at build and never
+republished (`NODES.md` §10). An **input port** (`with_input`) is a
+permanent Thevenin source at the pin, `v_bias` behind `r_in`, ranked by
+rule 2 like any source — at a kilohm or more a pull, so an otherwise open
+input sits at its bias and any real driver wins; the AM26LV32's open-input
+fail-safe is its 12 kΩ to its 0.83 V / 0.70 V open-circuit voltages. The
+bias is stamped in the engine's frame, exact while the part's ground sits at
+0 V. A **clamp** (`with_clamps`) is a diode branch — pin to supply, or
+reference to pin — registered as the part's own branches are: an element
+ending on its rail's terminal, no union, the region loop deciding it, its
+current summed into the pin's. A clamp makes its cluster an element cluster,
+solved whenever it resolves; no part on the three boards declares one. `PinHandle::thresholds` reports a pin's thresholds
+in volts at the instant — a relative declaration scaled by the voltage its
+supply reads against its reference.
+
+### What a node sees
+
+A node never reads the engine's projection. A sensing pin is handed a
+`Sense` (`NODES.md` §10 "Delivered to a sensing pin", §11; the sense task of
+§12 item 5):
+
+```rust
+pub struct Sense {
+    pub volts: Option<Volts>,            // against the pin's reference
+    pub periodic: Option<PeriodicSense>, // { hi, lo: Option<Volts>, segment }
+    pub at_ns: u64,                      // the instant it was delivered
 }
 ```
+
+- **`volts`** is the node's voltage **against the pin's declared
+  `reference`** — the engine's frame when it declares none. `None` when no
+  source reaches the node (a fact a part branches on: an open enable), and
+  when no voltage can be named: a node only an unmodelled rail reaches, a
+  clock (see `periodic`), a node with two operating points (a clock fought for
+  half of every cycle, two rates meeting), and a pin whose reference itself
+  names no voltage — floating, or detached. Ground is not implicit: a bench
+  holds the ground its parts measure against, or they are handed nothing. A
+  **fought** node with one operating point is handed that voltage — the one
+  the `AmbiguousLevel` finding beside the `Contention` names.
+- **`periodic`** carries a square wave's two phase voltages (same frame)
+  and its `PeriodicSchedule` (integer nanoseconds); the consumer integrates
+  the schedule.
+- The engine keeps a voltage beside every state it resolves (`Net::volts`,
+  crate-private): a projected node's winning source's open-circuit voltage,
+  a solved node's operating point. It is published with the states under the
+  same pass, and the build path and the live path hand the same `Sense` for
+  the same resolution — one conversion, `PinHandle::measure`.
+- A sense is delivered once at registration, then whenever the net's state
+  changes, whenever **only the voltage behind it** changes (a `Driven(High)`
+  whose source moved from 3.3 V to 1.8 V: `SenseDelivered` is logged, no
+  `NetResolved`), and whenever the pin's **reference** moves while its own
+  net did not, or its declared **supply** moves (a relative threshold scales
+  with it: the same `Sense` again, which a `DigitalReceiver` re-projects
+  through the thresholds the moved supply now gives). A subscription whose
+  reference and supply both moved is delivered once.
+
+The level is the **receiver's** projection: `Sense::level(&thresholds,
+last)` — at or below `V_IL` low and at or above `V_IH` high whatever it read
+last; between them the hysteresis chosen by the last level (a high input
+stays high down to `V_IH − ΔV_T`, a low one low up to `V_IL + ΔV_T`); what is
+left is the dead band, answered by the receiver's declared `DeadBand` —
+`HoldLast` (a Schmitt input, a comparator enable) or `Unknown` (a plain CMOS
+input, where the datasheet guarantees neither level). The policy is a field
+of `Thresholds`, required by its constructor: there is no crate default.
+`PinHandle::level` projects through the pin's declared thresholds at the
+instant; `DigitalReceiver` keeps the last level for a model. A pin with no
+thresholds is handed volts only. `PinHandle::sense` reads the same `Sense`
+on demand.
+
+The engine's own projection — `NetState`, `level_of`, the JESD8C.01 pair —
+stays the engine's **report**: `BuiltSystem::net_state`, the event log, the
+goldens, the census, and an instrument's subscription
+(`ComponentNetIo::on_net_report`, `PinHandle::net_report`) that a bench probe
+records. No part model reads it.
 
 Pin identity matching against the netlist: **pinfunction if present, else pin
 number**, with KiCad overline syntax normalized (`~{RESET}` ≡ `~RESET`).
@@ -199,16 +301,23 @@ alone). Then, per node:
   the winner's own impedance when that is itself a kilohm or more — a 15 kΩ
   pad is a resistor to its rail; a 25 Ω pad is a driver). A net one 10.5 kΩ
   resistor from ground reports 10 500, whatever else shares its cluster.
-- A node an **analog sense** reads, or one a **current injection**
-  (`Drive::Current`) lands in, has its whole cluster solved — the sense wants
-  a voltage, and an injection has no projection form (its effect is `I · R`
-  along whatever the node is tied to) — and every root of that cluster
-  publishes the solved voltage. In such a cluster the fight findings above
-  are not raised: the reader is handed the operating point, and a
-  `Contention` state would hand it nothing. This precedence retires with
-  `NODES.md` §10's `Sense { volts }`. A current injected where no Thevenin
-  source reaches leaves the node `Floating` with
-  `Finding::CurrentIntoFloatingNode`.
+- A node an **analog sense** reads, one a **current injection**
+  (`Drive::Current`) lands in, or one a **current instrument** reads is
+  published at its cluster's operating point — the sense wants a voltage,
+  an injection has no projection form (its effect is `I · R` along whatever
+  the node is tied to), an instrument a current — and the fight findings
+  above are reported beside it exactly as without the reader: a fought node
+  under an ADC reads `Analog(v)` *and* reports `Contention` (with
+  `AmbiguousLevel` inside the band), since the reader is handed the
+  voltage by its `Sense` (`NODES.md` §12 item 5, the rules task, which
+  retired phase 1's operating-point precedence). An injection or an
+  instrument solves the whole cluster. An analog sense solves only where it
+  must: a root **exactly one source reaches** is handed that source's
+  open-circuit voltage without a solve (`DESIGN.md` rule 8) — no other
+  source, terminal or injection shares its conduction component, so no
+  current flows and the voltage is exact; a root two or more sources reach
+  is solved. A current injected where no Thevenin source reaches leaves the
+  node `Floating` with `Finding::CurrentIntoFloatingNode`.
 - A **declared terminal** — a `PowerOut` pin's net, a harness `power(V)`
   endpoint, a `net_stuck` — is a cluster of its own and a boundary of every
   cluster around it (`NODES.md` "Three rules the taxonomy rests on", 1;
@@ -222,13 +331,16 @@ alone). Then, per node:
   is fixed at build — the terminal is declared whatever it holds.
 - A rail whose voltage no model declares yet (`PowerOut` at NaN, the facade's
   default idle) sources its cluster as *up*: a node nothing numeric reaches
-  reads `Pulled(High, path)` through the path to the nearest such rail. A
+  reads `Pulled(High, path)` through the path to the nearest such rail —
+  the engine's report; a sensing pin there is handed no voltage, since the
+  rail names none (`DESIGN.md` rule 6), and a supply gate reads it down. A
   rail its part released holds nothing: its node floats, and its dependents
   read only what else reaches them.
 - A `TheveninDrive` behind a non-finite impedance is normalised to
   *released* at the drive slot (`Resolver::set_drive`), so it is never
   ranked and never escalates a cluster.
-- `Floating` senses are reported to the sensing component, which chooses
+- A sense on a `Floating` net is handed no voltage, and the sensing
+  component chooses
   datasheet behavior (silent chip for a floating `~RESET`, noise policy for a
   floating ADC input). The engine never invents a value silently.
 - A **full resolution pass runs at `System::build()`**, so never-driven nets
@@ -271,7 +383,7 @@ pub struct PowerState { pub volts: f64, pub ok: bool }
 
 ### Analog clusters
 
-Connected subgraphs of `Passive`/`Analog` pins form **clusters**, extracted at
+Nets connected through passive primitives form **clusters**, extracted at
 build time. Solved by quasi-static modified nodal analysis (MNA): Thevenin
 sources + resistors → node voltages, recomputed only when a boundary input
 changes. Single-pole RC behavior is closed-form (time constant annotated on the
@@ -310,31 +422,35 @@ SPICE-backed solver is a possible future implementation and is intentionally
 **not** part of this design (no ngspice dependency, no cluster-marking syntax —
 see the consumer decision record for the rationale and revisit trigger).
 
-### Stream endpoints (pulse trains; serial is levels)
+### Step clocks and serial (one drive type; serial is levels)
 
-`StreamRole` is only for **step clocks carried as a rate**. UART bytes are
-**not** a stream role — they are framed onto ordinary digital pins as timed
-levels by [`SerialLevelBridge`](board/src/serial_levels.rs) (codec in
-`board/src/uart.rs`). There used to be `Producer`/`Consumer` byte-route roles
-and a `board/src/stream.rs` pipe layer; they are gone (history on
-`StreamRole` in `board/src/component.rs` and on `SerialLevelBridge`).
+There is no second channel (`DESIGN.md` rule 2). A step clock is the third
+encoding of the one per-instant message, `Drive::Periodic { hi, lo, segment }`
+(`NODES.md` §10/§11, the §12 item 5 record): two Thevenin ports and the
+integer `PeriodicSchedule` that alternates them — the half of the drive a
+peripheral owns (`embsim_peripherals::pulse_out`), anchored and integrated in
+the engine's nanoseconds. UART bytes are framed onto ordinary
+digital pins as timed levels by
+[`SerialLevelBridge`](board/src/serial_levels.rs) (codec in
+`board/src/uart.rs`). There used to be `Producer`/`Consumer` byte-route roles,
+a `board/src/stream.rs` pipe layer, and then a pulse channel with its own pin
+roles, routing pass and delivery; they are gone.
 
-**Pulse trains** (`PulseSource` / `PulseSink`):
+**Step clocks** (`Drive::Periodic`):
 
-- A step-clock pin declares `stream: Some(PulseSource)` or `PulseSink`; its
-  `PinKind` stays digital, with a resolvable idle drive.
-- At build (and on any topology-affecting change: jumper toggles, faults,
-  harness swaps), the engine routes each `PulseSource` to `PulseSink`s
-  reachable through its net **and through series passives below a collapse
-  threshold (default < 1 kΩ)**.
-- A `PulseTrain` (frequency, direction, count, anchor) is published **once per
-  rate change** and integrated by sinks at read time — not per edge.
-- Two `PulseSource`s reachable from each other raise **`StreamMismatch`** and
-  neither routes.
+- A step-clock pin is a plain digital output; a periodic drive on it is
+  published **once per rate change** (start / retarget / stop) and resolved
+  like any drive, **phase by phase** through rule 2: a pull follows the
+  square wave, a comparable static source or a second clock is `Contention`
+  with its finding. The net publishes `NetState::Periodic { hi, lo, segment }`
+  and a consumer integrates the segment at read time — not per edge.
+- Across a coupling capacitor the rate crosses by the AC rule
+  (`1/(2π·f·C) ≤ R_far / 10`, else `PeriodicNotCoupled`); a declared terminal
+  is a barrier.
 
 **Serial over pins** (levels, not a byte pipe):
 
-- TX/RX pins are plain `DigitalOut` / `DigitalIn` (no `StreamRole`).
+- TX/RX pins are a plain push-pull output and a plain digital input.
   `SerialLevelBridge` clocks start/data/stop bits onto the net; the peer
   decodes levels back to bytes. Contention, floating lines, and series
   resistors are therefore ordinary net effects.
@@ -457,9 +573,9 @@ Harness endpoints are `Board.Connector.Pin` references; bare MCU-pin endpoints
 (`P2EVAL.P0`) are allowed for bench rigs that aren't a designed PCB —
 `System::component(name, component)` registers such a **bench component**
 (no board netlist; each declared pin becomes a `{name}.{pin}` net addressable
-as a bare endpoint, with full electrical descriptors and stream roles).
+as a bare endpoint, with full electrical descriptors).
 Deliberately wrong harnesses (swapped pins) are valid fixtures — the
-`StreamMismatch`/`Contention`/`Floating` findings are the assertion targets.
+`Contention`/`Floating` findings are the assertion targets.
 
 ## The MCU as a component
 
@@ -478,9 +594,16 @@ A platform crate (per `CONTRACT.md`) provides the MCU component:
    caller's thread against the default instance keeps working unchanged.
    Inside a P2 package (`embsim_boards::p2::P2Package`) the core's start
    is gated once more, by the chip: the package holds `P2Core::start` —
-   the firmware entry, a QEMU core's first wake — until `RESN` reads
-   released and `VDD` a voltage inside the datasheet's window, and starts
-   it at that instant (`NODES.md` §2 "MCU node (P2)", the START gate).
+   the firmware entry, a QEMU core's first wake — and every wake the core
+   asks for until the datasheet's 3 ms restart delay has run out after
+   `RESN` read released with `VDD` inside its window, and starts it then,
+   on the engine thread, in a wake of its own (`NODES.md` §2 "MCU node
+   (P2)", the START gate). A core's wakes reach the engine through the
+   package's `WakeGate` whichever way it schedules — through `P2Pads`, or
+   on the net I/O it was handed (`ComponentNetIo::with_wake_gate`) — so the
+   native firmware image is held like any other core; its bridged pads
+   publish nothing before START and drive at their bank's supply after it
+   (`McuComponent::host_pads`).
 2. **Peripherals**: the generic peripheral emulations become fields of the MCU
    component instance rather than process globals. The full global-state
    inventory this de-globalizes: serial (`CHANNEL_FDS`/baud/pacing), GPIO
@@ -530,17 +653,20 @@ the pin facade directly rather than through a derived byte route.
 > whose edge count runs orders of magnitude ahead of the rest of the board: at
 > the reference machine's 8192 steps/mm, one mm/s is 8192 edges/s, each of
 > which would be a drive, a cluster resolution and a sense delivery through
-> the single-writer engine. So a `StreamRole::PulseSource` pin carries a
-> `PulseTrain` — frequency, direction, accumulated count and an anchor
-> instant — published **once per rate change** and integrated by
-> `StreamRole::PulseSink` consumers at *read* time, the discipline
-> `DETERMINISM.md` mandates. Counts stay exact: `PulseTrain::emitted_at` is
-> the same integer arithmetic `HAL_pulseOut_run` hands the firmware. Measured:
-> a four-segment motion profile delivering ~150 000 pulses costs **31 engine
-> events**, unchanged as the pulse count moves by tens of thousands
-> (`board/tests/pulse_bridge.rs`). The fidelity this trades away — no edges,
-> no pulse width, no per-edge DIR sampling, and up to one pulse of phase per
-> direction split — is enumerated on `PulseTrain`.
+> the single-writer engine. So the STEP pin carries a `Drive::Periodic` —
+> the pad's high and low ports around the peripheral's `PeriodicSchedule`
+> (frequency, accumulated count, ceiling and an anchor nanosecond) — published
+> **once per rate change**, resolved on the net like any drive, and
+> integrated by the consumer at *read* time, the discipline
+> `DETERMINISM.md` mandates. Counts stay exact: `PeriodicSchedule::emitted_at_ns`
+> is the same integer arithmetic `HAL_pulseOut_run` hands the firmware; the
+> wire carries no direction (the drive reads its own DIR pin). Measured: a
+> four-segment motion profile delivering 65 536 pulses costs **46 engine
+> events** (52 with the rig's drive keeping its own step counter — two more
+> subscriptions, six more deliveries), unchanged as the pulse count moves by
+> tens of thousands (`board/tests/pulse_bridge.rs`). The fidelity this trades away — no edges,
+> no pulse width, no per-edge DIR sampling — is enumerated on
+> `Drive::Periodic`.
 
 Behavioral fidelity boundary, stated explicitly: **no cycle-accurate silicon
 emulation.** Raising fidelity of one peripheral later (bit-timed serial, PWM
@@ -571,18 +697,24 @@ tests (assert a specific finding fired) and by trace tooling later:
 ran its bound without a consistent set of regions: its nodes float and the
 finding names the elements), `PowerNetUnsourced` (a power pin on a net no
 source reaches — or one that floats behind an off element, a rail blocked by
-a reversed polarity FET), `StreamMismatch`,
-`ClassificationError`, `UnconnectedRegistryPin` (both directions:
-declared-but-absent and present-but-undeclared), and the four the build
+a reversed polarity FET), `PeriodicNotCoupled` (a periodic drive's rate a
+coupling capacitor's reactance refuses), `ClassificationError`, `UnconnectedRegistryPin` (both directions:
+declared-but-absent and present-but-undeclared), and the five the build
 raises after its fixed point from the settled states and the parts'
-declarations (`NODES.md` §8 phase 4): `RailDown` (a `PowerOut` pin whose
+declarations (`NODES.md` §8 phase 4, §12 item 5): `RailDown` (a `PowerOut` pin whose
 net floats, with the reason the build can see — an input unsourced, the
 output's reference unheld, or the part holding it, a soft-start the
 snapshot is early for), `UnreferencedDomain` (a pin whose net is sourced
 while its declared reference's net is not — an isolator's unwired
 secondary ground), `UndecoupledPowerPin` (a power-in pin with no capacitor
 to its reference), `MechanicalOnDrivenNet` (a mounting hole's pad on a net a
-pin drives).
+pin drives), `OpenDrainWithoutPullUp` (an open drain — a signal pin that
+sinks and cannot source — whose net no pull-up reaches through the
+resistive network: no rail, supply above 0 V, sourcing pin or input port
+biased above 0 V; asked of the declarations and the network, not of the
+settled states, so a rail still in its soft-start counts; an open drain
+whose net reaches no other part's pin — a no-connect, a net that leaves the
+board only through a connector — raises nothing).
 
 ## Testing conventions
 

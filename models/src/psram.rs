@@ -87,8 +87,8 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::net::LOGIC_HIGH_VOLTS;
 use embsim_board::{
-    level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, Ohms, PinDecl, PinHandle,
-    PinKind, TheveninDrive,
+    AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver, Level, Ohms, PinDecl,
+    PinHandle, TheveninDrive, Thresholds, Volts,
 };
 use tracing::trace;
 
@@ -410,57 +410,72 @@ impl Psram {
 // Pin facades
 // ============================================================
 
-const fn pin(number: &'static str, name: Option<&'static str>, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+/// `V_IL` max, 0.4 V (APM SPI 3V PSRAM Datasheet, APS6404L-3SQR, Rev. 2.1,
+/// §14.5 Table 9 "DC Characteristics"; the -3SQN sheet, Rev. 2.7, §16.6
+/// Table 9, carries the same row).
+pub const APS6404L_VIL_MAX_VOLTS: Volts = 0.4;
+
+/// How far below `VDD` the `V_IH` minimum sits: `V_IH` min = `VDD − 0.4 V`
+/// (the same Table 9).
+pub const APS6404L_VIH_BELOW_VDD_VOLTS: Volts = 0.4;
+
+/// `VDD` max, 3.6 V (the same Table 9, "Supply Voltage" 2.7 V to 3.6 V).
+pub const APS6404L_VDD_MAX_VOLTS: Volts = 3.6;
+
+/// The inputs' thresholds, **absolute** against `VSS`. The datasheet gives
+/// `V_IH` as an offset below `VDD`, a form neither a fraction of the
+/// supply nor a fixed voltage carries, so it is evaluated where it holds
+/// at every supply the table allows — at `VDD` max, 3.6 − 0.4 = 3.2 V; an
+/// input at or above that reads high whatever the supply. `V_IL` is the
+/// table's fixed 0.4 V; no hysteresis is named, so between the two the
+/// table guarantees neither level ([`DeadBand::Unknown`]).
+pub const APS6404L_INPUT_THRESHOLDS: Thresholds = Thresholds::new(
+    APS6404L_VIL_MAX_VOLTS,
+    APS6404L_VDD_MAX_VOLTS - APS6404L_VIH_BELOW_VDD_VOLTS,
+    0.0,
+    DeadBand::Unknown,
+);
+
+/// An input, against `VSS` (`reference`, the pin's identifier in the
+/// table).
+const fn input(number: &'static str, reference: &'static str) -> PinDecl {
+    PinDecl::digital_in(number, APS6404L_INPUT_THRESHOLDS).with_reference(reference)
 }
 
 /// `SO`: driven only while the part has data out; released otherwise.
-const fn so_pin(number: &'static str, name: Option<&'static str>) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::Released,
-    }
+const fn so_pin(number: &'static str) -> PinDecl {
+    PinDecl::digital_out(number).with_idle(None)
 }
 
 /// The facade keyed by **function**, as the P2-EC32MB netlist names
 /// `U302`–`U305`'s pins. `NC_EP` is the package's exposed pad (tied per
 /// the vendor's routing note), passive. `SIO2`/`SIO3` are unused in SPI
-/// mode (Table 2) and sensed by nothing.
+/// mode (Table 2) and sensed by nothing. The supply is measured against
+/// `VSS`.
 pub const PSRAM_PINS_BY_FUNCTION: [PinDecl; 9] = [
-    pin("VSS", None, PinKind::PowerIn),
-    pin("VDD", None, PinKind::PowerIn),
-    pin("NC_EP", None, PinKind::Passive),
-    pin("SCLK", None, PinKind::DigitalIn),
-    pin("CEn", Some("/CE"), PinKind::DigitalIn),
-    pin("SI_SIO0", Some("SI"), PinKind::DigitalIn),
-    so_pin("SO_SIO1", Some("SO")),
-    pin("SIO2", None, PinKind::DigitalIn),
-    pin("SIO3", None, PinKind::DigitalIn),
+    PinDecl::power_in("VSS"),
+    PinDecl::power_in("VDD").with_reference("VSS"),
+    PinDecl::passive("NC_EP"),
+    input("SCLK", "VSS"),
+    input("CEn", "VSS").with_name("/CE"),
+    input("SI_SIO0", "VSS").with_name("SI"),
+    so_pin("SO_SIO1").with_name("SO"),
+    input("SIO2", "VSS"),
+    input("SIO3", "VSS"),
 ];
 
 /// The SOP-8 / USON-8 facade by pin **number** (§3.1): 1 `/CE`,
 /// 2 `SO/SIO[1]`, 3 `SIO[2]`, 4 `VSS`, 5 `SI/SIO[0]`, 6 `SCLK`, 7 `SIO[3]`,
 /// 8 `VDD`.
 pub const PSRAM_PINS_SOP8: [PinDecl; 8] = [
-    pin("1", Some("/CE"), PinKind::DigitalIn),
-    so_pin("2", Some("SO")),
-    pin("3", Some("SIO2"), PinKind::DigitalIn),
-    pin("4", Some("VSS"), PinKind::PowerIn),
-    pin("5", Some("SI"), PinKind::DigitalIn),
-    pin("6", Some("SCLK"), PinKind::DigitalIn),
-    pin("7", Some("SIO3"), PinKind::DigitalIn),
-    pin("8", Some("VDD"), PinKind::PowerIn),
+    input("1", "4").with_name("/CE"),
+    so_pin("2").with_name("SO"),
+    input("3", "4").with_name("SIO2"),
+    PinDecl::power_in("4").with_name("VSS"),
+    input("5", "4").with_name("SI"),
+    input("6", "4").with_name("SCLK"),
+    input("7", "4").with_name("SIO3"),
+    PinDecl::power_in("8").with_name("VDD").with_reference("4"),
 ];
 
 // ============================================================
@@ -584,8 +599,9 @@ impl Component for PsramComponent {
 
         {
             let shared = Arc::clone(&self.shared);
-            io.on_sense("SI", move |state| {
-                if let Some(level) = level_of(state) {
+            let si = DigitalReceiver::new(io.pin("SI")?);
+            io.on_sense("SI", move |sense| {
+                if let Some(level) = si.read(&sense) {
                     shared.lock().expect("psram mutex").si = level == Level::High;
                 }
             })?;
@@ -593,9 +609,10 @@ impl Component for PsramComponent {
         {
             let shared = Arc::clone(&self.shared);
             let so = so.clone();
-            io.on_sense("/CE", move |state| {
-                let Some(level) = level_of(state) else {
-                    trace!(?state, "PSRAM: /CE has no level; holding selection");
+            let ce = DigitalReceiver::new(io.pin("/CE")?);
+            io.on_sense("/CE", move |sense| {
+                let Some(level) = ce.read(&sense) else {
+                    trace!(?sense, "PSRAM: /CE has no level; holding selection");
                     return;
                 };
                 shared
@@ -609,9 +626,10 @@ impl Component for PsramComponent {
         {
             let shared = Arc::clone(&self.shared);
             let so = so.clone();
-            io.on_sense("SCLK", move |state| {
-                let Some(level) = level_of(state) else {
-                    trace!(?state, "PSRAM: SCLK has no level; no edge");
+            let sclk = DigitalReceiver::new(io.pin("SCLK")?);
+            io.on_sense("SCLK", move |sense| {
+                let Some(level) = sclk.read(&sense) else {
+                    trace!(?sense, "PSRAM: SCLK has no level; no edge");
                     return;
                 };
                 {
@@ -765,8 +783,8 @@ mod tests {
                 .iter()
                 .find(|p| p.number == "SO" || p.name == Some("SO"))
                 .unwrap();
-            assert_eq!(so.kind, PinKind::DigitalOut);
-            assert_eq!(so.idle, IdleDrive::Released);
+            assert!(so.drives());
+            assert_eq!(so.idle, None);
         }
         let ids: Vec<_> = PSRAM_PINS_BY_FUNCTION.iter().map(|p| p.number).collect();
         assert_eq!(
