@@ -18,11 +18,13 @@ build = "build.rs"
 [dependencies]
 embsim-core = { path = "../core" }
 embsim-board = { path = "../board" }
+# The node is the core inside `embsim_boards::p2::P2Package`, and the pad
+# strengths are decoded there (boards never depends back on this crate).
+embsim-boards = { path = "../boards" }
 tracing.workspace = true
 
 [dev-dependencies]
 embsim-models = { path = "../models" }
-embsim-boards = { path = "../boards" }
 
 [build-dependencies]
 cc = "1"

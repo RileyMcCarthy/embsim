@@ -11,4 +11,9 @@ categories = ["embedded", "simulation"]
 
 [dependencies]
 embsim-board = { path = "../board" }
+embsim-core = { path = "../core" }
 embsim-models = { path = "../models" }
+tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

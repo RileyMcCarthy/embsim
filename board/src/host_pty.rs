@@ -29,7 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::uart::{FramingError, UartFraming};
-use crate::{AttachError, Component, ComponentNetIo, PinDecl, PinKind, SerialLevelBridge};
+use crate::{
+    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, SerialLevelBridge,
+};
 use embsim_core::serial_pty::Pty;
 
 /// Poll timeout for the pump thread: the bound on shutdown latency, finer than
@@ -90,6 +92,7 @@ impl HostPty {
                     kind: PinKind::DigitalOut,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
                 PinDecl {
                     number: "RX",
@@ -97,6 +100,7 @@ impl HostPty {
                     kind: PinKind::DigitalIn,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
             ],
             framing: UartFraming::new_8n1(baud_hz),

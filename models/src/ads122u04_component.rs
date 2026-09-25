@@ -80,7 +80,8 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::uart::{FramingError, UartFraming};
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, NetState, PinDecl, PinKind, SerialLevelBridge,
+    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, PinDecl, PinKind,
+    SerialLevelBridge,
 };
 use tracing::{debug, trace, warn};
 
@@ -104,6 +105,7 @@ const fn pin(number: &'static str, name: Option<&'static str>, kind: PinKind) ->
         // onto the net as levels, so there is no byte route to declare.
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

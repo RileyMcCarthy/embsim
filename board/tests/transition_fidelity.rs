@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, Level, PinDecl,
-    PinHandle, PinKind, System,
+    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level,
+    PinDecl, PinHandle, PinKind, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -184,6 +184,7 @@ fn decl(number: &'static str, kind: PinKind) -> PinDecl {
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

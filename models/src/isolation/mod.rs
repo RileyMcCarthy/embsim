@@ -12,12 +12,21 @@
 //!   ──────                 ───────────                          ───────
 //!   P8  STEP ──┐
 //!   P7  DIR  ──┼──► iso67xx::Iso67xx (IC14, ISO6741) ──┬──────► MOTOR.STEP/DIR
-//!   P6  ENA  ──┘                                       └─► npn_switch::NpnSwitch (Q1)
+//!   P6  ENA  ──┘                                       └─► Q1 (pwl_library::mmbt3904)
 //!                                                                └──► MOTOR.ENA
 //!   P9..P12  ◄──── iso67xx::Iso67xx (IC16, ISO6740F) ◄──────────── encoder
 //!
-//!   P18/P19  ◄──── vo2631::Vo2631 (U6) ◄── nsi50010::Nsi50010 (IC9) ◄── end switch
+//!   P18/P19  ◄──── opto::Opto (U6) ◄── IC9 (pwl_library::nsi50010) ◄── end switch
 //! ```
+//!
+//! Only the digital isolators are models here. The transistor, the
+//! current regulators and the optocouplers' LEDs are **piecewise-linear
+//! elements** the engine solves ([`crate::pwl_library`]: `Q1` is a
+//! base–emitter diode and a gated collector, `IC6`–`IC13` are two-region
+//! regulating branches), and the optocouplers are [`crate::opto::Opto`],
+//! whose LED is a branch the part declares and whose output is a sink that
+//! releases. `NODES.md` §8 phase 3 turned each from a Thevenin stand-in
+//! into the element it is.
 //!
 //! # Shape of every component here
 //!
@@ -38,46 +47,35 @@
 //!   on one channel costs one drive. `board/tests/isolation_bridge.rs` asserts
 //!   the resulting engine-event budget.
 //!
-//! # A chain, not a mesh
+//! # Elements, not chains
 //!
-//! Two parts here ([`nsi50010`], [`vo2631`]) live in a **series current loop**,
-//! and the board engine cannot solve one. Every driver in the net model is a
-//! Thevenin source (`BOARD_ENGINE.md`, "Net state model") and a
-//! [`embsim_board::Component`] has no way to contribute a resistive edge
-//! *between two of its own pins* — that is the "transducer components
-//! contribute parameterized primitives" slice, which is described in the
-//! design doc and not built. A two-terminal element modeled as a drive on
-//! *both* terminals would make each terminal's source depend on the other's
-//! solved voltage: a fixed point the engine would chase one resolution per
-//! iteration, which is exactly the event cost this module exists to avoid.
+//! Two parts of the end-switch path — the current regulator and the
+//! optocoupler's LED — live in a **series current loop**. A loop is a
+//! cluster solve, and the engine solves it: the regulator's two-region
+//! branch and the LED's diode branch are stamped with the contact and the
+//! rail around them, their regions chosen by the flip loop, and the loop
+//! current read off the solution (`BuiltSystem::branch_current("Board.IC9")`
+//! and the current instrument the opto subscribes on its anode). What the
+//! bench asks — *is the loop closed, and at what current?* — is answered
+//! by the operating point: 10 mA in regulation, not the current a
+//! resistive stand-in would carry. The "drive one terminal from the other"
+//! chain that once stood in for the loop, and the output impedances tuned
+//! so its Thevenin sources cleared the engine's strength ratio, are gone
+//! with it: source-strength projection ranks a board's pull-up as a pull
+//! against any datasheet sink, so an output resistance is the datasheet's
+//! bound and nothing else.
 //!
-//! So each two-terminal part drives **one** terminal — the one facing the rest
-//! of the branch — from the terminal that faces its own stiff end:
+//! # Registering the parts
 //!
-//! ```text
-//!   rail ─── NSI50010 ─── (shared node) ─── VO2631 LED ─── return
-//!            drives ────────►             ◄──────── drives
-//!            (from its anode)              (from its cathode)
-//! ```
-//!
-//! Neither source depends on the node it drives, so the solve is one pass and
-//! the shared node's voltage is what tells the regulator how much overhead it
-//! has. What this buys is the question the bench actually asks — *is the loop
-//! closed?* — answered electrically rather than by fiat. What it costs is
-//! stated per part: the modeled branch current is the one the resistive
-//! equivalent carries, not the one the regulator would hold.
-//!
-//! # Promoting a stub
-//!
-//! A consumer that registers these parts as topology-only stubs replaces each
-//! `register_stub` line with a `register` line and changes nothing else — the
-//! pin facades here *are* the datasheet pin tables, so the build validates
-//! against the same netlist it always did:
+//! A consumer registers each part with one `register` line and nothing
+//! else — the pin facades here *are* the datasheet pin tables, so the build
+//! validates them against the netlist in both directions:
 //!
 //! ```rust
 //! use embsim_board::{PartRegistry, registry::normalize_part};
-//! use embsim_models::isolation::{iso67xx, npn_switch, nsi50010, vo2631};
-//! use embsim_models::isolation::{Channel, Iso67xx, NpnSwitch, Nsi50010, Vo2631};
+//! use embsim_models::isolation::{iso67xx, Channel, Iso67xx};
+//! use embsim_models::opto::Opto;
+//! use embsim_models::pwl_library;
 //!
 //! let mut registry = PartRegistry::new();
 //!
@@ -94,15 +92,11 @@
 //!         Box::new(Iso67xx::new(config).expect("a valid isolator"))
 //!     });
 //! }
-//! registry.register("VO2631", |_| {
-//!     Box::new(Vo2631::new(vo2631::Config::new()).expect("valid"))
-//! });
-//! registry.register("NSI50010YT1G_1", |_| {
-//!     Box::new(Nsi50010::new(nsi50010::Config::new()).expect("valid"))
-//! });
-//! registry.register("2N3904", |_| {
-//!     Box::new(NpnSwitch::new(npn_switch::Config::new()).expect("valid"))
-//! });
+//! // The optocouplers, by part; the transistor, the regulators, the
+//! // diodes and the LEDs by manufacturer part number, from the library.
+//! registry.register("VO2631", |_| Box::new(Opto::vo2631()));
+//! registry.register("6N137", |_| Box::new(Opto::lite_on_6n137()));
+//! pwl_library::register(&mut registry);
 //! ```
 //!
 //! Two things the *system description* must then supply, because a promoted
@@ -119,14 +113,8 @@
 //! `board/tests/isolation_bridge.rs` is the worked example of all of it.
 
 pub mod iso67xx;
-pub mod npn_switch;
-pub mod nsi50010;
-pub mod vo2631;
 
 pub use iso67xx::{Channel, Iso67xx, Iso67xxMonitor, Side, Variant};
-pub use npn_switch::{NpnSwitch, NpnSwitchMonitor};
-pub use nsi50010::{Nsi50010, Nsi50010Regulator};
-pub use vo2631::{OptoChannel, Vo2631, Vo2631Monitor};
 
 use std::fmt;
 

@@ -8,7 +8,7 @@
 //!
 //! # What that actually proves
 //!
-//! `Board::from_netlist_with_stubs` validates every registered component's pin
+//! `Board::from_netlist` validates every registered component's pin
 //! facade against the netlist in BOTH directions, and it matches on
 //! `PinDecl::number` verbatim. A component whose facade is right for the part
 //! but wrong for the netlist's identifier convention fails here and nowhere
@@ -31,10 +31,10 @@ mod machine_parts;
 
 use std::collections::BTreeSet;
 
-use embsim_board::{netlist, Board, PartRegistry};
+use embsim_board::{netlist, Board, IdleDrive, PartRegistry};
 use embsim_models::spi_flash::{SpiNorFlash, JEDEC_ID_W25Q128JV_IM};
 use embsim_models::spi_flash_component::SpiNorFlashComponent;
-use machine_parts::{ec32mb_registry, EC32MB_STUB_REFS};
+use machine_parts::ec32mb_registry;
 
 /// 128 M-bit = 16 MiB, the density the netlist's value field states.
 const W25Q128_CAPACITY: usize = 16 * 1024 * 1024;
@@ -42,10 +42,11 @@ const W25Q128_CAPACITY: usize = 16 * 1024 * 1024;
 /// The netlist's `value` for `U301`, which is the registry key.
 const FLASH_PART: &str = "SPI Flash 16MB (128Mb)";
 
-/// The module registry with `U301` live instead of stubbed.
+/// The module registry with this binary's own `U301` in place of the blank
+/// part the registry ships.
 fn registry_with_live_flash() -> PartRegistry {
     let mut registry = ec32mb_registry();
-    // Re-registering the same key replaces the stub.
+    // Re-registering the same key replaces the registry's part.
     registry.register(FLASH_PART, |_decl| {
         Box::new(SpiNorFlashComponent::new(SpiNorFlash::blank(
             W25Q128_CAPACITY,
@@ -55,17 +56,16 @@ fn registry_with_live_flash() -> PartRegistry {
 }
 
 #[test]
-fn the_part_mounts_on_a_real_netlist_in_place_of_its_stub() {
+fn the_part_mounts_on_a_real_netlist() {
     let parsed =
         netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
-    let board =
-        Board::from_netlist_with_stubs(parsed, &registry_with_live_flash(), &EC32MB_STUB_REFS)
-            .expect("the live flash's pin facade matches U301 in both directions");
+    let board = Board::from_netlist(parsed, &registry_with_live_flash())
+        .expect("the live flash's pin facade matches U301 in both directions");
 
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert!(
         registered.contains("U301"),
-        "the boot flash is a registered component, not a stub skipped over"
+        "the boot flash is a registered component of the module"
     );
 }
 
@@ -83,7 +83,7 @@ fn a_facade_keyed_by_pin_number_does_not_mount_on_this_netlist() {
         )
     });
 
-    let error = Board::from_netlist_with_stubs(parsed, &registry, &EC32MB_STUB_REFS)
+    let error = Board::from_netlist(parsed, &registry)
         .expect_err("pin \"1\" is not a pin this netlist has");
     let rendered = format!("{error}");
     assert!(
@@ -140,7 +140,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, ComponentNetIo, Harness, Level, PinHandle, PinKind, System,
+    digital_drive, level_of, ComponentNetIo, Harness, Level, NetState, PinHandle, PinKind, System,
 };
 use embsim_core::virtual_clock;
 use embsim_models::spi_flash_component::SPI_FLASH_PINS_BY_FUNCTION;
@@ -170,6 +170,7 @@ impl BitBangMaster {
             kind,
             stream: None,
             drive_impedance: None,
+            idle: IdleDrive::KindDefault,
         };
         Self {
             pins: [
@@ -639,5 +640,39 @@ fn the_boot_roms_read_frame_streams_the_image_from_zero() {
     assert_eq!(
         &got, b"Prop\x01\x02\x03\x04",
         "opcode and 24-bit address in one frame, then a stream with CS held low"
+    );
+}
+
+/// A deselected part's data-out is at high impedance (W25Q128JV §4.1 "Chip
+/// Select (/CS)", p.9): on a bench with no pull-up the line floats until the
+/// master selects the part, carries the part's bit while it is selected, and
+/// floats again when the master deselects it.
+#[test]
+fn the_data_line_floats_while_the_part_is_deselected() {
+    let (_system, handles) = bench(SpiNorFlash::with_image(vec![0xA5; 64]));
+    let pins = handles.lock().expect("master pins");
+    let dout = pins.dout.as_ref().unwrap();
+
+    // The master idles ~CS high, so the part comes up deselected.
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(
+        dout.sense(),
+        NetState::Floating,
+        "with ~CS high the part drives nothing onto DO"
+    );
+
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
+    drive_and_settle(pins.cs.as_ref().unwrap(), Level::Low);
+    assert!(
+        matches!(dout.sense(), NetState::Driven(_)),
+        "selected, the part presents its bit on DO: {:?}",
+        dout.sense()
+    );
+
+    drive_and_settle(pins.cs.as_ref().unwrap(), Level::High);
+    assert_eq!(
+        dout.sense(),
+        NetState::Floating,
+        "deselected again, DO is released"
     );
 }

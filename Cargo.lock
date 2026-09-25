@@ -196,6 +196,7 @@ dependencies = [
 name = "embsim-board"
 version = "0.1.0"
 dependencies = [
+ "embsim-boards",
  "embsim-core",
  "embsim-models",
  "embsim-peripherals",
@@ -212,7 +213,10 @@ name = "embsim-boards"
 version = "0.1.0"
 dependencies = [
  "embsim-board",
+ "embsim-core",
  "embsim-models",
+ "rstest",
+ "tracing",
 ]
 
 [[package]]

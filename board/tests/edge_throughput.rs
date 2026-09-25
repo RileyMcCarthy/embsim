@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, Level, PinDecl,
-    PinHandle, PinKind, System,
+    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level,
+    PinDecl, PinHandle, PinKind, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -96,6 +96,7 @@ impl BitBangMaster {
             kind,
             stream: None,
             drive_impedance: None,
+            idle: IdleDrive::KindDefault,
         };
         Self {
             pins: [

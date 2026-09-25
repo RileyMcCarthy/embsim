@@ -13,10 +13,14 @@
 //! and timer wheel, the quasi-static MNA cluster solver ([`QuasiStaticMna`]),
 //! stream byte pipes (routing, baud pacing, drop policies) derived from
 //! net resolution, and rate-carried pulse trains ([`PulseTrain`]) on the same
-//! derived routes. Both paths drive one shared resolution code path. Still
-//! deferred to later slices: live topology mutation and its epoch
-//! notification (the seam is registered), dead-band [`Finding::AmbiguousLevel`]
-//! projection, and transducer primitives.
+//! derived routes. Both paths drive one shared resolution code path, whose
+//! projection is source-strength ranking (`NODES.md` rule 2): sources
+//! reaching a node ranked by total ohms, a pull never contending, a ten
+//! times weaker source losing with a [`Finding::Contention`], comparable
+//! sources solved and projected through the [`net::V_IL`]/[`net::V_IH`]
+//! dead band ([`Finding::AmbiguousLevel`]). Still deferred to later slices:
+//! live topology mutation and its epoch notification (the seam is
+//! registered), and transducer primitives.
 //!
 //! Module map (mirrors the design doc's crate layout):
 //! - [`netlist`] — KiCad s-expression netlist parser → [`ComponentDecl`]/[`NetDecl`] graph
@@ -52,31 +56,36 @@ pub mod serial_levels;
 pub mod system;
 pub mod uart;
 
-pub use board::{Board, BoardError};
+pub use board::{Board, BoardError, PartClass};
 pub use cluster::{
-    Cluster, ClusterInputs, ClusterResistor, ClusterSolution, ClusterSolver, ClusterSource,
-    QuasiStaticMna,
+    Cluster, ClusterElement, ClusterInjection, ClusterInputs, ClusterResistor, ClusterSolution,
+    ClusterSolver, ClusterSource, ClusterTerminal, QuasiStaticMna, GMIN_OHMS,
+    PWL_SOLVES_PER_ELEMENT,
 };
 pub use component::{
-    AttachError, Component, ComponentNetIo, PinDecl, PinHandle, PinKind, PulseDirection,
-    PulseSegment, PulseTrain, PulseTx, StreamRole,
+    AttachError, Branch, Component, ComponentNetIo, Drive, IdleDrive, PinDecl, PinHandle, PinKind,
+    PinReference, PulseDirection, PulseSegment, PulseTrain, PulseTx, PwlCurve, RegionTest,
+    ResistorAt, StreamRole,
 };
-pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
+pub use diagnostics::{
+    CallbackKind, Diagnostics, Finding, PinMismatchDirection, RailDownReason, SenseKind,
+};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use host_pty::HostPty;
 pub use mcu::{McuBuildError, McuBuilder, McuComponent};
 pub use net::{
-    digital_drive, level_of, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
+    digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
+    COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use registry::{
-    reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind,
-    RegistryError,
+    reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind, PwlBranch,
+    PwlSpec, RegistryError, SwitchPole,
 };
 pub use serial_levels::SerialLevelBridge;
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
-    HarnessError, Scenario, System, SystemError, SystemHandle,
+    HarnessError, Scenario, System, SystemError, SystemHandle, BUILD_FIXED_POINT_BOUND,
 };
 pub use uart::{FramingError, UartDecoder, UartEncoder, UartFraming};

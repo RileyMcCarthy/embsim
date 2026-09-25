@@ -53,10 +53,11 @@ use std::sync::{Arc, Mutex};
 
 use embsim_core::virtual_clock;
 
+use crate::component::Drive;
 use crate::component::{PulseDirection, PulseTrain};
 use crate::diagnostics::Finding;
 use crate::engine::{ComponentId, EndpointId};
-use crate::net::{Level, NetId, NetState, TheveninDrive};
+use crate::net::{Level, NetId, NetState};
 
 // ============================================================
 // Constants
@@ -68,6 +69,10 @@ const VOLT_QUANTUM_PER_V: f64 = 1_000_000.0;
 /// Resistance quantum for normalization: 1 mΩ, per the trace normalization
 /// spec.
 const OHM_QUANTUM_PER_OHM: f64 = 1_000.0;
+
+/// Current injections quantized to 1 nA (the resolution the I-V port is
+/// held to; `NODES.md` §8 phase 4).
+const AMP_QUANTUM_PER_A: f64 = 1_000_000_000.0;
 
 /// Host filesystem roots whose paths are elided from finding payloads. A
 /// token is only replaced when it *starts* with one of these, so relative
@@ -95,8 +100,9 @@ pub enum EngineEvent {
         seq: u64,
         /// Endpoint whose contribution changed.
         endpoint: EndpointId,
-        /// New Thevenin contribution, or release to high-Z.
-        drive: Option<TheveninDrive>,
+        /// New contribution — Thevenin or current injection — or release to
+        /// high-Z.
+        drive: Option<Drive>,
     },
     /// A net's resolved state changed on a resolution pass.
     NetResolved {
@@ -278,14 +284,15 @@ fn level_form(level: Level) -> &'static str {
 }
 
 /// Canonical encoding of a drive contribution, floats quantized.
-fn drive_form(drive: Option<&TheveninDrive>) -> String {
+fn drive_form(drive: Option<&Drive>) -> String {
     match drive {
         None => "release".to_string(),
-        Some(drive) => format!(
+        Some(Drive::Thevenin(drive)) => format!(
             "{}uv@{}mohm",
             quantize(drive.volts, VOLT_QUANTUM_PER_V),
             quantize(drive.impedance, OHM_QUANTUM_PER_OHM)
         ),
+        Some(Drive::Current { amps }) => format!("{}na", quantize(*amps, AMP_QUANTUM_PER_A)),
     }
 }
 
@@ -422,6 +429,7 @@ mod tests {
 
     use super::*;
     use crate::diagnostics::SenseKind;
+    use crate::net::TheveninDrive;
 
     fn record(event: EngineEvent) -> EngineEventRecord {
         EngineEventRecord {
@@ -596,12 +604,17 @@ mod tests {
             EngineEvent::DriveApplied {
                 seq: 1,
                 endpoint: EndpointId(0),
-                drive: Some(drive),
+                drive: Some(Drive::Thevenin(drive)),
             },
             EngineEvent::DriveApplied {
                 seq: 1,
                 endpoint: EndpointId(0),
                 drive: None,
+            },
+            EngineEvent::DriveApplied {
+                seq: 1,
+                endpoint: EndpointId(0),
+                drive: Some(Drive::Current { amps: 1e-3 }),
             },
             EngineEvent::NetResolved {
                 net: NetId(0),
@@ -639,7 +652,8 @@ mod tests {
             "7 drive_applied seq=1 endpoint=0 drive=3300000uv@25000mohm"
         );
         assert_eq!(forms[1], "7 drive_applied seq=1 endpoint=0 drive=release");
-        assert_eq!(forms[5], "7 reroute epoch=0");
+        assert_eq!(forms[2], "7 drive_applied seq=1 endpoint=0 drive=1000000na");
+        assert_eq!(forms[6], "7 reroute epoch=0");
     }
 
     /// Non-finite floats encode as fixed tokens rather than platform-dependent

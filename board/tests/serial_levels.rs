@@ -25,8 +25,9 @@ use embsim_board::event_log::EngineEvent;
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::uart::{FramingError, UartDecoder, UartEncoder, UartFraming};
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Harness, Level, McuComponent, NetState,
-    PartRegistry, PinDecl, PinHandle, PinKind, Scenario, System, SystemHandle, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, Harness, IdleDrive, Level, McuComponent,
+    NetState, PartRegistry, PinDecl, PinHandle, PinKind, Scenario, System, SystemHandle,
+    TheveninDrive,
 };
 use embsim_core::virtual_clock;
 use embsim_peripherals::serial;
@@ -234,6 +235,7 @@ impl PeerUart {
                     kind: PinKind::DigitalOut,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
                 PinDecl {
                     number: "2",
@@ -241,6 +243,7 @@ impl PeerUart {
                     kind: PinKind::DigitalIn,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
             ],
             framing,
@@ -362,6 +365,7 @@ impl StuckLow {
                 kind: PinKind::DigitalOut,
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             }],
         }
     }

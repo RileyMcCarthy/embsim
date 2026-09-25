@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::UartFraming;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Harness, NetState, PartRegistry, PinDecl,
-    PinHandle, PinKind, System, SystemError, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, Harness, IdleDrive, NetState, PartRegistry,
+    PinDecl, PinHandle, PinKind, System, SystemError, TheveninDrive,
 };
 use embsim_core::virtual_clock;
 
@@ -95,6 +95,7 @@ const fn analog_pin(number: &'static str) -> PinDecl {
         kind: PinKind::Analog,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

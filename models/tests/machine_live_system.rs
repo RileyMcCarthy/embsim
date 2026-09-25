@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, Level, NetState,
-    PartRegistry, PinDecl, PinHandle, PinKind, SenseKind, System, SystemHandle, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, IdleDrive, Level,
+    NetState, PartRegistry, PinDecl, PinHandle, PinKind, SenseKind, System, SystemHandle,
+    TheveninDrive,
 };
 use embsim_models::machine::{end_switch, quadrature_encoder, stepper_motor};
 use embsim_models::machine::{
@@ -88,6 +89,7 @@ fn pin(number: &'static str, kind: PinKind) -> PinDecl {
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

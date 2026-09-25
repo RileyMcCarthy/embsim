@@ -1,10 +1,31 @@
-//! The QEMU Propeller 2 target as an embsim board component.
+//! The QEMU Propeller 2 target as the core of an embsim P2 package.
 //!
 //! A `P2X8C4M64P` that boots the way silicon does: the real Parallax ROM in
 //! the top of hub, and everything else arriving over pins that are **nets** —
 //! a flash on the board answers the ROM's bit-banged SPI, and the P2 sees it
 //! the way it sees any other component. The node knows nothing about flashes,
 //! cards or UARTs. It drives pads and senses pads.
+//!
+//! # The package around it
+//!
+//! [`P2Qemu`] is a [`P2Core`]: it goes inside
+//! [`embsim_boards::p2::P2Package`], which declares the 86 package pins,
+//! hands the core its 64 pads, and delivers the package-level facts —
+//! the **crystal**, which is the rate the board puts on `XI` (a TCXO
+//! through its buffer on the P2-EC32MB), the `RESN`/`VDD` state, and the
+//! sixteen bank supplies the pads drive high at. A board fills its
+//! processor slot with `P2Package::new(P2Qemu::…)`.
+//!
+//! # When the guest starts
+//!
+//! The package's **START gate** decides: the core is started — and its
+//! first wake delivered — only once `RESN` reads released and `VDD` reads
+//! a voltage inside the datasheet's window (`embsim_boards::p2`). The
+//! START instant is where the guest's clock begins: [`P2Core::start`]
+//! anchors clock segment 0 at the virtual instant it runs, so a guest
+//! started 2.5 ms in (the P2-EC32MB from its carrier's 5 V, its bucks'
+//! soft-start elapsed) stamps its first instruction there, and every edge
+//! after it at its own instant from there.
 //!
 //! # Where the CPU runs
 //!
@@ -29,6 +50,28 @@
 //! and a device on the net sees every transition — the rules
 //! `docs/dev/sil-unified-drive.md` sets out, R1 through R5.
 //!
+//! # What a pad is, and what it reads
+//!
+//! A pad the guest drives is a Thevenin source at the strength its `WRPIN`
+//! word configured (`embsim_boards::p2::pad_drive`): fast at
+//! [`embsim_boards::p2::P2_FAST_OHMS`], the 1.5 k / 15 k / 150 kΩ modes at
+//! those resistances, float released — and high at its **bank's supply**,
+//! the voltage the package senses on the pad's `VIO_a_b` pin
+//! ([`BankSupplies::pad_drive`]); a pad in a bank whose supply names no
+//! voltage presents nothing, and the package reports the bank once. A
+//! `WRPIN` on a driven pad is a pad change like a `DIR` write — it yields,
+//! and the next wake republishes the pad at the new strength. The
+//! current-source modes are not mapped: such a pad presents nothing, and
+//! the node says so once.
+//!
+//! `IN` reflects the **net** for every pad whose published drive is
+//! released or a pull (at or above [`WEAK_DRIVE_OHMS`]) — a pad pulling a
+//! line high through 15 kΩ reads what the line resolved to, which is what
+//! makes an I2C slave's clock stretch and its ACK visible to the master
+//! driving through the pull mode. A pad driven fast keeps reading its own
+//! `OUT` bit, which is what p2core does and what keeps the two engines'
+//! state traces identical instruction for instruction.
+//!
 //! # One machine per process
 //!
 //! QEMU's init is process-global and not repeatable. The first
@@ -44,10 +87,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Level, PinDecl, PinHandle,
-    PinKind,
-};
+use embsim_board::{level_of, AttachError, Level, PinHandle, TheveninDrive, WEAK_DRIVE_OHMS};
+use embsim_boards::p2::{self, BankSupplies, P2Core, P2Pads, P2ResetState, PadDrive};
+use embsim_core::virtual_clock;
+
+pub use embsim_boards::p2::{p2x8c4m64p_pins, pin_name};
 
 mod ffi;
 pub mod flashimage;
@@ -70,37 +114,47 @@ pub const COG_QUANTUM: i64 = 48;
 const HUB_EXEC_BASE: u32 = 0x400;
 
 const NUM_COGS: usize = 8;
-const NUM_PINS: usize = 64;
+const NUM_PINS: usize = p2::NUM_PADS;
 
 /// The internal RC oscillator the chip comes up on, nominal. Silicon runs
 /// RCFAST anywhere in 20–24 MHz; 20 MHz is Parallax's stated figure.
 pub const RCFAST_HZ: u64 = 20_000_000;
 /// The slow internal oscillator (`%01`), nominal.
 pub const RCSLOW_HZ: u64 = 20_000;
-/// The crystal a P2-EC32MB and a P2 Eval carry, and the default here.
-pub const DEFAULT_CRYSTAL_HZ: u64 = 20_000_000;
 
-/// The system clock a HUBSET clock word selects.
+/// The system clock a HUBSET clock word selects, given the crystal on `XI`
+/// — the rate the board delivers there, or `None` when nothing does.
 ///
 /// `%0000_000E_DDDD_DDMM_MMMM_MMMM_PPPP_CC_SS`: `SS` picks RCFAST, RCSLOW,
 /// the crystal, or the PLL; the PLL runs the crystal through `/(D+1)`,
 /// `*(M+1)`, and a final divider `PPPP` — `%1111` is the VCO direct,
-/// anything else `/((P+1)*2)`. What the guest records in hub `$14` is NOT
-/// used: the boot ROM overwrites that long with its base64 table, and the
-/// clock is a fact of the hardware the guest set, not a value it stored.
-pub fn clock_hz(mode: u32, crystal_hz: u64) -> u64 {
+/// anything else `/((P+1)*2)`. A word that derives its clock from the
+/// crystal when there is none yields `None`: a chip whose clock source is
+/// absent has no clock, and the node stalls the guest until one arrives
+/// rather than inventing a frequency. What the guest records in hub `$14`
+/// is NOT used: the boot ROM overwrites that long with its base64 table,
+/// and the clock is a fact of the hardware the guest set, not a value it
+/// stored.
+pub fn clock_hz(mode: u32, crystal_hz: Option<u64>) -> Option<u64> {
     match mode & 0b11 {
-        0b00 => RCFAST_HZ,
-        0b01 => RCSLOW_HZ,
+        0b00 => Some(RCFAST_HZ),
+        0b01 => Some(RCSLOW_HZ),
         0b10 => crystal_hz,
         _ => {
+            let crystal_hz = crystal_hz?;
             let d = u64::from((mode >> 18) & 0x3F) + 1;
             let m = u64::from((mode >> 8) & 0x3FF) + 1;
             let p = (mode >> 4) & 0xF;
             let pdiv = if p == 0xF { 1 } else { (u64::from(p) + 1) * 2 };
-            (crystal_hz * m / d / pdiv).max(1)
+            Some((crystal_hz * m / d / pdiv).max(1))
         }
     }
+}
+
+/// Whether a HUBSET clock word's source is the crystal (directly or through
+/// the PLL).
+const fn derives_from_crystal(mode: u32) -> bool {
+    matches!(mode & 0b11, 0b10 | 0b11)
 }
 
 /// Cog register addresses the bus is told about.
@@ -124,73 +178,6 @@ const fn smart_mode(cfg: u32) -> u32 {
 /// in the high byte select the ADC modes (`P_ADC_GIO` .. `P_ADC_100X`).
 const PIN_CFG_ADC_MASK: u32 = 0x00F8_0000;
 const PIN_CFG_ADC: u32 = 0x0010_0000;
-
-/// `P0`..`P63`, as the netlists name them.
-static P_NAMES: [&str; NUM_PINS] = [
-    "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14",
-    "P15", "P16", "P17", "P18", "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27",
-    "P28", "P29", "P30", "P31", "P32", "P33", "P34", "P35", "P36", "P37", "P38", "P39", "P40",
-    "P41", "P42", "P43", "P44", "P45", "P46", "P47", "P48", "P49", "P50", "P51", "P52", "P53",
-    "P54", "P55", "P56", "P57", "P58", "P59", "P60", "P61", "P62", "P63",
-];
-
-/// The name of I/O pin `pin` on the facade.
-pub fn pin_name(pin: u8) -> &'static str {
-    P_NAMES[usize::from(pin & 63)]
-}
-
-/// The package's other pins, as the P2-EC32MB netlist normalises them: the
-/// rails, the reset and test inputs, and the crystal pair.
-const PACKAGE_PINS: [(&str, PinKind); 22] = [
-    ("GND", PinKind::PowerIn),
-    ("VDD", PinKind::PowerIn),
-    ("RESN", PinKind::DigitalIn),
-    ("TEST", PinKind::DigitalIn),
-    ("XI", PinKind::DigitalIn),
-    // XO drives the crystal; nothing on a board reads it as logic.
-    ("XO", PinKind::Passive),
-    ("VIO_0_3", PinKind::PowerIn),
-    ("VIO_4_7", PinKind::PowerIn),
-    ("VIO_8_11", PinKind::PowerIn),
-    ("VIO_12_15", PinKind::PowerIn),
-    ("VIO_16_19", PinKind::PowerIn),
-    ("VIO_20_23", PinKind::PowerIn),
-    ("VIO_24_27", PinKind::PowerIn),
-    ("VIO_28_31", PinKind::PowerIn),
-    ("VIO_32_35", PinKind::PowerIn),
-    ("VIO_36_39", PinKind::PowerIn),
-    ("VIO_40_43", PinKind::PowerIn),
-    ("VIO_44_47", PinKind::PowerIn),
-    ("VIO_48_51", PinKind::PowerIn),
-    ("VIO_52_55", PinKind::PowerIn),
-    ("VIO_56_59", PinKind::PowerIn),
-    ("VIO_60_63", PinKind::PowerIn),
-];
-
-/// The chip's facade: 64 bidirectional I/O pins plus the 22 package pins.
-/// This is what the P2-EC32MB's `U100` slot expects, in both directions.
-pub fn p2x8c4m64p_pins() -> Vec<PinDecl> {
-    let mut pins = Vec::with_capacity(NUM_PINS + PACKAGE_PINS.len());
-    for name in P_NAMES {
-        pins.push(PinDecl {
-            number: name,
-            name: None,
-            kind: PinKind::DigitalBidir,
-            stream: None,
-            drive_impedance: None,
-        });
-    }
-    for (name, kind) in PACKAGE_PINS {
-        pins.push(PinDecl {
-            number: name,
-            name: None,
-            kind,
-            stream: None,
-            drive_impedance: None,
-        });
-    }
-    pins
-}
 
 // ============================================================
 // Errors
@@ -252,6 +239,17 @@ struct Shared {
     console: Mutex<Vec<(u8, u8)>>,
     /// Net transitions sensed since the last wake, in delivery order.
     edges: Mutex<VecDeque<(u8, bool)>>,
+    /// The crystal, as the package last delivered it from `XI`: the rate
+    /// in hertz, 0 while nothing reaches the pin.
+    crystal_hz: AtomicU64,
+    /// The reset inputs, as the package last delivered them. Information:
+    /// the START gate that acts on them is the package's, and a change
+    /// after the start (a rail dropping) changes nothing here until the
+    /// target has a reset entry.
+    reset: Mutex<P2ResetState>,
+    /// The guest selected a clock derived from the crystal while none
+    /// reached `XI`, and is not running until one does.
+    stalled: AtomicBool,
     /// Times the guest stopped on a pad change.
     yields: AtomicU64,
     /// Drives published to nets.
@@ -306,11 +304,37 @@ impl P2QemuHandle {
     pub fn halted(&self) -> bool {
         self.shared.halted.load(Ordering::Relaxed)
     }
+
+    /// The crystal the PLL multiplies: the rate the board delivers on `XI`,
+    /// or `None` while nothing reaches the pin.
+    pub fn crystal_hz(&self) -> Option<u64> {
+        let hz = self.shared.crystal_hz.load(Ordering::Relaxed);
+        (hz != 0).then_some(hz)
+    }
+
+    /// The reset inputs (`RESN`, `VDD`), as the package last delivered them.
+    pub fn reset(&self) -> P2ResetState {
+        *self
+            .shared
+            .reset
+            .lock()
+            .expect("reset state never poisoned")
+    }
+
+    /// Whether the guest is stalled on a crystal-derived clock with no
+    /// crystal on `XI`.
+    pub fn stalled(&self) -> bool {
+        self.shared.stalled.load(Ordering::Relaxed)
+    }
 }
 
 // ============================================================
 // The bus: the electrical side of the seam
 // ============================================================
+
+/// Said once per process: a pad was configured in a current-source drive
+/// mode, which the node does not map.
+static CURRENT_SOURCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The pin model behind QEMU's `P2PinBusOps`.
 ///
@@ -330,14 +354,18 @@ struct Bus {
     /// contention keeps its last level: an unresolvable net is not a logic
     /// value, and inventing one would hide the fault.
     in_ext: [u32; 2],
+    /// Pads whose **published** drive is a strong source (under
+    /// [`WEAK_DRIVE_OHMS`]): these read their own `OUT` bit; every other pad
+    /// reads its net. Recomputed at each publish.
+    strong: [u32; 2],
 
     mode: [u32; NUM_PINS],
     x: [u32; NUM_PINS],
     in_flag: [bool; NUM_PINS],
 
-    /// The drive each net was last told: `None` never, `Some(None)` released,
-    /// `Some(Some(level))` driven.
-    published: [Option<Option<bool>>; NUM_PINS],
+    /// The drive each net was last told: `None` never, `Some(None)`
+    /// released, `Some(Some(drive))` a Thevenin source.
+    published: [Option<Option<TheveninDrive>>; NUM_PINS],
     /// Pins whose wanted drive differs from what was published.
     dirty: u64,
     /// The instant of the pending pad change: the driving cog's clock at the
@@ -345,10 +373,19 @@ struct Bus {
     pending_at_ns: Option<u64>,
 
     handles: Vec<Option<PinHandle>>,
-    /// The crystal on the board's XI pin, for the PLL arithmetic.
-    crystal_hz: u64,
+    /// The bank supplies, as the package senses them: what a pad drives
+    /// high at. Unpowered until the package hands the core its table.
+    banks: BankSupplies,
+    /// The crystal on `XI`, as last drained from the package's delivery.
+    crystal_hz: Option<u64>,
+    /// The crystal the current clock segment was derived from, to notice a
+    /// change that matters.
+    clocked_crystal_hz: Option<u64>,
     /// The HUBSET clock word last seen, to notice a change.
     clock_mode: u32,
+    /// The guest selected a crystal-derived clock with no crystal: no
+    /// clock, no instructions, until a rate reaches `XI`.
+    stalled: bool,
     /// The clocks→nanoseconds mapping, piecewise: each segment starts at a
     /// cog clock count and the nanoseconds it corresponds to, at a rate. A
     /// clock change mid-run adds a segment; earlier instants keep theirs.
@@ -372,6 +409,7 @@ impl Bus {
             dir: [0; 2],
             out: [0; 2],
             in_ext: [0; 2],
+            strong: [0; 2],
             mode: [0; NUM_PINS],
             x: [0; NUM_PINS],
             in_flag: [false; NUM_PINS],
@@ -379,8 +417,11 @@ impl Bus {
             dirty: 0,
             pending_at_ns: None,
             handles: (0..NUM_PINS).map(|_| None).collect(),
-            crystal_hz: DEFAULT_CRYSTAL_HZ,
+            banks: BankSupplies::unpowered(),
+            crystal_hz: None,
+            clocked_crystal_hz: None,
             clock_mode: 0,
+            stalled: false,
             clock_segments: vec![ClockSegment {
                 from_clocks: 0,
                 from_ns: 0,
@@ -392,26 +433,46 @@ impl Bus {
 
     // ---- what a bank reads --------------------------------------------------
 
-    /// What the guest drives where DIR is set, and what the outside presents
-    /// everywhere else. This one line is why the ROM can use P61 as both a
-    /// strap and a chip select, and why it can float P58 to read the flash.
+    /// What the guest drives where its published drive is strong, and what
+    /// the outside presents everywhere else — a released pad and a pad
+    /// pulling through a resistive mode both read their net. This one line
+    /// is why the ROM can use P61 as both a strap and a chip select, why it
+    /// can float P58 to read the flash, and why a pad pulling a line high
+    /// sees the sink that is holding it low.
     fn sensed(&self, bank: usize) -> u32 {
-        let driven = self.dir[bank];
-        (driven & self.out[bank]) | (!driven & self.in_ext[bank])
+        let strong = self.strong[bank];
+        (strong & self.out[bank]) | (!strong & self.in_ext[bank])
     }
 
     fn pad_level(&self, pin: usize) -> bool {
         (self.sensed(pin >> 5) >> (pin & 31)) & 1 != 0
     }
 
-    /// The level the guest drives on `pin`, or `None` when it has released it.
-    fn output_level(&self, pin: usize) -> Option<bool> {
+    /// The drive the guest presents on `pin`: its `DIR`/`OUT` bits through
+    /// the strength its `WRPIN` word configured, high at the pad's bank
+    /// supply, or `None` when the pad is released — `DIR` clear, the float
+    /// mode, or a bank with no supply. A current-source mode is not mapped
+    /// and presents nothing.
+    fn pad_drive(&self, pin: usize) -> Option<TheveninDrive> {
         let bit = 1u32 << (pin & 31);
         let bank = pin >> 5;
-        if self.dir[bank] & bit != 0 {
-            Some(self.out[bank] & bit != 0)
-        } else {
-            None
+        let dir = self.dir[bank] & bit != 0;
+        let out = self.out[bank] & bit != 0;
+        match self.banks.pad_drive(pin as u8, self.mode[pin], dir, out) {
+            PadDrive::Released => None,
+            PadDrive::Thevenin(drive) => Some(drive),
+            PadDrive::CurrentSource(mode) => {
+                if !CURRENT_SOURCE_LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        pin,
+                        ?mode,
+                        "p2-qemu: a pad was configured in a current-source drive mode, which \
+                         is not mapped (no caller, and a resistor would be an invention); \
+                         the pad presents nothing to its net"
+                    );
+                }
+                None
+            }
         }
     }
 
@@ -433,31 +494,70 @@ impl Bus {
         }
     }
 
+    /// Take the crystal the package last delivered on `XI`.
+    fn drain_crystal(&mut self) {
+        let hz = self.shared.crystal_hz.load(Ordering::Relaxed);
+        self.crystal_hz = (hz != 0).then_some(hz);
+    }
+
     // ---- time -----------------------------------------------------------------
 
-    /// Notice a HUBSET clock change and start a new segment at the instant
-    /// the guest made it. Cheap when nothing changed: one load and a compare.
-    fn poll_clock_mode(&mut self) {
+    /// Notice a HUBSET clock change, or the crystal arriving or changing
+    /// under a clock derived from it, and start a new segment: at the
+    /// instant the guest made the change, or — for a crystal that arrived
+    /// while the guest was stalled — at `now`, the wake that found it.
+    /// Cheap when nothing changed: two loads and two compares.
+    fn poll_clock_mode(&mut self, now: u64) {
         // SAFETY: plain reads of two globals the target owns.
         let mode = unsafe { ffi::p2host_clock_mode() };
-        if mode == self.clock_mode {
+        let mode_changed = mode != self.clock_mode;
+        let crystal_changed = self.crystal_hz != self.clocked_crystal_hz;
+        if !mode_changed && !crystal_changed {
             return;
         }
-        let at = unsafe { ffi::p2host_clock_mode_at() };
-        let hz = clock_hz(mode, self.crystal_hz);
-        let from_ns = self.clocks_to_ns(at);
-        tracing::info!(
-            mode = format_args!("{mode:#010x}"),
-            hz,
-            at,
-            "p2-qemu: clock set"
-        );
+        self.clocked_crystal_hz = self.crystal_hz;
+        if !mode_changed && !derives_from_crystal(mode) {
+            // RCFAST/RCSLOW: the crystal is not the clock.
+            return;
+        }
+        let was_stalled = self.stalled;
+        let at = if mode_changed {
+            unsafe { ffi::p2host_clock_mode_at() }
+        } else {
+            self.machine_now_clocks()
+        };
         self.clock_mode = mode;
-        self.clock_segments.push(ClockSegment {
-            from_clocks: at,
-            from_ns,
-            hz,
-        });
+        match clock_hz(mode, self.crystal_hz) {
+            Some(hz) => {
+                let from_ns = if was_stalled {
+                    now
+                } else {
+                    self.clocks_to_ns(at)
+                };
+                tracing::info!(
+                    mode = format_args!("{mode:#010x}"),
+                    hz,
+                    crystal_hz = self.crystal_hz,
+                    at,
+                    from_ns,
+                    "p2-qemu: clock set"
+                );
+                self.stalled = false;
+                self.clock_segments.push(ClockSegment {
+                    from_clocks: at,
+                    from_ns,
+                    hz,
+                });
+            }
+            None => {
+                tracing::warn!(
+                    mode = format_args!("{mode:#010x}"),
+                    "p2-qemu: HUBSET selected a clock derived from the crystal while no rate \
+                     reaches XI; the guest has no clock and stalls until one arrives"
+                );
+                self.stalled = true;
+            }
+        }
     }
 
     fn clocks_to_ns(&self, clocks: u64) -> u64 {
@@ -476,14 +576,28 @@ impl Bus {
             .saturating_add(segment.from_ns)
     }
 
-    fn cog_ns(&self, cog: usize) -> u64 {
+    fn cog_clocks(cog: usize) -> u64 {
         // SAFETY: cog < NUM_COGS; the machine exists for the node's lifetime.
-        self.clocks_to_ns(unsafe { ffi::p2host_cog_clocks(cog as c_uint) })
+        unsafe { ffi::p2host_cog_clocks(cog as c_uint) }
+    }
+
+    fn cog_ns(&self, cog: usize) -> u64 {
+        self.clocks_to_ns(Self::cog_clocks(cog))
     }
 
     fn cog_running(cog: usize) -> bool {
         // SAFETY: as above.
         unsafe { ffi::p2host_cog_running(cog as c_uint) }
+    }
+
+    /// The machine's "now" in clocks: the least-advanced running cog, the
+    /// same rule as [`Self::machine_now_ns`].
+    fn machine_now_clocks(&self) -> u64 {
+        let running = (0..NUM_COGS)
+            .filter(|&c| Self::cog_running(c))
+            .map(Self::cog_clocks)
+            .min();
+        running.unwrap_or_else(|| (0..NUM_COGS).map(Self::cog_clocks).max().unwrap_or(0))
     }
 
     /// The machine's "now": the least-advanced running cog, exactly as
@@ -499,11 +613,11 @@ impl Bus {
 
     // ---- pad changes ----------------------------------------------------------
 
-    /// Recompute the OR-reduced DIR/OUT and note every pad whose drive changed.
-    /// The first change in an instruction sets the pending instant and stops
-    /// the cog; later ones in the same instruction (DRVH publishes OUT then
-    /// DIR) share it.
-    fn recompute_and_mark(&mut self, cog: usize) {
+    /// Recompute the OR-reduced DIR/OUT and note every pad whose drive —
+    /// level and strength — differs from what its net was last told.
+    /// Returns whether a change is newly pending: something is dirty and no
+    /// instant has been taken for it yet.
+    fn mark_changes(&mut self) -> bool {
         self.dir = [0; 2];
         self.out = [0; 2];
         for c in 0..NUM_COGS {
@@ -514,15 +628,21 @@ impl Bus {
         }
         let mut changed = 0u64;
         for pin in 0..NUM_PINS {
-            let want = self.output_level(pin);
+            let want = self.pad_drive(pin);
             if self.published[pin] != Some(want) {
                 changed |= 1u64 << pin;
             }
         }
-        if changed != self.dirty {
-            self.dirty = changed;
-        }
-        if self.dirty != 0 && self.pending_at_ns.is_none() {
+        self.dirty = changed;
+        self.dirty != 0 && self.pending_at_ns.is_none()
+    }
+
+    /// [`Self::mark_changes`] from a bus callback: the first change in an
+    /// instruction sets the pending instant to the executing cog's clock
+    /// and stops the cog; later ones in the same instruction (DRVH
+    /// publishes OUT then DIR) share it.
+    fn recompute_and_mark(&mut self, cog: usize) {
+        if self.mark_changes() {
             self.pending_at_ns = Some(self.cog_ns(cog));
             // SAFETY: called from a bus callback, on the thread running the
             // slice; stops the executing cog after this instruction.
@@ -538,20 +658,31 @@ impl Bus {
             if self.dirty & (1u64 << pin) == 0 {
                 continue;
             }
-            let want = self.output_level(pin);
+            let want = self.pad_drive(pin);
             if let Some(handle) = self.handles[pin].as_ref() {
-                handle.set_drive(
-                    want.map(|high| digital_drive(if high { Level::High } else { Level::Low })),
-                );
+                handle.set_drive(want);
                 published += 1;
             }
             self.published[pin] = Some(want);
         }
         self.dirty = 0;
         self.pending_at_ns = None;
+        self.refresh_strong();
         self.shared
             .publishes
             .fetch_add(published, Ordering::Relaxed);
+    }
+
+    /// The pads whose published drive is a strong source.
+    fn refresh_strong(&mut self) {
+        self.strong = [0; 2];
+        for pin in 0..NUM_PINS {
+            if let Some(Some(drive)) = self.published[pin] {
+                if drive.impedance < WEAK_DRIVE_OHMS {
+                    self.strong[pin >> 5] |= 1u32 << (pin & 31);
+                }
+            }
+        }
     }
 
     // ---- the vtable, in Rust --------------------------------------------------
@@ -568,6 +699,9 @@ impl Bus {
         self.recompute_and_mark(c);
     }
 
+    /// A mode write. On a pad the guest is driving, a new drive strength is
+    /// a pad change like a `DIR` write: it takes the executing cog's
+    /// instant and stops the cog, and the wake republishes the pad.
     fn wrpin(&mut self, pin: c_uint, cfg: u32) {
         let p = (pin as usize) & 63;
         // AKPIN assembles as `WRPIN #1,S` and never arrives as a distinct op:
@@ -579,6 +713,12 @@ impl Bus {
         }
         self.mode[p] = cfg;
         self.in_flag[p] = cfg != 0;
+        if self.dir[p >> 5] & (1u32 << (p & 31)) != 0 {
+            // SAFETY: inside a bus callback, where the executing cog is
+            // defined (`hostdrive.c`).
+            let cog = unsafe { ffi::p2host_current_cog() } as usize;
+            self.recompute_and_mark(cog & (NUM_COGS - 1));
+        }
     }
 
     fn wxpin(&mut self, pin: c_uint, x: u32) {
@@ -729,7 +869,7 @@ unsafe impl Send for BusPtr {}
 unsafe impl Sync for BusPtr {}
 
 // ============================================================
-// The component
+// The core
 // ============================================================
 
 static BOOTED: AtomicBool = AtomicBool::new(false);
@@ -739,9 +879,9 @@ thread_local! {
     static THREAD_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// A Propeller 2, booting from its ROM, on QEMU.
+/// A Propeller 2, booting from its ROM, on QEMU: the core inside a
+/// [`embsim_boards::p2::P2Package`].
 pub struct P2Qemu {
-    pins: Vec<PinDecl>,
     shared: Arc<Shared>,
     bus: BusPtr,
     /// Where the ROM was staged for `-bios`. Removed on drop.
@@ -751,7 +891,6 @@ pub struct P2Qemu {
 impl std::fmt::Debug for P2Qemu {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("P2Qemu")
-            .field("pins", &self.pins.len())
             .field("rom_path", &self.rom_path)
             .finish()
     }
@@ -822,23 +961,13 @@ impl P2Qemu {
         }
 
         Ok(Self {
-            pins: p2x8c4m64p_pins(),
             shared,
             bus: BusPtr(bus),
             rom_path,
         })
     }
 
-    /// The crystal on `XI`, for the PLL the guest programs with HUBSET.
-    /// Defaults to the 20 MHz a P2-EC32MB carries.
-    #[must_use]
-    pub fn with_crystal_hz(self, hz: u64) -> Self {
-        // SAFETY: before attach, nothing else holds the bus.
-        unsafe { (*self.bus.get()).crystal_hz = hz.max(1) };
-        self
-    }
-
-    /// A view that outlives handing this component to a `System`.
+    /// A view that outlives handing this core to a package and a `System`.
     pub fn handle(&self) -> P2QemuHandle {
         P2QemuHandle {
             shared: Arc::clone(&self.shared),
@@ -853,31 +982,25 @@ impl Drop for P2Qemu {
     }
 }
 
-impl Component for P2Qemu {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+impl P2Core for P2Qemu {
+    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
         let ptr = self.bus;
         // SAFETY: attach runs before any wake exists; nothing else holds the bus.
         let bus = unsafe { &mut *ptr.get() };
 
-        // Every I/O pin senses its net, and starts RELEASED. The engine's idle
-        // default for a bidirectional pin is driven high, which would make
-        // the ROM's P61 strap read the P2's own drive rather than the board's
-        // pull-up, and contend with the flash on P58, until the guest's first
-        // DIR write happened to publish every pad at once. A chip out of
-        // reset floats every pin; say so before anything can sample one.
-        // Floating and contention hold the last level rather than inventing
-        // one.
+        // The bank supplies: what each pad drives high at.
+        bus.banks = pads.bank_supplies();
+
+        // Every pad senses its net. The package declares every pad released
+        // at attach — a chip out of reset floats every pin — so that is what
+        // each net has been told. Floating and contention hold the last
+        // level rather than inventing one.
         for pin in 0..NUM_PINS as u8 {
-            let handle = io.pin(pin_name(pin))?;
-            handle.set_drive(None);
+            let handle = pads.pad(pin)?;
             bus.published[usize::from(pin)] = Some(None);
             bus.handles[usize::from(pin)] = Some(handle);
             let shared = Arc::clone(&self.shared);
-            io.on_sense(pin_name(pin), move |state| {
+            pads.on_pad_sense(pin, move |state| {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
@@ -892,9 +1015,30 @@ impl Component for P2Qemu {
             })?;
         }
 
+        // The crystal is whatever rate the board delivers on XI. A guest
+        // stalled on a crystal-derived clock is woken by its arrival.
+        {
+            let shared = Arc::clone(&self.shared);
+            let arm = pads.clone();
+            pads.on_crystal(move |hz| {
+                shared.crystal_hz.store(hz.unwrap_or(0), Ordering::Relaxed);
+                if shared.stalled.load(Ordering::Relaxed) {
+                    arm.schedule_at_ns(virtual_clock::virtual_ns().saturating_add(1));
+                }
+            });
+        }
+        // The reset inputs, as information: the package's START gate is what
+        // holds the guest on them.
+        {
+            let shared = Arc::clone(&self.shared);
+            pads.on_reset(move |state| {
+                *shared.reset.lock().expect("reset state never poisoned") = state;
+            });
+        }
+
         let shared = Arc::clone(&self.shared);
-        let arm = io.clone();
-        io.on_wake_ns(move |now| {
+        let arm = pads.clone();
+        pads.on_wake_ns(move |now| {
             if shared.shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -909,21 +1053,52 @@ impl Component for P2Qemu {
             let bus = unsafe { &mut *ptr.get() };
             wake(bus, &shared, &arm, now);
         });
-        // The first wake, at once. Without it the engine's first look at the
-        // guest would be whenever something else scheduled, and the guest's
-        // first edge would be stamped there.
-        io.schedule_at_ns(1);
+        // The first wake, at once — which the package holds until the START
+        // gate opens, so it lands at the START instant (or one nanosecond in,
+        // for a bench whose supplies are up from the build). Without it the
+        // engine's first look at the guest would be whenever something else
+        // scheduled, and the guest's first edge would be stamped there.
+        pads.schedule_at_ns(1);
         Ok(())
+    }
+
+    /// The START instant: the guest's clock counts from here. Clock
+    /// segment 0 — cog clock 0, RCFAST — is anchored at the current virtual
+    /// nanosecond, so the first instruction the guest retires is stamped at
+    /// the instant the chip could run, never at zero.
+    fn start(&mut self) {
+        // SAFETY: the package calls `start` before it forwards any wake the
+        // core asked for, so no wake and no slice is running; this is the
+        // only borrow of the bus, as attach's was.
+        let bus = unsafe { &mut *self.bus.get() };
+        let now = virtual_clock::virtual_ns();
+        let segment = bus
+            .clock_segments
+            .first_mut()
+            .expect("at least the reset segment");
+        segment.from_ns = now;
+        tracing::info!(
+            start_ns = now,
+            hz = segment.hz,
+            "p2-qemu: START; the guest's clock counts from here"
+        );
     }
 }
 
 /// One wake: publish a pending pad change at its instant, or run the guest
 /// forward until its next one.
-fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &ComponentNetIo, now: u64) {
+fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
     // Replay every transition the nets resolved since the last slice before
-    // the guest can read a pin.
+    // the guest can read a pin, and take the crystal as it stands.
     bus.drain_edges();
-    bus.poll_clock_mode();
+    bus.drain_crystal();
+    bus.poll_clock_mode(now);
+    if bus.stalled {
+        // No clock, no instructions. The crystal's arrival re-arms.
+        shared.stalled.store(true, Ordering::Relaxed);
+        return;
+    }
+    shared.stalled.store(false, Ordering::Relaxed);
 
     // A pad change waiting for its own instant.
     if let Some(at) = bus.pending_at_ns {
@@ -963,10 +1138,25 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &ComponentNetIo, now: u64) {
             let result = unsafe { ffi::p2host_slice(cog as c_uint, budget) };
             shared.slices.fetch_add(1, Ordering::Relaxed);
             stepped = true;
-            bus.poll_clock_mode();
+            // The slice's yield is taken with the slice, whatever else it
+            // did: a guest that selects a crystal-derived clock and changes
+            // a pad in the same slice stalls with that change pending, and
+            // the flag is the change's — consumed here, so it cannot fire
+            // as a phantom pad change on the slice after the clock arrives.
             // SAFETY: as above.
-            if unsafe { ffi::p2host_take_yield() } {
+            let yielded = unsafe { ffi::p2host_take_yield() };
+            if yielded {
                 shared.yields.fetch_add(1, Ordering::Relaxed);
+            }
+            bus.poll_clock_mode(now);
+            if bus.stalled {
+                // No clock, no instructions. The crystal's arrival re-arms,
+                // and the pending pad change (if the slice made one) is
+                // published at that instant by the branch above.
+                shared.stalled.store(true, Ordering::Relaxed);
+                return;
+            }
+            if yielded {
                 let at = bus.pending_at_ns.unwrap_or(now);
                 if at <= now {
                     // The change happened at or before the engine's now (a
@@ -1013,6 +1203,32 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &ComponentNetIo, now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embsim_boards::p2::{P2_FAST_OHMS, P_HIGH_15K, P_HIGH_1MA, P_HIGH_FLOAT, P_LOW_FAST};
+
+    /// The bench's bank supplies: every `VIO_a_b` at 3.3 V.
+    const BENCH_VIO_VOLTS: f64 = 3.3;
+
+    /// A bus with every bank at [`BENCH_VIO_VOLTS`] and nothing published
+    /// yet, the state a core is in once the package has handed it its
+    /// table.
+    fn bench_bus() -> Bus {
+        let mut bus = Bus::new(Arc::new(Shared::default()));
+        bus.banks = BankSupplies::held_at(BENCH_VIO_VOLTS);
+        bus.published = [Some(None); NUM_PINS];
+        bus
+    }
+
+    /// A bus with pads `dir`/`out` set by cog 0 and every change published
+    /// (to no net: the handles are empty), so `sensed` reads what a guest
+    /// would after the wake that publishes.
+    fn bus_driving(dir: u32, out: u32) -> Bus {
+        let mut bus = bench_bus();
+        bus.dir_cog[0][0] = dir;
+        bus.out_cog[0][0] = out;
+        assert!(bus.mark_changes() || dir == 0);
+        bus.publish_pending();
+        bus
+    }
 
     #[test]
     fn the_facade_is_the_ec32mb_u100_slot() {
@@ -1025,15 +1241,142 @@ mod tests {
     }
 
     #[test]
-    fn a_bank_reads_the_guest_where_driven_and_the_net_elsewhere() {
-        let mut bus = Bus::new(Arc::new(Shared::default()));
-        bus.dir = [0b0011, 0];
-        bus.out = [0b0001, 0];
+    fn a_bank_reads_the_guest_where_driven_fast_and_the_net_elsewhere() {
+        let mut bus = bus_driving(0b0011, 0b0001);
         bus.in_ext = [0b1100, 0];
         assert_eq!(bus.sensed(0), 0b1101);
-        assert_eq!(bus.output_level(0), Some(true));
-        assert_eq!(bus.output_level(1), Some(false));
-        assert_eq!(bus.output_level(2), None);
+        assert_eq!(
+            bus.pad_drive(0),
+            Some(TheveninDrive {
+                volts: BENCH_VIO_VOLTS,
+                impedance: P2_FAST_OHMS
+            })
+        );
+        assert_eq!(
+            bus.pad_drive(1),
+            Some(TheveninDrive {
+                volts: 0.0,
+                impedance: P2_FAST_OHMS
+            })
+        );
+        assert_eq!(bus.pad_drive(2), None);
+    }
+
+    /// The `sensed()` rule: a pad whose published drive is a pull reads its
+    /// NET, so a master driving SCL high through 15 kΩ sees a slave holding
+    /// it low, and a released pad reads its net as it always did. Only a
+    /// fast pad reads its own `OUT` bit.
+    #[test]
+    fn a_pulling_pad_reads_its_net_and_a_fast_pad_its_own_out_bit() {
+        let mut bus = bench_bus();
+        bus.mode[0] = P_HIGH_15K;
+        bus.dir_cog[0][0] = 0b11;
+        bus.out_cog[0][0] = 0b11;
+        assert!(bus.mark_changes());
+        bus.publish_pending();
+        assert_eq!(
+            bus.published[0],
+            Some(Some(TheveninDrive {
+                volts: BENCH_VIO_VOLTS,
+                impedance: 15_000.0
+            }))
+        );
+        assert_eq!(bus.strong[0], 0b10, "only the fast pad is strong");
+
+        // The net resolved low (a sink on it): the pulling pad reads 0.
+        bus.set_input_level(0, false);
+        bus.set_input_level(1, false);
+        assert!(!bus.testp(0), "the pull-up reads the sink holding the line");
+        assert!(bus.testp(1), "the fast pad reads its own OUT bit");
+        // The sink lets go and the net rises: the pull-up reads 1.
+        bus.set_input_level(0, true);
+        assert!(bus.testp(0));
+    }
+
+    /// A `WRPIN` on a driven pad is a pad change: the drive the net is told
+    /// changes strength, so the pad is dirty again and republishes.
+    #[test]
+    fn a_mode_change_on_a_driven_pad_republishes_it_at_the_new_strength() {
+        let mut bus = bus_driving(0b1, 0b1);
+        assert_eq!(bus.dirty, 0);
+        assert_eq!(bus.published[0].unwrap().unwrap().impedance, P2_FAST_OHMS);
+
+        bus.mode[0] = P_HIGH_15K;
+        assert!(bus.mark_changes(), "a strength change is a pad change");
+        assert_eq!(bus.dirty, 0b1);
+        bus.publish_pending();
+        assert_eq!(bus.published[0].unwrap().unwrap().impedance, 15_000.0);
+        assert_eq!(bus.strong[0], 0);
+
+        // Float while OUT = 1: released; fast while OUT = 0: a sink.
+        bus.mode[0] = P_HIGH_FLOAT | P_LOW_FAST;
+        assert!(bus.mark_changes());
+        bus.publish_pending();
+        assert_eq!(bus.published[0], Some(None));
+        bus.out_cog[0][0] = 0;
+        assert!(bus.mark_changes());
+        bus.publish_pending();
+        assert_eq!(
+            bus.published[0],
+            Some(Some(TheveninDrive {
+                volts: 0.0,
+                impedance: P2_FAST_OHMS
+            }))
+        );
+        assert_eq!(bus.strong[0], 0b1);
+
+        // The same word again changes nothing.
+        assert!(!bus.mark_changes());
+    }
+
+    #[test]
+    fn a_current_source_mode_presents_nothing_to_the_net() {
+        let mut bus = bench_bus();
+        bus.mode[5] = P_HIGH_1MA;
+        bus.dir_cog[0][0] = 1 << 5;
+        bus.out_cog[0][0] = 1 << 5;
+        assert!(!bus.mark_changes(), "released to released is no change");
+        assert_eq!(bus.pad_drive(5), None);
+    }
+
+    /// The pad's high is its bank's supply: a bank the package senses at
+    /// 1.8 V drives 1.8 V, and a bank whose supply names no voltage drives
+    /// nothing — a pad the guest sets there is released to its net, and is
+    /// no pad change while it was released already.
+    #[test]
+    fn a_pad_drives_high_at_its_banks_supply_and_nothing_in_an_unpowered_bank() {
+        let mut bus = Bus::new(Arc::new(Shared::default()));
+        bus.published = [Some(None); NUM_PINS];
+        // Every bank at 1.8 V (a bench table stands in for the package's
+        // senses): P4 driven high is a 1.8 V source.
+        bus.banks = BankSupplies::held_at(1.8);
+        bus.dir_cog[0][0] = 1 << 4;
+        bus.out_cog[0][0] = 1 << 4;
+        assert!(bus.mark_changes());
+        bus.publish_pending();
+        assert_eq!(
+            bus.published[4],
+            Some(Some(TheveninDrive {
+                volts: 1.8,
+                impedance: P2_FAST_OHMS
+            }))
+        );
+
+        // Every supply gone: P8 set high presents nothing, and P4's drive
+        // is a pad change (1.8 V to none) that publishes a release.
+        let banks = BankSupplies::unpowered();
+        bus.banks = banks.clone();
+        bus.dir_cog[0][0] |= 1 << 8;
+        bus.out_cog[0][0] |= 1 << 8;
+        assert!(
+            bus.mark_changes(),
+            "P4's drive changed with its bank's table (1.8 V to none)"
+        );
+        bus.publish_pending();
+        assert_eq!(bus.published[8], Some(None), "no supply, no driver");
+        assert_eq!(bus.published[4], Some(None));
+        assert_eq!(banks.unpowered_banks_driven(), vec![1, 2]);
+        assert_eq!(bus.strong[0], 0, "nothing strong: nothing drives");
     }
 
     #[test]
@@ -1055,17 +1398,47 @@ mod tests {
         assert!(bus.testp(62));
     }
 
+    /// HUBSET's word selects the oscillator or multiplies the crystal —
+    /// and the crystal is the rate delivered on `XI`, so a PLL word yields
+    /// 160 MHz from a delivered 20 MHz and nothing from no crystal.
     #[test]
-    fn the_clock_word_selects_the_oscillator_or_the_pll() {
-        assert_eq!(clock_hz(0, 20_000_000), RCFAST_HZ);
-        assert_eq!(clock_hz(0b01, 20_000_000), RCSLOW_HZ);
-        assert_eq!(clock_hz(0b10, 20_000_000), 20_000_000);
+    fn the_clock_word_selects_the_oscillator_or_multiplies_the_delivered_crystal() {
+        let crystal = Some(20_000_000);
+        assert_eq!(clock_hz(0, crystal), Some(RCFAST_HZ));
+        assert_eq!(clock_hz(0b01, crystal), Some(RCSLOW_HZ));
+        assert_eq!(clock_hz(0b10, crystal), Some(20_000_000));
         // flexspin's 160 MHz from a 20 MHz crystal: D=0, M=7, P=%1111, PLL on.
-        let mode = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
-        assert_eq!(clock_hz(mode, 20_000_000), 160_000_000);
+        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
+        assert_eq!(clock_hz(pll, crystal), Some(160_000_000));
         // P=%0000 divides the VCO by two.
-        let mode = (1 << 24) | (15 << 8) | 0b11;
-        assert_eq!(clock_hz(mode, 20_000_000), 160_000_000);
+        let halved = (1 << 24) | (15 << 8) | 0b11;
+        assert_eq!(clock_hz(halved, crystal), Some(160_000_000));
+
+        // No crystal: the internal oscillators still run, nothing derived
+        // from XI does.
+        assert_eq!(clock_hz(0, None), Some(RCFAST_HZ));
+        assert_eq!(clock_hz(0b10, None), None);
+        assert_eq!(clock_hz(pll, None), None);
+        assert!(derives_from_crystal(pll) && derives_from_crystal(0b10));
+        assert!(!derives_from_crystal(0) && !derives_from_crystal(0b01));
+    }
+
+    /// The package delivers the rate on XI; the bus takes it at its next
+    /// wake and the PLL arithmetic runs on it.
+    #[test]
+    fn a_delivered_rate_on_xi_is_the_crystal_the_pll_multiplies() {
+        let shared = Arc::new(Shared::default());
+        let mut bus = Bus::new(Arc::clone(&shared));
+        bus.drain_crystal();
+        assert_eq!(bus.crystal_hz, None);
+        shared.crystal_hz.store(20_000_000, Ordering::Relaxed);
+        bus.drain_crystal();
+        assert_eq!(bus.crystal_hz, Some(20_000_000));
+        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
+        assert_eq!(clock_hz(pll, bus.crystal_hz), Some(160_000_000));
+        shared.crystal_hz.store(0, Ordering::Relaxed);
+        bus.drain_crystal();
+        assert_eq!(bus.crystal_hz, None);
     }
 
     #[test]
