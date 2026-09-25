@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use crate::engine::{Command, ComponentId, EndpointId, EngineLink, ReadKind};
 use crate::net::{Amps, NetId, NetState, Ohms, TheveninDrive, Volts};
@@ -524,6 +524,27 @@ pub struct Branch {
     pub control: Option<(&'static str, RegionTest)>,
 }
 
+/// A pin's declared **reference**: the pin its voltages are measured
+/// against (`NODES.md` §11, `PinDecl::reference`). Declared on the
+/// component beside its branches until phase 5 rebuilds `PinDecl` around
+/// `PinRole`, when it moves onto the pin — a regulator's output against its
+/// own ground pin, an isolator's side supply against that side's ground, a
+/// supervisor's supply against its `VSS`. The build reads it for two lints
+/// and nothing else: a supply pin whose reference net no source reaches
+/// while its own does ([`crate::Finding::UnreferencedDomain`]), and a
+/// power-in pin with no capacitor to its reference
+/// ([`crate::Finding::UndecoupledPowerPin`]); a rail released because its
+/// reference is unheld names the reference in
+/// [`crate::Finding::RailDown`]. A reference naming a pin the facade does
+/// not declare fails the board build, as a branch does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinReference {
+    /// The pin, as its [`PinDecl`] names it (number or alias).
+    pub pin: &'static str,
+    /// The pin it is measured against.
+    pub reference: &'static str,
+}
+
 // ============================================================
 // Component trait
 // ============================================================
@@ -549,6 +570,13 @@ pub trait Component: Send + Sync {
         &[]
     }
 
+    /// The pins each of the component's pins is measured against
+    /// ([`PinReference`]): a static declaration the build lints read.
+    /// Default: none.
+    fn references(&self) -> &[PinReference] {
+        &[]
+    }
+
     /// Runs once at build, BEFORE the component is shared (pre-`Arc`), so
     /// components store typed pin handles without interior mutability and
     /// fail loudly on facade mismatch.
@@ -562,6 +590,35 @@ pub trait Component: Send + Sync {
     /// system from its first instruction. Build-time analysis
     /// ([`crate::System::build`]) never calls it. Default: nothing.
     fn start(&mut self) {}
+}
+
+/// One resistor touching a pin's node, as [`ComponentNetIo::resistors_at`]
+/// reports it: the build-time topology a part reads **once at attach** —
+/// the feedback divider a buck's output voltage is set by, the strap a
+/// select pin is tied through — and never again (`NODES.md` §2, the
+/// Regulator row; §5, `ComponentNetIo::resistors_at`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResistorAt {
+    /// The resistor, as `Board.Reference`.
+    pub reference: String,
+    /// Its value, ohms.
+    pub ohms: Ohms,
+    /// The node at its far end: the identity root of the net its other pin
+    /// is on, comparable with [`ComponentNetIo::node`].
+    pub far: NetId,
+}
+
+/// The build-time topology a component may read at attach: the identity
+/// root of every net (harness merges and closed poles applied) and the
+/// resistors touching each root. Fixed at build (`NODES.md` "Three rules
+/// the taxonomy rests on", 3), so a value read at attach holds for the
+/// system's life.
+#[derive(Debug, Default)]
+pub(crate) struct BuildTopology {
+    /// Identity root of every global net.
+    pub(crate) root_of: Vec<usize>,
+    /// The resistors touching each identity root, in declaration order.
+    pub(crate) resistors: HashMap<usize, Vec<ResistorAt>>,
 }
 
 // ============================================================
@@ -590,6 +647,10 @@ pub struct PinHandle {
     /// net into the pin), `−1` where it is `b`. Summed with the pin's own
     /// drive current by [`PinHandle::sense_current`].
     branch_terms: Vec<(usize, f64)>,
+    /// A `PowerOut` pin: its slot is its terminal's — what it publishes is
+    /// what the rail holds — and its current spans clusters, so it is no
+    /// instrument.
+    terminal: bool,
     link: EngineLink,
 }
 
@@ -611,6 +672,7 @@ impl PinHandle {
             stream: None,
             reads_when_released: false,
             branch_terms: Vec::new(),
+            terminal: false,
             link: EngineLink::default(),
         }
     }
@@ -631,8 +693,16 @@ impl PinHandle {
             stream,
             reads_when_released: false,
             branch_terms: Vec::new(),
+            terminal: false,
             link,
         }
+    }
+
+    /// Mark the handle as a `PowerOut` pin's (system-build internal use;
+    /// see the field).
+    pub(crate) fn on_terminal(mut self, terminal: bool) -> Self {
+        self.terminal = terminal;
+        self
     }
 
     /// Mark the handle as a released bidirectional pad's: a sense
@@ -651,11 +721,11 @@ impl PinHandle {
     }
 
     /// Whether the engine can report a current into this pin at all: it
-    /// has a drive slot, or it terminates a declared branch. A power or
+    /// has a drive slot, or it terminates a declared branch. A power-in or
     /// passive pin on no branch carries nothing the solve accounts for,
-    /// and a terminal's current spans clusters.
+    /// and a terminal's (a `PowerOut` pin's) current spans clusters.
     pub(crate) fn carries_current(&self) -> bool {
-        self.endpoint.is_some() || !self.branch_terms.is_empty()
+        (self.endpoint.is_some() && !self.terminal) || !self.branch_terms.is_empty()
     }
 
     /// The net this pin is attached to.
@@ -790,6 +860,10 @@ pub struct ComponentNetIo {
     pins: HashMap<String, PinHandle>,
     component: Option<ComponentId>,
     link: EngineLink,
+    /// The build-time topology behind [`Self::resistors_at`] and
+    /// [`Self::node`]; `None` on a handle table built without a system
+    /// (tests), where both answer with an error naming the fact.
+    topology: Option<Arc<BuildTopology>>,
 }
 
 impl ComponentNetIo {
@@ -801,6 +875,7 @@ impl ComponentNetIo {
             pins: entries.into_iter().collect(),
             component: None,
             link: EngineLink::default(),
+            topology: None,
         }
     }
 
@@ -814,7 +889,45 @@ impl ComponentNetIo {
             pins: entries.into_iter().collect(),
             component,
             link,
+            topology: None,
         }
+    }
+
+    /// The same handle table with the build-time topology behind it
+    /// (system-build internal use).
+    pub(crate) fn with_topology(mut self, topology: Arc<BuildTopology>) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+
+    /// The **node** a pin is on: the identity root of its net, with every
+    /// harness merge and closed pole applied — what a resistor's far end is
+    /// reported as by [`Self::resistors_at`], so a part can tell which of
+    /// the resistors on its feedback pin returns to its own ground pin.
+    pub fn node(&self, id: &str) -> Result<NetId, AttachError> {
+        let handle = self.pin(id)?;
+        let topology = self.topology.as_ref().ok_or_else(|| AttachError::Failed {
+            message: format!("pin {id:?}: no build topology behind this handle table"),
+        })?;
+        let net = handle.net().0;
+        Ok(NetId(topology.root_of.get(net).copied().unwrap_or(net)))
+    }
+
+    /// The resistors touching the node a pin is on — a **build-time
+    /// topology query**, read once at attach and never again (`NODES.md`
+    /// §5): the divider a regulator's output voltage is set by, the strap a
+    /// select pin is tied through. Each entry names the resistor, its ohms
+    /// and the node at its far end ([`ResistorAt::far`], comparable with
+    /// [`Self::node`]). Only resistors with a parsed value and both pads
+    /// fitted are reported; a resistor with both ends on this node is not.
+    /// Fails on a handle table with no build behind it.
+    pub fn resistors_at(&self, id: &str) -> Result<Vec<ResistorAt>, AttachError> {
+        let node = self.node(id)?;
+        let topology = self
+            .topology
+            .as_ref()
+            .expect("node() succeeded, so the topology is present");
+        Ok(topology.resistors.get(&node.0).cloned().unwrap_or_default())
     }
 
     /// Look up a pin handle by declared name or netlist pin number.

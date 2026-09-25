@@ -38,10 +38,51 @@ EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism
 # The phase-0 baselines of NODES.md (the numbers DESIGN.md rules 1, 4 and 8
 # are held to). The census asserts, per reference board, the cluster count,
 # the largest cluster's root count and the number of parts with nothing
-# behind them, as a committed fixture (the last a never-rises gate);
-# `--nocapture` prints the table with the largest cluster's nets, the node
-# classes and the stubs by name.
+# behind them, as a committed fixture (the last a never-rises gate), and —
+# phase 4 — rule 4's bound, `m ≤ 8` on every board under its reference
+# harness (the module from its fingers, the add-on under its rails, the
+# Edge board under the bench rails with its module-sourced socket finger
+# at the LDO's 3.3 V, and with the module in its socket); the Edge board
+# under the bench rails alone is above it, a never-rises fixture that
+# says why. `--nocapture` prints the table with the largest cluster's
+# nets, the node classes and the stubs by name.
 cargo test -p embsim-board --test cluster_census -- --nocapture
+# Phase 4, the engine half (stepped, own binary): a declared terminal — a
+# `PowerOut` pin's net, a bench supply, a stuck net — is a cluster of its
+# own and a boundary of every cluster around it. A power-out pin's idle
+# drive is what its rail holds before the part publishes; a rail that
+# publishes live re-resolves every cluster that reads it, through a
+# resistor and through a diode; a released rail takes a bench strap without
+# a fight; two sources disagreeing on one terminal are one fight, reported
+# once; the module's P59 pull-down projects beside a core rail held from
+# the bench (two hundred edges, no solve).
+cargo test -p embsim-board --test terminals
+# The resolver's side of it: the incremental-vs-full oracle with random
+# terminal changes and rail publishes mid-run.
+cargo test -p embsim-board --lib incremental_oracle
+# Phase 4, the parts half (stepped, own binary): the module's power tree
+# from its two J203 fingers — every bank rail at 3.3 V and the core rail at
+# 1.813 V from the instant the bucks' 2.5 ms soft-start elapses, two
+# setpoints from one registry key — the P2's reset through the rails'
+# rise and under a held core rail, the reset node floating with one pad of
+# its pull-up lifted, the debug-serial pins at their pull-ups, the build
+# lints (a domain measured against nothing, a mechanical pad on a driven
+# net, a rail down naming its input, a supply pin with no capacitor to its
+# reference), the current instrument on a real board, and build ==
+# live-held under each board's reference harness. Every rail wait waits on
+# every module rail at its setpoint: the LDOs publish one after another.
+cargo test -p embsim-board --test power_tree
+# The assembled machine's rails once its soft-starts elapse — its own
+# binary, because the add-on's ADC starts a protocol thread that lives for
+# the rest of the process (rule 5 below) and parks on the clock every
+# 250 µs, which idle-jumps the clock of every later stepped case sharing
+# the process.
+cargo test -p embsim-board --test power_tree_machine
+# The rail models and the detector without an engine: soft-start instants,
+# enable hysteresis, the discharge, the isolated reference, the comparator
+# and its delays.
+cargo test -p embsim-models --lib rail::
+cargo test -p embsim-models --lib supervisor::
 # The one pipeline (phase 1): every part a node, mechanical nodes, switch
 # poles as identity unions (the three-pad jumper's two poles among them),
 # the value parser over the whole module, the error that names the value;
@@ -66,7 +107,13 @@ cargo test -p embsim-board --lib source_strength
 cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --test psram_spi
 # Phase 2, the P2 package (stepped, own binary): the rate on XI is the
 # crystal the package reports, the reset inputs as it projects them, every
-# pad released with no core so a bench pin takes one without a fight.
+# pad released with no core so a bench pin takes one without a fight. Phase
+# 4 added the START gate — a core started, and its first wake delivered, at
+# the instant VDD enters the datasheet's 1.7–1.9 V window with RESN
+# released; held with the reason readable under, over, or with reset low —
+# and pads at their bank's supply: a pad in a 1.8 V bank sits at 1.8 V, a
+# pad in a bank whose supply pin reaches nothing floats and the bank is
+# named.
 cargo test -p embsim-board --test p2_package
 # Phase 3, the solver half (stepped, own binary): a diode from the element
 # library conducts at (V − V_F)/R and blocks reversed, a switched channel
@@ -103,12 +150,17 @@ cargo test -p embsim-board --test ec32mb_module --test isolation_bridge
 # ns/solve of the MNA at m = 2, 4, 8, 11, 47 (not a test; run in release).
 cargo run -p embsim-board --release --example solve_bench
 # The QEMU core inside the package (needs a QEMU P2 tree): the ROM boot
-# prints its edges / yields / publishes / wall time and holds its
-# escalated-solve count at 0; `pad_modes` runs a hand-assembled guest whose
-# 15 kΩ pull-up reads the sink holding its net low through `testp`;
-# `crystal_pll` stalls a guest that selected the PLL with nothing on XI,
-# then clocks it at 160 MHz from the 20 MHz that arrives — the scope reads
-# its pad writes 12–13 ns apart, and one yield per pad write.
+# prints its edges / yields / publishes / START instant / wall time and
+# holds its escalated-solve count exactly (since phase 4 the module is
+# powered from its J203 fingers, nothing stuck: the core starts at the
+# bucks' 2.5 ms soft-start, the TCXO's 20 MHz reaches XI, and the count is
+# the power tree's five solves before the first edge — none per edge);
+# `pad_modes` runs a hand-assembled guest whose 15 kΩ pull-up reads the
+# sink holding its net low through `testp`; `crystal_pll` stalls a guest
+# that selected the PLL with nothing on XI, then clocks it at 160 MHz from
+# the 20 MHz that arrives — the scope reads its pad writes 12–13 ns apart,
+# and one yield per pad write. Both benches supply VDD, RESN and the bank
+# the guest drives, as the START gate and the pads' bank rule need.
 EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocapture
 # The p2core differential behind "60 000 states identical" is a manual run
 # against MaD's `SIL/p2core`; the exact commands (flash image, reference,

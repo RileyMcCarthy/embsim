@@ -428,14 +428,14 @@ enum Route {
     Bench,
 }
 
-/// An idle drive is honoured on every pin with a drive slot; a power or
+/// An idle drive is honoured on every pin with a drive slot; a power-in or
 /// passive pin has none, so an idle drive declared on one is refused at
-/// build, naming the pin, by both routes a declaration can arrive.
+/// build, naming the pin, by both routes a declaration can arrive. A
+/// `PowerOut` pin's slot is its terminal's, and its idle drive is what the
+/// rail holds before its part publishes (`board/tests/terminals.rs`).
 #[rstest]
 #[case::power_in_released(PinKind::PowerIn, IdleDrive::Released)]
 #[case::power_in_thevenin(PinKind::PowerIn, IdleDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 0.1 }))]
-#[case::power_out_released(PinKind::PowerOut, IdleDrive::Released)]
-#[case::power_out_thevenin(PinKind::PowerOut, IdleDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 0.1 }))]
 #[case::passive_released(PinKind::Passive, IdleDrive::Released)]
 #[case::passive_thevenin(PinKind::Passive, IdleDrive::Thevenin(TheveninDrive { volts: 0.0, impedance: 25.0 }))]
 fn an_idle_drive_on_a_pin_without_a_drive_slot_is_refused_at_build(
@@ -447,13 +447,13 @@ fn an_idle_drive_on_a_pin_without_a_drive_slot_is_refused_at_build(
         id: "pin.idle-drive-needs-a-drive-slot",
         covers: Some("board/src/board.rs#validate_idle_drives"),
         given: "a part declaring an idle drive — released, or a voltage behind an impedance — \
-                on a power-in, power-out or passive pin, brought to the build as a netlist part \
-                or as a bench component",
+                on a power-in or passive pin, brought to the build as a netlist part or as a \
+                bench component",
     });
     expect!(
         "build-refused",
         "the build fails and the error names the part and the pin",
-        "a power or passive pin has no drive slot, so the declaration is a static fact the \
+        "a power-in or passive pin has no drive slot, so the declaration is a static fact the \
          engine could only drop; refusing it keeps every declaration honoured"
     );
 

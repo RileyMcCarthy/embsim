@@ -213,8 +213,10 @@ name = "embsim-boards"
 version = "0.1.0"
 dependencies = [
  "embsim-board",
+ "embsim-core",
  "embsim-models",
  "rstest",
+ "tracing",
 ]
 
 [[package]]

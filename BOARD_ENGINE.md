@@ -209,9 +209,22 @@ alone). Then, per node:
   `NODES.md` §10's `Sense { volts }`. A current injected where no Thevenin
   source reaches leaves the node `Floating` with
   `Finding::CurrentIntoFloatingNode`.
-- A rail whose voltage no model declares yet (`PowerOut` at NaN) sources its
-  cluster as *up*: a node nothing numeric reaches reads `Pulled(High, path)`
-  through the path to the nearest such rail.
+- A **declared terminal** — a `PowerOut` pin's net, a harness `power(V)`
+  endpoint, a `net_stuck` — is a cluster of its own and a boundary of every
+  cluster around it (`NODES.md` "Three rules the taxonomy rests on", 1;
+  phase 4): a resistor or an element ends on it and nothing unions through
+  it; what it holds is decided once from its sources (`decide_terminal`) and
+  enters every dependent's solve as a Dirichlet constant and every
+  dependent's ranking as an ideal 0 Ω source through the path to it; two
+  sources that disagree on it are one fight, solved and reported once at
+  the terminal; a change to what it holds re-resolves the terminal's cluster
+  and its fan-out (`Topology::terminals`, `mark_terminal_dirty`). Membership
+  is fixed at build — the terminal is declared whatever it holds.
+- A rail whose voltage no model declares yet (`PowerOut` at NaN, the facade's
+  default idle) sources its cluster as *up*: a node nothing numeric reaches
+  reads `Pulled(High, path)` through the path to the nearest such rail. A
+  rail its part released holds nothing: its node floats, and its dependents
+  read only what else reaches them.
 - A `TheveninDrive` behind a non-finite impedance is normalised to
   *released* at the drive slot (`Resolver::set_drive`), so it is never
   ranked and never escalates a cluster.
@@ -236,14 +249,19 @@ Power is **volts, not booleans**:
 pub struct PowerState { pub volts: f64, pub ok: bool }
 ```
 
-- `PowerOut` pins source their net at a declared voltage; those rails enter
-  cluster solves as real sources (the MNA needs values, and chip models need
-  the numeric AVDD for range checks like PGA common-mode).
+- `PowerOut` pins source their net at the voltage their part publishes
+  (`PinHandle::drive` on the pin sets it, `release` lets it go; the declared
+  idle drive is what the rail holds before the part publishes); those rails
+  are terminals, and enter every cluster that reads them as constants (the
+  MNA needs values, and chip models need the numeric AVDD for range checks
+  like PGA common-mode).
 - A power net with **no `PowerOut` source anywhere** (board or harness) raises
   a **`PowerNetUnsourced`** finding and presents as down — this is precisely
   the "AVDD unstrapped" failure mode.
-- A down domain presents its rail nodes to cluster solves as 0 V sources (not
-  removed), so dependent analog senses read the physical consequence.
+- A down rail is a **released** terminal (a real buck or LDO output is
+  high-impedance): its node floats, its loads read only what else reaches
+  them, and a bench strap onto the net sources it without a fight. A part
+  with an active output discharge drives 0 V and cites it.
 - **No implicit net-name merging across boards.** Two boards both naming a net
   `GND` share nothing until a harness connects them — grounds included. An
   unreferenced ground is a finding, not an assumption.
@@ -458,6 +476,11 @@ A platform crate (per `CONTRACT.md`) provides the MCU component:
    bridges attach installed (`serial::init` preserves installed FDs).
    Entry-less components stay in facade mode: `Emulator::run` on the
    caller's thread against the default instance keeps working unchanged.
+   Inside a P2 package (`embsim_boards::p2::P2Package`) the core's start
+   is gated once more, by the chip: the package holds `P2Core::start` —
+   the firmware entry, a QEMU core's first wake — until `RESN` reads
+   released and `VDD` a voltage inside the datasheet's window, and starts
+   it at that instant (`NODES.md` §2 "MCU node (P2)", the START gate).
 2. **Peripherals**: the generic peripheral emulations become fields of the MCU
    component instance rather than process globals. The full global-state
    inventory this de-globalizes: serial (`CHANNEL_FDS`/baud/pacing), GPIO
@@ -550,7 +573,16 @@ finding names the elements), `PowerNetUnsourced` (a power pin on a net no
 source reaches — or one that floats behind an off element, a rail blocked by
 a reversed polarity FET), `StreamMismatch`,
 `ClassificationError`, `UnconnectedRegistryPin` (both directions:
-declared-but-absent and present-but-undeclared).
+declared-but-absent and present-but-undeclared), and the four the build
+raises after its fixed point from the settled states and the parts'
+declarations (`NODES.md` §8 phase 4): `RailDown` (a `PowerOut` pin whose
+net floats, with the reason the build can see — an input unsourced, the
+output's reference unheld, or the part holding it, a soft-start the
+snapshot is early for), `UnreferencedDomain` (a pin whose net is sourced
+while its declared reference's net is not — an isolator's unwired
+secondary ground), `UndecoupledPowerPin` (a power-in pin with no capacitor
+to its reference), `MechanicalOnDrivenNet` (a mounting hole's pad on a net a
+pin drives).
 
 ## Testing conventions
 

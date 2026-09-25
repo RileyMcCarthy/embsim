@@ -119,7 +119,7 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::{
     AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms, PinDecl, PinHandle,
-    PinKind, PulseTrain, PulseTx, StreamRole, TheveninDrive, Volts,
+    PinKind, PinReference, PulseTrain, PulseTx, StreamRole, TheveninDrive, Volts,
 };
 
 use super::{
@@ -897,6 +897,12 @@ impl Iso67xxMonitor {
 #[derive(Debug)]
 pub struct Iso67xx {
     pins: Vec<PinDecl>,
+    /// Each side's supply against that side's first ground pin — the
+    /// declaration the build's domain lint reads
+    /// (`embsim_board::Finding::UnreferencedDomain`): a side whose supply
+    /// a source reaches while its ground floats is a domain measured
+    /// against nothing.
+    references: Vec<PinReference>,
     core: Arc<Core>,
 }
 
@@ -907,6 +913,17 @@ impl Iso67xx {
         let specs = config.variant.pin_specs();
         let wiring = wiring_for(&config);
         let pins = specs.iter().map(|spec| declare(spec, &config)).collect();
+        let references = [Side::One, Side::Two]
+            .into_iter()
+            .filter_map(|side| {
+                let vcc = specs.iter().find(|s| s.role == Role::Vcc(side))?;
+                let gnd = specs.iter().find(|s| s.role == Role::Gnd(side))?;
+                Some(PinReference {
+                    pin: vcc.number,
+                    reference: gnd.number,
+                })
+            })
+            .collect();
         tracing::info!(
             variant = config.variant.label(),
             fail_safe = config.fail_safe,
@@ -915,6 +932,7 @@ impl Iso67xx {
         );
         Ok(Self {
             pins,
+            references,
             core: Arc::new(Core {
                 config,
                 wiring,
@@ -1006,6 +1024,10 @@ fn declare(spec: &PinSpec, config: &Config) -> PinDecl {
 impl Component for Iso67xx {
     fn pins(&self) -> &[PinDecl] {
         &self.pins
+    }
+
+    fn references(&self) -> &[PinReference] {
+        &self.references
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {

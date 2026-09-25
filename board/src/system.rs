@@ -32,13 +32,13 @@ use std::time::Duration;
 use crate::board::{validate_idle_drives, Board, BoardError, PartClass};
 use crate::cluster::QuasiStaticMna;
 use crate::component::{
-    Component, ComponentNetIo, IdleDrive, PinDecl, PinHandle, PinKind, PwlCurve, RegionTest,
-    StreamRole,
+    BuildTopology, Component, ComponentNetIo, Drive, IdleDrive, PinDecl, PinHandle, PinKind,
+    PwlCurve, RegionTest, ResistorAt, StreamRole,
 };
-use crate::diagnostics::{Diagnostics, Finding};
+use crate::diagnostics::{Diagnostics, Finding, RailDownReason};
 use crate::engine::{
     same_state, ComponentId, CurrentTable, Dsu, EndpointId, EngineHandle, EngineLink, ReadKind,
-    RecordedCallback, Resolver, SenseLog, DEFAULT_HIGH_LEVEL_VOLTS,
+    RecordedCallback, Resolver, SenseLog, TerminalDrive, DEFAULT_HIGH_LEVEL_VOLTS,
 };
 use crate::event_log::EventLog;
 use crate::net::{
@@ -400,6 +400,9 @@ struct PreparedPin {
     /// The elements this pin terminates, as `(element index, sign)` (see
     /// [`crate::PinHandle::sense_current`]).
     branch_terms: Vec<(usize, f64)>,
+    /// A `PowerOut` pin: its slot is its terminal's, and its current spans
+    /// clusters — no current port, no instrument.
+    terminal: bool,
 }
 
 /// Whether a declared pin is a released bidirectional pad — the one kind
@@ -478,14 +481,46 @@ impl CurrentPaths {
     }
 }
 
+/// One pin of a part, as the build lints see it.
+struct PinLint {
+    number: String,
+    kind: PinKind,
+    net: usize,
+}
+
+/// One part, as the build lints see it: its path, its pins on their global
+/// nets, and its declared references as pin numbers.
+struct PartLint {
+    path: String,
+    pins: Vec<PinLint>,
+    /// `(pin number, reference pin number)`.
+    references: Vec<(String, String)>,
+}
+
+/// What the build lints read after the fixed point (`NODES.md` §8 phase 4,
+/// "the build lints"): the fitted two-pin capacitors by the nets they
+/// bridge, the mechanical nodes' pads, and every registered part's pins and
+/// references.
+#[derive(Default)]
+struct LintInputs {
+    /// Global nets at the two ends of every fitted two-pin capacitor.
+    capacitors: Vec<(usize, usize)>,
+    /// `(Board.Reference, global net)` of every mechanical node's pad.
+    mechanical: Vec<(String, usize)>,
+    parts: Vec<PartLint>,
+}
+
 /// Output of the shared assembly pass: the merged net table, the populated
 /// resolver (one code path for build-time analysis and live resolution),
-/// the components ready to attach, and the current paths.
+/// the components ready to attach, the current paths, the build-time
+/// topology a component may read at attach, and the lint inputs.
 struct Assembly {
     nets: Vec<Net>,
     resolver: Resolver,
     components: Vec<PreparedComponent>,
     paths: CurrentPaths,
+    topology: Arc<BuildTopology>,
+    lints: LintInputs,
 }
 
 impl System {
@@ -595,6 +630,8 @@ impl System {
             mut resolver,
             components,
             paths,
+            topology,
+            lints,
         } = self.assemble()?;
 
         let mut diagnostics = Diagnostics::new();
@@ -626,7 +663,8 @@ impl System {
         let mut attached = Vec::with_capacity(components.len());
         for mut prepared in components {
             let io =
-                ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone());
+                ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone())
+                    .with_topology(Arc::clone(&topology));
             prepared
                 .component
                 .attach(io)
@@ -780,6 +818,13 @@ impl System {
         drop(attached);
 
         let roots = resolver.identity_roots(nets.len());
+        // The build lints, over the settled snapshot (`NODES.md` §8 phase
+        // 4): a rail that sources nothing, a domain measured against
+        // nothing, a supply pin no capacitor decouples, a mechanical pad
+        // a pin drives. Build-time analysis only — they read the settled
+        // states and the declarations, and the live engine re-derives
+        // nothing of them.
+        lint_build(&nets, &roots, &resolver, &lints, &mut diagnostics);
         let cluster_roots = resolver.cluster_roots(nets.len());
         let escalated_solves = resolver.escalated_solves();
         let currents = resolver.current_table();
@@ -817,6 +862,8 @@ impl System {
             resolver,
             components,
             paths,
+            topology,
+            lints: _,
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
@@ -835,7 +882,8 @@ impl System {
                 handle_entries(&prepared.pins, &link),
                 Some(ComponentId(index)),
                 link.clone(),
-            );
+            )
+            .with_topology(Arc::clone(&topology));
             if let Err(error) = prepared.component.attach(io) {
                 let error = SystemError::Board {
                     name: prepared.board.clone(),
@@ -1127,23 +1175,41 @@ impl System {
             }
         }
 
-        // -- closed switch poles: identity unions --------------------------
+        // -- closed switch poles and inductors: identity unions -------------
         // A closed pole is the same merge a `pin_short` fault makes — its two
         // pins' nets become one electrical node — and it honours a detached
         // pin the same way a passive edge does: a lifted contact conducts
         // nothing. Membership is fixed at build (`NODES.md` §2, rule 3), so
-        // this is the whole of a switch's electrical existence.
+        // this is the whole of a switch's electrical existence. An inductor
+        // is the same merge: the DC short it has always been (`NODES.md` §2,
+        // the Inductor row), with a closed pole's semantics rather than a
+        // 0 Ω conduction edge's — so a regulator's output inductor makes the
+        // rail *the terminal's node*, a boundary of its loads' clusters,
+        // where a 0 Ω edge from the switch node made the rail a member of
+        // every load's cluster (the Edge board's `+3.3V` with its nine LED
+        // chains: 19 roots; `NODES.md` §8, the phase-4 record).
         for (bi, (_, board)) in self.boards.iter().enumerate() {
             for record in &board.records {
                 if !record.fitted {
                     continue;
                 }
-                let PartClass::Switch { poles } = &record.class else {
-                    continue;
+                let poles: Vec<(String, String)> = match &record.class {
+                    PartClass::Switch { poles } => poles
+                        .iter()
+                        .filter(|p| p.state == JumperState::Closed)
+                        .map(|p| (p.a.clone(), p.b.clone()))
+                        .collect(),
+                    PartClass::Passive {
+                        kind: PassiveKind::Inductor,
+                        ..
+                    } if record.pins.len() == 2 => {
+                        vec![(record.pins[0].clone(), record.pins[1].clone())]
+                    }
+                    _ => continue,
                 };
-                for pole in poles.iter().filter(|p| p.state == JumperState::Closed) {
-                    let a = (bi, PinRef::new(record.reference.clone(), pole.a.clone()));
-                    let b = (bi, PinRef::new(record.reference.clone(), pole.b.clone()));
+                for (pin_a, pin_b) in poles {
+                    let a = (bi, PinRef::new(record.reference.clone(), pin_a));
+                    let b = (bi, PinRef::new(record.reference.clone(), pin_b));
                     if detached.contains(&a) || detached.contains(&b) {
                         continue;
                     }
@@ -1156,6 +1222,14 @@ impl System {
 
         // -- electrical descriptors ----------------------------------------
         let mut resolver = Resolver::new(nets.len(), dsu);
+        // The identity roots are final here — every harness merge and
+        // closed pole is in the DSU — so the build-time topology a part
+        // reads at attach (`ComponentNetIo::resistors_at`, `::node`) and
+        // the lint inputs are collected against them as the descriptors
+        // are registered.
+        let root_of = resolver.identity_roots(nets.len());
+        let mut resistors: HashMap<usize, Vec<ResistorAt>> = HashMap::new();
+        let mut lints = LintInputs::default();
         for (idx, volts) in power_sources {
             resolver.add_power_source(idx, volts);
         }
@@ -1197,11 +1271,54 @@ impl System {
                     PartClass::Passive { kind, value } => {
                         let conducts = match kind {
                             PassiveKind::Resistor => value.is_some(),
-                            // DC short (documented simplification).
-                            PassiveKind::Inductor => true,
+                            // A DC short: an identity union, made above with
+                            // the closed poles — no edge.
+                            PassiveKind::Inductor => false,
                             // DC open in the build-time pass.
                             PassiveKind::Capacitor | PassiveKind::Diode | PassiveKind::Led => false,
                         };
+                        let ends = (record.pins.len() == 2)
+                            .then(|| {
+                                let a = (
+                                    bi,
+                                    PinRef::new(record.reference.clone(), record.pins[0].clone()),
+                                );
+                                let b = (
+                                    bi,
+                                    PinRef::new(record.reference.clone(), record.pins[1].clone()),
+                                );
+                                if detached.contains(&a) || detached.contains(&b) {
+                                    return None;
+                                }
+                                Some((*net_of_pin.get(&a)?, *net_of_pin.get(&b)?))
+                            })
+                            .flatten();
+                        match (kind, ends) {
+                            // The decoupling lint's input: every fitted
+                            // two-pin capacitor by the nets it bridges,
+                            // value or no value.
+                            (PassiveKind::Capacitor, Some(ends)) => lints.capacitors.push(ends),
+                            // The topology query's input: a resistor with
+                            // a value, on both nodes it touches — with the
+                            // far end reported as a node (its root), so a
+                            // part can compare it with its own pins'.
+                            (PassiveKind::Resistor, Some((a, b))) => {
+                                if let Some(ohms) = value {
+                                    let (ra, rb) = (root_of[a], root_of[b]);
+                                    if ra != rb {
+                                        let reference = format!("{bname}.{}", record.reference);
+                                        for (here, there) in [(ra, rb), (rb, ra)] {
+                                            resistors.entry(here).or_default().push(ResistorAt {
+                                                reference: reference.clone(),
+                                                ohms: *ohms,
+                                                far: NetId(there),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                         // A capacitor with a parsed value is an AC path for
                         // rate routing — a step clock or an oscillator's
                         // output crosses it — and a DC open everywhere else
@@ -1245,7 +1362,11 @@ impl System {
                             );
                         }
                     }
-                    PartClass::Registered { pins, branches } => {
+                    PartClass::Registered {
+                        pins,
+                        branches,
+                        references,
+                    } => {
                         for pin in pins {
                             let key = (bi, PinRef::new(record.reference.clone(), pin.number));
                             if detached.contains(&key) {
@@ -1305,6 +1426,36 @@ impl System {
                                 }
                             }
                         }
+                        // The lints' view of the part: its pins on their
+                        // nets and its references by pin number (a detached
+                        // pin is on no net and drops out).
+                        lints.parts.push(PartLint {
+                            path,
+                            pins: pins
+                                .iter()
+                                .filter_map(|pin| {
+                                    let key =
+                                        (bi, PinRef::new(record.reference.clone(), pin.number));
+                                    (!detached.contains(&key))
+                                        .then(|| net_of_pin.get(&key).copied())
+                                        .flatten()
+                                        .map(|net| PinLint {
+                                            number: pin.number.to_string(),
+                                            kind: pin.kind,
+                                            net,
+                                        })
+                                })
+                                .collect(),
+                            references: references
+                                .iter()
+                                .filter_map(|r| {
+                                    Some((
+                                        number_of(r.pin)?.to_string(),
+                                        number_of(r.reference)?.to_string(),
+                                    ))
+                                })
+                                .collect(),
+                        });
                     }
                     // An element registered by spec: its branches stamp
                     // into the cluster solve like a component's, and each
@@ -1357,10 +1508,17 @@ impl System {
                     // electrical existence; a probe senses through
                     // `BuiltSystem::probe`, which lands with the first board
                     // that carries a test point.
-                    PartClass::Boundary
-                    | PartClass::Switch { .. }
-                    | PartClass::Mechanical
-                    | PartClass::Probe => {}
+                    PartClass::Mechanical => {
+                        for pin in &record.pins {
+                            let key = (bi, PinRef::new(record.reference.clone(), pin.clone()));
+                            if let Some(&net) = net_of_pin.get(&key) {
+                                lints
+                                    .mechanical
+                                    .push((format!("{bname}.{}", record.reference), net));
+                            }
+                        }
+                    }
+                    PartClass::Boundary | PartClass::Switch { .. } | PartClass::Probe => {}
                 }
             }
         }
@@ -1399,6 +1557,31 @@ impl System {
                     .position(|p| p.number == id || p.name == Some(id))
             };
             let net_of = |id: &str| -> Option<usize> { position_of(id).map(|i| pin_nets[i]) };
+            lints.parts.push(PartLint {
+                path: bench.name.clone(),
+                pins: pins
+                    .iter()
+                    .zip(pin_nets)
+                    .map(|(pin, &net)| PinLint {
+                        number: pin.number.to_string(),
+                        kind: pin.kind,
+                        net,
+                    })
+                    .collect(),
+                references: bench
+                    .component
+                    .references()
+                    .iter()
+                    .filter_map(|r| {
+                        let number = |id: &str| {
+                            pins.iter()
+                                .find(|p| p.number == id || p.name == Some(id))
+                                .map(|p| p.number.to_string())
+                        };
+                        Some((number(r.pin)?, number(r.reference)?))
+                    })
+                    .collect(),
+            });
             let mut terms: Vec<Vec<(usize, f64)>> = vec![Vec::new(); pins.len()];
             for branch in bench.component.branches() {
                 if let Some((index, a, b)) = register_branch(
@@ -1440,10 +1623,14 @@ impl System {
                         if let Some(&net) = net_of_pin.get(&key) {
                             let endpoint = endpoints.get(&key).copied();
                             let terms = branch_terms.get(&key).cloned().unwrap_or_default();
-                            if endpoint.is_some() || !terms.is_empty() {
+                            let terminal = pin.kind == PinKind::PowerOut;
+                            // A terminal's current spans clusters: its
+                            // slot is no current port (`NODES.md` §2, the
+                            // I-V port paragraph).
+                            if (endpoint.is_some() && !terminal) || !terms.is_empty() {
                                 paths.ports.push(CurrentPort {
                                     path: format!("{bname}.{reference}.{}", pin.number),
-                                    endpoint,
+                                    endpoint: endpoint.filter(|_| !terminal),
                                     branch_terms: terms.clone(),
                                 });
                             }
@@ -1455,6 +1642,7 @@ impl System {
                                 stream: pin.stream,
                                 reads_when_released: reads_when_released(pin),
                                 branch_terms: terms,
+                                terminal,
                             });
                         }
                     }
@@ -1484,10 +1672,11 @@ impl System {
                 .zip(endpoints)
                 .zip(terms)
                 .map(|(((pin, &net), endpoint), branch_terms)| {
-                    if endpoint.is_some() || !branch_terms.is_empty() {
+                    let terminal = pin.kind == PinKind::PowerOut;
+                    if (endpoint.is_some() && !terminal) || !branch_terms.is_empty() {
                         paths.ports.push(CurrentPort {
                             path: format!("{}.{}", bench.name, pin.number),
-                            endpoint,
+                            endpoint: endpoint.filter(|_| !terminal),
                             branch_terms: branch_terms.clone(),
                         });
                     }
@@ -1499,6 +1688,7 @@ impl System {
                         stream: pin.stream,
                         reads_when_released: reads_when_released(pin),
                         branch_terms,
+                        terminal,
                     }
                 })
                 .collect();
@@ -1515,6 +1705,8 @@ impl System {
             resolver,
             components,
             paths,
+            topology: Arc::new(BuildTopology { root_of, resistors }),
+            lints,
         })
     }
 
@@ -1644,6 +1836,119 @@ impl System {
     }
 }
 
+/// The build lints (`NODES.md` §8 phase 4), over the settled snapshot.
+///
+/// - [`Finding::RailDown`] for every `PowerOut` pin whose net reaches no
+///   source — the terminal is released — unless the pin is another pin's
+///   declared reference (an isolated ground is a reference terminal the
+///   board or the harness holds, never a rail). The reason is what the
+///   build can see: an input of the part (a power-in pin with a declared
+///   reference) on an unsourced net first, the output's reference unheld
+///   second, any other floating power-in pin — a ground — as an unheld
+///   reference third, the part's own gate otherwise.
+/// - [`Finding::UnreferencedDomain`] for a pin whose net a source reaches
+///   while its declared reference's net reaches none.
+/// - [`Finding::UndecoupledPowerPin`] for a power-in pin with no fitted
+///   capacitor between its node and its reference's node.
+/// - [`Finding::MechanicalOnDrivenNet`] for a mechanical pad on a node a
+///   pin drives.
+///
+/// "Reaches no source" is the settled state `Floating` — the same fact
+/// `FloatingSense` and `PowerNetUnsourced` report from.
+fn lint_build(
+    nets: &[Net],
+    root_of: &[usize],
+    resolver: &Resolver,
+    lints: &LintInputs,
+    diagnostics: &mut Diagnostics,
+) {
+    let unsourced = |net: usize| nets[net].state == NetState::Floating;
+    let capacitor_pairs: HashSet<(usize, usize)> = lints
+        .capacitors
+        .iter()
+        .map(|&(a, b)| {
+            let (ra, rb) = (root_of[a], root_of[b]);
+            (ra.min(rb), ra.max(rb))
+        })
+        .collect();
+    for part in &lints.parts {
+        let pin = |number: &str| part.pins.iter().find(|p| p.number == number);
+        let reference_of = |number: &str| -> Option<&PinLint> {
+            part.references
+                .iter()
+                .find(|(p, _)| p == number)
+                .and_then(|(_, r)| pin(r))
+        };
+        let is_reference = |number: &str| part.references.iter().any(|(_, r)| r == number);
+        for p in &part.pins {
+            let reference = reference_of(&p.number);
+            if let Some(r) = reference {
+                if !unsourced(p.net) && unsourced(r.net) {
+                    diagnostics.report(Finding::UnreferencedDomain {
+                        part: part.path.clone(),
+                        pin: p.number.clone(),
+                        reference: r.number.clone(),
+                    });
+                }
+                if p.kind == PinKind::PowerIn {
+                    let (ra, rb) = (root_of[p.net], root_of[r.net]);
+                    if ra != rb && !capacitor_pairs.contains(&(ra.min(rb), ra.max(rb))) {
+                        diagnostics.report(Finding::UndecoupledPowerPin {
+                            part: part.path.clone(),
+                            pin: p.number.clone(),
+                            reference: r.number.clone(),
+                        });
+                    }
+                }
+            }
+            if p.kind == PinKind::PowerOut && !is_reference(&p.number) && unsourced(p.net) {
+                // An input is a power-in pin measured against a declared
+                // reference; a power-in pin with none is a ground, and a
+                // floating ground is an unheld reference, not a missing
+                // supply.
+                let reason = if let Some(input) = part.pins.iter().find(|q| {
+                    q.kind == PinKind::PowerIn
+                        && reference_of(&q.number).is_some()
+                        && unsourced(q.net)
+                }) {
+                    RailDownReason::InputUnsourced {
+                        pin: input.number.clone(),
+                    }
+                } else if let Some(r) = reference.filter(|r| unsourced(r.net)) {
+                    RailDownReason::ReferenceUnheld {
+                        pin: r.number.clone(),
+                    }
+                } else if let Some(ground) = part
+                    .pins
+                    .iter()
+                    .find(|q| q.kind == PinKind::PowerIn && unsourced(q.net))
+                {
+                    RailDownReason::ReferenceUnheld {
+                        pin: ground.number.clone(),
+                    }
+                } else {
+                    RailDownReason::HeldDown
+                };
+                diagnostics.report(Finding::RailDown {
+                    part: part.path.clone(),
+                    pin: p.number.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    for (part, net) in &lints.mechanical {
+        let drivers = resolver.driving_pins(root_of, root_of[*net]);
+        if !drivers.is_empty() {
+            diagnostics.report(Finding::MechanicalOnDrivenNet {
+                part: part.clone(),
+                net: nets[*net].name.clone(),
+                drivers,
+            });
+        }
+    }
+}
+
 /// Split `"Board.Ref"` against known boards.
 fn split_board_ref(path: &str, boards: &HashMap<String, usize>) -> Option<(usize, String)> {
     let (board, reference) = path.split_once('.')?;
@@ -1697,15 +2002,23 @@ fn add_pin_descriptor(
             None
         }
         PinKind::PowerOut => {
-            debug_assert!(
-                declared_idle.is_none(),
-                "{pin_ref:?}: idle drive on a PowerOut pin"
-            );
-            // Component-declared rail voltage arrives with the regulator
-            // models (a later slice); presence is what the build-time pass
-            // needs. NaN marks "sourced at an unmodeled voltage".
-            resolver.add_power_source(net, f64::NAN);
-            None
+            // The pin's net is a declared terminal from build on — its own
+            // cluster and a boundary of every cluster around it (`NODES.md`
+            // "Three rules the taxonomy rests on", 1) — and the slot is how
+            // the part sets what it holds. Until the part publishes it
+            // holds its declared idle: released (a rail that is down), a
+            // voltage, or by default the unmodelled rail a facade declares
+            // ("sourced at an unmodelled voltage", NaN in the source
+            // table), which the regulator models retire with the facades.
+            // A declared Thevenin idle keeps its impedance on the slot —
+            // the I-V port's record, never solved — as a published drive
+            // does.
+            let idle = match pin.idle {
+                IdleDrive::KindDefault => TerminalDrive::Unmodelled.idle_slot_drive(),
+                IdleDrive::Released => TerminalDrive::Released.idle_slot_drive(),
+                IdleDrive::Thevenin(drive) => Some(Drive::Thevenin(drive)),
+            };
+            Some(resolver.add_terminal_endpoint(net, pin_ref.clone(), idle))
         }
         PinKind::DigitalOut | PinKind::DigitalBidir => {
             // Idle default: stream producers idle Driven(High) per the
@@ -1735,7 +2048,8 @@ fn handle_entries(pins: &[PreparedPin], link: &EngineLink) -> Vec<(String, PinHa
     for pin in pins {
         let handle = PinHandle::wired(NetId(pin.net), pin.endpoint, pin.stream, link.clone())
             .reading_when_released(pin.reads_when_released)
-            .with_branch_terms(pin.branch_terms.clone());
+            .with_branch_terms(pin.branch_terms.clone())
+            .on_terminal(pin.terminal);
         entries.push((pin.number.clone(), handle.clone()));
         if let Some(name) = &pin.name {
             entries.push((name.clone(), handle));
@@ -1819,9 +2133,10 @@ impl BuiltSystem {
     /// The census of the system's conduction clusters: one entry per
     /// cluster, the identity roots it holds, in ascending cluster-root
     /// order (roots ascending within). A conduction cluster is what a
-    /// resistor, an inductor or a closed jumper joins and what nothing else
-    /// crosses; a root is one electrical node after harness and `pin_short`
-    /// merges, named by any of the nets merged into it (see
+    /// resistor joins, ending at a declared terminal, and what nothing else
+    /// crosses; a root is one electrical node after harness, `pin_short`,
+    /// closed-pole and inductor merges, named by any of the nets merged into
+    /// it (see
     /// [`BuiltSystem::nets`]). So an entry's length is the size `m` of the
     /// matrix an escalated solve of that cluster builds, and the longest
     /// entry bounds every solve on the board — the number `DESIGN.md` rule 4

@@ -18,10 +18,26 @@
 //! sinking the cathodes), the four PSRAMs as memories answering the SPI
 //! command set, the DIP switch and the oscillator-option solder link as
 //! switches with poles, the mounting holes and the BOM-only lines as
-//! mechanical nodes, the regulators, the polarity FET and the brownout
-//! detector as pin facades (the parts `NODES.md` §8 phases 3–4 turn into
-//! models), and all 114 components classified and validated against the
-//! vendor netlist — every one a node.
+//! mechanical nodes, the polarity FET and the two white LEDs as elements
+//! by specification, the two bucks and the eight LDOs as rails — each
+//! output a declared terminal, published at its setpoint from the instant
+//! its input allows plus its soft-start, the bucks' setpoints read from
+//! their feedback dividers at attach — the brownout detector as a
+//! comparator holding `RESN` while the core rail is under 1.6 V, and all
+//! 114 components classified and validated against the vendor netlist —
+//! every one a node, none a facade.
+//!
+//! # The power tree, and what it means for a test
+//!
+//! From the carrier's 5 V and 0 V on `J203`, the polarity FET `U401`
+//! passes the input, the bucks `U402` (1.813 V, `Common_VDD`) and `U403`
+//! (3.649 V, `Common_LDOin`) rise **2.5 ms** later (the AP62301's
+//! soft-start), and the eight LDOs step to 3.3 V on the `VIO_*` bank rails
+//! at that same instant. A build snapshot is the state before the first
+//! wake, so every module rail is down in it and reported as such
+//! ([`embsim_board::Finding::RailDown`]); a test that wants the rails up
+//! starts the system and steps past the soft-start
+//! (`board/tests/power_tree.rs`).
 //!
 //! ```no_run
 //! # use embsim_boards::ec32mb::Ec32mb;
@@ -68,20 +84,20 @@
 //! prefix and keys parts on their `value` field.
 
 use embsim_board::{
-    netlist, Board, BoardError, Component, ComponentDecl, PartRegistry, PinDecl, SwitchPole,
+    netlist, Board, BoardError, Component, ComponentDecl, PartRegistry, SwitchPole,
 };
 use embsim_models::logic_gate::{self, LogicGate, LVC2G04_PINS_BY_FUNCTION};
 use embsim_models::oscillator::{self, Oscillator};
 use embsim_models::psram::{Psram, PsramComponent};
 use embsim_models::pwl_library;
+use embsim_models::rail::{self, Rail, AP62301_PINS_BY_FUNCTION, NCP114_PINS_BY_FUNCTION};
 use embsim_models::sd_card::SdCard;
 use embsim_models::sd_card_component::{SdCardComponent, SD_CARD_PINS_BY_FUNCTION};
 use embsim_models::spi_flash::SpiNorFlash;
 use embsim_models::spi_flash_component::{
     FlashView, SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION,
 };
-
-use crate::stub::{dig_in, passive, pwr_in, pwr_out, register_stub};
+use embsim_models::supervisor::{self, VoltageDetector, STM1061_PINS_BY_FUNCTION};
 
 /// The vendor netlist this board is built from.
 pub const NETLIST: &str = include_str!("../netlists/p2_ec32mb.net");
@@ -134,30 +150,17 @@ pub const PSRAM_PART: &str = "PSRAM 64Mbit";
 /// The TCXO's frequency, as its value names it: 20 MHz.
 pub const TCXO_HZ: u32 = 20_000_000;
 
-/// `DCDC 3A SOT563` — Diodes AP62301Z buck (U402, U403). `SW` is declared
-/// `PinKind::PowerOut`: it is the switching node the output inductor
-/// integrates into a rail, and marking it a source is what makes the module's
-/// power tree reachable.
-pub const BUCK_PINS: [PinDecl; 5] = [
-    pwr_in("VIN"),
-    pwr_in("GND"),
-    passive("BST"),
-    dig_in("FB"),
-    pwr_out("SW"),
-];
-
-/// `Voltage Detector 1.6V` — STMicro STM1061 brownout detector (U404). `~OUT`
-/// is open-drain and unmodeled, so it is a sense.
-pub const BROWNOUT_PINS: [PinDecl; 3] = [pwr_in("VCC"), pwr_in("VSS"), dig_in("OUT")];
-
-/// `LDO 300mA, 3.3V` — OnSemi NCP114 (U501..U508), one per P2 I/O bank pair.
-pub const LDO_PINS: [PinDecl; 5] = [
-    dig_in("EN"),
-    pwr_in("IN"),
-    pwr_in("GND"),
-    pwr_in("GND_P"),
-    pwr_out("OUT"),
-];
+/// Registry key for the two bucks `U402` (the core rail, `Common_VDD`) and
+/// `U403` (the LDO input rail, `Common_LDOin`) — their `value`, Diodes
+/// `AP62301Z6-7`. One key, two setpoints: each part reads its own feedback
+/// divider at attach.
+pub const BUCK_PART: &str = "DCDC 3A SOT563";
+/// Registry key for the brownout detector `U404` — its `value`, STMicro
+/// `STM1061N16WX6F`.
+pub const BROWNOUT_DETECTOR_PART: &str = "Voltage Detector 1.6V";
+/// Registry key for the eight bank LDOs `U501`–`U508` — their `value`,
+/// onsemi `NCP114AMX330TCG`, which also names their 3.3 V.
+pub const LDO_PART: &str = "LDO 300mA, 3.3V";
 
 /// `DIP Switch 4 way` — the module's option switch (S301): four poles, one
 /// per printed position, each between the netlist's `<position>_ON` and
@@ -234,10 +237,29 @@ fn class_registry() -> PartRegistry {
     // their number, all from the element library.
     pwl_library::register(&mut registry);
 
-    // Pin facades, until phase 4 gives each its rail model.
-    register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
-    register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
-    register_stub(&mut registry, "LDO 300mA, 3.3V", &LDO_PINS);
+    // The power tree (`NODES.md` §8 phase 4): the two bucks from one key,
+    // each reading its feedback divider at attach; the eight LDOs at the
+    // voltage their value names; the detector at its 1.6 V threshold.
+    registry.register(BUCK_PART, |_decl| {
+        Box::new(
+            Rail::new(rail::Config::ap62301(), &AP62301_PINS_BY_FUNCTION)
+                .expect("the AP62301 table carries every role"),
+        )
+    });
+    registry.register(LDO_PART, |decl| {
+        let config = rail::Config::ncp114_from_value(&decl.value)
+            .unwrap_or_else(|| panic!("{}: the LDO value names no voltage", decl.reference));
+        Box::new(
+            Rail::new(config, &NCP114_PINS_BY_FUNCTION)
+                .expect("the NCP114 table carries every role"),
+        )
+    });
+    registry.register(BROWNOUT_DETECTOR_PART, |_decl| {
+        Box::new(VoltageDetector::new(
+            supervisor::Config::stm1061n16(),
+            &STM1061_PINS_BY_FUNCTION,
+        ))
+    });
     registry
 }
 

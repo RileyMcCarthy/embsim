@@ -12,8 +12,11 @@
 //! that earns it (§8 phase 7).
 //!
 //! The cluster at each size is representative of the boards, not synthetic:
-//! a 3.3 V rail terminal and a ground terminal (ideal sources, as a
-//! `PowerOut` or a harness `power(V)` enters a solve), signal nodes each
+//! a 3.3 V rail terminal and a ground terminal (as ideal 0 Ω sources, the
+//! way a `PowerOut` or a harness `power(V)` entered a solve when phase 0
+//! took the baseline — since phase 4 the engine hands a terminal over as a
+//! Dirichlet constant and it is not an unknown; the bench keeps the ideal
+//! sources so `m` counts the same matrix as the baseline), signal nodes each
 //! held by a 10.5 kΩ pull-up to the rail (the EC32MB's `R301`–`R303`),
 //! joined in a chain of 220 Ω series resistors (the Edge board's LED
 //! resistors `R9`…), every third node driven by a 25 Ω push-pull pad (the

@@ -20,13 +20,17 @@
 //!   are 12 or 13 ns apart on the integer grid — not the 100 ns of RCFAST.
 //!
 //! And the node reports the crystal it was handed: 20 MHz, from the pin.
+//!
+//! The bench supplies `VDD` at 1.8 V and `RESN` released, so the
+//! package's START gate opens at the build and the guest's clock counts
+//! from zero, and the `VIO_0_3` bank at 3.3 V for the pad it writes.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    level_of, AttachError, Component, ComponentNetIo, Harness, Level, PinDecl, PulseDirection,
-    PulseSegment, PulseTrain, PulseTx, StreamRole, System,
+    level_of, AttachError, Component, ComponentNetIo, EndpointRef, Harness, Level, PinDecl,
+    PulseDirection, PulseSegment, PulseTrain, PulseTx, StreamRole, System,
 };
 use embsim_boards::p2::P2Package;
 use embsim_core::virtual_clock;
@@ -156,6 +160,19 @@ impl Component for Scope {
     }
 }
 
+fn ep(endpoint: &str) -> EndpointRef {
+    EndpointRef::parse(endpoint).expect("endpoint parses")
+}
+
+/// The bench supplies: the core rail inside its window and reset
+/// released (the START gate), and the bank the guest writes its pad in.
+fn supplies(harness: Harness) -> Harness {
+    harness
+        .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+        .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
+        .power(ep("BENCH.VIO_0_3"), ep("P2.VIO_0_3"), 3.3)
+}
+
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -189,13 +206,13 @@ fn hubset_multiplies_the_rate_delivered_on_xi_and_stalls_without_one() {
         .component("P2", Box::new(package))
         .component("CLK", Box::new(BenchClock::new()))
         .component("SCOPE", Box::new(scope))
-        .harness(
+        .harness(supplies(
             Harness::new()
                 .connect_str("CLK.OUT", "P2.XI")
                 .expect("XI is a bench endpoint")
                 .connect_str("SCOPE.A", "P2.P0")
                 .expect("the pad is a bench endpoint"),
-        )
+        ))
         .start()
         .expect("the bench starts");
 
@@ -215,6 +232,10 @@ fn hubset_multiplies_the_rate_delivered_on_xi_and_stalls_without_one() {
         handle.yields(),
         handle.slices(),
     );
+
+    // The START gate opened at the build: the supplies were up before the
+    // first wake, so the guest's clock counts from zero.
+    assert_eq!(package_handle.started_at_ns(), Some(0));
 
     // The crystal is what the pin carried: the node and the package agree.
     assert_eq!(handle.crystal_hz(), Some(u64::from(CRYSTAL_HZ)));

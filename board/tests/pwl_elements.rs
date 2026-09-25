@@ -607,8 +607,12 @@ fn elements_that_chase_each_other_are_non_convergent_and_float() {
         .scenario(scenario())
         .build()
         .expect("builds");
+    // The cluster is the two switched nodes alone: `VDD` and `GND` are
+    // declared terminals, each a cluster of its own and a constant of this
+    // one (`NODES.md` §8 phase 4), so the finding names the cluster by its
+    // first net, `P`.
     let finding = Finding::NonConvergent {
-        cluster: "B.VDD".to_string(),
+        cluster: "B.P".to_string(),
         elements: vec!["B.Q1".to_string(), "B.Q2".to_string()],
         solves: PWL_SOLVES_PER_ELEMENT * 2,
     };

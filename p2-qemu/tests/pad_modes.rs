@@ -20,12 +20,18 @@
 //! Every pad change reaches its net as its own publish (the float-mode
 //! pad's `drvh` is none: released to released), and the test holds the
 //! fight count at zero: a 15 kΩ pull against a 25 Ω sink is not contention.
+//!
+//! The bench supplies what the chip needs to run and to drive: `VDD` at
+//! 1.8 V and `RESN` released, which open the package's START gate at the
+//! build, and the `VIO_0_3` bank at 3.3 V, which is what `P0`–`P2` drive
+//! high at (`embsim_boards::p2`, "Pads drive high at their bank's
+//! supply").
 
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, AttachError, Component, ComponentNetIo, Finding, Harness, IdleDrive, Level,
-    NetState, PinDecl, System,
+    digital_drive, AttachError, Component, ComponentNetIo, EndpointRef, Finding, Harness,
+    IdleDrive, Level, NetState, PinDecl, System,
 };
 use embsim_boards::p2::{P2Package, P2_PULL_15K_OHMS};
 use embsim_core::virtual_clock;
@@ -98,6 +104,19 @@ impl Component for Sink {
     }
 }
 
+fn ep(endpoint: &str) -> EndpointRef {
+    EndpointRef::parse(endpoint).expect("endpoint parses")
+}
+
+/// The bench supplies: the core rail inside its window and reset
+/// released (the START gate), and the bank the guest drives pads in.
+fn supplies(harness: Harness) -> Harness {
+    harness
+        .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+        .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
+        .power(ep("BENCH.VIO_0_3"), ep("P2.VIO_0_3"), 3.3)
+}
+
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -127,11 +146,11 @@ fn a_pad_pulling_its_net_high_reads_the_sink_holding_it_low() {
     let system = System::new()
         .component("P2", Box::new(P2Package::new(p2)))
         .component("SINK", Box::new(Sink::new()))
-        .harness(
+        .harness(supplies(
             Harness::new()
                 .connect_str("SINK.A", "P2.P0")
                 .expect("the pad is a bench endpoint"),
-        )
+        ))
         .start()
         .expect("the bench starts");
 
