@@ -305,8 +305,11 @@ const fn input(number: &'static str) -> PinDecl {
 /// other side of the harness owns the drive strength).
 ///
 /// `STEP` is a plain sense: a periodic drive on its net arrives as a
-/// [`embsim_board::PeriodicSense`] and reaches the plant without a per-step
-/// edge, and a net that toggles levels runs the edge path.
+/// [`embsim_board::PeriodicSense`] and, when its phases cross `STEP`'s
+/// thresholds ([`embsim_board::PeriodicSense::rate`]), reaches the plant
+/// without a per-step edge; a clock whose phases do not cross them is the
+/// level they settle to, or none, and a net that toggles levels runs the
+/// edge path.
 pub const STEPPER_PINS: [PinDecl; 3] = [input("STEP"), input("DIR"), input("ENA")];
 
 // ============================================================
@@ -924,11 +927,22 @@ impl Component for StepperMotor {
         // state, a periodic one included, once at registration).
         {
             let core = Arc::clone(&self.core);
-            let step = DigitalReceiver::new(io.pin("STEP")?);
+            let pin = io.pin("STEP")?;
+            let step = DigitalReceiver::new(pin.clone());
             io.on_sense("STEP", move |sense| {
+                // A clock is a train to fold when its phases cross STEP's
+                // own thresholds ([`embsim_board::PeriodicSense::rate`]); a
+                // held segment is the stop that folds a running train's
+                // final count. A running clock that does not cross them is
+                // no train: it is the level its phases settle to, or none,
+                // read on the level path below.
                 if let Some(clock) = sense.periodic {
-                    core.receive_train(clock.segment, Some(sense.at_ns));
-                    return;
+                    let counts = clock.segment.freq_hz == 0
+                        || pin.thresholds().is_some_and(|t| clock.rate(&t).is_some());
+                    if counts {
+                        core.receive_train(clock.segment, Some(sense.at_ns));
+                        return;
+                    }
                 }
                 let now_ns = core.sample_now("STEP");
                 core.end_train(now_ns.unwrap_or(0));

@@ -121,7 +121,9 @@ pub enum Drive {
     /// periodic source, is [`NetState::Contention`] — a sustained fight for
     /// half of every cycle. The net publishes [`NetState::Periodic`], a
     /// sensing pin is handed a [`PeriodicSense`] — each phase's voltage and
-    /// the segment — and a consumer integrates the segment itself.
+    /// the segment — and a consumer integrates the segment itself, once its
+    /// two phases cross the consumer's own thresholds
+    /// ([`PeriodicSense::rate`]).
     ///
     /// # Why a rate and not edges
     ///
@@ -409,14 +411,59 @@ pub struct PeriodicSense {
 }
 
 impl PeriodicSense {
-    /// Each phase through the receiver's thresholds, `(high phase, low
-    /// phase)`. A phase is steady for half a cycle and has no last level
-    /// of its own the receiver could hold, so each projects with none: the
-    /// guaranteed thresholds, and the dead band per the receiver's policy
-    /// with nothing to hold.
-    pub fn levels(&self, thresholds: &Thresholds) -> (Option<Level>, Option<Level>) {
-        let project = |volts: Option<Volts>| volts.and_then(|v| thresholds.project(v, None));
-        (project(self.hi), project(self.lo))
+    /// The level the receiver settles to in each phase of the running wave,
+    /// `(high phase, low phase)` — **the one per-phase rule**: [`Sense::level`]
+    /// derives from it, and so does every consumer of a rate
+    /// ([`Self::rate`]).
+    ///
+    /// In a running square wave the receiver enters each phase from the
+    /// level the other phase left it at, so each phase is projected
+    /// ([`Thresholds::project`]) from that level. A phase at or outside a
+    /// guaranteed threshold reads its level whatever came before. A phase
+    /// inside the dead band cannot read a level the other phase did not
+    /// leave: under [`DeadBand::HoldLast`] it holds the other phase's level,
+    /// and under [`DeadBand::Unknown`] it holds it only within the
+    /// hysteresis and reads none beyond — either way the receiver never
+    /// toggles, which is no clock to it. Where neither phase is outside the
+    /// band, the receiver entered the wave from `last`, the level it read
+    /// before, and neither phase moves it except to none. The projection
+    /// has three outcomes and a phase outside the band is fixed, so two
+    /// cycles from `last` reach the steady pair.
+    pub fn levels(
+        &self,
+        thresholds: &Thresholds,
+        last: Option<Level>,
+    ) -> (Option<Level>, Option<Level>) {
+        let project = |volts: Option<Volts>, from: Option<Level>| {
+            volts.and_then(|v| thresholds.project(v, from))
+        };
+        let (mut hi, mut lo) = (None, last);
+        for _ in 0..2 {
+            hi = project(self.hi, lo);
+            lo = project(self.lo, hi);
+        }
+        (hi, lo)
+    }
+
+    /// The segment a receiver counts or relays: the wave's own, while it
+    /// runs (a held segment is no rate) **and** its two phases settle to
+    /// two different levels through the receiver's thresholds
+    /// ([`Self::levels`]) — its input crosses the receiver's switching
+    /// point every cycle, which is what a receiver needs to see a clock. A
+    /// wave whose phases settle to one level is that level to the receiver
+    /// ([`Sense::level`]), and one with a phase that settles to none is no
+    /// level and no clock: `None` for both. It does not depend on what the
+    /// receiver read before — a phase inside the dead band settles to the
+    /// other phase's level or to none, so two levels need both phases
+    /// outside the band, on opposite sides.
+    pub fn rate(&self, thresholds: &Thresholds) -> Option<PeriodicSchedule> {
+        if self.segment.freq_hz == 0 {
+            return None;
+        }
+        match self.levels(thresholds, None) {
+            (Some(hi), Some(lo)) if hi != lo => Some(self.segment),
+            _ => None,
+        }
     }
 }
 
@@ -425,26 +472,23 @@ impl Sense {
     /// hysteresis, its last level, its dead-band policy
     /// ([`Thresholds::project`]). `None` where the node names no voltage —
     /// a floating node reads no level, and nothing invents one. A running
-    /// periodic node is projected phase by phase, each from the same last
-    /// level: where both phases project to one level the receiver sees no
-    /// edge in the swing and reads that level (a 0 V / 1.2 V clock at a
-    /// receiver whose `V_IL` is above 1.2 V is a steady low to it); where
-    /// they project to two, or a phase to none, the node has no single
-    /// level and reads `None` — the receiver consumes the segment, or
-    /// reads nothing (`NODES.md` §10, "the level is the receiver's").
+    /// periodic node is projected by the one per-phase rule,
+    /// [`PeriodicSense::levels`], each phase entered from the level the
+    /// other left: where both phases settle to one level the receiver sees
+    /// no edge in the swing and reads that level (a 0 V / 1.2 V clock at a
+    /// receiver whose `V_IL` is above 1.2 V is a steady low to it, and so
+    /// is one whose 1.2 V phase sits in a holding receiver's dead band);
+    /// where they settle to two, or a phase to none, the node has no single
+    /// level and reads `None` — the receiver consumes the segment
+    /// ([`PeriodicSense::rate`]), or reads nothing (`NODES.md` §10, "the
+    /// level is the receiver's").
     pub fn level(&self, thresholds: &Thresholds, last: Option<Level>) -> Option<Level> {
         match (self.volts, &self.periodic) {
             (Some(volts), _) => thresholds.project(volts, last),
-            (None, Some(periodic)) => {
-                let project =
-                    |volts: Option<Volts>| volts.and_then(|v| thresholds.project(v, last));
-                let (hi, lo) = (project(periodic.hi), project(periodic.lo));
-                if hi == lo {
-                    hi
-                } else {
-                    None
-                }
-            }
+            (None, Some(periodic)) => match periodic.levels(thresholds, last) {
+                (hi, lo) if hi == lo => hi,
+                _ => None,
+            },
             (None, None) => None,
         }
     }
@@ -1483,10 +1527,7 @@ impl PinHandle {
             return Some(declared.thresholds);
         }
         let table = &self.link.volts;
-        let supply = match declared.supply {
-            Some(net) => table.dc(net.0)?,
-            None => return None,
-        };
+        let supply = table.dc(declared.supply?.0)?;
         let reference = match self.frame {
             SenseFrame::Absolute => 0.0,
             SenseFrame::Against(net) => table.dc(net.0)?,
@@ -2413,6 +2454,95 @@ mod tests {
             at_ns: 0,
         };
         assert_eq!(sensed.level(&thresholds, None), expected);
+    }
+
+    /// The one per-phase rule (`PeriodicSense::levels`), which the level a
+    /// receiver reads and the rate it counts both derive from: each phase
+    /// entered from the level the other left. The receiver's figures are
+    /// 1.3 V / 2.0 V, no hysteresis; its last level before the wave is
+    /// given per case, to show where it matters (both phases inside the
+    /// band) and where it does not (a phase outside fixes the other's
+    /// entry).
+    #[rstest]
+    #[case::both_outside_holding(DeadBand::HoldLast, 3.3, 0.0, Some(Level::High), (Some(Level::High), Some(Level::Low)), None, true)]
+    #[case::both_outside_unknown(DeadBand::Unknown, 3.3, 0.0, None, (Some(Level::High), Some(Level::Low)), None, true)]
+    #[case::high_phase_in_band_holding_from_high(DeadBand::HoldLast, 1.5, 0.0, Some(Level::High), (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
+    #[case::high_phase_in_band_holding_from_low(DeadBand::HoldLast, 1.5, 0.0, Some(Level::Low), (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
+    #[case::high_phase_in_band_unknown(DeadBand::Unknown, 1.5, 0.0, Some(Level::Low), (None, Some(Level::Low)), None, false)]
+    #[case::low_phase_in_band_holding(DeadBand::HoldLast, 3.3, 1.5, Some(Level::Low), (Some(Level::High), Some(Level::High)), Some(Level::High), false)]
+    #[case::low_phase_in_band_unknown(DeadBand::Unknown, 3.3, 1.5, Some(Level::High), (Some(Level::High), None), None, false)]
+    #[case::both_in_band_holding(DeadBand::HoldLast, 1.8, 1.5, Some(Level::High), (Some(Level::High), Some(Level::High)), Some(Level::High), false)]
+    #[case::both_in_band_unknown(DeadBand::Unknown, 1.8, 1.5, Some(Level::High), (None, None), None, false)]
+    fn a_clock_phase_is_entered_from_the_other_phases_level(
+        #[case] policy: DeadBand,
+        #[case] hi: f64,
+        #[case] lo: f64,
+        #[case] last: Option<Level>,
+        #[case] levels: (Option<Level>, Option<Level>),
+        #[case] level: Option<Level>,
+        #[case] counts: bool,
+    ) {
+        use vibes_behaviour::{behaviour, expect, Test};
+        behaviour!(Test {
+            id: "sense.clock-phase-entered-from-the-other",
+            covers: Some("board/src/component.rs#PeriodicSense::levels"),
+            given: "a receiver with thresholds at 1.3 and 2 volts, holding its last level \
+                    between them or reading none there, handed a running square wave whose \
+                    phases sit above, below or between them",
+        });
+        expect!(
+            "phase-in-band-takes-the-other",
+            "a phase between the thresholds takes the level the other phase leaves on a \
+             holding receiver, and no level on one that reads none there",
+            "in a running wave the receiver enters each phase from the other phase's level",
+        );
+        expect!(
+            "one-level-is-that-level",
+            "the receiver reads a level from the wave exactly when both phases settle to it",
+        );
+        expect!(
+            "rate-needs-both-phases-across",
+            "the wave's rate is counted only when one phase sits at or above the high \
+             threshold and the other at or below the low one",
+            "a receiver sees a clock only when its input crosses its switching point every \
+             cycle",
+        );
+        let thresholds = Thresholds::new(1.3, 2.0, 0.0, policy);
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz: 1_000,
+            total: None,
+            since_ns: 0,
+        };
+        let wave = PeriodicSense {
+            hi: Some(hi),
+            lo: Some(lo),
+            segment,
+        };
+        let sensed = Sense {
+            volts: None,
+            periodic: Some(wave),
+            at_ns: 0,
+        };
+        assert_eq!(wave.levels(&thresholds, last), levels, "the per-phase rule");
+        assert_eq!(
+            sensed.level(&thresholds, last),
+            level,
+            "the level derives from the per-phase rule"
+        );
+        assert_eq!(
+            wave.rate(&thresholds),
+            counts.then_some(segment),
+            "the rate derives from the per-phase rule"
+        );
+        let held = PeriodicSense {
+            segment: PeriodicSchedule {
+                freq_hz: 0,
+                ..segment
+            },
+            ..wave
+        };
+        assert_eq!(held.rate(&thresholds), None, "a held segment is no rate");
     }
 
     /// What a pin is handed is its net's voltage against its reference:

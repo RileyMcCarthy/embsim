@@ -23,7 +23,7 @@
 //! | `VDD`, the 16 `VIO_a_b` | `PowerIn` (sensed), measured against `GND` | — |
 //! | `GND` | `PowerIn` | — |
 //! | `RESN`, `TEST` | `Signal` senses through [`P2_UNBANKED_INPUT_THRESHOLDS`] (`RESN` read by the START gate) | — |
-//! | `XI` | a `Signal` sense: the segment a periodic net carries here **is the crystal** | — |
+//! | `XI` | a `Signal` sense through [`P2_UNBANKED_INPUT_THRESHOLDS`]: the segment of a square wave whose phases cross them **is the crystal** | — |
 //! | `XO` | `Signal` output, released | the crystal driver, unused with an external clock |
 //!
 //! # The START gate
@@ -640,14 +640,20 @@ pub enum StartState {
 }
 
 /// The crystal `XI` is handed: the rate of the square wave it carries
-/// ([`Sense::periodic`]), or `None` for anything else — a held segment, a
-/// level, a floating or fought pin (no clock reaches it).
+/// ([`Sense::periodic`]) when its two phases cross `XI`'s own declared
+/// thresholds, [`P2_UNBANKED_INPUT_THRESHOLDS`]
+/// ([`embsim_board::PeriodicSense::rate`]: an input sees a clock only when
+/// it crosses the input's switching point every cycle), or `None` for
+/// anything else — a held segment, a swing whose phases settle to one level
+/// or to none there, a level, a floating or fought pin (no clock reaches
+/// it). The package takes `XI` as an external clock's input: a crystal is
+/// passive and publishes no rate, and the P2-EC32MB buffers its TCXO's
+/// 0.8 V clipped sine to a full swing through `U101` before `XI`.
 pub fn crystal_of(sense: &Sense) -> Option<u64> {
     sense
-        .periodic
-        .map(|clock| clock.segment.freq_hz)
-        .filter(|&hz| hz > 0)
-        .map(u64::from)
+        .periodic?
+        .rate(&P2_UNBANKED_INPUT_THRESHOLDS)
+        .map(|segment| u64::from(segment.freq_hz))
 }
 
 // ============================================================
@@ -1776,10 +1782,10 @@ mod tests {
 
     #[test]
     fn a_square_wave_with_a_rate_is_the_crystal_and_a_held_one_is_none() {
-        let clock = |freq_hz| Sense {
+        let swinging = |freq_hz, hi| Sense {
             volts: None,
             periodic: Some(embsim_board::PeriodicSense {
-                hi: Some(0.8),
+                hi: Some(hi),
                 lo: Some(0.0),
                 segment: PeriodicSchedule {
                     emitted: 0,
@@ -1795,8 +1801,14 @@ mod tests {
             periodic: None,
             at_ns: 0,
         };
+        let clock = |freq_hz| swinging(freq_hz, 3.3);
         assert_eq!(crystal_of(&clock(20_000_000)), Some(20_000_000));
         assert_eq!(crystal_of(&clock(0)), None);
+        // XI reads through the JESD8C.01 pair, 0.8 V / 2.0 V: a TCXO's
+        // 0.8 V clipped sine handed straight to it settles low in both
+        // phases, and a 1.2 V swing's high phase reads no level.
+        assert_eq!(crystal_of(&swinging(20_000_000, 0.8)), None);
+        assert_eq!(crystal_of(&swinging(20_000_000, 1.2)), None);
         assert_eq!(crystal_of(&at(Some(3.3))), None);
         assert_eq!(crystal_of(&at(None)), None);
     }

@@ -11,15 +11,36 @@
 //! output impedance after the datasheet's propagation delay, as a
 //! **scheduled instant** — never in the same pass as the input edge. A
 //! channel whose input is handed a *rate* — an [`embsim_board::PeriodicSense`] with
-//! a running segment, from a step clock or an oscillator — is in **rate
-//! mode**: it drives its output as an [`embsim_board::Drive::Periodic`], its
-//! own high port (`V_CC` behind `R_OH`) and low port (0 V behind `R_OL`)
-//! around the input's segment relayed verbatim, at once — which is what lets
-//! a self-biased stage (an inverter with a resistor from its output back to
-//! its input, AC-coupled to an oscillator) settle in one pass, with no
-//! sense→drive iteration: the square wave its own output carries back
-//! through the feedback resistor is the same segment it is relaying. See
-//! [`Mode`].
+//! a running segment, from a step clock or an oscillator, whose two phases
+//! cross the input's own thresholds ([`embsim_board::PeriodicSense::rate`]) —
+//! is in **rate mode**: it drives its output as an
+//! [`embsim_board::Drive::Periodic`], its own high port (`V_CC` behind
+//! `R_OH`) and low port (0 V behind `R_OL`) around the input's segment
+//! relayed verbatim, at once — which is what lets a self-biased stage (an
+//! inverter with a resistor from its output back to its input, AC-coupled
+//! to an oscillator) settle in one pass, with no sense→drive iteration: the
+//! square wave its own output carries back through the feedback resistor is
+//! the same segment it is relaying. A clock whose phases settle to one
+//! level through the input's thresholds is that level to the channel, and
+//! one with a phase that settles to none is no level (level mode, below).
+//! See [`Mode`].
+//!
+//! **A self-biased input** is the one exception, found at attach: a channel
+//! whose input node has a resistor to its own output node
+//! ([`embsim_board::ComponentNetIo::resistors_at`], read once) relays every
+//! running segment its input carries, whatever its phases. That resistor
+//! returns the output's average to the input, so the input rests at the
+//! stage's own switching point, and a swing coupled onto it through a
+//! capacitor is a swing *around* that point: it crosses it every cycle,
+//! however small. The engine hands a coupled node its source's swing, which
+//! the capacitor has stripped of any DC level (`NODES.md` §10, the periodic
+//! row), so the input's thresholds — absolute, measured from ground — have
+//! nothing to place it against. The P2-EC32MB's `U101` is the case: `R101`
+//! (100 kΩ) from `2Y` back to `2A`, and `C132` coupling the TCXO's 0.8 V
+//! clipped sine onto `2A`. The 74LVC2G04 datasheet (Rev. 13) has no
+//! application section and says nothing of operation around the switching
+//! point, so this is the circuit's reasoning, not a figure: the stage's
+//! gain there is not modelled, only that the swing crosses it.
 //!
 //! # Datasheet provenance
 //!
@@ -374,6 +395,10 @@ struct ChannelState {
     input: Sense,
     /// The input's last projected level — the hysteresis memory.
     last_level: Option<Level>,
+    /// A resistor joins the input's node to the output's (found at attach,
+    /// from the build topology): the input is biased at the stage's own
+    /// switching point, and any running segment it carries is relayed.
+    self_biased: bool,
     mode: Mode,
     /// The last drive asked for, whether applied yet or still pending.
     /// Starts as the declaration's released idle, so a channel whose input
@@ -514,21 +539,24 @@ impl Core {
         self.schedule(state, index, drive);
     }
 
-    /// The running segment a sensed input carries, if it is a rate: a
-    /// periodic net whose segment has a frequency. A held segment is no
-    /// rate.
-    fn rate_of(sensed: &Sense) -> Option<PeriodicSchedule> {
-        sensed
-            .periodic
-            .map(|clock| clock.segment)
-            .filter(|segment| segment.freq_hz > 0)
+    /// The rate channel `channel`'s input carries, if it carries one: the
+    /// running segment of a square wave whose two phases settle to two
+    /// levels through the input's own thresholds
+    /// ([`embsim_board::PeriodicSense::rate`]) — or, on a self-biased input,
+    /// any running segment (the module docs). A held segment is no rate.
+    fn rate_of(&self, channel: &ChannelState) -> Option<PeriodicSchedule> {
+        let clock = channel.input.periodic?;
+        if channel.self_biased {
+            return (clock.segment.freq_hz > 0).then_some(clock.segment);
+        }
+        clock.rate(&self.config.input_thresholds())
     }
 
     /// Re-evaluate one channel from its input: rate mode — at once, the
     /// relay applied in the same pass — while the input carries a rate,
     /// level mode (through `t_pd`) otherwise.
     fn refresh(&self, state: &mut State, index: usize) {
-        match Self::rate_of(&state.channels[index].input) {
+        match self.rate_of(&state.channels[index]) {
             Some(segment) => {
                 state.channels[index].mode = Mode::Rate;
                 state.channels[index].pending.clear();
@@ -588,6 +616,13 @@ impl LogicGateMonitor {
     /// What channel `index` is doing.
     pub fn mode(&self, index: usize) -> Mode {
         self.core.state.lock().unwrap().channels[index].mode
+    }
+
+    /// Whether channel `index`'s input is self-biased — a resistor from its
+    /// output node back to its input node, found at attach — and so relays
+    /// every running segment its input carries (the module docs).
+    pub fn self_biased(&self, index: usize) -> bool {
+        self.core.state.lock().unwrap().channels[index].self_biased
     }
 
     /// The drive channel `index`'s output presents, or `None` when released.
@@ -685,6 +720,7 @@ impl LogicGate {
                     output_pin,
                     input: NOTHING,
                     last_level: None,
+                    self_biased: false,
                     mode: Mode::Level,
                     requested: Some(None),
                     applied: Some(None),
@@ -735,6 +771,14 @@ impl Component for LogicGate {
             state.io = Some(io.clone());
             for channel in &mut state.channels {
                 channel.output = Some(io.pin(channel.output_pin)?);
+                // A build-time topology query, read once: a resistor from
+                // this channel's output node back to its input node biases
+                // the input at the stage's own switching point.
+                let output = io.node(channel.output_pin)?;
+                channel.self_biased = io
+                    .resistors_at(channel.input_pin)?
+                    .iter()
+                    .any(|resistor| resistor.far == output);
             }
             (
                 self.pins
@@ -913,9 +957,15 @@ mod tests {
         }
     }
 
-    /// The TCXO's clipped sine as the gate's input is handed it: 0.8 V of
-    /// swing above 0 V.
+    /// A rail-to-rail square wave: 3.3 V and 0 V, across both of the
+    /// 74LVC2G04's input thresholds (0.8 V / 2.0 V, Table 7).
     fn clock(freq_hz: u32) -> Sense {
+        swinging(freq_hz, 3.3, 0.0)
+    }
+
+    /// The TCXO's clipped sine as a coupled input is handed it: 0.8 V of
+    /// swing above 0 V — at or below `V_IL` in both phases.
+    fn tcxo(freq_hz: u32) -> Sense {
         swinging(freq_hz, 0.8, 0.0)
     }
 
@@ -947,9 +997,9 @@ mod tests {
         assert_eq!((state.channels[1].drives, state.channels[1].trains), (1, 1));
         assert!(state.channels[1].pending.is_empty(), "no t_pd for a rate");
 
-        // The same segment at other levels — what the gate's own output
-        // carries back through a feedback resistor — changes nothing.
-        core.on_input(&mut state, 1, swinging(20_000_000, 3.3, 0.0));
+        // The same segment at other levels that still cross both
+        // thresholds changes nothing.
+        core.on_input(&mut state, 1, swinging(20_000_000, 2.5, 0.5));
         assert_eq!(state.channels[1].drives, 1, "no sense→drive iteration");
 
         // A held segment ends rate mode: the input has no level, so the
@@ -957,6 +1007,64 @@ mod tests {
         core.on_input(&mut state, 1, clock(0));
         assert_eq!(state.channels[1].mode, Mode::Level);
         assert_eq!(state.channels[1].pending.len(), 1);
+    }
+
+    /// A clock whose phases do not both cross the input's thresholds is no
+    /// rate to a plain input: 0 V / 1.2 V puts the high phase inside the
+    /// 74LVC2G04's band, where it reads no level, so the channel stays in
+    /// level mode with no level and its output is released; the TCXO's
+    /// 0.8 V swing sits at or below `V_IL` in both phases, a steady low,
+    /// so the output is driven high `t_pd` later.
+    #[rstest]
+    #[case::high_phase_in_the_band(swinging(20_000_000, 1.2, 0.0), None)]
+    #[case::both_phases_low(tcxo(20_000_000), Some(Level::Low))]
+    fn a_clock_that_does_not_cross_a_plain_input_is_no_rate(
+        #[case] input: Sense,
+        #[case] level: Option<Level>,
+    ) {
+        let (_gate, core) = gate(Config::lvc2g04(), &LVC2G04_PINS_BY_FUNCTION);
+        let mut state = core.state.lock().unwrap();
+        core.on_supply(&mut state, V3V3);
+        core.on_input(&mut state, 1, input);
+        assert_eq!(state.channels[1].mode, Mode::Level);
+        assert_eq!(state.channels[1].last_level, level);
+        assert_eq!(state.channels[1].trains, 0, "nothing relayed");
+        let expected = level.map(|_| {
+            Drive::Thevenin(TheveninDrive {
+                volts: 3.3,
+                impedance: LVC2G04_R_OH_OHMS,
+            })
+        });
+        match expected {
+            Some(drive) => assert_eq!(state.channels[1].pending[0].1, Some(drive)),
+            None => assert!(
+                state.channels[1].pending.is_empty(),
+                "released is what the output already is"
+            ),
+        }
+    }
+
+    /// A self-biased input relays the swing coupled onto it whatever its
+    /// phases: the TCXO's 0.8 V is a rate there, and the same segment at
+    /// the full swing its own output carries back through the feedback
+    /// resistor changes nothing.
+    #[rstest]
+    fn a_self_biased_input_relays_the_swing_coupled_onto_it() {
+        let (_gate, core) = gate(Config::lvc2g04(), &LVC2G04_PINS_BY_FUNCTION);
+        let mut state = core.state.lock().unwrap();
+        state.channels[1].self_biased = true;
+        core.on_supply(&mut state, V3V3);
+        core.on_input(&mut state, 1, tcxo(20_000_000));
+        assert_eq!(state.channels[1].mode, Mode::Rate);
+        assert!(matches!(
+            state.channels[1].applied,
+            Some(Some(Drive::Periodic { segment, .. })) if segment == segment_at(20_000_000)
+        ));
+        core.on_input(&mut state, 1, clock(20_000_000));
+        assert_eq!(state.channels[1].drives, 1, "no sense→drive iteration");
+        // A held segment is no rate there either.
+        core.on_input(&mut state, 1, tcxo(0));
+        assert_eq!(state.channels[1].mode, Mode::Level);
     }
 
     /// Unpowered, every output is released and no rate crosses.
