@@ -14,11 +14,10 @@
 //! - [`p2`] — the Propeller 2 package as a node: the 86-pin facade around
 //!   a core (QEMU, an instruction-set simulator, the native firmware) or
 //!   around no core at all, held in reset
-//! - [`stub`] — pin facades for the parts of a board that are real but not
-//!   yet modelled, and the rule for choosing their pin directions (retiring:
-//!   `DESIGN.md` rule 1 admits no stub tier, and `NODES.md` §8 replaces each
-//!   facade with a model)
+//!
+//! There is no stub tier (`DESIGN.md` rule 1): every part on a board here
+//! is a node whose class has behaviour, and a part nobody has modelled is
+//! a build error naming it.
 
 pub mod ec32mb;
 pub mod p2;
-pub mod stub;

@@ -39,7 +39,8 @@ use rstest::rstest;
 
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, Finding, IdleDrive, JumperState, Level,
-    NetState, PartClass, PinDecl, PinKind, PinRef, Scenario, SenseKind, System, SystemHandle,
+    NetState, PartClass, PinDecl, PinKind, PinRef, RailDownReason, Scenario, SenseKind, System,
+    SystemHandle,
 };
 use embsim_core::virtual_clock;
 use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731_pins};
@@ -227,17 +228,22 @@ fn unsourced_domains(diagnostics: &embsim_board::Diagnostics) -> BTreeSet<String
 /// under a tolerance. See [`the_servo_isolator_secondary_ground_is_unconnected`].
 const IC14_ORPHAN_GROUND: &str = "EdgeBoard.Net-(IC14-GND2_1)";
 
-/// A bare board reports exactly the domains it cannot generate: its own input
-/// supply and the isolated domains that arrive over a cable. Everything the
-/// board makes for itself — `+5V` and `+3.3V` from the two XL1509 bucks through
-/// their output inductors, and the isolated I/O and force-gauge domains from the
-/// two UCC12040 DC/DC modules — is already sourced with nothing plugged in.
+/// A bare board reports exactly the domains it cannot generate — and, with
+/// nothing on its screw terminal, that is every domain: its own input
+/// supply and ground, the isolated domains that arrive over a cable, and
+/// the rails its own regulators make, which have no input to make them
+/// from. `+5V` and `+3.3V` are the two XL1509 bucks' outputs through their
+/// inductors and the isolated I/O and force-gauge domains the two UCC12040
+/// modules' — each a declared terminal its part holds released until its
+/// input arrives, and each reported down naming that input
+/// ([`Finding::RailDown`]).
 ///
 /// That list is the board's external dependency surface, derived from the
-/// netlist rather than written down: `V_IN` (the screw-terminal input), `GND`
-/// (the same connector's return), the Raspberry-Pi header's domain, the servo
-/// domain on J21, the isolated servo-serial domain on J23 — and one entry that
-/// is a board defect rather than a cable.
+/// netlist rather than written down: `V_IN` (the screw-terminal input),
+/// `GND` (the same connector's return), the Raspberry-Pi header's domain,
+/// the servo domain on J21, the isolated servo-serial domain on J23, the
+/// four on-board rails behind the unsupplied input — and one entry that is
+/// a board defect rather than a cable.
 #[rstest]
 fn a_bare_board_reports_only_the_domains_that_arrive_over_a_cable() {
     let system = System::new()
@@ -257,22 +263,35 @@ fn a_bare_board_reports_only_the_domains_that_arrive_over_a_cable() {
             "EdgeBoard.GND".to_string(),
             "EdgeBoard.V_IN".to_string(),
             IC14_ORPHAN_GROUND.to_string(),
+            // The board's own rails, down for want of an input.
+            "EdgeBoard.+5V".to_string(),
+            "EdgeBoard.+3.3V".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/5V_IO".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/GND_IO".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/IFG_5V".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/IFG_GND".to_string(),
         ])
     );
 
-    // The board's own regulators do source their outputs, so these must NOT
-    // appear above: a regression here means a facade lost its `PowerOut`.
-    for rail in [
-        "EdgeBoard.+5V",
-        "EdgeBoard.+3.3V",
-        "EdgeBoard./MaD_Edge_Sheet2/5V_IO",
-        "EdgeBoard./MaD_Edge_Sheet2/GND_IO",
-        "EdgeBoard./MaD_Edge_Sheet2/IFG_5V",
-        "EdgeBoard./MaD_Edge_Sheet2/IFG_GND",
+    // Each of the four regulators reports its output down, naming the
+    // unsourced input it has nothing to regulate from — the bucks their
+    // `VIN` (pin 1), the isolated DC/DCs their `VINP` (pin 3).
+    for (part, pin, input) in [
+        ("EdgeBoard.U1", "2", "1"),
+        ("EdgeBoard.U2", "2", "1"),
+        ("EdgeBoard.IC3", "14", "3"),
+        ("EdgeBoard.IC4", "14", "3"),
     ] {
         assert!(
-            !unsourced_domains(system.diagnostics()).contains(rail),
-            "{rail} is generated on-board"
+            system.diagnostics().contains(&Finding::RailDown {
+                part: part.to_string(),
+                pin: pin.to_string(),
+                reason: RailDownReason::InputUnsourced {
+                    pin: input.to_string()
+                },
+            }),
+            "{part}: {:?}",
+            system.diagnostics().findings()
         );
     }
 }
@@ -280,7 +299,18 @@ fn a_bare_board_reports_only_the_domains_that_arrive_over_a_cable() {
 /// The bench straps clear everything the machine's cables would, and leave the
 /// two ports nothing is plugged into still reported. The straps go through the
 /// board's own connector pins, so this is the rig a bring-up bench builds, not
-/// an engine back door.
+/// an engine back door: the 12 V input and the servo domain, and nothing on
+/// the rails the board makes for itself — `+5V` and `+3.3V` are the bucks'
+/// the instant the input reaches them (the XL1509 names no soft-start), and
+/// read their setpoints in the build snapshot.
+///
+/// The two isolated domains the UCC12040 modules make are a different case:
+/// an isolated DC/DC's output is measured against its own isolated ground,
+/// which is whatever the board or the harness ties it to — and on the board
+/// alone nothing ties `GND_IO` or `IFG_GND` down, so each rail stays down
+/// with its reference named ([`Finding::RailDown`]). The isolated return is
+/// a harness terminal, as the primary bench return is; no ground is
+/// implicit (`DESIGN.md` rule 6).
 #[rstest]
 fn bench_straps_clear_the_domains_they_feed() {
     let system = System::new()
@@ -300,8 +330,39 @@ fn bench_straps_clear_the_domains_they_feed() {
             "EdgeBoard./MaD_Edge_Sheet3/ISS_GND".to_string(),
             // No cable can clear this one — the pins are not on any rail.
             IC14_ORPHAN_GROUND.to_string(),
+            // The isolated domains, their returns tied to nothing on the
+            // board and nothing on this bench.
+            "EdgeBoard./MaD_Edge_Sheet2/5V_IO".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/GND_IO".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/IFG_5V".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/IFG_GND".to_string(),
         ])
     );
+
+    // The bucks are up in the snapshot, at their setpoints, from the 12 V
+    // the polarity FET passes — no strap on either rail.
+    for (rail, volts) in [("EdgeBoard.+5V", 5.0), ("EdgeBoard.+3.3V", 3.3)] {
+        let state = system.nets()[system.net_id(rail).unwrap().0].state;
+        assert!(
+            matches!(state, NetState::Analog(v) if (v - volts).abs() < 1e-9),
+            "{rail} from its own buck: {state:?}"
+        );
+    }
+    // The isolated DC/DCs are down for want of a reference: their input
+    // (`+5V`, pin 3) is up, their return (`GNDS`, pin 15) held by nothing.
+    for part in ["EdgeBoard.IC3", "EdgeBoard.IC4"] {
+        assert!(
+            system.diagnostics().contains(&Finding::RailDown {
+                part: part.to_string(),
+                pin: "14".to_string(),
+                reason: RailDownReason::ReferenceUnheld {
+                    pin: "15".to_string()
+                },
+            }),
+            "{part}: {:?}",
+            system.diagnostics().findings()
+        );
+    }
 
     // The main input reaches V_IN through the polarity FET `U3`, an element
     // the solve turns on: the 12 V strap is its drain, its gate is on the
@@ -309,7 +370,8 @@ fn bench_straps_clear_the_domains_they_feed() {
     // `pin_short` that stood in for it is gone). Reverse the input — the
     // strap 12 V *below* the bench ground — and the FET blocks: the gate
     // is above the source, the body diode is reverse-biased, and V_IN is a
-    // rail nothing reaches.
+    // rail nothing reaches — so the bucks behind it are down too, naming
+    // their input.
     assert!(
         matches!(
             system.nets()[system.net_id("EdgeBoard.V_IN").unwrap().0].state,
@@ -324,8 +386,6 @@ fn bench_straps_clear_the_domains_they_feed() {
             embsim_board::Harness::new()
                 .power(ep("BENCH.12V"), ep("EdgeBoard.J2.1"), -12.0)
                 .power(ep("BENCH.GND"), ep("EdgeBoard.J2.2"), 0.0)
-                .power(ep("BENCH.3V3"), ep("EdgeBoard.J19.1"), 3.3)
-                .power(ep("BENCH.5V"), ep("EdgeBoard.J22.1"), 5.0)
                 .power(ep("BENCH.SERVO5V"), ep("EdgeBoard.J21.1"), 5.0)
                 .power(ep("BENCH.SERVOGND"), ep("EdgeBoard.J21.8"), 0.0),
         )
@@ -339,6 +399,19 @@ fn bench_straps_clear_the_domains_they_feed() {
         reversed.nets()[reversed.net_id("EdgeBoard.V_IN").unwrap().0].state,
         NetState::Floating
     );
+    for part in ["EdgeBoard.U1", "EdgeBoard.U2"] {
+        assert!(
+            reversed.diagnostics().contains(&Finding::RailDown {
+                part: part.to_string(),
+                pin: "2".to_string(),
+                reason: RailDownReason::InputUnsourced {
+                    pin: "1".to_string()
+                },
+            }),
+            "{part}: {:?}",
+            reversed.diagnostics().findings()
+        );
+    }
 }
 
 // ============================================================
@@ -607,18 +680,20 @@ fn an_unpowered_rs422_driver_releases_the_pair() {
     ensure_clock();
     let system = System::new()
         .board("EdgeBoard", edge_board())
-        // Main rails only — nothing on J21, so SC_5V is dark.
+        // The main input only — the 3.3 V the isolator's primary side runs
+        // from is the board's own buck behind the polarity FET — and
+        // nothing on J21, so SC_5V is dark.
         .harness(
             embsim_board::Harness::new()
+                .power(
+                    machine_parts::ep("BENCH.12V"),
+                    machine_parts::ep("EdgeBoard.J2.1"),
+                    12.0,
+                )
                 .power(
                     machine_parts::ep("BENCH.GND"),
                     machine_parts::ep("EdgeBoard.J2.2"),
                     0.0,
-                )
-                .power(
-                    machine_parts::ep("BENCH.3V3"),
-                    machine_parts::ep("EdgeBoard.J19.1"),
-                    3.3,
                 ),
         )
         .scenario(Scenario::default().net_stuck("EdgeBoard.Net-(IC14-OUTA)", 3.3))

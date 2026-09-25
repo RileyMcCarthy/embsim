@@ -55,13 +55,17 @@ connector is a pass-through node, a test point a probe node, a mounting hole
 or board outline an explicit mechanical node, an IC nobody has modelled a
 build error.
 *Enforced by:* `RegistryError::UnknownPart { reference, part, value }`; the
-`stub_count` census test, which must read 0 on every board.
+`stub_count` census test, which reads 0 on every board since phase 4 took
+the last eleven facades (`cluster_census.rs`, `no_board_contains_a_stub_part`
+over all three boards — a never-rises gate).
 
 **Rule 2 — One interface.** Between a node and the engine there is exactly
 this: static facts declared once on `PinDecl` (idle drive, clamps, input
 port, capacitance, thresholds with hysteresis, reference and supply pins,
 `can_source`) and on `Component::branches()` (nonlinear elements as branches
-between two of the part's pins); one per-instant message, `Drive`, with three
+between two of the part's pins) — the reference pin sits beside the branches,
+on `Component::references()`, until phase 5 rebuilds `PinDecl` and moves it
+onto the pin; one per-instant message, `Drive`, with three
 encodings — `Thevenin { volts, ohms }`, `Current { amps }`, `Periodic { hi,
 lo, segment }` — all sequenced through one command; one delivery, `Sense {
 volts: Option<Volts> }`, relative to the pin's reference, `None` meaning no
@@ -92,14 +96,27 @@ floating as findings. Three structural rules keep that tractable: terminals
 are declared and are cluster boundaries; source-strength projection has one
 form; cluster membership is fixed at build and the only runtime-mutable
 conductance is the plant's.
-*Enforced by:* the incremental-versus-full resolution property test, the
-cluster census bound (m ≤ 8 on every board), and the fact that no node API
-can union nets or read another net. The bound is not yet met — phase 3's
-census reads 29 (Edge) and 10 (EC32MB) bare, and 20 on the Edge board's
-`+3.3V` cluster under the bench rails, because a resistor edge still unions
-through a terminal — and becomes the gate when phase 4 makes terminals
-boundaries for resistor edges as they are for elements (`NODES.md` §8,
-the phase-3 records and `cluster_census.rs`).
+*Enforced by:* the incremental-versus-full resolution property test (with
+random terminal changes and rail publishes mid-run, since phase 4), the
+cluster census bound — **m ≤ 8 on every board**, each under its reference
+harness, which is its declared supplies and nothing invented: the EC32MB
+from its J203 fingers (4), the DS2 add-on under its force-domain rails (2),
+the Edge board under the bench rails with the one socket finger a module
+sources, `VIO_16_23`, held at the module LDO's 3.3 V (3), and the Edge board
+with the module in its socket under the bench rails (4). Under the bench
+rails alone, that finger unsourced, the Edge board's `VIO_16_23` is a 9-root
+cluster with its eight pull-ups — above the bound, held as a never-rises
+fixture that says so — and a bare board declares no ground (rule 6: the
+bench return is a harness terminal), so its bare figures — 29 (Edge) and 6
+(EC32MB) — are fixtures, not the bound. And the fact that no node API can
+union nets or read another net. Met since phase 4 made every declared
+terminal a cluster of its own, for resistor edges as for elements, and made
+an inductor the identity union a DC short is, so a regulator's rail is its
+terminal's node and not a member of its loads' cluster; asserted as
+`every_board_under_its_reference_harness_is_within_rule_4s_bound` with the
+ROM boot beside it — the module from its fingers, every rail a part's
+output, boots at five escalated solves before its first edge and none per
+edge (`NODES.md` §8, the phase-4 record, and `cluster_census.rs`).
 
 **Rule 5 — No timestep, ever.** Time enters only as scheduled instants and
 closed forms: a single-pole RC, a linear ramp, a periodic segment. Regions

@@ -197,9 +197,10 @@ fn mechanical_parts_are_nodes_with_nothing_electrical(
     );
     expect!(
         "no-electrical-existence",
-        "none of them is a component, and the board builds with no finding that names \
-         their nets",
-        "a mechanical node has pads and no drive, no sense and no rail"
+        "none of them is a component, and the board builds with no finding that names their \
+         nets",
+        "a mechanical node has pads and no drive, no sense and no rail; the module's ground \
+         is held from a carrier finger, since a bare module has nothing to source it"
     );
 
     let board = build();
@@ -225,11 +226,26 @@ fn mechanical_parts_are_nodes_with_nothing_electrical(
                 .collect::<Vec<_>>()
         })
         .collect();
-    let built = System::new().board("B", board).build().expect("builds");
+    // The module's holes are on its ground: with the power parts real,
+    // a bare module's ground is a net nothing sources (its bucks are down
+    // without a supply), whatever sits on it — so the ground is held the
+    // way a carrier holds it, from a `J203` finger, and the claim is about
+    // the pads alone. The Edge board's holes are on the shield net and on
+    // nothing, which no strap touches.
+    let mut system = System::new().board("B", board);
+    if references.contains(&"J701") {
+        system = system.harness(Harness::new().power(
+            EndpointRef::parse("CARRIER.GND").expect("endpoint"),
+            EndpointRef::parse("B.J203.43").expect("endpoint"),
+            0.0,
+        ));
+    }
+    let built = system.build().expect("builds");
     for finding in built.diagnostics().findings() {
         let named = match finding {
             Finding::FloatingSense { net, .. } | Finding::PowerNetUnsourced { net } => Some(net),
             Finding::Contention { net, .. } => Some(net),
+            Finding::MechanicalOnDrivenNet { net, .. } => Some(net),
             _ => None,
         };
         if let Some(named) = named {

@@ -43,6 +43,34 @@ pub enum PinMismatchDirection {
     PresentButUndeclared,
 }
 
+/// Why a rail is down at build ([`Finding::RailDown`]): what the build can
+/// see of the part from the outside — its supply pins and its declared
+/// reference — with the part's own gate (its threshold, its enable, its
+/// soft-start) the third case, named as such.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RailDownReason {
+    /// A power-in pin of the part is on a net no source reaches: the rail
+    /// has nothing to regulate from.
+    InputUnsourced {
+        /// The unsourced power-in pin.
+        pin: String,
+    },
+    /// The output's declared reference pin is on a net no source reaches:
+    /// the rail has nothing to measure its voltage against, so it publishes
+    /// none (`NODES.md` §2, the Regulator row: an unheld reference is a
+    /// floating output).
+    ReferenceUnheld {
+        /// The reference pin.
+        pin: String,
+    },
+    /// The part's supply and reference are sourced and it holds the output
+    /// released anyway: its input is below its threshold, its enable is
+    /// off, or its soft-start has not elapsed — the build snapshot is the
+    /// state before the first wake, and a rail with a soft-start is down in
+    /// it (`NODES.md` §5). The part's own monitor says which.
+    HeldDown,
+}
+
 /// One structured diagnostic finding. A finding, never a panic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Finding {
@@ -208,6 +236,56 @@ pub enum Finding {
         pin: String,
         /// Which side declared the pin the other lacks.
         direction: PinMismatchDirection,
+    },
+    /// A rail — a `PowerOut` pin's net — that sources nothing at build: the
+    /// terminal is released, by the part or because nothing holds it.
+    /// Raised by the build for every such pin that is not itself another
+    /// pin's declared reference (an isolated ground is held by the board or
+    /// the harness, never a rail), with the reason the build can see
+    /// ([`RailDownReason`]).
+    RailDown {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The `PowerOut` pin.
+        pin: String,
+        /// Why.
+        reason: RailDownReason,
+    },
+    /// A pin whose net a source reaches while the net of its declared
+    /// reference pin ([`crate::PinReference`]) reaches none: the domain is
+    /// live and its voltages are measured against nothing. An isolator
+    /// whose secondary ground is unwired, an isolated supply whose
+    /// return nothing ties down.
+    UnreferencedDomain {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The live pin.
+        pin: String,
+        /// Its reference pin, on a net no source reaches.
+        reference: String,
+    },
+    /// A power-in pin with no capacitor between its node and its declared
+    /// reference pin's node: a supply pin the layout does not decouple. Two
+    /// caps on the same two nodes are one; a cap to any other node is none.
+    UndecoupledPowerPin {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The power-in pin.
+        pin: String,
+        /// Its reference pin.
+        reference: String,
+    },
+    /// A mechanical node's pad — a mounting hole, a fiducial, a layout node
+    /// — shares a net with a pin that drives it: a driver is loaded by a
+    /// pad the schematic meant to be ground or nothing. A pad on a declared
+    /// terminal (a ground the harness holds) or on no net raises nothing.
+    MechanicalOnDrivenNet {
+        /// The mechanical part, as `Board.Reference`.
+        part: String,
+        /// The net.
+        net: String,
+        /// The pins driving it.
+        drivers: Vec<PinRef>,
     },
     /// The build-time fixed point did not settle within its bound: after
     /// `passes` rounds of replaying the drives components issued in response

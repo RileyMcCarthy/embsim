@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::component::{AttachError, Branch, Component, IdleDrive, PinDecl, PinKind};
+use crate::component::{AttachError, Branch, Component, IdleDrive, PinDecl, PinKind, PinReference};
 use crate::net::{Net, NetId, NetState, PinRef};
 use crate::netlist::{normalize_net_name, NetlistError, ParsedNetlist};
 use crate::registry::{
@@ -71,6 +71,9 @@ pub enum PartClass {
         pins: Vec<PinDecl>,
         /// Declared nonlinear branches, each naming declared pins only.
         branches: Vec<Branch>,
+        /// Declared pin references ([`PinReference`]), each naming two
+        /// distinct declared pins.
+        references: Vec<PinReference>,
     },
 }
 
@@ -185,10 +188,30 @@ impl Board {
                     validate_branch_pins(&decl.reference, branch_pins, |pin| {
                         pins.iter().any(|p| p.number == pin || p.name == Some(pin))
                     })?;
+                    // A reference is a declaration about two of the part's
+                    // own pins, validated the way a branch is: both must be
+                    // declared, and a pin is not its own reference.
+                    let references = component.references().to_vec();
+                    let reference_pins = references
+                        .iter()
+                        .flat_map(|reference| [reference.pin, reference.reference]);
+                    validate_branch_pins(&decl.reference, reference_pins, |pin| {
+                        pins.iter().any(|p| p.number == pin || p.name == Some(pin))
+                    })?;
+                    if let Some(circular) = references.iter().find(|r| r.pin == r.reference) {
+                        return Err(BoardError::PinFacadeMismatch {
+                            reference: decl.reference.clone(),
+                            pin: format!("{} (its own reference)", circular.pin),
+                        });
+                    }
                     // attach() runs at system build, once final (merged) net
                     // ids exist — still pre-share.
                     components.push((decl.reference.clone(), component));
-                    PartClass::Registered { pins, branches }
+                    PartClass::Registered {
+                        pins,
+                        branches,
+                        references,
+                    }
                 }
             };
 
@@ -279,9 +302,13 @@ fn validate_facade(
 }
 
 /// A declared idle drive is honoured on every pin with a drive slot, and a
-/// power or passive pin has none ([`IdleDrive`]) — so an idle drive declared
-/// on one is a static fact the engine cannot keep, refused here rather than
-/// dropped without a word. Shared by the netlist facade check and the bench
+/// power-in or passive pin has none ([`IdleDrive`]) — so an idle drive
+/// declared on one is a static fact the engine cannot keep, refused here
+/// rather than dropped without a word. A `PowerOut` pin's slot is its
+/// terminal (`NODES.md` §8 phase 4): its idle drive is what the rail holds
+/// before its part publishes — released for a rail that is down, a voltage
+/// for one that is up from build — and the kind's default is the unmodelled
+/// rail a facade declares. Shared by the netlist facade check and the bench
 /// component path in `System::assemble`, which has no netlist facade to
 /// validate but the same declarations to honour.
 pub(crate) fn validate_idle_drives(
@@ -289,10 +316,7 @@ pub(crate) fn validate_idle_drives(
     declared: &[PinDecl],
 ) -> Result<(), BoardError> {
     for pin in declared {
-        let slotless = matches!(
-            pin.kind,
-            PinKind::PowerIn | PinKind::PowerOut | PinKind::Passive
-        );
+        let slotless = matches!(pin.kind, PinKind::PowerIn | PinKind::Passive);
         if slotless && !matches!(pin.idle, IdleDrive::KindDefault) {
             return Err(BoardError::IdleOnSlotlessPin {
                 reference: reference.to_string(),
@@ -378,8 +402,8 @@ pub enum BoardError {
         /// The mismatched pin identity.
         pin: String,
     },
-    /// A declared idle drive on a pin that has no drive slot — a power or
-    /// passive pin ([`IdleDrive`]). The engine could only drop the
+    /// A declared idle drive on a pin that has no drive slot — a power-in
+    /// or passive pin ([`IdleDrive`]). The engine could only drop the
     /// declaration, so the build refuses it and names the pin.
     IdleOnSlotlessPin {
         /// Component reference designator.
@@ -407,7 +431,7 @@ impl fmt::Display for BoardError {
             BoardError::IdleOnSlotlessPin { reference, pin } => write!(
                 f,
                 "{reference}: pin {pin:?} declares an idle drive but has no drive slot \
-                 (power and passive pins idle at nothing)"
+                 (power-in and passive pins idle at nothing)"
             ),
             BoardError::Attach { reference, error } => write!(f, "{reference}: {error}"),
         }

@@ -608,6 +608,102 @@ impl Dsu {
     }
 }
 
+/// A declared terminal source: a harness supply or a `PowerOut` pin
+/// ([`Resolver::add_power_source`], [`Resolver::add_terminal_endpoint`]),
+/// or a `net_stuck` fault ([`Resolver::add_stuck_source`]), by position in
+/// its list. The canonical order of the sources is every power source,
+/// then every stuck fault, each in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TerminalId {
+    Power(usize),
+    Stuck(usize),
+}
+
+/// What a declared terminal source holds its net at (`NODES.md` "Three
+/// rules the taxonomy rests on", 1). A terminal is declared once, at build
+/// — a `PowerOut` pin, a harness `power(V)` endpoint, a `net_stuck` — and
+/// is a cluster boundary whatever it holds; *what* it holds is the one
+/// thing about it that moves at run time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TerminalDrive {
+    /// Nothing: the terminal sources no voltage — a rail that is down, a
+    /// `PowerOut` its part released. Its node floats and nothing reaches
+    /// its dependents through it; a bench strap on the same net sources
+    /// it without a fight.
+    Released,
+    /// Sourced at a voltage no model declares (the `PowerOut` of a part
+    /// that is still a facade, `f64::NAN` in the source table): clears
+    /// `PowerNetUnsourced` and presents as up through the path to it,
+    /// ranks nowhere.
+    Unmodelled,
+    /// Held at a voltage.
+    Volts(Volts),
+}
+
+impl TerminalDrive {
+    /// The source-table encoding: a NaN voltage is an unmodelled rail.
+    fn from_volts(volts: Volts) -> Self {
+        if volts.is_nan() {
+            Self::Unmodelled
+        } else {
+            Self::Volts(volts)
+        }
+    }
+
+    /// The published drive of a `PowerOut` pin's slot, as the terminal it
+    /// holds: released or a current injection is released (a current into
+    /// a terminal is not a rail), a Thevenin drive is its open-circuit
+    /// voltage (NaN = unmodelled), the impedance recorded on the slot for
+    /// the I-V port and not solved (`NODES.md` §2, the Regulator row).
+    fn from_slot(drive: Option<Drive>) -> Self {
+        match drive {
+            Some(Drive::Thevenin(t)) => Self::from_volts(t.volts),
+            Some(Drive::Current { .. }) | None => Self::Released,
+        }
+    }
+
+    /// The slot drive that holds this terminal state at 0 Ω: what a
+    /// `PowerOut` slot idles at when its declaration names no impedance
+    /// — released is `None`, unmodelled the NaN-volt Thevenin `PowerOut`
+    /// has always meant. A declared `IdleDrive::Thevenin` passes its own
+    /// drive, impedance included, instead.
+    pub(crate) fn idle_slot_drive(self) -> Option<Drive> {
+        match self {
+            Self::Released => None,
+            Self::Unmodelled => Some(Drive::Thevenin(TheveninDrive {
+                volts: f64::NAN,
+                impedance: 0.0,
+            })),
+            Self::Volts(volts) => Some(Drive::Thevenin(TheveninDrive {
+                volts,
+                impedance: 0.0,
+            })),
+        }
+    }
+}
+
+/// One declared terminal source: the net it is declared on and what it
+/// holds. A `PowerOut` pin's source is written through its drive slot
+/// ([`DriveSlot::terminal`] points at it); a harness supply's and a
+/// `net_stuck`'s through [`Resolver::set_terminal`].
+struct TerminalSource {
+    net: usize,
+    drive: TerminalDrive,
+}
+
+/// What a terminal's root is held at once its sources are reconciled: the
+/// one voltage every dependent solve takes as its constant and every
+/// dependent root ranks as an ideal source — assigned once, at the
+/// terminal's own cluster, never per dependent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalState {
+    drive: TerminalDrive,
+    /// Two of its sources disagreed: the voltage is the fight's own
+    /// operating point (the Norton mid-value at the ideal floor) and the
+    /// terminal's cluster reports the fight, once.
+    fought: bool,
+}
+
 /// One drive-capable pin's slot: net membership plus the drive it currently
 /// contributes (`None` = released / high-Z / pure sense). Always holds the
 /// normalised form ([`normalise_drive`]): a Thevenin drive here has a finite
@@ -616,6 +712,10 @@ struct DriveSlot {
     net: usize,
     pin: PinRef,
     drive: Option<Drive>,
+    /// A `PowerOut` pin's slot: its drive is what the terminal holds, never
+    /// a source of the cluster it sits in (a rail is a constant, not a
+    /// driver), and it carries no current the solve accounts for.
+    terminal: Option<TerminalId>,
 }
 
 /// One piecewise-linear element: a [`crate::Branch`] with its pins resolved
@@ -688,6 +788,14 @@ fn element_home(
 struct PassCurrents {
     endpoints: Vec<(usize, Option<Amps>)>,
     elements: Vec<(usize, Option<Amps>)>,
+}
+
+/// What one pass produces beside the net states: its findings and its
+/// currents, accumulated cluster by cluster.
+#[derive(Default)]
+struct PassOutput {
+    findings: PassFindings,
+    currents: PassCurrents,
 }
 
 /// One serial-capable pin registered for stream routing.
@@ -780,8 +888,13 @@ pub(crate) struct Resolver {
     endpoint_currents: Vec<Option<Amps>>,
     /// The current through each element from the last solve of its cluster.
     element_currents: Vec<Option<Amps>>,
-    power_sources: Vec<(usize, Volts)>,
-    stuck_sources: Vec<(usize, Volts)>,
+    /// The declared terminal sources: harness supplies and `PowerOut`
+    /// pins, in declaration order ([`TerminalId::Power`]).
+    power_sources: Vec<TerminalSource>,
+    /// The `net_stuck` faults, in declaration order ([`TerminalId::Stuck`]).
+    /// The canonical order of the terminal sources is these after the
+    /// power sources.
+    stuck_sources: Vec<TerminalSource>,
     digital_senses: Vec<usize>,
     analog_senses: Vec<usize>,
     /// Current instruments' nets ([`ReadKind::Instrument`]): each
@@ -806,6 +919,17 @@ pub(crate) struct Resolver {
     topology_version: u64,
     /// Dense cluster ids whose drive table changed since the last pass.
     dirty: Vec<usize>,
+    /// What every terminal of the cached topology holds its root at, by
+    /// position in [`Topology::terminals`] — decided by the pass that
+    /// resolved the terminal's own cluster and read by every dependent's
+    /// pass after it (`NODES.md` "Three rules the taxonomy rests on", 1:
+    /// "its state is assigned once"). Rebuilt by the first full pass over a
+    /// topology.
+    terminal_states: Vec<TerminalState>,
+    /// Whether `terminal_states` describes the cached topology: false from
+    /// a rebuild until a full pass has decided every terminal, so a dirty
+    /// pass never reads a terminal no pass has resolved.
+    terminals_resolved: bool,
     /// How many times a pass escalated a cluster to the [`ClusterSolver`]
     /// (`DESIGN.md` rule 8: a solve runs only where sources within a factor
     /// of ten disagree or an analog sense asks — everything else is a
@@ -827,6 +951,33 @@ struct Topology {
     cluster_index: Vec<usize>,
     /// Clusters in ascending cluster-root order.
     clusters: Vec<ClusterTopo>,
+    /// The declared terminals, in ascending root order — one per root a
+    /// terminal source is declared on, however many sources share it.
+    terminals: Vec<TerminalTopo>,
+}
+
+/// One declared terminal (`NODES.md` "Three rules the taxonomy rests on",
+/// 1): a root held by a declared source — a `PowerOut` pin, a harness
+/// `power(V)` endpoint, a `net_stuck` — which is its own one-root cluster
+/// and a boundary of every cluster around it. Membership is fixed at build:
+/// the terminal is declared whatever its sources hold, so a rail that is
+/// down is a released terminal, not a member of its load's cluster.
+struct TerminalTopo {
+    /// Its identity root.
+    root: usize,
+    /// The dense id of its own cluster — exactly one root, this one.
+    cluster: usize,
+    /// The sources declared on it, in canonical order (power sources then
+    /// stuck faults, each in declaration order): what
+    /// [`decide_terminal`] reconciles into the one voltage it holds.
+    sources: Vec<TerminalId>,
+    /// The fan-out: the dense ids of every cluster that reads the terminal
+    /// — through a conduction edge ending on it, an element's conducting
+    /// end on it, or an element's control on it — ascending. A change to
+    /// what the terminal holds dirties these with the terminal's own
+    /// cluster ([`Resolver::mark_terminal_dirty`]), which is what keeps
+    /// `resolve_dirty` equal to a full pass.
+    dependents: Vec<usize>,
 }
 
 /// One conduction cluster's members, in the orders the pass iterates them.
@@ -835,27 +986,32 @@ struct ClusterTopo {
     nets: Vec<usize>,
     /// Member identity roots (nets that are their own root), ascending.
     roots: Vec<usize>,
-    /// Identity-collapsed conduction edges within the cluster, in
-    /// declaration order.
+    /// Identity-collapsed conduction edges with a member root at one end
+    /// or both, in declaration order. The other end of an edge may be a
+    /// boundary terminal's root: the edge belongs to the cluster of its
+    /// non-terminal end, and an edge between two terminals belongs to no
+    /// cluster (it sits between two constants and changes nothing).
     edges: Vec<(usize, usize, f64)>,
-    /// Drive-capable endpoints in the cluster, ascending.
+    /// Drive-capable endpoints in the cluster, ascending — the slots that
+    /// source it. A `PowerOut` pin's slot is not among them: what it holds
+    /// is its terminal's, read through `terminal`/`boundary`.
     slots: Vec<usize>,
     /// Piecewise-linear elements in the cluster, in declaration order.
     elements: Vec<usize>,
-    /// The declared terminals **outside** the cluster that its elements'
-    /// conducting ends stamp against, as `(root, volts)` in source
-    /// declaration order — the foreign constants of the solve, which
-    /// source the cluster (NaN for an unmodelled rail). Empty for a cluster
-    /// without elements.
-    foreign: Vec<(usize, Volts)>,
-    /// The declared terminals outside the cluster that its elements'
-    /// **controls alone** read — constants for the region tests, sourcing
-    /// nothing.
-    foreign_controls: Vec<(usize, Volts)>,
-    /// Power-rail sources in the cluster as `(root, volts)`, in declaration order.
-    power: Vec<(usize, Volts)>,
-    /// `net_stuck` sources in the cluster as `(root, volts)`, in declaration order.
-    stuck: Vec<(usize, Volts)>,
+    /// `Some(position in Topology::terminals)` when the cluster is a
+    /// declared terminal's own: exactly one root, the terminal's.
+    terminal: Option<usize>,
+    /// The terminals (positions in [`Topology::terminals`], ascending) the
+    /// cluster's edges end on and its elements' conducting ends name:
+    /// each enters the cluster's solve as a Dirichlet constant and its
+    /// ranking as an ideal source through the path to it, and is never a
+    /// member. A rail behind a diode is a rail: a boundary terminal sources
+    /// the cluster.
+    boundary: Vec<usize>,
+    /// The terminals the cluster's elements' **controls alone** read (no
+    /// edge or conducting end touches them): constants for the region
+    /// tests, sourcing nothing and ranking nowhere.
+    boundary_controls: Vec<usize>,
     /// Digital sense pins in the cluster as `(registration position, net)`.
     digital_senses: Vec<(usize, usize)>,
     /// Analog sense pins in the cluster as `(registration position, net)`.
@@ -864,9 +1020,75 @@ struct ClusterTopo {
     current_instruments: Vec<(usize, usize)>,
     /// Power sense pins in the cluster as `(registration position, net)`.
     power_senses: Vec<(usize, usize)>,
-    /// Minimum series resistance between roots, `roots.len()` square,
-    /// row-major by position in `roots`; `INFINITY` where no path exists.
+    /// Minimum series resistance from every root (rows, by position in
+    /// `roots`) to every root and then to every boundary terminal
+    /// (columns: `roots`, then `boundary`, `roots.len() + boundary.len()`
+    /// wide), ending at but never crossing a terminal; `INFINITY` where no
+    /// path exists.
     dist: Vec<f64>,
+}
+
+impl ClusterTopo {
+    /// Width of one row of `dist`.
+    fn columns(&self) -> usize {
+        self.roots.len() + self.boundary.len()
+    }
+}
+
+/// Rule 1's "assigned once": what a terminal holds its root at, from its
+/// declared sources alone — shared by the per-cluster pass and the
+/// test-only reference, so the rule is one function.
+///
+/// A released source holds nothing; an unmodelled one (a `PowerOut` still
+/// a facade) makes the terminal unmodelled when no voltage is declared on
+/// it; every declared voltage counts, and when they agree (`==`, so `0.0`
+/// and `-0.0` are one voltage) the terminal holds it. A bench strap onto a
+/// released or unmodelled rail therefore sources it with no fight. When
+/// declared voltages disagree — a rail against a `net_stuck` — the
+/// terminal is **fought**: `solve_fight` is handed the voltages in
+/// canonical order and answers with the fight's operating point (the
+/// solver's Norton mid-value at the ideal floor), which the terminal then
+/// holds for every dependent while its own cluster reports the fight once.
+fn decide_terminal(
+    drives: impl Iterator<Item = TerminalDrive>,
+    solve_fight: impl FnOnce(&[Volts]) -> Volts,
+) -> TerminalState {
+    let mut numeric: Vec<Volts> = Vec::new();
+    let mut unmodelled = false;
+    for drive in drives {
+        match drive {
+            TerminalDrive::Released => {}
+            TerminalDrive::Unmodelled => unmodelled = true,
+            TerminalDrive::Volts(v) => numeric.push(v),
+        }
+    }
+    let Some(&first) = numeric.first() else {
+        return TerminalState {
+            drive: if unmodelled {
+                TerminalDrive::Unmodelled
+            } else {
+                TerminalDrive::Released
+            },
+            fought: false,
+        };
+    };
+    if numeric.iter().all(|&v| v == first) {
+        return TerminalState {
+            drive: TerminalDrive::Volts(first),
+            fought: false,
+        };
+    }
+    TerminalState {
+        drive: TerminalDrive::from_volts(solve_fight(&numeric)),
+        fought: true,
+    }
+}
+
+/// The terminal ideal sources of one cluster's ranking: the volts each
+/// holds and the `dist` column it is reached through.
+struct TerminalSourceColumn {
+    volts: Volts,
+    column: usize,
 }
 
 /// Findings of one pass, each with the key that orders it the way a full
@@ -961,6 +1183,8 @@ impl Resolver {
             topology: None,
             topology_version: 0,
             dirty: Vec::new(),
+            terminal_states: Vec::new(),
+            terminals_resolved: false,
             escalated_solves: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1118,6 +1342,7 @@ impl Resolver {
             net,
             pin,
             drive: normalise_drive(initial),
+            terminal: None,
         });
         EndpointId(self.slots.len() - 1)
     }
@@ -1129,6 +1354,11 @@ impl Resolver {
     /// Returns whether the table changed. An identical drive is a no-op that
     /// marks nothing dirty — a card re-asserting the level it already holds,
     /// or a pin re-driven high on every clock edge, costs no resolution.
+    ///
+    /// On a `PowerOut` pin's slot ([`Resolver::add_terminal_endpoint`]) the
+    /// drive is what the pin's terminal holds ([`TerminalDrive::from_slot`]),
+    /// and a change to that dirties the terminal's own cluster and every
+    /// cluster in its fan-out — never the slot's cluster alone.
     pub(crate) fn set_drive(&mut self, endpoint: EndpointId, drive: Option<Drive>) -> bool {
         let drive = normalise_drive(drive);
         let Some(slot) = self.slots.get_mut(endpoint.0) else {
@@ -1140,6 +1370,14 @@ impl Resolver {
         }
         slot.drive = drive;
         let net = slot.net;
+        if let Some(id) = slot.terminal {
+            let held = TerminalDrive::from_slot(drive);
+            if self.terminal_source(id).drive != held {
+                self.terminal_source_mut(id).drive = held;
+                self.mark_terminal_dirty(id);
+            }
+            return true;
+        }
         if let Some(topology) = self
             .topology
             .as_ref()
@@ -1154,16 +1392,171 @@ impl Resolver {
         true
     }
 
-    /// Add a power-rail source (harness power endpoint or `PowerOut` pin).
-    pub(crate) fn add_power_source(&mut self, net: usize, volts: Volts) {
+    /// Add a power-rail source (a harness power endpoint) holding `volts`
+    /// (`NaN` = sourced at an unmodelled voltage).
+    pub(crate) fn add_power_source(&mut self, net: usize, volts: Volts) -> TerminalId {
         self.topology_version += 1;
-        self.power_sources.push((net, volts));
+        self.power_sources.push(TerminalSource {
+            net,
+            drive: TerminalDrive::from_volts(volts),
+        });
+        TerminalId::Power(self.power_sources.len() - 1)
     }
 
     /// Add a `net_stuck` fault source.
-    pub(crate) fn add_stuck_source(&mut self, net: usize, volts: Volts) {
+    pub(crate) fn add_stuck_source(&mut self, net: usize, volts: Volts) -> TerminalId {
         self.topology_version += 1;
-        self.stuck_sources.push((net, volts));
+        self.stuck_sources.push(TerminalSource {
+            net,
+            drive: TerminalDrive::from_volts(volts),
+        });
+        TerminalId::Stuck(self.stuck_sources.len() - 1)
+    }
+
+    /// Register a `PowerOut` pin: its net is a declared terminal from
+    /// build on (membership is fixed at build, `NODES.md` §2 rule 3), held
+    /// at `idle` until the part publishes, and the returned slot is how
+    /// the part drives it — a [`Drive::Thevenin`] sets the voltage the
+    /// terminal holds (the impedance is recorded on the slot for the I-V
+    /// port, not solved), a release lets it go ([`TerminalDrive::from_slot`]).
+    /// The slot is never a source of the cluster it sits in and carries no
+    /// current: a rail is a constant, and its current spans clusters.
+    pub(crate) fn add_terminal_endpoint(
+        &mut self,
+        net: usize,
+        pin: PinRef,
+        idle: Option<Drive>,
+    ) -> EndpointId {
+        self.topology_version += 1;
+        let id = TerminalId::Power(self.power_sources.len());
+        // The slot holds the idle drive in the encoding `set_drive`
+        // compares against, so the part's first publish — a release
+        // included — is a change: an unmodelled idle is the NaN-volt
+        // Thevenin `PowerOut` has always meant, a released one is `None`,
+        // and a declared Thevenin keeps its impedance on the slot — the
+        // I-V port's record, never solved — as a published one does
+        // (`TerminalDrive::idle_slot_drive` for the first two).
+        let drive = normalise_drive(idle);
+        self.slots.push(DriveSlot {
+            net,
+            pin,
+            drive,
+            terminal: Some(id),
+        });
+        self.power_sources.push(TerminalSource {
+            net,
+            drive: TerminalDrive::from_slot(drive),
+        });
+        EndpointId(self.slots.len() - 1)
+    }
+
+    /// Change what a declared terminal source holds its net at — the
+    /// oracle's entry today, and the harness's the day a scenario re-sets
+    /// a supply live; a `PowerOut` pin's part goes through its slot
+    /// ([`Self::set_drive`]). Returns whether it changed; a change dirties
+    /// the terminal's cluster and its fan-out.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_terminal(&mut self, id: TerminalId, drive: TerminalDrive) -> bool {
+        if self.terminal_source(id).drive == drive {
+            return false;
+        }
+        self.terminal_source_mut(id).drive = drive;
+        self.mark_terminal_dirty(id);
+        true
+    }
+
+    /// Every terminal source in canonical order: power sources, then
+    /// stuck faults, each in declaration order.
+    fn terminal_sources(&self) -> impl Iterator<Item = &TerminalSource> {
+        self.power_sources.iter().chain(self.stuck_sources.iter())
+    }
+
+    fn terminal_source(&self, id: TerminalId) -> &TerminalSource {
+        match id {
+            TerminalId::Power(i) => &self.power_sources[i],
+            TerminalId::Stuck(i) => &self.stuck_sources[i],
+        }
+    }
+
+    fn terminal_source_mut(&mut self, id: TerminalId) -> &mut TerminalSource {
+        match id {
+            TerminalId::Power(i) => &mut self.power_sources[i],
+            TerminalId::Stuck(i) => &mut self.stuck_sources[i],
+        }
+    }
+
+    /// The declared terminal roots — every root a terminal source is
+    /// declared on, whatever it holds — sorted and deduplicated: the roots
+    /// no path continues past, no edge or element unions through, and
+    /// each of which is a cluster of its own.
+    fn terminal_roots(&self, root_of: &[usize]) -> Vec<usize> {
+        let mut roots: Vec<usize> = self
+            .terminal_sources()
+            .map(|source| root_of[source.net])
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    }
+
+    /// The fan-out walk: a changed terminal dirties its own cluster and
+    /// every cluster that reads it. With no usable cache the next pass is
+    /// a full one anyway.
+    fn mark_terminal_dirty(&mut self, id: TerminalId) {
+        let net = self.terminal_source(id).net;
+        let Some(topology) = self
+            .topology
+            .as_ref()
+            .filter(|t| t.version == self.topology_version && net < t.root_of.len())
+        else {
+            return;
+        };
+        let root = topology.root_of[net];
+        let Ok(position) = topology.terminals.binary_search_by_key(&root, |t| t.root) else {
+            return;
+        };
+        let terminal = &topology.terminals[position];
+        let mut touched: Vec<usize> = Vec::with_capacity(1 + terminal.dependents.len());
+        touched.push(terminal.cluster);
+        touched.extend(terminal.dependents.iter().copied());
+        for cluster in touched {
+            if !self.dirty.contains(&cluster) {
+                self.dirty.push(cluster);
+            }
+        }
+    }
+
+    /// The fight of a terminal's own sources, solved as the one-node
+    /// cluster it is: the numeric sources as the ideal 0 Ω sources they
+    /// rank as, Norton-stamped at the ideal floor by the same solver every
+    /// cluster uses — counted, because it is an escalation.
+    fn solve_fight(&self, root: usize, volts: &[Volts], solver: &dyn ClusterSolver) -> Volts {
+        let node = NetId(root);
+        let inputs = ClusterInputs {
+            sources: volts
+                .iter()
+                .map(|&v| ClusterSource {
+                    node,
+                    volts: v,
+                    impedance: 0.0,
+                })
+                .collect(),
+            ..ClusterInputs::default()
+        };
+        self.escalated_solves.fetch_add(1, Ordering::SeqCst);
+        match solver
+            .solve(
+                &Cluster {
+                    nodes: vec![node],
+                    resistors: Vec::new(),
+                },
+                &inputs,
+            )
+            .state_of(node)
+        {
+            Some(NetState::Analog(v)) => v,
+            _ => f64::NAN,
+        }
     }
 
     /// Register a digital sense pin (floating-sense findings).
@@ -1183,6 +1576,22 @@ impl Resolver {
     pub(crate) fn add_current_instrument(&mut self, net: usize) {
         self.topology_version += 1;
         self.current_instruments.push(net);
+    }
+
+    /// The pins whose slots drive the identity root `root` right now: a
+    /// Thevenin drive on a non-terminal slot (a `PowerOut` pin's slot is
+    /// its terminal's, not a driver). The build's mechanical-pad lint asks
+    /// ([`crate::Finding::MechanicalOnDrivenNet`]).
+    pub(crate) fn driving_pins(&self, root_of: &[usize], root: usize) -> Vec<PinRef> {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                slot.terminal.is_none()
+                    && matches!(slot.drive, Some(Drive::Thevenin(_)))
+                    && root_of.get(slot.net).copied() == Some(root)
+            })
+            .map(|slot| slot.pin.clone())
+            .collect()
     }
 
     /// Register a power sense pin (`PowerNetUnsourced` findings).
@@ -1226,50 +1635,58 @@ impl Resolver {
     }
 
     /// Rebuild the topology cache if the inputs changed since it was built.
+    /// A rebuilt cache has no terminal decided yet: the next pass must be a
+    /// full one ([`Self::resolve`]), which `dirty_scope`/`resolve_dirty`
+    /// honour through `terminals_resolved`.
     fn ensure_topology(&mut self, n: usize) {
         if self.topology_is_current(n) {
             return;
         }
         self.identity.grow(self.net_count.max(n));
         let topology = self.build_topology(n);
+        self.terminal_states.clear();
+        self.terminals_resolved = false;
         self.topology = Some(topology);
         self.dirty.clear();
     }
 
     /// Derive every drive-independent structure of the board once: identity
-    /// roots, conduction clusters (dense ids in ascending cluster-root
-    /// order), each cluster's nets, roots, edges, endpoints, sources and
-    /// senses, and the minimum series resistance between each pair of its
-    /// roots. Resolution passes are pure lookups over this afterwards.
+    /// roots, the declared terminals, conduction clusters (dense ids in
+    /// ascending cluster-root order), each cluster's nets, roots, edges,
+    /// endpoints, boundary terminals and senses, the minimum series
+    /// resistance between each of its roots and each root and boundary
+    /// terminal, and each terminal's fan-out. Resolution passes are pure
+    /// lookups over this afterwards.
     fn build_topology(&mut self, n: usize) -> Topology {
         let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
 
-        // The declared terminals — rails (modelled or not) and stuck
-        // faults — as the roots no path continues past, and no element
-        // unions through.
-        let terminal_roots: Vec<usize> = self
-            .power_sources
-            .iter()
-            .chain(self.stuck_sources.iter())
-            .map(|(net, _)| root_of[*net])
-            .collect();
-        let is_terminal = |root: usize| terminal_roots.contains(&root);
+        // The declared terminals — rails (modelled, unmodelled or
+        // released) and stuck faults — as the roots no path continues
+        // past, no edge or element unions through, and each of which is a
+        // cluster of its own (`NODES.md` "Three rules the taxonomy rests
+        // on", 1).
+        let terminal_roots = self.terminal_roots(&root_of);
+        let is_terminal = |root: usize| terminal_roots.binary_search(&root).is_ok();
+        let terminal_position = |root: usize| terminal_roots.binary_search(&root).ok();
 
-        // Conduction clusters: identity merges are 0-ohm, conduction edges
-        // connect within a cluster without merging identity, and an
-        // element is a membership edge among its **non-terminal** nets —
-        // its two ends and its control, so a gate is in-cluster. A
-        // declared terminal is a constant, and a constant is a boundary: an
-        // element touching one stamps against it as a foreign constant of
-        // its own cluster rather than joining the terminal's (`NODES.md`
-        // §8 phase 3, the parts record — what keeps a polarity FET whose
-        // gate is on the stuck ground out of the ground cluster's solves).
+        // Conduction clusters: identity merges are 0-ohm, a conduction
+        // edge between two non-terminal roots connects them without merging
+        // identity, and an element is a membership edge among its
+        // **non-terminal** nets — its two ends and its control, so a gate
+        // is in-cluster. A declared terminal is a constant, and a constant
+        // is a boundary: an edge ending on one belongs to the cluster of
+        // its other end, an element touching one stamps against it as a
+        // boundary constant of its own cluster, and the terminal's root
+        // joins nothing.
         let mut conduction = Dsu::new(n);
         for (i, &root) in root_of.iter().enumerate() {
             conduction.union(root, i);
         }
         for (a, b, _ohms) in &self.edges {
-            conduction.union(root_of[*a], root_of[*b]);
+            let (ra, rb) = (root_of[*a], root_of[*b]);
+            if !is_terminal(ra) && !is_terminal(rb) {
+                conduction.union(ra, rb);
+            }
         }
         let homes: Vec<Option<ElementHome>> = self
             .elements
@@ -1308,17 +1725,27 @@ impl Resolver {
             .map(|(a, b, ohms)| (root_of[*a], root_of[*b], *ohms))
             .filter(|(a, b, _)| a != b)
             .collect();
-        let clusters = (0..cluster_roots.len())
+        let clusters: Vec<ClusterTopo> = (0..cluster_roots.len())
             .map(|cid| {
                 let nets: Vec<usize> = (0..n).filter(|&i| cluster_index[i] == cid).collect();
                 let roots: Vec<usize> = nets.iter().copied().filter(|&i| root_of[i] == i).collect();
+                // An edge belongs to the cluster of its non-terminal
+                // end(s): both ends when neither is a terminal (one
+                // cluster, by the union above), one end when the other is
+                // a boundary terminal, no cluster when both are.
                 let edges: Vec<(usize, usize, f64)> = root_edges
                     .iter()
-                    .filter(|(a, _, _)| cluster_index[*a] == cid)
+                    .filter(|(a, b, _)| {
+                        (cluster_index[*a] == cid && !is_terminal(*a))
+                            || (cluster_index[*b] == cid && !is_terminal(*b))
+                    })
                     .copied()
                     .collect();
                 let slots: Vec<usize> = (0..self.slots.len())
-                    .filter(|&si| cluster_index[self.slots[si].net] == cid)
+                    .filter(|&si| {
+                        self.slots[si].terminal.is_none()
+                            && cluster_index[self.slots[si].net] == cid
+                    })
                     .collect();
                 let elements: Vec<usize> = (0..self.elements.len())
                     .filter(|&ei| {
@@ -1327,48 +1754,43 @@ impl Resolver {
                             .is_some_and(|home| cluster_index[home.root] == cid)
                     })
                     .collect();
-                // The terminal roots the cluster's elements name outside
-                // it — conducting ends, and controls that are not also an
-                // end — each with every source declared on it, in the
-                // sources' own order (a fought terminal arrives as the
-                // fight it is).
-                let mut foreign_roots: Vec<usize> = Vec::new();
-                let mut control_roots: Vec<usize> = Vec::new();
-                for &ei in &elements {
-                    let home = homes[ei].as_ref().expect("a homed element");
-                    for &root in &home.terminal_ends {
-                        if cluster_index[root] != cid && !foreign_roots.contains(&root) {
-                            foreign_roots.push(root);
-                        }
-                    }
-                    if let Some(root) = home.terminal_control {
-                        if cluster_index[root] != cid && !control_roots.contains(&root) {
-                            control_roots.push(root);
+                // A terminal's own cluster is its root alone.
+                let terminal = roots.iter().find_map(|&root| terminal_position(root));
+                debug_assert!(terminal.is_none() || roots.len() == 1);
+                // The boundary: the terminals the edges end on and the
+                // elements' conducting ends name; then the terminals the
+                // controls alone read.
+                let mut boundary: Vec<usize> = Vec::new();
+                for (a, b, _) in &edges {
+                    for root in [*a, *b] {
+                        if let Some(position) = terminal_position(root) {
+                            if !boundary.contains(&position) {
+                                boundary.push(position);
+                            }
                         }
                     }
                 }
-                let sources_on = |roots: &[usize]| -> Vec<(usize, Volts)> {
-                    self.power_sources
-                        .iter()
-                        .chain(self.stuck_sources.iter())
-                        .map(|(net, volts)| (root_of[*net], *volts))
-                        .filter(|(root, _)| roots.contains(root))
-                        .collect()
-                };
-                let foreign = sources_on(&foreign_roots);
-                let foreign_controls = sources_on(
-                    &control_roots
-                        .iter()
-                        .copied()
-                        .filter(|root| !foreign_roots.contains(root))
-                        .collect::<Vec<_>>(),
-                );
-                let sources_in = |list: &[(usize, Volts)]| -> Vec<(usize, Volts)> {
-                    list.iter()
-                        .filter(|(net, _)| cluster_index[*net] == cid)
-                        .map(|(net, volts)| (root_of[*net], *volts))
-                        .collect()
-                };
+                for &ei in &elements {
+                    let home = homes[ei].as_ref().expect("a homed element");
+                    for &root in &home.terminal_ends {
+                        let position = terminal_position(root).expect("a terminal end");
+                        if !boundary.contains(&position) {
+                            boundary.push(position);
+                        }
+                    }
+                }
+                boundary.sort_unstable();
+                let mut boundary_controls: Vec<usize> = Vec::new();
+                for &ei in &elements {
+                    let home = homes[ei].as_ref().expect("a homed element");
+                    if let Some(root) = home.terminal_control {
+                        let position = terminal_position(root).expect("a terminal control");
+                        if !boundary.contains(&position) && !boundary_controls.contains(&position) {
+                            boundary_controls.push(position);
+                        }
+                    }
+                }
+                boundary_controls.sort_unstable();
                 let senses_in = |list: &[usize]| -> Vec<(usize, usize)> {
                     list.iter()
                         .enumerate()
@@ -1376,16 +1798,23 @@ impl Resolver {
                         .map(|(pos, net)| (pos, *net))
                         .collect()
                 };
-                // Minimum series resistance between every pair of the
-                // cluster's roots, ending at but never crossing a terminal;
-                // INFINITY where no such path exists.
+                // Minimum series resistance from every root of the
+                // cluster to every root and every boundary terminal,
+                // ending at but never crossing a terminal; INFINITY where
+                // no such path exists.
                 let k = roots.len();
-                let mut dist = vec![f64::INFINITY; k * k];
+                let columns = k + boundary.len();
+                let mut dist = vec![f64::INFINITY; k * columns];
                 for (ia, &ra) in roots.iter().enumerate() {
                     let from = min_path_ohms(&edges, ra, &terminal_roots);
                     for (ib, rb) in roots.iter().enumerate() {
                         if let Some(&ohms) = from.get(rb) {
-                            dist[ia * k + ib] = ohms;
+                            dist[ia * columns + ib] = ohms;
+                        }
+                    }
+                    for (jb, &position) in boundary.iter().enumerate() {
+                        if let Some(&ohms) = from.get(&terminal_roots[position]) {
+                            dist[ia * columns + k + jb] = ohms;
                         }
                     }
                 }
@@ -1395,15 +1824,44 @@ impl Resolver {
                     edges,
                     slots,
                     elements,
-                    foreign,
-                    foreign_controls,
-                    power: sources_in(&self.power_sources),
-                    stuck: sources_in(&self.stuck_sources),
+                    terminal,
+                    boundary,
+                    boundary_controls,
                     digital_senses: senses_in(&self.digital_senses),
                     analog_senses: senses_in(&self.analog_senses),
                     current_instruments: senses_in(&self.current_instruments),
                     power_senses: senses_in(&self.power_senses),
                     dist,
+                }
+            })
+            .collect();
+
+        // The terminals: their sources in canonical order, their own
+        // cluster, and the fan-out — every cluster whose boundary or
+        // controls name them.
+        let terminals: Vec<TerminalTopo> = terminal_roots
+            .iter()
+            .enumerate()
+            .map(|(position, &root)| {
+                let sources: Vec<TerminalId> = (0..self.power_sources.len())
+                    .map(TerminalId::Power)
+                    .chain((0..self.stuck_sources.len()).map(TerminalId::Stuck))
+                    .filter(|&id| root_of[self.terminal_source(id).net] == root)
+                    .collect();
+                let dependents: Vec<usize> = (0..clusters.len())
+                    .filter(|&cid| {
+                        clusters[cid].boundary.binary_search(&position).is_ok()
+                            || clusters[cid]
+                                .boundary_controls
+                                .binary_search(&position)
+                                .is_ok()
+                    })
+                    .collect();
+                TerminalTopo {
+                    root,
+                    cluster: cluster_index[root],
+                    sources,
+                    dependents,
                 }
             })
             .collect();
@@ -1414,6 +1872,7 @@ impl Resolver {
             root_of,
             cluster_index,
             clusters,
+            terminals,
         }
     }
 
@@ -1427,7 +1886,9 @@ impl Resolver {
     /// Clusters are electrically independent, so the pass is the union of
     /// one [`Self::resolve_cluster`] per cluster — the same routine the live
     /// path runs on just the clusters a drive touched
-    /// ([`Self::resolve_dirty`]). One code path, two scopes.
+    /// ([`Self::resolve_dirty`]). One code path, two scopes. The terminals
+    /// are decided first, each at its own cluster, so every dependent's
+    /// pass reads what its boundary holds *now*.
     pub(crate) fn resolve(
         &mut self,
         nets: &mut [Net],
@@ -1437,13 +1898,20 @@ impl Resolver {
         let n = nets.len();
         self.ensure_topology(n);
         let topology = self.topology.take().expect("ensure_topology built it");
-        let mut findings = PassFindings::default();
-        let mut currents = PassCurrents::default();
+        let mut out = PassOutput::default();
+        let mut states = std::mem::take(&mut self.terminal_states);
+        states.clear();
+        states.extend(
+            (0..topology.terminals.len())
+                .map(|position| self.resolve_terminal(&topology, position, solver)),
+        );
         for cid in 0..topology.clusters.len() {
-            self.resolve_cluster(&topology, cid, nets, &mut findings, &mut currents, solver);
+            self.resolve_cluster(&topology, cid, nets, &states, &mut out, solver);
         }
-        findings.emit(diagnostics);
-        self.apply_currents(currents);
+        self.terminal_states = states;
+        self.terminals_resolved = true;
+        out.findings.emit(diagnostics);
+        self.apply_currents(out.currents);
         self.topology = Some(topology);
         self.dirty.clear();
     }
@@ -1452,7 +1920,7 @@ impl Resolver {
     /// members of every cluster whose drive table changed — or every net,
     /// when the topology changed and the next pass must be a full one.
     pub(crate) fn dirty_scope(&self, n: usize) -> Vec<usize> {
-        if !self.topology_is_current(n) {
+        if !self.topology_is_current(n) || !self.terminals_resolved {
             return (0..n).collect();
         }
         let topology = self.topology.as_ref().expect("current");
@@ -1470,14 +1938,15 @@ impl Resolver {
     /// scope [`Self::dirty_scope`] announced), reporting their findings.
     /// Every other net keeps its state, which is exactly what the full pass
     /// would have recomputed for it. Falls back to a full pass when the
-    /// topology changed underneath.
+    /// topology changed underneath. A dirty terminal cluster is decided
+    /// before any dirty dependent is resolved — the fan-out marked both.
     pub(crate) fn resolve_dirty(
         &mut self,
         nets: &mut [Net],
         diagnostics: &mut Diagnostics,
         solver: &dyn ClusterSolver,
     ) {
-        if !self.topology_is_current(nets.len()) {
+        if !self.topology_is_current(nets.len()) || !self.terminals_resolved {
             self.resolve(nets, diagnostics, solver);
             return;
         }
@@ -1488,14 +1957,38 @@ impl Resolver {
         let mut dirty = std::mem::take(&mut self.dirty);
         dirty.sort_unstable();
         dirty.dedup();
-        let mut findings = PassFindings::default();
-        let mut currents = PassCurrents::default();
+        let mut out = PassOutput::default();
+        let mut states = std::mem::take(&mut self.terminal_states);
         for &cid in &dirty {
-            self.resolve_cluster(&topology, cid, nets, &mut findings, &mut currents, solver);
+            if let Some(position) = topology.clusters[cid].terminal {
+                states[position] = self.resolve_terminal(&topology, position, solver);
+            }
         }
-        findings.emit(diagnostics);
-        self.apply_currents(currents);
+        for &cid in &dirty {
+            self.resolve_cluster(&topology, cid, nets, &states, &mut out, solver);
+        }
+        self.terminal_states = states;
+        out.findings.emit(diagnostics);
+        self.apply_currents(out.currents);
         self.topology = Some(topology);
+    }
+
+    /// Decide what one terminal holds its root at, from its sources alone
+    /// ([`decide_terminal`]).
+    fn resolve_terminal(
+        &self,
+        topology: &Topology,
+        position: usize,
+        solver: &dyn ClusterSolver,
+    ) -> TerminalState {
+        let terminal = &topology.terminals[position];
+        decide_terminal(
+            terminal
+                .sources
+                .iter()
+                .map(|&id| self.terminal_source(id).drive),
+            |volts| self.solve_fight(terminal.root, volts, solver),
+        )
     }
 
     /// Resolve one conduction cluster from the current drive table: the
@@ -1507,21 +2000,24 @@ impl Resolver {
     ///
     /// Everything here is cluster-local by construction — every cross-net
     /// rule walks conduction edges or identity roots, and neither crosses a
-    /// cluster boundary — which is what makes resolving a subset exact.
-    /// Iteration is over dense, ascending indices throughout (never a hash
-    /// walk), so a pass is bit-for-bit reproducible; see `DETERMINISM.md`.
+    /// cluster boundary; a terminal on the boundary is read as the one
+    /// state its own cluster decided ([`TerminalState`]) — which is what
+    /// makes resolving a subset exact. Iteration is over dense, ascending
+    /// indices throughout (never a hash walk), so a pass is bit-for-bit
+    /// reproducible; see `DETERMINISM.md`.
     fn resolve_cluster(
         &self,
         topology: &Topology,
         cid: usize,
         nets: &mut [Net],
-        findings: &mut PassFindings,
-        currents: &mut PassCurrents,
+        terminal_states: &[TerminalState],
+        out: &mut PassOutput,
         solver: &dyn ClusterSolver,
     ) {
         let c = &topology.clusters[cid];
         let root_of = &topology.root_of;
         let k = c.roots.len();
+        let columns = c.columns();
         let has_elements = !c.elements.is_empty();
         let pos_of_root = |root: usize| -> usize {
             c.roots
@@ -1530,22 +2026,14 @@ impl Resolver {
                 .expect("a cluster's sources sit on its own roots")
         };
 
-        // Every Thevenin source in the cluster, in canonical order: drivers
-        // in endpoint order, then rails and stuck faults as ideal 0 Ω
-        // sources. This order is the SPICE card order the cluster solver
-        // stamps (determinism), and the tie-break order of rule 2's ranking.
-        // Beside each source, the slot it came from (`None` for a terminal).
-        // NaN ("sourced at an unmodeled voltage") rails source the cluster
-        // — a PowerIn on it is not unsourced — but carry no voltage to rank:
-        // they are the fallback presentation of a root nothing numeric
-        // reaches. Current injections are collected apart: they reach
-        // nothing and rank nowhere; they are stamped into the solve. The
-        // numeric terminals are collected apart too: they rank as ideal
-        // sources and enter the solve as constants.
+        // Every slot source in the cluster, in endpoint order: the SPICE
+        // card order the cluster solver stamps (determinism), and the
+        // tie-break order of rule 2's ranking. Current injections are
+        // collected apart: they reach nothing and rank nowhere; they are
+        // stamped into the solve.
         let mut cluster_sourced = false;
         let mut sources: Vec<ClusterSource> = Vec::new();
-        let mut source_slots: Vec<Option<usize>> = Vec::new();
-        let mut terminals: Vec<ClusterTerminal> = Vec::new();
+        let mut source_slots: Vec<usize> = Vec::new();
         let mut injections: Vec<ClusterInjection> = Vec::new();
         let mut injection_slots: Vec<usize> = Vec::new();
         for &si in &c.slots {
@@ -1557,7 +2045,7 @@ impl Resolver {
                         volts: drive.volts,
                         impedance: drive.impedance,
                     });
-                    source_slots.push(Some(si));
+                    source_slots.push(si);
                     cluster_sourced = true;
                 }
                 Some(Drive::Current { amps }) => {
@@ -1570,58 +2058,56 @@ impl Resolver {
                 None => {}
             }
         }
-        let slot_source_count = sources.len();
-        let mut unmodelled_roots: Vec<usize> = Vec::new();
-        for (root, volts) in c.power.iter().chain(c.stuck.iter()) {
-            cluster_sourced = true;
-            if volts.is_nan() {
-                unmodelled_roots.push(*root);
-                continue;
+
+        // The terminals, each as the one state its own cluster decided:
+        // the cluster's own (when it is a terminal's), then its boundary,
+        // then the controls' — in the solver's card order. A voltage is a
+        // Dirichlet constant of the solve and an ideal source of the
+        // ranking through the path to it; an unmodelled rail sources the
+        // cluster and is the fallback presentation of a root nothing
+        // numeric reaches; a released one is nothing at all. A control's
+        // terminal is a constant for its region test and sources nothing.
+        let mut terminals: Vec<ClusterTerminal> = Vec::new();
+        let mut terminal_sources: Vec<TerminalSourceColumn> = Vec::new();
+        let mut unmodelled_columns: Vec<usize> = Vec::new();
+        let mut boundary_nodes: Vec<NetId> = Vec::new();
+        let mut own_fight: Option<Volts> = None;
+        let mut admit = |position: usize, column: usize, boundary: bool| {
+            let state = terminal_states[position];
+            let node = NetId(topology.terminals[position].root);
+            match state.drive {
+                TerminalDrive::Volts(volts) => {
+                    terminals.push(ClusterTerminal { node, volts });
+                    terminal_sources.push(TerminalSourceColumn { volts, column });
+                    if boundary {
+                        boundary_nodes.push(node);
+                    } else if state.fought {
+                        own_fight = Some(volts);
+                    }
+                    cluster_sourced = true;
+                }
+                TerminalDrive::Unmodelled => {
+                    unmodelled_columns.push(column);
+                    cluster_sourced = true;
+                }
+                TerminalDrive::Released => {}
             }
-            sources.push(ClusterSource {
-                node: NetId(*root),
-                volts: *volts,
-                impedance: 0.0,
-            });
-            source_slots.push(None);
-            // A constant of the solve only in a cluster with elements; a
-            // linear cluster's terminals stay the ideal sources above and
-            // no table is built for them (`cluster.rs`, "Terminals are
-            // constants").
-            if has_elements {
-                terminals.push(ClusterTerminal {
-                    node: NetId(*root),
-                    volts: *volts,
-                });
-            }
+        };
+        if let Some(position) = c.terminal {
+            admit(position, 0, false);
         }
-        // The terminals outside the cluster its elements stamp against:
-        // they source the cluster (a rail behind a diode is a rail) and
-        // enter the solve as constants, but rank nowhere — no resistive
-        // path leads to them, so no root is "reached" by one — and an
-        // unmodelled rail behind an element reaches nothing at all. A
-        // terminal a control alone reads is a constant for its region
-        // test and sources nothing.
-        let mut foreign_numeric = false;
-        for &(root, volts) in &c.foreign {
-            cluster_sourced = true;
-            if volts.is_nan() {
-                continue;
-            }
-            foreign_numeric = true;
-            terminals.push(ClusterTerminal {
-                node: NetId(root),
-                volts,
-            });
+        for (j, &position) in c.boundary.iter().enumerate() {
+            admit(position, k + j, true);
         }
-        for &(root, volts) in &c.foreign_controls {
-            if volts.is_finite() {
+        for &position in &c.boundary_controls {
+            if let TerminalDrive::Volts(volts) = terminal_states[position].drive {
                 terminals.push(ClusterTerminal {
-                    node: NetId(root),
+                    node: NetId(topology.terminals[position].root),
                     volts,
                 });
             }
         }
+        let terminal_numeric = !terminal_sources.is_empty();
         // The cluster's elements, with their nets as roots, in declaration
         // order — the order the flip loop evaluates them in.
         let elements: Vec<ClusterElement> = c
@@ -1641,24 +2127,22 @@ impl Resolver {
             .collect();
         debug_assert_eq!(has_elements, !elements.is_empty());
 
-        // The cluster solve — built at most once per pass, on demand. In a
-        // cluster with elements the terminals enter as constants; in a
-        // linear cluster they stay the ideal sources they always were (see
-        // `cluster.rs`, "Terminals are constants", for why the split).
+        // The cluster solve — built at most once per pass, on demand. The
+        // terminals enter as constants, linear clusters included
+        // (`cluster.rs`, "Terminals are constants").
         let mut solution: Option<ClusterSolution> = None;
         let solve = |this: &Self| -> ClusterSolution {
-            if has_elements {
-                this.solve_cluster(
-                    c,
-                    &sources[..slot_source_count],
-                    &terminals,
-                    &injections,
-                    &elements,
-                    solver,
-                )
-            } else {
-                this.solve_cluster(c, &sources, &[], &injections, &elements, solver)
-            }
+            this.solve_cluster(
+                c,
+                &boundary_nodes,
+                ClusterInputs {
+                    sources: sources.clone(),
+                    injections: injections.clone(),
+                    terminals: terminals.clone(),
+                    elements: elements.clone(),
+                },
+                solver,
+            )
         };
 
         // Operating-point precedence. An analog sense reads a voltage, a
@@ -1680,7 +2164,7 @@ impl Resolver {
         // point it is handed, as in an element cluster.
         let injected = injections.iter().any(|i| i.amps != 0.0);
         let precedence = !c.analog_senses.is_empty() || injected;
-        let on_request = (!sources.is_empty() || foreign_numeric)
+        let on_request = (!sources.is_empty() || terminal_numeric)
             && (precedence || !c.current_instruments.is_empty() || has_elements);
         if on_request {
             solution = Some(solve(self));
@@ -1694,15 +2178,27 @@ impl Resolver {
         let mut root_ambiguous: Vec<(usize, Volts)> = Vec::new();
         for (pr, &root) in c.roots.iter().enumerate() {
             let mut reaching: Vec<ReachingSource> = Vec::new();
-            for (source, slot) in sources.iter().zip(&source_slots) {
-                let path = c.dist[pr * k + pos_of_root(source.node.0)];
+            for (source, &si) in sources.iter().zip(&source_slots) {
+                let path = c.dist[pr * columns + pos_of_root(source.node.0)];
                 if !path.is_finite() {
                     continue; // no resistive path: does not reach this root
                 }
                 reaching.push(ReachingSource {
-                    slot: *slot,
+                    slot: Some(si),
                     volts: source.volts,
                     impedance: source.impedance,
+                    path,
+                });
+            }
+            for terminal in &terminal_sources {
+                let path = c.dist[pr * columns + terminal.column];
+                if !path.is_finite() {
+                    continue;
+                }
+                reaching.push(ReachingSource {
+                    slot: None,
+                    volts: terminal.volts,
+                    impedance: 0.0,
                     path,
                 });
             }
@@ -1711,9 +2207,9 @@ impl Resolver {
             // `Pulled(High)` as a rail that is there); otherwise the root
             // floats.
             let unmodelled_or_floating = || {
-                let nearest = unmodelled_roots
+                let nearest = unmodelled_columns
                     .iter()
-                    .map(|&r| c.dist[pr * k + pos_of_root(r)])
+                    .map(|&column| c.dist[pr * columns + column])
                     .filter(|d| d.is_finite())
                     .fold(f64::INFINITY, f64::min);
                 if nearest.is_finite() {
@@ -1722,7 +2218,7 @@ impl Resolver {
                     NetState::Floating
                 }
             };
-            let state = if let (true, Some(solution)) = (has_elements, solution.as_ref()) {
+            let mut state = if let (true, Some(solution)) = (has_elements, solution.as_ref()) {
                 // An element cluster: the solve decided every root, the
                 // elements' far sides included (no resistive path reaches
                 // those, so the ranking has nothing to say about them). The
@@ -1787,6 +2283,29 @@ impl Resolver {
                 }
                 outcome.state
             };
+            // A terminal two of its own sources fought over — a rail
+            // against a `net_stuck` — is decided once, here, at the fight's
+            // operating point: `Contention` inside the dead band, the
+            // voltage outside it, and one finding naming the strong slots
+            // that fought it too, if any (a terminal has no pin). Unless an
+            // analog sense reads the node, whose operating-point precedence
+            // hands it the voltage and reports no fight.
+            if let (Some(volts), false) = (own_fight, precedence) {
+                debug_assert_eq!(pr, 0);
+                let fighting = root_fights
+                    .iter()
+                    .position(|(r, _)| *r == root)
+                    .map(|i| root_fights.remove(i).1)
+                    .unwrap_or_default();
+                root_fights.push((root, fighting));
+                root_ambiguous.retain(|(r, _)| *r != root);
+                state = if V_IL < volts && volts < V_IH {
+                    root_ambiguous.push((root, volts));
+                    NetState::Contention
+                } else {
+                    NetState::Analog(volts)
+                };
+            }
             root_states.push(state);
         }
 
@@ -1817,7 +2336,7 @@ impl Resolver {
                 }
             });
             if amps.is_some() || self.endpoint_currents.get(si).is_some_and(Option::is_some) {
-                currents.endpoints.push((si, amps));
+                out.currents.endpoints.push((si, amps));
             }
         }
         for (position, &ei) in c.elements.iter().enumerate() {
@@ -1825,7 +2344,7 @@ impl Resolver {
                 .as_ref()
                 .and_then(|solution| solution.branch_currents.get(position).copied().flatten());
             if amps.is_some() || self.element_currents.get(ei).is_some_and(Option::is_some) {
-                currents.elements.push((ei, amps));
+                out.currents.elements.push((ei, amps));
             }
         }
 
@@ -1849,7 +2368,7 @@ impl Resolver {
             }
             reported_fights.push(root);
             let name = nets[root.min(i)].name.clone();
-            findings.contention.push((
+            out.findings.contention.push((
                 i,
                 Finding::Contention {
                     net: name.clone(),
@@ -1860,7 +2379,7 @@ impl Resolver {
                 },
             ));
             if let Some((_, volts)) = root_ambiguous.iter().find(|(r, _)| *r == root) {
-                findings.contention.push((
+                out.findings.contention.push((
                     i,
                     Finding::AmbiguousLevel {
                         net: name,
@@ -1882,7 +2401,7 @@ impl Resolver {
                     && !reported_floating.contains(&(root, kind))
                 {
                     reported_floating.push((root, kind));
-                    findings.floating.push((
+                    out.findings.floating.push((
                         (kind_order, pos),
                         Finding::FloatingSense {
                             net: nets[net].name.clone(),
@@ -1907,7 +2426,7 @@ impl Resolver {
                 || (has_elements && !non_convergent && nets[net].state == NetState::Floating);
             if unsourced && !reported_power.contains(&root) {
                 reported_power.push(root);
-                findings.power.push((
+                out.findings.power.push((
                     pos,
                     Finding::PowerNetUnsourced {
                         net: nets[net].name.clone(),
@@ -1924,10 +2443,13 @@ impl Resolver {
             let pr = pos_of_root(injection.node.0);
             let reached = sources
                 .iter()
-                .any(|s| c.dist[pr * k + pos_of_root(s.node.0)].is_finite());
+                .any(|s| c.dist[pr * columns + pos_of_root(s.node.0)].is_finite())
+                || terminal_sources
+                    .iter()
+                    .any(|t| c.dist[pr * columns + t.column].is_finite());
             if !reached {
                 let slot = &self.slots[si];
-                findings.injection.push((
+                out.findings.injection.push((
                     si,
                     Finding::CurrentIntoFloatingNode {
                         net: nets[slot.net].name.clone(),
@@ -1941,7 +2463,7 @@ impl Resolver {
         // finding names the elements, keyed by the cluster's first net.
         if let Some(solution) = solution.as_ref().filter(|s| has_elements && !s.converged) {
             let first = c.nets[0];
-            findings.nonconvergent.push((
+            out.findings.nonconvergent.push((
                 first,
                 Finding::NonConvergent {
                     cluster: nets[first].name.clone(),
@@ -1957,30 +2479,24 @@ impl Resolver {
     }
 
     /// Escalate one cluster to the [`ClusterSolver`]: its roots as nodes,
-    /// its identity-collapsed edges, the slot sources in canonical order,
-    /// the terminals as constants, the current injections and the elements.
-    /// Counted, because every solve is a cost the fast path did not pay
+    /// then the boundary terminals holding a voltage (nodes of the solve
+    /// only as the constants they are, never members whose state this
+    /// cluster publishes), its identity-collapsed edges, and `inputs` —
+    /// the slot sources in canonical order, the terminals as constants,
+    /// the current injections and the elements. An unmodelled or released
+    /// boundary terminal stays outside: an edge or element naming it is
+    /// dropped by the solver, as a branch to no voltage is. Counted,
+    /// because every solve is a cost the fast path did not pay
     /// ([`Self::escalated_solves`]).
     fn solve_cluster(
         &self,
         c: &ClusterTopo,
-        sources: &[ClusterSource],
-        terminals: &[ClusterTerminal],
-        injections: &[ClusterInjection],
-        elements: &[ClusterElement],
+        boundary_nodes: &[NetId],
+        inputs: ClusterInputs,
         solver: &dyn ClusterSolver,
     ) -> ClusterSolution {
-        // The cluster's roots, then the numeric foreign terminals its
-        // elements stamp against — nodes of the solve, constants by the
-        // terminals handed over, never members whose state this cluster
-        // publishes. An unmodelled rail stays outside: an element naming
-        // it is dropped by the solver, as a branch to no voltage is.
         let mut nodes: Vec<NetId> = c.roots.iter().map(|&r| NetId(r)).collect();
-        for &(root, volts) in &c.foreign {
-            if volts.is_finite() && !nodes.contains(&NetId(root)) {
-                nodes.push(NetId(root));
-            }
-        }
+        nodes.extend_from_slice(boundary_nodes);
         let resistors: Vec<ClusterResistor> = c
             .edges
             .iter()
@@ -1990,12 +2506,6 @@ impl Resolver {
                 ohms: *ohms,
             })
             .collect();
-        let inputs = ClusterInputs {
-            sources: sources.to_vec(),
-            injections: injections.to_vec(),
-            terminals: terminals.to_vec(),
-            elements: elements.to_vec(),
-        };
         // Sequentially consistent on purpose: the count is read from another
         // thread (`EngineHandle::escalated_solves`, the ROM boot's budget
         // assertion) and must not lag the solves it counts. One increment
@@ -2008,9 +2518,9 @@ impl Resolver {
     /// The resolver as it was before the per-cluster rewrite: one global pass
     /// over every net, the clusters found on the fly and the path
     /// resistances recomputed per root. Kept, test-only, as the reference the
-    /// per-cluster pass is checked against. It shares [`project_root`] — the
-    /// rule is one function — and nothing else: no topology cache, no dirty
-    /// scope, no cluster tables.
+    /// per-cluster pass is checked against. It shares [`project_root`] and
+    /// [`decide_terminal`] — each rule is one function — and nothing else:
+    /// no topology cache, no dirty scope, no cluster tables, no fan-out.
     #[cfg(test)]
     pub(crate) fn resolve_reference(
         &mut self,
@@ -2024,26 +2534,24 @@ impl Resolver {
         // Pre-resolve identity roots so the remaining passes are pure lookups.
         let root_of: Vec<usize> = (0..n).map(|i| self.identity.find(i)).collect();
 
-        // The declared terminals: path barriers, and what no element
-        // unions through.
-        let terminal_roots: Vec<usize> = self
-            .power_sources
-            .iter()
-            .chain(self.stuck_sources.iter())
-            .map(|(net, _)| root_of[*net])
-            .collect();
-        let is_terminal = |root: usize| terminal_roots.contains(&root);
+        // The declared terminals: path barriers, what no edge or element
+        // unions through, and each a cluster of its own.
+        let terminal_roots = self.terminal_roots(&root_of);
+        let is_terminal = |root: usize| terminal_roots.binary_search(&root).is_ok();
 
         // Conduction clusters: identity merges are 0-ohm, conduction edges
-        // connect within a cluster without merging identity, elements are
-        // membership edges among their non-terminal nets (ends and
-        // control), as `build_topology` has it.
+        // between two non-terminal roots connect within a cluster without
+        // merging identity, elements are membership edges among their
+        // non-terminal nets (ends and control), as `build_topology` has it.
         let mut conduction = Dsu::new(n);
         for (i, &root) in root_of.iter().enumerate() {
             conduction.union(root, i);
         }
         for (a, b, _ohms) in &self.edges {
-            conduction.union(root_of[*a], root_of[*b]);
+            let (ra, rb) = (root_of[*a], root_of[*b]);
+            if !is_terminal(ra) && !is_terminal(rb) {
+                conduction.union(ra, rb);
+            }
         }
         let homes: Vec<Option<ElementHome>> = self
             .elements
@@ -2072,10 +2580,24 @@ impl Resolver {
             .filter(|(a, b, _)| a != b)
             .collect();
 
+        // What every terminal root holds, decided once from its sources in
+        // canonical order. hash-order: keyed access only.
+        let mut terminal_state: HashMap<usize, TerminalState> = HashMap::new();
+        for &root in &terminal_roots {
+            let state = decide_terminal(
+                self.terminal_sources()
+                    .filter(|source| root_of[source.net] == root)
+                    .map(|source| source.drive),
+                |volts| self.solve_fight(root, volts, solver),
+            );
+            terminal_state.insert(root, state);
+        }
+
         // Sources per cluster in canonical order — a dense walk of the slot
-        // table, then rails, then faults — each beside the slot it came from;
-        // injections likewise; the roots of NaN rails; the sourced clusters;
-        // the numeric terminals and the elements per cluster.
+        // table, terminal slots skipped — each beside the slot it came from;
+        // injections likewise; the elements per cluster; the boundary
+        // terminal roots per cluster (the edges' terminal ends and the
+        // elements' conducting ends) and the control-only ones.
         //
         // **Determinism (load-bearing):** iterate the DENSE drive table. This
         // `Vec`'s order is the SPICE card order
@@ -2083,18 +2605,21 @@ impl Resolver {
         // would make the deck (and, for a linear solver, last-bit voltages)
         // depend on a per-process hasher seed. See `DETERMINISM.md`.
         // hash-order: every map below is keyed access only.
-        let mut cluster_sources: HashMap<usize, Vec<(ClusterSource, Option<usize>)>> =
-            HashMap::new();
+        let mut cluster_sources: HashMap<usize, Vec<(ClusterSource, usize)>> = HashMap::new();
         let mut cluster_injections: HashMap<usize, Vec<(ClusterInjection, usize)>> = HashMap::new();
-        let mut cluster_terminals: HashMap<usize, Vec<ClusterTerminal>> = HashMap::new();
         let mut cluster_elements: HashMap<usize, Vec<(ClusterElement, usize)>> = HashMap::new();
-        let mut cluster_sourced: HashSet<usize> = HashSet::new();
-        let mut unmodelled_roots: Vec<usize> = Vec::new();
-        // The foreign terminal roots per cluster — conducting ends, and
-        // controls — in first-appearance order (keyed access only; walked
-        // in element order below).
-        let mut cluster_foreign: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut cluster_foreign_controls: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut cluster_boundary: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut cluster_controls: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (a, b, _) in &root_edges {
+            for (x, y) in [(*a, *b), (*b, *a)] {
+                if !is_terminal(x) && is_terminal(y) {
+                    let boundary = cluster_boundary.entry(cluster_of[x]).or_default();
+                    if !boundary.contains(&y) {
+                        boundary.push(y);
+                    }
+                }
+            }
+        }
         for (ei, element) in self.elements.iter().enumerate() {
             let Some(home) = &homes[ei] else {
                 continue;
@@ -2112,23 +2637,30 @@ impl Resolver {
                 ei,
             ));
             for &root in &home.terminal_ends {
-                if cluster_of[root] != cluster {
-                    let foreign = cluster_foreign.entry(cluster).or_default();
-                    if !foreign.contains(&root) {
-                        foreign.push(root);
-                    }
+                let boundary = cluster_boundary.entry(cluster).or_default();
+                if !boundary.contains(&root) {
+                    boundary.push(root);
                 }
             }
             if let Some(root) = home.terminal_control {
-                if cluster_of[root] != cluster {
-                    let controls = cluster_foreign_controls.entry(cluster).or_default();
-                    if !controls.contains(&root) {
-                        controls.push(root);
-                    }
+                let controls = cluster_controls.entry(cluster).or_default();
+                if !controls.contains(&root) {
+                    controls.push(root);
                 }
             }
         }
+        for boundary in cluster_boundary.values_mut() {
+            boundary.sort_unstable();
+        }
+        for (cluster, controls) in cluster_controls.iter_mut() {
+            let boundary = cluster_boundary.get(cluster).cloned().unwrap_or_default();
+            controls.retain(|root| !boundary.contains(root));
+            controls.sort_unstable();
+        }
         for (si, slot) in self.slots.iter().enumerate() {
+            if slot.terminal.is_some() {
+                continue;
+            }
             match slot.drive {
                 Some(Drive::Thevenin(drive)) => {
                     cluster_sources
@@ -2140,9 +2672,8 @@ impl Resolver {
                                 volts: drive.volts,
                                 impedance: drive.impedance,
                             },
-                            Some(si),
+                            si,
                         ));
-                    cluster_sourced.insert(cluster_of[slot.net]);
                 }
                 Some(Drive::Current { amps }) => {
                     cluster_injections
@@ -2159,75 +2690,6 @@ impl Resolver {
                 None => {}
             }
         }
-        for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
-            cluster_sourced.insert(cluster_of[*net]);
-            if volts.is_nan() {
-                unmodelled_roots.push(root_of[*net]);
-                continue;
-            }
-            cluster_sources.entry(cluster_of[*net]).or_default().push((
-                ClusterSource {
-                    node: NetId(root_of[*net]),
-                    volts: *volts,
-                    impedance: 0.0,
-                },
-                None,
-            ));
-            cluster_terminals
-                .entry(cluster_of[*net])
-                .or_default()
-                .push(ClusterTerminal {
-                    node: NetId(root_of[*net]),
-                    volts: *volts,
-                });
-        }
-        // The foreign constants: every source declared on a terminal root
-        // an element cluster names outside itself, in source order. A
-        // conducting end's sources the cluster and enters its solve; a
-        // control's alone is a constant for the region test. Neither
-        // ranks anywhere.
-        let mut cluster_foreign_nodes: HashMap<usize, Vec<NetId>> = HashMap::new();
-        let mut foreign_numeric: HashSet<usize> = HashSet::new();
-        for cluster in cluster_elements.keys().copied() {
-            let foreign = cluster_foreign.get(&cluster).cloned().unwrap_or_default();
-            let controls: Vec<usize> = cluster_foreign_controls
-                .get(&cluster)
-                .map(|controls| {
-                    controls
-                        .iter()
-                        .copied()
-                        .filter(|root| !foreign.contains(root))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (net, volts) in self.power_sources.iter().chain(self.stuck_sources.iter()) {
-                let root = root_of[*net];
-                let conducting = foreign.contains(&root);
-                if !conducting && !controls.contains(&root) {
-                    continue;
-                }
-                if conducting {
-                    cluster_sourced.insert(cluster);
-                }
-                if volts.is_nan() {
-                    continue;
-                }
-                cluster_terminals
-                    .entry(cluster)
-                    .or_default()
-                    .push(ClusterTerminal {
-                        node: NetId(root),
-                        volts: *volts,
-                    });
-                if conducting {
-                    foreign_numeric.insert(cluster);
-                    let nodes = cluster_foreign_nodes.entry(cluster).or_default();
-                    if !nodes.contains(&NetId(root)) {
-                        nodes.push(NetId(root));
-                    }
-                }
-            }
-        }
         // hash-order shape 3: membership only.
         let analog_clusters: HashSet<usize> = self
             .analog_senses
@@ -2239,58 +2701,110 @@ impl Resolver {
             .iter()
             .map(|&net| cluster_of[net])
             .collect();
-        let terminal_roots: Vec<usize> = self
-            .power_sources
-            .iter()
-            .chain(self.stuck_sources.iter())
-            .map(|(net, _)| root_of[*net])
-            .collect();
+
+        // The terminals a cluster reads, each as the state its root
+        // holds: the cluster's own root when it is a terminal's, then its
+        // boundary, then the controls' — the constants, the ideal sources
+        // `(root, volts)` of the ranking, the unmodelled roots, whether
+        // anything sources the cluster, the boundary nodes of its solve and
+        // its own fight.
+        struct ReadTerminals {
+            constants: Vec<ClusterTerminal>,
+            ideal: Vec<(usize, Volts)>,
+            unmodelled: Vec<usize>,
+            sourced: bool,
+            boundary_nodes: Vec<NetId>,
+            own_fight: Option<Volts>,
+        }
+        let read_terminals = |cluster: usize| -> ReadTerminals {
+            let mut read = ReadTerminals {
+                constants: Vec::new(),
+                ideal: Vec::new(),
+                unmodelled: Vec::new(),
+                sourced: false,
+                boundary_nodes: Vec::new(),
+                own_fight: None,
+            };
+            let own: Vec<usize> = terminal_roots
+                .iter()
+                .copied()
+                .filter(|&root| cluster_of[root] == cluster)
+                .collect();
+            let boundary = cluster_boundary.get(&cluster).cloned().unwrap_or_default();
+            for (root, is_boundary) in own
+                .iter()
+                .map(|&r| (r, false))
+                .chain(boundary.iter().map(|&r| (r, true)))
+            {
+                let state = terminal_state[&root];
+                match state.drive {
+                    TerminalDrive::Volts(volts) => {
+                        read.constants.push(ClusterTerminal {
+                            node: NetId(root),
+                            volts,
+                        });
+                        read.ideal.push((root, volts));
+                        read.sourced = true;
+                        if is_boundary {
+                            read.boundary_nodes.push(NetId(root));
+                        } else if state.fought {
+                            read.own_fight = Some(volts);
+                        }
+                    }
+                    TerminalDrive::Unmodelled => {
+                        read.unmodelled.push(root);
+                        read.sourced = true;
+                    }
+                    TerminalDrive::Released => {}
+                }
+            }
+            for root in cluster_controls.get(&cluster).cloned().unwrap_or_default() {
+                if let TerminalDrive::Volts(volts) = terminal_state[&root].drive {
+                    read.constants.push(ClusterTerminal {
+                        node: NetId(root),
+                        volts,
+                    });
+                }
+            }
+            read
+        };
 
         let solve_cluster = |cluster: usize| -> ClusterSolution {
+            let read = read_terminals(cluster);
             let mut nodes: Vec<NetId> = (0..n)
                 .filter(|&i| root_of[i] == i && cluster_of[i] == cluster)
                 .map(NetId)
                 .collect();
-            if let Some(foreign) = cluster_foreign_nodes.get(&cluster) {
-                nodes.extend(foreign.iter().copied());
-            }
+            nodes.extend(read.boundary_nodes.iter().copied());
+            // An edge belongs to the cluster of its non-terminal end(s).
             let resistors: Vec<ClusterResistor> = root_edges
                 .iter()
-                .filter(|(a, _, _)| cluster_of[*a] == cluster)
+                .filter(|(a, b, _)| {
+                    (cluster_of[*a] == cluster && !is_terminal(*a))
+                        || (cluster_of[*b] == cluster && !is_terminal(*b))
+                })
                 .map(|(a, b, ohms)| ClusterResistor {
                     a: NetId(*a),
                     b: NetId(*b),
                     ohms: *ohms,
                 })
                 .collect();
-            // Terminals are constants in a cluster with elements and ideal
-            // sources in a linear one, as `resolve_cluster` hands them.
-            let with_elements = cluster_elements.contains_key(&cluster);
             let inputs = ClusterInputs {
                 sources: cluster_sources
                     .get(&cluster)
-                    .map(|sources| {
-                        sources
-                            .iter()
-                            .filter(|(_, slot)| !with_elements || slot.is_some())
-                            .map(|(s, _)| *s)
-                            .collect()
-                    })
+                    .map(|sources| sources.iter().map(|(s, _)| *s).collect())
                     .unwrap_or_default(),
                 injections: cluster_injections
                     .get(&cluster)
                     .map(|injections| injections.iter().map(|(i, _)| *i).collect())
                     .unwrap_or_default(),
-                terminals: if with_elements {
-                    cluster_terminals.get(&cluster).cloned().unwrap_or_default()
-                } else {
-                    Vec::new()
-                },
+                terminals: read.constants,
                 elements: cluster_elements
                     .get(&cluster)
                     .map(|elements| elements.iter().map(|(e, _)| *e).collect())
                     .unwrap_or_default(),
             };
+            self.escalated_solves.fetch_add(1, Ordering::SeqCst);
             solver.solve(&Cluster { nodes, resistors }, &inputs)
         };
         let has_elements = |cluster: usize| -> bool { cluster_elements.contains_key(&cluster) };
@@ -2303,7 +2817,7 @@ impl Resolver {
                     .is_some_and(|injections| injections.iter().any(|(i, _)| i.amps != 0.0))
         };
         let on_request = |cluster: usize| -> bool {
-            (cluster_sources.contains_key(&cluster) || foreign_numeric.contains(&cluster))
+            (cluster_sources.contains_key(&cluster) || !read_terminals(cluster).ideal.is_empty())
                 && (precedence(cluster)
                     || instrument_clusters.contains(&cluster)
                     || has_elements(cluster))
@@ -2317,8 +2831,15 @@ impl Resolver {
         let mut root_ambiguous: HashMap<usize, Volts> = HashMap::new();
         for root in (0..n).filter(|&i| root_of[i] == i) {
             let cluster = cluster_of[root];
-            let dist = min_path_ohms(&root_edges, root, &terminal_roots);
-            let reaching: Vec<ReachingSource> = cluster_sources
+            let read = read_terminals(cluster);
+            // A terminal's root reaches nothing out of its own cluster:
+            // its paths are its dependents' to rank it by, not its own.
+            let dist: HashMap<usize, f64> = if is_terminal(root) {
+                HashMap::from([(root, 0.0)])
+            } else {
+                min_path_ohms(&root_edges, root, &terminal_roots)
+            };
+            let mut reaching: Vec<ReachingSource> = cluster_sources
                 .get(&cluster)
                 .map(|sources| {
                     sources
@@ -2326,7 +2847,7 @@ impl Resolver {
                         .filter_map(|(source, slot)| {
                             let path = *dist.get(&source.node.0)?;
                             path.is_finite().then_some(ReachingSource {
-                                slot: *slot,
+                                slot: Some(*slot),
                                 volts: source.volts,
                                 impedance: source.impedance,
                                 path,
@@ -2335,10 +2856,23 @@ impl Resolver {
                         .collect()
                 })
                 .unwrap_or_default();
+            for &(terminal_root, volts) in &read.ideal {
+                let Some(&path) = dist.get(&terminal_root) else {
+                    continue;
+                };
+                if path.is_finite() {
+                    reaching.push(ReachingSource {
+                        slot: None,
+                        volts,
+                        impedance: 0.0,
+                        path,
+                    });
+                }
+            }
             let unmodelled_or_floating = || {
-                let nearest = unmodelled_roots
+                let nearest = read
+                    .unmodelled
                     .iter()
-                    .filter(|&&r| cluster_of[r] == cluster)
                     .filter_map(|r| dist.get(r).copied())
                     .filter(|d| d.is_finite())
                     .fold(f64::INFINITY, f64::min);
@@ -2348,7 +2882,7 @@ impl Resolver {
                     NetState::Floating
                 }
             };
-            let state = if has_elements(cluster) && on_request(cluster) {
+            let mut state = if has_elements(cluster) && on_request(cluster) {
                 let solution = escalated
                     .entry(cluster)
                     .or_insert_with(|| solve_cluster(cluster));
@@ -2410,6 +2944,19 @@ impl Resolver {
                 }
                 outcome.state
             };
+            // A fought terminal's own root, decided once (see
+            // `resolve_cluster`).
+            if let (Some(volts), false) = (read.own_fight, precedence(cluster)) {
+                let fighting = root_fights.remove(&root).unwrap_or_default();
+                root_fights.insert(root, fighting);
+                root_ambiguous.remove(&root);
+                state = if V_IL < volts && volts < V_IH {
+                    root_ambiguous.insert(root, volts);
+                    NetState::Contention
+                } else {
+                    NetState::Analog(volts)
+                };
+            }
             root_state.insert(root, state);
         }
 
@@ -2469,7 +3016,8 @@ impl Resolver {
             let root = root_of[net];
             let cluster = cluster_of[net];
             let non_convergent = escalated.get(&cluster).is_some_and(|s| !s.converged);
-            let unsourced = !cluster_sourced.contains(&cluster)
+            let sourced = cluster_sources.contains_key(&cluster) || read_terminals(cluster).sourced;
+            let unsourced = !sourced
                 || (has_elements(cluster)
                     && !non_convergent
                     && nets[net].state == NetState::Floating);
@@ -2485,17 +3033,19 @@ impl Resolver {
             let Some(Drive::Current { amps }) = slot.drive else {
                 continue;
             };
-            if amps == 0.0 {
+            if amps == 0.0 || slot.terminal.is_some() {
                 continue;
             }
+            let cluster = cluster_of[slot.net];
             let dist = min_path_ohms(&root_edges, root_of[slot.net], &terminal_roots);
-            let reached = cluster_sources
-                .get(&cluster_of[slot.net])
-                .is_some_and(|sources| {
-                    sources
-                        .iter()
-                        .any(|(s, _)| dist.get(&s.node.0).is_some_and(|d| d.is_finite()))
-                });
+            let reached = cluster_sources.get(&cluster).is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|(s, _)| dist.get(&s.node.0).is_some_and(|d| d.is_finite()))
+            }) || read_terminals(cluster)
+                .ideal
+                .iter()
+                .any(|(root, _)| dist.get(root).is_some_and(|d| d.is_finite()));
             if !reached {
                 diagnostics.report(Finding::CurrentIntoFloatingNode {
                     net: nets[slot.net].name.clone(),
@@ -2534,7 +3084,6 @@ impl Resolver {
             diagnostics.report(finding);
         }
     }
-
     /// Derive the **pulse** routes from the current net topology — over the
     /// same collapsed-conduction reachability ([`STREAM_COLLAPSE_THRESHOLD`]),
     /// so a step signal that passes through series resistors or an isolator's
@@ -2605,12 +3154,7 @@ impl Resolver {
         // The declared terminals — rails (modelled or not) and stuck
         // faults — as the roots neither reach continues past (the same
         // list `resolve` ranks sources against).
-        let terminal_roots: Vec<usize> = self
-            .power_sources
-            .iter()
-            .chain(self.stuck_sources.iter())
-            .map(|(net, _)| root_of[*net])
-            .collect();
+        let terminal_roots = self.terminal_roots(&root_of);
         // The far-node resistance estimate, per root: the smallest
         // conduction edge touching it.
         let smallest_edge_at = |root: usize| -> f64 {
@@ -3002,13 +3546,15 @@ fn level_of_volts(volts: Volts) -> Level {
 /// a declared terminal — a rail, a harness supply, a `net_stuck` — holds its
 /// node, so nothing on the far side of it sees a source on the near side
 /// (`NODES.md` "Three rules the taxonomy rests on", 1: a terminal is a
-/// cluster boundary; this is that rule in the path matrix, ahead of the
-/// cluster split phase 4 makes of it). Without it the module's P59 pad,
-/// driven high through the P59 pull-down to ground, would reach the core
-/// rail's feedback divider on the other side of ground and rank there as a
-/// pull disagreeing with ground — a divider solve on every MOSI edge of the
-/// ROM boot. `from` itself is never a barrier: a terminal's own paths out
-/// are what its dependents rank it by.
+/// cluster boundary; this is that rule in the path matrix, and since phase
+/// 4 the cluster split says the same — a terminal is a cluster of its own,
+/// so a cluster's edges never lead past one anyway). Without it the
+/// module's P59 pad, driven high through the P59 pull-down to ground, would
+/// reach the core rail's feedback divider on the other side of ground and
+/// rank there as a pull disagreeing with ground — a divider solve on every
+/// MOSI edge of the ROM boot. `from` itself is never a barrier: a terminal's
+/// own paths out are what its dependents rank it by (the pulse router walks
+/// from a source's root; the cluster pass never walks from a terminal).
 fn min_path_ohms(
     root_edges: &[(usize, usize, f64)],
     from: usize,
@@ -4295,6 +4841,71 @@ mod tests {
             callback: Box::new(move |state| sink.lock().unwrap().push(state)),
         });
         log
+    }
+
+    /// A `PowerOut` slot's declared idle drive is recorded whole: a
+    /// Thevenin idle keeps its impedance on the slot (the I-V port's
+    /// record) while the terminal holds its open-circuit voltage, and the
+    /// two 0 Ω encodings — released, unmodelled — are what the kinds mean.
+    #[rstest]
+    fn a_terminal_slots_idle_drive_keeps_its_declared_impedance() {
+        behaviour!(Test {
+            id: "engine.terminal-idle-drive-keeps-its-impedance",
+            covers: Some("board/src/engine.rs#Resolver::add_terminal_endpoint"),
+            given: "three power-out slots on three nets, declared idle at 3.3 volts behind 0.1 ohms, released, and unmodelled",
+        });
+        expect!(
+            "impedance-on-the-slot",
+            "the declared drive is recorded on its slot whole, impedance included, and the terminal holds the open-circuit voltage",
+            "the impedance is recorded for the current port and never solved, so the terminal's voltage is the open-circuit one",
+        );
+        expect!(
+            "released-and-unmodelled-encodings",
+            "the released slot records no drive and its terminal is released; the unmodelled slot records the NaN-volt drive and its terminal is unmodelled",
+        );
+        let mut resolver = Resolver::new(3, Dsu::new(3));
+        let declared = Drive::Thevenin(TheveninDrive {
+            volts: 3.3,
+            impedance: 0.1,
+        });
+        let e0 = resolver.add_terminal_endpoint(0, PinRef::new("U", "OUT"), Some(declared));
+        let e1 = resolver.add_terminal_endpoint(
+            1,
+            PinRef::new("U", "OUT2"),
+            TerminalDrive::Released.idle_slot_drive(),
+        );
+        let e2 = resolver.add_terminal_endpoint(
+            2,
+            PinRef::new("U", "OUT3"),
+            TerminalDrive::Unmodelled.idle_slot_drive(),
+        );
+        assert_eq!(resolver.slots[e0.0].drive, Some(declared));
+        assert_eq!(
+            resolver
+                .terminal_source(resolver.slots[e0.0].terminal.unwrap())
+                .drive,
+            TerminalDrive::Volts(3.3)
+        );
+        assert_eq!(resolver.slots[e1.0].drive, None);
+        assert_eq!(
+            resolver
+                .terminal_source(resolver.slots[e1.0].terminal.unwrap())
+                .drive,
+            TerminalDrive::Released
+        );
+        match resolver.slots[e2.0].drive {
+            Some(Drive::Thevenin(t)) => {
+                assert!(t.volts.is_nan());
+                assert_eq!(t.impedance, 0.0);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            resolver
+                .terminal_source(resolver.slots[e2.0].terminal.unwrap())
+                .drive,
+            TerminalDrive::Unmodelled
+        );
     }
 
     /// Drives are applied in enqueue-seq order — the authoritative event
@@ -6108,6 +6719,10 @@ mod tests {
             power_senses: Vec<usize>,
             /// Piecewise-linear elements: `(a, b, curve, control)`.
             elements: Vec<RandomElement>,
+            /// `PowerOut` pins' nets: terminals a part drives through a
+            /// slot ([`Resolver::add_terminal_endpoint`]), unmodelled at
+            /// first.
+            rails: Vec<usize>,
         }
 
         /// One random element: `(a, b, curve, control)`.
@@ -6188,6 +6803,7 @@ mod tests {
                     prop::collection::vec(0..n, 0..2),
                     prop::collection::vec(0..n, 0..2),
                     prop::collection::vec(element_strategy(n), 0..3),
+                    prop::collection::vec(0..n, 0..2),
                 )
                     .prop_map(
                         move |(
@@ -6201,6 +6817,7 @@ mod tests {
                             instruments,
                             power_senses,
                             elements,
+                            rails,
                         )| Spec {
                             n,
                             merges,
@@ -6213,12 +6830,23 @@ mod tests {
                             instruments,
                             power_senses,
                             elements,
+                            rails,
                         },
                     )
             })
         }
 
-        fn build(spec: &Spec) -> (Resolver, Vec<EndpointId>) {
+        /// The resolver a spec builds, its slot endpoints, its terminal
+        /// sources (the harness's and the faults', in canonical order) and
+        /// its `PowerOut` slots.
+        struct Built {
+            resolver: Resolver,
+            ids: Vec<EndpointId>,
+            terminals: Vec<TerminalId>,
+            rails: Vec<EndpointId>,
+        }
+
+        fn build(spec: &Spec) -> Built {
             let mut identity = Dsu::new(spec.n);
             for &(a, b) in &spec.merges {
                 identity.union(a, b);
@@ -6235,11 +6863,24 @@ mod tests {
                     resolver.add_endpoint_with(*net, PinRef::new("U", format!("{i}")), *drive)
                 })
                 .collect();
+            let mut terminals: Vec<TerminalId> = Vec::new();
             for &(net, volts) in &spec.power {
-                resolver.add_power_source(net, volts);
+                terminals.push(resolver.add_power_source(net, volts));
             }
+            let rails: Vec<EndpointId> = spec
+                .rails
+                .iter()
+                .enumerate()
+                .map(|(i, &net)| {
+                    resolver.add_terminal_endpoint(
+                        net,
+                        PinRef::new("U", format!("OUT{i}")),
+                        TerminalDrive::Unmodelled.idle_slot_drive(),
+                    )
+                })
+                .collect();
             for &(net, volts) in &spec.stuck {
-                resolver.add_stuck_source(net, volts);
+                terminals.push(resolver.add_stuck_source(net, volts));
             }
             for &net in &spec.digital_senses {
                 resolver.add_digital_sense(net);
@@ -6256,7 +6897,12 @@ mod tests {
             for (i, &(a, b, curve, control)) in spec.elements.iter().enumerate() {
                 resolver.add_element(a, b, curve, control, format!("B.D{i}"));
             }
-            (resolver, ids)
+            Built {
+                resolver,
+                ids,
+                terminals,
+                rails,
+            }
         }
 
         fn bus_of(bus: &Diagnostics) -> Vec<String> {
@@ -6278,7 +6924,7 @@ mod tests {
             behaviour!(Test {
                 id: "engine.incremental-resolve-matches-full-pass",
                 covers: Some("board/src/engine.rs#Resolver::resolve_dirty"),
-                given: "a random board of up to nine nets with shorts, resistors, drivers at assorted impedances including released and infinite ones, current injections, rails, injected faults, senses, and diodes and switched channels with random control pins, under a random sequence of drive changes",
+                given: "a random board of up to nine nets with shorts, resistors, drivers of assorted strengths, injections, rails, faults, senses, diodes, switched channels and regulator outputs, under random drive changes, terminal changes and rail publishes",
             });
             expect!(
                 "states-match",
@@ -6292,14 +6938,50 @@ mod tests {
             touched_cluster_cases();
         }
 
+        /// One random change mid-run: a slot's drive; what a declared
+        /// terminal source holds its net at (a harness supply re-set,
+        /// released, or a fault's voltage moved); or a `PowerOut` pin's
+        /// part driving its rail to a new voltage or releasing it.
+        #[derive(Debug, Clone, Copy)]
+        enum Op {
+            Drive(usize, Option<Drive>),
+            Terminal(usize, TerminalDrive),
+            Rail(usize, Option<Drive>),
+        }
+
+        fn terminal_drive_strategy() -> impl Strategy<Value = TerminalDrive> {
+            prop_oneof![
+                Just(TerminalDrive::Released),
+                Just(TerminalDrive::Unmodelled),
+                Just(TerminalDrive::Volts(0.0)),
+                Just(TerminalDrive::Volts(3.3)),
+                Just(TerminalDrive::Volts(5.0)),
+                Just(TerminalDrive::Volts(1.5)),
+            ]
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                4 => (0usize..8, drive_strategy()).prop_map(|(slot, drive)| Op::Drive(slot, drive)),
+                1 => (0usize..8, terminal_drive_strategy())
+                    .prop_map(|(terminal, drive)| Op::Terminal(terminal, drive)),
+                1 => (0usize..8, drive_strategy()).prop_map(|(rail, drive)| Op::Rail(rail, drive)),
+            ]
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
             fn touched_cluster_cases(
                 spec in spec_strategy(),
-                ops in prop::collection::vec((0usize..8, drive_strategy()), 1..12),
+                ops in prop::collection::vec(op_strategy(), 1..12),
             ) {
-                let (mut incremental, ids) = build(&spec);
-                let (mut full, _) = build(&spec); // the OLD algorithm, one global pass
+                let Built {
+                    resolver: mut incremental,
+                    ids,
+                    terminals,
+                    rails,
+                } = build(&spec);
+                let mut full = build(&spec).resolver; // the OLD algorithm, one global pass
                 let mut nets_inc = nets(spec.n);
                 let mut nets_full = nets(spec.n);
                 let mut bus_inc = Diagnostics::new();
@@ -6320,10 +7002,26 @@ mod tests {
                     );
                 }
 
-                for (step, (slot, drive)) in ops.into_iter().enumerate() {
-                    let endpoint = ids[slot % ids.len()];
-                    let changed = incremental.set_drive(endpoint, drive);
-                    let _ = full.set_drive(endpoint, drive);
+                for (step, op) in ops.into_iter().enumerate() {
+                    let changed = match op {
+                        Op::Drive(slot, drive) => {
+                            let endpoint = ids[slot % ids.len()];
+                            let _ = full.set_drive(endpoint, drive);
+                            incremental.set_drive(endpoint, drive)
+                        }
+                        Op::Terminal(_, _) if terminals.is_empty() => continue,
+                        Op::Terminal(terminal, drive) => {
+                            let id = terminals[terminal % terminals.len()];
+                            let _ = full.set_terminal(id, drive);
+                            incremental.set_terminal(id, drive)
+                        }
+                        Op::Rail(_, _) if rails.is_empty() => continue,
+                        Op::Rail(rail, drive) => {
+                            let endpoint = rails[rail % rails.len()];
+                            let _ = full.set_drive(endpoint, drive);
+                            incremental.set_drive(endpoint, drive)
+                        }
+                    };
 
                     let mut pass = Diagnostics::new();
                     incremental.resolve_dirty(&mut nets_inc, &mut pass, &QuasiStaticMna);

@@ -22,37 +22,17 @@
 //! | `fixtures/mad_edge.net` | MaD EdgeBoard (3 sheets) | `kicad-cli sch export netlist` |
 //! | `fixtures/ds2_addon.net` | MaD DS2 force-gauge add-on | `kicad-cli sch export netlist` |
 //!
-//! # Stub pin kinds — the rule this module follows everywhere
+//! # Every part a node
 //!
-//! The power parts here are still **topology-only stubs**: they declare a
-//! real pin facade (which the board build validates against the netlist in
-//! both directions, so a symbol change breaks a test instead of going
-//! unnoticed) and no behavior. `DESIGN.md` rule 1 admits no stub tier, so
-//! each is a part `NODES.md` §8 phase 4 replaces with a model, and
-//! `cluster_census.rs` counts them as a figure that may only fall. Until
-//! then their pin kinds are not a stylistic choice:
-//!
-//! - **Power pins are declared truthfully** — [`embsim_board::PinKind::PowerIn`] for a rail
-//!   the part consumes, [`embsim_board::PinKind::PowerOut`] for one it generates. Unsourced
-//!   rails are the highest-value diagnostic this slice produces (the DS2
-//!   bench's unstrapped AVDD is the reference case), and that only works if
-//!   supply pins say what they are.
-//! - **Signal pins are declared [`embsim_board::PinKind::DigitalIn`]** — a *sense*,
-//!   contributing no drive — even where the real part drives. A stub has no
-//!   behavior with which to decide a level, and the engine's idle-high default
-//!   for a [`embsim_board::PinKind::DigitalOut`] would fabricate a drive the part does not
-//!   produce (and could manufacture [`embsim_board::Finding::Contention`] against a real
-//!   driver). Declared as senses they still participate in resolution and
-//!   still yield honest [`embsim_board::Finding::FloatingSense`] reports, while every actual
-//!   drive in the system comes from a modeled component.
-//! - **Pins the schematic marks no-connect are [`embsim_board::PinKind::Passive`]**
-//!   ([`nc`]), so an intentionally dangling pad raises nothing.
-//!
-//! The engine takes electrical descriptors from the component facade and never
-//! from the schematic (see the `netlist` module docs), which is what lets these
-//! tables *correct* a symbol: the EdgeBoard's `XL1509` symbol draws all eight
-//! pins as `input`, including VIN, OUT and the four grounds. [`XL1509_PINS`]
-//! declares what the part is.
+//! `DESIGN.md` rule 1 admits no stub tier, and since `NODES.md` §8 phase 4
+//! none is needed here: every registered part on the three boards is a
+//! model or an element by specification, and a part with nothing behind it
+//! is a build error naming it. The engine takes electrical descriptors
+//! from the component facade and never from the schematic (see the
+//! `netlist` module docs), which is what lets a model *correct* a symbol:
+//! the EdgeBoard's `XL1509` symbol draws all eight pins as `input`,
+//! including VIN, OUT and the four grounds, and the rail model declares
+//! what the part is.
 //!
 //! # Modeled parts (real behavior)
 //!
@@ -75,11 +55,14 @@
 //! netlists carry: on the Edge board the polarity FET `U3` with its body
 //! diode, the transistor `Q1`, the eight current regulators `IC6`–`IC13`,
 //! the Schottky diodes `D1`/`D2` and the 21 indicator LEDs; on the module
-//! the polarity FET `U401` and the white LEDs `D601`/`D602`. Everything
-//! else on both boards is a stub or an auto-classified primitive: on the
-//! module the bucks `U402`/`U403`, the detector `U404` and the LDOs
-//! `U501`–`U508`; on the Edge board the isolated DC/DCs `IC3`/`IC4` and the
-//! bucks `U1`/`U2` — the parts `NODES.md` §8 phase 4 turns into rail models.
+//! the polarity FET `U401` and the white LEDs `D601`/`D602`. The power
+//! parts are rails (`embsim_models::rail`) and a detector
+//! (`embsim_models::supervisor`): on the module the bucks `U402`/`U403`
+//! (one registry key, each reading its own feedback divider at attach),
+//! the LDOs `U501`–`U508` and the detector `U404`; on the Edge board the
+//! bucks `U1`/`U2` (their version from the value) and the isolated DC/DCs
+//! `IC3`/`IC4` (their setpoint from the `SEL` strap). Everything else is
+//! an auto-classified primitive.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -98,8 +81,13 @@ use embsim_models::opto::Opto;
 use embsim_models::oscillator::{self, Oscillator};
 use embsim_models::psram::{Psram, PsramComponent};
 use embsim_models::pwl_library;
+use embsim_models::rail::{
+    self, Rail, AP62301_PINS_BY_FUNCTION, NCP114_PINS_BY_FUNCTION, UCC12040_PINS_SOIC16,
+    XL1509_PINS_SOP8,
+};
 use embsim_models::spi_flash::SpiNorFlash;
 use embsim_models::spi_flash_component::{SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION};
+use embsim_models::supervisor::{self, VoltageDetector, STM1061_PINS_BY_FUNCTION};
 
 // ============================================================
 // Pin-declaration helpers
@@ -127,9 +115,9 @@ pub const fn pwr_in(number: &'static str) -> PinDecl {
 }
 
 /// A rail the part generates (regulator/DC-DC output, isolated-domain
-/// reference). Registers the net as sourced at an unmodeled voltage — enough
-/// to clear [`embsim_board::Finding::PowerNetUnsourced`], not enough for a
-/// component that gates on a rail *voltage*; see [`bench_rails`].
+/// reference). The net is a declared terminal — a cluster of its own and a
+/// boundary of every cluster around it (`NODES.md` §8 phase 4) — held at
+/// whatever the part publishes.
 pub const fn pwr_out(number: &'static str) -> PinDecl {
     PinDecl::power_out(number)
 }
@@ -145,39 +133,6 @@ pub const fn passive(number: &'static str) -> PinDecl {
 /// declaring it passive keeps a deliberately dangling pad out of the findings.
 pub const fn nc(number: &'static str) -> PinDecl {
     passive(number)
-}
-
-// ============================================================
-// Topology-only stub
-// ============================================================
-
-/// A part with a real pin facade and no behavior. See the module docs for how
-/// its pin kinds are chosen and why.
-#[derive(Debug)]
-pub struct StubPart {
-    pins: &'static [PinDecl],
-}
-
-impl StubPart {
-    /// A stub declaring `pins`.
-    pub const fn new(pins: &'static [PinDecl]) -> Self {
-        Self { pins }
-    }
-}
-
-impl Component for StubPart {
-    fn pins(&self) -> &[PinDecl] {
-        self.pins
-    }
-
-    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
-        Ok(())
-    }
-}
-
-/// Register `part` as a [`StubPart`] declaring `pins`.
-pub fn register_stub(registry: &mut PartRegistry, part: &str, pins: &'static [PinDecl]) {
-    registry.register(part, move |_decl| Box::new(StubPart::new(pins)));
 }
 
 // ============================================================
@@ -890,7 +845,7 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 }
 
 // ============================================================
-// P2-EC32MB module: stub facades
+// P2-EC32MB module: classification
 // ============================================================
 //
 // Classification, part by part. The module's netlist carries no `libsource`,
@@ -906,7 +861,10 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 //                            X100, the TCXO (`embsim_models::oscillator`);
 //                            U101 and U601, the dual inverters
 //                            (`embsim_models::logic_gate`); U302–U305, the
-//                            PSRAMs (`embsim_models::psram`).
+//                            PSRAMs (`embsim_models::psram`); U402/U403,
+//                            the bucks, and U501–U508, the LDOs
+//                            (`embsim_models::rail`); U404, the brownout
+//                            detector (`embsim_models::supervisor`).
 //   switch (by value)        S301, the four-way DIP switch, four poles by
 //                            `<position>_ON`/`<position>_OFF`; J101, the
 //                            oscillator-option solder link, one pole. Every
@@ -919,38 +877,12 @@ pub fn lock_module_instance() -> MutexGuard<'static, ()> {
 //                            D601/D602, the IN-S63AS5UW white LEDs — from
 //                            `embsim_models::pwl_library`, keyed on the
 //                            `MPN` field the transcription carries.
-//   stub                     every other active part, below.
 //
-// Why the power parts are still stubs and not models: the LDOs, bucks and
-// brownout detector matter as *power topology*, which their
-// PowerIn/PowerOut declarations already express. Each becomes a model in
-// `NODES.md` §8 phase 4 — the facades below are already the
-// netlist-validated boundary.
-
-/// `DCDC 3A SOT563` — Diodes AP62301Z buck (U402, U403). `SW` is declared
-/// [`embsim_board::PinKind::PowerOut`]: it is the switching node the output inductor
-/// integrates into a rail, and marking it a source is what makes the module's
-/// power tree reachable.
-pub const BUCK_PINS: [PinDecl; 5] = [
-    pwr_in("VIN"),
-    pwr_in("GND"),
-    passive("BST"),
-    dig_in("FB"),
-    pwr_out("SW"),
-];
-
-/// `Voltage Detector 1.6V` — STMicro STM1061 brownout detector (U404). `~OUT`
-/// is open-drain and unmodeled, so it is a sense.
-pub const BROWNOUT_PINS: [PinDecl; 3] = [pwr_in("VCC"), pwr_in("VSS"), dig_in("OUT")];
-
-/// `LDO 300mA, 3.3V` — OnSemi NCP114 (U501..U508), one per P2 I/O bank pair.
-pub const LDO_PINS: [PinDecl; 5] = [
-    dig_in("EN"),
-    pwr_in("IN"),
-    pwr_in("GND"),
-    pwr_in("GND_P"),
-    pwr_out("OUT"),
-];
+// The power tree is real, and it has a clock: from the carrier's 5 V on
+// `J203` the bucks rise 2.5 ms later (the AP62301's soft-start) and the
+// LDOs step with them, so a build snapshot — the state before the first
+// wake — has every module rail down and says so (`Finding::RailDown`).
+// `board/tests/power_tree.rs` starts the module and steps past it.
 
 /// `DIP Switch 4 way` — the module's option switch (S301): four poles, one
 /// per printed position *n*, between the netlist's `<n>_ON` and `<n>_OFF`
@@ -1015,9 +947,29 @@ pub fn ec32mb_registry() -> PartRegistry {
     // field) and the white LEDs `D601`/`D602`, from the element library —
     // as `embsim-boards` registers them.
     pwl_library::register(&mut registry);
-    register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);
-    register_stub(&mut registry, "Voltage Detector 1.6V", &BROWNOUT_PINS);
-    register_stub(&mut registry, "LDO 300mA, 3.3V", &LDO_PINS);
+    // The power tree — the same models `embsim-boards` registers: two
+    // bucks from one key, each reading its own feedback divider at attach;
+    // eight LDOs at the voltage their value names; the detector.
+    registry.register("DCDC 3A SOT563", |_decl| {
+        Box::new(
+            Rail::new(rail::Config::ap62301(), &AP62301_PINS_BY_FUNCTION)
+                .expect("the AP62301 table carries every role"),
+        )
+    });
+    registry.register("LDO 300mA, 3.3V", |decl: &ComponentDecl| {
+        let config = rail::Config::ncp114_from_value(&decl.value)
+            .unwrap_or_else(|| panic!("{}: the LDO value names no voltage", decl.reference));
+        Box::new(
+            Rail::new(config, &NCP114_PINS_BY_FUNCTION)
+                .expect("the NCP114 table carries every role"),
+        )
+    });
+    registry.register("Voltage Detector 1.6V", |_decl| {
+        Box::new(VoltageDetector::new(
+            supervisor::Config::stm1061n16(),
+            &STM1061_PINS_BY_FUNCTION,
+        ))
+    });
     registry
 }
 
@@ -1043,7 +995,7 @@ pub fn shipped_ec32mb_board() -> Board {
 }
 
 // ============================================================
-// MaD EdgeBoard: stub facades
+// MaD EdgeBoard: classification
 // ============================================================
 //
 // Classification, part by part (this netlist is a real KiCad export, so every
@@ -1062,60 +1014,39 @@ pub fn shipped_ec32mb_board() -> Board {
 //               and ISO6740FDWR (IC16), the `embsim_models::isolation`
 //               family model configured from each part name; SN74LVC1G14DBV
 //               ×21 (U9–U34), the Schmitt inverters driving the front-panel
-//               LEDs (`embsim_models::logic_gate`).
-//   stub        the other 7 active types, below.
+//               LEDs (`embsim_models::logic_gate`); 6N137 (U4) and VO2631
+//               ×4 (U5–U8), the optocouplers (`embsim_models::opto`);
+//               XL1509 (U1 5 V, U2 3.3 V), the bucks behind the polarity
+//               FET, and UCC12040DVER (IC3, IC4), the isolated DC/DCs
+//               (`embsim_models::rail`).
+//   element     the elements by specification (`embsim_models::pwl_library`).
 
 /// Which of `IC14`'s channels carries the servo step clock: `INA` (pin 3,
 /// on `P8`) to `OUTA` (pin 14) — a rate crosses the barrier, not edges.
 pub const SERVO_STEP_CHANNEL: Channel = Channel::A;
 
 /// `UCC12040DVER` — TI isolated 500 mW DC/DC module (IC3: the isolated I/O
-/// domain; IC4: the force-gauge domain).
-///
-/// `VISO` **and** the three `GNDS` pins are declared [`embsim_board::PinKind::PowerOut`]:
-/// an isolated DC/DC generates a whole domain, its ground reference included,
-/// so both terminals of that domain are sourced by this part. Declaring GNDS
-/// as an input instead would leave every isolated ground permanently
-/// unsourced and bury the real findings in noise.
-#[rustfmt::skip]
-pub const UCC12040_PINS: [PinDecl; 16] = [
-    dig_in("1"),   // EN
-    pwr_in("2"),   // GNDP
-    pwr_in("3"),   // VINP
-    dig_in("4"),   // SYNC
-    nc("5"),       // SYNC_OK
-    passive("6"),  // NC_1
-    passive("7"),  // NC_2
-    passive("8"),  // NC_3
-    pwr_out("9"),  // GNDS_1
-    passive("10"), // NC_4
-    passive("11"), // NC_5
-    passive("12"), // NC_6
-    dig_in("13"),  // SEL
-    pwr_out("14"), // VISO
-    pwr_out("15"), // GNDS_2
-    pwr_out("16"), // GNDS_3
-];
+/// domain `5V_IO`/`GND_IO`; IC4: the force-gauge domain `IFG_5V`/`IFG_GND`).
+/// Both tie `SEL` to `VISO`: the 5.0 V setpoint (SNVSBO5B Table 5-1). The
+/// rail model declares `VISO` **and** its `GNDS` return as terminals — an
+/// isolated DC/DC generates a whole domain, its ground included — and the
+/// isolated ground is held by whatever the board or the harness ties it
+/// to: nothing on the Edge board ties either, so on the board alone both
+/// isolated rails stay down with their reference named
+/// (`Finding::RailDown`), and a harness that declares the domain's return
+/// ([`force_domain_rails`] does for the force gauge's, over the cable) is
+/// what lets the rail come up.
+pub const UCC12040_PART: &str = "UCC12040DVER";
 
-/// `XL1509` — 2 A step-down converter (U1: +5 V, U2: +3.3 V).
+/// `XL1509` — 2 A step-down converter (U1: +5 V, U2: +3.3 V), the version
+/// read from the value (`XL1509-5V`, `XL1509-3.3V`).
 ///
-/// This facade **corrects the schematic symbol**, which draws all eight pins
-/// as `input` — including `VIN`, the four grounds, and `OUT`. Electrical
-/// descriptors come from the component, never from the netlist (see the
-/// `netlist` module docs), and getting `OUT` right as a
-/// [`embsim_board::PinKind::PowerOut`] is what makes the board's rails reachable through
-/// the output inductors.
-#[rustfmt::skip]
-pub const XL1509_PINS: [PinDecl; 8] = [
-    pwr_in("1"),  // VIN
-    pwr_out("2"), // OUT — the switching node into L1/L2
-    dig_in("3"),  // FDB
-    dig_in("4"),  // ~ON
-    pwr_in("5"),  // GND
-    pwr_in("6"),  // GND
-    pwr_in("7"),  // GND
-    pwr_in("8"),  // GND
-];
+/// The rail model **corrects the schematic symbol**, which draws all eight
+/// pins as `input` — including `VIN`, the four grounds, and `OUT`.
+/// Electrical descriptors come from the component, never from the netlist
+/// (see the `netlist` module docs), and `OUT` as a `PowerOut` terminal is
+/// what makes the board's rails reachable through the output inductors.
+pub const XL1509_PART: &str = "XL1509";
 
 /// Baud the EdgeBoard's isolated force-gauge UART runs at — the ADS122U04's
 /// fixed 115.2 kbaud, which is also [`FORCE_GAUGE_CHANNEL`]'s.
@@ -1187,9 +1118,23 @@ pub fn edge_registry_without_socket() -> PartRegistry {
     // number the export carries.
     pwl_library::register(&mut registry);
 
-    // Topology-only stubs, until phase 4 gives each its rail model.
-    register_stub(&mut registry, "UCC12040DVER", &UCC12040_PINS);
-    register_stub(&mut registry, "XL1509", &XL1509_PINS);
+    // The power tree: the two bucks at the version their value names, the
+    // two isolated DC/DCs at the setpoint their `SEL` strap selects.
+    registry.register(XL1509_PART, |decl: &ComponentDecl| {
+        let config = rail::Config::xl1509_from_value(&decl.value).unwrap_or_else(|| {
+            panic!(
+                "{}: the value {:?} names no fixed version",
+                decl.reference, decl.value
+            )
+        });
+        Box::new(Rail::new(config, &XL1509_PINS_SOP8).expect("the XL1509 table carries every role"))
+    });
+    registry.register(UCC12040_PART, |_decl| {
+        Box::new(
+            Rail::new(rail::Config::ucc12040(), &UCC12040_PINS_SOIC16)
+                .expect("the UCC12040 table carries every role"),
+        )
+    });
     registry
 }
 
@@ -1342,34 +1287,29 @@ pub fn machine_harness(edge: &str) -> Harness {
 }
 
 /// Bench supply straps for the EdgeBoard, through the board's own connector
-/// pins — the rig a bring-up bench actually builds.
-///
-/// Why straps at all when the board has regulators: a [`embsim_board::PinKind::PowerOut`]
-/// pin registers its net as sourced at an *unmodeled* voltage, which clears
-/// [`embsim_board::Finding::PowerNetUnsourced`] but carries no level, so a
-/// component that gates on a rail voltage (every modeled part here does) would
-/// read nothing. A numeric source on the rail is what turns the power topology
-/// into a voltage. Regulator models are a later slice; until then the straps
-/// say out loud what voltage each domain is at.
+/// pins — the rig a bring-up bench actually builds: the main input on the
+/// screw terminal and the isolated servo domain on its connector. Nothing
+/// else: `+5V` and `+3.3V` come from the board's own bucks `U1`/`U2`
+/// behind the polarity FET `U3`, the instant the 12 V arrives (the XL1509
+/// names no soft-start), so a strap on either would be a second declared
+/// source on a rail the board generates.
 ///
 /// | Endpoint | Net | Volts | Domain |
 /// |---|---|---|---|
 /// | `J2.1` | `Net-(J2-Pin_1)` | 12.0 | main input, ahead of the polarity FET |
 /// | `J2.2` | `GND` | 0.0 | primary ground |
-/// | `J19.1` | `+3.3V` | 3.3 | P2 I/O logic |
-/// | `J22.1` | `+5V` | 5.0 | pre-regulator 5 V |
 /// | `J21.1` | `SC_5V` | 5.0 | isolated servo domain |
 /// | `J21.8` | `EN_GND` | 0.0 | isolated servo/encoder ground |
+///
+/// The isolated I/O domain (`5V_IO`/`GND_IO`, from `IC3`) is not strapped
+/// and its return is tied to nothing on the board, so on the board alone
+/// that rail stays down with its reference named — `DESIGN.md` rule 6, no
+/// implicit ground: a test that needs the domain declares its return
+/// through a connector pin (`J10.2`, `J5.3`–`J8.3`).
 pub fn bench_rails(edge: &str) -> Harness {
     Harness::new()
         .power(ep("BENCH.12V"), ep(&format!("{edge}.J2.1")), 12.0)
         .power(ep("BENCH.GND"), ep(&format!("{edge}.J2.2")), 0.0)
-        .power(
-            ep("BENCH.3V3"),
-            ep(&format!("{edge}.J19.1")),
-            LOGIC_RAIL_VOLTS,
-        )
-        .power(ep("BENCH.5V"), ep(&format!("{edge}.J22.1")), 5.0)
         .power(
             ep("BENCH.SERVO5V"),
             ep(&format!("{edge}.J21.1")),
@@ -1397,11 +1337,14 @@ pub fn encoder_jumpers_closed(scenario: Scenario, edge: &str) -> Scenario {
         .jumper(&format!("{edge}.JP4"), JumperState::Closed)
 }
 
-/// Isolated force-domain straps, applied on the DS2 side of the cable (the
-/// add-on's `J1.1`/`J1.2`) so the whole isolated rail — the add-on's `+3V3`
-/// and the EdgeBoard's `IFG_5V`, one net once the cable is in — carries the
-/// 3.3 V the ADC needs. Mirrors the DS2 bench rig in
-/// `board/tests/ds2_regressions.rs`.
+/// Isolated force-domain straps for the DS2 add-on **on its own**, applied
+/// on its connectors (`J1.1`/`J1.2`, `J2.1`/`J2.2`): the add-on has no
+/// regulator, so on the bench its `+3V3` and analog supply are declared
+/// here. Mirrors the DS2 bench rig in `board/tests/ds2_regressions.rs`.
+/// With the add-on on the Edge board's cable the digital rail is the
+/// board's `IC4` (5.0 V, `SEL` to `VISO`), so the assembled machine uses
+/// [`force_domain_ground`] instead — a 3.3 V strap there would be a second
+/// declared source on a 5 V rail.
 pub fn force_domain_rails(ds2: &str) -> Harness {
     Harness::new()
         .power(
@@ -1409,6 +1352,25 @@ pub fn force_domain_rails(ds2: &str) -> Harness {
             ep(&format!("{ds2}.J1.1")),
             LOGIC_RAIL_VOLTS,
         )
+        .power(ep("BENCH.IFGGND"), ep(&format!("{ds2}.J1.2")), 0.0)
+        .power(
+            ep("BENCH.VDDA"),
+            ep(&format!("{ds2}.J2.1")),
+            LOGIC_RAIL_VOLTS,
+        )
+        .power(ep("BENCH.AGND"), ep(&format!("{ds2}.J2.2")), 0.0)
+}
+
+/// The isolated force domain's **references** for the assembled machine:
+/// the domain's return, tied down over the cable on the add-on's `J1.2`
+/// (`IFG_GND`), and the add-on's analog supply and return on `J2`, which
+/// nothing on either board generates. The domain's 5 V is the Edge board's
+/// `IC4`, 750 µs after its input arrives (the UCC12040's rise time), so in
+/// a build snapshot it is down and said so (`Finding::RailDown`). No
+/// ground is implicit (`DESIGN.md` rule 6): an isolated domain's reference
+/// is a harness terminal, as the primary bench return is.
+pub fn force_domain_ground(ds2: &str) -> Harness {
+    Harness::new()
         .power(ep("BENCH.IFGGND"), ep(&format!("{ds2}.J1.2")), 0.0)
         .power(
             ep("BENCH.VDDA"),

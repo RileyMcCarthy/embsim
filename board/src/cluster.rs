@@ -38,25 +38,28 @@
 //! (`NODES.md` "Three rules the taxonomy rests on", 1: "its voltage enters
 //! the solve as a constant") keeps that reason intact: a supernode held by
 //! **exactly one terminal voltage** is a constant, and a supernode two
-//! terminals disagree on — a fight the resolver reports as contention —
-//! keeps the Norton stamping at the [`IDEAL_SOURCE_FLOOR_OHMS`] floor, so
-//! the fight still solves to its divided mid-value until phase 4 decides it
-//! once at the terminal's own cluster. What the constant buys: an LED chain
-//! (driver → 220 Ω → anode → LED → ground) is a two-unknown solve, and the
-//! ground's voltage is exact rather than a microvolt from it.
+//! terminals disagree on keeps the Norton stamping at the
+//! [`IDEAL_SOURCE_FLOOR_OHMS`] floor, so the fight solves to its divided
+//! mid-value. Since phase 4 the resolver never hands over such a pair:
+//! two sources that disagree on one terminal are reconciled at the
+//! terminal's own one-node cluster (`engine.rs`, `decide_terminal` — the
+//! fight is solved there, as a one-node cluster of the ideal sources, and
+//! reported once), and every cluster that reads the terminal is handed the
+//! one voltage it holds. The fought path stays for a caller that hands a
+//! pair directly. What the constant buys: an LED chain (driver → 220 Ω →
+//! anode → LED → ground) is a two-unknown solve, and the ground's voltage
+//! is exact rather than a microvolt from it.
 //!
-//! **Which terminals arrive as constants is the resolver's decision, and
-//! today it is: those of a cluster that carries an element.** A linear
-//! cluster's terminals are still handed over as the 0 Ω
-//! [`ClusterSource`]s they always were. The `net_stuck_shared_node` golden
-//! trace records every pass of a stuck node's cluster re-publishing the
-//! node a few nanovolts from its constant — the Norton floor's drop under
-//! each new drive, quantized to 0 µV in the trace but a fresh state each
-//! time — and holding that node exactly at its constant deletes those
-//! records (17 against 65). Phase 3's gate is that the goldens pass without
-//! re-blessing, so the constant is confined to the clusters phase 3 adds,
-//! and the linear clusters change hands in phase 4, which makes every
-//! terminal its own cluster and reviews the two analog goldens' diffs.
+//! **Every cluster's terminals arrive as constants** — the terminal's own
+//! one-root cluster included, where the constant absorbs the slot sources
+//! on it — since `NODES.md` §8 phase 4 made every declared terminal a
+//! cluster of its own and a boundary of every cluster around it. Phase 3
+//! had confined the constant to clusters carrying an element and handed a
+//! linear cluster's terminals over as the 0 Ω [`ClusterSource`]s they had
+//! always been, because holding a stuck node exactly at its constant
+//! deletes the nanovolt re-publications the `net_stuck_shared_node` golden
+//! recorded (17 records against 65); phase 4 re-blessed that golden with
+//! the diff reviewed (`NODES.md` §8, the phase-4 record).
 //!
 //! # Piecewise-linear elements
 //!
@@ -97,17 +100,18 @@
 //!
 //! An element's pin on a **declared terminal** — a gate tied to ground, an
 //! LED cathode on it, a polarity FET's drain on the input rail — does not
-//! make that terminal a member of the element's cluster: the resolver
-//! never unions an element through a terminal (`engine.rs`,
-//! `build_topology`; a terminal's voltage is fixed for the life of the
-//! system until phase 4's fan-out), and hands the terminal over instead as
-//! a *foreign* node of the solve — appended to the cluster's node list
-//! with its constant in [`ClusterInputs::terminals`] — so the branch
-//! stamps against the constant and the region test reads it. A control on
-//! a terminal outside the node list reads the constant of the same id
+//! make that terminal a member of the element's cluster, and neither does
+//! a resistor ending on it: the resolver never unions anything through a
+//! terminal (`engine.rs`, `build_topology`; a terminal is a cluster of its
+//! own, and a change to what it holds re-resolves every cluster in its
+//! fan-out), and hands the terminal over instead as a *boundary* node of
+//! the solve — appended to the cluster's node list with its constant in
+//! [`ClusterInputs::terminals`] — so the edge or branch stamps against the
+//! constant and the region test reads it. A control on a terminal outside
+//! the node list reads the constant of the same id
 //! ([`ClusterInputs::terminals`] may name a node the cluster does not
 //! hold). An element whose every pin is a terminal sits between constants,
-//! changes nothing, and is in no solve.
+//! changes nothing, and is in no solve; so does a resistor between two.
 //!
 //! Numerical policy (each choice documented at its constant/field):
 //! - **Zero-ohm edges** are a hard merge (supernode via union-find), never a
@@ -509,9 +513,9 @@ impl ClusterSolver for QuasiStaticMna {
         // fight at the floor (the module docs say why). Invalid terminals
         // (non-finite volts, node outside the cluster) contribute nothing.
         //
-        // A cluster handed no terminal — every linear cluster today — pays
-        // nothing here: the tables stay empty and `constant` reads `None`
-        // for every supernode (`DESIGN.md` rule 8).
+        // A cluster handed no terminal — one with no declared terminal on
+        // its boundary — pays nothing here: the tables stay empty and
+        // `constant` reads `None` for every supernode (`DESIGN.md` rule 8).
         let mut terminal_roots: Vec<(usize, Volts)> = Vec::new();
         let mut fought: Vec<bool> = Vec::new();
         let mut dirichlet: Vec<Option<Volts>> = Vec::new();

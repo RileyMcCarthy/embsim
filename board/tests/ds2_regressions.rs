@@ -12,6 +12,7 @@ use embsim_board::{
 };
 use embsim_models::ads122u04_component::ADS122U04_PINS;
 use rstest::rstest;
+use vibes_behaviour::{behaviour, expect, Test};
 
 // ============================================================
 // ADS122U04 pin facade (TSSOP-16, TI SBAS752B pin table p.3)
@@ -141,6 +142,50 @@ fn avdd_unstrapped_reports_power_net_unsourced() {
     assert!(!system.diagnostics().contains(&Finding::PowerNetUnsourced {
         net: "DS2Addon.VDDA".to_string()
     }));
+}
+
+// ============================================================
+// Every domain referenced: the build's domain lints report nothing
+// ============================================================
+
+/// Under the full bench harness every supply pin on the add-on is measured
+/// against a ground the harness holds — the ADC's digital supply against
+/// its digital ground, its analog supply against its analog ground — so
+/// the build's domain lints (`NODES.md` §8 phase 4) have nothing to say:
+/// no domain measured against nothing, no rail down. The Edge board alone
+/// under its bench rails is the case that reports both
+/// (`power_tree.rs`).
+#[rstest]
+fn the_referenced_add_on_reports_no_unreferenced_domain_and_no_rail_down() {
+    behaviour!(Test {
+        id: "lint.referenced-add-on-reports-nothing",
+        covers: Some("board/src/system.rs#lint_build"),
+        given: "the DS2 add-on under the bench harness that holds both its supply pins and \
+                both its grounds, analyzed at build",
+    });
+    expect!(
+        "no-domain-lint",
+        "the build reports no domain measured against nothing and no rail down",
+        "every supply pin on the add-on is measured against a ground the harness holds, and \
+         the add-on has no regulator whose output could be down"
+    );
+    let system = System::new()
+        .board("DS2Addon", ds2_board())
+        .harness(powered_bench_harness())
+        .build()
+        .expect("system builds");
+    let lints: Vec<&Finding> = system
+        .diagnostics()
+        .findings()
+        .iter()
+        .filter(|f| {
+            matches!(
+                f,
+                Finding::UnreferencedDomain { .. } | Finding::RailDown { .. }
+            )
+        })
+        .collect();
+    assert_eq!(lints, Vec::<&Finding>::new());
 }
 
 // ============================================================

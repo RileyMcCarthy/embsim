@@ -37,6 +37,15 @@
 //!   current regulators registered by specification rather than modelled:
 //!   a datasheet's curve as piecewise-linear branches, keyed on the
 //!   netlist's manufacturer part number
+//! - [`rail`] — a regulator (the Diodes AP62301 buck, the onsemi NCP114
+//!   LDO, the XLSEMI XL1509 buck, the TI UCC12040 isolated DC/DC): its
+//!   output a declared terminal, published at its reference plus its
+//!   setpoint from the instant its input and enable allow plus the
+//!   datasheet's soft-start, the setpoint read once at attach from the
+//!   part's value, its feedback divider or its select strap
+//! - [`supervisor`] — a voltage detector (the STMicroelectronics STM1061):
+//!   a comparator with hysteresis on an open-drain output, sinking while
+//!   the supply it reads against its own ground is under its threshold
 //! - [`spi_shift`] — the byte-wide shift register every SPI-mode device
 //!   model here is built on
 //! - [`machine`] — the **physical world** as harness-attached `embsim-board`
@@ -62,8 +71,10 @@ pub mod opto;
 pub mod oscillator;
 pub mod psram;
 pub mod pwl_library;
+pub mod rail;
 pub mod sd_card;
 pub mod sd_card_component;
 pub mod spi_flash;
 pub mod spi_flash_component;
 pub mod spi_shift;
+pub mod supervisor;

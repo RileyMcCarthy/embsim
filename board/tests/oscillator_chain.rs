@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use embsim_board::netlist;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, Harness, IdleDrive, NetState,
-    PartRegistry, PinDecl, PinKind, PulseDirection, PulseSegment, PulseTrain, PulseTx, Scenario,
-    StreamRole, System, SystemHandle,
+    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, IdleDrive,
+    NetState, PartRegistry, PinDecl, PinKind, PulseDirection, PulseSegment, PulseTrain, PulseTx,
+    Scenario, StreamRole, System, SystemHandle,
 };
 use embsim_boards::ec32mb::{Ec32mb, INVERTER_PART, NETLIST, TCXO_HZ, TCXO_PART};
 use embsim_boards::p2::{P2Package, P2PackageHandle};
@@ -36,6 +36,7 @@ use embsim_models::logic_gate::{
     self, LogicGate, LogicGateMonitor, Mode, LVC2G04_PINS_BY_FUNCTION, LVC2G04_R_OH_OHMS,
 };
 use embsim_models::oscillator::{self, Oscillator, OscillatorMonitor, TG2520SMN_START_UP_NS};
+use embsim_models::rail::AP62301_SOFT_START_NS;
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
@@ -174,6 +175,10 @@ impl Watched {
     }
 }
 
+fn ep(endpoint: &str) -> EndpointRef {
+    EndpointRef::parse(endpoint).expect("endpoint parses")
+}
+
 fn state(system: &SystemHandle, net: &str) -> NetState {
     system
         .net_state(&format!("{MODULE}.{net}"))
@@ -201,11 +206,11 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
          before time moves the chain is where the build analysis left it"
     );
     expect!(
-        "twenty-megahertz-at-one-millisecond",
-        "once time runs, the probe on XI is delivered a 20 megahertz rate that began one \
-         millisecond after the module came up",
-        "the TCXO's value names 20 MHz and its datasheet start-up time is 1.0 ms, and the \
-         two inverter stages relay the rate across the coupling capacitor"
+        "twenty-megahertz-after-the-rails",
+        "once time runs, the probe on XI is delivered a 20 megahertz rate that began 3.5 \
+         milliseconds after the carrier's 5 volts arrived",
+        "the core buck's datasheet soft-start is 2.5 ms and the TCXO's start-up 1.0 ms from \
+         its supply, and the two inverter stages relay the rate across the coupling capacitor"
     );
     expect!(
         "mid-rail-fixed-point",
@@ -218,9 +223,16 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     expect!(
         "one-drive-per-stage",
         "each inverter stage drives its output exactly once and relays the rate exactly \
-         once, and no cluster escalates to the solver",
+         once",
         "the rate arrives as one event, the stage answers with one drive and one relay, and \
          the level its own drive puts on its input changes nothing"
+    );
+    expect!(
+        "clock-chain-escalates-nothing",
+        "the only solves are the polarity FET's at the start pass and each feedback \
+         divider's when its rail rose",
+        "the clock chain is projections; a divider between two terminals is solved the once \
+         its rail steps"
     );
     expect!(
         "package-takes-the-crystal",
@@ -240,13 +252,18 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     stepped();
     let watched = Watched::default();
     let (probe, trains, _states) = RateProbe::new();
+    // The module powered as a carrier powers it, 5 V and 0 V on the `J203`
+    // fingers: the TCXO runs from `Common_VDD`, the core buck's output,
+    // which is a real rail now and rises 2.5 ms after the input arrives.
     let system = System::new()
         .board(MODULE, watched.board())
         .component("PROBE", Box::new(probe))
         .harness(
             Harness::new()
                 .connect_str("PROBE.CLK", &format!("{MODULE}.U100.XI"))
-                .expect("endpoints parse"),
+                .expect("endpoints parse")
+                .power(ep("CARRIER.5V"), ep(&format!("{MODULE}.J203.41")), 5.0)
+                .power(ep("CARRIER.GND"), ep(&format!("{MODULE}.J203.43")), 0.0),
         )
         .hold_time()
         .start()
@@ -272,6 +289,9 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     let tcxo = watched.tcxo.lock().unwrap().clone().expect("built");
     assert!(!tcxo.is_running());
 
+    // One solve before time moves: the polarity FET's element cluster, the
+    // carrier's 5 V turning its channel on at the start pass.
+    assert_eq!(system.escalated_solves(), 1, "the FET's cluster, once");
     system.release_time();
     assert!(
         wait_for(
@@ -291,8 +311,9 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     assert_eq!(delivered.direction, PulseDirection::Forward);
     assert_eq!(
         delivered.pulses.since_us,
-        TG2520SMN_START_UP_NS / 1_000,
-        "published at the start-up instant, t_str after the supply was seen up at t = 0"
+        (AP62301_SOFT_START_NS + TG2520SMN_START_UP_NS) / 1_000,
+        "published at the start-up instant: t_SS after the input arrived at t = 0, when the \
+         core rail rose and the TCXO saw its supply, then t_str"
     );
     assert_eq!(tcxo.publish_count(), 1, "one publish, nothing per edge");
 
@@ -324,7 +345,15 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     assert_eq!(u101.drive_count(0), 1);
     assert_eq!(u101.train_count(1), 1);
     assert_eq!(u101.train_count(0), 1);
-    assert_eq!(system.escalated_solves(), 0, "projections only");
+    // The clock chain escalates nothing: the two solves since the start
+    // pass are the bucks' feedback dividers, one each, when their rails
+    // rose at t_SS — a one-node cluster between two terminals, its two
+    // sources within a factor of ten of each other.
+    assert_eq!(
+        system.escalated_solves(),
+        3,
+        "the FET at the start pass and the two dividers at t_SS; nothing for the clock chain"
+    );
     assert!(
         !system
             .findings()

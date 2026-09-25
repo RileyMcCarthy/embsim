@@ -9,17 +9,24 @@ it sees anything else on a wire.
 `P2Qemu` is the **core** inside `embsim_boards::p2::P2Package`: the package
 declares the 86 package pins (64 pads released, the rails, `RESN`/`TEST`
 sensed, `XI` a rate sink, `XO` released), hands the core its pads, and
-delivers the two package-level facts — the crystal, which is whatever rate
-the board puts on `XI`, and the `RESN`/`VDD` state. A board fills its
-processor slot with `P2Package::new(P2Qemu::with_boot_rom(…)?)`.
+delivers the package-level facts — the crystal, which is whatever rate the
+board puts on `XI`; the `RESN`/`VDD` state; and the sixteen bank supplies,
+which are what a pad drives high at. The package's **START gate** holds
+the core until `RESN` reads released and `VDD` a voltage inside the
+datasheet's 1.7–1.9 V window; the instant it opens is where the guest's
+clock begins. A board fills its processor slot with
+`P2Package::new(P2Qemu::with_boot_rom(…)?)`.
 
 `tests/rom_boot_ec32mb.rs` is the whole claim in one test: the ROM, on the
-P2-EC32MB board from its vendor netlist, bit-bangs the module's SPI flash
-(`embsim_models`' generic part) over four shared nets, loads stage-1, which
-loads and runs a program — and every one of the ~16 600 clock edges lands on
-the net at the guest's own instant, two ROM instructions apart, never
-collapsed and never a slice late. The same boot diffs state-for-state against
-p2core (`SIL/p2core/tools/romtest.sh` in MaD) — 60 000 states identical.
+P2-EC32MB board from its vendor netlist powered from its carrier's `J203`
+fingers — its own bucks, LDOs and brownout detector raising the rails, the
+core started by the package at the instant they allow it, 2.5 ms in —
+bit-bangs the module's SPI flash (`embsim_models`' generic part) over four
+shared nets, loads stage-1, which loads and runs a program — and every one
+of the ~16 600 clock edges lands on the net at the guest's own instant, two
+ROM instructions apart, never collapsed and never a slice late. The same
+boot diffs state-for-state against p2core (`SIL/p2core/tools/romtest.sh` in
+MaD) — 60 000 states identical.
 
 ## Building it
 
@@ -193,8 +200,10 @@ PY
 rm -rf "$W"
 ```
 
-Recorded runs: 2026-09-23 (the node's first boot) and 2026-09-24 (the phase-2
-review pass) — `compared 60000, identical`.
+Recorded runs: 2026-09-23 (the node's first boot), 2026-09-24 (the phase-2
+review pass), and 2026-09-24 again with the module powered from its `J203`
+fingers and the core started by the package's START gate at 2.5 ms (phase
+4) — `compared 60000, identical` each time.
 
 ## Facts of the board the boot test states as scenario
 
@@ -202,8 +211,14 @@ review pass) — `compared 60000, identical`.
 - `S301` position 4 (P59 pull-down) closed: the ROM boots the program it
   loaded instead of waiting for a serial loader. It really samples this —
   drives P59 high, floats it, waits, reads it back.
-- `GND` stuck at 0 V and `VIO_56_63` at 3.3 V: the engine has no idea of
-  ground, and without the first, ground is just another node the pull-ups
-  reach, which reads high.
+- Nothing is stuck. The module is powered the way a carrier powers it —
+  5 V on `J203`'s two `5V` fingers and 0 V on its three `GND` fingers, as a
+  harness — and every rail the boot depends on is a part's output: the
+  ground the pull-downs return to is the finger's terminal, the `VIO_56_63`
+  rail `R301` pulls the boot strap to is an LDO's, the core rail the START
+  gate reads is `U402`'s, and the TCXO's 20 MHz reaches `XI` from the same
+  rail. The engine has no idea of ground: without the declared return,
+  ground is just another node the pull-ups reach, which reads high.
 
-Each of those was a divergence from p2core before it was a line of scenario.
+Each of those was a divergence from p2core before it was a line of scenario
+or a wire of harness.

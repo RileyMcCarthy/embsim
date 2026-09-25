@@ -64,9 +64,12 @@ pub use cluster::{
 };
 pub use component::{
     AttachError, Branch, Component, ComponentNetIo, Drive, IdleDrive, PinDecl, PinHandle, PinKind,
-    PulseDirection, PulseSegment, PulseTrain, PulseTx, PwlCurve, RegionTest, StreamRole,
+    PinReference, PulseDirection, PulseSegment, PulseTrain, PulseTx, PwlCurve, RegionTest,
+    ResistorAt, StreamRole,
 };
-pub use diagnostics::{CallbackKind, Diagnostics, Finding, PinMismatchDirection, SenseKind};
+pub use diagnostics::{
+    CallbackKind, Diagnostics, Finding, PinMismatchDirection, RailDownReason, SenseKind,
+};
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use host_pty::HostPty;

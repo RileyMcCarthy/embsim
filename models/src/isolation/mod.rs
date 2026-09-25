@@ -65,12 +65,11 @@
 //! against any datasheet sink, so an output resistance is the datasheet's
 //! bound and nothing else.
 //!
-//! # Promoting a stub
+//! # Registering the parts
 //!
-//! A consumer that registers these parts as topology-only stubs replaces each
-//! `register_stub` line with a `register` line and changes nothing else —
-//! the pin facades here *are* the datasheet pin tables, so the build
-//! validates against the same netlist it always did:
+//! A consumer registers each part with one `register` line and nothing
+//! else — the pin facades here *are* the datasheet pin tables, so the build
+//! validates them against the netlist in both directions:
 //!
 //! ```rust
 //! use embsim_board::{PartRegistry, registry::normalize_part};

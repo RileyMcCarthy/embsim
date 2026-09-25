@@ -10,10 +10,22 @@
 //!
 //! [`P2Qemu`] is a [`P2Core`]: it goes inside
 //! [`embsim_boards::p2::P2Package`], which declares the 86 package pins,
-//! hands the core its 64 pads, and delivers the two package-level facts —
+//! hands the core its 64 pads, and delivers the package-level facts —
 //! the **crystal**, which is the rate the board puts on `XI` (a TCXO
-//! through its buffer on the P2-EC32MB), and the `RESN`/`VDD` state. A
-//! board fills its processor slot with `P2Package::new(P2Qemu::…)`.
+//! through its buffer on the P2-EC32MB), the `RESN`/`VDD` state, and the
+//! sixteen bank supplies the pads drive high at. A board fills its
+//! processor slot with `P2Package::new(P2Qemu::…)`.
+//!
+//! # When the guest starts
+//!
+//! The package's **START gate** decides: the core is started — and its
+//! first wake delivered — only once `RESN` reads released and `VDD` reads
+//! a voltage inside the datasheet's window (`embsim_boards::p2`). The
+//! START instant is where the guest's clock begins: [`P2Core::start`]
+//! anchors clock segment 0 at the virtual instant it runs, so a guest
+//! started 2.5 ms in (the P2-EC32MB from its carrier's 5 V, its bucks'
+//! soft-start elapsed) stamps its first instruction there, and every edge
+//! after it at its own instant from there.
 //!
 //! # Where the CPU runs
 //!
@@ -43,10 +55,14 @@
 //! A pad the guest drives is a Thevenin source at the strength its `WRPIN`
 //! word configured (`embsim_boards::p2::pad_drive`): fast at
 //! [`embsim_boards::p2::P2_FAST_OHMS`], the 1.5 k / 15 k / 150 kΩ modes at
-//! those resistances, float released. A `WRPIN` on a driven pad is a pad
-//! change like a `DIR` write — it yields, and the next wake republishes the
-//! pad at the new strength. The current-source modes are not mapped: such a
-//! pad presents nothing, and the node says so once.
+//! those resistances, float released — and high at its **bank's supply**,
+//! the voltage the package senses on the pad's `VIO_a_b` pin
+//! ([`BankSupplies::pad_drive`]); a pad in a bank whose supply names no
+//! voltage presents nothing, and the package reports the bank once. A
+//! `WRPIN` on a driven pad is a pad change like a `DIR` write — it yields,
+//! and the next wake republishes the pad at the new strength. The
+//! current-source modes are not mapped: such a pad presents nothing, and
+//! the node says so once.
 //!
 //! `IN` reflects the **net** for every pad whose published drive is
 //! released or a pull (at or above [`WEAK_DRIVE_OHMS`]) — a pad pulling a
@@ -72,7 +88,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{level_of, AttachError, Level, PinHandle, TheveninDrive, WEAK_DRIVE_OHMS};
-use embsim_boards::p2::{self, P2Core, P2Pads, P2ResetState, PadDrive, LOGIC_HIGH_VOLTS};
+use embsim_boards::p2::{self, BankSupplies, P2Core, P2Pads, P2ResetState, PadDrive};
 use embsim_core::virtual_clock;
 
 pub use embsim_boards::p2::{p2x8c4m64p_pins, pin_name};
@@ -226,9 +242,10 @@ struct Shared {
     /// The crystal, as the package last delivered it from `XI`: the rate
     /// in hertz, 0 while nothing reaches the pin.
     crystal_hz: AtomicU64,
-    /// The reset inputs, as the package last delivered them. Recorded, not
-    /// yet acted on: the START gate is `NODES.md` §8 phase 4's, with the
-    /// rails that make `VDD` read a voltage.
+    /// The reset inputs, as the package last delivered them. Information:
+    /// the START gate that acts on them is the package's, and a change
+    /// after the start (a rail dropping) changes nothing here until the
+    /// target has a reset entry.
     reset: Mutex<P2ResetState>,
     /// The guest selected a clock derived from the crystal while none
     /// reached `XI`, and is not running until one does.
@@ -356,6 +373,9 @@ struct Bus {
     pending_at_ns: Option<u64>,
 
     handles: Vec<Option<PinHandle>>,
+    /// The bank supplies, as the package senses them: what a pad drives
+    /// high at. Unpowered until the package hands the core its table.
+    banks: BankSupplies,
     /// The crystal on `XI`, as last drained from the package's delivery.
     crystal_hz: Option<u64>,
     /// The crystal the current clock segment was derived from, to notice a
@@ -397,6 +417,7 @@ impl Bus {
             dirty: 0,
             pending_at_ns: None,
             handles: (0..NUM_PINS).map(|_| None).collect(),
+            banks: BankSupplies::unpowered(),
             crystal_hz: None,
             clocked_crystal_hz: None,
             clock_mode: 0,
@@ -428,14 +449,16 @@ impl Bus {
     }
 
     /// The drive the guest presents on `pin`: its `DIR`/`OUT` bits through
-    /// the strength its `WRPIN` word configured, or `None` when the pad is
-    /// released. A current-source mode is not mapped and presents nothing.
+    /// the strength its `WRPIN` word configured, high at the pad's bank
+    /// supply, or `None` when the pad is released — `DIR` clear, the float
+    /// mode, or a bank with no supply. A current-source mode is not mapped
+    /// and presents nothing.
     fn pad_drive(&self, pin: usize) -> Option<TheveninDrive> {
         let bit = 1u32 << (pin & 31);
         let bank = pin >> 5;
         let dir = self.dir[bank] & bit != 0;
         let out = self.out[bank] & bit != 0;
-        match p2::pad_drive(self.mode[pin], dir, out, LOGIC_HIGH_VOLTS) {
+        match self.banks.pad_drive(pin as u8, self.mode[pin], dir, out) {
             PadDrive::Released => None,
             PadDrive::Thevenin(drive) => Some(drive),
             PadDrive::CurrentSource(mode) => {
@@ -965,6 +988,9 @@ impl P2Core for P2Qemu {
         // SAFETY: attach runs before any wake exists; nothing else holds the bus.
         let bus = unsafe { &mut *ptr.get() };
 
+        // The bank supplies: what each pad drives high at.
+        bus.banks = pads.bank_supplies();
+
         // Every pad senses its net. The package declares every pad released
         // at attach — a chip out of reset floats every pin — so that is what
         // each net has been told. Floating and contention hold the last
@@ -1001,7 +1027,8 @@ impl P2Core for P2Qemu {
                 }
             });
         }
-        // The reset inputs: recorded for the START gate (phase 4).
+        // The reset inputs, as information: the package's START gate is what
+        // holds the guest on them.
         {
             let shared = Arc::clone(&self.shared);
             pads.on_reset(move |state| {
@@ -1026,11 +1053,35 @@ impl P2Core for P2Qemu {
             let bus = unsafe { &mut *ptr.get() };
             wake(bus, &shared, &arm, now);
         });
-        // The first wake, at once. Without it the engine's first look at the
-        // guest would be whenever something else scheduled, and the guest's
-        // first edge would be stamped there.
+        // The first wake, at once — which the package holds until the START
+        // gate opens, so it lands at the START instant (or one nanosecond in,
+        // for a bench whose supplies are up from the build). Without it the
+        // engine's first look at the guest would be whenever something else
+        // scheduled, and the guest's first edge would be stamped there.
         pads.schedule_at_ns(1);
         Ok(())
+    }
+
+    /// The START instant: the guest's clock counts from here. Clock
+    /// segment 0 — cog clock 0, RCFAST — is anchored at the current virtual
+    /// nanosecond, so the first instruction the guest retires is stamped at
+    /// the instant the chip could run, never at zero.
+    fn start(&mut self) {
+        // SAFETY: the package calls `start` before it forwards any wake the
+        // core asked for, so no wake and no slice is running; this is the
+        // only borrow of the bus, as attach's was.
+        let bus = unsafe { &mut *self.bus.get() };
+        let now = virtual_clock::virtual_ns();
+        let segment = bus
+            .clock_segments
+            .first_mut()
+            .expect("at least the reset segment");
+        segment.from_ns = now;
+        tracing::info!(
+            start_ns = now,
+            hz = segment.hz,
+            "p2-qemu: START; the guest's clock counts from here"
+        );
     }
 }
 
@@ -1154,12 +1205,24 @@ mod tests {
     use super::*;
     use embsim_boards::p2::{P2_FAST_OHMS, P_HIGH_15K, P_HIGH_1MA, P_HIGH_FLOAT, P_LOW_FAST};
 
+    /// The bench's bank supplies: every `VIO_a_b` at 3.3 V.
+    const BENCH_VIO_VOLTS: f64 = 3.3;
+
+    /// A bus with every bank at [`BENCH_VIO_VOLTS`] and nothing published
+    /// yet, the state a core is in once the package has handed it its
+    /// table.
+    fn bench_bus() -> Bus {
+        let mut bus = Bus::new(Arc::new(Shared::default()));
+        bus.banks = BankSupplies::held_at(BENCH_VIO_VOLTS);
+        bus.published = [Some(None); NUM_PINS];
+        bus
+    }
+
     /// A bus with pads `dir`/`out` set by cog 0 and every change published
     /// (to no net: the handles are empty), so `sensed` reads what a guest
     /// would after the wake that publishes.
     fn bus_driving(dir: u32, out: u32) -> Bus {
-        let mut bus = Bus::new(Arc::new(Shared::default()));
-        bus.published = [Some(None); NUM_PINS];
+        let mut bus = bench_bus();
         bus.dir_cog[0][0] = dir;
         bus.out_cog[0][0] = out;
         assert!(bus.mark_changes() || dir == 0);
@@ -1185,7 +1248,7 @@ mod tests {
         assert_eq!(
             bus.pad_drive(0),
             Some(TheveninDrive {
-                volts: LOGIC_HIGH_VOLTS,
+                volts: BENCH_VIO_VOLTS,
                 impedance: P2_FAST_OHMS
             })
         );
@@ -1205,8 +1268,7 @@ mod tests {
     /// fast pad reads its own `OUT` bit.
     #[test]
     fn a_pulling_pad_reads_its_net_and_a_fast_pad_its_own_out_bit() {
-        let mut bus = Bus::new(Arc::new(Shared::default()));
-        bus.published = [Some(None); NUM_PINS];
+        let mut bus = bench_bus();
         bus.mode[0] = P_HIGH_15K;
         bus.dir_cog[0][0] = 0b11;
         bus.out_cog[0][0] = 0b11;
@@ -1215,7 +1277,7 @@ mod tests {
         assert_eq!(
             bus.published[0],
             Some(Some(TheveninDrive {
-                volts: LOGIC_HIGH_VOLTS,
+                volts: BENCH_VIO_VOLTS,
                 impedance: 15_000.0
             }))
         );
@@ -1269,13 +1331,52 @@ mod tests {
 
     #[test]
     fn a_current_source_mode_presents_nothing_to_the_net() {
-        let mut bus = Bus::new(Arc::new(Shared::default()));
-        bus.published = [Some(None); NUM_PINS];
+        let mut bus = bench_bus();
         bus.mode[5] = P_HIGH_1MA;
         bus.dir_cog[0][0] = 1 << 5;
         bus.out_cog[0][0] = 1 << 5;
         assert!(!bus.mark_changes(), "released to released is no change");
         assert_eq!(bus.pad_drive(5), None);
+    }
+
+    /// The pad's high is its bank's supply: a bank the package senses at
+    /// 1.8 V drives 1.8 V, and a bank whose supply names no voltage drives
+    /// nothing — a pad the guest sets there is released to its net, and is
+    /// no pad change while it was released already.
+    #[test]
+    fn a_pad_drives_high_at_its_banks_supply_and_nothing_in_an_unpowered_bank() {
+        let mut bus = Bus::new(Arc::new(Shared::default()));
+        bus.published = [Some(None); NUM_PINS];
+        // Every bank at 1.8 V (a bench table stands in for the package's
+        // senses): P4 driven high is a 1.8 V source.
+        bus.banks = BankSupplies::held_at(1.8);
+        bus.dir_cog[0][0] = 1 << 4;
+        bus.out_cog[0][0] = 1 << 4;
+        assert!(bus.mark_changes());
+        bus.publish_pending();
+        assert_eq!(
+            bus.published[4],
+            Some(Some(TheveninDrive {
+                volts: 1.8,
+                impedance: P2_FAST_OHMS
+            }))
+        );
+
+        // Every supply gone: P8 set high presents nothing, and P4's drive
+        // is a pad change (1.8 V to none) that publishes a release.
+        let banks = BankSupplies::unpowered();
+        bus.banks = banks.clone();
+        bus.dir_cog[0][0] |= 1 << 8;
+        bus.out_cog[0][0] |= 1 << 8;
+        assert!(
+            bus.mark_changes(),
+            "P4's drive changed with its bank's table (1.8 V to none)"
+        );
+        bus.publish_pending();
+        assert_eq!(bus.published[8], Some(None), "no supply, no driver");
+        assert_eq!(bus.published[4], Some(None));
+        assert_eq!(banks.unpowered_banks_driven(), vec![1, 2]);
+        assert_eq!(bus.strong[0], 0, "nothing strong: nothing drives");
     }
 
     #[test]
