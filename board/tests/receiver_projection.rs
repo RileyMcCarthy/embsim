@@ -11,19 +11,22 @@
 //! policies, the JESD8C.01 3.3 V LVCMOS pair, and a P2 pad's 0.3/0.7 of a
 //! 1.8 V bank — plus an analog reader measured against a reference pin held
 //! at 1.0 V, a digital sense nothing drives, and a receiver on a net two
-//! drivers fight over. Stepped mode (`TESTING.md` rule 9): every delivery
-//! carries the virtual instant the engine delivered it at. Its own binary
-//! per rule 5.
+//! drivers fight over. And a clock is the receiver's too: a stepper drive
+//! counts a square wave on its `STEP` input only when the wave's phases
+//! cross that input's thresholds. Stepped mode (`TESTING.md` rule 9): every
+//! delivery carries the virtual instant the engine delivered it at. Its own
+//! binary per rule 5.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
     jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver,
-    EndpointRef, Finding, Harness, Level, PinDecl, PinHandle, Sense, SenseKind, System,
-    SystemHandle, TheveninDrive, Thresholds, Volts,
+    Drive, EndpointRef, Finding, Harness, Level, NetState, PeriodicSchedule, PinDecl, PinHandle,
+    Sense, SenseKind, System, SystemHandle, TheveninDrive, Thresholds, Volts,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
+use embsim_models::machine::{stepper_motor, StepperMotor};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
@@ -549,7 +552,18 @@ fn a_supply_that_moves_re_delivers_the_pins_sense() {
                 impedance: 25.0,
             }));
     };
+    // The bank first, and seen published before the node is driven: the
+    // node's delivery is then projected against a 3.3 V bank.
     drive(&supply, 3.3);
+    let supply_net = supply.lock().unwrap().as_ref().unwrap().net();
+    assert!(
+        wait_for(
+            || system.net_state_of(supply_net) == Some(NetState::Driven(Level::High)),
+            SETTLE
+        ),
+        "the bank is at 3.3 V: {:?}",
+        system.net_state_of(supply_net)
+    );
     drive(&node, 1.3);
     assert!(
         wait_for(
@@ -559,19 +573,174 @@ fn a_supply_that_moves_re_delivers_the_pins_sense() {
         "{:?}",
         pad_log.lock().unwrap()
     );
-    // The supply's own settling may re-deliver; wait for the log to rest.
-    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(last(&pad_log).unwrap().2, None, "1.3 V in a 3.3 V bank");
-    let before = pad_log.lock().unwrap().len();
 
+    // Only the bank moves: the pad is handed its unchanged node again, and
+    // reads it through the thresholds the new bank scales. Wait for that
+    // observable itself — the last delivery at 1.3 V, read high.
     drive(&supply, 1.8);
     assert!(
-        wait_for(|| pad_log.lock().unwrap().len() > before, SETTLE),
-        "the bank's move re-delivers the pad's sense: {:?}",
+        wait_for(
+            || last(&pad_log)
+                .is_some_and(|(_, v, level)| near(v, 1.3) && level == Some(Level::High)),
+            SETTLE
+        ),
+        "the bank's move re-delivers the pad's sense, read high: {:?}",
         pad_log.lock().unwrap()
     );
-    let (_, volts, level) = last(&pad_log).unwrap();
-    assert!(near(volts, 1.3), "the node did not move: {volts:?}");
-    assert_eq!(level, Some(Level::High), "1.3 V in a 1.8 V bank");
+    drop(system);
+}
+
+// ============================================================
+// A clock is the receiver's too
+// ============================================================
+
+/// A stepper drive — `STEP`, `DIR` and `ENA` read through the JESD8C.01
+/// pair, 0.8 V / 2.0 V, no level between (`stepper_motor::STEPPER_PINS`) —
+/// enabled and pointed one way from the bench, its `STEP` input driven
+/// straight by a 10 kHz square wave from 0 V to 1.2 V for 3 ms, then by one
+/// from 0 V to 3.3 V. The 1.2 V phase sits between the thresholds, where
+/// the input reads no level: the wave never crosses the input's switching
+/// point, so the drive sees no clock and counts nothing. The 3.3 V wave
+/// crosses both and is counted pulse for pulse from its anchor.
+#[rstest]
+fn a_step_input_counts_a_clock_only_when_it_crosses_the_thresholds() {
+    behaviour!(Test {
+        id: "sense.step-clock-must-cross",
+        covers: Some("models/src/machine/stepper_motor.rs#StepperMotor"),
+        given: "an enabled stepper drive whose step input is driven directly by a 10 kilohertz \
+                square wave from 0 to 1.2 volts for 3 milliseconds, then by one from 0 to 3.3 \
+                volts",
+    });
+    expect!(
+        "low-swing-uncounted",
+        "the 1.2 volt wave leaves the commanded step count at zero",
+        "1.2 volts sits between the step input's 0.8 and 2.0 volt thresholds, where it reads \
+         no level, so the input never switches"
+    );
+    expect!(
+        "full-swing-counted",
+        "the 3.3 volt wave is counted pulse for pulse from the instant it was driven",
+        "each phase crosses a threshold, so the input switches every cycle"
+    );
+
+    let _lock = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let step = Arc::new(Mutex::new(None));
+    let held = |volts: Volts| {
+        Some(TheveninDrive {
+            volts,
+            impedance: 25.0,
+        })
+    };
+    let motor = StepperMotor::new(stepper_motor::Config::new(100.0)).expect("valid");
+    let shaft = motor.shaft();
+    let system = System::new()
+        .component(
+            "DRV",
+            Box::new(Driver {
+                pins: [PinDecl::digital_out("Q").with_idle(None)],
+                handle: Arc::clone(&step),
+            }),
+        )
+        // ENA active high (the configuration's default), DIR low.
+        .component(
+            "ENA",
+            Box::new(Driver {
+                pins: [PinDecl::digital_out("Q").with_idle(held(3.3))],
+                handle: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .component(
+            "DIR",
+            Box::new(Driver {
+                pins: [PinDecl::digital_out("Q").with_idle(held(0.0))],
+                handle: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .component("MOTOR", Box::new(motor))
+        .harness(
+            Harness::new()
+                .connect(ep("MOTOR.STEP"), ep("DRV.Q"))
+                .connect(ep("MOTOR.ENA"), ep("ENA.Q"))
+                .connect(ep("MOTOR.DIR"), ep("DIR.Q")),
+        )
+        .start()
+        .expect("the bench starts");
+    assert!(
+        wait_for(|| step.lock().unwrap().is_some() && shaft.enabled(), SETTLE),
+        "the driver is wired and the drive enabled"
+    );
+    let q = step.lock().unwrap().clone().unwrap();
+    let square = |high_volts: Volts, segment: PeriodicSchedule| Drive::Periodic {
+        hi: TheveninDrive {
+            volts: high_volts,
+            impedance: 25.0,
+        },
+        lo: TheveninDrive {
+            volts: 0.0,
+            impedance: 25.0,
+        },
+        segment,
+    };
+    let segment_from = |since_ns: u64| PeriodicSchedule {
+        emitted: 0,
+        freq_hz: 10_000,
+        total: None,
+        since_ns,
+    };
+
+    // The low-swing wave: wait until the engine reports it on the net, then
+    // until 3 ms of virtual time have passed — time moves only once every
+    // delivery of that pass has run.
+    let low = segment_from(virtual_clock::virtual_ns());
+    q.drive(square(1.2, low));
+    assert!(
+        wait_for(
+            || matches!(
+                system.net_state_of(q.net()),
+                Some(NetState::Periodic { segment, .. }) if segment == low
+            ),
+            SETTLE
+        ),
+        "the step net carries the 1.2 V wave: {:?}",
+        system.net_state_of(q.net())
+    );
+    let reported_at = virtual_clock::virtual_ns();
+    assert!(
+        wait_for(
+            || virtual_clock::virtual_ns() >= reported_at + 3_000_000,
+            SETTLE
+        ),
+        "virtual time runs on the drive's own observation wakes"
+    );
+    assert_eq!(shaft.train(), None, "no train presented");
+    assert_eq!(shaft.commanded_steps(), 0, "nothing counted");
+
+    // The full-swing wave, counted from its anchor.
+    let full = segment_from(virtual_clock::virtual_ns());
+    q.drive(square(3.3, full));
+    assert!(
+        wait_for(|| shaft.train() == Some(full), SETTLE),
+        "the 3.3 V wave is presented as a train: {:?}",
+        shaft.train()
+    );
+    assert!(
+        wait_for(
+            || virtual_clock::virtual_ns() >= full.since_ns + 3_000_000,
+            SETTLE
+        ),
+        "virtual time runs"
+    );
+    let before = virtual_clock::virtual_ns();
+    let counted = shaft.commanded_steps().unsigned_abs();
+    let after = virtual_clock::virtual_ns();
+    assert!(
+        (full.emitted_at_ns(before)..=full.emitted_at_ns(after)).contains(&counted),
+        "every pulse since the anchor, and only those: {counted} in {}..={}",
+        full.emitted_at_ns(before),
+        full.emitted_at_ns(after)
+    );
+    assert!(counted >= 30, "3 ms at 10 kHz: {counted}");
     drop(system);
 }

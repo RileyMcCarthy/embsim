@@ -1,7 +1,9 @@
 //! A logic gate on the net, live: the output changes exactly the datasheet
 //! propagation delay after the input, driven through the datasheet output
 //! resistance, and a Schmitt-trigger input does not flip inside its
-//! hysteresis band — `NODES.md` §8 phase 2's proof for `LogicGate`.
+//! hysteresis band — `NODES.md` §8 phase 2's proof for `LogicGate`. And a
+//! clock driven straight onto a plain input is relayed only when its phases
+//! cross the input's thresholds (`NODES.md` §12 item 5, the cleanup).
 //!
 //! The rig is a bench: a driver pin, the gate, a probe on both of its nets
 //! that stamps every state it is delivered with the virtual instant it
@@ -14,12 +16,14 @@ use std::time::{Duration, Instant};
 
 use embsim_board::{
     digital_drive, jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand,
-    Drive, EndpointRef, Harness, Level, NetState, PinDecl, PinHandle, System, TheveninDrive,
+    Drive, EndpointRef, Harness, Level, NetState, PeriodicSchedule, PinDecl, PinHandle, System,
+    TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::logic_gate::{
-    self, GatePin, LogicGate, LogicGateMonitor, LVC1G14_PINS_SOT23, LVC1G14_R_OH_OHMS,
-    LVC1G14_R_OL_OHMS, LVC1G14_T_PD_NS, LVC2G04_PINS_SOT363, LVC2G04_T_PD_NS,
+    self, GatePin, LogicGate, LogicGateMonitor, Mode, LVC1G14_PINS_SOT23, LVC1G14_R_OH_OHMS,
+    LVC1G14_R_OL_OHMS, LVC1G14_T_PD_NS, LVC2G04_PINS_SOT363, LVC2G04_R_OH_OHMS, LVC2G04_R_OL_OHMS,
+    LVC2G04_T_PD_NS,
 };
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
@@ -464,5 +468,128 @@ fn a_plain_input_reads_no_level_inside_its_band() {
         "released, low, released, high"
     );
     assert_eq!(b.gate.drive_count(0), 3, "one drive per input change");
+    drop(b.system);
+}
+
+// ============================================================
+// A clock on a plain input
+// ============================================================
+
+/// A square wave the bench drives straight onto the input — no capacitor
+/// between — from 0 V to `high_volts`, both phases behind 25 Ω, at 1 MHz
+/// from `since_ns`.
+fn square_wave(high_volts: f64, since_ns: u64) -> Drive {
+    Drive::Periodic {
+        hi: TheveninDrive {
+            volts: high_volts,
+            impedance: 25.0,
+        },
+        lo: TheveninDrive {
+            volts: 0.0,
+            impedance: 25.0,
+        },
+        segment: PeriodicSchedule {
+            emitted: 0,
+            freq_hz: 1_000_000,
+            total: None,
+            since_ns,
+        },
+    }
+}
+
+/// The 74LVC2G04's input — `V_IL` max 0.8 V, `V_IH` min 2.0 V (Table 7),
+/// no level between — first held high, then driven by a 0 V / 1.2 V square
+/// wave, then by a 0 V / 3.3 V one. A receiver sees a clock only when its
+/// input crosses its switching point every cycle: the 1.2 V phase sits in
+/// the band, where the input reads no level, so the wave is no clock and no
+/// level there — the output is released, as for any input with no level;
+/// the 3.3 V wave crosses both thresholds and is relayed at its own rate.
+/// Nothing on the bench joins the output back to the input, so the input is
+/// not self-biased.
+#[rstest]
+fn a_clock_on_a_plain_input_is_relayed_only_when_it_crosses_the_thresholds() {
+    behaviour!(Test {
+        id: "logic-gate.clock-must-cross-the-input",
+        covers: Some("models/src/logic_gate.rs#LogicGate"),
+        given: "a 74LVC2G04 inverter on a 3.3 volt bench whose input, first held high, is \
+                driven directly by a square wave from 0 to 1.2 volts, then from 0 to 3.3 volts",
+    });
+    expect!(
+        "low-swing-released",
+        "while the 1.2 volt wave runs, the output rests released",
+        "1.2 volts sits between the input's 0.8 and 2.0 volt thresholds, where the datasheet \
+         guarantees no level, so that phase reads none and the input sees no edge"
+    );
+    expect!(
+        "full-swing-relayed",
+        "the 3.3 volt wave is relayed at its own rate between the part's own output levels",
+        "each phase crosses a threshold, so the input switches every cycle"
+    );
+
+    let _lock = suite_lock();
+    let b = bench(
+        logic_gate::Config::lvc2g04(),
+        &LVC2G04_PINS_SOT363,
+        "1",
+        "6",
+    );
+    assert!(!b.gate.self_biased(0), "nothing joins 1Y back to 1A");
+
+    b.q.drive(Drive::Thevenin(digital_drive(Level::High)));
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Driven(Level::Low)))),
+            SETTLE
+        ),
+        "Y low after a high input"
+    );
+
+    let low_swing = square_wave(1.2, virtual_clock::virtual_ns());
+    b.q.drive(low_swing);
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Floating))),
+            SETTLE
+        ),
+        "Y released under the 1.2 V wave: y={:?} a={:?}",
+        b.y.lock().unwrap(),
+        b.a.lock().unwrap()
+    );
+    assert!(
+        matches!(last(&b.a), Some((_, NetState::Periodic { .. }))),
+        "the input carries the wave: {:?}",
+        last(&b.a)
+    );
+    assert_eq!(b.gate.mode(0), Mode::Level);
+    assert_eq!(b.gate.relayed_segment(0), None);
+    assert_eq!(b.gate.train_count(0), 0, "no rate relayed");
+
+    let full_swing = square_wave(3.3, virtual_clock::virtual_ns());
+    let Drive::Periodic { segment, .. } = full_swing else {
+        unreachable!()
+    };
+    b.q.drive(full_swing);
+    assert!(
+        wait_for(|| b.gate.relayed_segment(0) == Some(segment), SETTLE),
+        "the 3.3 V wave is relayed: y={:?}",
+        b.y.lock().unwrap()
+    );
+    assert_eq!(b.gate.mode(0), Mode::Rate);
+    assert_eq!(
+        b.gate.output(0),
+        Some(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: LVC2G04_R_OH_OHMS,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: LVC2G04_R_OL_OHMS,
+            },
+            segment,
+        }),
+        "between the datasheet's own output ports"
+    );
+    assert_eq!(b.gate.train_count(0), 1, "one relayed rate");
     drop(b.system);
 }

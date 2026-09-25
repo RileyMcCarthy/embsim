@@ -771,7 +771,7 @@ impl Core {
         ) {
             let thresholds = self.config.input_thresholds().scaled(input_rail);
             let default = self.config.default_level();
-            let (hi, lo) = clock.levels(&thresholds);
+            let (hi, lo) = clock.levels(&thresholds, state.input_level[wiring.channel.index()]);
             let (hi, lo) = (hi.unwrap_or(default), lo.unwrap_or(default));
             return Some(if hi == lo {
                 Drive::Thevenin(port(hi))

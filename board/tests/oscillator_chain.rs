@@ -404,6 +404,56 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     drop(system);
 }
 
+/// The module's two 74LVC2G04s as the build finds them: `U101`'s second
+/// stage has `R101` (100 kΩ) from `2Y` back to `2A`, so its input is
+/// self-biased and relays the TCXO's 0.8 V swing coupled onto it; its first
+/// stage (`1A` on the `2Y` node) and both stages of the LED buffer `U601`
+/// have no resistor back from their output, so a clock must cross their
+/// input thresholds to be relayed.
+#[rstest]
+fn only_the_oscillator_buffers_fed_back_stage_is_self_biased() {
+    behaviour!(Test {
+        id: "logic-gate.self-bias-from-the-netlist",
+        covers: Some("models/src/logic_gate.rs#LogicGate"),
+        given: "the P2-EC32MB module built from its vendor netlist, whose oscillator inverter \
+                has a 100 kilohm resistor from its second output back to its second input",
+    });
+    expect!(
+        "fed-back-stage-self-biased",
+        "that stage's input is treated as self-biased: any running clock it carries is relayed",
+        "the resistor holds the input at the stage's own switching point, so a swing coupled \
+         onto it crosses that point every cycle"
+    );
+    expect!(
+        "other-stages-plain",
+        "the oscillator inverter's first stage and both stages of the LED inverter are plain \
+         inputs, whose clock must cross their thresholds"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let watched = Watched::default();
+    let system = System::new()
+        .board(MODULE, watched.board())
+        .harness(
+            Harness::new()
+                .power(ep("CARRIER.5V"), ep(&format!("{MODULE}.J203.41")), 5.0)
+                .power(ep("CARRIER.GND"), ep(&format!("{MODULE}.J203.43")), 0.0),
+        )
+        .hold_time()
+        .start()
+        .expect("the module starts");
+    let u101 = watched.gate("U101");
+    let u601 = watched.gate("U601");
+    assert!(u101.self_biased(1), "R101 joins 2Y back to 2A");
+    assert!(!u101.self_biased(0), "nothing joins 1Y back to 1A");
+    assert!(
+        !u601.self_biased(0) && !u601.self_biased(1),
+        "the LED buffer"
+    );
+    drop(system);
+}
+
 // ============================================================
 // The AC-coupling rule, on a bench fixture
 // ============================================================

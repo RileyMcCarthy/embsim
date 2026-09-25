@@ -104,7 +104,10 @@ cargo test -p embsim-board --lib source_strength
 # a gate's output moving exactly t_pd after its input through the datasheet
 # output resistance, a Schmitt input holding inside its band and a plain
 # one reading no level there (its output released); a PSRAM
-# Read ID answered over the module's own nets.
+# Read ID answered over the module's own nets. Since the interface phase's
+# cleanup: only the buffer's fed-back stage is self-biased (the build finds
+# `R101` from `2Y` back to `2A`), and a clock driven straight onto a plain
+# input is relayed only when its phases cross the input's thresholds.
 cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --test psram_spi
 # Phase 2, the P2 package (stepped, own binary): the rate on XI is the
 # crystal the package reports, the reset inputs as it projects them, every
@@ -180,7 +183,10 @@ EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocap
 # inside the dead band, the same 1.5 V read high by a P2 pad in a 1.8 V bank
 # and no level by an LVCMOS receiver, a reader against a reference pin at
 # 1 V, a floating sense handed no voltage with its finding, a fought net
-# handed its 1.65 V operating point with the contention beside it.
+# handed its 1.65 V operating point with the contention beside it, a supply
+# move re-delivering a pad's sense (waited on as the reading itself), and —
+# the cleanup — a stepper counting a step clock only when its phases cross
+# its `STEP` thresholds.
 cargo test -p embsim-board --test receiver_projection --test pin_declarations
 # The interface phase's rules task (stepped, own binary): a fought node
 # under an ADC
