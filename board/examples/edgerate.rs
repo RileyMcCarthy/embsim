@@ -11,7 +11,7 @@
 //!
 //! This example was written to test whether the step clock could be carried as
 //! edges rather than as a rate, and it answered the wrong question. Cost is not
-//! why `StreamRole::PulseTrain` exists. **Correctness is**, and it was measured
+//! why a step clock is a `Drive::Periodic` and not edges. **Correctness is**, and it was measured
 //! before this was written — `p2iss/src/pulse.rs:40`:
 //!
 //! > driving it edge by edge makes every step a wheel deadline, and any service
@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level,
-    PinDecl, PinHandle, PinKind, System,
+    digital_drive, jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand,
+    DigitalReceiver, Harness, Level, PinDecl, PinHandle, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -125,23 +125,13 @@ impl Component for Listener {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let counts = Arc::clone(&self.counts);
-        io.on_sense("IN", move |state| {
-            if level_of(state).is_some() {
+        let receiver = DigitalReceiver::new(io.pin("IN")?);
+        io.on_sense("IN", move |sense| {
+            if receiver.read(&sense).is_some() {
                 counts.sensed.fetch_add(1, Ordering::Relaxed);
             }
         })?;
         Ok(())
-    }
-}
-
-fn decl(number: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -158,7 +148,7 @@ fn main() {
         .component(
             "DRV",
             Box::new(Driver {
-                pins: [decl("OUT", PinKind::DigitalOut)],
+                pins: [PinDecl::digital_out("OUT")],
                 counts: Arc::clone(&counts),
                 pin: Arc::new(Mutex::new(None)),
             }),
@@ -166,7 +156,10 @@ fn main() {
         .component(
             "LSN",
             Box::new(Listener {
-                pins: [decl("IN", PinKind::DigitalIn)],
+                pins: [PinDecl::digital_in(
+                    "IN",
+                    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+                )],
                 counts: Arc::clone(&counts),
             }),
         )

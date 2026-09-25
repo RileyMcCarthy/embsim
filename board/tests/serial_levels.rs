@@ -25,9 +25,9 @@ use embsim_board::event_log::EngineEvent;
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::uart::{FramingError, UartDecoder, UartEncoder, UartFraming};
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Harness, IdleDrive, Level, McuComponent,
-    NetState, PartRegistry, PinDecl, PinHandle, PinKind, Scenario, System, SystemHandle,
-    TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand,
+    DigitalReceiver, Harness, Level, McuComponent, NetState, PartRegistry, PinDecl, PinHandle,
+    Scenario, System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock;
 use embsim_peripherals::serial;
@@ -73,21 +73,6 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(1));
     }
     pred()
-}
-
-/// The logic level a resolved net presents, if it presents one. A contended or
-/// floating net has none — the engine never invents one, and neither does a
-/// receiver.
-fn level_of(state: NetState) -> Option<Level> {
-    match state {
-        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
-        NetState::Analog(volts) => Some(if volts >= 1.5 {
-            Level::High
-        } else {
-            Level::Low
-        }),
-        NetState::Floating | NetState::Contention => None,
-    }
 }
 
 // ============================================================
@@ -229,22 +214,9 @@ impl PeerUart {
     fn new(framing: UartFraming, state: Peer) -> Self {
         Self {
             pins: [
-                PinDecl {
-                    number: "1",
-                    name: Some("TX"),
-                    kind: PinKind::DigitalOut,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
-                PinDecl {
-                    number: "2",
-                    name: Some("RX"),
-                    kind: PinKind::DigitalIn,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
+                PinDecl::digital_out("1").with_name("TX"),
+                PinDecl::digital_in("2", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+                    .with_name("RX"),
             ],
             framing,
             state,
@@ -271,10 +243,11 @@ impl Component for PeerUart {
             let state = self.state.clone();
             let decoder = Arc::clone(&decoder);
             let io = io.clone();
-            io.clone().on_sense("RX", move |net_state| {
-                let now = virtual_clock::virtual_ns();
+            let receiver = DigitalReceiver::new(io.pin("RX")?);
+            io.clone().on_sense("RX", move |sense| {
+                let now = sense.at_ns;
                 let mut rx = decoder.lock().expect("decoder never poisoned");
-                if let Some(level) = level_of(net_state) {
+                if let Some(level) = receiver.read(&sense) {
                     state.lock().seen.push((level, now));
                     rx.on_level(level, now);
                 }
@@ -359,14 +332,7 @@ struct StuckLow {
 impl StuckLow {
     fn new() -> Self {
         Self {
-            pins: [PinDecl {
-                number: "1",
-                name: None,
-                kind: PinKind::DigitalOut,
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            }],
+            pins: [PinDecl::digital_out("1")],
         }
     }
 }
@@ -512,12 +478,10 @@ fn a_serial_channel_declares_plain_digital_pins() {
 
     let pins = mcu.pins();
     let tx = pins.iter().find(|p| p.number == "P2").expect("P2 declared");
-    assert_eq!(tx.kind, PinKind::DigitalOut);
-    assert_eq!(tx.stream, None, "TX carries edges, not a byte route");
+    assert!(tx.drives());
 
     let rx = pins.iter().find(|p| p.number == "P0").expect("P0 declared");
-    assert_eq!(rx.kind, PinKind::DigitalIn);
-    assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
+    assert_eq!(rx.senses_at_build(), Some(embsim_board::SenseKind::Digital));
 }
 
 /// A detached transmit pin leaves the line floating, and a floating line

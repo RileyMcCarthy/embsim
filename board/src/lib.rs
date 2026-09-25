@@ -11,9 +11,9 @@
 //! resolution pass → findings) and the **live net-engine slice**
 //! (`System::start`): the single-writer engine thread with its drive queue
 //! and timer wheel, the quasi-static MNA cluster solver ([`QuasiStaticMna`]),
-//! stream byte pipes (routing, baud pacing, drop policies) derived from
-//! net resolution, and rate-carried pulse trains ([`PulseTrain`]) on the same
-//! derived routes. Both paths drive one shared resolution code path, whose
+//! UARTs framed onto the nets as levels ([`SerialLevelBridge`]), and step
+//! clocks as periodic drives ([`Drive::Periodic`]) resolved like every other
+//! drive. Both paths drive one shared resolution code path, whose
 //! projection is source-strength ranking (`NODES.md` rule 2): sources
 //! reaching a node ranked by total ohms, a pull never contending, a ten
 //! times weaker source losing with a [`Finding::Contention`], comparable
@@ -24,9 +24,9 @@
 //!
 //! Module map (mirrors the design doc's crate layout):
 //! - [`netlist`] — KiCad s-expression netlist parser → [`ComponentDecl`]/[`NetDecl`] graph
-//! - [`component`] — [`Component`] trait, [`PinDecl`], [`PinKind`], [`StreamRole`], [`PulseTrain`], [`ComponentNetIo`]
+//! - [`component`] — [`Component`] trait, [`PinDecl`], [`PinRole`], [`Drive`], [`ComponentNetIo`]
 //! - [`registry`] — [`PartRegistry`]: identity → constructor; auto-classification tiers
-//! - [`engine`] — the live single-writer net engine: drive queue, resolution, timer wheel, stream routing
+//! - [`engine`] — the live single-writer net engine: drive queue, resolution, timer wheel
 //! - [`net`] — net state model ([`NetState`]) and shared net/pin identity types
 //! - [`cluster`] — analog cluster types + [`ClusterSolver`] trait ([`QuasiStaticMna`] default)
 //! - [`board`] — [`Board::from_netlist`]: netlist + registry → components + nets
@@ -63,9 +63,9 @@ pub use cluster::{
     PWL_SOLVES_PER_ELEMENT,
 };
 pub use component::{
-    AttachError, Branch, Component, ComponentNetIo, Drive, IdleDrive, PinDecl, PinHandle, PinKind,
-    PinReference, PulseDirection, PulseSegment, PulseTrain, PulseTx, PwlCurve, RegionTest,
-    ResistorAt, StreamRole,
+    jesd8c01_lvcmos_thresholds, AttachError, Branch, Clamp, ClampRail, Component, ComponentNetIo,
+    DeadBand, DigitalReceiver, Drive, InputPort, PeriodicSchedule, PeriodicSense, PinDecl,
+    PinHandle, PinRole, PwlCurve, RegionTest, ResistorAt, Sense, Thresholds, WakeGate, WakeHandler,
 };
 pub use diagnostics::{
     CallbackKind, Diagnostics, Finding, PinMismatchDirection, RailDownReason, SenseKind,
@@ -73,7 +73,7 @@ pub use diagnostics::{
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use host_pty::HostPty;
-pub use mcu::{McuBuildError, McuBuilder, McuComponent};
+pub use mcu::{McuBuildError, McuBuilder, McuComponent, PadPorts};
 pub use net::{
     digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
     COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO, V_IH, V_IL, WEAK_DRIVE_OHMS,

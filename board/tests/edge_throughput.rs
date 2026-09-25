@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level,
-    PinDecl, PinHandle, PinKind, System,
+    digital_drive, jesd8c01_lvcmos_thresholds, level_of, AttachError, Component, ComponentNetIo,
+    DeadBand, Harness, Level, PinDecl, PinHandle, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -90,20 +90,13 @@ struct BitBangMaster {
 
 impl BitBangMaster {
     fn new(handles: Arc<Mutex<MasterPins>>, report: Arc<Report>, payload: usize) -> Self {
-        let decl = |number, name, kind| PinDecl {
-            number,
-            name: Some(name),
-            kind,
-            stream: None,
-            drive_impedance: None,
-            idle: IdleDrive::KindDefault,
-        };
         Self {
             pins: [
-                decl("1", "CS", PinKind::DigitalOut),
-                decl("2", "CLK", PinKind::DigitalOut),
-                decl("3", "DI", PinKind::DigitalOut),
-                decl("4", "DO", PinKind::DigitalIn),
+                PinDecl::digital_out("1").with_name("CS"),
+                PinDecl::digital_out("2").with_name("CLK"),
+                PinDecl::digital_out("3").with_name("DI"),
+                PinDecl::digital_in("4", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+                    .with_name("DO"),
             ],
             handles,
             report,
@@ -172,7 +165,8 @@ impl Component for BitBangMaster {
                         edge(&clk, Level::High, &report);
                         // The part presents its bit on the rising edge, after
                         // taking MOSI — so sample here, not before.
-                        byte = (byte << 1) | u8::from(level_of(dout.sense()) == Some(Level::High));
+                        byte = (byte << 1)
+                            | u8::from(level_of(dout.net_report()) == Some(Level::High));
                     }
                     byte
                 };

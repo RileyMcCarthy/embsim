@@ -5,11 +5,11 @@
 //! An oscillator's information is its frequency, and its edge count runs
 //! ahead of everything else on a board: 20 MHz is forty million edges a
 //! second, each of which would be a drive, a resolution pass and a sense
-//! delivery. So the output pin is a [`StreamRole::PulseSource`] and the
-//! model publishes **one** [`PulseTrain`] at the frequency parsed from the
-//! part's value — the representation a step clock already uses
-//! (`NODES.md` §2, the crystal / oscillator row), one event, nothing per
-//! edge — and retracts it with a held train when the supply drops.
+//! delivery. So the output pin publishes **one**
+//! [`embsim_board::Drive::Periodic`] at the frequency parsed from the part's
+//! value — the encoding a step clock uses (`NODES.md` §2, the crystal /
+//! oscillator row; §10 row 3), one drive, nothing per edge — and retracts
+//! it with a held segment when the supply drops.
 //!
 //! # Datasheet provenance
 //!
@@ -35,12 +35,17 @@
 //!   to peak; symmetry 40 % to 60 % "GND level (DC cut)"; output load
 //!   10 kΩ // 10 pF with "DC cut capacitor = 0.01 µF". The datasheet
 //!   characterises the output **into a DC-blocking capacitor** and names
-//!   no DC level and no source impedance for it — so the output pin
-//!   publishes the rate and **no DC drive**: it rests released, and the
-//!   net on its side of the coupling capacitor reads floating at DC, which
-//!   is what a node with a capacitor and nothing else on it is. The rate
-//!   crosses the capacitor by the engine's AC-coupling rule
-//!   (`embsim_board::engine`, `route_pulses`).
+//!   no DC level and no source impedance for it — so the periodic drive's
+//!   two phases are **released** (an infinite impedance: they source
+//!   nothing at DC), the pin rests released before start-up, and the net on
+//!   its side of the coupling capacitor reads floating at DC, which is what
+//!   a node with a capacitor and nothing else on it is. The phases' two
+//!   voltages are the datasheet's swing — `V_pp` min above the GND level
+//!   the symmetry is specified at ([`TG2520SMN_VPP_MIN_VOLTS`]) — which is
+//!   what the rate carries across the capacitor by the engine's AC-coupling
+//!   rule (`embsim_board::engine`, `overlay_arrivals`): a swing below any
+//!   logic threshold, which is why the module squares it with a
+//!   self-biased inverter.
 //! - **Pins** — the pin map: 1 `N.C.` ("please keep N.C. pin OPEN
 //!   condition or GND connection"), 2 `GND`, 3 `OUT`, 4 `V_CC`.
 //!
@@ -48,9 +53,8 @@
 //!
 //! - **Frequency tolerance, aging and the temperature characteristic**
 //!   (±0.5 ppm) are not modelled: the published rate is the nominal.
-//! - **Symmetry** is not carried by the train (a [`PulseSegment`] has a
-//!   rate and no duty); a consumer that needs the time-average takes the
-//!   mid-point of the 40–60 % specification, 50 %, and says so.
+//! - **Symmetry** is not carried by the drive (a [`PeriodicSchedule`] has a
+//!   rate and no duty).
 //! - **The supply threshold is one value.** The datasheet's `t_str` counts
 //!   from 90 % of `V_CC`; here a supply at or above the minimum operating
 //!   voltage is up, and the start-up clock runs from the instant the model
@@ -59,8 +63,8 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, NetState, PinDecl, PinKind, PulseDirection,
-    PulseSegment, PulseTrain, PulseTx, StreamRole, Volts,
+    AttachError, Component, ComponentNetIo, Drive, PeriodicSchedule, PinDecl, PinHandle, Sense,
+    TheveninDrive, Volts,
 };
 use embsim_core::virtual_clock;
 
@@ -81,6 +85,13 @@ pub const TG2520SMN_SUPPLY_MIN_VOLTS: Volts = 1.7;
 /// The `E` supply option, 1.8 V typical (ordering key field ④, "E: 1.8"),
 /// which the module's `…-ECGNNM3` part is.
 pub const TG2520SMN_NOMINAL_SUPPLY_VOLTS: Volts = 1.8;
+
+/// Output voltage, clipped sine: `V_pp` 0.8 V Min, peak to peak, with the
+/// symmetry specified at the GND level, DC cut (TG2520SMN specifications
+/// table, "Output voltage" and "Symmetry"). The high phase of the periodic
+/// drive sits this far above the low phase's 0 V — the swing the coupling
+/// capacitor passes.
+pub const TG2520SMN_VPP_MIN_VOLTS: Volts = 0.8;
 
 // ============================================================
 // The value field
@@ -153,47 +164,30 @@ impl Config {
 // Pin facades
 // ============================================================
 
-const fn pin(number: &'static str, name: Option<&'static str>, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
-}
-
-/// The output pin: a pulse source that rests released — the datasheet
-/// characterises the clipped-sine output into a DC-blocking capacitor and
-/// names no DC level for it, so none is driven.
-const fn out_pin(number: &'static str, name: Option<&'static str>) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind: PinKind::DigitalOut,
-        stream: Some(StreamRole::PulseSource),
-        drive_impedance: None,
-        idle: IdleDrive::Released,
-    }
+/// The output pin: rests released — the datasheet characterises the
+/// clipped-sine output into a DC-blocking capacitor and names no DC level
+/// for it, so none is driven.
+const fn out_pin(number: &'static str) -> PinDecl {
+    PinDecl::digital_out(number).with_idle(None)
 }
 
 /// The 2520 / 2016 package keyed by **function**, as the P2-EC32MB netlist
-/// names `X100`'s pins (`NC_GND` is the vendor's option pad, pin 1).
+/// names `X100`'s pins (`NC_GND` is the vendor's option pad, pin 1). The
+/// supply is measured against the ground pin.
 pub const TCXO_PINS_BY_FUNCTION: [PinDecl; 4] = [
-    pin("VCC", None, PinKind::PowerIn),
-    pin("GND", None, PinKind::PowerIn),
-    out_pin("OUT", None),
-    pin("NC_GND", None, PinKind::Passive),
+    PinDecl::power_in("VCC").with_reference("GND"),
+    PinDecl::power_in("GND"),
+    out_pin("OUT"),
+    PinDecl::passive("NC_GND"),
 ];
 
 /// The same package keyed by pin **number** (the datasheet's pin map:
 /// 1 `N.C.`, 2 `GND`, 3 `OUT`, 4 `V_CC`), for a KiCad export.
 pub const TCXO_PINS_NUMBERED: [PinDecl; 4] = [
-    pin("1", Some("NC"), PinKind::Passive),
-    pin("2", Some("GND"), PinKind::PowerIn),
-    out_pin("3", Some("OUT")),
-    pin("4", Some("VCC"), PinKind::PowerIn),
+    PinDecl::passive("1").with_name("NC"),
+    PinDecl::power_in("2").with_name("GND"),
+    out_pin("3").with_name("OUT"),
+    PinDecl::power_in("4").with_name("VCC").with_reference("2"),
 ];
 
 // ============================================================
@@ -202,14 +196,14 @@ pub const TCXO_PINS_NUMBERED: [PinDecl; 4] = [
 
 #[derive(Debug)]
 struct State {
-    /// The supply, as last sensed.
-    supply: NetState,
+    /// The supply, as last sensed (against `GND`).
+    supply: Sense,
     /// The deadline armed for the current start-up, if one is pending.
     armed_at: Option<u64>,
-    /// The rate currently published: `Some(train)` while running.
-    published: Option<PulseTrain>,
-    tx: Option<PulseTx>,
-    /// `set_train` calls issued — the event-cost meter.
+    /// The segment currently published: `Some(segment)` while running.
+    published: Option<PeriodicSchedule>,
+    out: Option<PinHandle>,
+    /// Drives issued — the event-cost meter.
     publishes: u64,
 }
 
@@ -221,24 +215,26 @@ struct Core {
 
 impl Core {
     fn up(&self, state: &State) -> bool {
-        supply_up(state.supply, self.config.supply_min_volts)
+        supply_up(&state.supply, self.config.supply_min_volts)
     }
 
-    /// Publish a train once, on change only.
-    fn publish(&self, state: &mut State, train: Option<PulseTrain>) {
-        if state.published == train {
+    /// Publish a segment once, on change only: a periodic drive whose two
+    /// phases are released at DC and swing by the datasheet's `V_pp` (the
+    /// module docs), a held segment when the part stops.
+    fn publish(&self, state: &mut State, segment: Option<PeriodicSchedule>) {
+        if state.published == segment {
             return;
         }
-        state.published = train;
+        state.published = segment;
         state.publishes += 1;
-        if let Some(tx) = &state.tx {
-            tx.set_train(train.unwrap_or(PulseTrain::IDLE));
+        if let Some(out) = &state.out {
+            out.drive(clock_drive(segment.unwrap_or(PeriodicSchedule::IDLE)));
         }
     }
 
     /// The supply changed: arm the start-up on the way up, retract the rate
     /// on the way down.
-    fn on_supply(&self, state: &mut State, sensed: NetState, io: &ComponentNetIo) {
+    fn on_supply(&self, state: &mut State, sensed: Sense, io: &ComponentNetIo) {
         let was_up = self.up(state);
         state.supply = sensed;
         let up = self.up(state);
@@ -270,16 +266,30 @@ impl Core {
             return;
         }
         state.armed_at = None;
-        let train = PulseTrain {
-            pulses: PulseSegment {
-                emitted: 0,
-                freq_hz: self.config.hz,
-                total: None,
-                since_us: now_ns / 1_000,
-            },
-            direction: PulseDirection::Forward,
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz: self.config.hz,
+            total: None,
+            since_ns: now_ns,
         };
-        self.publish(state, Some(train));
+        self.publish(state, Some(segment));
+    }
+}
+
+/// The periodic drive the output presents for `segment`: two phases the
+/// datasheet names no source impedance for — released at DC — swinging
+/// [`TG2520SMN_VPP_MIN_VOLTS`] above 0 V.
+pub fn clock_drive(segment: PeriodicSchedule) -> Drive {
+    Drive::Periodic {
+        hi: TheveninDrive {
+            volts: TG2520SMN_VPP_MIN_VOLTS,
+            impedance: f64::INFINITY,
+        },
+        lo: TheveninDrive {
+            volts: 0.0,
+            impedance: f64::INFINITY,
+        },
+        segment,
     }
 }
 
@@ -294,8 +304,9 @@ pub struct OscillatorMonitor {
 }
 
 impl OscillatorMonitor {
-    /// The rate currently published, `None` while the part is not running.
-    pub fn published(&self) -> Option<PulseTrain> {
+    /// The segment currently published, `None` while the part is not
+    /// running.
+    pub fn published(&self) -> Option<PeriodicSchedule> {
         self.core.state.lock().unwrap().published
     }
 
@@ -304,8 +315,8 @@ impl OscillatorMonitor {
         self.published().is_some()
     }
 
-    /// Total `set_train` calls issued since construction: one per start,
-    /// one per retraction, nothing per edge.
+    /// Total drives issued since construction: one per start, one per
+    /// retraction, nothing per edge.
     pub fn publish_count(&self) -> u64 {
         self.core.state.lock().unwrap().publishes
     }
@@ -347,10 +358,14 @@ impl Oscillator {
             core: Arc::new(Core {
                 config,
                 state: Mutex::new(State {
-                    supply: NetState::Floating,
+                    supply: Sense {
+                        volts: None,
+                        periodic: None,
+                        at_ns: 0,
+                    },
                     armed_at: None,
                     published: None,
-                    tx: None,
+                    out: None,
                     publishes: 0,
                 }),
             }),
@@ -379,7 +394,7 @@ impl Component for Oscillator {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        self.core.state.lock().unwrap().tx = Some(io.pulse_tx("OUT")?);
+        self.core.state.lock().unwrap().out = Some(io.pin("OUT")?);
 
         let core = Arc::clone(&self.core);
         io.on_wake_ns(move |now_ns| {
@@ -402,6 +417,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// A supply handed `volts`.
+    fn supply(volts: Option<f64>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
+    }
 
     #[rstest]
     #[case::module_value("TG2520SMN 20.0000M-ECGNNM3", Some(20_000_000))]
@@ -435,22 +459,22 @@ mod tests {
         let mut state = core.state.lock().unwrap();
         let io = ComponentNetIo::default();
 
-        core.on_supply(&mut state, NetState::Analog(1.8), &io);
+        core.on_supply(&mut state, supply(Some(1.8)), &io);
         let deadline = state.armed_at.expect("armed on the way up");
         core.on_wake(&mut state, deadline - 1);
         assert_eq!(state.published, None, "nothing before the deadline");
         core.on_wake(&mut state, deadline);
-        let train = state.published.expect("running at the deadline");
-        assert_eq!(train.pulses.freq_hz, 20_000_000);
+        let segment = state.published.expect("running at the deadline");
+        assert_eq!(segment.freq_hz, 20_000_000);
         assert_eq!(state.publishes, 1);
 
-        core.on_supply(&mut state, NetState::Analog(1.8), &io);
+        core.on_supply(&mut state, supply(Some(1.8)), &io);
         assert_eq!(
             state.publishes, 1,
             "a supply that stays up publishes nothing new"
         );
 
-        core.on_supply(&mut state, NetState::Analog(1.0), &io);
+        core.on_supply(&mut state, supply(Some(1.0)), &io);
         assert_eq!(state.published, None, "retracted below the minimum");
         assert_eq!(state.publishes, 2);
     }
@@ -463,13 +487,9 @@ mod tests {
         let core = Arc::clone(&osc.core);
         let mut state = core.state.lock().unwrap();
         let io = ComponentNetIo::default();
-        core.on_supply(
-            &mut state,
-            NetState::Pulled(embsim_board::Level::High, 0.0),
-            &io,
-        );
+        core.on_supply(&mut state, supply(Some(1.8)), &io);
         let deadline = state.armed_at.unwrap();
-        core.on_supply(&mut state, NetState::Floating, &io);
+        core.on_supply(&mut state, supply(None), &io);
         core.on_wake(&mut state, deadline);
         assert_eq!(state.published, None);
         assert_eq!(state.publishes, 0);
@@ -482,11 +502,23 @@ mod tests {
                 .iter()
                 .find(|p| p.number == "OUT" || p.name == Some("OUT"))
                 .expect("an OUT pin");
-            assert_eq!(out.stream, Some(StreamRole::PulseSource));
-            assert_eq!(out.idle, IdleDrive::Released, "no DC level is driven");
+            assert!(out.drives());
+            assert_eq!(out.idle, None, "no DC level is driven");
             assert!(pins
                 .iter()
                 .any(|p| p.number == "VCC" || p.name == Some("VCC")));
         }
+    }
+
+    /// The clock the output drives is released in both phases at DC and
+    /// swings by the datasheet's minimum peak-to-peak.
+    #[rstest]
+    fn the_clock_is_released_at_dc_and_swings_by_v_pp() {
+        let Drive::Periodic { hi, lo, segment } = clock_drive(PeriodicSchedule::IDLE) else {
+            panic!("a periodic drive");
+        };
+        assert_eq!((hi.volts, lo.volts), (0.8, 0.0));
+        assert!(!hi.impedance.is_finite() && !lo.impedance.is_finite());
+        assert_eq!(segment, PeriodicSchedule::IDLE);
     }
 }

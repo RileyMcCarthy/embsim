@@ -501,9 +501,8 @@ struct LowDriver {
 impl LowDriver {
     fn new() -> Self {
         Self {
-            pins: [embsim_board::PinDecl::digital_out("Q").with_idle(
-                embsim_board::IdleDrive::Thevenin(embsim_board::digital_drive(Level::Low)),
-            )],
+            pins: [embsim_board::PinDecl::digital_out("Q")
+                .with_idle(Some(embsim_board::digital_drive(Level::Low)))],
         }
     }
 }

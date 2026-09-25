@@ -67,6 +67,7 @@ use embsim_peripherals::serial;
 use machine_parts::{
     bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, encoder_jumpers_closed,
     force_domain_ground, force_gauge_harness, machine_harness, module_socket_harness,
+    AM26LV32_INPUT_OHMS, AM26LV32_OPEN_A_VOLTS,
 };
 
 /// Board names used throughout.
@@ -201,11 +202,8 @@ fn state_of(system: &BuiltSystem, net: &str) -> NetState {
 /// validated against its netlist in both directions to get here, so a
 /// classification or facade regression anywhere fails this first.
 ///
-/// This used to also assert no `StreamMismatch`. It no longer can: the
-/// assembled machine declares no `StreamRole` anywhere now that the force-gauge
-/// UART is carried as levels, so that finding is unreachable and asserting its
-/// absence would be a guard that can never fail. The link's health is asserted
-/// where it is now observable — the two UART nets resolve to a level rather
+/// The link's health is asserted where it is observable — the force-gauge
+/// UART is carried as levels, so the two UART nets resolve to a level rather
 /// than floating or contending, below.
 #[rstest]
 fn the_whole_machine_builds_without_contention() {
@@ -337,9 +335,11 @@ fn the_assembled_machine_leaves_only_the_unplugged_ports_unsourced() {
 /// engine performs **no implicit net-name merging across boards**.
 ///
 /// Two of the 58 are asymmetric enough to name individually: the P2's bridged
-/// UART transmit pin drives finger 38 (so both sides read `Driven(High)`, the
-/// idle line), and the force isolator drives finger 40 from the EdgeBoard side
-/// (so the drive crosses the socket in the other direction).
+/// UART transmit pin drives finger 38 once the P2 has started — in the build
+/// snapshot it has not (its package starts the core the datasheet's restart
+/// delay after its reset releases), so both sides float — and the force
+/// isolator drives finger 40 from the EdgeBoard side (so the drive crosses
+/// the socket in the other direction).
 #[rstest]
 fn every_declared_finger_is_one_node_across_the_socket() {
     let system = build_machine();
@@ -376,15 +376,12 @@ fn every_declared_finger_is_one_node_across_the_socket() {
         );
     }
 
-    // Module → EdgeBoard: the P2's bridged TX pin idles high on both sides.
-    assert_eq!(
-        state_of(&system, "EC32MB.P2_IO2"),
-        NetState::Driven(Level::High)
-    );
-    assert_eq!(
-        state_of(&system, "EdgeBoard.P2"),
-        NetState::Driven(Level::High)
-    );
+    // Module → EdgeBoard: the P2's bridged TX pin is one node across the
+    // socket, floating on both sides until the P2 starts (the force path
+    // below sees it idle high once it has).
+    assert!(system.names_are_merged("EC32MB.P2_IO2", "EdgeBoard.P2"));
+    assert_eq!(state_of(&system, "EC32MB.P2_IO2"), NetState::Floating);
+    assert_eq!(state_of(&system, "EdgeBoard.P2"), NetState::Floating);
     // EdgeBoard → module: the force isolator's MCU-side output lands on
     // P0 — one node across the socket. In the build snapshot the isolator
     // drives nothing: its isolated side runs from the force domain, the
@@ -577,6 +574,21 @@ fn the_force_path_carries_a_command_and_a_conversion_end_to_end() {
         ),
         "the force domain rises to the isolated DC/DC's 5 V; got {:?}",
         system.net_state(force_rail)
+    );
+
+    // The P2's own bank rail too: its UART pins, `P0`/`P2`, read against
+    // 0.3/0.7 of `VIO_00_07`, the module's LDO output behind the bucks'
+    // 2.5 ms soft-start — a pad in a bank with no supply reads nothing, and
+    // a reply that arrived first would be lost, as it would be on the
+    // bench before the module's rails were up.
+    let bank_rail = format!("{MODULE}.VIO_00_07");
+    assert!(
+        wait_for(
+            || matches!(system.net_state(&bank_rail), Some(NetState::Analog(v)) if (v - 3.3).abs() < 1e-3),
+            Duration::from_secs(5)
+        ),
+        "the P2's bank rail rises to 3.3 V; got {:?}",
+        system.net_state(&bank_rail)
     );
 
     // SYNC + RDATA (0x55 0x10 — TI SBAS752B §8.5.3.4), written the way the
@@ -819,11 +831,14 @@ fn live_volts(system: &SystemHandle, net: &str) -> Option<f64> {
 /// The encoder's channel drives the EdgeBoard's `A+` net, and — because the
 /// RS-422 receiver declares its differential inputs as **analog** pins — that
 /// net resolves through the cluster solver to a node *voltage*, not to a digital
-/// projection. Reading `Analog(0.0)` / `Analog(3.3)` here rather than
-/// `Driven(Low)` / `Driven(High)` is the receiver's ±200 mV threshold getting
-/// the numbers it needs, and is the difference between this pair and an ordinary
-/// logic net (compare `EdgeBoard.Net-(IC16-INA)`, the receiver's *output*, which
-/// is an ordinary driven net).
+/// projection. Reading voltages here rather than `Driven(Low)` /
+/// `Driven(High)` is the receiver's ±200 mV threshold getting the numbers it
+/// needs, and is the difference between this pair and an ordinary logic net
+/// (compare `EdgeBoard.Net-(IC16-INA)`, the receiver's *output*, which is an
+/// ordinary driven net). The voltages are the encoder's output divided
+/// against the receiver's own input port — 12 kΩ to its 0.83 V open-circuit
+/// bias (`AM26LV32_A_PORT`) — which is why the node reads 1.7 mV above 0 V
+/// and 6.7 mV below 3.3 V: two sources reach it.
 ///
 /// This is deliberately the only behavioral motion assertion here — enough to
 /// show the components form an axis rather than sitting side by side. The plant
@@ -859,9 +874,16 @@ fn moving_the_shaft_changes_the_encoder_nets_the_board_reads() {
         .expect("the axis starts");
 
     const A_PLUS: &str = "EdgeBoard./MaD_Edge_Sheet3/A+";
+    // The encoder's output `volts` behind its push-pull impedance, divided
+    // against the receiver's input port.
+    let encoder_ohms = quadrature_encoder::Config::new(80.0).drive_impedance_ohms;
+    let loaded = |volts: f64| {
+        (volts * AM26LV32_INPUT_OHMS + AM26LV32_OPEN_A_VOLTS * encoder_ohms)
+            / (AM26LV32_INPUT_OHMS + encoder_ohms)
+    };
     let settled_at = |volts: f64| {
         wait_for(
-            || live_volts(&system, A_PLUS).is_some_and(|v| (v - volts).abs() < 1e-3),
+            || live_volts(&system, A_PLUS).is_some_and(|v| (v - loaded(volts)).abs() < 1e-9),
             Duration::from_secs(5),
         )
     };

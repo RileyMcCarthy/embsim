@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::uart::UartFraming;
-use embsim_board::{Board, Harness, McuComponent, PartRegistry, PinKind, System};
+use embsim_board::{Board, Harness, McuComponent, PartRegistry, System};
 use embsim_core::virtual_clock;
 use embsim_peripherals::serial;
 
@@ -345,12 +345,10 @@ fn fg_channel_pin_table_matches_the_hal_config() {
     assert_eq!(pins.len(), 2, "one bridged channel declares two pins");
 
     let tx = pins.iter().find(|p| p.number == "P2").expect("P2 declared");
-    assert_eq!(tx.kind, PinKind::DigitalOut);
-    assert_eq!(tx.stream, None, "TX clocks out edges, not a byte route");
+    assert!(tx.drives());
 
     let rx = pins.iter().find(|p| p.number == "P0").expect("P0 declared");
-    assert_eq!(rx.kind, PinKind::DigitalIn);
-    assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
+    assert_eq!(rx.senses_at_build(), Some(embsim_board::SenseKind::Digital));
 }
 
 // ============================================================

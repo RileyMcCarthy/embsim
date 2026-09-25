@@ -1,6 +1,6 @@
 //! Analog cluster extraction types + quasi-static MNA solver.
 //!
-//! Connected subgraphs of `Passive`/`Analog` pins form **clusters**, extracted
+//! Nets connected through passive primitives form **clusters**, extracted
 //! at build time and solved by quasi-static modified nodal analysis (MNA):
 //! Thevenin sources + resistors + piecewise-linear elements → node voltages,
 //! recomputed only when a boundary input changes.

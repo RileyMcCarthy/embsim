@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::uart::{FramingError, UartFraming};
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, SerialLevelBridge,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, PinDecl,
+    SerialLevelBridge,
 };
 
 /// What the probe saw and what it can say, shared with the test body.
@@ -96,20 +97,12 @@ impl UartProbe {
         Self {
             pins: [
                 PinDecl {
-                    number: tx,
                     name: tx_name,
-                    kind: PinKind::DigitalOut,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
+                    ..PinDecl::digital_out(tx)
                 },
                 PinDecl {
-                    number: rx,
                     name: rx_name,
-                    kind: PinKind::DigitalIn,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
+                    ..PinDecl::digital_in(rx, jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
                 },
             ],
             framing,
@@ -142,8 +135,9 @@ impl Component for UartProbe {
         {
             let handle = self.handle.clone();
             let bridge = Arc::clone(&bridge);
-            io.on_sense(rx_id, move |state| {
-                let frames = bridge.receive_sense(state);
+            let rx = io.pin(rx_id)?;
+            io.on_sense(rx_id, move |sense| {
+                let frames = bridge.receive_sense(&rx, &sense);
                 handle.lock().frames.extend(frames);
             })?;
         }

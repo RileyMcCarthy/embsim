@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level,
-    NetState, PinDecl, PinHandle, PinKind, System,
+    digital_drive, jesd8c01_lvcmos_thresholds, level_of, AttachError, Component, ComponentNetIo,
+    DeadBand, Harness, Level, NetState, PinDecl, PinHandle, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::psram::{APS6404L_KGD_PASS, APS6404L_MF_ID};
@@ -47,20 +47,13 @@ struct BitBangMaster {
 
 impl BitBangMaster {
     fn new(handles: Arc<Mutex<MasterPins>>) -> Self {
-        let decl = |number, name, kind| PinDecl {
-            number,
-            name: Some(name),
-            kind,
-            stream: None,
-            drive_impedance: None,
-            idle: IdleDrive::KindDefault,
-        };
         Self {
             pins: [
-                decl("1", "CS", PinKind::DigitalOut),
-                decl("2", "CLK", PinKind::DigitalOut),
-                decl("3", "DI", PinKind::DigitalOut),
-                decl("4", "DO", PinKind::DigitalIn),
+                PinDecl::digital_out("1").with_name("CS"),
+                PinDecl::digital_out("2").with_name("CLK"),
+                PinDecl::digital_out("3").with_name("DI"),
+                PinDecl::digital_in("4", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+                    .with_name("DO"),
             ],
             handles,
         }
@@ -110,7 +103,7 @@ fn recv(pins: &MasterPins) -> u8 {
     for _ in 0..8 {
         drive_and_settle(clk, Level::High);
         drive_and_settle(clk, Level::Low);
-        byte = (byte << 1) | u8::from(level_of(dout.sense()) == Some(Level::High));
+        byte = (byte << 1) | u8::from(level_of(dout.net_report()) == Some(Level::High));
     }
     byte
 }
@@ -150,7 +143,15 @@ fn a_read_id_over_the_modules_nets_returns_the_datasheet_id() {
 
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
     let handles = Arc::new(Mutex::new(MasterPins::default()));
+    // The module's ground from the carrier's `GND` finger: the PSRAM's
+    // inputs read against `VSS`, which is not implicit (`DESIGN.md` rule 6).
     let harness = Harness::new()
+        .power(
+            embsim_board::EndpointRef::parse("CARRIER.GND").expect("endpoint parses"),
+            embsim_board::EndpointRef::parse(&format!("{MODULE}.J203.43"))
+                .expect("endpoint parses"),
+            0.0,
+        )
         .connect_str("MASTER.CS", &format!("{MODULE}.U100.P57"))
         .expect("endpoints parse")
         .connect_str("MASTER.CLK", &format!("{MODULE}.U100.P56"))

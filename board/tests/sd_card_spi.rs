@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, netlist, AttachError, Board, Component, ComponentNetIo, Harness,
-    IdleDrive, Level, PartRegistry, PinDecl, PinHandle, PinKind, System,
+    digital_drive, jesd8c01_lvcmos_thresholds, level_of, netlist, AttachError, Board, Component,
+    ComponentNetIo, DeadBand, Harness, Level, PartRegistry, PinDecl, PinHandle, System,
 };
 use embsim_core::virtual_clock;
 use embsim_models::sd_card::{SdCard, BLOCK_LEN};
@@ -360,20 +360,13 @@ struct BitBangMaster {
 
 impl BitBangMaster {
     fn new(handles: Arc<Mutex<MasterPins>>) -> Self {
-        let decl = |number, name, kind| PinDecl {
-            number,
-            name: Some(name),
-            kind,
-            stream: None,
-            drive_impedance: None,
-            idle: IdleDrive::KindDefault,
-        };
         Self {
             pins: [
-                decl("1", "CS", PinKind::DigitalOut),
-                decl("2", "CLK", PinKind::DigitalOut),
-                decl("3", "DI", PinKind::DigitalOut),
-                decl("4", "DO", PinKind::DigitalIn),
+                PinDecl::digital_out("1").with_name("CS"),
+                PinDecl::digital_out("2").with_name("CLK"),
+                PinDecl::digital_out("3").with_name("DI"),
+                PinDecl::digital_in("4", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+                    .with_name("DO"),
             ],
             handles,
         }
@@ -409,7 +402,7 @@ impl Component for BitBangMaster {
 fn drive_and_settle(pin: &PinHandle, level: Level) {
     pin.set_drive(Some(digital_drive(level)));
     for _ in 0..SETTLE_POLLS {
-        if level_of(pin.sense()) == Some(level) {
+        if level_of(pin.net_report()) == Some(level) {
             return;
         }
         std::thread::sleep(SETTLE_POLL);
@@ -447,7 +440,7 @@ const CARD_ANSWER: Duration = Duration::from_micros(300);
 /// reads `None`, and this resolves that the way the missing resistor would: to
 /// a one, which is the idle bit an SD driver expects.
 fn sense_bit(pin: &PinHandle) -> bool {
-    level_of(pin.sense()).is_none_or(|level| level == Level::High)
+    level_of(pin.net_report()).is_none_or(|level| level == Level::High)
 }
 
 /// Exchange one byte, MSB first, the way the wire actually does it: both ends

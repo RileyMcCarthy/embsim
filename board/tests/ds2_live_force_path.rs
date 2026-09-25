@@ -208,12 +208,12 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
     // 256 mV differential: 1.778 V / 1.522 V at the bridge terminals.
     let system = ds2_live_system(true, 0.256, &host);
 
-    // Straight harness: no stream mismatch, engine healthy.
+    // Straight harness: no two drivers fighting on a line, engine healthy.
     assert!(
         !system
             .findings()
             .iter()
-            .any(|f| matches!(f, Finding::StreamMismatch { .. })),
+            .any(|f| matches!(f, Finding::Contention { .. })),
         "straight harness must route cleanly; got {:?}",
         system.findings()
     );

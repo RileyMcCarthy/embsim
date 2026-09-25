@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 
-use embsim_board::{Component, IdleDrive, PartClass, PinKind, StreamRole};
+use embsim_board::{Component, PartClass};
 use embsim_boards::ec32mb::{Ec32mb, FLASH_CAPACITY, NETLIST};
 use embsim_boards::p2::{HeldInReset, P2Package, NUM_PADS};
 use embsim_models::sd_card::SdCard;
@@ -50,8 +50,8 @@ fn the_package_declares_the_netlists_u100_pins() {
     // Every pad is a released bidirectional pin; XI takes a rate; XO is a
     // released output; the supplies are supplies.
     for pad in &package.pins()[..NUM_PADS] {
-        assert_eq!(pad.kind, PinKind::DigitalBidir, "{}", pad.number);
-        assert_eq!(pad.idle, IdleDrive::Released, "{}", pad.number);
+        assert!(pad.reads_when_subscribed(), "{}", pad.number);
+        assert_eq!(pad.idle, None, "{}", pad.number);
     }
     let pin = |name: &str| {
         package
@@ -61,12 +61,18 @@ fn the_package_declares_the_netlists_u100_pins() {
             .copied()
             .unwrap_or_else(|| panic!("{name} declared"))
     };
-    assert_eq!(pin("XI").stream, Some(StreamRole::PulseSink));
-    assert_eq!(pin("XO").kind, PinKind::DigitalOut);
-    assert_eq!(pin("XO").idle, IdleDrive::Released);
-    assert_eq!(pin("RESN").kind, PinKind::DigitalIn);
-    assert_eq!(pin("VDD").kind, PinKind::PowerIn);
-    assert_eq!(pin("VIO_60_63").kind, PinKind::PowerIn);
+    assert_eq!(
+        pin("XI").senses_at_build(),
+        Some(embsim_board::SenseKind::Digital)
+    );
+    assert!(pin("XO").drives());
+    assert_eq!(pin("XO").idle, None);
+    assert_eq!(
+        pin("RESN").senses_at_build(),
+        Some(embsim_board::SenseKind::Digital)
+    );
+    assert_eq!(pin("VDD").role, embsim_board::PinRole::PowerIn);
+    assert_eq!(pin("VIO_60_63").role, embsim_board::PinRole::PowerIn);
 }
 
 #[test]

@@ -18,9 +18,10 @@
 //! - **The encoder walks, it does not teleport.** `snapped_updates() == 0`
 //!   proves the counts the firmware reads came from a real Gray-code walk on
 //!   real pins, decoded by the bridge — not from a model writing the bank.
-//! - **Direction agrees on both paths.** The drive latches its own `DIR` pin
-//!   while the train carries a direction of its own; a machine whose two
-//!   descriptions of "reverse" disagree is the classic inverted-axis bug.
+//! - **Direction is the drive's own `DIR` pin, and only that.** The step
+//!   clock is a periodic drive on the STEP net and carries no direction, so
+//!   there is one description of "reverse" on the machine, not two that
+//!   could disagree — the classic inverted-axis bug has nowhere to live.
 //!
 //! Its own binary: it owns the process-default peripheral banks and the
 //! process-global virtual clock (`TESTING.md` rule 5).
@@ -31,7 +32,7 @@ use std::time::{Duration, Instant};
 use embsim_board::mcu::{
     EncoderChannelConfig, GpioChannelConfig, GpioDirection, PulseOutChannelConfig,
 };
-use embsim_board::{Harness, Level, McuComponent, NetState, PulseDirection, System, SystemHandle};
+use embsim_board::{Harness, Level, McuComponent, NetState, System, SystemHandle};
 use embsim_core::virtual_clock;
 use embsim_models::machine::{quadrature_encoder, stepper_motor, QuadratureEncoder, StepperMotor};
 use embsim_peripherals::{encoder, gpio, pulse_out};
@@ -40,7 +41,7 @@ use embsim_peripherals::{encoder, gpio, pulse_out};
 /// low, and the drive is enabled by a low `ENA`.
 const ENA_CHANNEL: usize = 0;
 /// GPIO channel 1: direction, active-high — and on this machine *active means
-/// reverse*, which is stated twice below and asserted to agree.
+/// reverse*, which the drive's configuration states.
 const DIR_CHANNEL: usize = 1;
 
 const GPIO_TABLE: [GpioChannelConfig; 2] = [
@@ -127,7 +128,7 @@ fn the_carriage_seam_closes_through_real_pins() {
         .bridge_gpio(ENA_CHANNEL, GpioDirection::Output)
         .bridge_gpio(DIR_CHANNEL, GpioDirection::Output)
         .pulse_out_table(PULSE_TABLE.to_vec())
-        .bridge_pulse_out_with_direction(0, DIR_CHANNEL, PulseDirection::Reverse)
+        .bridge_pulse_out(0)
         .encoder_table(ENCODER_TABLE.to_vec())
         .bridge_encoder(0)
         .build()
@@ -219,16 +220,17 @@ fn the_carriage_seam_closes_through_real_pins() {
     );
 
     // --- reverse leg ----------------------------------------------------
+    let forward_leg = shaft.train();
     gpio::set_active(DIR_CHANNEL, true);
     assert!(
         wait_for(|| !shaft.forward(), Duration::from_secs(5)),
         "the drive latches reverse from its own DIR pin"
     );
     assert_eq!(
-        shaft.train().map(|train| train.direction),
-        Some(PulseDirection::Reverse),
-        "…and the train carries the same direction — the two descriptions of \
-         'reverse' must agree, or the axis is silently inverted"
+        shaft.train(),
+        forward_leg,
+        "…and the STEP net is untouched by it: the clock carries no direction, \
+         so DIR is the one description of 'reverse' on the machine"
     );
 
     pulse_out::start(0, MOVE_STEPS, STEP_HZ);
