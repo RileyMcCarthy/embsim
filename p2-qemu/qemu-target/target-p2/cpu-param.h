@@ -1,4 +1,5 @@
 /* Parallax Propeller 2 CPU parameters. SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Copyright (c) 2026 Riley McCarthy */
 #ifndef P2_CPU_PARAM_H
 #define P2_CPU_PARAM_H
 

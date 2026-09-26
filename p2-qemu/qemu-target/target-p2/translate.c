@@ -1,8 +1,10 @@
 /*
  * Parallax Propeller 2 translation.
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  *
- * Shape settled by the Phase 0 spikes (docs/dev/p2-qemu-target-plan.md):
+ * Shape settled by the spikes recorded in MaD's docs/dev/p2-qemu-target-plan.md
+ * (RileyMcCarthy/MaD@5ef1d19c3a94d64365c974bca00f891a528018b7):
  *
  *  - Hub-exec (PC >= $400) is TRANSLATED. Measured: hub RAM takes zero
  *    self-modifying-code invalidations across a whole firmware run, and it is
@@ -388,9 +390,10 @@ static bool trans_sub(DisasContext *ctx, arg_ds *a)
 }
 
 
-/* ---- batch 2: semantics transcribed from p2core's execute(), which is the
- * reference the differential harness checks against. Each WC rule is
- * per-instruction and none of them is guessable. */
+/* ---- arithmetic and compare ------------------------------------------------
+ * Semantics transcribed from p2core's execute(), which is the reference the
+ * differential harness checks against. Each WC rule is per-instruction and
+ * none of them is guessable. */
 
 /* SAR: C is the last bit shifted out (the bit below the final position). */
 static bool trans_sar(DisasContext *ctx, arg_ds *a)
@@ -495,7 +498,7 @@ static bool trans_abs(DisasContext *ctx, arg_ds *a)
 }
 
 
-/* ---- batch 3 ------------------------------------------------------------
+/* ---- shifts, rotates and the carry chain -----------------------------------
  * Shifts: C is the last bit shifted OUT, probed at n-1 (and at n==0 the probe
  * is D itself, which is why every one of these needs a movcond rather than a
  * plain shift). Semantics transcribed from p2core's execute().
@@ -730,7 +733,7 @@ GEN_MUX(muxz,  z, 0)
 GEN_MUX(muxnz, z, 1)
 
 
-/* ---- batch 4 ------------------------------------------------------------ */
+/* ---- field extract, sum and mux ----------------------------------------- */
 
 /* ZEROX keeps bits 0..S, and has NO C rule at all. SIGNX sign-extends from
  * bit S and sets C to the resulting sign. */
@@ -912,7 +915,7 @@ static bool trans_decmod(DisasContext *ctx, arg_ds *a)
 }
 
 
-/* ---- batch 5 ------------------------------------------------------------ */
+/* ---- negate-by-flag and CMPSUB ------------------------------------------ */
 
 /* NEGx negates S only when the flag says so; C is the sign of the RESULT. */
 #define GEN_NEGX(NAME, FIELD, INVERT)                                         \
@@ -965,7 +968,7 @@ static bool trans_cmpsub(DisasContext *ctx, arg_ds *a)
 }
 
 
-/* ---- batch 6: rotate-through-carry and the bit-span family ---------------- */
+/* ---- rotate-through-carry and the bit-span family ----------------------- */
 
 /*
  * The BITx span: S[4:0] is the base bit and S[9:5]+1 the count, and the span
@@ -1227,7 +1230,7 @@ static bool trans_nop_zero(DisasContext *ctx, arg_nop_zero *a)
     return true;
 }
 
-/* ---- batch 7: control flow and the hardware stack ------------------------ */
+/* ---- control flow and the hardware stack -------------------------------- */
 
 /*
  * Every branch ends the translation block. goto_tb chaining is deliberately
@@ -1529,7 +1532,7 @@ static bool trans_calld(DisasContext *ctx, arg_ds *a)
 }
 
 
-/* ---- batch 8: hub memory ------------------------------------------------- */
+/* ---- hub memory --------------------------------------------------------- */
 
 /*
  * A hub instruction's immediate S can be a PTRA/PTRB expression rather than an
@@ -1677,7 +1680,7 @@ GEN_BLOCK_ST(wrlong,   0)
 GEN_BLOCK_ST(wrlong_2, 1)
 
 
-/* ---- batch 9: prefixes, GETCT, REV --------------------------------------- */
+/* ---- prefixes, GETCT, REV ----------------------------------------------- */
 
 /*
  * AUGS/AUGD carry the top 23 bits of a 32-bit literal for the NEXT
@@ -1824,7 +1827,7 @@ static bool trans_rev(DisasContext *ctx, arg_misc *a)
 }
 
 
-/* ---- batch 10: ALTD/ALTS ------------------------------------------------- */
+/* ---- ALTD/ALTS ---------------------------------------------------------- */
 
 /*
  * The S operand of ALTD/ALTS is two fields, not one addend: S[8:0] is the
@@ -1878,7 +1881,7 @@ GEN_ALTX(altd, alt_d, P2_PFX_ALTD)
 GEN_ALTX(alts, alt_s, P2_PFX_ALTS)
 
 
-/* ---- batch 11: smart pins ------------------------------------------------ */
+/* ---- smart pins --------------------------------------------------------- */
 
 /*
  * WRPIN/WXPIN/WYPIN take the PIN from S and the VALUE from D -- the opposite
@@ -2052,7 +2055,7 @@ GEN_WAITX(waitx)
 GEN_WAITX(waitx_2)
 
 
-/* ---- batch 12: the simple tail ------------------------------------------- */
+/* ---- the simple tail ---------------------------------------------------- */
 
 /* SUBR is the reverse subtract: D = S - D, and C is its borrow. */
 static bool trans_subr(DisasContext *ctx, arg_ds *a)
@@ -2142,7 +2145,7 @@ GEN_WRFLAG(wrz_2,  z, 0, 1)
 GEN_WRFLAG(wrnz_2, z, 1, 1)
 
 
-/* ---- batch 13: CORDIC, locks, cog identity, the CT1 deadline ------------- */
+/* ---- CORDIC, locks, cog identity, the CT1 deadline ---------------------- */
 
 /*
  * QMUL/QDIV/QSQRT/QROTATE write the result queue; GETQX/GETQY read it back.
@@ -2303,10 +2306,6 @@ GEN_COGID(cogid_2)
 GEN_COGSTOP(cogstop)
 GEN_COGSTOP(cogstop_2)
 
-/*
- * HUBSET records a clock mode and nothing else: the PLL is not modelled and
- * clkfreq() reads hub $14 on demand, which is where the firmware puts it.
- */
 /* HUBSET records the clock setting (op_helper.c) and does nothing else. */
 #define GEN_HUBSET(NAME)                                                      \
     static bool trans_##NAME(DisasContext *ctx, arg_misc *a)                  \
@@ -2377,7 +2376,7 @@ static bool trans_waitct1(DisasContext *ctx, arg_dsel *a)
 }
 
 
-/* ---- batch 14: REP, SKIP, COGINIT ---------------------------------------- */
+/* ---- REP, SKIP, COGINIT ------------------------------------------------- */
 
 /*
  * REP arms a hardware loop over the NEXT D instructions, run S times. Bit 19
@@ -2464,7 +2463,7 @@ static bool trans_coginit(DisasContext *ctx, arg_ds *a)
 }
 
 
-/* ---- batch 15: the four p2core implements and this target still refused ---- */
+/* ---- alternate encodings p2core also executes --------------------------- */
 
 /* GETCT's I=1 encoding reaches the same arm in p2core (the misc decode falls
  * back to the S-only table entry), and still writes cog register #D. */

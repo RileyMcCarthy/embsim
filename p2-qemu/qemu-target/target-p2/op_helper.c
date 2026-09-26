@@ -1,12 +1,14 @@
 /*
  * Propeller 2 helpers: the cog-exec interpreter and the pin bus.
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  */
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "system/runstate.h"
 #include "hw/core/cpu.h"
 #include "pinbus.h"
@@ -19,8 +21,9 @@
  * the SD driver bit-bangs one every 1-3 instructions.
  *
  * They forward to whatever P2PinBus is installed (pinbus.h) -- the bring-up
- * model during development, embsim's engine later. Nothing electrical is
- * decided here.
+ * model (pinbus.c) or the flash bus (hw/p2/flashbus.c) in the standalone
+ * binary; embsim-p2-qemu's bus (its hostdrive.c) on the engine thread.
+ * Nothing electrical is decided here.
  */
 
 void HELPER(p2_wrpin)(CPUP2State *env, uint32_t pin, uint32_t cfg)
@@ -175,12 +178,12 @@ G_NORETURN void helper_p2_unimpl(CPUArchState *env, uint32_t pc)
      * getting that wrong makes this message actively misleading: reading only
      * hub reported `00000000` for every cog-exec halt, which reads as "the
      * target jumped into zeroed memory" when the truth is "the target does not
-     * implement this opcode". That sends you looking for a memory bug. It cost
-     * a real detour during the ROM bring-up.
+     * implement this opcode". That sends you looking for a memory bug.
      */
     uint32_t w = pc >= P2_HUB_BASE ? cpu_ldl_le_data(env, pc)
                                    : env->cog[pc & (P2_COG_LONGS - 1)];
-    qemu_log_mask(LOG_UNIMP, "p2: unimplemented instruction %08X at $%05X\n", w, pc);
+    error_report("p2: cog %u halted: unmodelled instruction %08X at $%05X",
+                 env->cogid, w, pc);
     env->pc = pc;
     env->running = false;
     cs->halted = 1;

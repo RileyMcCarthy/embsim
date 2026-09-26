@@ -300,6 +300,8 @@ jobs:
     timeout-minutes: 45
     env:
       QEMU_TAG: v10.1.0
+      # What QEMU_TAG must resolve to. A tag can be moved; a commit cannot.
+      QEMU_COMMIT: f8b2f64e2336a28bf0d50b6ef8a7d8c013e9bcf3
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -312,25 +314,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libglib2.0-dev flex bison python3-venv
 
+      # build.ninja carries absolute paths to the runner image's system
+      # libraries, so the image is part of what a cached build was built
+      # against. (`env` holds only workflow-set variables, so ImageOS and
+      # ImageVersion are read from the shell.)
+      - name: Runner image
+        id: img
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+
       # The node links QEMU's OBJECTS, so the whole build directory is what a
       # hit has to restore -- not just the binary. ~165 MB for one target.
       # The SOURCE tree is not cached: the shim compiles against QEMU's
       # headers, so the checkout and the staging below run on a hit too, and
       # only configure + ninja are skipped. build.ninja carries absolute
       # paths, which is why the tree goes to the same place every time.
+      #
+      # The key is the image, the QEMU pin and the target sources. The node's
+      # tree is configured without the standalone flash bus
+      # (--with-devices-p2=node), so it links neither flashbus.c nor
+      # embsim-cffi, and neither cffi nor the flash model can change what
+      # this job builds or tests.
       - name: Cache the QEMU build
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: qemu-build/build-p2
-          key: qemu-p2-node-${{ env.QEMU_TAG }}-${{ hashFiles('p2-qemu/qemu-target/**', 'models/src/spi_flash.rs', 'cffi/**') }}
-
-      # The standalone binary's flash bus links the flash model as a C static
-      # library, and ninja builds that binary along with the objects the node
-      # needs. The node itself never links the archive.
-      - name: Build the device models as a C static library
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
-        run: cargo build -p embsim-cffi
+          key: qemu-p2-node-${{ runner.os }}-${{ steps.img.outputs.id }}-${{ env.QEMU_TAG }}-${{ hashFiles('p2-qemu/qemu-target/**') }}
 
       # Into a directory the cache may already have populated with build-p2,
       # which `git clone` refuses; a fetch into an initialised repository
@@ -341,30 +350,16 @@ jobs:
           mkdir -p qemu-build
           git -C qemu-build init -q
           git -C qemu-build fetch -q --depth 1 https://gitlab.com/qemu-project/qemu.git "refs/tags/$QEMU_TAG"
+          test "$(git -C qemu-build rev-parse 'FETCH_HEAD^{commit}')" = "$QEMU_COMMIT"
           git -C qemu-build checkout -q FETCH_HEAD
 
       - name: Stage the P2 target into the QEMU tree
-        run: |
-          set -euo pipefail
-          T=p2-qemu/qemu-target
-          mkdir -p qemu-build/target/p2 qemu-build/hw/p2 qemu-build/configs/devices/p2-softmmu
-          cp $T/target-p2/* qemu-build/target/p2/
-          cp $T/hw-p2/*     qemu-build/hw/p2/
-          cp $T/p2-softmmu.mak          qemu-build/configs/targets/
-          cp $T/p2-softmmu-devices.mak  qemu-build/configs/devices/p2-softmmu/default.mak
-          cd qemu-build
-          patch -p1 < ../$T/register-p2.patch
-          patch -p1 < ../$T/host-thread.patch
-          python3 scripts/decodetree.py --static-decode=decode_p2 --insnwidth=32 \
-              -o /tmp/d.c.inc target/p2/insn.decode
-          python3 scripts/decodetree.py --static-decode=interp_p2 --translate=iexec \
-              --insnwidth=32 -o /tmp/i.c.inc target/p2/insn.decode
-          python3 target/p2/gen_stubs.py /tmp/d.c.inc target/p2/trans_stub.c.inc
-          python3 target/p2/gen_stubs.py /tmp/i.c.inc target/p2/interp_stub.c.inc --interp
+        run: p2-qemu/qemu-target/stage.sh qemu-build
 
       # --enable-pie: the objects have to link into a Rust test binary, which
       # is position-independent. --disable-containers: configure otherwise
-      # probes docker.
+      # probes docker. --with-devices-p2=node: the node's tree, without the
+      # standalone flash bus (p2-qemu/qemu-target/README.md).
       - name: Build qemu-system-p2
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -372,9 +367,7 @@ jobs:
           cd qemu-build
           mkdir -p build-p2 && cd build-p2
           ../configure --target-list=p2-softmmu --disable-containers --enable-pie \
-              --disable-docs --disable-werror \
-              --extra-cflags="-I$GITHUB_WORKSPACE/cffi/include" \
-              --extra-ldflags="$GITHUB_WORKSPACE/target/debug/libembsim_cffi.a -lpthread -ldl -lm"
+              --disable-docs --disable-werror --with-devices-p2=node
           ninja qemu-system-p2
 
       - name: Boot the ROM off the module's flash, over the nets

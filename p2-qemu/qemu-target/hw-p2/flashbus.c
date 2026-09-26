@@ -1,27 +1,31 @@
 /*
- * A pin bus with the boot flash on it, so the chip can boot the way silicon
- * does: nothing in hub RAM but the 16 KB Parallax boot ROM, and everything
- * else arriving over a bit-banged SPI bus.
+ * A pin bus with the boot flash on it, so the standalone qemu-system-p2 can
+ * boot the way silicon does: nothing in hub RAM but the 16 KB Parallax boot
+ * ROM, and everything else arriving over a bit-banged SPI bus.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  *
- * This is the SECOND pin bus. `pinbus.c` mirrors p2core's small `SmartPins`
- * and is what the CPU differential harness runs against; this one mirrors
- * p2core's `Board` far enough to boot, and is what the ROM harness runs
- * against. They are separate because they answer separate questions, and the
- * bring-up bus deliberately has no peripherals at all.
+ * Built only when CONFIG_P2_EMBSIM_FLASH is on (Kconfig). The standalone
+ * build keeps it on; embsim-p2-qemu's tree is configured with it off, because
+ * there the flash is a component on the board's nets and this bus has no job.
+ *
+ * This is the SECOND pin bus. `target/p2/pinbus.c` mirrors p2core's small
+ * `SmartPins` and is what the CPU differential harness runs against; this one
+ * mirrors p2core's `Board` far enough to boot, and is what the ROM harness
+ * runs against. They are separate because they answer separate questions,
+ * and the bring-up bus deliberately has no peripherals at all.
  *
  * THE FLASH MODEL IS NOT HERE. It is embsim's, reached through `embsim.h` --
  * one model of the device, shared by every host that needs one, rather than a
  * C reimplementation that would be a second set of bugs uncovered by the
  * differential tests that make the first one trustworthy.
  *
- * The transport is a direct call rather than embsim's net engine, and that is
- * a deliberate and separate choice. The boot ROM bit-bangs this bus with
- * drvh/drvl/testp and samples a floated pin microseconds after driving the
- * clock -- sooner than a net resolves between engine wakes -- and it spends on
- * the order of 16 600 edges loading one kilobyte. A peripheral-clocked bus (the
- * SD card, the serial links) goes on nets; a CPU-bit-banged one cannot.
+ * The transport is a direct call because this host has no net engine: the
+ * standalone binary runs QEMU's own main loop, so it calls the one Rust model
+ * in-process through embsim-cffi. Inside embsim every device is a node on
+ * nets, this one included -- embsim-p2-qemu's ROM boot bit-bangs the same part
+ * through the engine, 16 901 edges of it (p2-qemu/tests/rom_boot_ec32mb.rs).
  *
  * Wiring, from p2core's flash.rs and confirmed against the P2-EC32MB netlist:
  *
@@ -39,8 +43,9 @@
  * using the pin as chip select.
  */
 #include "qemu/osdep.h"
-#include "cpu.h"
-#include "pinbus.h"
+#include "target/p2/cpu.h"
+#include "target/p2/pinbus.h"
+#include "flashbus.h"
 #include "embsim.h"
 
 #define P2_PINS 64
@@ -52,9 +57,16 @@
 #define P2_FLASH_CS  61
 /* The debug console the boot chain's payload writes to with WYPIN. */
 #define P2_PIN_TX    62
-/* The async receive pins, which report "a byte is waiting" -- see testp. */
-#define P2_PIN_RX       63
-#define P2_PIN_PROTO_RX 53
+
+/*
+ * Pins TESTP treats as asynchronous receivers with nothing attached ("no byte
+ * waiting"). The set is p2core Board's (MaD's SIL/p2core/src/board.rs,
+ * testp), kept identical so the ROM harness's trace matches it: 63 is the
+ * boot ROM's serial RX (rom_booter_v33k.spin2 rx_pin), 53 is MaD's protocol
+ * RX (PIN_PROTO_RX), and p2core also routes 0 and 1 to its debug UART
+ * receiver.
+ */
+static const unsigned p2_async_rx_pins[] = { 63, 53, 0, 1 };
 
 typedef struct P2FlashBus {
     /*
@@ -85,10 +97,6 @@ typedef struct P2FlashBus {
      * that never halts would not give it.
      */
     size_t reads_seen;
-
-    /* What the guest has written to the debug pin, which is how a boot test
-     * observes that the program it loaded actually ran. */
-    GString *console;
 } P2FlashBus;
 
 static P2FlashBus p2_flashbus;
@@ -160,11 +168,7 @@ static void flashbus_clock_flash(void)
  * asserted nothing when the mask was wrong.
  *
  * Drained in windows from `reads_seen`, and the fill reports how many it
- * WROTE. An earlier version took the fill's return as the number of valid
- * entries when it was the running total, and indexed past this array the
- * moment more than sixteen reads existed. It could not fire on a ROM boot,
- * which serves exactly two -- it was waiting for the first firmware to page
- * from flash.
+ * WROTE, not the running total.
  */
 static void flashbus_announce_reads(void)
 {
@@ -224,13 +228,12 @@ static void flashbus_wxpin(void *o, unsigned pin, uint32_t x)
 
 static void flashbus_wypin(void *o, unsigned pin, uint32_t y)
 {
-    if ((pin & 63) == P2_PIN_TX && p2_flashbus.console) {
+    if ((pin & 63) == P2_PIN_TX) {
         /*
          * The debug pin. A boot chain's whole observable is often one byte
          * arriving here -- it means the program that was loaded off the flash
          * really executed, which nothing else in the trace can show.
          */
-        g_string_append_c(p2_flashbus.console, (char)(y & 0xFF));
         printf("P2CON %02X\n", (unsigned)(y & 0xFF));
         fflush(stdout);
     }
@@ -252,6 +255,7 @@ static uint32_t flashbus_rdpin(void *o, unsigned pin, bool *busy)
 static bool flashbus_testp(void *o, unsigned pin)
 {
     unsigned p = pin & 63;
+    size_t i;
 
     /*
      * An ASYNC RX pin reports "a byte is waiting", not "an operation
@@ -268,10 +272,12 @@ static bool flashbus_testp(void *o, unsigned pin)
      * -- 1550 times. WRPIN leaves the pin configured, so a bus that answered
      * "configured means ready" returns C=1 on every one of those and the trace
      * diverges from p2core's on the FIFTH instruction of the boot, long before
-     * the flash is ever touched. That is exactly how this was found.
+     * the flash is ever touched.
      */
-    if (p == P2_PIN_RX || p == P2_PIN_PROTO_RX || p == 0 || p == 1) {
-        return false;
+    for (i = 0; i < ARRAY_SIZE(p2_async_rx_pins); i++) {
+        if (p == p2_async_rx_pins[i]) {
+            return false;
+        }
     }
 
     /*
@@ -308,7 +314,6 @@ static const P2PinBusOps p2_flashbus_ops = {
 void p2_flashbus_init(const uint8_t *image, size_t len, size_t capacity)
 {
     memset(&p2_flashbus, 0, sizeof(p2_flashbus));
-    p2_flashbus.console = g_string_new(NULL);
     p2_flashbus.flash = embsim_spi_flash_with_image(capacity, image, len);
 
     /*
@@ -323,14 +328,4 @@ void p2_flashbus_init(const uint8_t *image, size_t len, size_t capacity)
                              embsim_spi_flash_miso(p2_flashbus.flash));
 
     p2_pinbus_set(&p2_flashbus_ops, &p2_flashbus);
-}
-
-const char *p2_flashbus_console(void)
-{
-    return p2_flashbus.console ? p2_flashbus.console->str : "";
-}
-
-size_t p2_flashbus_reads(uint32_t *out, size_t cap)
-{
-    return embsim_spi_flash_reads(p2_flashbus.flash, 0, out, cap);
 }

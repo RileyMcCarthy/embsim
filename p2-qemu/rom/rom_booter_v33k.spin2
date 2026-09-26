@@ -1,3 +1,18 @@
+{{
+  Parallax's P2 boot ROM source, trimmed for flexspin.
+
+  Source: https://github.com/parallaxinc/propeller/blob/65f74a117e0470b83f492f888e5c55366c51864f/resources/FPGA%20Examples/ROM_Booter_v33k.spin2
+  (git blob 2a323533af69d1c5554574b36a35e3c4821a7215).
+
+  MIT License, Copyright (c) 2019 Parallax Inc.; full text in LICENSE-PARALLAX.
+
+  Modifications, by upstream line number:
+    - truncated after upstream line 989, before the hub-exec `orgh` at line
+      990 (SD second stage, TAQOZ, monitor);
+    - lines 229 and 284 `jmp #@_start_sdcard` -> `jmp #try_serial`;
+    - lines 537 `jmp #@_start_taqoz` and 540 `jmp #@_start_monitor`
+      -> `jmp #.byte`.
+}}
 CON
 
 

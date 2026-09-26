@@ -11,66 +11,109 @@ shape, as `embsim` and `ProtoEmb` are to MaD.
 | path | goes to |
 |---|---|
 | `target-p2/` | `target/p2/` in the QEMU tree |
-| `hw-p2/` | `hw/p2/` |
+| `hw-p2/` | `hw/p2/`: the board, and the standalone binary's flash bus |
 | `p2-softmmu.mak` | `configs/targets/p2-softmmu.mak` |
-| `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak` — the P2 has one board and no optional devices, but meson requires the file to exist |
+| `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak`: the standalone build, flash bus on |
+| `p2-softmmu-node-devices.mak` | `configs/devices/p2-softmmu/node.mak`: `embsim-p2-qemu`'s build (`--with-devices-p2=node`), flash bus off |
 | `register-p2.patch` | the five registration edits (`target/meson.build`, `hw/meson.build`, both `Kconfig`s, `QEMU_ARCH_P2` in `include/system/arch_init.h`) |
-| `host-thread.patch` | parks QEMU's own vCPU thread when `EMBSIM_QEMU_HOST_THREAD` is set, so a host thread — embsim's engine — can run the cogs itself (`../hostdrive.c`) |
+| `host-thread.patch` | parks QEMU's own vCPU thread when the host sets `rr_host_driven`, so a host thread — embsim's engine — can run the cogs itself (`../hostdrive.c`) |
+| `stage.sh` | puts all of the above into a QEMU source tree |
+| `LICENSE-PNut-TS` | the notice `target-p2/insn.decode`'s source carries |
 
-`target-p2/insn.decode` is **generated** from p2core (`tools/gen_decoder.py
---decodetree` in MaD): the 359 encodings stay single-source with p2core's Rust
-decoder, so the two cannot drift. Regenerate it there and copy it here.
-
-Two more files are generated at build time and not copied: `trans_stub.c.inc`
-and `interp_stub.c.inc`, emitted by `target-p2/gen_stubs.py`, one per
-dispatcher. Every DecodeTree pattern needs a function to link; anything not
-hand-written halts the cog and logs the opcode and PC rather than silently
-doing the wrong thing.
-
-**QEMU is pinned at `v10.1.0`**, and the pin lives in one place: the
-`QEMU_TAG` of the `p2-qemu-boot` job in `.github/workflows/ci.yml`. Both
-patches carry upstream context, so they will reject on a different tree — if
-one does, that tag is what moved.
+`target-p2/insn.decode` is **generated** from p2core's decoder table, so the
+359 encodings stay single-source with p2core's Rust decoder and the two cannot
+drift. It is the output of
 
 ```bash
-cp -r target-p2/* <qemu>/target/p2/ ; cp -r hw-p2/* <qemu>/hw/p2/
-cp p2-softmmu.mak <qemu>/configs/targets/
-mkdir -p <qemu>/configs/devices/p2-softmmu
-cp p2-softmmu-devices.mak <qemu>/configs/devices/p2-softmmu/default.mak
-cd <qemu> && patch -p1 < .../register-p2.patch && patch -p1 < .../host-thread.patch
+python3 SIL/p2core/tools/gen_decoder.py --decodetree <embsim>/p2-qemu/qemu-target/target-p2/insn.decode
+```
 
-# The stub files are #included, so they have to exist before the build. One
-# insn.decode, two dispatchers -- see "Two engines" below.
-python3 scripts/decodetree.py --static-decode=decode_p2 --insnwidth=32 \
-        -o /tmp/d.c.inc target/p2/insn.decode
-python3 scripts/decodetree.py --static-decode=interp_p2 --translate=iexec \
-        --insnwidth=32 -o /tmp/i.c.inc target/p2/insn.decode
-python3 target/p2/gen_stubs.py /tmp/d.c.inc target/p2/trans_stub.c.inc
-python3 target/p2/gen_stubs.py /tmp/i.c.inc target/p2/interp_stub.c.inc --interp
+run in RileyMcCarthy/MaD at `6e1581634b69368effe48b7476bb483d6f67dfc0` (to be
+re-pinned to MaD's main once that branch merges), and that command reproduces
+this file byte-for-byte. Its input is MaD's `SIL/p2core/vendor/parseUtils.ts`,
+which is PNut-TS's `src/classes/parseUtils.ts` at
+ironsheep/PNut-TS@`d9e46a378c7d0efdad45c9fee5f029b7314cfeb3`, under the MIT
+License in [`LICENSE-PNut-TS`](LICENSE-PNut-TS). Regenerate it there and copy
+it here; do not edit it.
 
-# The standalone binary's flash bus links embsim's flash model as a static
-# library -- see "The flash is embsim's" below. Build it first with
-# `cargo build -p embsim-cffi` (from this repository's root).
+Two more files are generated at build time, into the build directory, and not
+copied: `target/p2/trans_stub.c.inc` and `target/p2/interp_stub.c.inc`, which
+`target-p2/meson.build` has `target-p2/gen_stubs.py` emit from each
+dispatcher's decoder. Every DecodeTree pattern needs a function to link;
+anything not hand-written halts the cog and reports the opcode and PC on
+stderr rather than silently doing the wrong thing.
+
+## Building
+
+**QEMU is pinned at `v10.1.0`**, and the pin lives in one place: `QEMU_TAG`
+and `QEMU_COMMIT` of the `p2-qemu-boot` job in `.github/workflows/ci.yml`,
+which checks the fetched tag against the commit. Both patches carry upstream
+context, so they will reject on a different tree — if one does, that tag is
+what moved.
+
+`stage.sh` copies this directory into a QEMU checkout and applies both
+patches. It replaces `target/p2` and `hw/p2` outright and skips a patch that
+is already applied, so re-run it after every edit here:
+
+```bash
+git clone --depth 1 --branch v10.1.0 https://gitlab.com/qemu-project/qemu.git <qemu>
+p2-qemu/qemu-target/stage.sh <qemu>
+```
+
+One staged tree builds two ways. `embsim-p2-qemu` links a tree configured with
+`--with-devices-p2=node`, which leaves the standalone flash bus out:
+
+```bash
+mkdir <qemu>/build-p2 && cd <qemu>/build-p2
+../configure --target-list=p2-softmmu --disable-containers --enable-pie \
+    --disable-docs --disable-werror --with-devices-p2=node
+ninja qemu-system-p2
+# Then, from this repository's root:
+EMBSIM_QEMU_P2_BUILD=<qemu>/build-p2 cargo test -p embsim-p2-qemu
+```
+
+The standalone `qemu-system-p2` the MaD harnesses run keeps the default
+devices, flash bus included, and that bus links embsim's flash model as a
+static library (see "The flash is embsim's" below). Build it first with
+`cargo build -p embsim-cffi`, from this repository's root:
+
+```bash
 EMB=<embsim>
-./configure --target-list=p2-softmmu --disable-containers --enable-pie \
+mkdir <qemu>/build-sa && cd <qemu>/build-sa
+../configure --target-list=p2-softmmu --disable-containers --enable-pie \
+    --disable-docs --disable-werror \
     --extra-cflags="-I$EMB/cffi/include" \
-    --extra-ldflags="$EMB/target/debug/libembsim_cffi.a \
-                     -framework CoreFoundation -framework Security"
-make
-# Then the node:
-EMBSIM_QEMU_P2_BUILD=<qemu>/build cargo test -p embsim-p2-qemu
+    --extra-ldflags="$EMB/target/debug/libembsim_cffi.a -lpthread -ldl -lm"
+ninja qemu-system-p2
 ```
 
 `--disable-containers` matters on macOS: `configure` otherwise hangs in
-`docker version`. On Linux the link needs `-lpthread -ldl -lm` instead of the
-two frameworks, and `--enable-pie` is what lets the objects link into a Rust
-test binary, which is position-independent.
+`docker version`. `--enable-pie` is what lets the objects link into a Rust
+test binary, which is position-independent; leave it off on macOS, whose
+toolchain builds position-independent executables anyway and fails
+`configure`'s `-pie` probe. On macOS the standalone link needs
+`-liconv -lSystem -lc -lm` (what `cargo rustc -p embsim-cffi --lib --
+--print native-static-libs` prints there) in place of `-lpthread -ldl -lm`.
 
-`embsim-p2-qemu` itself does NOT link `flashbus.c` or the cffi archive: its
-flash is a component on the board (`build.rs`). The archive is only for the
-standalone binary's own link.
+`embsim-p2-qemu`'s `build.rs` refuses a tree that is not what this directory
+says it should be: a file here that differs from the staged copy, a tree
+without `host-thread.patch`, or a tree configured with the flash bus. Re-stage
+and run `ninja` after an edit here, and the next `cargo test` relinks.
 
-## Three host-facing flags (`target-p2/pinbus.h`)
+## Adding an instruction
+
+1. Write `trans_<name>` in `translate.c` (hub-exec) and `iexec_<name>` in
+   `interp.c` (cog-exec). Anything with machinery behind it — the pin bus, the
+   lock pool, CORDIC, hub block transfers — calls `op_helper.c`'s shared
+   helpers from both.
+2. Add the name and each operand form (`_2`, `_3`) to `TRANS` and/or `INTERP`
+   in `gen_stubs.py`. They are matched by exact name.
+3. Re-stage and run `ninja -C <build>`. A listed name with no function, or a
+   function with no listed name, fails the build.
+4. Diff it against p2core with MaD's `SIL/p2core/tools/difftest.sh` (`cog=1`
+   for the interpreter).
+
+## Host-facing flags (`target-p2/pinbus.h`)
 
 - `p2_pinbus_yield` — a bus sets it from inside a pin op: stop this cog after
   the current instruction. The interpreter checks it after every instruction;
@@ -90,12 +133,12 @@ Runs the real MaDCore firmware. `qemu-system-p2 -M p2 -kernel <image>` boots it
 the way silicon does — the first `$1F8` longs of hub become cog 0's RAM and it
 runs them from cog `$000`, because a P2 image is a cog program, not a hub one —
 and **the first million instructions are identical to p2core's**, state by
-state, registers, flags, stack pointer and cycle count
-(`../p2core/tools/fwtest.sh`).
+state, registers, flags, stack pointer and cycle count (MaD's
+`SIL/p2core/tools/fwtest.sh`).
 
 220 DecodeTree patterns are hand-written in each engine, covering every
 mnemonic the firmware executes: 80 in hub space, 41 in cog space, measured over
-20 M instructions with `../p2core/examples/ophist.rs`.
+20 M instructions with MaD's `SIL/p2core/examples/ophist.rs`.
 
 It also **boots the way silicon does**. `qemu-system-p2 -M p2,flash=<image>
 -bios <rom>` puts nothing in hub but Parallax's own 16 KB boot ROM; the ROM
@@ -103,26 +146,27 @@ samples the pull-up strap on P61, bit-bangs the SPI flash, loads its first
 kilobyte, verifies the 256 longs sum to `"Prop"`, copies them into cog RAM and
 jumps. That kilobyte is this repository's stage-1 loader, which reads the
 application from flash `$400` and relaunches the cog on it. The whole chain is
-**identical to p2core's, state by state** (`../p2core/tools/romtest.sh`), and
-the two things it actually DID -- the flash served reads at `0` and `$400`, and
-the booted payload's byte reached the console -- are the same assertions
-`../p2core/tests/rom_boot_chain.rs` makes.
+**identical to p2core's, state by state** (MaD's `SIL/p2core/tools/romtest.sh`),
+and the two things it actually DID -- the flash served reads at `0` and `$400`,
+and the booted payload's byte reached the console -- are the same assertions
+MaD's `SIL/p2core/tests/rom_boot_chain.rs` makes.
 
 ## The flash is embsim's, not a copy
 
-`flashbus.c` is a second pin bus, mirroring p2core's `Board` far enough to
-boot. What it is NOT is a second flash model: the device is
-`embsim/models/src/spi_flash.rs`, reached from C through `embsim-cffi`. One
-model of the part, shared by every host that needs one -- a C reimplementation
-would be a second set of bugs, uncovered by the differential tests that make
-the first one trustworthy.
+`hw-p2/flashbus.c` is the standalone binary's second pin bus, mirroring
+p2core's `Board` far enough to boot. What it is NOT is a second flash model:
+the device is this repository's `models/src/spi_flash.rs`, reached from C
+through `embsim-cffi`. One model of the part, shared by every host that needs
+one -- a C reimplementation would be a second set of bugs, uncovered by the
+differential tests that make the first one trustworthy.
 
-The TRANSPORT is a direct call rather than embsim's net engine, and that is a
-separate decision from where the model lives. The boot ROM drives a clock edge
-and samples a floated pin microseconds later -- sooner than a net resolves
-between engine wakes -- and spends about 8 300 clock pulses -- 16 600 edges --
-loading one kilobyte. A peripheral-clocked bus (the SD card, the serial links) goes on
-nets; a CPU-bit-banged one cannot.
+`embsim-cffi` exists for a host with no net engine: the standalone
+`qemu-system-p2` runs QEMU's own main loop, so it calls the one Rust model
+in-process. Inside embsim every device is a node on nets, the flash included —
+`p2-qemu/tests/rom_boot_ec32mb.rs` boots the ROM through the node, bit-banging
+16 901 edges over the P2-EC32MB's nets. So the node's tree leaves this bus out
+(`CONFIG_P2_EMBSIM_FLASH`, off in `p2-softmmu-node-devices.mak`) and links
+neither it nor the archive.
 
 ## Two engines, one instruction set
 
@@ -143,7 +187,11 @@ opinion about the ISA:
 What is genuinely duplicated is the ALU core, and that is what the harness
 covers most densely.
 
-## The Phase 0 design decisions, built in
+## Design decisions
+
+"Spike Nx" figures quoted in these sources are measurements recorded in MaD's
+`docs/dev/p2-qemu-target-plan.md`
+(RileyMcCarthy/MaD@5ef1d19c3a94d64365c974bca00f891a528018b7).
 
 - **Cog RAM and LUT live in `CPUArchState`**, deliberately absent from the
   address space. Routing the register file through softmmu costs +194 ns per
@@ -185,11 +233,11 @@ node, on the P2-EC32MB board, over nets — `p2-qemu-boot` in CI, in
 
 ## What it does NOT do yet
 
-- **No SD card and no serial peer in the standalone binary.** `flashbus.c`
-  has the boot flash, which is all the ROM chain needs; `pinbus.c` remains the
-  bring-up model for the CPU differential tests. On embsim's engine
-  (`embsim-p2-qemu`) the flash is already a board component and the SD card
-  can be; the UART peers are the next seam.
+- **No SD card and no serial peer in the standalone binary.**
+  `hw-p2/flashbus.c` has the boot flash, which is all the ROM chain needs;
+  `target-p2/pinbus.c` remains the bring-up model for the CPU differential
+  tests. On embsim's engine (`embsim-p2-qemu`) the flash is already a board
+  component and the SD card can be; the UART peers are the next seam.
 - **No streamer** (`XINIT`/`XZERO`/`XCONT`/`SETXFRQ`), so the transition-mode
   smart-pin clock path halts rather than guessing.
 - **The refused set matches p2core's**, deliberately: an instruction the oracle
@@ -205,4 +253,23 @@ node, on the P2-EC32MB board, over nets — `p2-qemu-boot` in CI, in
   prefetch depth. That is what p2core models, so it is the most the harness can
   check, and every user in reach streams sequentially with a wrap count of
   zero.
-- The silicon goldens in MaD's `SIL/p2core/hwtest/` are still the Phase 2 target.
+- The silicon goldens in MaD's `SIL/p2core/hwtest/` are not yet diffed against
+  this target.
+
+## License
+
+- The target, the board and their build files here (`target-p2/`, `hw-p2/`,
+  the `.mak` files, `stage.sh`) are LGPL-2.1-or-later, as QEMU targets are:
+  [`LICENSES/LGPL-2.1-or-later.txt`](../../LICENSES/LGPL-2.1-or-later.txt).
+- `target-p2/insn.decode` derives from PNut-TS and is MIT
+  ([`LICENSE-PNut-TS`](LICENSE-PNut-TS)). It is generated, so it carries no
+  licence line of its own.
+- Each patch carries the licence of the QEMU files it modifies, stated at its
+  top: `register-p2.patch` GPL-2.0-or-later; `host-thread.patch` MIT for
+  `tcg-accel-ops-rr.c` and GPL-2.0-or-later for `tcg-accel-ops-rr.h`.
+- `../hostdrive.c`, like the rest of `embsim-p2-qemu`, is MIT.
+
+Linked into QEMU, the whole is a GPL-2.0-or-later work: a `qemu-system-p2`
+built from a tree staged from here, or an `embsim-p2-qemu` test binary built
+with `EMBSIM_QEMU_P2_BUILD`, is distributable only under the GPL, version 2 or
+later, with its corresponding source.

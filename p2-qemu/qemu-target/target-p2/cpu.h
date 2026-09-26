@@ -1,4 +1,5 @@
 /* Parallax Propeller 2 CPU state. SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Copyright (c) 2026 Riley McCarthy */
 #ifndef P2_CPU_H
 #define P2_CPU_H
 
@@ -58,12 +59,6 @@ enum {
 /* Unified PC regions. */
 #define P2_LUT_BASE  0x200
 #define P2_HUB_BASE  0x400
-
-/* Special cog registers. */
-#define P2_REG_DIRA  0x1FA
-#define P2_REG_OUTA  0x1FC
-#define P2_REG_INA   0x1FE
-#define P2_REG_INB   0x1FF
 
 /* Silicon retires a simple instruction in two clocks. */
 #define P2_CLOCKS_PER_INSN 2
@@ -176,8 +171,6 @@ void p2_cpu_translate_code(CPUState *cs, TranslationBlock *tb,
 void p2_cpu_do_interrupt(CPUState *cpu);
 bool p2_cpu_exec_interrupt(CPUState *cpu, int interrupt_request);
 hwaddr p2_cpu_get_phys_page_debug(CPUState *cpu, vaddr addr);
-int p2_cpu_gdb_read_register(CPUState *cpu, GByteArray *mem_buf, int n);
-int p2_cpu_gdb_write_register(CPUState *cpu, uint8_t *mem_buf, int n);
 bool p2_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                      MMUAccessType access_type, int mmu_idx,
                      bool probe, uintptr_t retaddr);

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (c) 2026 Riley McCarthy
 """Emit stubs for every DecodeTree pattern an engine does not model yet.
 
 One `insn.decode` feeds two dispatchers -- the hub-exec translator's `trans_*`

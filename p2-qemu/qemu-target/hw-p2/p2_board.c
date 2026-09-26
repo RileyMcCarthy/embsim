@@ -1,6 +1,7 @@
 /*
  * A bare Propeller 2: 512 KB of hub RAM and eight cogs.
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  */
 #include "qemu/osdep.h"
 #include "qemu/units.h"
@@ -19,6 +20,10 @@
 #include "system/address-spaces.h"
 #include "hw/loader.h"
 #include "qemu/error-report.h"
+#include CONFIG_DEVICES
+#ifdef CONFIG_P2_EMBSIM_FLASH
+#include "flashbus.h"
+#endif
 
 /* One definition, in cpu.h: the CPU's ROM-boot base is derived from it. */
 #define P2_HUB_SIZE P2_HUB_BYTES
@@ -164,7 +169,12 @@ static void p2_machine_init(MachineState *machine)
          * erased part that answers is a different thing from no part at all,
          * and the ROM distinguishes them -- so a test for "the ROM gives up
          * gracefully" needs the empty case to be reachable.
+         *
+         * Only in a build with the flash bus (CONFIG_P2_EMBSIM_FLASH).
+         * Without it the pins belong to whatever bus the host installs --
+         * embsim-p2-qemu's, where the flash is a component on the board.
          */
+#ifdef CONFIG_P2_EMBSIM_FLASH
         if (p2_flash_file) {
             gsize flen;
             char *fbuf;
@@ -178,6 +188,13 @@ static void p2_machine_init(MachineState *machine)
         } else {
             p2_flashbus_init(NULL, 0, P2_FLASH_CAPACITY);
         }
+#else
+        if (p2_flash_file) {
+            error_report("p2: flash=%s needs a build with the flash bus "
+                         "(CONFIG_P2_EMBSIM_FLASH)", p2_flash_file);
+            exit(1);
+        }
+#endif
     }
 
     for (i = 0; i < P2_NUM_COGS; i++) {

@@ -1,5 +1,7 @@
 /*
  * The host side of the seam: embsim's engine thread drives QEMU's cogs.
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Riley McCarthy
  *
  * QEMU is linked into the process as a library (build.rs replays its link
  * line minus main()). Its own vCPU thread parks at start-up (host-thread.patch)
@@ -15,7 +17,7 @@
  * Spike 1d measured that at 172-254 ns a slice, exact to the instruction. It
  * is what makes a pin edge a function call rather than a cross-thread
  * park/wake (10.9 us), which is the whole reason the CPU lives on the engine
- * thread -- the same shape p2iss runs p2core in.
+ * thread.
  *
  * Everything here is glue over public QEMU headers; the electrical model is on
  * the Rust side, reached through the P2PinBusOps vtable (target/p2/pinbus.h).
@@ -31,21 +33,32 @@
 #include "exec/cpu-common.h"
 #include "accel/tcg/tcg-accel-ops.h"
 #include "accel/tcg/tcg-accel-ops-icount.h"
+#include "accel/tcg/tcg-accel-ops-rr.h"
 #include "cpu.h"
 #include "pinbus.h"
+
+/*
+ * src/ffi.rs mirrors P2PinBusOps field for field, and nothing else ties the
+ * two together: a pointer added on this side would be read past the end of
+ * the Rust struct. Ten function pointers is the shape both sides agree on.
+ */
+QEMU_BUILD_BUG_MSG(sizeof(P2PinBusOps) != 10 * sizeof(void (*)(void)),
+                   "P2PinBusOps changed: update p2-qemu/src/ffi.rs to match, "
+                   "field for field");
 
 /*
  * Build the machine. Returns with the vCPU thread parked and both locks
  * qemu_init hands back (the BQL and the replay mutex) released, exactly as
  * system/main.c releases them before its loop.
  *
- * The two target flags are set BEFORE qemu_init: the board reads
+ * The flags are set BEFORE qemu_init: the round-robin thread reads
+ * `rr_host_driven` when it starts (host-thread.patch), the board reads
  * `p2_host_driven` in its init, and `p2_pin_ops_end_tb` is read at translate
- * time, so both must be in place before any block exists.
+ * time, so all three must be in place before any thread or block exists.
  */
 void p2host_boot(int argc, char **argv)
 {
-    g_setenv("EMBSIM_QEMU_HOST_THREAD", "1", true);
+    rr_host_driven = true;
     p2_host_driven = true;
     p2_pin_ops_end_tb = true;
     qemu_init(argc, argv);
@@ -74,8 +87,7 @@ void p2host_install_bus(const P2PinBusOps *ops, void *opaque)
  * (accel/tcg/tcg-accel-ops-rr.c) drops it before icount_prepare_for_run and
  * takes it back after icount_process_data, and for a reason: when the budget
  * clamps to zero -- a virtual-clock deadline has expired -- prepare takes the
- * BQL ITSELF to run the timers, and the BQL is not recursive. Spike 1d held it
- * and got away with it only because its machine armed no timer; this one
+ * BQL ITSELF to run the timers, and the BQL is not recursive. This machine
  * inherits the parked vCPU thread's 100 ms kick timer, so a zero budget is a
  * matter of time, and the caller treats a slice that retired nothing as
  * ordinary.
@@ -125,11 +137,6 @@ unsigned p2host_current_cog(void)
     return current_cpu ? cpu_env(current_cpu)->cogid : 0;
 }
 
-void p2host_hub_read(uint32_t addr, void *buf, size_t len)
-{
-    cpu_physical_memory_read(addr & P2_HUB_MASK, buf, len);
-}
-
 /* The clock setting the guest last wrote with HUBSET (0 = none yet, RCFAST),
  * and the executing cog's clock count when it did. */
 uint32_t p2host_clock_mode(void)
@@ -162,39 +169,4 @@ bool p2host_take_yield(void)
 
     p2_pinbus_yield = false;
     return y;
-}
-
-/*
- * Instructions retired, for a harness that wants to check a slice's
- * exactness. NEVER from inside a bus callback: icount_get_raw() aborts when
- * read mid-block ("Bad icount read"), and a helper is mid-block.
- */
-int64_t p2host_icount(void)
-{
-    return icount_get_raw();
-}
-
-/*
- * The C flash bus is NOT linked (build.rs drops flashbus.c.o along with the
- * embsim-cffi archive it needs, which carries a second Rust runtime). The
- * board still calls its init on a `-bios` boot; here that is a no-op, because
- * the flash is a component on the board the Rust side builds.
- */
-void p2_flashbus_init(const uint8_t *image, size_t len, size_t capacity)
-{
-    (void)image;
-    (void)len;
-    (void)capacity;
-}
-
-const char *p2_flashbus_console(void)
-{
-    return "";
-}
-
-size_t p2_flashbus_reads(uint32_t *out, size_t cap)
-{
-    (void)out;
-    (void)cap;
-    return 0;
 }

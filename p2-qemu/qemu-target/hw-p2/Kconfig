@@ -1,4 +1,15 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (c) 2026 Riley McCarthy
+
 config P2_BOARD
     bool
     default y
     depends on P2
+
+# The standalone emulator's flash bus (flashbus.c), which links embsim's flash
+# model through embsim-cffi. embsim-p2-qemu's tree turns it off
+# (p2-softmmu-node-devices.mak): there the flash is a component on the nets.
+config P2_EMBSIM_FLASH
+    bool
+    default y
+    depends on P2_BOARD

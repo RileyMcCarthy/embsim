@@ -1,4 +1,4 @@
-'' Stage-1 flash loader for the ISS boot chain.
+'' Stage-1 flash loader for the P2 boot chain (the image is built by ../src/flashimage.rs).
 ''
 '' The P2 boot ROM loads the first $400 bytes of SPI flash into hub 0, checks
 '' that their 256 longs sum to "Prop", copies them into cog $000..$0FF and

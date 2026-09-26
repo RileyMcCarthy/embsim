@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Copyright (c) 2026 Riley McCarthy */
 DEF_HELPER_2(p2_interp_cog, void, env, i32)
 DEF_HELPER_FLAGS_2(p2_unimpl, TCG_CALL_NO_RETURN, noreturn, env, i32)
 DEF_HELPER_2(p2_push, void, env, i32)

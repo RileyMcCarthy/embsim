@@ -1,4 +1,5 @@
 /* Parallax Propeller 2 CPU QOM header. SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Copyright (c) 2026 Riley McCarthy */
 #ifndef TARGET_P2_CPU_QOM_H
 #define TARGET_P2_CPU_QOM_H
 
