@@ -1,28 +1,25 @@
 //! What one escalated cluster solve costs, at the cluster sizes the plan
 //! argues about.
 //!
-//! `NODES.md` §6 keeps every cluster at `m ≤ 8` by making declared terminals
-//! cluster boundaries. The EC32MB's largest cluster today is 8 roots and the
-//! Edge board's 11 (`board/tests/cluster_census.rs`); with diodes as edges
-//! and no boundary the Edge board's +3.3V, +5V, GND and all 21 LED chains
-//! collapse into one 47-net cluster (§2, rule 1). This records what the
-//! dense elimination in `QuasiStaticMna` costs at each of those sizes, so
-//! the decision to bound clusters rests on a number in the tree, and so
-//! phase 7's LU cache is dropped unless a hot path shows an escalated solve
-//! that earns it (§8 phase 7).
+//! `NODES.md` §6 bounds every cluster at `m ≤ 8` under each board's
+//! reference harness by making declared terminals cluster boundaries;
+//! `board/tests/cluster_census.rs` records each board's largest cluster.
+//! With diodes as edges and no boundary the Edge board's +3.3V, +5V, GND
+//! and all 21 LED chains collapse into one 47-net cluster (§2, rule 1).
+//! This records what the dense elimination in `QuasiStaticMna` costs at the
+//! sizes that bound argues about, so the decision rests on a number in the
+//! tree (the LU-cache decision is `NODES.md` §8, phase 7).
 //!
 //! The cluster at each size is representative of the boards, not synthetic:
-//! a 3.3 V rail terminal and a ground terminal (as ideal 0 Ω sources, the
-//! way a `PowerOut` or a harness `power(V)` entered a solve when phase 0
-//! took the baseline — since phase 4 the engine hands a terminal over as a
-//! Dirichlet constant and it is not an unknown; the bench keeps the ideal
-//! sources so `m` counts the same matrix as the baseline), signal nodes each
+//! a 3.3 V rail terminal and a ground terminal, kept as ideal 0 Ω sources so
+//! that `m` counts them as unknowns: an upper bound on the matrix the engine
+//! builds, which hands a terminal over as a constant. Signal nodes are each
 //! held by a 10.5 kΩ pull-up to the rail (the EC32MB's `R301`–`R303`),
 //! joined in a chain of 220 Ω series resistors (the Edge board's LED
-//! resistors `R9`…), every third node driven by a 25 Ω push-pull pad (the
-//! default drive impedance, `BOARD_ENGINE.md` "Net state model") at
-//! alternating levels — so the solve is a real divided-voltage one, never a
-//! single-source projection.
+//! resistors `R9`…), every third node driven by a push-pull pad at the
+//! engine's default drive impedance ([`DEFAULT_PUSH_PULL_IMPEDANCE`],
+//! `BOARD_ENGINE.md` "Net state model") at alternating levels — so the
+//! solve is a real divided-voltage one, never a single-source projection.
 //!
 //! Not a test: the figures are hardware-dependent. Run it, in release, as
 //!
@@ -36,15 +33,21 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE;
 use embsim_board::{
     Cluster, ClusterInputs, ClusterResistor, ClusterSolver, ClusterSource, NetId, NetState,
     QuasiStaticMna,
 };
 
-/// The sizes the plan argues about: a pull-up against a pad (2), a short
-/// chain (4), the plan's bound (8), the Edge board's largest cluster today
-/// (11), and the Edge board with no terminal boundaries (47).
-const SIZES: [usize; 5] = [2, 4, 8, 11, 47];
+/// The sizes the plan argues about:
+/// - 2, a pull-up against a pad;
+/// - 4, a short chain;
+/// - 8, rule 4's bound under the reference harnesses (`cluster_census`
+///   `RULE_4_LARGEST_CLUSTER_ROOTS`);
+/// - 29, the Edge board's largest cluster built bare (`cluster_census`
+///   `EDGE`);
+/// - 47, the Edge board with no terminal boundaries.
+const SIZES: [usize; 5] = [2, 4, 8, 29, 47];
 
 /// Rail the pull-ups reach and the rail terminal sources.
 const RAIL_VOLTS: f64 = 3.3;
@@ -52,8 +55,6 @@ const RAIL_VOLTS: f64 = 3.3;
 const PULL_UP_OHMS: f64 = 10_500.0;
 /// Edge board LED series resistors (`board/tests/fixtures/mad_edge.net`, `220R`).
 const SERIES_OHMS: f64 = 220.0;
-/// Default push-pull drive impedance (`BOARD_ENGINE.md`, "Net state model").
-const PAD_OHMS: f64 = 25.0;
 
 /// Wall time each timed batch aims for; batches are repeated and the median
 /// and the minimum per-solve figure reported.
@@ -110,7 +111,7 @@ fn representative(m: usize) -> (Cluster, ClusterInputs) {
         sources.push(ClusterSource {
             node: NetId(n),
             volts: if (i / 3) % 2 == 0 { 0.0 } else { RAIL_VOLTS },
-            impedance: PAD_OHMS,
+            impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
         });
     }
 
@@ -148,7 +149,7 @@ fn time_batch(cluster: &Cluster, inputs: &ClusterInputs) -> f64 {
 fn main() {
     println!(
         "QuasiStaticMna, one solve of a representative cluster (rail + ground terminals, \
-         {PULL_UP_OHMS} Ω pull-ups, {SERIES_OHMS} Ω chain, {PAD_OHMS} Ω pads on every third node); \
+         {PULL_UP_OHMS} Ω pull-ups, {SERIES_OHMS} Ω chain, {DEFAULT_PUSH_PULL_IMPEDANCE} Ω pads on every third node); \
          median and min of {BATCHES} batches of ~{} ms",
         BATCH_TARGET.as_millis()
     );

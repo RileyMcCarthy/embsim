@@ -9,7 +9,7 @@
 //!
 //! # Keys
 //!
-//! Every entry is keyed on the netlist's **manufacturer part number** (the
+//! An entry is keyed on the netlist's **manufacturer part number** (the
 //! `Manufacturer_Part_Number` / `MPN` field a KiCad export carries,
 //! [`embsim_board::ComponentDecl::mpn`]) and, where the part name or the
 //! value field is the part's own name, on that too — the registry looks a
@@ -19,6 +19,13 @@
 //! active part without one is `RegistryError::UnknownPart` (`DESIGN.md`
 //! rule 1). A colour (`White`) or a function (`NPN`, `P Mosfet 30V 8A`) is
 //! never a key: it names no purchasable part.
+//!
+//! An entry answers to a manufacturer part number only when its pin ids
+//! are that part's own: its package's pin order, or functional ids (`A`,
+//! `K`; `D`, `G`, `S`) that name the same pin on any package. Where a board
+//! draws a part with another package's symbol, the entry answers to the
+//! symbol's part name alone — the 2N3904 entry carries the TO-92 order,
+//! which the SOT-23 `MMBT3904` does not share ([`MMBT3904_KEYS`]).
 //!
 //! # Provenance
 //!
@@ -78,7 +85,7 @@ pub const SS36_R_D_OHMS: Ohms = 0.0;
 /// 3.0 A (Document 88751, "Maximum Ratings") — the rating the `V_F` point
 /// is taken at, recorded so a consumer can judge a modelled current
 /// against it.
-pub const SS36_IF_AV_AMPS: f64 = 3.0;
+pub const SS36_IF_AV_AMPS: Amps = 3.0;
 
 /// The keys the SS36 entry answers to: the orderable number the EdgeBoard's
 /// export carries, and the family name its value field spells.
@@ -110,13 +117,13 @@ pub const LTST_C190KGKT_R_D_OHMS: Ohms = 0.0;
 
 /// The LTST-C190KGKT's continuous forward current rating, **30 mA**
 /// (BNS-OD-C131/A4, "Absolute Maximum Ratings At Ta=25 °C", p. 1 of 12).
-pub const LTST_C190KGKT_IF_MAX_AMPS: f64 = 30e-3;
+pub const LTST_C190KGKT_IF_MAX_AMPS: Amps = 30e-3;
 
 /// The current the LTST-C190KGKT's luminous intensity is specified at,
 /// `I_F` = **20 mA** (the "Electrical Optical Characteristics" test
 /// condition): the current at which the datasheet rates the part's
 /// brightness (18–71 mcd).
-pub const LTST_C190KGKT_IF_TEST_AMPS: f64 = 20e-3;
+pub const LTST_C190KGKT_IF_TEST_AMPS: Amps = 20e-3;
 
 /// The current above which the LTST-C190KGKT is **lit**: the datasheet's
 /// one bound on a dark part's current, reverse current `I_R` **10 µA**
@@ -163,12 +170,12 @@ pub const IN_S63AS5UW_R_D_OHMS: Ohms = 0.0;
 
 /// The IN-S63AS5UW's continuous forward current rating, **25 mA**
 /// (IN-S63AS series V1.0, "Absolute Maximum Rating at 25 °C").
-pub const IN_S63AS5UW_IF_MAX_AMPS: f64 = 25e-3;
+pub const IN_S63AS5UW_IF_MAX_AMPS: Amps = 25e-3;
 
 /// The current the IN-S63AS5UW's luminous intensity is specified at,
 /// `I_F` = **5 mA** (IN-S63AS series V1.0, "Electrical Characteristics",
 /// 285 mcd typical).
-pub const IN_S63AS5UW_IF_TEST_AMPS: f64 = 5e-3;
+pub const IN_S63AS5UW_IF_TEST_AMPS: Amps = 5e-3;
 
 /// The current above which the IN-S63AS5UW is **lit**: the datasheet
 /// tabulates no dark-current bound (its reverse voltage rating carries no
@@ -195,21 +202,22 @@ pub fn in_s63as5uw() -> PwlSpec {
 /// The APM4953's gate threshold magnitude, `V_GS(th)` **−2 V maximum**
 /// (−1 V minimum, −1.5 V typical) at `V_GS` = `V_DS`, `I_DS` = −250 µA
 /// (ANPEC Electronics, APM4953 Dual P-Channel Enhancement Mode MOSFET,
-/// "Electrical Characteristics (T_A = 25 °C)", Static). The channel is on
-/// where `V_GS` ≤ −2 V: the bound beyond which every part of the type has
-/// turned on. A gate between −1 V and −2 V is inside the datasheet's
-/// spread and reads off here.
+/// Rev. A.2 - Feb., 2003 — the LCSC C20897 copy the EdgeBoard's export
+/// links — "Electrical Characteristics (T_A = 25 °C unless otherwise
+/// noted)", Static, p. 2). The channel is on where `V_GS` ≤ −2 V: the
+/// bound beyond which every part of the type has turned on. A gate between
+/// −1 V and −2 V is inside the datasheet's spread and reads off here.
 pub const APM4953_VGS_TH_VOLTS: Volts = 2.0;
 
 /// The APM4953's on-resistance, `R_DS(on)` **60 mΩ maximum** (53 mΩ
-/// typical) at `V_GS` = −10 V, `I_DS` = −4.9 A (the same table) — the row
-/// for the gate drive the EdgeBoard gives it, `V_GS` = −12 V. (At −4.5 V the
-/// table gives 95 mΩ maximum.)
+/// typical) at `V_GS` = −10 V, `I_DS` = −4.9 A (APM4953 Rev. A.2, the same
+/// table, p. 2) — the row for the gate drive the EdgeBoard gives it,
+/// `V_GS` = −12 V. (At −4.5 V the table gives 95 mΩ maximum.)
 pub const APM4953_R_DS_ON_OHMS: Ohms = 60e-3;
 
 /// The APM4953's body diode drop, `V_SD` **1.3 V maximum** (0.7 V typical)
-/// at `I_SD` = −1.7 A, `V_GS` = 0 V (the same table, note b: guaranteed by
-/// design).
+/// at `I_SD` = −1.7 A, `V_GS` = 0 V (APM4953 Rev. A.2, the same table,
+/// p. 2, note b: guaranteed by design).
 pub const APM4953_VSD_VOLTS: Volts = 1.3;
 
 /// The keys the APM4953 entry answers to: the EdgeBoard's manufacturer
@@ -344,7 +352,7 @@ pub fn nsi50010() -> PwlSpec {
 }
 
 // ============================================================
-// onsemi 2N3904 / MMBT3904, small-signal NPN (the servo-enable sink)
+// onsemi 2N3904, small-signal NPN (the servo-enable sink)
 // ============================================================
 
 /// The 2N3904's base–emitter knee: `V_BE(sat)` **0.65 V minimum** (0.85 V
@@ -368,16 +376,23 @@ pub const MMBT3904_HFE_MIN: f64 = 100.0;
 /// Characteristics") over that current, **20 Ω**.
 pub const MMBT3904_R_SAT_OHMS: Ohms = 0.2 / 10e-3;
 
-/// The keys the 2N3904 entry answers to: the EdgeBoard's manufacturer part
-/// number (`MMBT3904-TP`, the SOT-23 part), the symbol's part name
-/// (`2N3904`) and the plain SOT-23 number.
-pub const MMBT3904_KEYS: &[&str] = &["MMBT3904-TP", "2N3904", "MMBT3904"];
+/// The key the 2N3904 entry answers to: `2N3904`, the part name of KiCad's
+/// `Transistor_BJT:2N3904` symbol, whose pin order — TO-92, `1` E / `2` B /
+/// `3` C — this entry carries. The SOT-23 MMBT3904, the EdgeBoard's
+/// manufacturer part number `MMBT3904-TP` among them, is pinned `1` B /
+/// `2` E / `3` C, so it is not a key (module docs, "Keys"): a board drawn
+/// with KiCad's `MMBT3904` symbol registers its own entry, citing the
+/// SOT-23 datasheet.
+pub const MMBT3904_KEYS: &[&str] = &["2N3904"];
 
-/// The 2N3904 in the package order the EdgeBoard's `Q1` uses: `1` emitter,
-/// `2` base, `3` collector (2N3903/D Rev. 9 TO-92 / SOT-23 drawings; the
-/// netlist's `pinfunction` labels `E`, `B`, `C`). The base–emitter diode
-/// is declared first, then the collector–emitter branch it gates: on
-/// while `V(B) − V(E)` ≥ [`MMBT3904_VBE_VOLTS`], saturated at
+/// The 2N3904 in the pin order of the symbol the EdgeBoard's `Q1` is drawn
+/// with: `1` emitter, `2` base, `3` collector (2N3903/D Rev. 9, the TO-92
+/// Case 29 pinout the KiCad `2N3904` symbol carries; the netlist's
+/// `pinfunction` labels `E`, `B`, `C`). The EdgeBoard draws `Q1` with this
+/// symbol on a SOT-23 footprint (MPN `MMBT3904-TP`), and the entry follows
+/// the symbol, as every entry does. The base–emitter diode is declared
+/// first, then the collector–emitter branch it gates: on while
+/// `V(B) − V(E)` ≥ [`MMBT3904_VBE_VOLTS`], saturated at
 /// [`MMBT3904_R_SAT_OHMS`] while the base supports the collector current,
 /// active — `h_FE(min) · I_B` — when it does not.
 pub fn mmbt3904() -> PwlSpec {
@@ -445,8 +460,8 @@ pub const ENTRIES: &[LibraryEntry] = &[
     },
     LibraryEntry {
         keys: APM4953_KEYS,
-        provenance:
-            "ANPEC APM4953 Dual P-Channel Enhancement Mode MOSFET, Electrical Characteristics",
+        provenance: "ANPEC APM4953 Dual P-Channel Enhancement Mode MOSFET, Rev. A.2 - Feb., 2003, \
+                     Electrical Characteristics, p. 2",
         spec: apm4953_half,
         lit_amps: None,
     },
@@ -610,7 +625,6 @@ mod tests {
     /// The transistor entry is its base–emitter diode, then its collector
     /// gated by the base at the same knee.
     #[rstest]
-    #[case::by_number("MMBT3904-TP")]
     #[case::by_part("2N3904")]
     fn the_transistor_entry_is_a_base_diode_and_a_gated_collector(#[case] key: &str) {
         let spec = spec_for(key).expect("the library holds the key");
@@ -644,6 +658,15 @@ mod tests {
                 .map(|(pin, test)| (pin.as_str(), *test)),
             Some(("2", RegionTest::AtLeast(MMBT3904_VBE_VOLTS)))
         );
+    }
+
+    /// The SOT-23 numbers are not keys of the TO-92 entry: the MMBT3904 is
+    /// pinned `1` B / `2` E / `3` C, and the entry's `1` E / `2` B / `3` C
+    /// would build it with its base and emitter swapped.
+    #[rstest]
+    fn the_sot23_numbers_are_not_keys_of_the_to92_entry() {
+        assert!(spec_for("MMBT3904").is_none());
+        assert!(spec_for("MMBT3904-TP").is_none());
     }
 
     /// Only the LEDs have a lit threshold, and it is the current the
