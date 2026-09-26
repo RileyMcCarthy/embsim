@@ -136,7 +136,20 @@ pub const RCSLOW_HZ: u64 = 20_000;
 /// is NOT used: the boot ROM overwrites that long with its base64 table,
 /// and the clock is a fact of the hardware the guest set, not a value it
 /// stored.
+///
+/// `SS` is read with the fields the datasheet's `%SS` notes name
+/// (P2X8C4M64P Datasheet, System Clock, p. 18): `XI` (`%10`) needs
+/// "CC != %00" and the PLL (`%11`) "CC != %00 and E=1" — in `%CC` = `%00`
+/// "XI status" is "ignored", and `%E` is "PLL off/on". A word that selects
+/// either without them selects a source that never runs, and yields `None`
+/// whatever the crystal: the clock selector waits for a positive edge on
+/// the new source before switching over to it (PLL Example, p. 19), so the
+/// chip has no clock, and no rate reaching an ignored `XI` gives it one
+/// (`source_runs`).
 pub fn clock_hz(mode: u32, crystal_hz: Option<u64>) -> Option<u64> {
+    if !source_runs(mode) {
+        return None;
+    }
     match mode & 0b11 {
         0b00 => Some(RCFAST_HZ),
         0b01 => Some(RCSLOW_HZ),
@@ -156,6 +169,20 @@ pub fn clock_hz(mode: u32, crystal_hz: Option<u64>) -> Option<u64> {
 /// the PLL).
 const fn derives_from_crystal(mode: u32) -> bool {
     matches!(mode & 0b11, 0b10 | 0b11)
+}
+
+/// Whether the source a HUBSET clock word selects runs at all, by the
+/// datasheet's `%SS` notes (System Clock, p. 18): RCFAST and RCSLOW always;
+/// `XI` only with its input on, `%CC` ≠ `%00`; the PLL only with `XI` on
+/// and `%E` set.
+const fn source_runs(mode: u32) -> bool {
+    let xi_on = (mode >> 2) & 0b11 != 0;
+    let pll_on = (mode >> 24) & 1 == 1;
+    match mode & 0b11 {
+        0b10 => xi_on,
+        0b11 => xi_on && pll_on,
+        _ => true,
+    }
 }
 
 /// Cog register addresses the bus is told about.
@@ -568,6 +595,15 @@ impl Bus {
                     from_ns,
                     hz,
                 });
+            }
+            None if !source_runs(mode) => {
+                tracing::warn!(
+                    mode = format_args!("{mode:#010x}"),
+                    "p2-qemu: HUBSET selected XI with its input off (%CC = %00) or the PLL \
+                     with it or %E off; the source never runs, so the guest has no clock and \
+                     stalls for good"
+                );
+                self.stalled = true;
             }
             None => {
                 tracing::warn!(
@@ -1437,6 +1473,9 @@ mod tests {
         assert!(bus.testp(62));
     }
 
+    /// `%CC` = `%10`, the 15 pF crystal mode: `XI`'s input on.
+    const CC_CRYSTAL_15PF: u32 = 0b10 << 2;
+
     /// HUBSET's word selects the oscillator or multiplies the crystal —
     /// and the crystal is the rate delivered on `XI`, so a PLL word yields
     /// 160 MHz from a delivered 20 MHz and nothing from no crystal.
@@ -1445,21 +1484,54 @@ mod tests {
         let crystal = Some(20_000_000);
         assert_eq!(clock_hz(0, crystal), Some(RCFAST_HZ));
         assert_eq!(clock_hz(0b01, crystal), Some(RCSLOW_HZ));
-        assert_eq!(clock_hz(0b10, crystal), Some(20_000_000));
-        // flexspin's 160 MHz from a 20 MHz crystal: D=0, M=7, P=%1111, PLL on.
-        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
+        let xi = CC_CRYSTAL_15PF | 0b10;
+        assert_eq!(clock_hz(xi, crystal), Some(20_000_000));
+        // flexspin's 160 MHz from a 20 MHz crystal, `$010007FB`: D=0, M=7,
+        // P=%1111, %CC=%10, PLL on.
+        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | CC_CRYSTAL_15PF | 0b11;
+        assert_eq!(pll, 0x0100_07FB);
         assert_eq!(clock_hz(pll, crystal), Some(160_000_000));
         // P=%0000 divides the VCO by two.
-        let halved = (1 << 24) | (15 << 8) | 0b11;
+        let halved = (1 << 24) | (15 << 8) | CC_CRYSTAL_15PF | 0b11;
         assert_eq!(clock_hz(halved, crystal), Some(160_000_000));
+        // The datasheet's own example (PLL Example, p. 19): a 20 MHz crystal
+        // divided by 40 and multiplied by 297, the VCO direct — 148.5 MHz.
+        assert_eq!(clock_hz(0x019D_28FB, crystal), Some(148_500_000));
 
         // No crystal: the internal oscillators still run, nothing derived
         // from XI does.
         assert_eq!(clock_hz(0, None), Some(RCFAST_HZ));
-        assert_eq!(clock_hz(0b10, None), None);
+        assert_eq!(clock_hz(xi, None), None);
         assert_eq!(clock_hz(pll, None), None);
-        assert!(derives_from_crystal(pll) && derives_from_crystal(0b10));
+        assert!(derives_from_crystal(pll) && derives_from_crystal(xi));
         assert!(!derives_from_crystal(0) && !derives_from_crystal(0b01));
+    }
+
+    /// The `%SS` notes (datasheet, System Clock, p. 18): `XI` needs
+    /// `%CC` ≠ `%00`, the PLL that and `%E` — a word that selects either
+    /// without them has no clock, whatever rate reaches the pin; the
+    /// internal oscillators run in any `%CC`.
+    #[test]
+    fn a_source_the_word_leaves_off_gives_no_clock() {
+        let crystal = Some(20_000_000);
+        // XI selected with its input ignored.
+        assert_eq!(clock_hz(0b10, crystal), None);
+        // The PLL selected with XI ignored: `$010007F3`, the word the
+        // `crystal_pll` guest selected before the decode read `%CC`.
+        assert_eq!(clock_hz(0x0100_07F3, crystal), None);
+        // The PLL selected with XI on and the PLL off.
+        assert_eq!(clock_hz(0x0000_07FB, crystal), None);
+        // RCFAST and RCSLOW with any `%CC`, the PLL word's first step among
+        // them (`$010007F8`: "enable crystal+PLL, stay in RCFAST mode",
+        // PLL Example, p. 19).
+        assert_eq!(clock_hz(0x0100_07F8, crystal), Some(RCFAST_HZ));
+        assert_eq!(clock_hz(0b11_01, crystal), Some(RCSLOW_HZ));
+        for word in [0b10, 0x0100_07F3, 0x0000_07FB] {
+            assert!(!source_runs(word), "{word:#010x}");
+        }
+        for word in [0, 0b01, 0x0100_07F8, 0x0100_07FB, 0x019D_28FB, 0b01_10] {
+            assert!(source_runs(word), "{word:#010x}");
+        }
     }
 
     /// The package delivers the rate on XI; the bus takes it at its next
@@ -1473,7 +1545,7 @@ mod tests {
         shared.crystal_hz.store(20_000_000, Ordering::Relaxed);
         bus.drain_crystal();
         assert_eq!(bus.crystal_hz, Some(20_000_000));
-        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
+        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | CC_CRYSTAL_15PF | 0b11;
         assert_eq!(clock_hz(pll, bus.crystal_hz), Some(160_000_000));
         shared.crystal_hz.store(0, Ordering::Relaxed);
         bus.drain_crystal();

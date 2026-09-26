@@ -1306,6 +1306,12 @@ pub(crate) struct DriveCapability {
     /// An identity-only or test handle declares nothing and is not
     /// checked.
     pub(crate) declared: bool,
+    /// Some drive could contradict the declaration: it was declared and
+    /// the pin cannot both source and sink. Decided once, when the handle
+    /// is built, so a publish through a pin that may do both — every
+    /// push-pull output, whose every drive [`Self::contradicted_by`]
+    /// accepts — pays one flag test and nothing else (`DESIGN.md` rule 8).
+    pub(crate) checked: bool,
 }
 
 impl DriveCapability {
@@ -1315,6 +1321,7 @@ impl DriveCapability {
             can_source: pin.can_source,
             can_sink: pin.can_sink,
             declared: true,
+            checked: !(pin.can_source && pin.can_sink),
         }
     }
 
@@ -1649,13 +1656,18 @@ impl PinHandle {
     }
 
     fn publish(&self, drive: Option<Drive>) {
-        if let Some(reason) = drive
-            .as_ref()
-            .and_then(|drive| self.capability.contradicted_by(drive))
-        {
-            // Published all the same: the engine resolves what the node
-            // publishes, and the trace names the declaration it broke.
-            tracing::warn!(net = self.net.0, ?drive, "{reason}");
+        // Checked where some drive could contradict the declaration
+        // ([`DriveCapability::checked`], decided when the handle was
+        // built), at the publish that does.
+        if self.capability.checked {
+            if let Some(reason) = drive
+                .as_ref()
+                .and_then(|drive| self.capability.contradicted_by(drive))
+            {
+                // Published all the same: the engine resolves what the node
+                // publishes, and the trace names the declaration it broke.
+                tracing::warn!(net = self.net.0, ?drive, "{reason}");
+            }
         }
         let Some(endpoint) = self.endpoint else {
             tracing::debug!(
@@ -2376,10 +2388,12 @@ mod tests {
             "declared-drives-accepted",
             "a linear source's voltage, and a pull-low output sinking to 0 volts, are accepted"
         );
-        assert_eq!(
-            DriveCapability::of(&pin).contradicted_by(&drive).is_some(),
-            contradicts
-        );
+        let capability = DriveCapability::of(&pin);
+        assert_eq!(capability.contradicted_by(&drive).is_some(), contradicts);
+        // The publish tests only a pin its flag marks as checkable: a pin
+        // it skips is one no drive can contradict.
+        assert!(capability.checked || !contradicts);
+        assert_eq!(capability.checked, !(pin.can_source && pin.can_sink));
     }
 
     /// The linear-source constructor declares a pin that drives and reads

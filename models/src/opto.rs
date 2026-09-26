@@ -68,7 +68,9 @@
 //!   6N137): a voltage in it reads as disabled — the bound that guarantees
 //!   the outputs follow the LED is `V_EH`, and the model takes the
 //!   guaranteed bound, as it does for the LED. A level (`Driven(High)`, a
-//!   pull-up) is enabled; an open enable follows.
+//!   pull-up) is enabled; an open enable follows. A clock on the enable is
+//!   the level its phases settle to through `V_EL`/`V_EH`, and one that
+//!   toggles it, or has a phase that reads none, is the open pin's answer.
 //! - **Propagation delay, pulse-width distortion, edge rates**: a channel
 //!   switches in the pass its current changes.
 //! - **CMTI, isolation rating, supply current, aging.**
@@ -390,17 +392,34 @@ impl Core {
     }
 
     /// Whether the enable lets the outputs follow the LEDs: a part with
-    /// no enable always does; an enable handed no voltage follows — open
-    /// is the 6N137 truth table's `NC` row, and a clock names no voltage
-    /// either (the wildcard audit's no-level answer, `NODES.md` §12 item
-    /// 5); an enable handed a voltage follows only when it reads high
-    /// through `V_EL`/`V_EH`, so a low one, or one in the band between that
-    /// the sheet guarantees neither level in, holds them released.
+    /// no enable always does; an enable handed nothing follows — open is
+    /// the 6N137 truth table's `NC` row; an enable handed a voltage follows
+    /// only when it reads high through `V_EL`/`V_EH`, so a low one, or one
+    /// in the band between that the sheet guarantees neither level in,
+    /// holds them released. A clock on the enable is read the way every
+    /// receiver reads one ([`Sense::level`]), as a rail's `EN` is
+    /// (`NODES.md` §12 item 5, the final pass (9)): a wave whose phases
+    /// settle to one level through `V_EL`/`V_EH` is that level; one that
+    /// toggles the input, or has a phase that reads none, names no single
+    /// level and takes the open pin's answer — the wildcard audit's answer
+    /// for a clock with no single level.
     fn enabled(&self, state: &OptoState) -> bool {
         match state.enable {
             None => true,
-            Some(Sense { volts: None, .. }) => true,
             Some(Sense { volts: Some(_), .. }) => state.enable_level == Some(Level::High),
+            Some(Sense {
+                volts: None,
+                periodic: Some(_),
+                ..
+            }) => match state.enable_level {
+                Some(level) => level == Level::High,
+                None => true,
+            },
+            Some(Sense {
+                volts: None,
+                periodic: None,
+                ..
+            }) => true,
         }
     }
 
@@ -791,6 +810,53 @@ mod tests {
         set_enable(&opto, enable);
         assert_eq!(monitor.is_sinking(OptoChannel::One), sinks);
         assert_eq!(monitor.is_enabled(), sinks);
+    }
+
+    /// A clock on the 6N137's enable is read through `V_EL`/`V_EH` like any
+    /// receiver reads one: a wave whose phases settle to one level is that
+    /// level — at or above the 2.0 V `V_EH` in both phases enabled, at or
+    /// under the 0.8 V `V_EL` in both disabled, a phase in the band between
+    /// reading none — and one that toggles the input names no single level
+    /// and takes the open pin's answer, the truth table's `NC` row: the
+    /// output follows the LED.
+    #[rstest]
+    #[case::steady_high(5.0, 2.5, true)]
+    #[case::steady_low(0.5, 0.0, false)]
+    #[case::toggling(5.0, 0.0, true)]
+    #[case::a_phase_in_the_band(1.5, 0.0, true)]
+    fn a_clock_on_the_enable_is_the_level_its_phases_settle_to(
+        #[case] hi: Volts,
+        #[case] lo: Volts,
+        #[case] sinks: bool,
+    ) {
+        let opto = Opto::lite_on_6n137();
+        let monitor = opto.monitor();
+        set_vcc(&opto, Some(5.0));
+        set_led(&opto, OptoChannel::One, Some(10e-3));
+        // From a low enable, so a clock that follows is a change.
+        set_enable(&opto, Some(0.0));
+        assert!(!monitor.is_sinking(OptoChannel::One));
+        {
+            let mut state = opto.core.state.lock().unwrap();
+            let clock = Sense {
+                volts: None,
+                periodic: Some(embsim_board::PeriodicSense {
+                    hi: Some(hi),
+                    lo: Some(lo),
+                    segment: embsim_board::PeriodicSchedule {
+                        emitted: 0,
+                        freq_hz: 1_000,
+                        total: None,
+                        since_ns: 0,
+                    },
+                }),
+                at_ns: 0,
+            };
+            opto.core.set_enable(&mut state, clock);
+            opto.core.refresh_all(&mut state);
+        }
+        assert_eq!(monitor.is_enabled(), sinks);
+        assert_eq!(monitor.is_sinking(OptoChannel::One), sinks);
     }
 
     /// Drive on change: re-delivering the same current costs no drive.

@@ -24,7 +24,13 @@ cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 cargo test -p embsim-board --test pulse_bridge --test carriage_seam -- --nocapture
 cargo test -p embsim-board --test pulse_bridge_stepped -- --nocapture
 
-# The isolation parts, promoted from stubs on the real EdgeBoard netlist:
+# The EdgeBoard's RS-422 pair live, an SD card driven bit by bit over nets,
+# and the RS-422 receiver started twelve times in one process (each stepped,
+# its own binary; live reads at a settled instant, rule 9).
+cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_determinism
+
+# The isolation parts, promoted from stubs on the real EdgeBoard netlist
+# (stepped, own binary; every read after a 1 ms virtual settle, rule 9):
 # levels and a rate-carried step train crossing the barrier, the fail-safe
 # output of an unpowered side, and the end-switch current loop. `--nocapture`
 # prints the measured engine-event cost of a step train at two rates a
@@ -272,7 +278,12 @@ cargo llvm-cov --workspace --summary-only
 
 4. **Assert contracts, not wall flakiness.** Prefer virtual-time schedules,
    monotonicity, clamps, and ε windows. Dedicated paced-stream tests that pin
-   scale and assert wall delay are the exception (document why).
+   scale and assert wall delay are the exception (document why). A wall-clock
+   wait for what a stepped run must do *eventually* — a burst to finish
+   crossing, a node to reach its next slice — is sized for a hang, never for
+   a speed: the wall time a stepped run takes is the engine's cost per edge
+   times its edges, and the runner decides that (`qemu/tests/loopback.rs`'s
+   `EVENTUALLY`, with the measurements that sized it).
 
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`
@@ -320,21 +331,40 @@ cargo llvm-cov --workspace --summary-only
    free-running *does* diverge where stepped does not, and requires every named
    case to have a golden.
 
-9. **A model's proving tests run in stepped mode.** A free-running system
-   with no firmware in it can still settle two ways from one input:
-   `board/tests/rs422_determinism.rs` holds an open divergence of exactly
-   that kind (the receiver output rests `Floating` in about one run in twelve,
-   a drive release from a component's attach interleaving differently with a
-   sense delivery — reproduced 2026-09-23, see the test's docs for the
-   recipe). Until it is closed, a new model's proving test — the tests
+9. **A model's proving tests run in stepped mode, and read at a settled
+   instant.** A free-running read cannot tell a settled system from a cascade
+   in flight: `System::start` returns with the attach cascade still running,
+   and a wall-clock poll for the state a case expects passes early whenever
+   that state is also a pin's idle. The AM26LV32's `1Y` idles `Driven(High)`
+   and is released twice on its way to driving it (the test-tree model
+   publishes at its supply's delivery and `G`'s, before `~G` enables it), so
+   a poll that accepted the idle and then read again read `Floating`. That was
+   `board/tests/rs422_determinism.rs`'s one run in twelve — reproduced
+   2026-09-23 and taken then for a system settling two ways from one input,
+   root-caused 2026-09-25 as this read race (`NODES.md` §12 item 5, the flake
+   record and the performance and stepped-tests record: every run reached the
+   one settled state) — and the `Floating` reads that flaked
+   `isolation_bridge.rs` and `edgeboard.rs`; a fixed wall wait for a card's
+   answer flaked `sd_card_spi.rs`. So a new model's proving test — the tests
    `NODES.md` §8 lists as each phase's proof — starts its system in stepped
-   mode (`virtual_clock::init_mode(ClockMode::Stepped, …)`, the pattern in
-   `determinism.rs` and `pulse_bridge_stepped.rs`), where the engine quiesces
-   every actor before it advances and the interleaving is the engine's own.
-   A free-running case may still exist beside it to measure divergence, under
-   rule 8; it is not the proof. Every sense→drive cascade a new model adds is
-   one more place the open divergence can show, which is why the rule lands
-   before the models do.
+   mode (`virtual_clock::init_mode(ClockMode::Stepped, …)`), and a case that
+   reads a live system follows `isolation_bridge.rs`: a suite lock, the clock
+   re-anchored stepped, the system started with time held, the case's thread
+   registered as a virtual-clock actor and time released, every wait a virtual
+   `settle()` longer than any instant the rig arms (asserted at compile time),
+   and no `QuiescenceTimeout` at the end. The engine then advances only while
+   the case is parked, so a read between two settles is deterministic: every
+   wake due before the settle's deadline has fired. One due at the deadline
+   itself fires after the case parks again (at an instant, released actors
+   run before the engine fires what is due there), which is why the window
+   is longer than any span the rig arms after a settled instant — then no
+   wake falls on a deadline and the read is the system at rest. The order of
+   the held start-up instant is still the attach thread's race with the
+   engine's deliveries — the state it comes to rest in is not — so such a case
+   compares states at rest, not start-up logs. A free-running case may still
+   exist beside it to measure divergence, under rule 8; it is not the proof,
+   and it never waits for a value an idle can satisfy. Every sense→drive
+   cascade a new model adds is one more transient such a wait can land in.
 
 ## What each layer should cover
 

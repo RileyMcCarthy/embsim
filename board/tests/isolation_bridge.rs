@@ -113,18 +113,29 @@ fn suite_lock() -> MutexGuard<'static, ()> {
 /// §6.9, 750 µs typ: [`UCC12040_RISE_NS`]) — so a settled read is the
 /// system at rest, not a cascade in flight. The window is the harness's,
 /// not a part's: any span past the longest armed instant reads the same.
+/// The longest is a chain, the rise and then an indicator's `t_pd` on the
+/// side it powers, and the window is asserted past their sum.
 const SETTLE_NS: u64 = 1_000_000;
-const _: () = assert!(SETTLE_NS > UCC12040_RISE_NS && SETTLE_NS > LVC1G14_T_PD_NS);
+const _: () = assert!(SETTLE_NS > UCC12040_RISE_NS + LVC1G14_T_PD_NS);
 
 /// Park the case's thread for [`SETTLE_NS`] of virtual time and return with
 /// the system at rest.
 ///
 /// The thread is a registered actor ([`Rig::actor`]), and the stepped
-/// engine advances only while every actor is parked: here it drains every
-/// command the case sent before the call, delivers every sense that moves,
-/// fires every wake due in the window, and then releases the thread — and
-/// it does nothing more until the thread parks again. A read between two
-/// settles is exact. Never wait on the wall clock between them: the engine
+/// engine advances only while every actor is parked. What that guarantees,
+/// exactly: before it releases the thread the engine has drained every
+/// command the case sent before the call, delivered every sense that
+/// moves, and fired every wake due **before** the settle's deadline. At the
+/// deadline itself the released thread runs first — at any one instant the
+/// engine drains and fires only once every actor has parked again
+/// (`EngineCore::run_stepped_iteration`) — so a wake due at that very
+/// instant would fire after the case's next park, and a read in between
+/// would see the system before it. The engine does nothing while the
+/// thread runs, so a read between two settles is deterministic either way;
+/// it is the system at rest because no wake falls on a deadline in this
+/// rig: every instant a part arms is a fixed span after a stimulus the case
+/// sent at a settled instant, the longest the chain [`SETTLE_NS`] is
+/// asserted past. Never wait on the wall clock between settles: the engine
 /// is waiting for the case.
 fn settle() {
     virtual_clock::wait_virtual_ns(SETTLE_NS);
@@ -876,8 +887,9 @@ fn the_enable_path_crosses_the_isolator_and_the_transistor() {
 ///
 /// Read at the settled instant, not polled. The receiver's `1Y` declares a
 /// push-pull output's idle, `Driven(High)` — the very state asserted — and
-/// on the way to it the part releases `1Y` once: its supply is delivered
-/// before its enables, and with `~G` not yet read it is disabled. The
+/// on the way to it the part releases `1Y` twice: its supply is delivered
+/// before its enables, then `G`, which reads no level with `Z+` open, and
+/// with `~G` not yet read it is disabled at both. The
 /// free-running version polled until the net read `Driven(High)`, which
 /// the idle satisfied before the receiver had run at all, then re-read it
 /// inside that release: `Floating` (`NODES.md` §12 item 5, the flake
@@ -1070,9 +1082,9 @@ fn an_unpowered_optocoupler_leaves_p19_at_its_pull_up() {
 ///
 /// The alternative — an isolator that re-drove its output pin per STEP edge —
 /// is ~8192 events per millimetre at the reference machine's resolution, so a
-/// regression would miss this ceiling by orders of magnitude.
+/// regression would miss this count by orders of magnitude.
 ///
-/// **Measured, and the ceiling is the measurement: 57 events per
+/// **Measured, and asserted exactly: 57 events per
 /// four-change profile, at 8 192 Hz and at 819 200 Hz alike** (the test
 /// prints it). The step clock is a periodic drive on the STEP net, so a rate
 /// change is a drive like any other, and it reaches everything on the net
@@ -1092,16 +1104,16 @@ fn an_unpowered_optocoupler_leaves_p19_at_its_pull_up() {
 /// resting low and drives its LED high `t_pd` later (a wake, a drive and a
 /// resolution in place of its relay's two: 5 + 5 + 4 + 3 = 17). 16 + 12 +
 /// 12 + 17 = 57. While the train rode a pulse channel beside the net the
-/// same profile cost 19 events (the phase-4 tree, measured) and the ceiling
-/// was 32 — the ~7× per rate change `sil-unified-drive.md` measured for a
+/// same profile cost 19 events (the phase-4 tree, measured) against a
+/// ceiling of 32 — the ~7× per rate change `sil-unified-drive.md` measured for a
 /// drive on this rig ("level (drive) 14"; the two relays beyond it are the
 /// readers the channel never reached), bounded, and still independent of
 /// the rate, which is the property this guards.
-const RELAY_EVENT_CEILING: usize = 57;
+const RELAY_EVENTS: usize = 57;
 
 /// Engine events the one level-to-clock change costs: the STEP line, held
 /// at a level, becomes a clock at rest (a held segment) before a profile
-/// is measured. **Measured, and the ceiling is the measurement: 18.** The
+/// is measured. **Measured, and asserted exactly: 18.** The
 /// source's drive, its net resolved, handed to `IC14` and the indicator,
 /// its identity net resolved (5); `IC14`'s first relay onto the isolated
 /// net, resolved and handed on (5); `U24`, handed the held clock's resting
@@ -1110,7 +1122,7 @@ const RELAY_EVENT_CEILING: usize = 57;
 /// drive, its two LED nets resolved: 4). Paid once per line, not per
 /// profile, and asserted exactly here so the level path's cost stays under
 /// test.
-const PRIME_EVENT_CEILING: usize = 18;
+const PRIME_EVENTS: usize = 18;
 
 /// Virtual time each segment of a profile holds for, the stop included: the
 /// profile is one fixed span of virtual time, 800 ms.
@@ -1199,9 +1211,9 @@ fn a_step_train_crosses_the_barrier_at_a_bounded_engine_cost() {
     );
     let prime = log.len() - before_prime;
     assert_eq!(
-        prime, PRIME_EVENT_CEILING,
+        prime, PRIME_EVENTS,
         "the level-to-clock change costs {prime} engine events (the measurement is \
-         {PRIME_EVENT_CEILING})"
+         {PRIME_EVENTS})"
     );
 
     let mut published = 0u64;
@@ -1239,9 +1251,9 @@ fn a_step_train_crosses_the_barrier_at_a_bounded_engine_cost() {
         slow.1, fast.1
     );
     assert_eq!(
-        fast.1, RELAY_EVENT_CEILING,
+        fast.1, RELAY_EVENTS,
         "engine events must not scale with the step rate: {} events for {} pulses \
-         (the measurement is {RELAY_EVENT_CEILING})",
+         (the measurement is {RELAY_EVENTS})",
         fast.1, fast.0
     );
     println!(

@@ -27,13 +27,34 @@
 //! `Hardware/EdgeBoard/KiCad/MaD_Edge.kicad_sch` (provenance in the fixture
 //! header). Part classification decisions are documented in
 //! `machine_parts/mod.rs`.
+//!
+//! # Time
+//!
+//! The cases that build without starting (the census, the power topology,
+//! the netlist reads) run no engine and read no clock. Every case that
+//! starts a live system runs alone, on the stepped clock, and reads what it
+//! asserts at a settled virtual instant (`TESTING.md` rules 5 and 9), the
+//! pattern `isolation_bridge.rs` set: the case takes the suite lock,
+//! re-anchors the clock stepped, starts its system with time held,
+//! registers its thread as a virtual-clock actor and releases time, and
+//! reads only after [`settle`] — so the engine advances only while the case
+//! is parked, and every read is of the system at rest. [`Live::finish`]
+//! asserts the engine never stopped waiting for the case.
+//!
+//! This binary once polled the wall clock for the state it expected
+//! (`settled_state`) and read it again. `System::start` returns with the
+//! attach cascade in flight, and two of those states were an output pin's
+//! idle `Driven(High)`, which the poll accepted before the part behind it
+//! had run: the case then read the release that part applies on its way to
+//! driving — `Floating` for the AM26LV32's open fourth channel and for the
+//! AM26LS31's `SC_DIR+` (`NODES.md` §12 item 5, the flake record's Open
+//! list and the performance and stepped-tests record).
 
 mod machine_parts;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rstest::rstest;
 
@@ -42,7 +63,9 @@ use embsim_board::{
     JumperState, Level, NetState, PartClass, PinDecl, PinRef, RailDownReason, Scenario, SenseKind,
     System, SystemHandle,
 };
-use embsim_core::virtual_clock;
+use embsim_core::virtual_clock::{self, Actor, ClockMode};
+use embsim_models::logic_gate::LVC1G14_T_PD_NS;
+use embsim_models::rail::UCC12040_RISE_NS;
 use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731_pins};
 
 /// Registered component count: the instances of the active part types
@@ -51,28 +74,122 @@ use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731
 /// specification, not components).
 const EXPECTED_REGISTERED: usize = 38;
 
-/// The engine's timer wheel and any paced stream sample the process-global
-/// virtual clock, and `init` re-anchors it — so it runs once per binary.
-fn ensure_clock() {
-    static CLOCK: Once = Once::new();
-    // Unpaced: DC analog settle is a virtual-time fact, not a wall-paced jump.
-    CLOCK.call_once(|| virtual_clock::init(0.0, 1_000_000));
+/// One live case at a time: the virtual clock is process-global, and each
+/// live case re-anchors it in stepped mode (`TESTING.md` rule 5). The cases
+/// that only build take no lock — they run no engine and read no clock.
+static SUITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn suite_lock() -> MutexGuard<'static, ()> {
+    SUITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        SUITE_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
 }
 
-fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if pred() {
-            return true;
-        }
-        // Test-side liveness only — this thread is not an actor and must not
-        // park on a clock the engine is stepping.
-        std::thread::sleep(Duration::from_millis(1));
+/// The virtual time a case hands the engine before it reads: 1 ms. Longer
+/// than every instant a part on this board arms — an indicator inverter's
+/// `t_pd` (SN74LVC1G14 §5.6, 4.6 ns max, 5 ns on the wheel:
+/// [`LVC1G14_T_PD_NS`]) and the longest start-up any Edge board part
+/// declares, the UCC12040's `VISO` rise (SNVSBO5B §6.9, 750 µs typ:
+/// [`UCC12040_RISE_NS`]) — and than this binary's own settle probe
+/// ([`SETTLE_WAKE_US`]), so a settled read is the system at rest, not a
+/// cascade in flight. The window is the harness's, not a part's: any span
+/// past the longest armed instant reads the same (`isolation_bridge.rs`
+/// derives the same window for the same board). The longest is a chain,
+/// the rise and then an indicator's `t_pd` on the side it powers, and the
+/// window is asserted past their sum.
+const SETTLE_NS: u64 = 1_000_000;
+const _: () = assert!(SETTLE_NS > UCC12040_RISE_NS + LVC1G14_T_PD_NS);
+
+/// Park the case's thread for [`SETTLE_NS`] of virtual time and return with
+/// the system at rest.
+///
+/// The thread is a registered actor ([`Live`]), and the stepped engine
+/// advances only while every actor is parked: before it releases the
+/// thread it applies every drive the attach cascade queued, delivers every
+/// sense that moves and fires every wake due **before** the settle's
+/// deadline, and it does nothing more until the thread parks again. A wake
+/// due at the deadline itself would fire only after that park (at one
+/// instant the released actor runs first; `isolation_bridge.rs`'s `settle`
+/// says exactly what the barrier guarantees), and none falls there on this
+/// board: every instant a part arms is a fixed span after a settled
+/// instant, the longest the chain [`SETTLE_NS`] is asserted past. Never
+/// wait on the wall clock instead: the engine is waiting for the case.
+fn settle() {
+    virtual_clock::wait_virtual_ns(SETTLE_NS);
+}
+
+/// A started system and the case's hold on it.
+///
+/// Field order is drop order, and it is load-bearing: the case's actor
+/// registration goes first, so a case that panics stops holding the
+/// engine's barrier before its system shuts down, and the suite lock goes
+/// last, after the engine has been joined.
+struct Live {
+    /// The case's thread as a registered virtual-clock actor, from the
+    /// started system to [`Live::finish`]: what makes [`settle`] exact.
+    actor: Actor,
+    system: SystemHandle,
+    _suite: MutexGuard<'static, ()>,
+}
+
+impl Live {
+    /// The engine's report of `net`, read at the settled instant.
+    fn state(&self, net: &str) -> NetState {
+        self.system
+            .net_state(net)
+            .unwrap_or_else(|| panic!("net {net} exists"))
     }
-    pred()
+
+    /// End the case: the engine must never have stopped waiting for the
+    /// case's thread (a `QuiescenceTimeout` would mean a settled read may
+    /// have raced the system), then the thread leaves the barrier and the
+    /// system shuts down.
+    fn finish(self) {
+        let Live {
+            actor,
+            system,
+            _suite,
+        } = self;
+        let stalled: Vec<Finding> = system
+            .findings()
+            .into_iter()
+            .filter(|f| matches!(f, Finding::QuiescenceTimeout { .. }))
+            .collect();
+        assert!(
+            stalled.is_empty(),
+            "the engine stopped waiting for the case's thread, so a settled read \
+             may have raced the system: {stalled:?}"
+        );
+        drop(actor);
+        system.shutdown();
+    }
 }
 
-const SETTLE: Duration = Duration::from_secs(5);
+/// Take the suite lock, re-anchor the clock in stepped mode, start `system`
+/// with time held, register the case's thread as an actor, release time and
+/// settle: the system is handed back at rest at its first settled instant,
+/// [`SETTLE_NS`] after it was assembled, every attach-time cascade drained.
+///
+/// Time is held until the thread has registered so that instant is the
+/// same every run: released at once, the engine could advance past the
+/// start-up wakes before the thread joined the barrier.
+fn start_live(system: System) -> Live {
+    let suite = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let system = system
+        .hold_time()
+        .start()
+        .expect("the EdgeBoard system starts");
+    let actor = virtual_clock::register_actor("edgeboard-case");
+    system.release_time();
+    settle();
+    Live {
+        actor,
+        system,
+        _suite: suite,
+    }
+}
 
 /// Map every pin to the board-local net name that owns it.
 fn net_of_pin(board: &Board) -> HashMap<PinRef, String> {
@@ -491,41 +608,28 @@ fn every_isolator_channel_is_a_plain_level_repeater() {
 
 /// Start the board with the servo domain powered, the encoder jumpers as given,
 /// and optional ideal sources injected on named nets (the stand-in for whatever
-/// the isolators or the encoder would drive).
-fn start_servo_domain(jumpers_closed: bool, sources: &[(&str, f64)]) -> SystemHandle {
-    ensure_clock();
-    let mut scenario = Scenario::default();
-    if jumpers_closed {
-        scenario = encoder_jumpers_closed(scenario, "EdgeBoard");
-    }
-    for (net, volts) in sources {
-        scenario = scenario.net_stuck(net, *volts);
-    }
-    System::new()
-        .board("EdgeBoard", edge_board())
-        .harness(bench_rails("EdgeBoard"))
-        .scenario(scenario)
-        .start()
-        .expect("the servo-domain system starts")
+/// the isolators or the encoder would drive), settled.
+fn start_servo_domain(jumpers_closed: bool, sources: &[(&str, f64)]) -> Live {
+    start_live(
+        System::new()
+            .board("EdgeBoard", edge_board())
+            .harness(bench_rails("EdgeBoard"))
+            .scenario(encoder_scenario(jumpers_closed, sources)),
+    )
 }
 
-fn settled_state(system: &SystemHandle, net: &str, expected: NetState) -> NetState {
-    wait_for(|| system.net_state(net) == Some(expected), SETTLE);
-    system
-        .net_state(net)
-        .unwrap_or_else(|| panic!("net {net} exists"))
-}
-
-/// One virtual microsecond after attach. The engine holds time until every
-/// component has attached (`ReleaseTime`), drains the attach-time drive/sense
-/// cascade to a fixpoint at t = 0, then advances to this deadline — so the
-/// capture is the settled DC state, not a wall-race sample of a transient
-/// `Driven(High)` that a later `Drive(None)` released.
+/// One virtual microsecond after attach. The engine holds time until the
+/// case releases it, drains the attach-time drive/sense cascade to a
+/// fixpoint at t = 0, then advances to this deadline — so the capture is
+/// the settled DC state, not a sample of a transient `Driven(High)` that a
+/// later `Drive(None)` released. Inside the [`settle`] window the capture
+/// is read after.
 ///
 /// macos CI on `3c10c04` failed `case_3_failsafe` in a 0.26 s edgeboard binary:
-/// `settled_state` returns on the first High, then the assertion reads
+/// a wall poll returned on the first High, then the assertion read
 /// Floating. That is a TOCTOU, not a slow runner.
 const SETTLE_WAKE_US: u64 = 1;
+const _: () = assert!(SETTLE_WAKE_US * 1_000 < SETTLE_NS);
 
 /// High-impedance probe on the receiver's channel-1 output (`U25.1Y` /
 /// `Net-(IC16-INA)`). Captures on the engine thread at [`SETTLE_WAKE_US`].
@@ -562,13 +666,11 @@ fn probe_pin() -> PinDecl {
 /// The returned `NetState` was captured on the engine thread after the attach
 /// cascade, so it cannot be a mid-resolution transient.
 ///
-/// One live engine at a time: two engines sharing the process clock will
-/// advance a settle wake for each other mid-cascade (the reverse case then
-/// samples failsafe High instead of the injected differential).
+/// One live engine at a time — the suite lock ([`SUITE_LOCK`]): two engines
+/// sharing the process clock will advance a settle wake for each other
+/// mid-cascade (the reverse case then samples failsafe High instead of the
+/// injected differential).
 fn start_servo_settled_on(scenario: Scenario, probe_at: &str) -> NetState {
-    static LIVE: Mutex<()> = Mutex::new(());
-    let _guard = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    ensure_clock();
     let capture = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
     let probe = SettleProbe {
@@ -576,22 +678,31 @@ fn start_servo_settled_on(scenario: Scenario, probe_at: &str) -> NetState {
         capture: Arc::clone(&capture),
         done: Arc::clone(&done),
     };
-    let system = System::new()
-        .board("EdgeBoard", edge_board())
-        .component("SETTLE", Box::new(probe))
-        .harness(bench_rails("EdgeBoard").connect(ep("SETTLE.Y"), ep(probe_at)))
-        .scenario(scenario)
-        .start()
-        .expect("the servo-domain system starts");
+    let live = start_live(
+        System::new()
+            .board("EdgeBoard", edge_board())
+            .component("SETTLE", Box::new(probe))
+            .harness(bench_rails("EdgeBoard").connect(ep("SETTLE.Y"), ep(probe_at)))
+            .scenario(scenario),
+    );
     assert!(
-        wait_for(|| done.load(Ordering::SeqCst), SETTLE),
-        "the engine never reached the DC settle wake — analog cascade is still on wall time"
+        done.load(Ordering::SeqCst),
+        "the DC settle wake fires inside the first settle window"
     );
     let got = capture
         .lock()
         .unwrap()
         .expect("settle wake fired without capturing");
-    system.shutdown();
+    // Channel 1's probe sits on `U25.3` (`1Y`), the isolator input the P2
+    // reads as P9: at the end of the window that net is where the wake found it.
+    if probe_at == "EdgeBoard.U25.3" {
+        assert_eq!(
+            live.state("EdgeBoard.Net-(IC16-INA)"),
+            got,
+            "the receiver output at rest is the state the settle wake captured"
+        );
+    }
+    live.finish();
     got
 }
 
@@ -626,50 +737,34 @@ fn the_rs422_driver_makes_a_complementary_pair_on_the_step_nets(
     #[case] expect_true: Level,
     #[case] expect_complement: Level,
 ) {
-    let system = start_servo_domain(true, &[("EdgeBoard.Net-(IC14-OUTA)", input_volts)]);
+    let live = start_servo_domain(true, &[("EdgeBoard.Net-(IC14-OUTA)", input_volts)]);
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard./MaD_Edge_Sheet3/SC_PUL+",
-            NetState::Driven(expect_true)
-        ),
+        live.state("EdgeBoard./MaD_Edge_Sheet3/SC_PUL+"),
         NetState::Driven(expect_true),
         "SC_PUL+ follows the driver input"
     );
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard./MaD_Edge_Sheet3/SC_PUL-",
-            NetState::Driven(expect_complement)
-        ),
+        live.state("EdgeBoard./MaD_Edge_Sheet3/SC_PUL-"),
         NetState::Driven(expect_complement),
         "SC_PUL- is its complement"
     );
-    system.shutdown();
+    live.finish();
 }
 
 /// The direction channel is the driver's second wired channel and behaves
 /// identically — proof the model is per-channel and not one hard-wired path.
 #[rstest]
 fn the_rs422_driver_second_channel_drives_the_direction_pair() {
-    let system = start_servo_domain(true, &[("EdgeBoard.Net-(IC14-OUTB)", 3.3)]);
+    let live = start_servo_domain(true, &[("EdgeBoard.Net-(IC14-OUTB)", 3.3)]);
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard./MaD_Edge_Sheet3/SC_DIR+",
-            NetState::Driven(Level::High)
-        ),
+        live.state("EdgeBoard./MaD_Edge_Sheet3/SC_DIR+"),
         NetState::Driven(Level::High)
     );
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard./MaD_Edge_Sheet3/SC_DIR-",
-            NetState::Driven(Level::Low)
-        ),
+        live.state("EdgeBoard./MaD_Edge_Sheet3/SC_DIR-"),
         NetState::Driven(Level::Low)
     );
-    system.shutdown();
+    live.finish();
 }
 
 /// With the servo domain unpowered the driver releases both legs: the pair
@@ -678,47 +773,42 @@ fn the_rs422_driver_second_channel_drives_the_direction_pair() {
 /// engine reports it as one.
 #[rstest]
 fn an_unpowered_rs422_driver_releases_the_pair() {
-    ensure_clock();
-    let system = System::new()
-        .board("EdgeBoard", edge_board())
-        // The main input only — the 3.3 V the isolator's primary side runs
-        // from is the board's own buck behind the polarity FET — and
-        // nothing on J21, so SC_5V is dark.
-        .harness(
-            embsim_board::Harness::new()
-                .power(
-                    machine_parts::ep("BENCH.12V"),
-                    machine_parts::ep("EdgeBoard.J2.1"),
-                    12.0,
-                )
-                .power(
-                    machine_parts::ep("BENCH.GND"),
-                    machine_parts::ep("EdgeBoard.J2.2"),
-                    0.0,
-                ),
-        )
-        .scenario(Scenario::default().net_stuck("EdgeBoard.Net-(IC14-OUTA)", 3.3))
-        .start()
-        .expect("starts");
+    let live = start_live(
+        System::new()
+            .board("EdgeBoard", edge_board())
+            // The main input only — the 3.3 V the isolator's primary side runs
+            // from is the board's own buck behind the polarity FET — and
+            // nothing on J21, so SC_5V is dark.
+            .harness(
+                embsim_board::Harness::new()
+                    .power(
+                        machine_parts::ep("BENCH.12V"),
+                        machine_parts::ep("EdgeBoard.J2.1"),
+                        12.0,
+                    )
+                    .power(
+                        machine_parts::ep("BENCH.GND"),
+                        machine_parts::ep("EdgeBoard.J2.2"),
+                        0.0,
+                    ),
+            )
+            .scenario(Scenario::default().net_stuck("EdgeBoard.Net-(IC14-OUTA)", 3.3)),
+    );
 
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard./MaD_Edge_Sheet3/SC_PUL+",
-            NetState::Floating
-        ),
+        live.state("EdgeBoard./MaD_Edge_Sheet3/SC_PUL+"),
         NetState::Floating,
         "an unpowered differential driver must not drive"
     );
     assert!(
-        system.findings().iter().any(|f| matches!(
+        live.system.findings().iter().any(|f| matches!(
             f,
             Finding::PowerNetUnsourced { net } if net == "EdgeBoard./MaD_Edge_Sheet3/SC_5V"
         )),
         "and the reason must be reported; got {:?}",
-        system.findings()
+        live.system.findings()
     );
-    system.shutdown();
+    live.finish();
 }
 
 /// The AM26LV32 turns the encoder's differential pair back into one logic level,

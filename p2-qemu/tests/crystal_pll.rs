@@ -6,10 +6,11 @@
 //! below and checked against flexspin's listing) starts at three — the
 //! datasheet's restart delay after its supplies, up from the build — waits
 //! one millisecond on RCFAST, then does what a flexspin program does in
-//! its first
-//! instructions: `HUBSET` the PLL word with the source still RCFAST, wait,
-//! `HUBSET` again selecting the PLL — `20 MHz × 8 = 160 MHz`. Then four
-//! back-to-back pad writes, and a byte to the debug pin.
+//! its first instructions, and what the datasheet's PLL Example (p. 19)
+//! does: `HUBSET` the PLL word with the crystal mode on and the source
+//! still RCFAST, wait, `HUBSET` again selecting the PLL —
+//! `20 MHz × 8 = 160 MHz`. Then four back-to-back pad writes, and a byte to
+//! the debug pin.
 //!
 //! What the scope on `P0` proves:
 //!
@@ -50,15 +51,15 @@ const CRYSTAL_HZ: u32 = 20_000_000;
 /// One two-clock instruction at 160 MHz, on the nanosecond grid.
 const PLL_INSTRUCTION_NS: [u64; 2] = [12, 13];
 
-/// The guest, as flexspin 6.0.5 assembles it (`-2 -l`); the last jump
+/// The guest, as flexspin 7.4.3 assembles it (`-2 -l`); the last jump
 /// re-targeted by hand at itself (word 14):
 ///
 /// ```text
 ///         org     0
 ///         waitx   ##20000               ' FF800027 FD64401F  1 ms on RCFAST
-///         hubset  ##$010007F0           ' FF808003 FD67E000  PLL word, source RCFAST
+///         hubset  ##$010007F8           ' FF808003 FD67F000  PLL word, crystal on, source RCFAST
 ///         waitx   ##100                 ' FF800000 FD64C81F
-///         hubset  ##$010007F3           ' FF808003 FD67E600  select the PLL
+///         hubset  ##$010007FB           ' FF808003 FD67F600  select the PLL
 ///         drvh    #0                    ' FD640059
 ///         drvl    #0                    ' FD640058
 ///         drvh    #0                    ' FD640059
@@ -68,19 +69,26 @@ const PLL_INSTRUCTION_NS: [u64; 2] = [12, 13];
 ///         jmp     #\14                  ' FD80000E  (to itself)
 /// ```
 ///
-/// `$010007F3` is `%0000_0001_000000_0000000111_1111_00_11`: PLL enabled
-/// (bit 24), `D` = 0, `M` = 7, `P` = `%1111` (VCO direct), source `%11`
-/// (the PLL) — `20 MHz / 1 × 8 / 1 = 160 MHz`, the word flexspin emits for
-/// a 20 MHz crystal.
+/// `$010007FB` is `%0000_0001_000000_0000000111_1111_10_11`: PLL enabled
+/// (bit 24), `D` = 0, `M` = 7, `P` = `%1111` (VCO direct), `%CC` = `%10`
+/// (`XI` an input, the 15 pF crystal mode), source `%11` (the PLL) —
+/// `20 MHz / 1 × 8 / 1 = 160 MHz`; `$010007F8` is the same word with the
+/// source RCFAST. They are the two words flexspin 7.4.3 emits for
+/// `_clkfreq = 160_000_000` on its default 20 MHz crystal, and the
+/// datasheet's own sequence (PLL Example, p. 19: "enable crystal+PLL, stay
+/// in RCFAST mode", then "now switch to PLL"), whose `%SS` notes need
+/// `CC != %00` for the PLL (System Clock, p. 18). The guest once used
+/// `$010007F0` / `$010007F3`, `%CC` = `%00`: `XI` ignored, which the QEMU
+/// decode now reads as no clock at all.
 const PROGRAM: [u32; 15] = [
     0xFF80_0027,
     0xFD64_401F,
     0xFF80_8003,
-    0xFD67_E000,
+    0xFD67_F000,
     0xFF80_0000,
     0xFD64_C81F,
     0xFF80_8003,
-    0xFD67_E600,
+    0xFD67_F600,
     0xFD64_0059,
     0xFD64_0058,
     0xFD64_0059,

@@ -32,18 +32,40 @@
 //!   response formats and pin roles.
 //! - ChaN's `sdmm.cc`, the reference SPI-mode driver, for the order a real host
 //!   actually sends those commands in.
+//!
+//! # Time
+//!
+//! The cases that drive the card over nets run alone, on the stepped clock
+//! (`TESTING.md` rules 5 and 9), the pattern `isolation_bridge.rs` set: each
+//! takes the suite lock, re-anchors the clock stepped, starts its bench with
+//! time held, registers its thread as a virtual-clock actor and releases
+//! time. The master then waits after every edge with [`settle`] — a park on
+//! the virtual clock, during which the engine applies the edge, delivers
+//! it to the card and applies the card's answer — and the thread holds the
+//! engine still between two settles, so every read is of the bus at rest.
+//! [`Bench::finish`] asserts the engine never stopped waiting for the case.
+//!
+//! These cases once waited on the wall clock: a poll for the master's own
+//! drive and a fixed 300 µs for the card's answer to a falling clock edge.
+//! Under load the answer had not landed when the master next read: the poll
+//! for its data-in drive returns as soon as the net reads the level — at
+//! once when a bit repeats the one before — and 300 µs was shorter than the
+//! engine took to deliver the edge and apply the answer. A block read back
+//! with one to four bytes wrong, every wrong bit equal to the bit before it
+//! (`NODES.md` §12 item 5, the flake record's Open list and the performance
+//! and stepped-tests record).
 
 mod machine_parts;
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::{
     digital_drive, jesd8c01_lvcmos_thresholds, level_of, netlist, AttachError, Board, Component,
-    ComponentNetIo, DeadBand, Harness, Level, PartRegistry, PinDecl, PinHandle, System,
+    ComponentNetIo, DeadBand, Finding, Harness, Level, PartRegistry, PinDecl, PinHandle, System,
+    SystemHandle,
 };
-use embsim_core::virtual_clock;
+use embsim_core::virtual_clock::{self, Actor, ClockMode};
 use embsim_models::sd_card::{SdCard, BLOCK_LEN};
 use embsim_models::sd_card_component::{
     SdCardComponent, SD_CARD_PINS_BY_FUNCTION, SD_CARD_PINS_MICROSD, SD_CARD_PINS_SPI_ONLY,
@@ -388,52 +410,59 @@ impl Component for BitBangMaster {
     }
 }
 
+/// One bench at a time: the virtual clock is process-global, and each bench
+/// re-anchors it in stepped mode (`TESTING.md` rule 5). The cases that drive
+/// the card model directly run no engine and take no lock.
+static SUITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn suite_lock() -> MutexGuard<'static, ()> {
+    SUITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        SUITE_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// The virtual time the master hands the engine after each edge: 1 µs.
+///
+/// Nothing on this bench arms an instant — the card adapter answers each
+/// edge from its sense callback at the edge's own instant, and the master
+/// is the test thread — so a settle only has to let the engine drain the
+/// instant, and any span reads the same. It must not be zero: a zero wait
+/// returns without parking (`virtual_clock::wait_virtual_ns`), and a
+/// thread that never parks holds the engine still.
+const SETTLE_NS: u64 = 1_000;
+const _: () = assert!(SETTLE_NS > 0);
+
+/// Park the master's thread for [`SETTLE_NS`] of virtual time and return with
+/// the bus at rest.
+///
+/// The thread is a registered actor ([`Bench`]), and the stepped engine
+/// advances only while every actor is parked: here it applies every drive
+/// the master queued before the call, delivers the card's sense callbacks,
+/// applies the card's answering drive, and then releases the thread — and it
+/// does nothing more until the thread parks again.
+fn settle() {
+    virtual_clock::wait_virtual_ns(SETTLE_NS);
+}
+
 /// Drive a level and then LET THE ENGINE RUN. Every edge goes through here: the
 /// drive is enqueued, the engine resolves it and delivers the card's sense
 /// callback, and the card's answering drive is resolved in turn. Skip the wait
 /// and the next sense reads what was there before.
 ///
-/// The wait is a CONDITION, not a duration: sensing our own pin reads the
-/// resolved net, so this returns as soon as the engine has actually applied the
-/// drive. A fixed sleep long enough to be safe on a loaded machine costs
-/// milliseconds per edge, and a 512-byte block is 12 288 of them — the
-/// difference between a test that runs in a second and one that runs in a
-/// minute and a quarter.
+/// The wait is [`settle`], so when it returns the card has answered too —
+/// on a falling clock edge, the edge the card presents its next bit on, its
+/// DO drive has been applied — and sensing our own pin reads the level we
+/// drove, exactly.
 fn drive_and_settle(pin: &PinHandle, level: Level) {
     pin.set_drive(Some(digital_drive(level)));
-    for _ in 0..SETTLE_POLLS {
-        if level_of(pin.net_report()) == Some(level) {
-            return;
-        }
-        std::thread::sleep(SETTLE_POLL);
-    }
-    panic!("the engine never applied a drive of {level:?}");
+    settle();
+    assert_eq!(
+        level_of(pin.net_report()),
+        Some(level),
+        "the engine applied a drive of {level:?}"
+    );
 }
-
-/// How long each poll of [`drive_and_settle`] waits, and how many it allows
-/// before giving up — together, a generous ceiling on how long the engine may
-/// take to resolve one drive.
-const SETTLE_POLL: Duration = Duration::from_micros(50);
-const SETTLE_POLLS: u32 = 2_000;
-
-/// Drop the clock and give the card time to answer.
-///
-/// [`drive_and_settle`] can only wait on a condition it can observe, and what
-/// it observes is OUR drive landing — which says nothing about whether the
-/// card's sense callback has run and its answering DO drive has been resolved.
-/// The falling edge is the one where that matters, because it is the edge the
-/// card presents its next bit on, so this is the one place a fixed wait is
-/// unavoidable.
-///
-/// Waiting here rather than in every `drive_and_settle` is what keeps the
-/// 512-byte tests to seconds: one fixed wait per bit instead of three.
-fn clock_low(pin: &PinHandle) {
-    drive_and_settle(pin, Level::Low);
-    std::thread::sleep(CARD_ANSWER);
-}
-
-/// How long the card gets to put its next bit on the wire.
-const CARD_ANSWER: Duration = Duration::from_micros(300);
 
 /// A released MISO has no level at all — the card drives nothing when it is
 /// deselected, exactly as a real one does. A bench without a pull-up therefore
@@ -469,7 +498,7 @@ fn exchange(pins: &MasterPins, mosi: u8) -> u8 {
         );
         miso = (miso << 1) | u8::from(sense_bit(dout));
         drive_and_settle(clk, Level::High);
-        clock_low(clk);
+        drive_and_settle(clk, Level::Low);
     }
     miso
 }
@@ -495,27 +524,55 @@ fn net_command(pins: &MasterPins, cmd: u8, arg: u32, want: usize) -> Vec<u8> {
     out
 }
 
-fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if pred() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    pred()
+/// A running four-wire bench and the case's hold on it.
+///
+/// Field order is drop order, and it is load-bearing: the case's actor
+/// registration goes first, so a case that panics stops holding the
+/// engine's barrier before its system shuts down, and the suite lock goes
+/// last, after the engine has been joined.
+struct Bench {
+    /// The case's thread as a registered virtual-clock actor, from the
+    /// started bench to [`Bench::finish`]: what makes [`settle`] exact.
+    actor: Actor,
+    system: SystemHandle,
+    handles: Arc<Mutex<MasterPins>>,
+    _suite: MutexGuard<'static, ()>,
 }
 
-/// Bring up a four-wire bench with the card on it, and wait for the master's
-/// pins to be wired.
-fn spi_bench(
-    card: SdCard,
-) -> (
-    Arc<Mutex<MasterPins>>,
-    Arc<Mutex<SdCard>>,
-    embsim_board::SystemHandle,
-) {
-    virtual_clock::init(50.0, 1_000_000);
+impl Bench {
+    /// End the case: the engine must never have stopped waiting for the
+    /// case's thread (a `QuiescenceTimeout` would mean a settled read may
+    /// have raced the bus), then the thread leaves the barrier and the
+    /// system shuts down.
+    fn finish(self) {
+        let Bench {
+            actor,
+            system,
+            _suite,
+            ..
+        } = self;
+        let stalled: Vec<Finding> = system
+            .findings()
+            .into_iter()
+            .filter(|f| matches!(f, Finding::QuiescenceTimeout { .. }))
+            .collect();
+        assert!(
+            stalled.is_empty(),
+            "the engine stopped waiting for the case's thread, so a settled read \
+             may have raced the bus: {stalled:?}"
+        );
+        drop(actor);
+        system.shutdown();
+    }
+}
+
+/// Bring up a four-wire bench with `component` on it: take the suite lock,
+/// re-anchor the clock in stepped mode, start the bench with time held,
+/// register the case's thread as an actor, release time and settle — the
+/// bench is handed back at rest, the master's pins wired at attach.
+fn start_bench(component: SdCardComponent) -> Bench {
+    let suite = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
 
     let handles = Arc::new(Mutex::new(MasterPins::default()));
     let harness = Harness::new()
@@ -528,41 +585,54 @@ fn spi_bench(
         .connect_str("MASTER.DO", "CARD.MISO")
         .expect("endpoints parse");
 
-    let component = SdCardComponent::new(card).with_pins(&SD_CARD_PINS_SPI_ONLY);
-    let card_handle = component.card();
     let system = System::new()
         .component("MASTER", Box::new(BitBangMaster::new(Arc::clone(&handles))))
-        .component("CARD", Box::new(component))
+        .component(
+            "CARD",
+            Box::new(component.with_pins(&SD_CARD_PINS_SPI_ONLY)),
+        )
         .harness(harness)
+        .hold_time()
         .start()
         .expect("the bench system starts");
+    let actor = virtual_clock::register_actor("sd-card-spi-case");
+    system.release_time();
+    settle();
 
     assert!(
-        wait_for(
-            || handles.lock().expect("master pins").clk.is_some(),
-            Duration::from_secs(5)
-        ),
+        handles.lock().expect("master pins").clk.is_some(),
         "the master's pins are wired at attach"
     );
-    (handles, card_handle, system)
+    Bench {
+        actor,
+        system,
+        handles,
+        _suite: suite,
+    }
+}
+
+/// [`start_bench`] with `card` behind the adapter, and a handle on the card.
+fn spi_bench(card: SdCard) -> (Bench, Arc<Mutex<SdCard>>) {
+    let component = SdCardComponent::new(card);
+    let card_handle = component.card();
+    (start_bench(component), card_handle)
 }
 
 /// Idle the clock low and take the card out of, then into, chip select — the
-/// state a driver establishes before its first command.
+/// state a driver establishes before its first command. Selection is also an
+/// edge the card answers — it presents the first bit of whatever it has
+/// queued — and the chip select's settle applies that answer.
 fn open_bus(pins: &MasterPins) {
-    clock_low(pins.clk.as_ref().unwrap());
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
     drive_and_settle(pins.di.as_ref().unwrap(), Level::High);
     drive_and_settle(pins.cs.as_ref().unwrap(), Level::High);
     drive_and_settle(pins.cs.as_ref().unwrap(), Level::Low);
-    // Selection is also an edge the card answers: it presents the first bit of
-    // whatever it has queued.
-    std::thread::sleep(CARD_ANSWER);
 }
 
 #[test]
 fn the_card_initialises_over_nets_driven_bit_by_bit() {
-    let (handles, card, _system) = spi_bench(SdCard::blank(CARD_CAPACITY));
-    let pins = handles.lock().expect("master pins");
+    let (bench, card) = spi_bench(SdCard::blank(CARD_CAPACITY));
+    let pins = bench.handles.lock().expect("master pins");
     open_bus(&pins);
 
     assert_eq!(
@@ -579,6 +649,8 @@ fn the_card_initialises_over_nets_driven_bit_by_bit() {
         card.lock().expect("card").initialised,
         "the card behind the nets really did initialise"
     );
+    drop(pins);
+    bench.finish();
 }
 
 #[test]
@@ -586,8 +658,8 @@ fn a_block_written_over_nets_reads_back_over_nets() {
     // A recognisable payload: a mis-shifted byte stream would not reproduce it.
     let payload: Vec<u8> = (0..BLOCK_LEN).map(|i| (i * 7 % 251) as u8).collect();
 
-    let (handles, card, _system) = spi_bench(SdCard::blank(CARD_CAPACITY));
-    let pins = handles.lock().expect("master pins");
+    let (bench, card) = spi_bench(SdCard::blank(CARD_CAPACITY));
+    let pins = bench.handles.lock().expect("master pins");
     open_bus(&pins);
 
     // Write block 3.
@@ -629,6 +701,8 @@ fn a_block_written_over_nets_reads_back_over_nets() {
     assert_eq!(token, 0xFE, "the data-block start token");
     let read: Vec<u8> = (0..BLOCK_LEN).map(|_| exchange(&pins, 0xFF)).collect();
     assert_eq!(read, payload, "and came back byte for byte");
+    drop(pins);
+    bench.finish();
 }
 
 /// The control that makes the tests above mean something.
@@ -638,10 +712,15 @@ fn a_block_written_over_nets_reads_back_over_nets() {
 /// reads the released line. All-ones is exactly the signature of an empty
 /// socket, which is the failure this costs you: not a corrupt byte, a card that
 /// appears absent.
+///
+/// On the stepped clock "never lets the engine run" is exact: the master is
+/// a registered actor that never parks between its edges, and the engine
+/// advances nothing while an actor is running, so every bit it senses is
+/// the line as the settle after start-up left it — released.
 #[test]
 fn without_a_yield_between_edges_the_card_reads_as_absent() {
-    let (handles, _card, _system) = spi_bench(SdCard::blank(CARD_CAPACITY));
-    let pins = handles.lock().expect("master pins");
+    let (bench, _card) = spi_bench(SdCard::blank(CARD_CAPACITY));
+    let pins = bench.handles.lock().expect("master pins");
 
     let rush = |p: &PinHandle, l: Level| p.set_drive(Some(digital_drive(l)));
     rush(pins.clk.as_ref().unwrap(), Level::Low);
@@ -673,6 +752,12 @@ fn without_a_yield_between_edges_the_card_reads_as_absent() {
         r1, 0x01,
         "a master that never yields cannot have read the idle response"
     );
+    assert_eq!(
+        r1, 0xFF,
+        "every bit it sensed is the released line: the empty socket's signature"
+    );
+    drop(pins);
+    bench.finish();
 }
 
 /// The counters exist so a test can assert the bus MOVED, rather than inferring
@@ -680,33 +765,11 @@ fn without_a_yield_between_edges_the_card_reads_as_absent() {
 /// that never clocked look identical from the response alone.
 #[test]
 fn the_adapter_counts_the_edges_and_bytes_it_actually_saw() {
-    virtual_clock::init(50.0, 1_000_000);
-
-    let handles = Arc::new(Mutex::new(MasterPins::default()));
-    let harness = Harness::new()
-        .connect_str("MASTER.CS", "CARD.CS")
-        .expect("endpoints parse")
-        .connect_str("MASTER.CLK", "CARD.CLK")
-        .expect("endpoints parse")
-        .connect_str("MASTER.DI", "CARD.MOSI")
-        .expect("endpoints parse")
-        .connect_str("MASTER.DO", "CARD.MISO")
-        .expect("endpoints parse");
-
-    let component = SdCardComponent::blank(CARD_CAPACITY).with_pins(&SD_CARD_PINS_SPI_ONLY);
+    let component = SdCardComponent::blank(CARD_CAPACITY);
     let counters = component.counters();
-    let _system = System::new()
-        .component("MASTER", Box::new(BitBangMaster::new(Arc::clone(&handles))))
-        .component("CARD", Box::new(component))
-        .harness(harness)
-        .start()
-        .expect("the bench system starts");
-    assert!(wait_for(
-        || handles.lock().expect("master pins").clk.is_some(),
-        Duration::from_secs(5)
-    ));
+    let bench = start_bench(component);
 
-    let pins = handles.lock().expect("master pins");
+    let pins = bench.handles.lock().expect("master pins");
     open_bus(&pins);
     for b in [0x40u8, 0, 0, 0, 0, 0x95] {
         exchange(&pins, b);
@@ -723,6 +786,8 @@ fn the_adapter_counts_the_edges_and_bytes_it_actually_saw() {
         6 * 16,
         "two edges per bit, and none counted while deselected"
     );
+    drop(pins);
+    bench.finish();
 }
 
 #[test]
@@ -774,8 +839,8 @@ fn a_fat16_image_built_in_memory_reads_back_over_the_wire() {
     // why the cluster count, not the label, decides the type.
     let image = build(32 * 1024 * 1024, &root).expect("a FAT16 image builds");
 
-    let (handles, _card, _system) = spi_bench(SdCard::with_image(image.clone()));
-    let pins = handles.lock().expect("master pins");
+    let (bench, _card) = spi_bench(SdCard::with_image(image.clone()));
+    let pins = bench.handles.lock().expect("master pins");
     open_bus(&pins);
 
     assert_eq!(
@@ -808,4 +873,6 @@ fn a_fat16_image_built_in_memory_reads_back_over_the_wire() {
         image[..BLOCK_LEN],
         "the sector on the wire is the sector in the image, byte for byte"
     );
+    drop(pins);
+    bench.finish();
 }

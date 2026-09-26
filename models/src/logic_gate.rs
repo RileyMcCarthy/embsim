@@ -144,8 +144,9 @@ pub const LVC2G04_HIGH_AT_VOLTS: Volts = 2.0;
 /// 74LVC2G04 `V_IL` max at `V_CC` = 2.7 V to 3.6 V: 0.8 V (Table 7).
 pub const LVC2G04_LOW_AT_VOLTS: Volts = 0.8;
 /// 74LVC2G04 input hysteresis as a separate figure: none — Table 7 gives
-/// the two thresholds and no `ΔV_T` (the band between them is where the
-/// input holds its last level).
+/// the two thresholds and no `ΔV_T`, so the band between `V_IL` max and
+/// `V_IH` min guarantees no level ([`DeadBand::Unknown`], as
+/// [`Config::lvc2g04`] declares it).
 pub const LVC2G04_HYSTERESIS_VOLTS: Volts = 0.0;
 /// 74LVC2G04 high-level output impedance: `(3.0 V − V_OH min 2.3 V) /
 /// 24 mA` (Table 7, `I_O` = −24 mA, `V_CC` = 3.0 V).

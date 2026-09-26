@@ -108,6 +108,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -490,10 +492,11 @@ impl VoltsTable {
 
     /// Publish net `net`'s voltage (the engine thread only).
     pub(crate) fn store(&self, net: usize, volts: NetVolts) {
-        if let Some(cell) = self.cells.get(net) {
-            for (slot, word) in cell.iter().zip(Self::words(volts)) {
-                slot.store(word, Ordering::Relaxed);
-            }
+        if let Some([dc, hi, lo]) = self.cells.get(net) {
+            let [dc_word, hi_word, lo_word] = Self::words(volts);
+            dc.store(dc_word, Ordering::Relaxed);
+            hi.store(hi_word, Ordering::Relaxed);
+            lo.store(lo_word, Ordering::Relaxed);
         }
     }
 
@@ -1279,7 +1282,22 @@ struct PassFindings {
 }
 
 impl PassFindings {
+    /// Whether the pass found nothing — every pass of a clean edge.
+    fn is_empty(&self) -> bool {
+        self.contention.is_empty()
+            && self.floating.is_empty()
+            && self.power.is_empty()
+            && self.injection.is_empty()
+            && self.nonconvergent.is_empty()
+            && self.coupling.is_empty()
+    }
+
     fn emit(mut self, diagnostics: &mut Diagnostics) {
+        // A clean pass reports nothing, and builds no six-list chain to
+        // say so (`DESIGN.md` rule 8: the edge path).
+        if self.is_empty() {
+            return;
+        }
         // Stable sorts: a root's `AmbiguousLevel` is pushed right behind its
         // `Contention` under the same key and stays there.
         self.contention.sort_by_key(|(key, _)| *key);
@@ -4757,6 +4775,52 @@ enum TimerTarget {
     Wake(ComponentId),
 }
 
+/// The subscriber a wake's [`Finding::CallbackPanic`] names — `component
+/// {index}` — formatted only if the handler panicked.
+struct WakeSubscriber(ComponentId);
+
+impl fmt::Display for WakeSubscriber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "component {}", self.0 .0)
+    }
+}
+
+/// The wheel's armed `(component, deadline)` keys ([`EngineCore`]'s
+/// `armed_wakes`), under a fixed hasher.
+type WakeKeys = HashSet<(usize, u64), BuildHasherDefault<WakeKeyHasher>>;
+
+/// A fixed multiply-rotate hash (the `FxHasher` shape) for the wheel's
+/// `(component, deadline)` keys: every wake inserts one and removes one,
+/// and `std`'s keyed SipHash was two fifths of the wheel's own work per
+/// wake in a debug build (`NODES.md` §12 item 5, "Performance and stepped
+/// tests"). Nothing about the set's order escapes it — it is a membership
+/// gate, never iterated — so neither the hash's quality against an
+/// adversary nor its seed matters here.
+#[derive(Default, Clone, Copy)]
+struct WakeKeyHasher(u64);
+
+impl Hasher for WakeKeyHasher {
+    fn finish(&self) -> u64 {
+        // The multiply leaves its best bits high; hashbrown indexes by the
+        // low ones.
+        self.0.rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0xf135_7aea_2e62_a9c5);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
+}
+
 /// One armed wakeup. Ordered by `(deadline_ns, seq)` so simultaneous and
 /// late deadlines fire in schedule order.
 #[derive(Debug, Clone, Copy, Eq)]
@@ -4879,12 +4943,11 @@ struct EngineCore {
     /// Whether any subscription depends on a net beside its own: a pass
     /// with none skips the dependents' walk.
     any_dependent_subs: bool,
-    // hash-order: every map below is **keyed access only** — `get`, `entry`,
-    // `insert`, `contains_key`. None is iterated. Sense delivery walks
-    // `self.nets` by index and the per-net callbacks are a `Vec` in
-    // registration order. Adding an iteration over any of these needs a sort
-    // (see the module's review rule).
-    wake_subs: HashMap<usize, WakeCallback>,
+    /// Each component's wake handler, dense by [`ComponentId`] (`None`
+    /// until it registers one): a wake looks its handler up by index,
+    /// never through a hash (`DESIGN.md` rule 8 — a wake is on the edge
+    /// path of every node that clocks its own bits).
+    wake_subs: Vec<Option<WakeCallback>>,
     topology_observers: Vec<TopologyCallback>,
     topology_epoch: u64,
     wheel: BinaryHeap<Reverse<TimerEntry>>,
@@ -4897,8 +4960,10 @@ struct EngineCore {
     /// each of which re-requests again. Measured before this set: ~500 wheel
     /// entries per stepper edge during an SD burst, a quarter of the engine
     /// thread in `BinaryHeap::pop`, and virtual time at 0.0001x.
-    /// hash-order: keyed access only (`insert`, `remove`), never iterated.
-    armed_wakes: HashSet<(usize, u64)>,
+    /// hash-order: keyed access only (`insert`, `remove`), never iterated —
+    /// which is also why its hasher may be a fixed, cheap one
+    /// ([`WakeKeyHasher`]).
+    armed_wakes: WakeKeys,
     timer_seq: u64,
     /// Drives received but not yet applicable (a lower enqueue seq is still
     /// in flight); applied strictly in seq order.
@@ -4957,17 +5022,24 @@ impl EngineCore {
     /// component must not silently end net service for every other
     /// component (net state would freeze at the last publication with the
     /// only symptom a join-time error, potentially hours later).
-    fn deliver_contained(&self, kind: CallbackKind, subscriber: &str, deliver: impl FnOnce()) {
+    ///
+    /// `subscriber` is named only when the callback panicked: a delivery
+    /// that returns formats and allocates nothing for it (a wake is on the
+    /// edge path of every node that clocks its own bits).
+    fn deliver_contained(
+        &self,
+        kind: CallbackKind,
+        subscriber: &dyn fmt::Display,
+        deliver: impl FnOnce(),
+    ) {
         if catch_unwind(AssertUnwindSafe(deliver)).is_err() {
+            let subscriber = subscriber.to_string();
             tracing::error!(
                 kind = ?kind,
-                subscriber,
+                subscriber = subscriber.as_str(),
                 "component callback panicked; contained, engine continues"
             );
-            self.report_finding(Finding::CallbackPanic {
-                kind,
-                subscriber: subscriber.to_string(),
-            });
+            self.report_finding(Finding::CallbackPanic { kind, subscriber });
         }
     }
 
@@ -5171,17 +5243,26 @@ impl EngineCore {
     /// net's state is provably unchanged), and a drive identical to the one
     /// already held resolves nothing at all.
     fn apply_ready_drives(&mut self) {
+        if self.pending_drives.is_empty() {
+            return;
+        }
         while let Some((endpoint, drive)) = self.pending_drives.remove(&self.next_drive_seq) {
-            let seq = self.next_drive_seq;
-            self.next_drive_seq += 1;
-            self.event_log.record(|| EngineEvent::DriveApplied {
-                seq,
-                endpoint,
-                drive,
-            });
-            if self.resolver.set_drive(endpoint, drive) {
-                self.resolve_and_publish_dirty();
-            }
+            self.apply_drive(self.next_drive_seq, endpoint, drive);
+        }
+    }
+
+    /// Apply the drive whose turn it is — `seq` is the next in sequence —
+    /// and resolve what it changed.
+    fn apply_drive(&mut self, seq: u64, endpoint: EndpointId, drive: Option<Drive>) {
+        debug_assert_eq!(seq, self.next_drive_seq, "drives apply in sequence");
+        self.next_drive_seq += 1;
+        self.event_log.record(|| EngineEvent::DriveApplied {
+            seq,
+            endpoint,
+            drive,
+        });
+        if self.resolver.set_drive(endpoint, drive) {
+            self.resolve_and_publish_dirty();
         }
     }
 
@@ -5264,12 +5345,15 @@ impl EngineCore {
                     let deliver = self.armed_wakes.remove(&(component.0, head.deadline_ns));
                     if !deliver {
                         // fall through to the periodic re-arm
-                    } else if let Some(callback) = self.wake_subs.get(&component.0) {
+                    } else if let Some(Some(callback)) = self.wake_subs.get(component.0) {
                         self.event_log.record(|| EngineEvent::Wake { component });
-                        let subscriber = format!("component {}", component.0);
-                        self.deliver_contained(CallbackKind::Wake, &subscriber, || {
-                            callback(now);
-                        });
+                        self.deliver_contained(
+                            CallbackKind::Wake,
+                            &WakeSubscriber(component),
+                            || {
+                                callback(now);
+                            },
+                        );
                     } else {
                         tracing::debug!(
                             component = component.0,
@@ -5317,7 +5401,15 @@ impl EngineCore {
                 endpoint,
                 drive,
             } => {
-                self.pending_drives.insert(seq, (endpoint, drive));
+                // The next in sequence — every drive, unless two threads'
+                // sends crossed — applies at once: nothing lower is still
+                // in flight, and buffering it only to take it straight
+                // back out is a map insert and remove per edge.
+                if seq == self.next_drive_seq {
+                    self.apply_drive(seq, endpoint, drive);
+                } else {
+                    self.pending_drives.insert(seq, (endpoint, drive));
+                }
                 self.apply_ready_drives();
             }
             Command::RegisterSense {
@@ -5392,7 +5484,10 @@ impl EngineCore {
                 component,
                 callback,
             } => {
-                self.wake_subs.insert(component.0, callback);
+                if self.wake_subs.len() <= component.0 {
+                    self.wake_subs.resize_with(component.0 + 1, || None);
+                }
+                self.wake_subs[component.0] = Some(callback);
             }
             Command::ScheduleAt { component, at_ns } => {
                 // Wheel entries make the run loop read the virtual clock;
@@ -5419,7 +5514,7 @@ impl EngineCore {
             }
             Command::RegisterTopologyObserver { callback } => {
                 let epoch = self.topology_epoch;
-                self.deliver_contained(CallbackKind::Topology, "topology observer", || {
+                self.deliver_contained(CallbackKind::Topology, &"topology observer", || {
                     callback(epoch);
                 });
                 self.topology_observers.push(callback);
@@ -5749,11 +5844,11 @@ impl EngineHandle {
             old: Vec::new(),
             dependent_subs: Vec::new(),
             any_dependent_subs: false,
-            wake_subs: HashMap::new(),
+            wake_subs: Vec::new(),
             topology_observers: Vec::new(),
             topology_epoch: 0,
             wheel: BinaryHeap::new(),
-            armed_wakes: HashSet::new(),
+            armed_wakes: WakeKeys::default(),
             timer_seq: 0,
             pending_drives: BTreeMap::new(),
             next_drive_seq: 0,
@@ -7578,6 +7673,71 @@ mod tests {
                 subscriber: "N0".to_string(),
             }),
             "the panic must surface as a finding; got {:?}",
+            handle.findings()
+        );
+    }
+
+    /// A panicking wake handler is contained like a sense callback, and
+    /// the finding names the component — the name built only once the
+    /// handler has panicked (`deliver_contained`'s subscriber) — while a
+    /// wake for a component with no handler fires into nothing and the
+    /// next component is still woken.
+    #[rstest]
+    fn wake_callback_panic_is_contained_and_names_the_component() {
+        behaviour!(Test {
+            id: "engine.wake-crash-contained",
+            covers: Some("board/src/engine.rs#EngineCore::deliver_contained"),
+            given: "three components woken in turn: the first's wakeup handler crashes, the \
+                    second never registered one, the third is well-behaved",
+        });
+        expect!(
+            "others-woken",
+            "the well-behaved component is still woken, at the instant it asked for"
+        );
+        expect!("engine-alive", "the engine stays alive");
+        expect!(
+            "crash-names-component",
+            "the crash is reported as a finding naming the component by its index on the board",
+            "a wakeup carries only its instant, so the index is the one name the engine has for \
+             the component",
+        );
+        let _g = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        // Held while the three wakeups are armed, so they fire in their
+        // deadlines' order by construction.
+        let handle = empty_engine_held();
+        let log = wake_log(&handle, ComponentId(0));
+        handle.link().send_control(Command::RegisterWake {
+            component: ComponentId(2),
+            callback: Box::new(|_| panic!("component bug")),
+        });
+        let now = virtual_clock::virtual_ns();
+        for (component, at_ns) in [
+            (ComponentId(2), now + 1_000),
+            (ComponentId(1), now + 1_500),
+            (ComponentId(0), now + 2_000),
+        ] {
+            handle
+                .link()
+                .send_control(Command::ScheduleAt { component, at_ns });
+        }
+        handle.release_time();
+
+        assert!(
+            wait_for(|| !log.lock().unwrap().is_empty(), Duration::from_secs(5)),
+            "the well-behaved component must still be woken"
+        );
+        assert_eq!(*log.lock().unwrap(), vec![now + 2_000]);
+        assert!(
+            handle.is_alive(),
+            "a contained wake panic must not kill the engine"
+        );
+        assert!(
+            handle.findings().contains(&Finding::CallbackPanic {
+                kind: CallbackKind::Wake,
+                subscriber: "component 2".to_string(),
+            }),
+            "the panic must surface as a finding naming the component; got {:?}",
             handle.findings()
         );
     }

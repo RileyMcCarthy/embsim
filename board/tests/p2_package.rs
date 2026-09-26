@@ -568,7 +568,7 @@ fn xi_takes_a_small_swing_as_the_crystal_once_the_clock_word_turns_its_feedback_
     stepped();
     const MS: u64 = 1_000_000;
     // `%1_100111_0100101000_1111_10_00`: `%CC` = `%10` with RCFAST still
-    // selected, the datasheet's first step (System Clock, p. 18: "enable
+    // selected, the datasheet's first step (PLL Example, p. 19: "enable
     // crystal+PLL, stay in RCFAST mode"); then `HUBSET #$F0`, RCFAST with
     // `%CC` = `%00`.
     let crystal_mode = 0x019D_28F8;

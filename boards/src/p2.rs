@@ -32,8 +32,15 @@
 //! its `%CC` field ([`XiMode`]; datasheet, "System Clock", p. 18). In the
 //! mode the chip starts in, `%00`, `XI` is ignored and its 1 MΩ feedback
 //! resistor is off ("Mode 0 : Disabled (1MΩ feedback resistor off)", AC
-//! Characteristics, p. 48), and the package reads the crystal through
-//! `XI`'s declared thresholds, as any receiver reads a clock. In `%01`,
+//! Characteristics, p. 48), so by the datasheet the chip has no crystal
+//! there. The package deviates, named here and at [`XiMode::Plain`]: it
+//! still reads the rate on `XI` through the pin's declared thresholds, as
+//! any receiver reads a clock, and reports it — the rate the board
+//! delivers to the pin, which is what the board's clock-chain tests
+//! observe before any guest sets a word. No core clocks from it: the QEMU
+//! core, the one that clocks from the crystal, selects `XI` or the PLL
+//! only with `%CC` ≠ `%00`, as the datasheet's `%SS` notes need
+//! (`embsim_p2_qemu::clock_hz`). In `%01`,
 //! `%10` and `%11` — direct drive and the two crystal modes — `XO` drives
 //! ("600-ohm drive") and "1M-ohm" joins it to `XI`: the oscillator's stage
 //! with its feedback resistor, which rests `XI` at the stage's own
@@ -667,8 +674,13 @@ pub enum StartState {
 pub enum XiMode {
     /// `%CC` = `%00`, the mode the chip starts in: `XI` "ignored", `XO`
     /// "float", "Hi-Z" — "Mode 0 : Disabled (1MΩ feedback resistor off)"
-    /// (AC Characteristics, `Cin` row, p. 48). `XI` is read through its
-    /// declared thresholds, [`P2_UNBANKED_INPUT_THRESHOLDS`].
+    /// (AC Characteristics, `Cin` row, p. 48). Per the datasheet the chip
+    /// has no crystal in this mode; the package deviates and still reads
+    /// `XI` through its declared thresholds, [`P2_UNBANKED_INPUT_THRESHOLDS`],
+    /// reporting the rate the board delivers to the pin (the module docs,
+    /// "`XI` and the clock word": what the clock-chain tests observe, and a
+    /// clock to no core — the QEMU decode needs `%CC` ≠ `%00` to select
+    /// `XI` or the PLL).
     #[default]
     Plain,
     /// `%CC` = `%01`, `%10` or `%11`: `XI` an "input", `XO` a "600-ohm
@@ -1943,10 +1955,14 @@ mod tests {
     #[case::crystal_15pf_rcfast(0b10_00, XiMode::FedBack)]
     #[case::crystal_30pf_xi(0b11_10, XiMode::FedBack)]
     // The datasheet's 148.5 MHz example word, `%1_100111_0100101000_1111_10_11`
-    // (System Clock, p. 18): `%CC` = `%10`.
+    // (PLL Example, p. 19): `%CC` = `%10`.
     #[case::crystal_pll_148_5_mhz(0x019D_28FB, XiMode::FedBack)]
-    // `embsim-p2-qemu`'s `crystal_pll` guest's PLL word, `$010007F3`:
-    // `%CC` = `%00`.
+    // `embsim-p2-qemu`'s `crystal_pll` guest's PLL word, `$010007FB`,
+    // flexspin's for 160 MHz on a 20 MHz crystal: `%CC` = `%10`.
+    #[case::crystal_pll_160_mhz(0x0100_07FB, XiMode::FedBack)]
+    // A word selecting the PLL with `%CC` = `%00`, `$010007F3` (that
+    // guest's before the QEMU decode read `%CC`): `XI` stays plain, and the
+    // core's decode gives the word no clock.
     #[case::pll_selected_with_xi_ignored(0x0100_07F3, XiMode::Plain)]
     fn the_clock_words_cc_field_is_xis_mode(#[case] word: u32, #[case] mode: XiMode) {
         assert_eq!(XiMode::of_clock_word(word), mode);

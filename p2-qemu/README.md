@@ -94,9 +94,12 @@ comes up on RCFAST (20 MHz nominal) and stays there until the guest writes a
 clock word with `HUBSET` — the ROM never does; a flexspin program sets its
 PLL in its first instructions. The target records that word and the cog
 clock it was written at (`p2_clock_mode`), and the node decodes it: RCFAST,
-RCSLOW, the crystal on `XI`, or the PLL `crystal / (D+1) * (M+1) / P`. A
-change adds a segment to a piecewise mapping, so instants before it keep
-their timestamps.
+RCSLOW, the crystal on `XI`, or the PLL `crystal / (D+1) * (M+1) / P`. `XI`
+and the PLL are read with the fields the datasheet's `%SS` notes name
+(System Clock, p. 18): `XI` only with its input on, `%CC` ≠ `%00`, and the
+PLL only with that and `%E` set — a word that selects either without them
+has no clock, and the guest stalls for good. A change adds a segment to a
+piecewise mapping, so instants before it keep their timestamps.
 
 The crystal is not a number handed to the node: it is the **rate the board
 delivers on `XI`** (the P2-EC32MB's TCXO, through its buffer and coupling
@@ -218,8 +221,9 @@ and 2026-09-25 once more with the core started 3 ms after the reset releases
 (its P2 task; the p2core reference reused, p2core not having moved), and
 2026-09-25 after that phase's review (a clock's phases combined on their
 voltages, a supply's move re-delivering its pads, the resolver's scratch
-buffers; the reference reused again) — `compared 60000, identical` each
-time.
+buffers; the reference reused again), and 2026-09-26 with the clock decode
+reading `%CC` and `%E` beside `%SS` (the final lows; the reference reused)
+— `compared 60000, identical` each time.
 
 ## Facts of the board the boot test states as scenario
 
