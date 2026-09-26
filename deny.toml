@@ -32,8 +32,10 @@ ignore = []
 # ── Licenses ──────────────────────────────────────────────────────────────
 # Allow-list built from the crates actually resolved in the tree (verified via
 # `cargo deny list` / `cargo metadata`). Every entry is a permissive /
-# BSD-family license. NO copyleft is allowed: the one weak-copyleft option in
-# the tree, LGPL-2.1-or-later, appears only in `r-efi`'s
+# BSD-family license. Copyleft is refused, except where a
+# `[[licenses.exceptions]]` entry below names the one crate it is allowed for
+# and says why. The one weak-copyleft option among the dependencies,
+# LGPL-2.1-or-later, appears only in `r-efi`'s
 # `MIT OR Apache-2.0 OR LGPL-2.1-or-later` expression, so cargo-deny satisfies
 # it via MIT/Apache and LGPL is never selected.
 [licenses]
@@ -49,6 +51,15 @@ allow = [
     "Unlicense",     # memchr / aho-corasick: `Unlicense OR MIT`
 ]
 confidence-threshold = 0.8
+
+# embsim-boards compiles in `boards/netlists/p2_ec32mb.net`, a transcription of
+# Parallax's P2-EC32MB Rev B schematic, which Parallax publishes under
+# CC BY-SA 4.0. ShareAlike makes the transcription CC BY-SA 4.0 too, so the
+# crate is `MIT AND CC-BY-SA-4.0`. See boards/netlists/LICENSE. (The reason
+# lives in this comment: cargo-deny 0.19's exception entries take no `reason`.)
+[[licenses.exceptions]]
+crate = "embsim-boards"
+allow = ["CC-BY-SA-4.0"]
 
 [licenses.private]
 # embsim-minimal-example is `publish = false` and carries no license field;

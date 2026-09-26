@@ -1,7 +1,7 @@
 /*
  * embsim device models, for a C host.
  *
- * SPDX-License-Identifier: LGPL-2.1-or-later
+ * SPDX-License-Identifier: MIT
  *
  * There is ONE model of each device and it lives in Rust. A C host links this
  * rather than growing its own copy: a second implementation is a second set of
@@ -9,8 +9,12 @@
  * cover it.
  *
  * Link against `libembsim_cffi.a`. It is a Rust staticlib, so the final link
- * also needs the platform's usual C runtime bits -- on macOS `-framework
- * CoreFoundation -lSystem`, on Linux `-lpthread -ldl -lm`.
+ * also needs the native libraries the Rust standard library inside it uses.
+ * rustc names them: `cargo rustc -p embsim-cffi --lib -- --print
+ * native-static-libs` prints, on macOS, `-liconv -lSystem -lc -lm`. On Linux
+ * add `-lpthread -ldl -lm`, the list the C link test links with on the
+ * ubuntu CI runner. `cffi/tests/c_link.rs` links with exactly these two
+ * lists; keep the two in step.
  *
  * Every function tolerates a NULL handle and treats it as "no device fitted"
  * rather than dereferencing it, so a host that failed to construct one gets a
