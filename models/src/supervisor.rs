@@ -620,6 +620,29 @@ mod tests {
         assert_eq!(state.drives, 3);
     }
 
+    /// An asserted output sinks to the voltage `VSS` names and is released
+    /// where `VSS` names none: no ground is implied. (On a board `VCC` is
+    /// measured against `VSS`, so a `VSS` naming nothing hands `VCC`
+    /// nothing and the verdict is undefined first; the state is set here
+    /// directly to reach the sink with no ground under it.)
+    #[rstest]
+    #[case::held_ground(Some(0.0), Some(TheveninDrive { volts: 0.0, impedance: STM1061_R_OL_OHMS }))]
+    #[case::ground_above_zero(Some(0.2), Some(TheveninDrive { volts: 0.2, impedance: STM1061_R_OL_OHMS }))]
+    #[case::no_ground(None, None)]
+    fn an_asserted_output_sinks_to_the_voltage_vss_names(
+        #[case] vss: Option<Volts>,
+        #[case] expected: Option<TheveninDrive>,
+    ) {
+        let detector = VoltageDetector::new(Config::stm1061n16(), &STM1061_PINS_BY_FUNCTION);
+        let core = Arc::clone(&detector.core);
+        let mut state = core.state.lock().unwrap();
+        state.vss = handed(vss);
+        state.vcc = handed(Some(1.2));
+        core.on_supply(&mut state, 0);
+        assert_eq!(state.verdict, Verdict::Asserted, "1.2 V is under V_TH-");
+        assert_eq!(state.published, expected);
+    }
+
     /// A crossing reversed before its delay elapses publishes nothing.
     #[rstest]
     fn a_reversed_crossing_publishes_nothing_at_its_instant() {

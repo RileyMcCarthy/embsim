@@ -88,12 +88,18 @@
 //! the channel, and a re-anchoring relay would quietly desynchronise the
 //! carriage; forwarding the segment keeps the downstream count bit-identical
 //! to the firmware's, and relaying it costs **one drive per rate change**, not
-//! one per edge. Each phase is projected through the channel's own input
-//! thresholds, `0.3/0.7 × VCCI` (a phase inside the dead band reads as an
-//! open input: the default state); a square wave whose two phases project
-//! to one level crosses as that level. A channel that stops passing (its
-//! input side down) presents its default state, a level, and the clock
-//! stops at the barrier.
+//! one per edge. The channel relays a running square wave only where its
+//! two phases settle to two levels through the channel's own input
+//! thresholds, `0.3/0.7 × VCCI` ([`embsim_board::PeriodicSense::rate`], as
+//! every consumer of a rate takes it: the input then switches every cycle);
+//! a held segment — the stop that ends a relayed train and carries its
+//! final count — is forwarded where its phases settle to two levels the
+//! same way. Any other wave is the level the input reads from it
+//! ([`embsim_board::Sense::level`]: one level where both phases settle to
+//! it) or, where it reads none — a phase inside the dead band — an open
+//! input, and the output presents the default state. A channel that stops
+//! passing (its input side down) presents its default state, a level, and
+//! the clock stops at the barrier.
 //!
 //! A UART needs no role of its own. It used to have one — the input pin a
 //! stream `Consumer`, the output a `Producer`, bytes relayed one for one and
@@ -754,11 +760,14 @@ impl Core {
 
     /// The drive a channel's output pin should present: released while the
     /// output stage is not live; a square wave forwarded **verbatim** while
-    /// the channel is passing a clock (the module docs, "A clock crosses as a
-    /// clock"); otherwise the level the function table gives. The ports are
-    /// the output side's rail against its ground and that ground, in the
-    /// engine's frame while the ground sits at 0 V there — every board's
-    /// grounds do; a ground offset is not modelled.
+    /// the channel is passing a clock — a running segment whose phases
+    /// settle to two levels through the input's thresholds
+    /// ([`embsim_board::PeriodicSense::rate`]), or a held one whose phases
+    /// do (the module docs, "A clock crosses as a clock"); otherwise the
+    /// level the function table gives for the level the input reads. The
+    /// ports are the output side's rail against its ground and that ground,
+    /// in the engine's frame while the ground sits at 0 V there — every
+    /// board's grounds do; a ground offset is not modelled.
     fn desired_drive(&self, state: &CoreState, wiring: &Wiring) -> Option<Drive> {
         if !self.output_live(state, wiring) {
             return None;
@@ -770,18 +779,19 @@ impl Core {
             state.input[wiring.channel.index()].periodic,
         ) {
             let thresholds = self.config.input_thresholds().scaled(input_rail);
-            let default = self.config.default_level();
-            let (hi, lo) = clock.levels(&thresholds, state.input_level[wiring.channel.index()]);
-            let (hi, lo) = (hi.unwrap_or(default), lo.unwrap_or(default));
-            return Some(if hi == lo {
-                Drive::Thevenin(port(hi))
-            } else {
-                Drive::Periodic {
-                    hi: port(hi),
-                    lo: port(lo),
-                    segment: clock.segment,
+            // Two levels need both phases outside the dead band, on
+            // opposite sides, whatever the input read before.
+            if let (Some(hi), Some(lo)) = clock.levels(&thresholds, None) {
+                let relayed =
+                    clock.rate(&thresholds).is_some() || (clock.segment.freq_hz == 0 && hi != lo);
+                if relayed {
+                    return Some(Drive::Periodic {
+                        hi: port(hi),
+                        lo: port(lo),
+                        segment: clock.segment,
+                    });
                 }
-            });
+            }
         }
         Some(Drive::Thevenin(port(self.output_level(state, wiring))))
     }
@@ -1570,6 +1580,55 @@ mod tests {
         };
         assert_eq!((hi.volts, lo.volts), (3.3, 0.0));
         assert_eq!(hi.impedance, iso.core.config.output_impedance_ohms);
+    }
+
+    /// A square wave swinging `hi`/`lo` volts against the input's ground.
+    fn swinging(freq_hz: u32, hi: Volts, lo: Volts) -> Sense {
+        Sense {
+            volts: None,
+            periodic: Some(embsim_board::PeriodicSense {
+                hi: Some(hi),
+                lo: Some(lo),
+                segment: segment(freq_hz, 1_000_000),
+            }),
+            at_ns: 0,
+        }
+    }
+
+    /// A channel relays a clock only where its phases settle to two levels
+    /// through the input's thresholds (0.99 V / 2.31 V at 3.3 V): a
+    /// 0 V / 1.2 V wave puts its high phase in the dead band, so the input
+    /// reads no level from it — an open input, the default state, high for
+    /// a plain part and low for an `F` part; a 0 V / 0.9 V wave is a steady
+    /// low, relayed as that level by both. A held segment whose phases
+    /// cross — the stop that ends a relayed train — is forwarded verbatim.
+    #[rstest]
+    #[case::high_phase_in_the_band_plain(swinging(8_192, 1.2, 0.0), false, Level::High)]
+    #[case::high_phase_in_the_band_fail_safe(swinging(8_192, 1.2, 0.0), true, Level::Low)]
+    #[case::a_steady_low_plain(swinging(8_192, 0.9, 0.0), false, Level::Low)]
+    #[case::a_steady_low_fail_safe(swinging(8_192, 0.9, 0.0), true, Level::Low)]
+    fn a_clock_that_does_not_cross_the_input_is_a_level(
+        #[case] input: Sense,
+        #[case] fail_safe: bool,
+        #[case] expect: Level,
+    ) {
+        let (iso, monitor) = isolator(Config::new(Variant::Iso6741).fail_safe(fail_safe));
+        power_up(&iso);
+        set_input(&iso, Channel::A, input);
+        assert_eq!(monitor.relayed_segment(Channel::A), None, "no relay");
+        assert_eq!(monitor.train_count(), 0);
+        assert_eq!(monitor.output_level(Channel::A), Some(expect));
+        assert_eq!(
+            monitor.output_drive(Channel::A).map(|drive| drive.volts),
+            Some(if expect == Level::High { 3.3 } else { 0.0 })
+        );
+
+        // The same channel handed a held segment that crosses forwards it.
+        set_input(&iso, Channel::A, clock(0, 2_000_000));
+        assert_eq!(
+            monitor.relayed_segment(Channel::A),
+            Some(segment(0, 2_000_000))
+        );
     }
 
     /// A rate change costs one relay; re-delivering the same segment costs

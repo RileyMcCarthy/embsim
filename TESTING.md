@@ -107,7 +107,11 @@ cargo test -p embsim-board --lib source_strength
 # Read ID answered over the module's own nets. Since the interface phase's
 # cleanup: only the buffer's fed-back stage is self-biased (the build finds
 # `R101` from `2Y` back to `2A`), and a clock driven straight onto a plain
-# input is relayed only when its phases cross the input's thresholds.
+# input is relayed only when its phases cross the input's thresholds. The
+# final pass: a fed-back stage is self-biased only where it inverts with a
+# plain input — a buffer fed back the same way reads a coupled 0.8 V swing
+# as a steady low, and a Schmitt inverter drives levels and relays none of
+# it (read at a settled instant, the case's thread an actor).
 cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --test psram_spi
 # Phase 2, the P2 package (stepped, own binary): the rate on XI is the
 # crystal the package reports, the reset inputs as it projects them, every
@@ -123,7 +127,10 @@ cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --te
 # core runs and RESN is not asserted: reported, the core held, its wakes
 # stopped — and nothing with RESN asserted first); the native firmware
 # image's pads through the package's bank supplies, floating before START;
-# and the fast pad's strength fitted to the datasheet's output table.
+# and the fast pad's strength fitted to the datasheet's output table. The
+# final pass: a coupled 0.8 V swing on `XI` is the crystal from the instant
+# the core's clock word turns `XI`'s 1 MΩ feedback on, and none in the
+# clock mode the chip starts in.
 cargo test -p embsim-board --test p2_package
 # Phase 3, the solver half (stepped, own binary): a diode from the element
 # library conducts at (V − V_F)/R and blocks reversed, a switched channel
@@ -186,7 +193,11 @@ EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocap
 # handed its 1.65 V operating point with the contention beside it, a supply
 # move re-delivering a pad's sense (waited on as the reading itself), and —
 # the cleanup — a stepper counting a step clock only when its phases cross
-# its `STEP` thresholds.
+# its `STEP` thresholds; the final pass — a step clock that stops crossing
+# and crosses again under one schedule counted once per pulse, from the
+# instant it crosses again, wherever that lands against the drive's own
+# position samples, and a build's senses carrying instant 0 whatever the
+# clock reads.
 cargo test -p embsim-board --test receiver_projection --test pin_declarations
 # The interface phase's rules task (stepped, own binary): a fought node
 # under an ADC

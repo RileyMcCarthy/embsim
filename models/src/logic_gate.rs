@@ -26,13 +26,20 @@
 //! See [`Mode`].
 //!
 //! **A self-biased input** is the one exception, found at attach: a channel
-//! whose input node has a resistor to its own output node
+//! of an **inverting** part with a **plain** input — no hysteresis, and no
+//! level in its band ([`Config::biases_itself`]) — whose input node has a
+//! resistor to its own output node
 //! ([`embsim_board::ComponentNetIo::resistors_at`], read once) relays every
 //! running segment its input carries, whatever its phases. That resistor
 //! returns the output's average to the input, so the input rests at the
 //! stage's own switching point, and a swing coupled onto it through a
 //! capacitor is a swing *around* that point: it crosses it every cycle,
-//! however small. The engine hands a coupled node its source's swing, which
+//! however small. The circuit fact holds only for that stage: on a buffer
+//! the same resistor is positive feedback, a keeper that holds the input at
+//! the rail its output drives; on a Schmitt input a swing must exceed the
+//! hysteresis to toggle it, and a Schmitt inverter fed back through a
+//! resistor is a relaxation oscillator's shape, not a bias. Either keeps
+//! the rule every other input has. The engine hands a coupled node its source's swing, which
 //! the capacitor has stripped of any DC level (`NODES.md` §10, the periodic
 //! row), so the input's thresholds — absolute, measured from ground — have
 //! nothing to place it against. The P2-EC32MB's `U101` is the case: `R101`
@@ -249,6 +256,16 @@ impl Config {
         }
     }
 
+    /// Whether a resistor from a channel's output back to its input biases
+    /// that input at the stage's own switching point (the module docs, "A
+    /// self-biased input"): an inverting stage whose input is plain — no
+    /// hysteresis figure and no level guaranteed inside its band
+    /// ([`DeadBand::Unknown`]). The 74LVC2G04 is one; the SN74LVC1G14, a
+    /// Schmitt trigger, and any buffer are not.
+    pub fn biases_itself(&self) -> bool {
+        self.inverting && self.dead_band == DeadBand::Unknown && self.hysteresis_volts == 0.0
+    }
+
     /// The inputs' thresholds, **absolute** against the ground pin, as both
     /// datasheets give them over the supply range: `V_IL`/`V_T−`,
     /// `V_IH`/`V_T+`, the hysteresis and the dead-band policy.
@@ -395,9 +412,10 @@ struct ChannelState {
     input: Sense,
     /// The input's last projected level — the hysteresis memory.
     last_level: Option<Level>,
-    /// A resistor joins the input's node to the output's (found at attach,
-    /// from the build topology): the input is biased at the stage's own
-    /// switching point, and any running segment it carries is relayed.
+    /// A resistor joins the input's node to the output's on a stage that
+    /// biases itself ([`Config::biases_itself`]; found at attach, from the
+    /// build topology): the input is biased at the stage's own switching
+    /// point, and any running segment it carries is relayed.
     self_biased: bool,
     mode: Mode,
     /// The last drive asked for, whether applied yet or still pending.
@@ -618,9 +636,10 @@ impl LogicGateMonitor {
         self.core.state.lock().unwrap().channels[index].mode
     }
 
-    /// Whether channel `index`'s input is self-biased — a resistor from its
-    /// output node back to its input node, found at attach — and so relays
-    /// every running segment its input carries (the module docs).
+    /// Whether channel `index`'s input is self-biased — an inverting stage
+    /// with a plain input and a resistor from its output node back to its
+    /// input node, found at attach — and so relays every running segment
+    /// its input carries (the module docs).
     pub fn self_biased(&self, index: usize) -> bool {
         self.core.state.lock().unwrap().channels[index].self_biased
     }
@@ -773,12 +792,14 @@ impl Component for LogicGate {
                 channel.output = Some(io.pin(channel.output_pin)?);
                 // A build-time topology query, read once: a resistor from
                 // this channel's output node back to its input node biases
-                // the input at the stage's own switching point.
+                // the input at the stage's own switching point — on an
+                // inverting stage with a plain input only.
                 let output = io.node(channel.output_pin)?;
-                channel.self_biased = io
-                    .resistors_at(channel.input_pin)?
-                    .iter()
-                    .any(|resistor| resistor.far == output);
+                channel.self_biased = self.core.config.biases_itself()
+                    && io
+                        .resistors_at(channel.input_pin)?
+                        .iter()
+                        .any(|resistor| resistor.far == output);
             }
             (
                 self.pins
@@ -1065,6 +1086,18 @@ mod tests {
         // A held segment is no rate there either.
         core.on_input(&mut state, 1, tcxo(0));
         assert_eq!(state.channels[1].mode, Mode::Level);
+    }
+
+    /// Only an inverting stage with a plain input biases itself through a
+    /// resistor from its output: the 74LVC2G04; neither the SN74LVC1G14's
+    /// Schmitt input nor a buffer.
+    #[rstest]
+    #[case::plain_inverter(Config::lvc2g04(), true)]
+    #[case::schmitt_inverter(Config::lvc1g14(), false)]
+    #[case::plain_buffer(Config { inverting: false, ..Config::lvc2g04() }, false)]
+    #[case::schmitt_buffer(Config { inverting: false, ..Config::lvc1g14() }, false)]
+    fn only_an_inverting_plain_stage_biases_itself(#[case] config: Config, #[case] biases: bool) {
+        assert_eq!(config.biases_itself(), biases);
     }
 
     /// Unpowered, every output is released and no rate crosses.

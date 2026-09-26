@@ -23,8 +23,28 @@
 //! | `VDD`, the 16 `VIO_a_b` | `PowerIn` (sensed), measured against `GND` | — |
 //! | `GND` | `PowerIn` | — |
 //! | `RESN`, `TEST` | `Signal` senses through [`P2_UNBANKED_INPUT_THRESHOLDS`] (`RESN` read by the START gate) | — |
-//! | `XI` | a `Signal` sense through [`P2_UNBANKED_INPUT_THRESHOLDS`]: the segment of a square wave whose phases cross them **is the crystal** | — |
+//! | `XI` | a `Signal` sense through [`P2_UNBANKED_INPUT_THRESHOLDS`]: the segment of a square wave whose phases cross them **is the crystal** — any running segment, once the core's clock word turns on `XI`'s 1 MΩ feedback ([`XiMode`]) | — |
 //! | `XO` | `Signal` output, released | the crystal driver, unused with an external clock |
+//!
+//! # `XI` and the clock word
+//!
+//! What `XI` is depends on the clock mode the guest selects with `HUBSET`:
+//! its `%CC` field ([`XiMode`]; datasheet, "System Clock", p. 18). In the
+//! mode the chip starts in, `%00`, `XI` is ignored and its 1 MΩ feedback
+//! resistor is off ("Mode 0 : Disabled (1MΩ feedback resistor off)", AC
+//! Characteristics, p. 48), and the package reads the crystal through
+//! `XI`'s declared thresholds, as any receiver reads a clock. In `%01`,
+//! `%10` and `%11` — direct drive and the two crystal modes — `XO` drives
+//! ("600-ohm drive") and "1M-ohm" joins it to `XI`: the oscillator's stage
+//! with its feedback resistor, which rests `XI` at the stage's own
+//! switching point, so any running segment on `XI` is a swing around that
+//! point and the crystal — a self-biased input, as `U101`'s second stage
+//! is on the P2-EC32MB ([`embsim_models::logic_gate`], "A self-biased
+//! input"). A core that runs a guest reports the clock word it set through
+//! [`P2Pads::set_clock_mode`]; a core that reports none leaves `XI` in the
+//! mode the chip starts in. Not modelled, as for the gate: a source driving
+//! `XI` DC-coupled hard enough to hold it off its switching point, whose
+//! swing is still taken as the crystal in a fed-back mode.
 //!
 //! # The START gate
 //!
@@ -162,7 +182,7 @@
 //!   no caller.
 
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use embsim_board::{
     jesd8c01_lvcmos_thresholds, Amps, AttachError, Component, ComponentNetIo, DeadBand,
@@ -639,21 +659,56 @@ pub enum StartState {
     },
 }
 
-/// The crystal `XI` is handed: the rate of the square wave it carries
-/// ([`Sense::periodic`]) when its two phases cross `XI`'s own declared
-/// thresholds, [`P2_UNBANKED_INPUT_THRESHOLDS`]
+/// What `XI` is to the chip, as the guest's clock word sets it: `HUBSET`'s
+/// `%CC` field, bits 3:2 of `%0000_000E_DDDD_DDMM_MMMM_MMMM_PPPP_CCSS`
+/// (P2X8C4M64P Datasheet, "System Clock", p. 18: the `%CC` table's "XI
+/// status", "XO status" and "XI / XO impedance" columns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XiMode {
+    /// `%CC` = `%00`, the mode the chip starts in: `XI` "ignored", `XO`
+    /// "float", "Hi-Z" — "Mode 0 : Disabled (1MΩ feedback resistor off)"
+    /// (AC Characteristics, `Cin` row, p. 48). `XI` is read through its
+    /// declared thresholds, [`P2_UNBANKED_INPUT_THRESHOLDS`].
+    #[default]
+    Plain,
+    /// `%CC` = `%01`, `%10` or `%11`: `XI` an "input", `XO` a "600-ohm
+    /// drive", "1M-ohm" between them — the `Cin` row's Mode 1 "Direct
+    /// drive" and Modes 2/3 "Crystal", the 1 MΩ feedback resistor on. `XI`
+    /// rests at the oscillator stage's own switching point: a self-biased
+    /// input, which any running segment crosses every cycle.
+    FedBack,
+}
+
+impl XiMode {
+    /// The mode a `HUBSET` clock word selects: its `%CC` field.
+    pub const fn of_clock_word(word: u32) -> Self {
+        if (word >> 2) & 0b11 == 0 {
+            Self::Plain
+        } else {
+            Self::FedBack
+        }
+    }
+}
+
+/// The crystal `XI` is handed in `mode`: the rate of the square wave it
+/// carries ([`Sense::periodic`]) — in [`XiMode::Plain`] when its two phases
+/// cross `XI`'s own declared thresholds, [`P2_UNBANKED_INPUT_THRESHOLDS`]
 /// ([`embsim_board::PeriodicSense::rate`]: an input sees a clock only when
-/// it crosses the input's switching point every cycle), or `None` for
-/// anything else — a held segment, a swing whose phases settle to one level
-/// or to none there, a level, a floating or fought pin (no clock reaches
-/// it). The package takes `XI` as an external clock's input: a crystal is
-/// passive and publishes no rate, and the P2-EC32MB buffers its TCXO's
-/// 0.8 V clipped sine to a full swing through `U101` before `XI`.
-pub fn crystal_of(sense: &Sense) -> Option<u64> {
-    sense
-        .periodic?
-        .rate(&P2_UNBANKED_INPUT_THRESHOLDS)
-        .map(|segment| u64::from(segment.freq_hz))
+/// it crosses the input's switching point every cycle); in
+/// [`XiMode::FedBack`] whatever its phases, the feedback resting `XI` at the
+/// switching point the swing is around (the module docs, "`XI` and the
+/// clock word"). `None` for anything else — a held segment, a swing whose
+/// phases settle to one level or to none through the thresholds of a plain
+/// `XI`, a level, a floating or fought pin (no clock reaches it). The
+/// P2-EC32MB buffers its TCXO's 0.8 V clipped sine to a full swing through
+/// `U101` before `XI`, so its crystal is the same in every mode.
+pub fn crystal_of(sense: &Sense, mode: XiMode) -> Option<u64> {
+    let clock = sense.periodic?;
+    let segment = match mode {
+        XiMode::Plain => clock.rate(&P2_UNBANKED_INPUT_THRESHOLDS)?,
+        XiMode::FedBack => Some(clock.segment).filter(|segment| segment.freq_hz > 0)?,
+    };
+    Some(u64::from(segment.freq_hz))
 }
 
 // ============================================================
@@ -821,7 +876,41 @@ struct Subscribers {
 #[derive(Default)]
 struct PackageState {
     crystal_hz: Option<u64>,
+    /// `XI`'s last sense, and the mode the core's clock word set: what
+    /// [`crystal_of`] reads the crystal from.
+    xi: Option<Sense>,
+    xi_mode: XiMode,
     reset: P2ResetState,
+}
+
+/// The core's crystal subscribers, frozen once its attach has returned:
+/// told by `XI`'s sense and by the core's clock word alike.
+type CrystalSubscribers = Arc<OnceLock<Arc<[CrystalCallback]>>>;
+
+/// Read the crystal again after `update` moved `XI`'s sense or its mode,
+/// and tell every subscriber when it changed — on the engine thread, with
+/// no lock held across a callback.
+fn refresh_crystal(
+    state: &Mutex<PackageState>,
+    subscribers: &[CrystalCallback],
+    update: impl FnOnce(&mut PackageState),
+) {
+    let hz = {
+        let mut state = state.lock().expect("package state never poisoned");
+        update(&mut state);
+        let hz = state
+            .xi
+            .as_ref()
+            .and_then(|sense| crystal_of(sense, state.xi_mode));
+        if state.crystal_hz == hz {
+            return;
+        }
+        state.crystal_hz = hz;
+        hz
+    };
+    for callback in subscribers {
+        callback(hz);
+    }
 }
 
 /// The START gate: what the core asked for before it may run, and
@@ -937,6 +1026,10 @@ pub struct P2Pads {
     io: ComponentNetIo,
     subscribers: Arc<Mutex<Subscribers>>,
     banks: BankSupplies,
+    /// The package's delivered facts, where `XI`'s mode is kept.
+    state: Arc<Mutex<PackageState>>,
+    /// The crystal subscribers once frozen, for [`Self::set_clock_mode`].
+    crystal: CrystalSubscribers,
 }
 
 impl std::fmt::Debug for P2Pads {
@@ -983,6 +1076,20 @@ impl P2Pads {
             .expect("subscriber list never poisoned")
             .crystal
             .push(Box::new(callback));
+    }
+
+    /// Report the clock word the core's guest set with `HUBSET`: its `%CC`
+    /// field is `XI`'s mode ([`XiMode::of_clock_word`]), and the crystal
+    /// the package reads on `XI` depends on it (the module docs, "`XI` and
+    /// the clock word"). Called on the engine thread, from the core's own
+    /// wake; a crystal that changes with the mode is delivered to every
+    /// [`Self::on_crystal`] subscriber before this returns. A core that
+    /// never calls it leaves `XI` in the mode the chip starts in,
+    /// [`XiMode::Plain`].
+    pub fn set_clock_mode(&self, word: u32) {
+        let mode = XiMode::of_clock_word(word);
+        let subscribers = self.crystal.get().map_or(&[][..], |frozen| &frozen[..]);
+        refresh_crystal(&self.state, subscribers, |state| state.xi_mode = mode);
     }
 
     /// Subscribe to the reset inputs (`RESN` and `VDD`, projected):
@@ -1440,6 +1547,7 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
             io: io.clone(),
         }));
         let subscribers = Arc::new(Mutex::new(Subscribers::default()));
+        let frozen_crystal: CrystalSubscribers = Arc::default();
         self.core
             .lock()
             .expect("core never poisoned")
@@ -1447,6 +1555,8 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
                 io: core_io,
                 subscribers: Arc::clone(&subscribers),
                 banks: self.banks.clone(),
+                state: Arc::clone(&self.state),
+                crystal: Arc::clone(&frozen_crystal),
             })?;
         // The core has subscribed to what it wants; freeze the lists so
         // delivery never holds a lock across a callback.
@@ -1454,24 +1564,16 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
             std::mem::take(&mut *subscribers.lock().expect("subscriber list never poisoned"));
         let crystal: Arc<[CrystalCallback]> = crystal.into();
         let reset: Arc<[ResetCallback]> = reset.into();
+        let _ = frozen_crystal.set(Arc::clone(&crystal));
 
-        // XI: the rate of the square wave here is the crystal. One
-        // projection, then every subscriber — on a change of crystal only,
-        // so a net whose levels move under one segment tells no one.
+        // XI: the rate of the square wave here is the crystal, read in the
+        // mode the core's clock word set. One projection, then every
+        // subscriber — on a change of crystal only, so a net whose levels
+        // move under one segment tells no one.
         {
             let state = Arc::clone(&self.state);
             io.on_sense("XI", move |sensed| {
-                let hz = crystal_of(&sensed);
-                {
-                    let mut state = state.lock().expect("package state never poisoned");
-                    if state.crystal_hz == hz {
-                        return;
-                    }
-                    state.crystal_hz = hz;
-                }
-                for callback in crystal.iter() {
-                    callback(hz);
-                }
+                refresh_crystal(&state, &crystal, |state| state.xi = Some(sensed));
             })?;
         }
 
@@ -1802,15 +1904,52 @@ mod tests {
             at_ns: 0,
         };
         let clock = |freq_hz| swinging(freq_hz, 3.3);
-        assert_eq!(crystal_of(&clock(20_000_000)), Some(20_000_000));
-        assert_eq!(crystal_of(&clock(0)), None);
-        // XI reads through the JESD8C.01 pair, 0.8 V / 2.0 V: a TCXO's
-        // 0.8 V clipped sine handed straight to it settles low in both
-        // phases, and a 1.2 V swing's high phase reads no level.
-        assert_eq!(crystal_of(&swinging(20_000_000, 0.8)), None);
-        assert_eq!(crystal_of(&swinging(20_000_000, 1.2)), None);
-        assert_eq!(crystal_of(&at(Some(3.3))), None);
-        assert_eq!(crystal_of(&at(None)), None);
+        let plain = XiMode::Plain;
+        assert_eq!(crystal_of(&clock(20_000_000), plain), Some(20_000_000));
+        assert_eq!(crystal_of(&clock(0), plain), None);
+        // A plain XI reads through the JESD8C.01 pair, 0.8 V / 2.0 V: a
+        // TCXO's 0.8 V clipped sine handed straight to it settles low in
+        // both phases, and a 1.2 V swing's high phase reads no level.
+        assert_eq!(crystal_of(&swinging(20_000_000, 0.8), plain), None);
+        assert_eq!(crystal_of(&swinging(20_000_000, 1.2), plain), None);
+        assert_eq!(crystal_of(&at(Some(3.3)), plain), None);
+        assert_eq!(crystal_of(&at(None), plain), None);
+        // With its 1 MΩ feedback on, XI rests at its own switching point
+        // and any running swing is the crystal; a held one, a level or
+        // nothing still is none.
+        let fed_back = XiMode::FedBack;
+        assert_eq!(crystal_of(&clock(20_000_000), fed_back), Some(20_000_000));
+        assert_eq!(
+            crystal_of(&swinging(20_000_000, 0.8), fed_back),
+            Some(20_000_000)
+        );
+        assert_eq!(
+            crystal_of(&swinging(20_000_000, 1.2), fed_back),
+            Some(20_000_000)
+        );
+        assert_eq!(crystal_of(&swinging(0, 0.8), fed_back), None);
+        assert_eq!(crystal_of(&at(Some(3.3)), fed_back), None);
+        assert_eq!(crystal_of(&at(None), fed_back), None);
+    }
+
+    /// `HUBSET`'s `%CC` field, bits 3:2, is `XI`'s mode (datasheet, System
+    /// Clock, p. 18): `%00` plain — the reset state, `HUBSET #$F0`'s RCFAST
+    /// — and `%01`/`%10`/`%11` with the feedback on, whatever the other
+    /// fields say.
+    #[rstest]
+    #[case::rcfast_at_reset(0x0000_0000, XiMode::Plain)]
+    #[case::rcfast_hubset_f0(0x0000_00F0, XiMode::Plain)]
+    #[case::direct_drive_rcfast(0b01_00, XiMode::FedBack)]
+    #[case::crystal_15pf_rcfast(0b10_00, XiMode::FedBack)]
+    #[case::crystal_30pf_xi(0b11_10, XiMode::FedBack)]
+    // The datasheet's 148.5 MHz example word, `%1_100111_0100101000_1111_10_11`
+    // (System Clock, p. 18): `%CC` = `%10`.
+    #[case::crystal_pll_148_5_mhz(0x019D_28FB, XiMode::FedBack)]
+    // `embsim-p2-qemu`'s `crystal_pll` guest's PLL word, `$010007F3`:
+    // `%CC` = `%00`.
+    #[case::pll_selected_with_xi_ignored(0x0100_07F3, XiMode::Plain)]
+    fn the_clock_words_cc_field_is_xis_mode(#[case] word: u32, #[case] mode: XiMode) {
+        assert_eq!(XiMode::of_clock_word(word), mode);
     }
 
     /// The core-supply window is the datasheet's `Vdd` row, 1.7 V to 1.9 V

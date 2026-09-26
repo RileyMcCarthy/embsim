@@ -13,7 +13,9 @@
 //! at 1.0 V, a digital sense nothing drives, and a receiver on a net two
 //! drivers fight over. And a clock is the receiver's too: a stepper drive
 //! counts a square wave on its `STEP` input only when the wave's phases
-//! cross that input's thresholds. Stepped mode (`TESTING.md` rule 9): every
+//! cross that input's thresholds, and each pulse of a segment once when it
+//! stops crossing and crosses again; and a build's senses carry no instant.
+//! Stepped mode (`TESTING.md` rule 9): every
 //! delivery carries the virtual instant the engine delivered it at. Its own
 //! binary per rule 5.
 
@@ -591,6 +593,47 @@ fn a_supply_that_moves_re_delivers_the_pins_sense() {
     drop(system);
 }
 
+/// A build is a snapshot with no instant: what it hands a receiver
+/// carries instant 0, whatever the process's virtual clock reads — here
+/// advanced to 5 ms, as a run before the build would have left it.
+#[rstest]
+fn a_sense_handed_at_build_carries_no_instant() {
+    behaviour!(Test {
+        id: "sense.build-has-no-instant",
+        covers: Some("board/src/component.rs#PinHandle::measure"),
+        given: "a receiver whose input a 3.3 volt bench rail holds, built while the virtual \
+                clock a previous run left behind reads 5 milliseconds",
+    });
+    expect!(
+        "instant-zero",
+        "every sense the build hands the receiver carries instant 0 and the rail's 3.3 volts",
+        "a build resolves the board before any time passes, and a clock another run advanced \
+         is not the build's"
+    );
+
+    let _lock = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    virtual_clock::advance_to_ns(5_000_000).expect("time moves forward");
+    assert_eq!(virtual_clock::virtual_ns(), 5_000_000);
+    let (receiver, readings) = Receiver::new(vec![PinDecl::digital_in(
+        "IN",
+        jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+    )]);
+    let built = System::new()
+        .component("RX", Box::new(receiver))
+        .harness(Harness::new().power(ep("BENCH.3V3"), ep("RX.IN"), 3.3))
+        .build()
+        .expect("the bench builds");
+    let readings = readings.lock().unwrap().clone();
+    assert!(!readings.is_empty(), "the build hands the receiver its net");
+    assert!(
+        readings.iter().all(|(at_ns, _, _)| *at_ns == 0),
+        "{readings:?}"
+    );
+    assert_eq!(readings.last(), Some(&(0, Some(3.3), Some(Level::High))));
+    drop(built);
+}
+
 // ============================================================
 // A clock is the receiver's too
 // ============================================================
@@ -742,5 +785,164 @@ fn a_step_input_counts_a_clock_only_when_it_crosses_the_thresholds() {
         full.emitted_at_ns(after)
     );
     assert!(counted >= 30, "3 ms at 10 kHz: {counted}");
+    drop(system);
+}
+
+/// A step source that drives `STEP` from its own wakes, at the instants
+/// its schedule names: each drive published at its instant is resolved and
+/// handed on at that instant (`NODES.md` §11 contract lines 1 and 2), so
+/// every instant the drive reads is one the test wrote down.
+struct ScheduledStep {
+    pins: [PinDecl; 1],
+    schedule: Vec<(u64, Drive)>,
+}
+
+impl Component for ScheduledStep {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let out = io.pin("Q")?;
+        let schedule = self.schedule.clone();
+        io.on_wake_ns(move |now| {
+            if let Some((_, drive)) = schedule.iter().find(|(at, _)| *at == now) {
+                out.drive(*drive);
+            }
+        });
+        for (at_ns, _) in &self.schedule {
+            io.schedule_at_ns(*at_ns);
+        }
+        Ok(())
+    }
+}
+
+/// A millisecond of virtual time, in the engine's nanoseconds.
+const MS: u64 = 1_000_000;
+
+/// One 10 kHz step segment, anchored at 1 ms, whose high phase the source
+/// drives at 3.3 V, then at 1.2 V from 4 ms — inside `STEP`'s 0.8 V / 2.0 V
+/// band, so the input stops switching — then at 3.3 V again from
+/// `resume_ns`, under the same schedule throughout; at 12 ms the source
+/// stops the train (a held segment banking its count). The drive counts the
+/// pulses of the two spans the input switched on, 1–4 ms and `resume_ns`–12
+/// ms, each once — wherever the resume lands against the drive's own
+/// position samples (`stepper_motor::Config::observe_interval_us`, 1 ms by
+/// default): on one (9 ms), between two (9.5 ms), or with none armed, so
+/// nothing moves the drive between the stop and the resume (9 ms).
+#[rstest]
+#[case::on_a_position_sample(9 * MS, Some(stepper_motor::DEFAULT_OBSERVE_INTERVAL_US), 30 + 30)]
+#[case::between_position_samples(
+    9 * MS + MS / 2,
+    Some(stepper_motor::DEFAULT_OBSERVE_INTERVAL_US),
+    30 + 25
+)]
+#[case::with_no_position_samples(9 * MS, None, 30 + 30)]
+fn a_step_clock_that_stops_and_resumes_crossing_counts_each_pulse_once(
+    #[case] resume_ns: u64,
+    #[case] observe_interval_us: Option<u64>,
+    #[case] crossed: u64,
+) {
+    behaviour!(Test {
+        id: "sense.step-clock-resumes-crossing",
+        covers: Some("models/src/machine/stepper_motor.rs#StepperMotor"),
+        given: "an enabled stepper drive whose step input carries a 10 kilohertz pulse train \
+                from 1 to 12 milliseconds, its high phase 1.2 volts from 4 to 9 or 9.5, else 3.3",
+    });
+    expect!(
+        "spans-that-crossed",
+        "the commanded step count is the pulses of the two spans the input switched on, each \
+         counted once",
+        "a pulse the input never switched on is no step and a pulse already counted is counted \
+         once, wherever the input switches again against the drive's own position samples"
+    );
+
+    let _lock = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let running = PeriodicSchedule {
+        emitted: 0,
+        freq_hz: 10_000,
+        total: None,
+        since_ns: MS,
+    };
+    let square = |high_volts: Volts, segment: PeriodicSchedule| Drive::Periodic {
+        hi: TheveninDrive {
+            volts: high_volts,
+            impedance: 25.0,
+        },
+        lo: TheveninDrive {
+            volts: 0.0,
+            impedance: 25.0,
+        },
+        segment,
+    };
+    let stop = PeriodicSchedule {
+        emitted: running.emitted_at_ns(12 * MS),
+        freq_hz: 0,
+        total: None,
+        since_ns: 12 * MS,
+    };
+    let held = |volts: Volts| {
+        Some(TheveninDrive {
+            volts,
+            impedance: 25.0,
+        })
+    };
+    let motor = StepperMotor::new(stepper_motor::Config {
+        observe_interval_us,
+        ..stepper_motor::Config::new(100.0)
+    })
+    .expect("valid");
+    let shaft = motor.shaft();
+    let system = System::new()
+        .component(
+            "DRV",
+            Box::new(ScheduledStep {
+                pins: [PinDecl::digital_out("Q").with_idle(None)],
+                schedule: vec![
+                    (MS, square(3.3, running)),
+                    (4 * MS, square(1.2, running)),
+                    (resume_ns, square(3.3, running)),
+                    (12 * MS, square(3.3, stop)),
+                ],
+            }),
+        )
+        // ENA active high (the configuration's default), DIR low.
+        .component(
+            "ENA",
+            Box::new(Driver {
+                pins: [PinDecl::digital_out("Q").with_idle(held(3.3))],
+                handle: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .component(
+            "DIR",
+            Box::new(Driver {
+                pins: [PinDecl::digital_out("Q").with_idle(held(0.0))],
+                handle: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .component("MOTOR", Box::new(motor))
+        .harness(
+            Harness::new()
+                .connect(ep("MOTOR.STEP"), ep("DRV.Q"))
+                .connect(ep("MOTOR.ENA"), ep("ENA.Q"))
+                .connect(ep("MOTOR.DIR"), ep("DIR.Q")),
+        )
+        .start()
+        .expect("the bench starts");
+
+    assert!(
+        wait_for(|| shaft.train() == Some(stop), SETTLE),
+        "the stop reaches the drive: {:?}",
+        shaft.train()
+    );
+    assert_eq!(
+        (running.emitted_at_ns(4 * MS) - running.emitted_at_ns(MS))
+            + (running.emitted_at_ns(12 * MS) - running.emitted_at_ns(resume_ns)),
+        crossed,
+        "the segment's own pulses over the two spans: one every 100 µs"
+    );
+    assert_eq!(shaft.commanded_steps().unsigned_abs(), crossed);
     drop(system);
 }

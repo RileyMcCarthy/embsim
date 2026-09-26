@@ -205,7 +205,9 @@ pub struct Sense {
   the `AmbiguousLevel` finding beside the `Contention` names.
 - **`periodic`** carries a square wave's two phase voltages (same frame)
   and its `PeriodicSchedule` (integer nanoseconds); the consumer integrates
-  the schedule.
+  the schedule once its two phases cross the consumer's own thresholds
+  (`PeriodicSense::rate`); a self-biased input is the exception (`NODES.md`
+  §12 item 5, the cleanup and the final pass).
 - The engine keeps a voltage beside every state it resolves (`Net::volts`,
   crate-private): a projected node's winning source's open-circuit voltage,
   a solved node's operating point. It is published with the states under the
@@ -443,7 +445,10 @@ roles, routing pass and delivery; they are gone.
   like any drive, **phase by phase** through rule 2: a pull follows the
   square wave, a comparable static source or a second clock is `Contention`
   with its finding. The net publishes `NetState::Periodic { hi, lo, segment }`
-  and a consumer integrates the segment at read time — not per edge.
+  and a consumer integrates the segment at read time — not per edge — once
+  its two phases cross the consumer's own thresholds (`PeriodicSense::rate`);
+  a self-biased input is the exception (`NODES.md` §12 item 5, the cleanup
+  and the final pass).
 - Across a coupling capacitor the rate crosses by the AC rule
   (`1/(2π·f·C) ≤ R_far / 10`, else `PeriodicNotCoupled`); a declared terminal
   is a barrier.

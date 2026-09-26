@@ -3,7 +3,9 @@
 //! (`NODES.md` §2 "MCU node (P2)", §8 phase 2).
 //!
 //! Three facts a board puts on the package and the package hands to its
-//! core: the rate of the square wave on `XI` is the crystal; `RESN` and
+//! core: the rate of the square wave on `XI` is the crystal — read in the
+//! mode the core's clock word sets (`NODES.md` §12 item 5, the final
+//! pass); `RESN` and
 //! `VDD` are the reset
 //! inputs; and every pad is a released bidirectional pin that a bench
 //! driver can take without a fight. Each is asserted from outside — the
@@ -447,6 +449,197 @@ fn the_rate_on_xi_is_the_crystal_the_package_reports(
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(handle.crystal_hz(), expected);
+    drop(system);
+}
+
+/// A core that reports a clock word at each of its instants, as a guest's
+/// `HUBSET` does through the QEMU core, and records every crystal the
+/// package tells it, with the instant.
+struct ClockWords {
+    words: Vec<(u64, u32)>,
+    told: Told,
+}
+
+/// Every crystal a core was told, with the instant.
+type Told = Arc<StdMutex<Vec<(u64, Option<u64>)>>>;
+
+impl P2Core for ClockWords {
+    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
+        let told = Arc::clone(&self.told);
+        pads.on_crystal(move |hz| {
+            told.lock().unwrap().push((virtual_clock::virtual_ns(), hz));
+        });
+        let words = self.words.clone();
+        let reporter = pads.clone();
+        pads.on_wake_ns(move |now| {
+            if let Some(&(_, word)) = words.iter().find(|(at, _)| *at == now) {
+                reporter.set_clock_mode(word);
+            }
+        });
+        for &(at_ns, _) in &self.words {
+            pads.schedule_at_ns(at_ns);
+        }
+        Ok(())
+    }
+}
+
+/// A bench clock whose 0.8 V, 20 MHz swing — the P2-EC32MB TCXO's clipped
+/// sine, as a square wave — reaches `XIN` only through `C1`, 100 nF: the
+/// harness wires the package's `XI` to `C1`'s far pin.
+const COUPLED_XI_FIXTURE: &str = r#"(export (version "E")
+  (components
+    (comp (ref "X1") (value "Swing"))
+    (comp (ref "C1") (value "100nF") (libsource (lib "Device") (part "C_Small") (description ""))))
+  (nets
+    (net (code "1") (name "OSC") (node (ref "X1") (pin "OUT")) (node (ref "C1") (pin "1")))
+    (net (code "2") (name "XIN") (node (ref "C1") (pin "2")))))"#;
+
+/// The swing of [`COUPLED_XI_FIXTURE`]'s clock.
+struct Swing {
+    pins: [PinDecl; 1],
+    out: Option<PinHandle>,
+}
+
+impl Component for Swing {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        self.out = Some(io.pin("OUT")?);
+        Ok(())
+    }
+
+    fn start(&mut self) {
+        self.out.as_ref().expect("attached").drive(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 0.8,
+                impedance: 25.0,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: 25.0,
+            },
+            segment: PeriodicSchedule {
+                emitted: 0,
+                freq_hz: CRYSTAL_HZ,
+                total: None,
+                since_ns: 0,
+            },
+        });
+    }
+}
+
+/// `XI` in the mode the guest's clock word sets (P2X8C4M64P Datasheet,
+/// System Clock, p. 18, the `%CC` table; AC Characteristics, p. 48, the
+/// `Cin` row): in the reset mode `%00` its 1 MΩ feedback is off and it
+/// reads the coupled 0.8 V swing through its thresholds (0.8 V / 2.0 V) —
+/// low in both phases, no crystal; in the crystal mode `%10` the feedback
+/// rests it at its own switching point and the swing is the crystal.
+#[rstest]
+fn xi_takes_a_small_swing_as_the_crystal_once_the_clock_word_turns_its_feedback_on() {
+    behaviour!(Test {
+        id: "p2-package.xi-feedback-follows-the-clock-word",
+        covers: Some("boards/src/p2.rs#P2Pads::set_clock_mode"),
+        given: "a P2 package, a 0.8 volt 20 megahertz swing coupled onto its XI pin through \
+                100 nanofarads, whose core selects a crystal clock mode at 4 milliseconds and \
+                the reset mode at 5",
+    });
+    expect!(
+        "no-crystal-in-the-reset-mode",
+        "until the core selects the crystal mode the package reports no crystal",
+        "in the mode the chip starts in, XI's internal 1 megohm feedback resistor is off, and \
+         0.8 volts reads low in both phases through XI's 0.8 and 2.0 volt thresholds"
+    );
+    expect!(
+        "crystal-with-the-feedback-on",
+        "from the instant the core selects the crystal mode the package reports the swing's \
+         20 megahertz as the crystal, and tells the core then",
+        "in a crystal mode the feedback resistor rests XI at its own switching point, and a \
+         swing around that point crosses it every cycle"
+    );
+    expect!(
+        "no-crystal-again",
+        "from the instant the core selects the reset clock mode again the package reports no \
+         crystal, and tells the core then"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    const MS: u64 = 1_000_000;
+    // `%1_100111_0100101000_1111_10_00`: `%CC` = `%10` with RCFAST still
+    // selected, the datasheet's first step (System Clock, p. 18: "enable
+    // crystal+PLL, stay in RCFAST mode"); then `HUBSET #$F0`, RCFAST with
+    // `%CC` = `%00`.
+    let crystal_mode = 0x019D_28F8;
+    let reset_mode = 0xF0;
+    let told: Told = Arc::new(StdMutex::new(Vec::new()));
+    let package = P2Package::new(ClockWords {
+        words: vec![(4 * MS, crystal_mode), (5 * MS, reset_mode)],
+        told: Arc::clone(&told),
+    });
+    let handle = package.handle();
+    let readers: Vec<ReadAt<Option<u64>>> = [3_500_000, 4_500_000, 5_500_000]
+        .into_iter()
+        .map(|at| {
+            let handle = handle.clone();
+            ReadAt::new(at, move || handle.crystal_hz())
+        })
+        .collect();
+    let read: Vec<_> = readers.iter().map(|r| Arc::clone(&r.got)).collect();
+    let mut registry = embsim_board::PartRegistry::new();
+    registry.register("Swing", |_decl| {
+        Box::new(Swing {
+            pins: [PinDecl::digital_out("OUT").with_idle(None)],
+            out: None,
+        })
+    });
+    let board = embsim_board::Board::from_netlist(
+        embsim_board::netlist::parse(COUPLED_XI_FIXTURE).expect("the fixture parses"),
+        &registry,
+    )
+    .expect("the fixture builds");
+    let mut system = System::new()
+        .component("P2", Box::new(package))
+        .board("B", board);
+    for (index, reader) in readers.into_iter().enumerate() {
+        system = system.component(&format!("READ{index}"), Box::new(reader));
+    }
+    let system = system
+        .harness(grounded(
+            Harness::new()
+                .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+                .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
+                .connect(ep("P2.XI"), ep("B.C1.2")),
+        ))
+        .start()
+        .expect("the bench starts");
+
+    assert!(
+        wait_for(|| read[2].lock().unwrap().is_some(), SETTLE),
+        "the last read lands: {:?}, told {:?}",
+        handle.start_state(),
+        told.lock().unwrap()
+    );
+    let at = |index: usize| *read[index].lock().unwrap();
+    assert_eq!(
+        handle.start_state(),
+        StartState::Started {
+            at_ns: P2_RESTART_DELAY_NS
+        }
+    );
+    assert_eq!(at(0), Some((3_500_000, None)), "the reset mode");
+    assert_eq!(
+        at(1),
+        Some((4_500_000, Some(u64::from(CRYSTAL_HZ)))),
+        "the crystal mode"
+    );
+    assert_eq!(at(2), Some((5_500_000, None)), "the reset mode again");
+    assert_eq!(
+        *told.lock().unwrap(),
+        vec![(4 * MS, Some(u64::from(CRYSTAL_HZ))), (5 * MS, None)],
+        "the core is told at each instant, and only on a change"
+    );
     drop(system);
 }
 
