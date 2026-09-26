@@ -9343,6 +9343,56 @@ mod tests {
             );
         }
 
+        /// A clock phase driven at a voltage no model names couples no
+        /// voltage for that phase: the far node carries the rate, the low
+        /// port's voltage for the low phase, and none for the high one.
+        #[rstest]
+        fn a_phase_at_an_unknown_voltage_couples_no_voltage_for_it() {
+            behaviour!(Test {
+                id: "engine.unknown-phase-couples-no-voltage",
+                covers: Some("board/src/engine.rs#Arrival::swing_of"),
+                given: "a clock whose high phase is driven at an unknown voltage and its low \
+                        phase at 0 volts, coupled through 1 microfarad to a node pulled to 0 \
+                        volts through 10 kilohms",
+            });
+            expect!(
+                "rate-with-one-phase-voltage",
+                "the far node carries the clock's rate with the low phase at 0 volts and no \
+                 voltage named for the high phase",
+                "a capacitor passes each phase's own swing, and nothing is invented for a phase \
+                 whose voltage is unknown",
+            );
+            let mut resolver = Resolver::new(2, Dsu::new(2));
+            let source = resolver.add_endpoint_with(0, PinRef::new("X1", "OUT"), None);
+            resolver.add_endpoint_with(1, PinRef::new("R1", "1"), level(0.0, 10_000.0));
+            resolver.add_coupling(0, 1, 1e-6, "C1".to_string());
+            let mut net_table = nets(2);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            resolver.set_drive(
+                source,
+                Some(Drive::Periodic {
+                    hi: TheveninDrive {
+                        volts: f64::NAN,
+                        impedance: 25.0,
+                    },
+                    lo: TheveninDrive {
+                        volts: 0.0,
+                        impedance: 25.0,
+                    },
+                    segment: SEGMENT,
+                }),
+            );
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            assert!(
+                matches!(net_table[1].state, NetState::Periodic { segment, .. } if segment == SEGMENT),
+                "{:?}",
+                net_table[1].state
+            );
+            assert_eq!(net_table[1].volts.phases, Some((None, Some(0.0))));
+        }
+
         /// The sense change gate compares a periodic state by its segment,
         /// anchor included.
         #[rstest]

@@ -14,7 +14,9 @@
 //! scenario — is an AC short to its reference, so a rate coupled into it
 //! is shunted there rather than forwarded through the next capacitor, and
 //! two sources that merely share decoupling to it do not face each other;
-//! the same node left undeclared is one more node on the path.
+//! the same node left undeclared is one more node on the path. And which
+//! fed-back stages are self-biased: an inverting stage with a plain input
+//! only (`NODES.md` §12 item 5, the final pass).
 //!
 //! Every case runs in stepped mode (`TESTING.md` rule 9), in its own binary
 //! (rule 5): the cases pin the process-global clock and its mode.
@@ -35,8 +37,9 @@ use embsim_boards::ec32mb::{Ec32mb, INVERTER_PART, NETLIST, TCXO_HZ, TCXO_PART};
 use embsim_boards::p2::{P2Package, P2PackageHandle};
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::logic_gate::{
-    self, LogicGate, LogicGateMonitor, Mode, LVC2G04_PINS_BY_FUNCTION, LVC2G04_R_OH_OHMS,
-    LVC2G04_R_OL_OHMS,
+    self, LogicGate, LogicGateMonitor, Mode, LVC1G14_PINS_SOT23, LVC1G14_T_PD_NS,
+    LVC2G04_PINS_BY_FUNCTION, LVC2G04_PINS_SOT363, LVC2G04_R_OH_OHMS, LVC2G04_R_OL_OHMS,
+    LVC2G04_T_PD_NS,
 };
 use embsim_models::oscillator::{self, Oscillator, OscillatorMonitor, TG2520SMN_START_UP_NS};
 use embsim_models::rail::AP62301_SOFT_START_NS;
@@ -477,11 +480,23 @@ const COUPLING_FIXTURE: &str = r#"(export (version "E")
     (net (code "3") (name "GND") (class "Default")
       (node (ref "R1") (pin "2") (pintype "passive")))))"#;
 
-/// A clock buffer that drives one 20 MHz square wave, rail to rail at
-/// 25 Ω, when the system starts.
+/// A clock buffer that drives one 20 MHz square wave from 0 V to
+/// `hi_volts` — rail to rail at 3.3 V on the coupling fixtures — at 25 Ω,
+/// when the system starts.
 struct Src {
     pins: [PinDecl; 1],
     out: Option<PinHandle>,
+    hi_volts: f64,
+}
+
+impl Src {
+    fn swinging_to(hi_volts: f64) -> Self {
+        Self {
+            pins: [PinDecl::digital_out("OUT").with_idle(None)],
+            out: None,
+            hi_volts,
+        }
+    }
 }
 
 impl Component for Src {
@@ -497,7 +512,7 @@ impl Component for Src {
     fn start(&mut self) {
         self.out.as_ref().unwrap().drive(Drive::Periodic {
             hi: TheveninDrive {
-                volts: 3.3,
+                volts: self.hi_volts,
                 impedance: 25.0,
             },
             lo: TheveninDrive {
@@ -516,12 +531,7 @@ impl Component for Src {
 
 fn coupling_board(fixture: &str, delivered: Trains) -> Board {
     let mut registry = PartRegistry::new();
-    registry.register("Src", |_decl| {
-        Box::new(Src {
-            pins: [PinDecl::digital_out("OUT").with_idle(None)],
-            out: None,
-        })
-    });
+    registry.register("Src", |_decl| Box::new(Src::swinging_to(3.3)));
     registry.register("Snk", move |_decl| {
         Box::new(RateProbe::logging(
             "A",
@@ -889,5 +899,224 @@ fn two_sources_decoupled_to_one_terminal_do_not_face_each_other(#[case] held: bo
             system.net_state("B.OSC1")
         );
     }
+    drop(system);
+}
+
+// ============================================================
+// Which fed-back stages are self-biased
+// ============================================================
+
+/// Three stages on one bench, each with `R` (100 kΩ) from its output back
+/// to its input and `C` (100 nF) coupling one 0.8 V, 20 MHz swing from `X1`
+/// onto that input: `U1` a 74LVC2G04 inverter (`1A`, `1Y`), `U2` a buffer
+/// with the 74LVC2G04's input figures on the same pins, `U3` an
+/// SN74LVC1G14 Schmitt inverter (`A`, `Y`). Every other pin is on a net of
+/// its own; the supplies are the harness's.
+const FED_BACK_FIXTURE: &str = r#"(export (version "E")
+  (components
+    (comp (ref "X1") (value "Swing"))
+    (comp (ref "U1") (value "Inverter"))
+    (comp (ref "U2") (value "Buffer"))
+    (comp (ref "U3") (value "Schmitt"))
+    (comp (ref "C1") (value "100nF") (libsource (lib "Device") (part "C_Small") (description "")))
+    (comp (ref "C2") (value "100nF") (libsource (lib "Device") (part "C_Small") (description "")))
+    (comp (ref "C3") (value "100nF") (libsource (lib "Device") (part "C_Small") (description "")))
+    (comp (ref "R1") (value "100k") (libsource (lib "Device") (part "R_Small") (description "")))
+    (comp (ref "R2") (value "100k") (libsource (lib "Device") (part "R_Small") (description "")))
+    (comp (ref "R3") (value "100k") (libsource (lib "Device") (part "R_Small") (description ""))))
+  (nets
+    (net (code "1") (name "OSC")
+      (node (ref "X1") (pin "OUT")) (node (ref "C1") (pin "1"))
+      (node (ref "C2") (pin "1")) (node (ref "C3") (pin "1")))
+    (net (code "2") (name "A1") (node (ref "C1") (pin "2")) (node (ref "R1") (pin "1")) (node (ref "U1") (pin "1")))
+    (net (code "3") (name "Y1") (node (ref "R1") (pin "2")) (node (ref "U1") (pin "6")))
+    (net (code "4") (name "A2") (node (ref "C2") (pin "2")) (node (ref "R2") (pin "1")) (node (ref "U2") (pin "1")))
+    (net (code "5") (name "Y2") (node (ref "R2") (pin "2")) (node (ref "U2") (pin "6")))
+    (net (code "6") (name "A3") (node (ref "C3") (pin "2")) (node (ref "R3") (pin "1")) (node (ref "U3") (pin "2")))
+    (net (code "7") (name "Y3") (node (ref "R3") (pin "2")) (node (ref "U3") (pin "4")))
+    (net (code "8") (name "VCC") (node (ref "U1") (pin "5")) (node (ref "U2") (pin "5")) (node (ref "U3") (pin "5")))
+    (net (code "9") (name "GND") (node (ref "U1") (pin "2")) (node (ref "U2") (pin "2")) (node (ref "U3") (pin "3")))
+    (net (code "10") (name "U1_2A") (node (ref "U1") (pin "3")))
+    (net (code "11") (name "U1_2Y") (node (ref "U1") (pin "4")))
+    (net (code "12") (name "U2_2A") (node (ref "U2") (pin "3")))
+    (net (code "13") (name "U2_2Y") (node (ref "U2") (pin "4")))
+    (net (code "14") (name "U3_NC") (node (ref "U3") (pin "1")))))"#;
+
+/// The TCXO's swing on the EC32MB, 0.8 V (`oscillator::TG2520SMN`'s
+/// clipped sine), as a bench square wave.
+const SWING_VOLTS: f64 = 0.8;
+
+/// The fed-back bench: the three stages' monitors by reference.
+fn fed_back_board(gates: &Arc<Mutex<HashMap<String, LogicGateMonitor>>>) -> Board {
+    let mut registry = PartRegistry::new();
+    registry.register("Swing", |_decl| Box::new(Src::swinging_to(SWING_VOLTS)));
+    let parts: [(&str, logic_gate::Config, &'static [logic_gate::GatePin]); 3] = [
+        (
+            "Inverter",
+            logic_gate::Config::lvc2g04(),
+            &LVC2G04_PINS_SOT363,
+        ),
+        (
+            "Buffer",
+            logic_gate::Config {
+                inverting: false,
+                ..logic_gate::Config::lvc2g04()
+            },
+            &LVC2G04_PINS_SOT363,
+        ),
+        (
+            "Schmitt",
+            logic_gate::Config::lvc1g14(),
+            &LVC1G14_PINS_SOT23,
+        ),
+    ];
+    for (value, config, pins) in parts {
+        let gates = Arc::clone(gates);
+        registry.register(value, move |decl| {
+            let gate = LogicGate::new(config.clone(), pins).expect("valid");
+            gates
+                .lock()
+                .unwrap()
+                .insert(decl.reference.clone(), gate.monitor());
+            Box::new(gate)
+        });
+    }
+    let parsed = netlist::parse(FED_BACK_FIXTURE).expect("the fixture parses");
+    Board::from_netlist(parsed, &registry).expect("the fixture builds")
+}
+
+/// The virtual time the fed-back case hands the engine before it reads:
+/// 1 ms, past every instant the bench arms — each stage's `t_pd`
+/// (74LVC2G04 and SN74LVC1G14, 5 ns on the wheel: [`LVC2G04_T_PD_NS`],
+/// [`LVC1G14_T_PD_NS`]); the swing is driven at start. The window is the
+/// harness's: any span past the longest armed instant reads the same.
+const FED_BACK_SETTLE_NS: u64 = 1_000_000;
+const _: () = assert!(FED_BACK_SETTLE_NS > LVC2G04_T_PD_NS && FED_BACK_SETTLE_NS > LVC1G14_T_PD_NS);
+
+/// The build's self-bias test is the circuit's: a resistor from a stage's
+/// output back to its input rests the input at the stage's own switching
+/// point only on an inverting stage with a plain input. On the buffer it is
+/// positive feedback, holding the input at the rail its output drives, and
+/// the buffer reads the swing through its thresholds as what it is there:
+/// 0.8 V is at the 74LVC2G04's `V_IL` max (0.8 V, Table 7), a steady low.
+/// On the Schmitt inverter the resistor charges `C` toward the output until
+/// a threshold flips it — a relaxation oscillator's shape (`R`·`C` = 10 ms),
+/// no bias — and the engine does not model that relaxation: it hands the
+/// coupled input the swing without the DC `R` sets (`NODES.md` §12 item 5,
+/// the final pass, Open). So of the Schmitt stage the case asserts what the
+/// build decided and the circuit supports: it is not self-biased, and its
+/// output drives levels, relaying none of the swing.
+///
+/// The case's thread is a registered actor from the moment the system is
+/// assembled, and reads only after a settle ([`FED_BACK_SETTLE_NS`] of
+/// virtual time), so each read is the bench at rest — never a wall-clock
+/// poll a stage's first drive could satisfy on its way elsewhere.
+#[rstest]
+fn only_an_inverting_stage_with_a_plain_input_is_self_biased() {
+    behaviour!(Test {
+        id: "logic-gate.self-bias-needs-a-plain-inverter",
+        covers: Some("models/src/logic_gate.rs#Config::biases_itself"),
+        given: "a 74LVC2G04 inverter, a non-inverting stage with its inputs and an \
+                SN74LVC1G14 Schmitt inverter, each fed back through 100 kilohms, with one 0.8 \
+                volt, 20 megahertz swing coupled onto their inputs",
+    });
+    expect!(
+        "inverter-relays",
+        "the inverter relays the swing at its own rate between the part's own output levels",
+        "the resistor returns the inverter's average output to its input, which rests at the \
+         stage's own switching point, so the swing crosses that point every cycle"
+    );
+    expect!(
+        "non-inverting-reads-a-steady-low",
+        "the non-inverting stage reads the swing as a steady low and holds its output low",
+        "on a stage that does not invert, the resistor is positive feedback that holds the \
+         input at the rail the output drives, and 0.8 volts is at the input's low threshold"
+    );
+    expect!(
+        "schmitt-drives-levels",
+        "the Schmitt inverter drives its output as levels and relays none of the swing's cycles",
+        "through a resistor from its output a Schmitt input charges toward that output until a \
+         threshold flips it, and never rests at a switching point for the swing to cross"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let gates = Arc::new(Mutex::new(HashMap::new()));
+    let system = System::new()
+        .board("B", fed_back_board(&gates))
+        .harness(
+            Harness::new()
+                .power(ep("BENCH.3V3"), ep("B.U1.5"), 3.3)
+                .power(ep("BENCH.GND"), ep("B.U1.2"), 0.0),
+        )
+        .hold_time()
+        .start()
+        .expect("the bench starts");
+    let actor = virtual_clock::register_actor("fed-back-case");
+    system.release_time();
+    virtual_clock::wait_virtual_ns(FED_BACK_SETTLE_NS);
+
+    let gate = |reference: &str| gates.lock().unwrap()[reference].clone();
+    let (inverter, buffer, schmitt) = (gate("U1"), gate("U2"), gate("U3"));
+    let segment = PeriodicSchedule {
+        emitted: 0,
+        freq_hz: 20_000_000,
+        total: None,
+        since_ns: 0,
+    };
+
+    assert!(inverter.self_biased(0), "R1 joins 1Y back to 1A");
+    assert!(!buffer.self_biased(0), "R2 joins 1Y back to 1A on a buffer");
+    assert!(
+        !schmitt.self_biased(0),
+        "R3 joins Y back to A on a Schmitt input"
+    );
+
+    assert_eq!(
+        inverter.output(0),
+        Some(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: LVC2G04_R_OH_OHMS,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: LVC2G04_R_OL_OHMS,
+            },
+            segment,
+        }),
+        "the inverter relays the swing: findings {:?}",
+        system.findings()
+    );
+    assert_eq!(
+        buffer.output_drive(0),
+        Some(TheveninDrive {
+            volts: 0.0,
+            impedance: LVC2G04_R_OL_OHMS,
+        }),
+        "the buffer drives a steady low: findings {:?}",
+        system.findings()
+    );
+    assert_eq!((buffer.mode(0), buffer.train_count(0)), (Mode::Level, 0));
+    assert_eq!(
+        (schmitt.mode(0), schmitt.train_count(0)),
+        (Mode::Level, 0),
+        "the Schmitt inverter drives levels and relays nothing: findings {:?}",
+        system.findings()
+    );
+    let findings = system.findings();
+    assert!(
+        !findings
+            .iter()
+            .any(|f| matches!(f, Finding::PeriodicNotCoupled { .. })),
+        "100 nF couples 20 MHz onto a 100 kΩ node: {findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| matches!(f, Finding::QuiescenceTimeout { .. })),
+        "the engine waited for the case's thread at every advance: {findings:?}"
+    );
+    drop(actor);
     drop(system);
 }

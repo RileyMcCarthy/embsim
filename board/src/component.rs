@@ -393,7 +393,8 @@ pub struct Sense {
     /// itself (`NODES.md` §11, contract line 6).
     pub periodic: Option<PeriodicSense>,
     /// The virtual instant, nanoseconds, the engine delivered this at — 0 on
-    /// a build before the virtual clock exists.
+    /// a build, which has no instant, whatever the virtual clock another
+    /// system (or an earlier run) left behind reads.
     pub at_ns: u64,
 }
 
@@ -2459,24 +2460,27 @@ mod tests {
     /// The one per-phase rule (`PeriodicSense::levels`), which the level a
     /// receiver reads and the rate it counts both derive from: each phase
     /// entered from the level the other left. The receiver's figures are
-    /// 1.3 V / 2.0 V, no hysteresis; its last level before the wave is
-    /// given per case, to show where it matters (both phases inside the
-    /// band) and where it does not (a phase outside fixes the other's
-    /// entry).
+    /// 1.3 V / 2.0 V, with no hysteresis but in the last two cases, where
+    /// 0.3 V of it lets a receiver that reads no level in its band hold a
+    /// low up to 1.6 V; its last level before the wave is given per case,
+    /// to show where it matters (both phases inside the band) and where it
+    /// does not (a phase outside fixes the other's entry).
     #[rstest]
-    #[case::both_outside_holding(DeadBand::HoldLast, 3.3, 0.0, Some(Level::High), (Some(Level::High), Some(Level::Low)), None, true)]
-    #[case::both_outside_unknown(DeadBand::Unknown, 3.3, 0.0, None, (Some(Level::High), Some(Level::Low)), None, true)]
-    #[case::high_phase_in_band_holding_from_high(DeadBand::HoldLast, 1.5, 0.0, Some(Level::High), (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
-    #[case::high_phase_in_band_holding_from_low(DeadBand::HoldLast, 1.5, 0.0, Some(Level::Low), (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
-    #[case::high_phase_in_band_unknown(DeadBand::Unknown, 1.5, 0.0, Some(Level::Low), (None, Some(Level::Low)), None, false)]
-    #[case::low_phase_in_band_holding(DeadBand::HoldLast, 3.3, 1.5, Some(Level::Low), (Some(Level::High), Some(Level::High)), Some(Level::High), false)]
-    #[case::low_phase_in_band_unknown(DeadBand::Unknown, 3.3, 1.5, Some(Level::High), (Some(Level::High), None), None, false)]
-    #[case::both_in_band_holding(DeadBand::HoldLast, 1.8, 1.5, Some(Level::High), (Some(Level::High), Some(Level::High)), Some(Level::High), false)]
-    #[case::both_in_band_unknown(DeadBand::Unknown, 1.8, 1.5, Some(Level::High), (None, None), None, false)]
+    #[case::both_outside_holding(DeadBand::HoldLast, 0.0, (3.3, 0.0), Some(Level::High), (Some(Level::High), Some(Level::Low)), None, true)]
+    #[case::both_outside_unknown(DeadBand::Unknown, 0.0, (3.3, 0.0), None, (Some(Level::High), Some(Level::Low)), None, true)]
+    #[case::high_phase_in_band_holding_from_high(DeadBand::HoldLast, 0.0, (1.5, 0.0), Some(Level::High), (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
+    #[case::high_phase_in_band_holding_from_low(DeadBand::HoldLast, 0.0, (1.5, 0.0), Some(Level::Low), (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
+    #[case::high_phase_in_band_unknown(DeadBand::Unknown, 0.0, (1.5, 0.0), Some(Level::Low), (None, Some(Level::Low)), None, false)]
+    #[case::low_phase_in_band_holding(DeadBand::HoldLast, 0.0, (3.3, 1.5), Some(Level::Low), (Some(Level::High), Some(Level::High)), Some(Level::High), false)]
+    #[case::low_phase_in_band_unknown(DeadBand::Unknown, 0.0, (3.3, 1.5), Some(Level::High), (Some(Level::High), None), None, false)]
+    #[case::both_in_band_holding(DeadBand::HoldLast, 0.0, (1.8, 1.5), Some(Level::High), (Some(Level::High), Some(Level::High)), Some(Level::High), false)]
+    #[case::both_in_band_unknown(DeadBand::Unknown, 0.0, (1.8, 1.5), Some(Level::High), (None, None), None, false)]
+    #[case::high_phase_within_the_hysteresis_unknown(DeadBand::Unknown, 0.3, (1.5, 0.0), None, (Some(Level::Low), Some(Level::Low)), Some(Level::Low), false)]
+    #[case::high_phase_beyond_the_hysteresis_unknown(DeadBand::Unknown, 0.3, (1.7, 0.0), None, (None, Some(Level::Low)), None, false)]
     fn a_clock_phase_is_entered_from_the_other_phases_level(
         #[case] policy: DeadBand,
-        #[case] hi: f64,
-        #[case] lo: f64,
+        #[case] hysteresis: f64,
+        #[case] (hi, lo): (f64, f64),
         #[case] last: Option<Level>,
         #[case] levels: (Option<Level>, Option<Level>),
         #[case] level: Option<Level>,
@@ -2486,14 +2490,14 @@ mod tests {
         behaviour!(Test {
             id: "sense.clock-phase-entered-from-the-other",
             covers: Some("board/src/component.rs#PeriodicSense::levels"),
-            given: "a receiver with thresholds at 1.3 and 2 volts, holding its last level \
-                    between them or reading none there, handed a running square wave whose \
-                    phases sit above, below or between them",
+            given: "a receiver with 1.3 and 2 volt thresholds and 0 or 0.3 volts of \
+                    hysteresis, holding its last level or reading none between them, handed \
+                    running waves at various phase voltages",
         });
         expect!(
             "phase-in-band-takes-the-other",
             "a phase between the thresholds takes the level the other phase leaves on a \
-             holding receiver, and no level on one that reads none there",
+             holding receiver, and on one reading none there only within the hysteresis",
             "in a running wave the receiver enters each phase from the other phase's level",
         );
         expect!(
@@ -2507,7 +2511,7 @@ mod tests {
             "a receiver sees a clock only when its input crosses its switching point every \
              cycle",
         );
-        let thresholds = Thresholds::new(1.3, 2.0, 0.0, policy);
+        let thresholds = Thresholds::new(1.3, 2.0, hysteresis, policy);
         let segment = PeriodicSchedule {
             emitted: 0,
             freq_hz: 1_000,

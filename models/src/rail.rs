@@ -846,11 +846,15 @@ impl Core {
     ///
     /// An enable in its band that has read nothing yet is not asserted. One
     /// handed no voltage while the ground names one has no source: the
-    /// part's own open-pin answer ([`EnableSpec::floating_enables`]) — a
-    /// clock on EN has no single level either and takes it too (the
-    /// wildcard audit, `NODES.md` §12 item 5). With no ground to measure
-    /// against the enable is undecided (`None`, which evaluates as
-    /// disabled) rather than read against an assumed 0 V.
+    /// part's own open-pin answer ([`EnableSpec::floating_enables`]). A
+    /// clock on EN is read like every receiver reads one
+    /// ([`Sense::level`]): a wave whose phases settle to one level through
+    /// the enable's thresholds is that level; one that toggles the input,
+    /// or has a phase that reads none, names no single level and takes the
+    /// open-pin answer too (the wildcard audit, `NODES.md` §12 item 5; the
+    /// final pass). With no ground to measure against the enable is
+    /// undecided (`None`, which evaluates as disabled) rather than read
+    /// against an assumed 0 V.
     fn latch_enable(&self, state: &mut State) {
         let Some(spec) = self.config.enable else {
             state.enabled = Some(true);
@@ -865,14 +869,20 @@ impl Core {
             EnableSense::High => level == Level::High,
             EnableSense::Low => level == Level::Low,
         };
-        state.enabled = match pin.volts {
-            Some(_) => {
+        state.enabled = match (pin.volts, pin.periodic) {
+            (Some(_), _) => {
                 state.enable_level = pin.level(&enable_thresholds(spec), state.enable_level);
                 Some(state.enable_level.is_some_and(asserting))
             }
-            None if pin.periodic.is_some() => Some(spec.floating_enables),
-            None if state.ground.volts.is_some() => Some(spec.floating_enables),
-            None => None,
+            (None, Some(_)) => {
+                state.enable_level = pin.level(&enable_thresholds(spec), state.enable_level);
+                Some(match state.enable_level {
+                    Some(level) => asserting(level),
+                    None => spec.floating_enables,
+                })
+            }
+            (None, None) if state.ground.volts.is_some() => Some(spec.floating_enables),
+            (None, None) => None,
         };
     }
 
@@ -1582,6 +1592,76 @@ mod tests {
             }
         );
         assert_eq!(state.publishes, 2);
+    }
+
+    /// A clock on EN is read through the enable's thresholds like any
+    /// receiver reads one: a wave whose phases settle to one level is that
+    /// level — above the NCP114's 0.9 V `V_EN_HI` in both phases is on,
+    /// under the 0.4 V `V_EN_LO` (and the AP62301's 1.10 V `V_EN_L`) off —
+    /// and one that toggles the input names no single level and takes the
+    /// part's open-pin answer: off for the NCP114, on for the AP62301.
+    #[rstest]
+    #[case::ncp114_steady_high(Config::ncp114(3.3), 3.3, 1.5, true)]
+    #[case::ncp114_steady_low(Config::ncp114(3.3), 0.3, 0.0, false)]
+    #[case::ncp114_toggling(Config::ncp114(3.3), 3.3, 0.0, false)]
+    #[case::ap62301_steady_low(Config::ap62301(), 0.3, 0.0, false)]
+    #[case::ap62301_toggling(Config::ap62301(), 3.3, 0.0, true)]
+    fn a_clock_on_the_enable_is_the_level_its_phases_settle_to(
+        #[case] config: Config,
+        #[case] hi: Volts,
+        #[case] lo: Volts,
+        #[case] enabled: bool,
+    ) {
+        let table: &'static [RailPin] = if config.part == Config::ap62301().part {
+            &AP62301_PINS_BY_FUNCTION
+        } else {
+            &NCP114_PINS_BY_FUNCTION
+        };
+        let rail = Rail::new(config, table).unwrap();
+        let core = Arc::clone(&rail.core);
+        let mut state = core.state.lock().unwrap();
+        state.ground = handed(Some(0.0));
+        state.enable = Some(Sense {
+            volts: None,
+            periodic: Some(embsim_board::PeriodicSense {
+                hi: Some(hi),
+                lo: Some(lo),
+                segment: embsim_board::PeriodicSchedule {
+                    emitted: 0,
+                    freq_hz: 1_000,
+                    total: None,
+                    since_ns: 0,
+                },
+            }),
+            at_ns: 0,
+        });
+        core.latch_enable(&mut state);
+        assert_eq!(state.enabled, Some(enabled));
+    }
+
+    /// A table with an enable pin behind a configuration that names no
+    /// enable declares the pin passive: nothing reads it, so it carries no
+    /// thresholds and is no input that could float.
+    #[rstest]
+    fn an_enable_pin_no_configuration_reads_is_passive() {
+        let config = Config {
+            enable: None,
+            ..Config::ncp114(3.3)
+        };
+        let rail = Rail::new(config, &NCP114_PINS_BY_FUNCTION).unwrap();
+        let enable = NCP114_PINS_BY_FUNCTION
+            .iter()
+            .find(|p| p.role == RailRole::Enable)
+            .expect("the table has an enable pin");
+        let pin = rail
+            .pins()
+            .iter()
+            .find(|p| p.number == enable.number)
+            .copied()
+            .unwrap();
+        assert_eq!(pin.role, PinRole::Passive);
+        assert_eq!(pin.thresholds, None);
+        assert_eq!(pin.senses_at_build(), None);
     }
 
     /// The XL1509's enable is active-low and floats to on; its output is

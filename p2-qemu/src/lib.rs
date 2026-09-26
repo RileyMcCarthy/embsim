@@ -517,10 +517,20 @@ impl Bus {
     /// instant the guest made the change, or — for a crystal that arrived
     /// while the guest was stalled — at `now`, the wake that found it.
     /// Cheap when nothing changed: two loads and two compares.
-    fn poll_clock_mode(&mut self, now: u64) {
+    ///
+    /// A changed word is reported to the package first
+    /// ([`P2Pads::set_clock_mode`]): its `%CC` field is `XI`'s mode, which
+    /// decides the crystal the package reads on `XI`, and the package
+    /// answers through `on_crystal` before the call returns — so the
+    /// crystal is taken again before the word is decoded against it.
+    fn poll_clock_mode(&mut self, now: u64, pads: &P2Pads) {
         // SAFETY: plain reads of two globals the target owns.
         let mode = unsafe { ffi::p2host_clock_mode() };
         let mode_changed = mode != self.clock_mode;
+        if mode_changed {
+            pads.set_clock_mode(mode);
+            self.drain_crystal();
+        }
         let crystal_changed = self.crystal_hz != self.clocked_crystal_hz;
         if !mode_changed && !crystal_changed {
             return;
@@ -1112,7 +1122,7 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
     // the guest can read a pin, and take the crystal as it stands.
     bus.drain_edges();
     bus.drain_crystal();
-    bus.poll_clock_mode(now);
+    bus.poll_clock_mode(now, arm);
     if bus.stalled {
         // No clock, no instructions. The crystal's arrival re-arms.
         shared.stalled.store(true, Ordering::Relaxed);
@@ -1168,7 +1178,7 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
             if yielded {
                 shared.yields.fetch_add(1, Ordering::Relaxed);
             }
-            bus.poll_clock_mode(now);
+            bus.poll_clock_mode(now, arm);
             if bus.stalled {
                 // No clock, no instructions. The crystal's arrival re-arms,
                 // and the pending pad change (if the slice made one) is

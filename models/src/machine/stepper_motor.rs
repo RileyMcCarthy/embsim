@@ -351,6 +351,12 @@ struct Plant {
     /// measured from that train's own baseline. Reset when a new segment
     /// replaces it.
     train_folded: u64,
+    /// The segment `STEP` stopped carrying as a train while it still ran —
+    /// its phases stopped crossing the input's thresholds, or a fight took
+    /// the net ([`MotorCore::end_train`]) — so that the same segment handed
+    /// back is folded from where it resumes, never again from its anchor
+    /// (`NODES.md` §12 item 5, the final pass). Cleared by any segment.
+    ended_train: Option<PeriodicSchedule>,
     /// Signed pulses folded out of rate-carried trains — the same quantity
     /// `steps` is for edges, kept apart so a defect in one path cannot look
     /// like the other.
@@ -385,6 +391,7 @@ impl Plant {
             steps: 0,
             train: None,
             train_folded: 0,
+            ended_train: None,
             train_steps: 0,
             train_delivery_lag_ns: 0,
             emitted: 0,
@@ -555,6 +562,15 @@ impl MotorCore {
     /// again (the net's levels changed and its schedule did not) is no change
     /// at all: it is still the segment being folded.
     ///
+    /// A segment handed back after it stopped crossing `STEP`'s thresholds
+    /// under the same schedule ([`Self::end_train`]) is folded from the
+    /// instant it resumes — the instant it was delivered again: the pulses
+    /// before it were folded before the stop or went out while the input
+    /// did not switch, and neither is a step — so each pulse of a segment is
+    /// counted at most once. A plant already past that instant (a late,
+    /// free-running delivery) is not rewound: the span is its lag, as for a
+    /// late new segment.
+    ///
     /// The plant never moves past the instant it was handed the segment. A
     /// segment anchored later than that — a producer that
     /// published ahead of virtual time, against `NODES.md` §11 contract
@@ -577,19 +593,37 @@ impl MotorCore {
             }
             _ => train.since_ns,
         };
+        // Where the plant moves to, and where the segment's count starts: a
+        // new segment's delivery (clamped as above) and its anchor. A
+        // segment handed back after it stopped crossing (`end_train`) starts
+        // again at the instant it was delivered again — the instant its
+        // phases cross the input again: its pulses before that were folded
+        // before the stop or went out while the input did not switch, and
+        // neither its anchor nor wherever a read last left the plant says
+        // where it resumes.
+        let resumed = plant.ended_train == Some(train);
+        let (from, counted_from) = if resumed {
+            let delivered = delivered_ns.unwrap_or(plant.now_ns);
+            (delivered, delivered)
+        } else {
+            (anchor, train.since_ns)
+        };
         // The engine may deliver later than the source acted (free-running);
         // never rewind the plant to match. Record the lag so `train_end`
         // finishes `lag` later than the source said — conserving the
         // pulse↔distance invariant instead of silently truncating travel.
-        let at = anchor.max(plant.now_ns);
-        let delivery_lag_ns = at.saturating_sub(train.since_ns);
+        let at = from.max(plant.now_ns);
+        let delivery_lag_ns = at.saturating_sub(counted_from);
         self.advance(&mut plant, at);
         // `advance` is a no-op when `at == now_ns`, so fold explicitly. It is
         // idempotent, so doing both is safe.
         self.fold(&mut plant, at);
         plant.cmd = Self::train_rate(&plant, &train);
         plant.train = Some(train);
-        plant.train_folded = 0;
+        plant.train_folded = train
+            .emitted_at_ns(counted_from)
+            .saturating_sub(train.emitted);
+        plant.ended_train = None;
         plant.train_delivery_lag_ns = delivery_lag_ns;
         // A rate-carried train supplies its own rate, so the edge path's
         // phase measurement (and its stall window) must not also apply.
@@ -598,8 +632,11 @@ impl MotorCore {
     }
 
     /// The `STEP` net stopped carrying a segment at `now_ns` — its source
-    /// released it, or a fight took it: fold the train up to that instant
-    /// and stop commanding. Nothing to do on the edge path.
+    /// released it, a fight took it, or its phases stopped crossing the
+    /// input's thresholds: fold the train up to that instant, remember the
+    /// segment (handed back, it resumes at the instant it is delivered
+    /// again, [`Self::receive_train`]), and stop commanding. Nothing to do on
+    /// the edge path.
     fn end_train(&self, now_ns: u64) {
         let mut plant = self.plant.lock().unwrap();
         if plant.train.is_none() {
@@ -607,6 +644,7 @@ impl MotorCore {
         }
         self.advance(&mut plant, now_ns);
         self.fold(&mut plant, now_ns);
+        plant.ended_train = plant.train;
         plant.train = None;
         plant.train_folded = 0;
         plant.train_delivery_lag_ns = 0;
@@ -1738,6 +1776,92 @@ mod tests {
             core.plant.lock().unwrap().cmd > 0.0,
             "the train is still commanding after a minute of no events"
         );
+    }
+
+    /// A segment that stops crossing `STEP`'s thresholds and crosses again
+    /// under the same schedule — its phase voltages moved, the source did
+    /// not re-publish — is counted for the spans it crossed and nothing
+    /// else: every pulse of it once, none while the input did not switch.
+    /// The resume is folded from the instant it was delivered, wherever the
+    /// plant was last advanced: at the resume by a read there, more than a
+    /// pulse short of it (read at 8 ms, resumed at 9.5 ms: the pulse at 9 ms
+    /// went out while the input did not switch), not since the stop at all,
+    /// or — a free-running delivery, late — past it (read at 10.5 ms,
+    /// resumed at 9 ms: the pulse at 10 ms counted, the plant not rewound,
+    /// the 1.5 ms recorded as the lag a late segment's travel recovers).
+    #[rstest]
+    #[case::read_at_the_resume(Some(9_000), 9_000)]
+    #[case::read_short_of_the_resume(Some(8_000), 9_500)]
+    #[case::not_read_since_the_stop(None, 9_000)]
+    #[case::read_past_the_resume(Some(10_500), 9_000)]
+    fn a_segment_that_stops_and_resumes_crossing_counts_each_pulse_once(
+        #[case] read_between_us: Option<u64>,
+        #[case] resume_us: u64,
+    ) {
+        let core = enabled_core(quasi_static());
+        let running = train(1_000, 0, None);
+        core.receive_train(running, Some(0));
+        // It stops crossing at 4 ms: four pulses folded.
+        core.end_train(us(4_000));
+        assert_eq!(train_steps(&core), 4);
+        assert_eq!(core.plant.lock().unwrap().cmd, 0.0, "no train, no command");
+        // Nothing while it does not cross, however long.
+        if let Some(read_us) = read_between_us {
+            read_at(&core, read_us);
+            assert_eq!(train_steps(&core), 4);
+        }
+        // The same segment crosses again at the resume and runs to 12 ms.
+        core.receive_train(running, Some(us(resume_us)));
+        {
+            let plant = core.plant.lock().unwrap();
+            let reached = us(read_between_us.map_or(resume_us, |read| read.max(resume_us)));
+            assert_eq!(plant.now_ns, reached, "at the resume, never rewound");
+            assert_eq!(plant.train_delivery_lag_ns, reached - us(resume_us));
+        }
+        read_at(&core, 12_000);
+        assert_eq!(
+            train_steps(&core),
+            4 + 3,
+            "0–4 ms and the resume to 12 ms: the pulses the input switched on"
+        );
+        assert_eq!(
+            train_steps(&core),
+            i64::try_from(
+                running.emitted_at_ns(us(4_000)) + running.emitted_at_ns(us(12_000))
+                    - running.emitted_at_ns(us(resume_us))
+            )
+            .unwrap(),
+            "the drive's count is the segment's own over the spans it crossed"
+        );
+        // A different segment is folded whole from its own anchor.
+        let next = PeriodicSchedule {
+            emitted: running.emitted_at_ns(us(12_000)),
+            ..train(2_000, 12_000, None)
+        };
+        core.receive_train(next, Some(us(12_000)));
+        read_at(&core, 13_000);
+        assert_eq!(train_steps(&core), 7 + 2);
+    }
+
+    /// A segment anchored after the instant it was delivered — a producer
+    /// ahead of virtual time — moves the plant only to the delivery; the
+    /// segment's own arithmetic still counts from its anchor.
+    #[rstest]
+    fn a_segment_anchored_after_its_delivery_is_folded_only_to_the_delivery() {
+        let core = enabled_core(quasi_static());
+        let early = train(1_000, 5_000, None);
+        core.receive_train(early, Some(us(3_000)));
+        {
+            let plant = core.plant.lock().unwrap();
+            assert_eq!(plant.now_ns, us(3_000), "no further than the delivery");
+            assert_eq!(plant.train, Some(early), "the segment as published");
+            assert_eq!(plant.train_delivery_lag_ns, 0);
+        }
+        assert_eq!(train_steps(&core), 0);
+        read_at(&core, 5_000);
+        assert_eq!(train_steps(&core), 0, "nothing before its anchor");
+        read_at(&core, 8_000);
+        assert_eq!(train_steps(&core), 3, "three pulses from its anchor");
     }
 
     /// `commanded_steps` is the sum of both paths, and the shaft exposes the
