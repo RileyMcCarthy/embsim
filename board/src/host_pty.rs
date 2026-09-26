@@ -30,7 +30,8 @@ use std::thread::JoinHandle;
 
 use crate::uart::{FramingError, UartFraming};
 use crate::{
-    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, SerialLevelBridge,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, PinDecl,
+    SerialLevelBridge,
 };
 use embsim_core::serial_pty::Pty;
 
@@ -86,22 +87,11 @@ impl HostPty {
     pub fn open(symlink_path: &str, baud_hz: u32) -> std::io::Result<Self> {
         Ok(Self {
             pins: [
-                PinDecl {
-                    number: "TX",
-                    name: None,
-                    kind: PinKind::DigitalOut,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
-                PinDecl {
-                    number: "RX",
-                    name: None,
-                    kind: PinKind::DigitalIn,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
+                PinDecl::digital_out("TX"),
+                // The host's end is a bench adapter no datasheet here
+                // describes: its receiver reads at the 3.3 V LVCMOS pair
+                // the link signals at.
+                PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)),
             ],
             framing: UartFraming::new_8n1(baud_hz),
             pty: Pty::new(symlink_path)?,
@@ -142,11 +132,17 @@ impl Component for HostPty {
         {
             let (bridge, shutdown) = (Arc::clone(&bridge), Arc::clone(&self.shutdown));
             let (outbound, dropped) = (Arc::clone(&self.outbound), Arc::clone(&self.dropped));
-            io.on_sense("RX", move |state| {
+            let rx = io.pin("RX")?;
+            io.on_sense("RX", move |sense| {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                deliver(master, &outbound, &dropped, bridge.receive_sense(state));
+                deliver(
+                    master,
+                    &outbound,
+                    &dropped,
+                    bridge.receive_sense(&rx, &sense),
+                );
             })?;
         }
         {

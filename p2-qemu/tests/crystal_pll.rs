@@ -3,15 +3,17 @@
 //!
 //! A bench clock puts a 20 MHz train on the package's `XI` five
 //! milliseconds in. The guest (fifteen instructions of PASM2, assembled
-//! below and checked against flexspin's listing) waits one millisecond on
-//! RCFAST, then does what a flexspin program does in its first
+//! below and checked against flexspin's listing) starts at three — the
+//! datasheet's restart delay after its supplies, up from the build — waits
+//! one millisecond on RCFAST, then does what a flexspin program does in
+//! its first
 //! instructions: `HUBSET` the PLL word with the source still RCFAST, wait,
 //! `HUBSET` again selecting the PLL — `20 MHz × 8 = 160 MHz`. Then four
 //! back-to-back pad writes, and a byte to the debug pin.
 //!
 //! What the scope on `P0` proves:
 //!
-//! - **No crystal, no clock.** At one millisecond the guest selects a
+//! - **No crystal, no clock.** At four milliseconds the guest selects a
 //!   clock derived from `XI` while nothing reaches the pin, and the node
 //!   stalls it rather than inventing a frequency: the first edge lands
 //!   after the clock arrived at 5 ms, never before.
@@ -22,24 +24,26 @@
 //! And the node reports the crystal it was handed: 20 MHz, from the pin.
 //!
 //! The bench supplies `VDD` at 1.8 V and `RESN` released, so the
-//! package's START gate opens at the build and the guest's clock counts
-//! from zero, and the `VIO_0_3` bank at 3.3 V for the pad it writes.
+//! package's reset releases at the build and the guest's clock counts from
+//! the START instant the restart delay later, 3 ms, and the `VIO_0_3` bank
+//! at 3.3 V for the pad it writes.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    level_of, AttachError, Component, ComponentNetIo, EndpointRef, Harness, Level, PinDecl,
-    PulseDirection, PulseSegment, PulseTrain, PulseTx, StreamRole, System,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver,
+    Drive, EndpointRef, Harness, Level, PeriodicSchedule, PinDecl, System, TheveninDrive,
 };
-use embsim_boards::p2::P2Package;
+use embsim_boards::p2::{P2Package, P2_RESTART_DELAY_NS};
 use embsim_core::virtual_clock;
 use embsim_p2_qemu::{P2Qemu, P2QemuError};
 
 /// The P2's debug transmit pin, where the guest writes its byte.
 const DEBUG_TX: u8 = 62;
-/// When the bench clock starts: five milliseconds in, well after the
-/// guest has selected the PLL at one.
+/// When the bench clock starts: five milliseconds in, after the guest —
+/// started at three, the restart delay after the build — has selected the
+/// PLL at four.
 const CLOCK_AT_NS: u64 = 5_000_000;
 /// The rate on `XI`.
 const CRYSTAL_HZ: u32 = 20_000_000;
@@ -86,8 +90,8 @@ const PROGRAM: [u32; 15] = [
     0xFD80_000E,
 ];
 
-/// A bench clock: a push-pull pulse source that publishes its train from
-/// a wake at [`CLOCK_AT_NS`].
+/// A bench clock: a push-pull output that drives its square wave — rail to
+/// rail at 25 Ω — from a wake at [`CLOCK_AT_NS`].
 struct BenchClock {
     pins: [PinDecl; 1],
 }
@@ -95,7 +99,7 @@ struct BenchClock {
 impl BenchClock {
     fn new() -> Self {
         Self {
-            pins: [PinDecl::digital_out("OUT").with_stream(StreamRole::PulseSource)],
+            pins: [PinDecl::digital_out("OUT")],
         }
     }
 }
@@ -106,16 +110,23 @@ impl Component for BenchClock {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        let tx: PulseTx = io.pulse_tx("OUT")?;
+        let out = io.pin("OUT")?;
         io.on_wake_ns(move |now| {
-            tx.set_train(PulseTrain {
-                pulses: PulseSegment {
+            out.drive(Drive::Periodic {
+                hi: TheveninDrive {
+                    volts: 3.3,
+                    impedance: 25.0,
+                },
+                lo: TheveninDrive {
+                    volts: 0.0,
+                    impedance: 25.0,
+                },
+                segment: PeriodicSchedule {
                     emitted: 0,
                     freq_hz: CRYSTAL_HZ,
                     total: None,
-                    since_us: now / 1_000,
+                    since_ns: now,
                 },
-                direction: PulseDirection::Forward,
             });
         });
         io.schedule_at_ns(CLOCK_AT_NS);
@@ -133,7 +144,10 @@ impl Scope {
     fn new() -> (Self, Arc<Mutex<Vec<u64>>>) {
         let instants = Arc::new(Mutex::new(Vec::new()));
         let scope = Self {
-            pins: [PinDecl::digital_in("A")],
+            pins: [PinDecl::digital_in(
+                "A",
+                jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+            )],
             instants: Arc::clone(&instants),
         };
         (scope, instants)
@@ -147,14 +161,15 @@ impl Component for Scope {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let instants = Arc::clone(&self.instants);
         let last = Mutex::new(None::<Level>);
-        io.on_sense("A", move |state| {
-            let Some(level) = level_of(state) else {
+        let receiver = DigitalReceiver::new(io.pin("A")?);
+        io.on_sense("A", move |sense| {
+            let Some(level) = receiver.read(&sense) else {
                 return;
             };
             let mut last = last.lock().unwrap();
             if *last != Some(level) {
                 *last = Some(level);
-                instants.lock().unwrap().push(virtual_clock::virtual_ns());
+                instants.lock().unwrap().push(sense.at_ns);
             }
         })
     }
@@ -165,9 +180,13 @@ fn ep(endpoint: &str) -> EndpointRef {
 }
 
 /// The bench supplies: the core rail inside its window and reset
-/// released (the START gate), and the bank the guest writes its pad in.
+/// released (the START gate), and the bank the guest writes its pad in — each
+/// measured against the ground the bench holds at 0 V, which is not
+/// implicit (`DESIGN.md` rule 6): a pin's sense is its voltage against its
+/// reference pin, `GND`.
 fn supplies(harness: Harness) -> Harness {
     harness
+        .power(ep("BENCH.GND"), ep("P2.GND"), 0.0)
         .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
         .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
         .power(ep("BENCH.VIO_0_3"), ep("P2.VIO_0_3"), 3.3)
@@ -233,16 +252,17 @@ fn hubset_multiplies_the_rate_delivered_on_xi_and_stalls_without_one() {
         handle.slices(),
     );
 
-    // The START gate opened at the build: the supplies were up before the
-    // first wake, so the guest's clock counts from zero.
-    assert_eq!(package_handle.started_at_ns(), Some(0));
+    // The reset released at the build — the supplies were up before the
+    // first wake — so the guest's clock counts from the end of the
+    // datasheet's restart delay.
+    assert_eq!(package_handle.started_at_ns(), Some(P2_RESTART_DELAY_NS));
 
     // The crystal is what the pin carried: the node and the package agree.
     assert_eq!(handle.crystal_hz(), Some(u64::from(CRYSTAL_HZ)));
     assert_eq!(package_handle.crystal_hz(), Some(u64::from(CRYSTAL_HZ)));
     assert!(!handle.stalled(), "running again since the clock arrived");
 
-    // No crystal, no clock: the guest selected the PLL at ~1 ms and its
+    // No crystal, no clock: the guest selected the PLL at ~4 ms and its
     // first pad write landed only after the rate reached XI at 5 ms.
     assert_eq!(edges.len(), 4, "four pad writes, four edges: {edges:?}");
     assert!(

@@ -73,7 +73,7 @@
 //!
 //! ```rust
 //! use embsim_board::{PartRegistry, registry::normalize_part};
-//! use embsim_models::isolation::{iso67xx, Channel, Iso67xx};
+//! use embsim_models::isolation::{iso67xx, Iso67xx};
 //! use embsim_models::opto::Opto;
 //! use embsim_models::pwl_library;
 //!
@@ -84,11 +84,8 @@
 //! for part in ["ISO6742DWR", "ISO6741DWR", "ISO6740FDWR", "ISO6721BDR"] {
 //!     registry.register(part, |decl| {
 //!         let name = normalize_part(decl);
-//!         let mut config = iso67xx::Config::from_part_name(&name).expect("an ISO67xx");
-//!         // Opt a channel into carrying a step clock as a rate, not edges.
-//!         if decl.reference == "IC14" {
-//!             config = config.with_pulse_channel(Channel::A);
-//!         }
+//!         let config = iso67xx::Config::from_part_name(&name).expect("an ISO67xx");
+//!         // A step clock crosses any channel as a clock, not as edges.
 //!         Box::new(Iso67xx::new(config).expect("a valid isolator"))
 //!     });
 //! }
@@ -118,7 +115,7 @@ pub use iso67xx::{Channel, Iso67xx, Iso67xxMonitor, Side, Variant};
 
 use std::fmt;
 
-use embsim_board::{Level, NetState, TheveninDrive, Volts};
+use embsim_board::{Level, Sense, TheveninDrive, Volts};
 
 // ============================================================
 // Configuration errors
@@ -148,13 +145,6 @@ pub enum PartConfigError {
         /// Configured `V_IH` fraction of the input supply.
         vih_ratio: f64,
     },
-    /// A channel was named that the configured device variant does not have.
-    NoSuchChannel {
-        /// Variant name as spelled in [`iso67xx::Variant`].
-        variant: &'static str,
-        /// The channel that was asked for.
-        channel: &'static str,
-    },
 }
 
 impl fmt::Display for PartConfigError {
@@ -171,9 +161,6 @@ impl fmt::Display for PartConfigError {
                 "inverted input thresholds: V_IL ratio {vil_ratio} must be below V_IH ratio \
                  {vih_ratio}, or no input voltage is ever unambiguous"
             ),
-            PartConfigError::NoSuchChannel { variant, channel } => {
-                write!(f, "{variant} has no channel {channel}")
-            }
         }
     }
 }
@@ -193,72 +180,25 @@ pub(crate) fn require_positive(field: &'static str, value: f64) -> Result<(), Pa
 // Supply gating
 // ============================================================
 
-/// Whether a sensed supply net is up, against a part's own minimum.
+/// The voltage a sensed supply pin is at when it is **up** — at or above a
+/// part's own minimum against the pin's reference — and `None` when it is
+/// not.
 ///
-/// The projection matches [`crate::ads122u04_component`]'s `supply_ok`, which
-/// is the reference for supply gating in this workspace: a numeric solve is
-/// compared to the minimum; a rail known only as a digital projection (an
-/// unmodeled-voltage [`embsim_board::PinKind::PowerOut`] presenting
-/// `Pulled(High)`) counts as up; a rail held low, floating, or fought over
-/// does not.
-///
-/// The engine never invents a value for an unsourced node, so a *floating*
-/// supply is a down supply — which is exactly the failure a system description
-/// that forgot a rail should get.
-pub fn supply_up(state: NetState, min_volts: Volts) -> bool {
-    match state {
-        NetState::Analog(volts) => volts >= min_volts,
-        NetState::Driven(Level::High) | NetState::Pulled(Level::High, _) => true,
-        NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => false,
-        NetState::Floating | NetState::Contention => false,
-    }
+/// A supply that names no voltage is down: floating, a clock (a periodic
+/// net names no operating voltage), fought for half of every cycle, a node
+/// only an unmodelled rail reaches, or a ground the pin is measured against
+/// that nothing holds. The engine never invents a value for such a node
+/// (`DESIGN.md` rule 6), so neither does a part: a system description that
+/// forgot a rail — or its return — gets a down part, which is exactly the
+/// failure it should get. [`crate::ads122u04_component`]'s gate reads its
+/// supplies the same way.
+pub fn supply_volts(sense: &Sense, min_volts: Volts) -> Option<Volts> {
+    sense.volts.filter(|&volts| volts >= min_volts)
 }
 
-/// The voltage a supply rail is at, or `nominal` when the engine has only a
-/// digital projection of it.
-///
-/// `Driven`/`Pulled` carry a level, not volts; an output driven "to the rail"
-/// against such a supply has to pick some number, and the part's configured
-/// nominal is the honest one to pick (and to say so).
-pub fn rail_volts(state: NetState, nominal: Volts) -> Volts {
-    match state {
-        NetState::Analog(volts) if volts.is_finite() => volts,
-        _ => nominal,
-    }
-}
-
-// ============================================================
-// Input projection
-// ============================================================
-
-/// Project a sensed net onto a logic level against an **asymmetric**
-/// `V_IL`/`V_IH` pair, returning `None` inside the dead band.
-///
-/// [`crate::machine::digital_level`] takes one threshold because a machine
-/// part has no logic family; a real interface IC specifies two, as fractions
-/// of its own input supply, with a dead band between them where the datasheet
-/// promises nothing. This helper keeps that promise: a node voltage inside the
-/// band returns `None`, and each part chooses its documented behavior (the
-/// isolators fall to their default output state, which is what the TI function
-/// table says an *indeterminate* input does).
-///
-/// `Floating` and `Contention` are `None` for the same reason they are in
-/// [`crate::machine::digital_level`] — the engine never invents a value for an
-/// unsourced or fought-over node, and neither does a part model.
-///
-/// Projecting the dead band as `None` rather than as
-/// [`embsim_board::Finding::AmbiguousLevel`] is deliberate: that finding is an
-/// engine-side slice (`BOARD_ENGINE.md`, deferred features), so the part
-/// resolves the ambiguity locally and documents how.
-pub fn threshold_level(state: NetState, vil: Volts, vih: Volts) -> Option<Level> {
-    match state {
-        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
-        NetState::Analog(volts) if volts.is_nan() => None,
-        NetState::Analog(volts) if volts >= vih => Some(Level::High),
-        NetState::Analog(volts) if volts <= vil => Some(Level::Low),
-        NetState::Analog(_) => None,
-        NetState::Floating | NetState::Contention => None,
-    }
+/// Whether a sensed supply pin is up ([`supply_volts`]).
+pub fn supply_up(sense: &Sense, min_volts: Volts) -> bool {
+    supply_volts(sense, min_volts).is_some()
 }
 
 // ============================================================
@@ -287,48 +227,27 @@ mod tests {
 
     use super::*;
 
-    #[rstest]
-    #[case::analog_above(NetState::Analog(3.3), true)]
-    #[case::analog_at_minimum(NetState::Analog(1.71), true)]
-    #[case::analog_below(NetState::Analog(1.0), false)]
-    #[case::analog_zero(NetState::Analog(0.0), false)]
-    #[case::driven_high(NetState::Driven(Level::High), true)]
-    #[case::driven_low(NetState::Driven(Level::Low), false)]
-    #[case::pulled_high(NetState::Pulled(Level::High, 10_000.0), true)]
-    #[case::pulled_low(NetState::Pulled(Level::Low, 10_000.0), false)]
-    #[case::floating(NetState::Floating, false)]
-    #[case::contention(NetState::Contention, false)]
-    fn supply_up_matches_the_ads122u04_projection(#[case] state: NetState, #[case] expect: bool) {
-        assert_eq!(supply_up(state, 1.71), expect);
+    /// A sense handed `volts`.
+    fn handed(volts: Option<Volts>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
     }
 
     #[rstest]
-    #[case::solved(NetState::Analog(5.0), 5.0)]
-    #[case::projected_high(NetState::Driven(Level::High), 3.3)]
-    #[case::floating(NetState::Floating, 3.3)]
-    #[case::nan(NetState::Analog(f64::NAN), 3.3)]
-    fn rail_volts_falls_back_to_the_nominal(#[case] state: NetState, #[case] expect: Volts) {
-        assert!((rail_volts(state, 3.3) - expect).abs() < 1e-12);
-    }
-
-    /// The dead band between `V_IL` and `V_IH` is `None`, not a guess.
-    #[rstest]
-    #[case::high(NetState::Analog(3.0), Some(Level::High))]
-    #[case::at_vih(NetState::Analog(2.31), Some(Level::High))]
-    #[case::dead_band(NetState::Analog(1.65), None)]
-    #[case::at_vil(NetState::Analog(0.99), Some(Level::Low))]
-    #[case::low(NetState::Analog(0.0), Some(Level::Low))]
-    #[case::driven(NetState::Driven(Level::High), Some(Level::High))]
-    #[case::pulled(NetState::Pulled(Level::Low, 4_700.0), Some(Level::Low))]
-    #[case::floating(NetState::Floating, None)]
-    #[case::contention(NetState::Contention, None)]
-    #[case::nan(NetState::Analog(f64::NAN), None)]
-    fn threshold_level_refuses_the_dead_band(
-        #[case] state: NetState,
-        #[case] expect: Option<Level>,
+    #[case::above(Some(3.3), Some(3.3))]
+    #[case::at_minimum(Some(1.71), Some(1.71))]
+    #[case::below(Some(1.0), None)]
+    #[case::zero(Some(0.0), None)]
+    #[case::no_voltage(None, None)]
+    fn a_supply_is_up_at_its_voltage_from_the_minimum(
+        #[case] volts: Option<Volts>,
+        #[case] expect: Option<Volts>,
     ) {
-        // 0.3 x 3.3 = 0.99, 0.7 x 3.3 = 2.31 (SLLSFJ6G section 7.3).
-        assert_eq!(threshold_level(state, 0.99, 2.31), expect);
+        assert_eq!(supply_volts(&handed(volts), 1.71), expect);
+        assert_eq!(supply_up(&handed(volts), 1.71), expect.is_some());
     }
 
     #[rstest]
@@ -381,11 +300,5 @@ mod tests {
         }
         .to_string()
         .contains("0.7"));
-        assert!(PartConfigError::NoSuchChannel {
-            variant: "Iso6721",
-            channel: "D"
-        }
-        .to_string()
-        .contains("Iso6721"));
     }
 }

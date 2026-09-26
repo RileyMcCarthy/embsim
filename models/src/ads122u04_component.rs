@@ -20,7 +20,7 @@
 //! Pins 15/16 carry **levels**, through the shared
 //! [`embsim_board::SerialLevelBridge`]: a byte leaves as a
 //! start bit, eight data bits and a stop bit at [`ADS122U04_BAUD_HZ`], and
-//! arrives the same way. They used to carry `StreamRole::Producer`/`Consumer`,
+//! arrives the same way. They used to carry stream `Producer`/`Consumer` roles,
 //! where the net decided *reachability* and the payload never became a level —
 //! so a command could not be corrupted by a driver fighting it, and the chip's
 //! answer could not break on a wire that was also being driven by something
@@ -40,7 +40,7 @@
 //!
 //! - Power-on reset requires **both** supplies — an unpowered AVDD or DVDD is
 //!   a silent chip (SBAS752B power-on reset; supplies specified 2.3 V–5.5 V,
-//!   §7.3 Recommended Operating Conditions). This is the July 2026 bench
+//!   §6.3 Recommended Operating Conditions). This is the July 2026 bench
 //!   "AVDD unstrapped" failure made live.
 //! - **`~RESET` is active low**; held low the interface never answers, and a
 //!   *floating* digital input is out of spec (SBAS752B, unused-inputs
@@ -49,7 +49,8 @@
 //!   board rev with the R10 pull-up) gets exactly the bench symptom: perfect
 //!   commands in, silence out. The engine reports the floating sense; the
 //!   adapter chooses the datasheet behavior (silence).
-//! - The high projection of `~RESET` uses **V_IH = 0.7 · DVDD** (§7.3),
+//! - The high projection of `~RESET` uses **V_IH = 0.7 · DVDD** (§6.5
+//!   Electrical Characteristics, Digital Inputs/Outputs),
 //!   against the solved DVDD rail voltage when the engine publishes one.
 //!
 //! ## Deliberate simplifications
@@ -80,8 +81,8 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::uart::{FramingError, UartFraming};
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, PinDecl, PinKind,
-    SerialLevelBridge,
+    AttachError, Component, ComponentNetIo, DeadBand, Level, PinDecl, Sense, SerialLevelBridge,
+    Thresholds, Volts,
 };
 use tracing::{debug, trace, warn};
 
@@ -96,17 +97,37 @@ use crate::ads122u04::{Ads122u04, Config};
 /// facade pins the rate the consuming firmware runs the interface at.
 pub const ADS122U04_BAUD_HZ: u32 = 115_200;
 
-const fn pin(number: &'static str, name: Option<&'static str>, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name,
-        kind,
-        // No stream role on any pin, TX and RX included: the UART is framed
-        // onto the net as levels, so there is no byte route to declare.
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+/// Digital input low level, as a fraction of `DVDD`: `V_IL` max 0.3 · DVDD
+/// (SBAS752B §6.5 Electrical Characteristics, Digital Inputs/Outputs, p. 6).
+const VIL_DVDD_RATIO: f64 = 0.3;
+
+/// Digital input high level, as a fraction of `DVDD`: `V_IH` min 0.7 · DVDD
+/// (SBAS752B §6.5 Electrical Characteristics, Digital Inputs/Outputs, p. 6).
+const VIH_DVDD_RATIO: f64 = 0.7;
+
+/// The digital inputs' thresholds, **relative** to `DVDD` and measured
+/// against `DGND`: `V_IL` 0.3 · DVDD, `V_IH` 0.7 · DVDD; the datasheet names
+/// no input hysteresis (SBAS752B §6.5, p. 6), so between the two it
+/// guarantees neither level ([`DeadBand::Unknown`]).
+pub const ADS122U04_INPUT_THRESHOLDS: Thresholds =
+    Thresholds::new(VIL_DVDD_RATIO, VIH_DVDD_RATIO, 0.0, DeadBand::Unknown);
+
+/// A digital input: the datasheet's thresholds against its `DVDD`/`DGND`.
+/// No pin declares a byte route, TX and RX included: the UART is framed
+/// onto the net as levels.
+const fn digital_in(number: &'static str, name: &'static str) -> PinDecl {
+    PinDecl::digital_in(number, ADS122U04_INPUT_THRESHOLDS)
+        .with_name(name)
+        .with_supply("DVDD")
+        .with_reference("DGND")
+}
+
+/// An analog input or reference input, read against `AVSS` — the
+/// converter's analog ground.
+const fn analog_in(number: &'static str, name: &'static str) -> PinDecl {
+    PinDecl::analog(number)
+        .with_name(name)
+        .with_reference("AVSS")
 }
 
 /// TSSOP-16 (PW) pinout per SBAS752B p.3: 1 GPIO1, 2 GPIO0, 3 ~RESET,
@@ -117,22 +138,26 @@ const fn pin(number: &'static str, name: Option<&'static str>, kind: PinKind) ->
 /// build-time facades in the `embsim-board` regression tests — one table, so
 /// the analysis pass and the live component can never disagree on the pinout.
 pub const ADS122U04_PINS: [PinDecl; 16] = [
-    pin("1", Some("GPIO1"), PinKind::DigitalIn),
-    pin("2", Some("GPIO0"), PinKind::DigitalIn),
-    pin("3", Some("~RESET"), PinKind::DigitalIn),
-    pin("4", Some("DGND"), PinKind::PowerIn),
-    pin("5", Some("AVSS"), PinKind::PowerIn),
-    pin("6", Some("AIN3"), PinKind::Analog),
-    pin("7", Some("AIN2"), PinKind::Analog),
-    pin("8", Some("REFN"), PinKind::Analog),
-    pin("9", Some("REFP"), PinKind::Analog),
-    pin("10", Some("AIN1"), PinKind::Analog),
-    pin("11", Some("AIN0"), PinKind::Analog),
-    pin("12", Some("AVDD"), PinKind::PowerIn),
-    pin("13", Some("DVDD"), PinKind::PowerIn),
-    pin("14", Some("DRDY"), PinKind::DigitalIn),
-    pin("15", Some("TX"), PinKind::DigitalOut),
-    pin("16", Some("RX"), PinKind::DigitalIn),
+    digital_in("1", "GPIO1"),
+    digital_in("2", "GPIO0"),
+    digital_in("3", "~RESET"),
+    PinDecl::power_in("4").with_name("DGND"),
+    PinDecl::power_in("5").with_name("AVSS"),
+    analog_in("6", "AIN3"),
+    analog_in("7", "AIN2"),
+    analog_in("8", "REFN"),
+    analog_in("9", "REFP"),
+    analog_in("10", "AIN1"),
+    analog_in("11", "AIN0"),
+    PinDecl::power_in("12")
+        .with_name("AVDD")
+        .with_reference("AVSS"),
+    PinDecl::power_in("13")
+        .with_name("DVDD")
+        .with_reference("DGND"),
+    digital_in("14", "DRDY"),
+    PinDecl::digital_out("15").with_name("TX"),
+    digital_in("16", "RX"),
 ];
 
 /// The framing the chip's UART uses: 8N1 at [`ADS122U04_BAUD_HZ`].
@@ -145,23 +170,36 @@ pub fn ads122u04_framing() -> UartFraming {
 // ============================================================
 
 /// Minimum operating supply voltage: AVDD and DVDD are specified
-/// 2.3 V–5.5 V (SBAS752B §7.3 Recommended Operating Conditions). A rail
+/// 2.3 V–5.5 V (SBAS752B §6.3 Recommended Operating Conditions). A rail
 /// solved below this — including a rail stuck at 0 V — is a down domain.
 const SUPPLY_MIN_VOLTS: f64 = 2.3;
 
-/// Digital input high threshold: V_IH = 0.7 · DVDD (SBAS752B §7.3).
-const VIH_DVDD_RATIO: f64 = 0.7;
-
-/// Nominal DVDD used for the V_IH projection while the DVDD net has no
-/// numeric solve (`Driven`/`Pulled` states carry a level, not volts).
-const NOMINAL_DVDD_VOLTS: f64 = 3.3;
-
-/// Last engine-published states of the three gating nets.
-#[derive(Debug, Clone, Copy)]
+/// The three gating inputs, as their pins were last handed them: each a
+/// voltage against the pin's own ground (`DGND` for `~RESET` and `DVDD`,
+/// `AVSS` for `AVDD`), `None` where no source reaches the net or no voltage
+/// can be named for it.
+#[derive(Debug, Clone, Copy, Default)]
 struct GateInputs {
-    reset: NetState,
-    dvdd: NetState,
-    avdd: NetState,
+    reset: Option<Volts>,
+    dvdd: Option<Volts>,
+    avdd: Option<Volts>,
+    /// The level `~RESET` last read — its receiver's last level, which the
+    /// next projection is chosen by.
+    reset_level: Option<Level>,
+}
+
+impl GateInputs {
+    /// `~RESET` through the datasheet's thresholds, 0.3/0.7 × `DVDD`
+    /// (SBAS752B §6.5), scaled by the `DVDD` it has now. No `DVDD`, no
+    /// level: the thresholds have no supply to scale by.
+    fn project_reset(&mut self) {
+        self.reset_level = match (self.reset, self.dvdd) {
+            (Some(reset), Some(dvdd)) => ADS122U04_INPUT_THRESHOLDS
+                .scaled(dvdd)
+                .project(reset, self.reset_level),
+            _ => None,
+        };
+    }
 }
 
 /// Adapter-level power/reset gate. Sense callbacks (engine thread) write the
@@ -174,29 +212,30 @@ struct Gate {
 }
 
 impl Gate {
-    /// Everything floating until the engine says otherwise — the engine
-    /// delivers the current state of every sensed net once at registration,
-    /// so a live system settles the gate before any stream traffic lands.
+    /// Nothing handed yet, chip dead until the engine says otherwise — the
+    /// engine delivers the current sense of every sensed net once at
+    /// registration, so a live system settles the gate before any stream
+    /// traffic lands.
     fn new() -> Self {
         Self {
-            inputs: Mutex::new(GateInputs {
-                reset: NetState::Floating,
-                dvdd: NetState::Floating,
-                avdd: NetState::Floating,
-            }),
+            inputs: Mutex::new(GateInputs::default()),
         }
     }
 
-    fn set_reset(&self, state: NetState) {
-        self.inputs.lock().unwrap().reset = state;
+    fn set_reset(&self, sense: &Sense) {
+        let mut inputs = self.inputs.lock().unwrap();
+        inputs.reset = sense.volts;
+        inputs.project_reset();
     }
 
-    fn set_dvdd(&self, state: NetState) {
-        self.inputs.lock().unwrap().dvdd = state;
+    fn set_dvdd(&self, sense: &Sense) {
+        let mut inputs = self.inputs.lock().unwrap();
+        inputs.dvdd = sense.volts;
+        inputs.project_reset();
     }
 
-    fn set_avdd(&self, state: NetState) {
-        self.inputs.lock().unwrap().avdd = state;
+    fn set_avdd(&self, sense: &Sense) {
+        self.inputs.lock().unwrap().avdd = sense.volts;
     }
 
     /// True when the chip is electrically alive: both supplies up (power-on
@@ -205,7 +244,7 @@ impl Gate {
     /// domain, a rail fight — is the bench-observed silent chip.
     fn alive(&self) -> bool {
         let inputs = *self.inputs.lock().unwrap();
-        supply_ok(inputs.dvdd) && supply_ok(inputs.avdd) && reset_high(inputs.reset, inputs.dvdd)
+        supply_ok(inputs.dvdd) && supply_ok(inputs.avdd) && inputs.reset_level == Some(Level::High)
     }
 }
 
@@ -215,33 +254,13 @@ fn regate_output(gate: &Gate, uart: &SerialLevelBridge) {
     uart.set_output_enabled(gate.alive());
 }
 
-/// A supply rail counts as up when it is sourced at an operating voltage.
-fn supply_ok(state: NetState) -> bool {
-    match state {
-        NetState::Analog(v) => v >= SUPPLY_MIN_VOLTS,
-        // A rail known only as a digital projection (e.g. an unmodeled-
-        // voltage `PowerOut` presenting `Pulled(High)`) counts as up; a rail
-        // held low, floating, or fought over does not.
-        NetState::Driven(Level::High) | NetState::Pulled(Level::High, _) => true,
-        NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => false,
-        NetState::Floating | NetState::Contention => false,
-    }
-}
-
-/// Digital-high projection of the `~RESET` net: V_IH = 0.7 · DVDD against
-/// the solved rail voltage (nominal 3.3 V while DVDD has no numeric solve).
-/// `Floating` is deliberately NOT high — the engine never invents a value
-/// for a floating sense, and neither does the chip model.
-fn reset_high(reset: NetState, dvdd: NetState) -> bool {
-    let dvdd_volts = match dvdd {
-        NetState::Analog(v) => v,
-        _ => NOMINAL_DVDD_VOLTS,
-    };
-    match reset {
-        NetState::Driven(Level::High) | NetState::Pulled(Level::High, _) => true,
-        NetState::Analog(v) => v >= VIH_DVDD_RATIO * dvdd_volts,
-        _ => false,
-    }
+/// A supply rail counts as up when it is at an operating voltage against
+/// its ground, [`SUPPLY_MIN_VOLTS`] or more. A rail that names no voltage —
+/// floating, a clock, fought for half of every cycle, only an unmodelled
+/// rail behind it, a ground that is not held — is down: the engine never
+/// invents a value, and neither does the chip model (`DESIGN.md` rule 6).
+fn supply_ok(volts: Option<Volts>) -> bool {
+    volts.is_some_and(|v| v >= SUPPLY_MIN_VOLTS)
 }
 
 // ============================================================
@@ -330,14 +349,21 @@ impl Component for Ads122u04Component {
 
         // -- power/reset gate ------------------------------------------
         for (pin, set) in [
-            ("~RESET", Gate::set_reset as fn(&Gate, NetState)),
+            ("~RESET", Gate::set_reset as fn(&Gate, &Sense)),
             ("DVDD", Gate::set_dvdd),
             ("AVDD", Gate::set_avdd),
         ] {
             let gate = Arc::clone(&self.gate);
             let uart = Arc::clone(&uart);
-            io.on_sense(pin, move |state| {
-                set(&gate, state);
+            let is_dvdd = pin == "DVDD";
+            io.on_sense(pin, move |sense| {
+                set(&gate, &sense);
+                // The UART's output high is the digital supply: `V_OH` is
+                // 0.8 × `DVDD` min at 1 mA (SBAS752B §6.5), so a part on a
+                // 5 V `DVDD` drives 5 V, not the crate's 3.3 V logic rail.
+                if let (true, Some(dvdd)) = (is_dvdd, sense.volts) {
+                    uart.set_high_volts(dvdd);
+                }
                 regate_output(&gate, &uart);
             })?;
         }
@@ -351,12 +377,12 @@ impl Component for Ads122u04Component {
         for (index, pin) in [(0usize, "AIN0"), (1usize, "AIN1")] {
             let ain_volts = Arc::clone(&self.ain_volts);
             let model = Arc::clone(&self.model);
-            io.on_sense(pin, move |state| {
-                let NetState::Analog(volts) = state else {
+            io.on_sense(pin, move |sense| {
+                let Some(volts) = sense.volts else {
                     trace!(
                         pin,
-                        ?state,
-                        "ADS122U04: input has no numeric solve; holding last differential"
+                        ?sense,
+                        "ADS122U04: input names no voltage; holding last differential"
                     );
                     return;
                 };
@@ -378,8 +404,9 @@ impl Component for Ads122u04Component {
             let gate = Arc::clone(&self.gate);
             let fd = Arc::clone(&self.firmware_fd);
             let uart = Arc::clone(&uart);
-            io.on_sense("RX", move |state| {
-                deliver_rx(&fd, &gate, uart.receive_sense(state));
+            let rx = io.pin("RX")?;
+            io.on_sense("RX", move |sense| {
+                deliver_rx(&fd, &gate, uart.receive_sense(&rx, &sense));
             })?;
         }
 
@@ -537,17 +564,26 @@ mod tests {
 
     use super::*;
 
-    const ANALOG_3V3: NetState = NetState::Analog(3.3);
+    const RAIL_3V3: Option<Volts> = Some(3.3);
 
-    fn gate_with(reset: NetState, dvdd: NetState, avdd: NetState) -> Gate {
+    /// A sense handed `volts` (the instant plays no part in the gate).
+    fn handed(volts: Option<Volts>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
+    }
+
+    fn gate_with(reset: Option<Volts>, dvdd: Option<Volts>, avdd: Option<Volts>) -> Gate {
         let gate = Gate::new();
-        gate.set_reset(reset);
-        gate.set_dvdd(dvdd);
-        gate.set_avdd(avdd);
+        gate.set_dvdd(&handed(dvdd));
+        gate.set_avdd(&handed(avdd));
+        gate.set_reset(&handed(reset));
         gate
     }
 
-    /// Fresh gate: everything floating, chip dead — the engine has not yet
+    /// Fresh gate: nothing handed, chip dead — the engine has not yet
     /// delivered any sense, and the adapter must not assume power.
     #[rstest]
     fn gate_starts_dead() {
@@ -555,54 +591,56 @@ mod tests {
     }
 
     /// The full bench-good configuration: both rails at 3.3 V, reset tied
-    /// high (the bodge) — alive.
+    /// high (the bodge, or the R10 pull-up rev's 3.3 V) — alive.
     #[rstest]
     fn gate_alive_with_both_rails_and_reset_high() {
-        assert!(gate_with(ANALOG_3V3, ANALOG_3V3, ANALOG_3V3).alive());
-        // A digitally projected reset (e.g. the R10 pull-up rev) works too.
-        assert!(gate_with(
-            NetState::Pulled(Level::High, 10_000.0),
-            ANALOG_3V3,
-            ANALOG_3V3
-        )
-        .alive());
-        assert!(gate_with(NetState::Driven(Level::High), ANALOG_3V3, ANALOG_3V3).alive());
+        assert!(gate_with(RAIL_3V3, RAIL_3V3, RAIL_3V3).alive());
     }
 
     /// The DS2Addon bench bug: a floating `~RESET` is a silent chip even
     /// with both supplies up.
     #[rstest]
     fn gate_dead_with_floating_reset() {
-        assert!(!gate_with(NetState::Floating, ANALOG_3V3, ANALOG_3V3).alive());
+        assert!(!gate_with(None, RAIL_3V3, RAIL_3V3).alive());
     }
 
-    /// Reset held low (or fought over) is a held-in-reset chip.
+    /// Reset held low, or fought to a voltage inside its dead band (two
+    /// 25 Ω drivers at 1.65 V), is a held-in-reset chip.
     #[rstest]
     fn gate_dead_with_reset_low_or_contended() {
-        assert!(!gate_with(NetState::Driven(Level::Low), ANALOG_3V3, ANALOG_3V3).alive());
-        assert!(!gate_with(NetState::Contention, ANALOG_3V3, ANALOG_3V3).alive());
+        assert!(!gate_with(Some(0.0), RAIL_3V3, RAIL_3V3).alive());
+        assert!(!gate_with(Some(1.65), RAIL_3V3, RAIL_3V3).alive());
     }
 
     /// POR requires BOTH supplies (SBAS752B): an unstrapped (floating) AVDD
     /// or DVDD — or a rail sourced at 0 V — is a dead chip.
     #[rstest]
     fn gate_dead_with_either_supply_down() {
-        assert!(!gate_with(ANALOG_3V3, NetState::Floating, ANALOG_3V3).alive());
-        assert!(!gate_with(ANALOG_3V3, ANALOG_3V3, NetState::Floating).alive());
-        assert!(!gate_with(ANALOG_3V3, ANALOG_3V3, NetState::Analog(0.0)).alive());
-        assert!(!gate_with(ANALOG_3V3, NetState::Analog(1.0), ANALOG_3V3).alive());
+        assert!(!gate_with(RAIL_3V3, None, RAIL_3V3).alive());
+        assert!(!gate_with(RAIL_3V3, RAIL_3V3, None).alive());
+        assert!(!gate_with(RAIL_3V3, RAIL_3V3, Some(0.0)).alive());
+        assert!(!gate_with(RAIL_3V3, Some(1.0), RAIL_3V3).alive());
     }
 
-    /// V_IH scales with the solved DVDD rail (0.7 · DVDD, SBAS752B §7.3):
-    /// 2.4 V clears the threshold at DVDD = 3.3 V (V_IH = 2.31 V) but not at
+    /// V_IH scales with the DVDD rail (0.7 · DVDD, SBAS752B §6.5): 2.4 V
+    /// clears the threshold at DVDD = 3.3 V (V_IH = 2.31 V) but not at
     /// DVDD = 5.0 V (V_IH = 3.5 V).
     #[rstest]
     fn reset_threshold_tracks_dvdd() {
-        let reset = NetState::Analog(2.4);
-        assert!(gate_with(reset, ANALOG_3V3, ANALOG_3V3).alive());
-        assert!(!gate_with(reset, NetState::Analog(5.0), NetState::Analog(5.0)).alive());
-        // Just below the 3.3 V threshold: dead.
-        assert!(!gate_with(NetState::Analog(2.3), ANALOG_3V3, ANALOG_3V3).alive());
+        assert!(gate_with(Some(2.4), RAIL_3V3, RAIL_3V3).alive());
+        assert!(!gate_with(Some(2.4), Some(5.0), Some(5.0)).alive());
+        // Just below the 3.3 V threshold, inside the dead band: dead.
+        assert!(!gate_with(Some(2.3), RAIL_3V3, RAIL_3V3).alive());
+    }
+
+    /// A DVDD that moves re-projects the reset the gate holds: the same
+    /// 2.4 V is high at 3.3 V and not once DVDD rises to 5 V.
+    #[rstest]
+    fn a_dvdd_move_reprojects_the_held_reset() {
+        let gate = gate_with(Some(2.4), RAIL_3V3, RAIL_3V3);
+        assert!(gate.alive());
+        gate.set_dvdd(&handed(Some(5.0)));
+        assert!(!gate.alive());
     }
 
     /// The shared pin table stays the SBAS752B p.3 truth: 16 pins, and the
@@ -611,23 +649,21 @@ mod tests {
     #[rstest]
     fn the_uart_pins_are_plain_digital_pins() {
         assert_eq!(ADS122U04_PINS.len(), 16);
-        for decl in &ADS122U04_PINS {
-            assert_eq!(
-                decl.stream, None,
-                "pin {} must not declare a byte route",
-                decl.number
-            );
-        }
         let tx = ADS122U04_PINS
             .iter()
             .find(|p| p.number == "15")
             .expect("TX declared");
-        assert_eq!(tx.kind, PinKind::DigitalOut);
+        assert_eq!(*tx, PinDecl::digital_out("15").with_name("TX"));
         let rx = ADS122U04_PINS
             .iter()
             .find(|p| p.number == "16")
             .expect("RX declared");
-        assert_eq!(rx.kind, PinKind::DigitalIn);
+        assert_eq!(
+            rx.senses_at_build(),
+            Some(embsim_board::SenseKind::Digital),
+            "RX reads through the datasheet's thresholds"
+        );
+        assert_eq!(rx.thresholds, Some(ADS122U04_INPUT_THRESHOLDS));
     }
 
     /// The framing is 8N1 at the rate the firmware runs the interface at.

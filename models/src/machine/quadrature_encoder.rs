@@ -90,8 +90,7 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE;
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, Level, Ohms, PinDecl, PinHandle, PinKind,
-    TheveninDrive, Volts,
+    AttachError, Component, ComponentNetIo, Level, Ohms, PinDecl, PinHandle, TheveninDrive, Volts,
 };
 use embsim_core::event::Observers;
 
@@ -202,16 +201,10 @@ impl Config {
 // Pin facade
 // ============================================================
 
-/// One declared output channel.
+/// One declared output channel: push-pull, idling high behind the
+/// configured impedance until the encoder drives it.
 fn output(number: &'static str, impedance: Ohms) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: Some(impedance),
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_out(number).with_impedance(impedance)
 }
 
 // ============================================================
@@ -494,8 +487,8 @@ impl Component for QuadratureEncoder {
         if self.core.config.index.is_some() {
             wire.z = Some(io.pin("Z")?);
         }
-        // Force the initial phase: the engine gives every `DigitalOut` an
-        // idle-high drive at assembly, which is not the encoder's count-0
+        // Force the initial phase: every channel is declared push-pull and
+        // idles high from assembly, which is not the encoder's count-0
         // state, so all channels are re-driven here rather than diffed.
         self.core.publish(&mut wire, true);
         Ok(())
@@ -748,9 +741,8 @@ mod tests {
             ..Config::new(1.0)
         });
         for decl in enc.pins() {
-            assert_eq!(decl.kind, PinKind::DigitalOut);
-            assert_eq!(decl.drive_impedance, Some(47.0));
-            assert_eq!(decl.stream, None);
+            assert!(decl.drives());
+            assert_eq!(decl.idle.map(|idle| idle.impedance), Some(47.0));
         }
     }
 

@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, AttachError, Component, ComponentNetIo, Harness, IdleDrive, Level, PinDecl,
-    PinHandle, PinKind, System,
+    digital_drive, jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand,
+    Harness, Level, PinDecl, PinHandle, System,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::spi_flash::SpiNorFlash;
@@ -101,22 +101,15 @@ impl Component for Probe {
 
 fn run(label: &str, mode: u8, with_flash: bool) {
     let _s = Stepped::enter();
-    let decl = |number, name, kind| PinDecl {
-        number,
-        name: Some(name),
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    };
     let slot = Arc::new(Mutex::new(Slot::default()));
     let out = Arc::new(Out::default());
     let probe = Probe {
         pins: [
-            decl("1", "CS", PinKind::DigitalOut),
-            decl("2", "CLK", PinKind::DigitalOut),
-            decl("3", "MOSI", PinKind::DigitalOut),
-            decl("4", "MISO", PinKind::DigitalIn),
+            PinDecl::digital_out("1").with_name("CS"),
+            PinDecl::digital_out("2").with_name("CLK"),
+            PinDecl::digital_out("3").with_name("MOSI"),
+            PinDecl::digital_in("4", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+                .with_name("MISO"),
         ],
         slot: Arc::clone(&slot),
         out: Arc::clone(&out),

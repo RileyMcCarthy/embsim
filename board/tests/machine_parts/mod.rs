@@ -69,13 +69,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentDecl, ComponentNetIo, EndpointRef, Harness,
-    JumperState, Level, McuComponent, NetState, Ohms, PartRegistry, PinDecl, PinHandle, Scenario,
-    SwitchPole, TheveninDrive, Volts,
+    AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver,
+    EndpointRef, Harness, InputPort, JumperState, Level, McuComponent, Ohms, PartRegistry, PinDecl,
+    PinHandle, Scenario, SwitchPole, TheveninDrive, Thresholds, Volts,
 };
 use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
-use embsim_models::isolation::{iso67xx, Channel, Iso67xx};
+use embsim_models::isolation::{iso67xx, Iso67xx};
 use embsim_models::logic_gate::{self, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION};
 use embsim_models::opto::Opto;
 use embsim_models::oscillator::{self, Oscillator};
@@ -93,9 +93,10 @@ use embsim_models::supervisor::{self, VoltageDetector, STM1061_PINS_BY_FUNCTION}
 // Pin-declaration helpers
 // ============================================================
 
-/// A pin the component senses and never drives.
-pub const fn dig_in(number: &'static str) -> PinDecl {
-    PinDecl::digital_in(number)
+/// A pin the component senses and never drives, reading through
+/// `thresholds` — the part's own datasheet figures.
+pub const fn dig_in(number: &'static str, thresholds: Thresholds) -> PinDecl {
+    PinDecl::digital_in(number, thresholds)
 }
 
 /// A push-pull output pin (idles `Driven(High)` until the component drives).
@@ -103,8 +104,9 @@ pub const fn dig_out(number: &'static str) -> PinDecl {
     PinDecl::digital_out(number)
 }
 
-/// A pin whose *voltage* the component needs (participates in the cluster
-/// solve) — a differential receiver input, an ADC input.
+/// A pin whose *voltage* the component needs — an analog reader, declaring
+/// no thresholds, whose cluster is solved — a differential receiver input,
+/// an ADC input.
 pub const fn analog(number: &'static str) -> PinDecl {
     PinDecl::analog(number)
 }
@@ -139,34 +141,6 @@ pub const fn nc(number: &'static str) -> PinDecl {
 // Shared electrical helpers
 // ============================================================
 
-/// Logic level a resolved net state defensibly implies, or `None`
-/// ([`NetState::Floating`] / [`NetState::Contention`] — the engine invents no
-/// value and neither does a model).
-fn level_of(state: NetState, threshold_volts: Volts) -> Option<Level> {
-    match state {
-        NetState::Driven(level) | NetState::Pulled(level, _) => Some(level),
-        NetState::Analog(volts) if volts.is_nan() => None,
-        NetState::Analog(volts) if volts >= threshold_volts => Some(Level::High),
-        NetState::Analog(_) => Some(Level::Low),
-        NetState::Floating | NetState::Contention => None,
-    }
-}
-
-/// Node voltage a resolved state defensibly implies, or `None`. A digital
-/// projection is mapped back to its rail (`rail_volts` / 0 V) so a
-/// differential model can compare a solved node against a driven one.
-fn volts_of(state: NetState, rail_volts: Volts) -> Option<Volts> {
-    match state {
-        NetState::Driven(Level::High) | NetState::Pulled(Level::High, _) => Some(rail_volts),
-        NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => Some(0.0),
-        NetState::Analog(volts) if volts.is_finite() => Some(volts),
-        _ => None,
-    }
-}
-
-/// Mid-rail logic threshold for the 3.3 V / 5 V parts here.
-const LOGIC_THRESHOLD_VOLTS: Volts = 1.5;
-
 /// Push-pull source impedance the modeled outputs drive through.
 const OUTPUT_IMPEDANCE_OHMS: Ohms = 25.0;
 
@@ -188,8 +162,8 @@ fn drive(level: Level, rail_volts: Volts) -> TheveninDrive {
 //
 // Provenance
 //   Part      : Texas Instruments AM26LS31C, "AM26LS31 Quadruple Differential
-//               Line Driver" (TI literature number SLLS103; see the citation
-//               note at the end of this block).
+//               Line Driver" (TI literature number SLLS114N, revised June
+//               2026; see the citation note at the end of this block).
 //   Governs   : the datasheet's **function table** — input A and the two
 //               enables G / ~G against outputs Y / Z — which is the whole of
 //               the behavior modeled here.
@@ -223,31 +197,41 @@ fn drive(level: Level, rail_volts: Volts) -> TheveninDrive {
 //
 // Citation note
 //   The behavior above is the function table, which is stable across every
-//   revision of this part. The literature number is recorded from memory and
-//   the revision letter is deliberately absent: when this model is promoted
-//   out of the test tree, re-check the number and pin the exact revision, and
-//   add per-behavior "(§x.y, p.N)" citations the way
-//   `embsim-models`' ADS122U04 model does against SBAS752B. Behavior with no
-//   datasheet basis is a defect; behavior with an unverified *document number*
-//   is a gap in the paperwork, and this note is it.
+//   revision of this part. The literature number and revision were pinned
+//   when the input thresholds were declared (SLLS114N §5.3, see
+//   `AM26LS31_INPUT_THRESHOLDS`); when this model is promoted out of the test
+//   tree, add per-behavior "(§x.y, p.N)" citations the way `embsim-models`'
+//   ADS122U04 model does against SBAS752B.
 //
+
+/// The AM26LS31's inputs — A and the two enables — read against GND at the
+/// datasheet's TTL levels, absolute: `V_IL` max 0.8 V, `V_IH` min 2 V (TI
+/// SLLS114N, §5.3 Recommended Operating Conditions); no hysteresis is named,
+/// so between the two neither level is guaranteed ([`DeadBand::Unknown`]).
+pub const AM26LS31_INPUT_THRESHOLDS: Thresholds = Thresholds::new(0.8, 2.0, 0.0, DeadBand::Unknown);
+
+/// The AM26LS31's power-on-reset threshold, `V_POR` max with `V_CC` rising:
+/// 3.04 V (TI SLLS114N, §5.5 Electrical Characteristics) — the supply at
+/// which every part is out of reset and driving. Below it the outputs are
+/// released.
+pub const AM26LS31_VPOR_MAX_VOLTS: Volts = 3.04;
 
 /// Pin facade of the `AM26LS31CD` (SOIC-16), pin numbers as the EdgeBoard
 /// netlist names them.
 #[rustfmt::skip]
 pub const AM26LS31_PINS: [PinDecl; 16] = [
-    dig_in("1"),   // 1A  — channel-1 input
+    dig_in("1", AM26LS31_INPUT_THRESHOLDS),   // 1A  — channel-1 input
     dig_out("2"),  // 1Y  — channel-1 true output
     dig_out("3"),  // 1Z  — channel-1 complement
-    dig_in("4"),   // G   — active-high enable
+    dig_in("4", AM26LS31_INPUT_THRESHOLDS),   // G   — active-high enable
     dig_out("5"),  // 2Z  — channel-2 complement
     dig_out("6"),  // 2Y  — channel-2 true output
-    dig_in("7"),   // 2A  — channel-2 input
+    dig_in("7", AM26LS31_INPUT_THRESHOLDS),   // 2A  — channel-2 input
     pwr_in("8"),   // GND
     nc("9"),       // 3A  — unused on this board
     nc("10"),      // 3Y
     nc("11"),      // 3Z
-    dig_in("12"),  // ~G  — active-low enable
+    dig_in("12", AM26LS31_INPUT_THRESHOLDS),  // ~G  — active-low enable
     nc("13"),      // 4Z
     nc("14"),      // 4Y
     nc("15"),      // 4A
@@ -268,6 +252,11 @@ struct DriverState {
     enable_low: Option<Level>,
     inputs: [Option<Level>; 2],
     outputs: Vec<(PinHandle, PinHandle)>,
+    /// What each channel's pair last published: `Some(level)` driving `Y`
+    /// at `level` (and `Z` at its complement), `None` released; `None` in
+    /// the outer option before the first publish. A pair re-issued
+    /// unchanged would resolve nothing and cost an engine event per sense.
+    applied: [Option<Option<Level>>; 2],
 }
 
 struct DriverCore {
@@ -276,25 +265,31 @@ struct DriverCore {
 }
 
 impl DriverCore {
-    /// True when the SLLS103 enable structure has the outputs active: G high
+    /// True when the SLLS114N enable structure has the outputs active: G high
     /// OR ~G low.
     fn enabled(state: &DriverState) -> bool {
         state.enable_high == Some(Level::High) || state.enable_low == Some(Level::Low)
     }
 
     /// Re-drive every channel from the current inputs (or release when
-    /// disabled/unpowered).
+    /// disabled/unpowered) — only a channel whose output changed, as the
+    /// isolator and the gates publish.
     fn apply(&self, state: &mut DriverState) {
         let active = state.powered && Self::enabled(state);
         for (channel, (y, z)) in state.outputs.iter().enumerate() {
-            match (active, state.inputs[channel]) {
-                (true, Some(level)) => {
+            // Disabled, unpowered, or an input with no defensible level:
+            // high-Z, never a guessed differential.
+            let desired = if active { state.inputs[channel] } else { None };
+            if state.applied[channel] == Some(desired) {
+                continue;
+            }
+            state.applied[channel] = Some(desired);
+            match desired {
+                Some(level) => {
                     y.set_drive(Some(drive(level, self.rail_volts)));
                     z.set_drive(Some(drive(invert(level), self.rail_volts)));
                 }
-                // Disabled, unpowered, or an input with no defensible level:
-                // high-Z, never a guessed differential.
-                _ => {
+                None => {
                     y.set_drive(None);
                     z.set_drive(None);
                 }
@@ -354,14 +349,15 @@ impl Component for Rs422Driver {
         let core = Arc::clone(&self.core);
         io.on_sense("16", move |rail| {
             let mut state = core.state.lock().unwrap();
-            state.powered = level_of(rail, LOGIC_THRESHOLD_VOLTS) == Some(Level::High);
+            state.powered = rail.volts.is_some_and(|v| v >= AM26LS31_VPOR_MAX_VOLTS);
             core.apply(&mut state);
         })?;
         for (pin, slot) in [("4", true), ("12", false)] {
             let core = Arc::clone(&self.core);
+            let receiver = DigitalReceiver::new(io.pin(pin)?);
             io.on_sense(pin, move |sensed| {
                 let mut state = core.state.lock().unwrap();
-                let level = level_of(sensed, LOGIC_THRESHOLD_VOLTS);
+                let level = receiver.read(&sensed);
                 if slot {
                     state.enable_high = level;
                 } else {
@@ -372,9 +368,10 @@ impl Component for Rs422Driver {
         }
         for (channel, (a, _, _)) in AM26LS31_CHANNELS.into_iter().enumerate() {
             let core = Arc::clone(&self.core);
+            let receiver = DigitalReceiver::new(io.pin(a)?);
             io.on_sense(a, move |sensed| {
                 let mut state = core.state.lock().unwrap();
-                state.inputs[channel] = level_of(sensed, LOGIC_THRESHOLD_VOLTS);
+                state.inputs[channel] = receiver.read(&sensed);
                 core.apply(&mut state);
             })?;
         }
@@ -389,9 +386,11 @@ impl Component for Rs422Driver {
 //
 // Provenance
 //   Part      : Texas Instruments AM26LV32, "Low-Voltage Quadruple
-//               Differential Line Receiver" (TI literature number SLLS329;
-//               see the citation note on `Rs422Driver`, which applies here
-//               too).
+//               Differential Line Receiver" (TI literature number SLLS202H,
+//               revised August 2023: the ±200 mV thresholds and the input
+//               resistance are §6.5 Electrical Characteristics, the
+//               fail-safe §8.4.1, each input's open-circuit voltage Figure
+//               9-2 of §9.2.3).
 //   Governs   : the differential input thresholds (V_IT± = ±200 mV), the
 //               enable structure (G / ~G, same OR form as the AM26LS31), and
 //               the input failsafe that forces Y high for open, shorted, or
@@ -402,12 +401,19 @@ impl Component for Rs422Driver {
 //
 // Behavior modeled
 //   Per channel, when enabled and powered: V_ID = V(A) − V(B) is taken from
-//   the *solved node voltages* (the input pins are declared `Analog`, so they
-//   join the cluster solve), and Y is driven high for V_ID >= +200 mV, low for
+//   the *solved node voltages* (the input pins are analog readers — senses
+//   with no thresholds), and Y is driven high for V_ID >= +200 mV, low for
 //   V_ID <= −200 mV. Inside the ±200 mV band — the shorted-pair and
-//   idle-terminated cases — and whenever either leg has no defensible voltage
-//   (an open input), the datasheet's failsafe forces Y **high**. Disabled or
-//   unpowered releases Y to high-Z.
+//   idle-terminated cases — and whenever either leg has no defensible voltage,
+//   the datasheet's failsafe forces Y **high**. Disabled or unpowered releases
+//   Y to high-Z.
+//   Each input declares its own port (`InputPort`, `NODES.md` §10), the open
+//   fail-safe's mechanism (§8.4.1): r_I 12 kΩ typical (§6.5) to the input's
+//   open-circuit voltage, 0.83 V on an A input and 0.70 V on a B input —
+//   read off Figure 9-2, "RS422 Port Open-Circuit Voltage vs V_CC", flat
+//   from V_CC 1.6 V to 3.6 V. An open pair therefore reads +130 mV, inside
+//   the band: high, by the failsafe, through the part's own bias and no
+//   other source.
 //   Channel 4 is exactly that failsafe case on this board: 4A/4B are marked
 //   no-connect while 4Y is wired to the encoder isolator, so 4Y sits high.
 //
@@ -422,29 +428,66 @@ impl Component for Rs422Driver {
 // Deliberately NOT modeled
 //   * Propagation delay (tens of nanoseconds) and hysteresis around V_IT, for
 //     the reasons given on the driver.
-//   * Input common-mode range and the receiver's own input resistance: the
-//     input pins are high-Z senses, so a real termination network across the
-//     pair comes from the netlist's own resistors, not from here.
-//   * The supply-range check — an out-of-range VDD is a rail finding, not a
-//     receiver behavior.
+//   * Input common-mode range, and the ports' fall below V_CC 1.6 V
+//     (Figure 9-2: 0.42 V / 0.35 V at 0.8 V): a port is a declaration,
+//     stamped once and never republished, so it holds its flat-band figure
+//     whatever the supply. The bias is stamped in the engine's frame, exact
+//     while GND sits at 0 V. r_I's minimum, 7 kΩ, is not modeled.
+//   * The supply-range check beyond its minimum — an over-range VDD is a
+//     rail finding, not a receiver behavior; under `V_CC` min 3 V (SLLS202H
+//     §6.3) the outputs are released.
 //
+
+/// The AM26LV32's enables, G and ~G, read against GND, absolute: `V_IL(EN)`
+/// max 0.8 V, `V_IH(EN)` min 2 V (TI SLLS202H, §6.3 Recommended Operating
+/// Conditions); no hysteresis is named, so between the two neither level is
+/// guaranteed ([`DeadBand::Unknown`]).
+pub const AM26LV32_ENABLE_THRESHOLDS: Thresholds =
+    Thresholds::new(0.8, 2.0, 0.0, DeadBand::Unknown);
+
+/// The AM26LV32's input resistance, `r_I` 12 kΩ typical (TI SLLS202H, §6.5
+/// Electrical Characteristics; 7 kΩ minimum): each input's own port.
+pub const AM26LV32_INPUT_OHMS: Ohms = 12_000.0;
+
+/// The open-circuit voltage of an A (non-inverting) input, 0.83 V: read off
+/// Figure 9-2, "RS422 Port Open-Circuit Voltage vs V_CC" (TI SLLS202H,
+/// §9.2.3 Application Curve), curve A, flat from `V_CC` 1.6 V to 3.6 V.
+pub const AM26LV32_OPEN_A_VOLTS: Volts = 0.83;
+
+/// The open-circuit voltage of a B (inverting) input, 0.70 V: the same
+/// figure's curve B.
+pub const AM26LV32_OPEN_B_VOLTS: Volts = 0.70;
+
+/// An A input's own port: [`AM26LV32_INPUT_OHMS`] to
+/// [`AM26LV32_OPEN_A_VOLTS`].
+pub const AM26LV32_A_PORT: InputPort = InputPort {
+    v_bias: AM26LV32_OPEN_A_VOLTS,
+    r_in: AM26LV32_INPUT_OHMS,
+};
+
+/// A B input's own port: [`AM26LV32_INPUT_OHMS`] to
+/// [`AM26LV32_OPEN_B_VOLTS`].
+pub const AM26LV32_B_PORT: InputPort = InputPort {
+    v_bias: AM26LV32_OPEN_B_VOLTS,
+    r_in: AM26LV32_INPUT_OHMS,
+};
 
 /// Pin facade of the `AM26LV32xD` (SOIC-16), pin numbers as the EdgeBoard
 /// netlist names them.
 #[rustfmt::skip]
 pub const AM26LV32_PINS: [PinDecl; 16] = [
-    analog("1"),   // 1B
-    analog("2"),   // 1A
+    analog("1").with_input(AM26LV32_B_PORT),   // 1B
+    analog("2").with_input(AM26LV32_A_PORT),   // 1A
     dig_out("3"),  // 1Y
-    dig_in("4"),   // G   — active-high enable (wired to the encoder's Z+)
+    dig_in("4", AM26LV32_ENABLE_THRESHOLDS),   // G   — active-high enable (wired to the encoder's Z+)
     dig_out("5"),  // 2Y
-    analog("6"),   // 2A
-    analog("7"),   // 2B
+    analog("6").with_input(AM26LV32_A_PORT),   // 2A
+    analog("7").with_input(AM26LV32_B_PORT),   // 2B
     pwr_in("8"),   // GND
-    analog("9"),   // 3B
-    analog("10"),  // 3A
+    analog("9").with_input(AM26LV32_B_PORT),   // 3B
+    analog("10").with_input(AM26LV32_A_PORT),  // 3A
     dig_out("11"), // 3Y
-    dig_in("12"),  // ~G  — active-low enable (wired to the encoder's Z−)
+    dig_in("12", AM26LV32_ENABLE_THRESHOLDS),  // ~G  — active-low enable (wired to the encoder's Z−)
     dig_out("13"), // 4Y
     nc("14"),      // 4A  — no-connect: channel 4 rides the input failsafe
     nc("15"),      // 4B
@@ -459,7 +502,11 @@ const AM26LV32_CHANNELS: [(Option<&str>, Option<&str>, &str); 4] = [
     (None, None, "13"),
 ];
 
-/// SLLS329 differential input threshold magnitude: V_IT+ <= +200 mV,
+/// The AM26LV32's supply minimum, `V_CC` min 3 V (TI SLLS202H, §6.3
+/// Recommended Operating Conditions): below it the outputs are released.
+pub const AM26LV32_VCC_MIN_VOLTS: Volts = 3.0;
+
+/// SLLS202H differential input threshold magnitude: V_IT+ <= +200 mV,
 /// V_IT- >= -200 mV.
 const VID_THRESHOLD_VOLTS: Volts = 0.200;
 
@@ -479,7 +526,7 @@ struct ReceiverCore {
 }
 
 impl ReceiverCore {
-    /// SLLS329 enable structure — identical OR form to the driver's.
+    /// SLLS202H enable structure — identical OR form to the driver's.
     fn enabled(state: &ReceiverState) -> bool {
         state.enable_high == Some(Level::High) || state.enable_low == Some(Level::Low)
     }
@@ -560,14 +607,15 @@ impl Component for Rs422Receiver {
         let core = Arc::clone(&self.core);
         io.on_sense("16", move |rail| {
             let mut state = core.state.lock().unwrap();
-            state.powered = level_of(rail, LOGIC_THRESHOLD_VOLTS) == Some(Level::High);
+            state.powered = rail.volts.is_some_and(|v| v >= AM26LV32_VCC_MIN_VOLTS);
             core.apply(&mut state);
         })?;
         for (pin, is_active_high) in [("4", true), ("12", false)] {
             let core = Arc::clone(&self.core);
+            let receiver = DigitalReceiver::new(io.pin(pin)?);
             io.on_sense(pin, move |sensed| {
                 let mut state = core.state.lock().unwrap();
-                let level = level_of(sensed, LOGIC_THRESHOLD_VOLTS);
+                let level = receiver.read(&sensed);
                 if is_active_high {
                     state.enable_high = level;
                 } else {
@@ -580,10 +628,9 @@ impl Component for Rs422Receiver {
             for (pin, is_a) in [(a, true), (b, false)] {
                 let Some(pin) = pin else { continue };
                 let core = Arc::clone(&self.core);
-                let rail = self.core.rail_volts;
                 io.on_sense(pin, move |sensed| {
                     let mut state = core.state.lock().unwrap();
-                    let volts = volts_of(sensed, rail);
+                    let volts = sensed.volts;
                     if is_a {
                         state.inputs[channel].0 = volts;
                     } else {
@@ -653,6 +700,24 @@ impl Component for Rs422Receiver {
 //     netlist-structural engine gets for free by never connecting the nets.
 //
 
+/// The ISO67xx family's input thresholds, **relative** to the input side's
+/// supply: `V_IL` 0.3 × VCCI, `V_IH` 0.7 × VCCI (SLLSFJ6G §7.3, the model
+/// crate's [`iso67xx::DEFAULT_VIL_RATIO`]/[`iso67xx::DEFAULT_VIH_RATIO`]).
+const ISO6731_INPUT_THRESHOLDS: Thresholds = Thresholds::new(
+    embsim_models::isolation::iso67xx::DEFAULT_VIL_RATIO,
+    embsim_models::isolation::iso67xx::DEFAULT_VIH_RATIO,
+    0.0,
+    DeadBand::Unknown,
+);
+
+/// An input on side 1 (`VCC1` against `GND1_1`) or side 2 (`VCC2` against
+/// `GND2_1`).
+const fn iso_in(number: &'static str, vcc: &'static str, gnd: &'static str) -> PinDecl {
+    dig_in(number, ISO6731_INPUT_THRESHOLDS)
+        .with_supply(vcc)
+        .with_reference(gnd)
+}
+
 /// Pin facade of the `ISO6731DWR` (SOIC-16 wide), pin numbers as the
 /// EdgeBoard netlist names them.
 #[rustfmt::skip]
@@ -660,8 +725,8 @@ pub fn iso6731_pins() -> Vec<PinDecl> {
     vec![
         pwr_in("1"),    // VCC1   — isolated side
         pwr_in("2"),    // GND1_1
-        dig_in("3"),    // INA    — gauge transmit in
-        dig_in("4"),    // INB    — gauge ~DRDY in
+        iso_in("3", "1", "2"),    // INA    — gauge transmit in
+        iso_in("4", "1", "2"),    // INB    — gauge ~DRDY in
         dig_out("5"),   // OUTC   — MCU transmit out (isolated side)
         nc("6"),        // NC_1
         nc("7"),        // EN1
@@ -669,7 +734,7 @@ pub fn iso6731_pins() -> Vec<PinDecl> {
         pwr_in("9"),    // GND2_1
         nc("10"),       // EN2
         nc("11"),       // NC_2
-        dig_in("12"),   // INC    — MCU transmit in
+        iso_in("12", "16", "9"),  // INC    — MCU transmit in
         dig_out("13"),  // OUTB   — ~DRDY out
         dig_out("14"),  // OUTA   — gauge transmit out
         pwr_in("15"),   // GND2_2
@@ -681,15 +746,19 @@ pub fn iso6731_pins() -> Vec<PinDecl> {
 /// wires them: MCU transmit, gauge transmit, and the ADC's `~DRDY`.
 const ISO6731_CHANNELS: [(&str, &str); 3] = [("12", "5"), ("3", "14"), ("4", "13")];
 
+/// The side each channel's output is on: `OUTC` on side 1, `OUTA`/`OUTB` on
+/// side 2 (index 0 is side 1).
+const ISO6731_OUTPUT_SIDE: [usize; 3] = [0, 1, 1];
+
 struct IsolatorCore {
-    rail_volts: Volts,
     state: Mutex<IsolatorState>,
 }
 
 #[derive(Default)]
 struct IsolatorState {
-    side1_powered: bool,
-    side2_powered: bool,
+    /// Each side's supply when it is up: `VCC1`, `VCC2`, at or above the
+    /// family's powered-up threshold.
+    rails: [Option<Volts>; 2],
     /// Per channel: the level last sensed on its input, and its output pin.
     level_in: [Option<Level>; 3],
     level_out: [Option<PinHandle>; 3],
@@ -697,16 +766,18 @@ struct IsolatorState {
 
 impl IsolatorCore {
     fn live(state: &IsolatorState) -> bool {
-        state.side1_powered && state.side2_powered
+        state.rails.iter().all(Option::is_some)
     }
 
-    /// Re-drive one channel's output from its input.
+    /// Re-drive one channel's output from its input, at its own side's
+    /// supply — the family's level translation.
     fn apply(&self, state: &mut IsolatorState, channel: usize) {
         let Some(out) = state.level_out[channel].clone() else {
             return;
         };
-        match (Self::live(state), state.level_in[channel]) {
-            (true, Some(level)) => out.set_drive(Some(drive(level, self.rail_volts))),
+        let rail = state.rails[ISO6731_OUTPUT_SIDE[channel]];
+        match (Self::live(state), state.level_in[channel], rail) {
+            (true, Some(level), Some(rail)) => out.set_drive(Some(drive(level, rail))),
             _ => out.set_drive(None),
         }
     }
@@ -727,23 +798,26 @@ pub struct SerialIsolator {
 }
 
 impl SerialIsolator {
-    /// An isolator whose repeated outputs drive `rail_volts`.
-    pub fn new(rail_volts: Volts) -> Self {
+    /// An isolator whose repeated outputs drive their own side's supply.
+    pub fn new() -> Self {
         Self {
             pins: iso6731_pins(),
             core: Arc::new(IsolatorCore {
-                rail_volts,
                 state: Mutex::new(IsolatorState::default()),
             }),
         }
     }
 }
 
+impl Default for SerialIsolator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Debug for SerialIsolator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SerialIsolator")
-            .field("rail_volts", &self.core.rail_volts)
-            .finish()
+        f.debug_struct("SerialIsolator").finish_non_exhaustive()
     }
 }
 
@@ -762,16 +836,13 @@ impl Component for SerialIsolator {
 
         // Rail senses first: a level delivered before the rails are known must
         // not slip through the power gate.
-        for (pin, is_side1) in [("1", true), ("16", false)] {
+        for (pin, side) in [("1", 0usize), ("16", 1usize)] {
             let core = Arc::clone(&self.core);
             io.on_sense(pin, move |rail| {
                 let mut state = core.state.lock().unwrap();
-                let up = level_of(rail, LOGIC_THRESHOLD_VOLTS) == Some(Level::High);
-                if is_side1 {
-                    state.side1_powered = up;
-                } else {
-                    state.side2_powered = up;
-                }
+                state.rails[side] = rail
+                    .volts
+                    .filter(|&v| v >= iso67xx::DEFAULT_SUPPLY_MIN_VOLTS);
                 core.apply_all(&mut state);
             })?;
         }
@@ -780,9 +851,10 @@ impl Component for SerialIsolator {
         // costs one drive rather than one per channel.
         for (channel, (input, _)) in ISO6731_CHANNELS.iter().enumerate() {
             let core = Arc::clone(&self.core);
+            let receiver = DigitalReceiver::new(io.pin(input)?);
             io.on_sense(input, move |sensed| {
                 let mut state = core.state.lock().unwrap();
-                state.level_in[channel] = level_of(sensed, LOGIC_THRESHOLD_VOLTS);
+                state.level_in[channel] = receiver.read(&sensed);
                 core.apply(&mut state, channel);
             })?;
         }
@@ -1021,10 +1093,6 @@ pub fn shipped_ec32mb_board() -> Board {
 //               (`embsim_models::rail`).
 //   element     the elements by specification (`embsim_models::pwl_library`).
 
-/// Which of `IC14`'s channels carries the servo step clock: `INA` (pin 3,
-/// on `P8`) to `OUTA` (pin 14) — a rate crosses the barrier, not edges.
-pub const SERVO_STEP_CHANNEL: Channel = Channel::A;
-
 /// `UCC12040DVER` — TI isolated 500 mW DC/DC module (IC3: the isolated I/O
 /// domain `5V_IO`/`GND_IO`; IC4: the force-gauge domain `IFG_5V`/`IFG_GND`).
 /// Both tie `SEL` to `VISO`: the 5.0 V setpoint (SNVSBO5B Table 5-1). The
@@ -1079,22 +1147,17 @@ pub fn edge_registry_without_socket() -> PartRegistry {
     registry.register("AM26LV32xD", |_decl| {
         Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
     });
-    registry.register("ISO6731DWR", |_decl| {
-        Box::new(SerialIsolator::new(LOGIC_RAIL_VOLTS))
-    });
+    registry.register("ISO6731DWR", |_decl| Box::new(SerialIsolator::new()));
 
     // The other ISO67xx isolators, configured straight from their part
     // names — `ISO6740FDWR` picks up its fail-safe-low default without
     // anyone re-deriving it from the suffix. `IC14`'s STEP channel carries
-    // the servo step clock as a rate.
+    // the servo step clock as a clock, like any channel handed one.
     for part in ["ISO6742DWR", "ISO6741DWR", "ISO6740FDWR", "ISO6721BDR"] {
         registry.register(part, move |decl: &ComponentDecl| {
             let name = normalize_part(decl);
-            let mut config = iso67xx::Config::from_part_name(&name)
+            let config = iso67xx::Config::from_part_name(&name)
                 .unwrap_or_else(|| panic!("{name} is an ISO67xx"));
-            if decl.reference == "IC14" {
-                config = config.with_pulse_channel(SERVO_STEP_CHANNEL);
-            }
             Box::new(Iso67xx::new(config).expect("a valid isolator configuration"))
         });
     }

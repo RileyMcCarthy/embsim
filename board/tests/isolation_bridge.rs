@@ -30,31 +30,54 @@
 //! - a rail on the end-switch loop, which the schematic genuinely does not
 //!   have — `IEND_U+` reaches only `IC9`'s anode and the `J16` screw terminal,
 //!   so the loop is drawn closed and unpowered. The strap says out loud what a
-//!   working machine has to provide.
+//!   working machine has to provide;
+//! - a wire from `IC14`'s secondary ground to `EN_GND`: the rework the
+//!   schematic defect `edgeboard.rs` asserts
+//!   (`the_servo_isolator_secondary_ground_is_unconnected`) needs. A part
+//!   measures its supply against its own ground pin (`NODES.md` §12 item 5,
+//!   the sense task), and as drawn `IC14`'s `GND2` pins reach only `C26`, so
+//!   its secondary side is down and nothing crosses it — the bench
+//!   behaviour the defect predicts. The wire is the fix, said out loud.
+//!
+//! # Time
+//!
+//! Every case runs alone, on the stepped clock, and reads what it asserts at
+//! a settled virtual instant (`TESTING.md` rules 5 and 9): the case's thread
+//! is a registered actor from the moment its system is assembled until it
+//! shuts down, so the engine advances only while the case is parked in
+//! [`settle`], and every read after a settle is of the system at rest at
+//! that instant — never a wall-clock poll of a cascade in flight. Two flakes
+//! of the free-running rig this replaces, both root-caused in `NODES.md`
+//! §12 item 5 (the flake record after the final pass): the receiver output
+//! read `Floating` in the middle of its own start-up, after a poll had
+//! accepted the output pin's idle `Driven(High)` as settled; and the step
+//! profile's event count split 54/58 when another case's clock jump left
+//! this engine pacing against the wall with a wake due.
 
 mod machine_parts;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use embsim_core::virtual_clock;
+use embsim_core::virtual_clock::{self, Actor, ClockMode};
 
 use rstest::rstest;
 
 use embsim_board::netlist::{self, ComponentDecl};
 use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EventLog, Finding, Harness, IdleDrive, Level,
-    NetState, PartRegistry, PinDecl, PinHandle, PinKind, PulseDirection, PulseSegment, PulseTrain,
-    PulseTx, Scenario, StreamRole, System, SystemHandle,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, Drive,
+    EventLog, Finding, Harness, Level, NetState, PartRegistry, PeriodicSchedule, PinDecl,
+    PinHandle, Scenario, System, SystemHandle, TheveninDrive,
 };
 use embsim_models::isolation::iso67xx;
 use embsim_models::isolation::{Channel, Iso67xx, Iso67xxMonitor};
+use embsim_models::logic_gate::LVC1G14_T_PD_NS;
 use embsim_models::machine::{end_switch, ActuationSense, EndSwitch, EndSwitchActuator};
 use embsim_models::opto::{Opto, OptoChannel, OptoMonitor};
 use embsim_models::pwl_library::{MMBT3904_VBE_VOLTS, NSI50010_I_REG_AMPS};
+use embsim_models::rail::UCC12040_RISE_NS;
 use machine_parts::{bench_rails, edge_registry, ep};
 
 // ============================================================
@@ -62,28 +85,53 @@ use machine_parts::{bench_rails, edge_registry, ep};
 // ============================================================
 
 const EDGE: &str = "EdgeBoard";
-const SETTLE: Duration = Duration::from_secs(5);
 
-/// The engine's timer wheel samples the process-global virtual clock, and
-/// `init` re-anchors it — so it runs once per binary.
-fn ensure_clock() {
-    static CLOCK: Once = Once::new();
-    CLOCK.call_once(|| embsim_core::virtual_clock::init(1.0, 1_000_000));
+/// One case at a time: the virtual clock is process-global, and each case
+/// re-anchors it in stepped mode (`TESTING.md` rule 5).
+///
+/// This binary's cases once ran in parallel on one free-running clock, and
+/// that sharing was one of the two flakes: a test thread parked on a 200 ms
+/// virtual wait is released by whichever engine advances to it, *before*
+/// that engine's pacing sleep, so every other engine in the process then
+/// saw virtual time up to a segment ahead of the wall and paced against it
+/// — with a wake due — while its own case's wall-clock "quiet" window
+/// closed (`NODES.md` §12 item 5, the flake record).
+static SUITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn suite_lock() -> MutexGuard<'static, ()> {
+    SUITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        SUITE_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
 }
 
-fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if pred() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    pred()
+/// The virtual time a case hands the engine after a stimulus, before it
+/// reads what the stimulus did: 1 ms. Longer than every instant a part in
+/// the rig arms — an indicator inverter's `t_pd` (SN74LVC1G14 §5.6, 4.6 ns
+/// max, 5 ns on the wheel: [`LVC1G14_T_PD_NS`]) and the longest start-up
+/// any Edge board part declares, the UCC12040's `VISO` rise (SNVSBO5B
+/// §6.9, 750 µs typ: [`UCC12040_RISE_NS`]) — so a settled read is the
+/// system at rest, not a cascade in flight. The window is the harness's,
+/// not a part's: any span past the longest armed instant reads the same.
+const SETTLE_NS: u64 = 1_000_000;
+const _: () = assert!(SETTLE_NS > UCC12040_RISE_NS && SETTLE_NS > LVC1G14_T_PD_NS);
+
+/// Park the case's thread for [`SETTLE_NS`] of virtual time and return with
+/// the system at rest.
+///
+/// The thread is a registered actor ([`Rig::actor`]), and the stepped
+/// engine advances only while every actor is parked: here it drains every
+/// command the case sent before the call, delivers every sense that moves,
+/// fires every wake due in the window, and then releases the thread — and
+/// it does nothing more until the thread parks again. A read between two
+/// settles is exact. Never wait on the wall clock between them: the engine
+/// is waiting for the case.
+fn settle() {
+    virtual_clock::wait_virtual_ns(SETTLE_NS);
 }
 
-fn settled_state(system: &SystemHandle, net: &str, expected: NetState) -> NetState {
-    wait_for(|| system.net_state(net) == Some(expected), SETTLE);
+/// The engine's report of `net`, read at the settled instant.
+fn state(system: &SystemHandle, net: &str) -> NetState {
     system
         .net_state(net)
         .unwrap_or_else(|| panic!("net {net} exists"))
@@ -91,8 +139,10 @@ fn settled_state(system: &SystemHandle, net: &str, expected: NetState) -> NetSta
 
 /// One virtual microsecond after a stimulus. Same idea as `edgeboard.rs`:
 /// the engine drains the attach/drive cascade to a fixpoint, then the wake
-/// samples settled DC — not a wall-race glance at a transient.
+/// samples settled DC — not a wall-race glance at a transient. Inside the
+/// [`settle`] window the capture is read after.
 const SETTLE_WAKE_US: u64 = 1;
+const _: () = assert!(SETTLE_WAKE_US * 1_000 < SETTLE_NS);
 
 /// End-switch / opto loop facts captured on the engine thread.
 #[derive(Clone, Debug)]
@@ -127,7 +177,7 @@ impl Component for EndSwitchSettleProbe {
         let done = Arc::clone(&self.done);
         io.on_wake(move |_now_us| {
             *capture.lock().unwrap() = Some(EndSwitchSettled {
-                p19: y.sense(),
+                p19: y.net_report(),
                 lit: opto.is_lit(OptoChannel::Two),
                 sinking: opto.is_sinking(OptoChannel::Two),
                 current_ma: opto
@@ -143,17 +193,11 @@ impl Component for EndSwitchSettleProbe {
 }
 
 fn settle_probe_pin() -> PinDecl {
-    PinDecl {
-        number: "Y",
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_in("Y", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
 }
 
-/// Re-arm the end-switch settle probe and wait for the engine-thread capture.
+/// Re-arm the end-switch settle probe and settle past its wake: the capture
+/// is the engine thread's, taken [`SETTLE_WAKE_US`] after the stimulus.
 fn capture_end_switch_settled(
     done: &AtomicBool,
     capture: &Mutex<Option<EndSwitchSettled>>,
@@ -167,9 +211,10 @@ fn capture_end_switch_settled(
         .clone()
         .expect("end-switch settle probe attached");
     handle.schedule_at(virtual_clock::virtual_us() + SETTLE_WAKE_US);
+    settle();
     assert!(
-        wait_for(|| done.load(Ordering::SeqCst), SETTLE),
-        "end-switch settle wake never fired — analog cascade is still on wall time"
+        done.load(Ordering::SeqCst),
+        "the end-switch settle wake fires inside the settle window"
     );
     capture
         .lock()
@@ -239,12 +284,8 @@ fn promoted_registry(promoted: &Promoted) -> PartRegistry {
         let promoted = promoted.clone();
         registry.register(part, move |decl: &ComponentDecl| {
             let name = normalize_part(decl);
-            let mut config = iso67xx::Config::from_part_name(&name)
+            let config = iso67xx::Config::from_part_name(&name)
                 .unwrap_or_else(|| panic!("{name} is an ISO67xx"));
-            // The servo isolator's STEP channel carries a rate, not edges.
-            if decl.reference == "IC14" {
-                config = config.with_pulse_channel(STEP_CHANNEL);
-            }
             let isolator = Iso67xx::new(config).expect("a valid isolator configuration");
             promoted
                 .isolators
@@ -290,9 +331,8 @@ const STEP_FINGER: &str = "32";
 const DIR_FINGER: &str = "33";
 const ENA_FINGER: &str = "34";
 
-/// A stand-in for the P2's driven pins: three push-pull outputs, with `STEP`
-/// additionally a [`StreamRole::PulseSource`] so a rate-carried train can
-/// reach the isolator.
+/// A stand-in for the P2's driven pins: three push-pull outputs, `STEP`
+/// driven with a periodic drive when a test clocks it.
 ///
 /// Deliberately not an [`embsim_board::McuComponent`]: this binary needs no
 /// firmware and no peripheral banks, and a component that claimed the
@@ -301,39 +341,19 @@ const ENA_FINGER: &str = "34";
 struct FakePins {
     pins: Vec<PinDecl>,
     handles: Arc<Mutex<HashMap<&'static str, PinHandle>>>,
-    step_tx: Arc<Mutex<Option<PulseTx>>>,
 }
 
 impl FakePins {
     fn new() -> Self {
         Self {
-            pins: vec![
-                PinDecl {
-                    number: "STEP",
-                    name: None,
-                    kind: PinKind::DigitalOut,
-                    stream: Some(StreamRole::PulseSource),
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
-                out("DIR"),
-                out("ENA"),
-            ],
+            pins: vec![out("STEP"), out("DIR"), out("ENA")],
             handles: Arc::new(Mutex::new(HashMap::new())),
-            step_tx: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 fn out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_out(number)
 }
 
 impl Component for FakePins {
@@ -346,26 +366,22 @@ impl Component for FakePins {
         for number in ["STEP", "DIR", "ENA"] {
             handles.insert(number, io.pin(number)?);
         }
-        *self.step_tx.lock().unwrap() = Some(io.pulse_tx("STEP")?);
         Ok(())
     }
 }
 
 /// A stand-in for whatever consumes the step clock on the isolated side. It is
 /// harnessed onto the RS-422 driver's own `1A` input pin, so it watches the
-/// exact net the schematic feeds the stepper driver from.
+/// exact net the schematic feeds the stepper driver from, and records every
+/// segment that net carries.
 struct FakeStepSink {
-    trains: Arc<Mutex<Vec<PulseTrain>>>,
+    trains: Arc<Mutex<Vec<PeriodicSchedule>>>,
 }
 
-const STEP_SINK_PINS: [PinDecl; 1] = [PinDecl {
-    number: "IN",
-    name: None,
-    kind: PinKind::DigitalIn,
-    stream: Some(StreamRole::PulseSink),
-    drive_impedance: None,
-    idle: IdleDrive::KindDefault,
-}];
+const STEP_SINK_PINS: [PinDecl; 1] = [PinDecl::digital_in(
+    "IN",
+    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+)];
 
 impl Component for FakeStepSink {
     fn pins(&self) -> &[PinDecl] {
@@ -374,7 +390,11 @@ impl Component for FakeStepSink {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let trains = Arc::clone(&self.trains);
-        io.on_pulse("IN", move |train| trains.lock().unwrap().push(train))
+        io.on_sense("IN", move |sense| {
+            if let Some(clock) = sense.periodic {
+                trains.lock().unwrap().push(clock.segment);
+            }
+        })
     }
 }
 
@@ -383,16 +403,49 @@ impl Component for FakeStepSink {
 // ============================================================
 
 /// Everything a test drives or reads.
+///
+/// Field order is drop order, and it is load-bearing: the case's actor
+/// registration goes first, so a case that panics stops holding the
+/// engine's barrier before its system shuts down, and the suite lock goes
+/// last, after the engine has been joined.
 struct Rig {
+    /// The case's thread as a registered virtual-clock actor, from the
+    /// assembled system to [`Rig::finish`]: what makes [`settle`] exact.
+    actor: Actor,
     system: SystemHandle,
     promoted: Promoted,
     handles: Arc<Mutex<HashMap<&'static str, PinHandle>>>,
-    step_tx: Arc<Mutex<Option<PulseTx>>>,
-    trains: Arc<Mutex<Vec<PulseTrain>>>,
+    trains: Arc<Mutex<Vec<PeriodicSchedule>>>,
     end_switch: EndSwitchActuator,
+    _suite: MutexGuard<'static, ()>,
 }
 
 impl Rig {
+    /// End the case: the engine must never have stopped waiting for the
+    /// case's thread (a `QuiescenceTimeout` would mean a settle read a
+    /// system that was still moving), then the thread leaves the barrier
+    /// and the system shuts down.
+    fn finish(self) {
+        let Rig {
+            actor,
+            system,
+            _suite,
+            ..
+        } = self;
+        let stalled: Vec<Finding> = system
+            .findings()
+            .into_iter()
+            .filter(|f| matches!(f, Finding::QuiescenceTimeout { .. }))
+            .collect();
+        assert!(
+            stalled.is_empty(),
+            "the engine stopped waiting for the case's thread, so a settled read \
+             may have raced the system: {stalled:?}"
+        );
+        drop(actor);
+        system.shutdown();
+    }
+
     fn pin(&self, number: &str) -> PinHandle {
         self.handles
             .lock()
@@ -410,13 +463,19 @@ impl Rig {
             }));
     }
 
-    fn publish_step(&self, train: PulseTrain) {
-        self.step_tx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("the pulse source attached")
-            .set_train(train);
+    /// Clock `STEP` with `segment`, rail to rail at the pad's 25 Ω.
+    fn publish_step(&self, segment: PeriodicSchedule) {
+        self.pin("STEP").drive(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: 25.0,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: 25.0,
+            },
+            segment,
+        });
     }
 }
 
@@ -438,6 +497,9 @@ fn extra_rails() -> Harness {
 /// RS-422 driver's input, and the end switch to the `J16` screw terminal.
 fn rig_harness() -> Harness {
     Harness::new()
+        // The rework: `IC14`'s orphaned `GND2_1`/`GND2_2` net onto `EN_GND`
+        // (`J21.8`), the isolated ground its own supply `SC_5V` returns to.
+        .connect(ep(&format!("{EDGE}.IC14.9")), ep(&format!("{EDGE}.J21.8")))
         .connect(ep("MCU.STEP"), ep(&format!("{EDGE}.J3.{STEP_FINGER}")))
         .connect(ep("MCU.DIR"), ep(&format!("{EDGE}.J3.{DIR_FINGER}")))
         .connect(ep("MCU.ENA"), ep(&format!("{EDGE}.J3.{ENA_FINGER}")))
@@ -447,7 +509,7 @@ fn rig_harness() -> Harness {
         .connect(ep(&format!("{EDGE}.J16.1")), ep("END_U.NO"))
 }
 
-/// Probe wiring returned from `start_inner` before the LIVE suite lock is applied.
+/// Probe wiring returned from `start_inner`.
 struct EndSwitchSettleParts {
     capture: Arc<Mutex<Option<EndSwitchSettled>>>,
     done: Arc<AtomicBool>,
@@ -455,12 +517,10 @@ struct EndSwitchSettleParts {
 }
 
 /// Handles for re-arming the end-switch settle probe after a position change.
-///
-/// `_live` serializes settle-probe engines so a sibling test cannot advance
-/// the shared virtual clock mid-cascade (see `edgeboard.rs` `SettleProbe`).
+/// One engine at a time is the suite lock's ([`SUITE_LOCK`]), so no sibling
+/// case can advance the clock under the probe's wake.
 struct EndSwitchSettle {
     parts: EndSwitchSettleParts,
-    _live: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EndSwitchSettle {
@@ -469,7 +529,7 @@ impl EndSwitchSettle {
     }
 }
 
-/// Build and start the promoted board.
+/// Build and start the promoted board, settled.
 ///
 /// `servo_domain` powers `SC_5V` — the isolated servo rail `IC14`'s side 2 and
 /// `IC16`'s side 1 run from. Dropping it is how a test asks "what does an
@@ -479,37 +539,37 @@ fn start(servo_domain: bool, event_log: bool, sources: &[(&str, f64)]) -> Rig {
 }
 
 /// Start the end-switch loop with an engine-hosted settle probe on U6.VO2 (net P19).
-///
-/// One live settle-probe engine at a time: two engines sharing the process
-/// clock will advance a settle wake for each other mid-cascade (same hazard
-/// `edgeboard.rs` documents for its `SettleProbe`).
 fn start_end_switch_loop(sources: &[(&str, f64)]) -> (Rig, EndSwitchSettle) {
-    static LIVE: Mutex<()> = Mutex::new(());
-    let live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (rig, parts) = start_inner(true, false, sources, true);
-    let settle = EndSwitchSettle {
+    let probe = EndSwitchSettle {
         parts: parts.expect("end-switch settle probe requested"),
-        _live: live,
     };
-    // Drain the attach-time cascade before the test samples open-loop facts.
-    let _ = settle.capture();
-    (rig, settle)
+    (rig, probe)
 }
 
+/// Take the suite lock, re-anchor the clock in stepped mode, build and start
+/// the rig with time held, register the case's thread as an actor, release
+/// time and settle: the rig is handed back at rest at its first settled
+/// instant, [`SETTLE_NS`] after the system was assembled, every attach-time
+/// cascade drained.
+///
+/// Time is held until the thread has registered so that instant is the
+/// same every run: released at once, the engine could advance past the
+/// start-up wakes before the thread joined the barrier.
 fn start_inner(
     servo_domain: bool,
     event_log: bool,
     sources: &[(&str, f64)],
     with_end_switch_settle: bool,
 ) -> (Rig, Option<EndSwitchSettleParts>) {
-    ensure_clock();
+    let suite = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
     let promoted = Promoted::default();
     let board = promoted_board(&promoted);
 
     let mcu = FakePins::new();
     let handles = Arc::clone(&mcu.handles);
-    let step_tx = Arc::clone(&mcu.step_tx);
-    let trains: Arc<Mutex<Vec<PulseTrain>>> = Arc::new(Mutex::new(Vec::new()));
+    let trains: Arc<Mutex<Vec<PeriodicSchedule>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = FakeStepSink {
         trains: Arc::clone(&trains),
     };
@@ -556,7 +616,7 @@ fn start_inner(
         .component("MCU", Box::new(mcu))
         .component("STEPSINK", Box::new(sink))
         .component("END_U", Box::new(switch));
-    let settle = if let Some((probe, handles)) = settle_handles {
+    let probe = if let Some((probe, handles)) = settle_handles {
         system = system
             .component("END_SETTLE", Box::new(probe))
             .harness(Harness::new().connect(ep("END_SETTLE.Y"), ep(&format!("{EDGE}.U6.6"))));
@@ -572,18 +632,25 @@ fn start_inner(
     if event_log {
         system = system.event_log();
     }
-    let system = system.start().expect("the promoted EdgeBoard starts");
+    let system = system
+        .hold_time()
+        .start()
+        .expect("the promoted EdgeBoard starts");
+    let actor = virtual_clock::register_actor("isolation-bridge-case");
+    system.release_time();
+    settle();
 
     (
         Rig {
+            actor,
             system,
             promoted,
             handles,
-            step_tx,
             trains,
             end_switch,
+            _suite: suite,
         },
-        settle,
+        probe,
     )
 }
 
@@ -608,18 +675,19 @@ fn a_level_crosses_the_step_isolator_end_to_end(#[case] volts: f64, #[case] expe
     // anything: an isolator whose input side is still dark drives its
     // *default* state, which for this non-F part is also high.
     assert!(
-        wait_for(|| monitor.is_passing(STEP_CHANNEL), SETTLE),
+        monitor.is_passing(STEP_CHANNEL),
         "both of IC14's supplies must come up"
     );
     rig.drive("STEP", volts);
+    settle();
 
     let net = format!("{EDGE}.Net-(IC14-OUTA)");
     assert_eq!(
-        settled_state(&rig.system, &net, NetState::Driven(expect)),
+        state(&rig.system, &net),
         NetState::Driven(expect),
         "P8 must reach the stepper driver's input across IC14"
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 /// `DIR` is a second, independent channel of the same part — proof the model
@@ -630,24 +698,17 @@ fn the_direction_channel_is_independent_of_the_step_channel() {
     let rig = start(true, false, &[]);
     rig.drive("STEP", 3.3);
     rig.drive("DIR", 0.0);
+    settle();
 
     assert_eq!(
-        settled_state(
-            &rig.system,
-            &format!("{EDGE}.Net-(IC14-OUTA)"),
-            NetState::Driven(Level::High)
-        ),
+        state(&rig.system, &format!("{EDGE}.Net-(IC14-OUTA)")),
         NetState::Driven(Level::High)
     );
     assert_eq!(
-        settled_state(
-            &rig.system,
-            &format!("{EDGE}.Net-(IC14-OUTB)"),
-            NetState::Driven(Level::Low)
-        ),
+        state(&rig.system, &format!("{EDGE}.Net-(IC14-OUTB)")),
         NetState::Driven(Level::Low)
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 /// One side powered is no isolator at all. With `SC_5V` dark, `IC14`'s output
@@ -657,10 +718,11 @@ fn the_direction_channel_is_independent_of_the_step_channel() {
 fn an_unpowered_isolated_side_stops_the_step_path() {
     let rig = start(false, false, &[]);
     rig.drive("STEP", 3.3);
+    settle();
 
     let net = format!("{EDGE}.Net-(IC14-OUTA)");
     assert_eq!(
-        settled_state(&rig.system, &net, NetState::Floating),
+        state(&rig.system, &net),
         NetState::Floating,
         "an isolator with only one side powered must pass nothing"
     );
@@ -678,12 +740,9 @@ fn an_unpowered_isolated_side_stops_the_step_path() {
     // carries nothing and its collector is an open circuit rather than a
     // plausible enable.
     rig.drive("ENA", 3.3);
+    settle();
     assert_eq!(
-        settled_state(
-            &rig.system,
-            &format!("{EDGE}.Net-(Q1-B)"),
-            NetState::Floating
-        ),
+        state(&rig.system, &format!("{EDGE}.Net-(Q1-B)")),
         NetState::Floating
     );
     // The transistor's cluster still solves — its emitter is on the bench
@@ -698,15 +757,11 @@ fn an_unpowered_isolated_side_stops_the_step_path() {
         "an unsourced base carries nothing: {into_base}"
     );
     assert_eq!(
-        settled_state(
-            &rig.system,
-            &format!("{EDGE}.Net-(JP1-B)"),
-            NetState::Floating
-        ),
+        state(&rig.system, &format!("{EDGE}.Net-(JP1-B)")),
         NetState::Floating,
         "an off transistor releases its collector"
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 // ============================================================
@@ -742,10 +797,7 @@ fn the_enable_path_crosses_the_isolator_and_the_transistor() {
     let base = format!("{EDGE}.Net-(Q1-B)");
     let collector = format!("{EDGE}.Net-(JP1-B)");
     let base_pin = format!("{EDGE}.Q1.2");
-    assert!(wait_for(
-        || rig.promoted.isolator("IC14").is_passing(Channel::C),
-        SETTLE
-    ));
+    assert!(rig.promoted.isolator("IC14").is_passing(Channel::C));
     let volts = |net: &str| match rig.system.net_state(net) {
         Some(NetState::Analog(v)) => Some(v),
         _ => None,
@@ -754,11 +806,9 @@ fn the_enable_path_crosses_the_isolator_and_the_transistor() {
     // Enable asserted: the isolator drives OUTC high, the base resistor
     // takes it to Q1, and the base–emitter junction turns on at its knee.
     rig.drive("ENA", 3.3);
+    settle();
     assert!(
-        wait_for(
-            || volts(&base).is_some_and(|v| (MMBT3904_VBE_VOLTS..=0.75).contains(&v)),
-            SETTLE
-        ),
+        volts(&base).is_some_and(|v| (MMBT3904_VBE_VOLTS..=0.75).contains(&v)),
         "P6 must reach the base across IC14 and R24, and the junction sit at its knee; got {:?}",
         rig.system.net_state(&base)
     );
@@ -793,28 +843,25 @@ fn the_enable_path_crosses_the_isolator_and_the_transistor() {
     // the junction is off; the collector is reached only through the off
     // transistor and floats.
     rig.drive("ENA", 0.0);
+    settle();
     assert!(
-        wait_for(|| volts(&base).is_some_and(|v| v < 0.1), SETTLE),
+        volts(&base).is_some_and(|v| v < 0.1),
         "a released P6 reaches the base through R24; got {:?}",
         rig.system.net_state(&base)
     );
     assert!(
-        wait_for(
-            || rig
-                .system
-                .pin_current(&base_pin)
-                .is_some_and(|i| i.abs() < 1e-9),
-            SETTLE
-        ),
+        rig.system
+            .pin_current(&base_pin)
+            .is_some_and(|i| i.abs() < 1e-9),
         "an off junction carries only leakage: {:?}",
         rig.system.pin_current(&base_pin)
     );
     assert_eq!(
-        settled_state(&rig.system, &collector, NetState::Floating),
+        state(&rig.system, &collector),
         NetState::Floating,
         "an off transistor's unloaded collector is an open circuit"
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 // ============================================================
@@ -826,30 +873,36 @@ fn the_enable_path_crosses_the_isolator_and_the_transistor() {
 ///
 /// `edgeboard.rs` stops at `Net-(IC16-INA)` because that was as far as a
 /// stubbed isolator let it go.
+///
+/// Read at the settled instant, not polled. The receiver's `1Y` declares a
+/// push-pull output's idle, `Driven(High)` — the very state asserted — and
+/// on the way to it the part releases `1Y` once: its supply is delivered
+/// before its enables, and with `~G` not yet read it is disabled. The
+/// free-running version polled until the net read `Driven(High)`, which
+/// the idle satisfied before the receiver had run at all, then re-read it
+/// inside that release: `Floating` (`NODES.md` §12 item 5, the flake
+/// record).
 #[rstest]
 #[case::forward(3.3, Level::High)]
 #[case::reverse(0.0, Level::High)]
 fn the_encoder_reaches_the_p2_across_the_isolator(#[case] a_plus: f64, #[case] expect: Level) {
     let rig = start(true, false, &[("EdgeBoard./MaD_Edge_Sheet3/A+", a_plus)]);
     assert!(
-        wait_for(
-            || rig.promoted.isolator("IC16").is_passing(Channel::A),
-            SETTLE
-        ),
+        rig.promoted.isolator("IC16").is_passing(Channel::A),
         "both of IC16's supplies must come up"
     );
     let receiver = format!("{EDGE}.Net-(IC16-INA)");
     assert_eq!(
-        settled_state(&rig.system, &receiver, NetState::Driven(expect)),
+        state(&rig.system, &receiver),
         NetState::Driven(expect),
         "the receiver's own output, as edgeboard.rs asserts it"
     );
     assert_eq!(
-        settled_state(&rig.system, &format!("{EDGE}.P9"), NetState::Driven(expect)),
+        state(&rig.system, &format!("{EDGE}.P9")),
         NetState::Driven(expect),
         "and now it reaches P9 across IC16"
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 /// `IC16` is an `ISO6740F` — the **fail-safe** part — and this is what the F
@@ -864,7 +917,7 @@ fn the_encoder_isolator_fails_safe_low_when_its_input_side_dies() {
     for pin in ["P9", "P10", "P11", "P12"] {
         let net = format!("{EDGE}.{pin}");
         assert_eq!(
-            settled_state(&rig.system, &net, NetState::Driven(Level::Low)),
+            state(&rig.system, &net),
             NetState::Driven(Level::Low),
             "{pin} must present the ISO6740F default, not float"
         );
@@ -873,7 +926,7 @@ fn the_encoder_isolator_fails_safe_low_when_its_input_side_dies() {
     assert!(!monitor.is_passing(Channel::A), "nothing is being relayed");
     assert_eq!(monitor.output_level(Channel::A), Some(Level::Low));
     assert_eq!(monitor.config().default_level(), Level::Low);
-    rig.system.shutdown();
+    rig.finish();
 }
 
 // ============================================================
@@ -895,18 +948,18 @@ fn the_encoder_isolator_fails_safe_low_when_its_input_side_dies() {
 #[rstest]
 fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
     // Engine-hosted settle probe (see edgeboard `SettleProbe`): open/closed
-    // facts are sampled on the engine thread after a virtual-time wake so a
-    // wall-race glance at a mid-cascade transient cannot pass wait_for and
-    // then fail the lit/current asserts (ubuntu release smoke flake on
+    // facts are sampled on the engine thread after a virtual-time wake, and
+    // read after the case has settled past it, so a mid-cascade transient
+    // cannot fail the lit/current asserts (ubuntu release smoke flake on
     // #50 / run 35007027583).
-    let (rig, settle) = start_end_switch_loop(&[]);
+    let (rig, probe) = start_end_switch_loop(&[]);
     let opto = rig.promoted.opto("U6");
     let regulator = format!("{EDGE}.IC9");
     let regulation_ma = NSI50010_I_REG_AMPS * 1e3;
 
     // Open contact: no return path, so the loop carries nothing.
     rig.end_switch.set_position_mm(0.0);
-    let open = settle.capture();
+    let open = probe.capture();
     assert!(
         matches!(open.p19, NetState::Pulled(Level::High, _)),
         "an unlit optocoupler must leave P19 to the pull-up; got {:?}",
@@ -932,7 +985,7 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
 
     // Closed contact: the loop completes and the regulator holds it.
     rig.end_switch.set_position_mm(150.0);
-    let closed = settle.capture();
+    let closed = probe.capture();
     assert!(
         matches!(closed.p19, NetState::Driven(Level::Low)),
         "a closed contact must pull P19 down; got {:?}",
@@ -962,7 +1015,7 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
 
     // And back: the path is not one-way.
     rig.end_switch.set_position_mm(0.0);
-    let reopen = settle.capture();
+    let reopen = probe.capture();
     assert!(
         matches!(reopen.p19, NetState::Pulled(Level::High, _)),
         "re-opening must return P19 to the pull-up; got {:?}",
@@ -970,7 +1023,7 @@ fn a_closed_end_switch_lights_the_optocoupler_and_pulls_p19_down() {
     );
     assert!(!reopen.lit);
     assert!(!reopen.sinking);
-    rig.system.shutdown();
+    rig.finish();
 }
 
 /// An **unpowered** optocoupler cannot sink however brightly its LED is lit.
@@ -988,60 +1041,90 @@ fn an_unpowered_optocoupler_leaves_p19_at_its_pull_up() {
     let p19 = format!("{EDGE}.P19");
 
     rig.end_switch.set_position_mm(150.0);
+    settle();
     assert!(
-        wait_for(|| opto.is_lit(OptoChannel::Two), SETTLE),
+        opto.is_lit(OptoChannel::Two),
         "the LED loop is still powered and the contact is closed"
     );
     assert!(!opto.is_powered(), "but the detector is not");
     assert!(!opto.is_sinking(OptoChannel::Two));
     assert!(
-        wait_for(
-            || matches!(
-                rig.system.net_state(&p19),
-                Some(NetState::Pulled(Level::High, _))
-            ),
-            SETTLE
-        ),
+        matches!(state(&rig.system, &p19), NetState::Pulled(Level::High, _)),
         "P19 must sit at the pull-up, not be held low; got {:?}",
         rig.system.net_state(&p19)
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 // ============================================================
 // The budget: a step train crosses without scaling engine traffic
 // ============================================================
 
-/// Engine events a whole four-segment step profile is allowed to cost, from
-/// the moment the system has gone quiet.
+/// Engine events a whole four-segment step profile costs, from the settled
+/// instant it starts at to the settled instant after its stop — asserted
+/// exactly, at both rates: a span of virtual time, not a wall-clock quiet
+/// window. (The free-running version closed its window after 50 ms of wall
+/// quiet, and under load split one profile 54/58: the stop's `t_pd` wake
+/// had not fired, then fired at the next profile's first instant, after
+/// its drive — `NODES.md` §12 item 5, the flake record.)
 ///
 /// The alternative — an isolator that re-drove its output pin per STEP edge —
 /// is ~8192 events per millimetre at the reference machine's resolution, so a
-/// regression would miss this ceiling by orders of magnitude. The measured
-/// number is printed by the test; the ceiling is headroom over it for
-/// incidental engine bookkeeping, not for per-pulse traffic.
-const RELAY_EVENT_CEILING: usize = 32;
+/// regression would miss this ceiling by orders of magnitude.
+///
+/// **Measured, and the ceiling is the measurement: 57 events per
+/// four-change profile, at 8 192 Hz and at 819 200 Hz alike** (the test
+/// prints it). The step clock is a periodic drive on the STEP net, so a rate
+/// change is a drive like any other, and it reaches everything on the net
+/// that reads it — 12 records per running rate change: the source's drive
+/// with its net resolved (two identity nets) and handed to `IC14`'s input
+/// and to the `P8` indicator's SN74LVC1G14 (5); `IC14`'s relay, one periodic
+/// drive, with the isolated net resolved (two identity nets) and handed to
+/// the sink and to `U24`'s `1A` (5); and the indicator inverter's own relay
+/// onto its LED net (2). `U24` re-issues nothing it already drives (the
+/// harness model publishes a changed pair only, as the isolator and the
+/// gates do), so it costs only where its input changes meaning: the first
+/// rate change turns the resting line it drove from into a running clock it
+/// reads no level from, and it releases its pair (2 drives, 2 resolutions:
+/// 16); the stop hands it the held clock's resting low (the node names its
+/// low phase's voltage, `NODES.md` §12 item 5, the review) and it drives the
+/// pair again (4), while the inverter, out of rate mode, reads the same
+/// resting low and drives its LED high `t_pd` later (a wake, a drive and a
+/// resolution in place of its relay's two: 5 + 5 + 4 + 3 = 17). 16 + 12 +
+/// 12 + 17 = 57. While the train rode a pulse channel beside the net the
+/// same profile cost 19 events (the phase-4 tree, measured) and the ceiling
+/// was 32 — the ~7× per rate change `sil-unified-drive.md` measured for a
+/// drive on this rig ("level (drive) 14"; the two relays beyond it are the
+/// readers the channel never reached), bounded, and still independent of
+/// the rate, which is the property this guards.
+const RELAY_EVENT_CEILING: usize = 57;
 
-/// Virtual time each constant-rate segment runs for.
+/// Engine events the one level-to-clock change costs: the STEP line, held
+/// at a level, becomes a clock at rest (a held segment) before a profile
+/// is measured. **Measured, and the ceiling is the measurement: 18.** The
+/// source's drive, its net resolved, handed to `IC14` and the indicator,
+/// its identity net resolved (5); `IC14`'s first relay onto the isolated
+/// net, resolved and handed on (5); `U24`, handed the held clock's resting
+/// low where it read the level's high, re-drives its pair (4); the
+/// inverter, reading the same low, drives its LED `t_pd` later (a wake, a
+/// drive, its two LED nets resolved: 4). Paid once per line, not per
+/// profile, and asserted exactly here so the level path's cost stays under
+/// test.
+const PRIME_EVENT_CEILING: usize = 18;
+
+/// Virtual time each segment of a profile holds for, the stop included: the
+/// profile is one fixed span of virtual time, 800 ms.
 const SEGMENT_US: u64 = 200_000;
-
-/// Wait until the engine's event log stops growing, so a measurement taken
-/// after this covers only what the test then does.
-fn settle_log(log: &EventLog) {
-    let deadline = Instant::now() + SETTLE;
-    let mut last = log.records().len();
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-        let now = log.records().len();
-        if now == last {
-            return;
-        }
-        last = now;
-    }
-}
+const _: () = assert!(SEGMENT_US * 1_000 > SETTLE_NS);
 
 /// One four-segment profile at `base_hz`, `2 x base_hz`, `base_hz`, stop.
 /// Returns `(pulses emitted, engine events, relays)`.
+///
+/// Each segment is published at a settled instant — the case's thread holds
+/// the engine there, so `since_ns` is that instant exactly — and held for
+/// [`SEGMENT_US`] of virtual time, during which the engine delivers the
+/// change, every relay and every wake it arms; the count is the log's
+/// length from the first instant to the last.
 fn run_profile(
     rig: &Rig,
     log: &EventLog,
@@ -1049,40 +1132,32 @@ fn run_profile(
     base_hz: u32,
     published: &mut u64,
 ) -> (u64, usize, u64) {
-    let before = log.records().len();
+    let before = log.len();
     let relays_before = monitor.train_count();
     let received_before = rig.trains.lock().unwrap().len();
     let mut pulses = 0u64;
 
     for (index, multiplier) in [1u32, 2, 1, 0].into_iter().enumerate() {
         let freq_hz = base_hz * multiplier;
-        rig.publish_step(PulseTrain {
-            pulses: PulseSegment {
-                emitted: *published,
-                freq_hz,
-                total: None,
-                since_us: embsim_core::virtual_clock::virtual_us(),
-            },
-            direction: PulseDirection::Forward,
+        rig.publish_step(PeriodicSchedule {
+            emitted: *published,
+            freq_hz,
+            total: None,
+            since_ns: virtual_clock::virtual_ns(),
         });
-        assert!(
-            wait_for(
-                || rig.trains.lock().unwrap().len() > received_before + index,
-                SETTLE
-            ),
-            "segment {index} at {base_hz} Hz must reach the isolated side"
+        virtual_clock::wait_virtual_us(SEGMENT_US);
+        assert_eq!(
+            rig.trains.lock().unwrap().len(),
+            received_before + index + 1,
+            "segment {index} at {base_hz} Hz must reach the isolated side, once"
         );
-        if freq_hz > 0 {
-            embsim_core::virtual_clock::wait_virtual_us(SEGMENT_US);
-            let emitted = u64::from(freq_hz) * SEGMENT_US / 1_000_000;
-            pulses += emitted;
-            *published += emitted;
-        }
+        let emitted = u64::from(freq_hz) * SEGMENT_US / 1_000_000;
+        pulses += emitted;
+        *published += emitted;
     }
-    settle_log(log);
     (
         pulses,
-        log.records().len() - before,
+        log.len() - before,
         monitor.train_count() - relays_before,
     )
 }
@@ -1102,31 +1177,48 @@ fn a_step_train_crosses_the_barrier_at_a_bounded_engine_cost() {
 
     // Settle the level path first, so the measurement covers the train only.
     rig.drive("STEP", 3.3);
-    assert!(wait_for(
-        || rig.system.net_state(&format!("{EDGE}.Net-(IC14-OUTA)"))
-            == Some(NetState::Driven(Level::High)),
-        SETTLE
-    ));
-    // Nothing has published a train yet, so nothing has been relayed: a pulse
-    // route delivers at registration only when its source already has a
-    // segment, and an isolator relays only what it has received.
+    settle();
+    assert_eq!(
+        state(&rig.system, &format!("{EDGE}.Net-(IC14-OUTA)")),
+        NetState::Driven(Level::High)
+    );
+    // Nothing has clocked the line yet, so nothing has been relayed: the
+    // STEP net carries a level, and an isolator relays a clock only when its
+    // input carries one.
     assert!(rig.trains.lock().unwrap().is_empty());
-    settle_log(&log);
+    // The line becomes a clock at rest — a held segment — before anything
+    // is measured: the level-to-clock change is the level path's cost, paid
+    // once here, so both profiles below start from the same line.
+    let before_prime = log.len();
+    rig.publish_step(PeriodicSchedule::IDLE);
+    settle();
+    assert_eq!(
+        rig.trains.lock().unwrap().len(),
+        1,
+        "the held clock must reach the isolated side"
+    );
+    let prime = log.len() - before_prime;
+    assert_eq!(
+        prime, PRIME_EVENT_CEILING,
+        "the level-to-clock change costs {prime} engine events (the measurement is \
+         {PRIME_EVENT_CEILING})"
+    );
 
     let mut published = 0u64;
     let slow = run_profile(&rig, &log, &monitor, 8_192, &mut published);
     let fast = run_profile(&rig, &log, &monitor, 819_200, &mut published);
 
-    // The isolated side saw every segment, unaltered.
-    let received = rig.trains.lock().unwrap().clone();
-    let rates: Vec<u32> = received.iter().map(|t| t.pulses.freq_hz).collect();
+    // The isolated side saw every segment, unaltered (after the held one it
+    // was primed with).
+    let received = rig.trains.lock().unwrap()[1..].to_vec();
+    let rates: Vec<u32> = received.iter().map(|t| t.freq_hz).collect();
     assert_eq!(
         rates,
         vec![8_192, 16_384, 8_192, 0, 819_200, 1_638_400, 819_200, 0],
         "every rate change crossed the barrier, and only rate changes did"
     );
     assert_eq!(
-        received.last().expect("segments arrived").pulses.emitted,
+        received.last().expect("segments arrived").emitted,
         published,
         "the relayed count is the source's own, verbatim"
     );
@@ -1146,12 +1238,11 @@ fn a_step_train_crosses_the_barrier_at_a_bounded_engine_cost() {
         "engine cost must be identical at a hundredfold higher rate: {} vs {} events",
         slow.1, fast.1
     );
-    assert!(
-        fast.1 <= RELAY_EVENT_CEILING,
+    assert_eq!(
+        fast.1, RELAY_EVENT_CEILING,
         "engine events must not scale with the step rate: {} events for {} pulses \
-         (ceiling {RELAY_EVENT_CEILING})",
-        fast.1,
-        fast.0
+         (the measurement is {RELAY_EVENT_CEILING})",
+        fast.1, fast.0
     );
     println!(
         "[budget] {} pulses crossed IC14 in {} engine events; {} pulses in {} events \
@@ -1159,7 +1250,7 @@ fn a_step_train_crosses_the_barrier_at_a_bounded_engine_cost() {
          would have been at least {}",
         slow.0, slow.1, fast.0, fast.1, fast.0
     );
-    rig.system.shutdown();
+    rig.finish();
 }
 
 /// A level channel is a repeater, so its cost is one drive per transition —
@@ -1171,34 +1262,35 @@ fn a_level_transition_costs_one_drive_on_one_channel() {
     rig.drive("STEP", 0.0);
     rig.drive("DIR", 0.0);
     rig.drive("ENA", 0.0);
-    assert!(wait_for(
-        || rig.system.net_state(&format!("{EDGE}.Net-(IC14-OUTA)"))
-            == Some(NetState::Driven(Level::Low)),
-        SETTLE
-    ));
+    settle();
+    assert_eq!(
+        state(&rig.system, &format!("{EDGE}.Net-(IC14-OUTA)")),
+        NetState::Driven(Level::Low)
+    );
     let settled = monitor.drive_count();
 
     rig.drive("STEP", 3.3);
-    assert!(wait_for(
-        || rig.system.net_state(&format!("{EDGE}.Net-(IC14-OUTA)"))
-            == Some(NetState::Driven(Level::High)),
-        SETTLE
-    ));
+    settle();
+    assert_eq!(
+        state(&rig.system, &format!("{EDGE}.Net-(IC14-OUTA)")),
+        NetState::Driven(Level::High)
+    );
     assert_eq!(
         monitor.drive_count(),
         settled + 1,
         "one transition on one channel is one drive across the whole part"
     );
 
-    // Re-driving the same level, ten times over, costs nothing at all.
+    // Re-driving the same level, ten times over, costs nothing at all —
+    // read after a settle that delivered all ten, not after a wall sleep.
     for _ in 0..10 {
         rig.drive("STEP", 3.3);
     }
-    std::thread::sleep(Duration::from_millis(50));
+    settle();
     assert_eq!(monitor.drive_count(), settled + 1);
     println!(
         "[budget] {} drives for a settled four-channel isolator plus one transition",
         monitor.drive_count()
     );
-    rig.system.shutdown();
+    rig.finish();
 }

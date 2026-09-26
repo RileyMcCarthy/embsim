@@ -50,8 +50,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::{
     netlist, AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, Level,
-    NetId, NetState, PartRegistry, PinDecl, PinHandle, PinReference, RailDownReason, Scenario,
-    SenseKind, System, SystemHandle, TheveninDrive,
+    NetId, NetState, PartRegistry, PinDecl, PinHandle, RailDownReason, Scenario, SenseKind, System,
+    SystemHandle, TheveninDrive,
 };
 use embsim_boards::ec32mb::{Ec32mb, BROWNOUT_DETECTOR_PART, BUCK_PART, LDO_PART, NETLIST};
 use embsim_boards::p2::P2Package;
@@ -873,17 +873,15 @@ fn rails_with_no_input_are_reported_down_at_build() {
 /// decoupling lint's fixture.
 struct Supplied {
     pins: [PinDecl; 2],
-    references: [PinReference; 1],
 }
 
 impl Supplied {
     fn new() -> Self {
         Self {
-            pins: [PinDecl::power_in("VCC"), PinDecl::power_in("GND")],
-            references: [PinReference {
-                pin: "VCC",
-                reference: "GND",
-            }],
+            pins: [
+                PinDecl::power_in("VCC").with_reference("GND"),
+                PinDecl::power_in("GND"),
+            ],
         }
     }
 }
@@ -891,9 +889,6 @@ impl Supplied {
 impl Component for Supplied {
     fn pins(&self) -> &[PinDecl] {
         &self.pins
-    }
-    fn references(&self) -> &[PinReference] {
-        &self.references
     }
     fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
         Ok(())
@@ -1023,7 +1018,7 @@ fn sense_current_into_a_low_sink_on_the_module_reads_the_pull_ups_current() {
     );
     let _guard = stepped();
     let pad = Pad {
-        pins: [PinDecl::digital_out("P").with_idle(embsim_board::IdleDrive::Released)],
+        pins: [PinDecl::digital_out("P").with_idle(None)],
         handle: Arc::default(),
     };
     let pad_handle = Arc::clone(&pad.handle);

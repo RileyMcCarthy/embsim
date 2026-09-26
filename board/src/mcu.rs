@@ -12,7 +12,7 @@
 //! |---|---|---|---|
 //! | serial | [`McuBuilder::bridge_serial`] | TX + RX, plain digital | both |
 //! | GPIO | [`McuBuilder::bridge_gpio`] | one, per declared direction | firmware → net **and** net → firmware |
-//! | pulse-out | [`McuBuilder::bridge_pulse_out`] | one STEP pin, [`StreamRole::PulseSource`] | firmware → net |
+//! | pulse-out | [`McuBuilder::bridge_pulse_out`] | one STEP pin, driven [`Drive::Periodic`] | firmware → net |
 //! | encoder | [`McuBuilder::bridge_encoder`] | A + B phase pins | net → firmware |
 //!
 //! Together these close the "hand-wired motion" seam: a step train reaches a
@@ -30,22 +30,34 @@
 //! step*. So the pulse-out bridge does not synthesize edges at all: it
 //! forwards the peripheral's
 //! [`on_rate_change`](embsim_peripherals::pulse_out::PulseOut::on_rate_change)
-//! events onto a [`StreamRole::PulseSource`] pin as [`PulseTrain`] segments —
-//! **one engine event per rate change** — and the consumer integrates at read
-//! time. Exact step counts survive: [`PulseTrain::emitted_at`] is the same
-//! integer arithmetic `HAL_pulseOut_run` hands the firmware, so an encoder fed
-//! from the train cannot drift from the firmware's own view. The fidelity this
+//! events onto the STEP pin as a [`Drive::Periodic`] — the pad's high and low
+//! ports and the peripheral's own [`PeriodicSchedule`], **one drive per rate
+//! change** — resolved on the net like every other drive, so a fought step
+//! line is `Contention`, and the consumer integrates at read time. Exact step
+//! counts survive: [`PeriodicSchedule::emitted_at_ns`] is the same integer
+//! arithmetic `HAL_pulseOut_run` hands the firmware, so an encoder fed from
+//! the segment cannot drift from the firmware's own view. The fidelity this
 //! trades away (no edges, no pulse width, no per-edge DIR sampling) is
-//! enumerated on [`PulseTrain`].
+//! enumerated on [`Drive::Periodic`].
 //!
-//! A pulse channel may name a bridged GPIO **output** channel as its direction
-//! source ([`McuBuilder::bridge_pulse_out_with_direction`], which also takes
-//! the direction that channel's *active* state means). A change of that GPIO
-//! re-publishes the train, re-based at the change instant, so the pulses
-//! before and after keep their own signs and the running count stays exact.
-//! Without a direction source every segment is [`PulseDirection::Forward`] and
-//! the sink takes direction from its own DIR pin — which is what a real
-//! step/direction drive does, and the wiring to prefer.
+//! The wire carries no direction. A step/direction drive takes it from its
+//! own DIR pin — a bridged GPIO output the firmware drives like any other —
+//! at the instant the DIR net changes, folding the one segment the STEP pin
+//! carries from the peripheral's own anchor.
+//!
+//! # Hosted in a package
+//!
+//! Inside a package that decides when the chip runs and what its pads drive
+//! at — `embsim-boards`' P2 package, whose `P2Core` impl calls
+//! [`McuComponent::host_pads`] — the bridges publish nothing until
+//! [`Component::start`], which the package runs at the chip's START
+//! instant; there every bridged output presents its power-on state, and
+//! every drive after it goes through the package's ports (a pad high at its
+//! bank's supply, nothing in a bank with none). The wakes the serial bridges
+//! arm go through the package's gate too (the net I/O it hands the core is
+//! its own, [`ComponentNetIo::with_wake_gate`]), so a byte the firmware
+//! queues before START goes out after it. On a board of its own an MCU
+//! publishes from attach, at [`crate::net::digital_drive`]'s nominal ports.
 //!
 //! # Two modes
 //!
@@ -130,8 +142,9 @@
 //!
 //! ## The bits are on the net
 //!
-//! The TX/RX pins are plain [`PinKind::DigitalOut`] / [`PinKind::DigitalIn`]
-//! with no [`StreamRole`] at all, and a byte becomes a start bit, eight data
+//! The TX/RX pins are a plain push-pull output and a plain digital input
+//! ([`PinDecl::digital_out`] / [`PinDecl::digital_in`]) with no channel role
+//! at all, and a byte becomes a start bit, eight data
 //! bits and a stop bit at the table baud — driven by
 //! [`crate::SerialLevelBridge`] out of the component's wake handler, and
 //! decoded on the way back from the RX pin's resolved state.
@@ -158,18 +171,17 @@
 
 use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use embsim_core::virtual_clock;
 use embsim_peripherals::instance::PeripheralInstance;
-use embsim_peripherals::pulse_out::PulseSegment;
+use embsim_peripherals::pulse_out::PeriodicSchedule;
 
 use crate::component::{
-    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, PulseDirection,
-    PulseTrain, PulseTx, StreamRole,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, Drive, PinDecl,
+    PinHandle, Thresholds,
 };
-use crate::net::Level;
+use crate::net::{Level, TheveninDrive};
 use crate::serial_levels::SerialLevelBridge;
 use crate::uart::{FramingError, UartFraming};
 
@@ -222,26 +234,15 @@ pub struct EncoderChannelConfig {
     pub pin_b: u32,
 }
 
-/// Which bridged GPIO output channel stamps a pulse train's direction, and
-/// which way the train counts while that channel is active. Built by
-/// [`McuBuilder::bridge_pulse_out_with_direction`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DirectionSource {
-    /// HAL GPIO channel index supplying the direction.
-    channel: usize,
-    /// Direction the train carries while that channel reads active.
-    active_direction: PulseDirection,
-}
-
 /// Electrical direction of a declared GPIO channel pin (the HAL tables do
 /// not encode direction, so the builder takes it per channel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpioDirection {
-    /// The MCU senses this pin ([`PinKind::DigitalIn`]): the net drives, and a
+    /// The MCU senses this pin ([`PinDecl::digital_in`]): the net drives, and a
     /// bridged channel writes what it reads into the peripheral GPIO bank —
     /// what an endstop needs.
     Input,
-    /// The MCU drives this pin ([`PinKind::DigitalOut`]): a bridged channel
+    /// The MCU drives this pin ([`PinDecl::digital_out`]): a bridged channel
     /// turns every firmware write into a net drive.
     Output,
 }
@@ -255,7 +256,41 @@ pub enum GpioDirection {
 // [`crate::net`]: it is the engine's own, not the MCU's, and the serial level
 // bridge needs the same one. An input with no level holds the last value the
 // firmware saw rather than inventing a released state.
-use crate::net::{digital_drive as output_drive, level_of};
+use crate::net::digital_drive as output_drive;
+
+/// The thresholds every bridged input declares: the JEDEC JESD8C.01 3.3 V
+/// LVCMOS pair ([`jesd8c01_lvcmos_thresholds`]), absolute. The pins are the
+/// P2's pads, whose own threshold is relative — `V_IH` between 0.3 and 0.7
+/// × the bank's `Vxxyy` (P2X8C4M64P Datasheet, DC Characteristics, p. 47)
+/// — but an MCU on a board of its own declares no bank-supply pin for a
+/// relative declaration to scale by, so the pair the engine's own dead
+/// band already projects through stands in for it, stated. Inside a P2
+/// package the package's own declarations apply instead — each pad
+/// relative to its bank's `VIO_a_b` — since it is the package that
+/// declares the pins ([`McuComponent::host_pads`]).
+const BRIDGED_INPUT_THRESHOLDS: Thresholds = jesd8c01_lvcmos_thresholds(DeadBand::Unknown);
+
+/// How a package that **hosts** this MCU drives its pads
+/// ([`McuComponent::host_pads`]): the Thevenin port pad `pin` (`"P{n}"`)
+/// presents for a level, or `None` for a pad whose driver has no supply.
+/// The P2 package (`embsim-boards`) answers from its bank supplies — a pad
+/// high at its `VIO_a_b` pin's voltage, at the fast drive strength —
+/// exactly as it answers the QEMU core's pads.
+pub type PadPorts = Arc<dyn Fn(&'static str, Level) -> Option<TheveninDrive> + Send + Sync>;
+
+/// The drive a bridged pad presents for `level`: the host's port for it
+/// ([`PadPorts`]), or — an MCU on a board of its own — the crate's
+/// push-pull digital drive.
+fn pad_drive(ports: Option<&PadPorts>, pin: &'static str, level: Level) -> Option<TheveninDrive> {
+    match ports {
+        Some(ports) => ports(pin, level),
+        None => Some(output_drive(level)),
+    }
+}
+
+/// A bridged output's power-on publish, run at attach for an MCU on a
+/// board of its own and at [`Component::start`] for a hosted one.
+type PowerOn = Box<dyn Fn() + Send + Sync>;
 
 /// The pin level a GPIO channel's `active` state drives, honoring
 /// `active_low`.
@@ -270,19 +305,6 @@ fn level_of_active(active: bool, active_low: bool) -> Level {
 /// The `active` state a pin level reads back as, honoring `active_low`.
 fn active_of_level(level: Level, active_low: bool) -> bool {
     (level == Level::High) != active_low
-}
-
-/// The direction a pulse train carries given its direction GPIO's `active`
-/// state and the machine's declared mapping for the active state.
-fn direction_of_active(active: bool, active_direction: PulseDirection) -> PulseDirection {
-    if active {
-        active_direction
-    } else {
-        match active_direction {
-            PulseDirection::Forward => PulseDirection::Reverse,
-            PulseDirection::Reverse => PulseDirection::Forward,
-        }
-    }
 }
 
 // ============================================================
@@ -324,8 +346,7 @@ pub struct McuBuilder {
     gpio_table: Vec<GpioChannelConfig>,
     bridged_gpio: Vec<(usize, GpioDirection)>,
     pulse_out_table: Vec<PulseOutChannelConfig>,
-    /// `(pulse channel, optional direction source)`.
-    bridged_pulse_out: Vec<(usize, Option<DirectionSource>)>,
+    bridged_pulse_out: Vec<usize>,
     encoder_table: Vec<EncoderChannelConfig>,
     bridged_encoder: Vec<usize>,
     entry: Option<Box<dyn FnOnce() + Send>>,
@@ -425,55 +446,18 @@ impl McuBuilder {
         self
     }
 
-    /// Bridge one pulse-output channel to its STEP pin as a rate-carried
-    /// [`PulseTrain`] (see the module docs for why a rate and not edges).
+    /// Bridge one pulse-output channel to its STEP pin as a
+    /// [`Drive::Periodic`] (see the module docs for why a rate and not
+    /// edges).
     ///
-    /// The pin is declared [`PinKind::DigitalOut`] with
-    /// [`StreamRole::PulseSource`], so it also holds a resolvable idle level;
-    /// the *train* rides the derived pulse route to every reachable
-    /// [`StreamRole::PulseSink`]. Every segment is
-    /// [`PulseDirection::Forward`] — use
-    /// [`McuBuilder::bridge_pulse_out_with_direction`] when the sink has no
-    /// DIR pin of its own.
+    /// The pin is declared a push-pull output; every rate change the
+    /// peripheral makes is one periodic drive on it — the pad's high and low
+    /// ports ([`crate::net::digital_drive`], the same the GPIO bridge drives)
+    /// and the peripheral's own segment — resolved on the net like any
+    /// drive. The direction is the DIR pin's, a GPIO channel bridged on its
+    /// own.
     pub fn bridge_pulse_out(mut self, channel: usize) -> Self {
-        self.bridged_pulse_out.push((channel, None));
-        self
-    }
-
-    /// Bridge a pulse-output channel and stamp each segment's direction from a
-    /// bridged GPIO **output** channel's active state.
-    ///
-    /// `active_direction` says which way the train counts while that channel
-    /// is *active* (the channel's own `active_low` polarity already decides
-    /// what "active" means electrically); the inactive state carries the
-    /// opposite. It is an explicit argument because the mapping is a machine
-    /// convention, not a fact about the silicon — a default here would
-    /// silently invert an axis on half the machines that use it.
-    ///
-    /// A change on `direction_gpio_channel` re-publishes the train re-based at
-    /// the change instant, so the pulses on each side of the reversal keep
-    /// their own sign and the running count stays exact. The direction channel
-    /// must itself be bridged as [`GpioDirection::Output`] — otherwise the
-    /// build fails with [`McuBuildError::DirectionChannelNotBridged`], because
-    /// the bridge hooks the same `on_change` slot rather than silently
-    /// installing a second, conflicting callback.
-    ///
-    /// Reach for this only when the sink has no DIR pin of its own; a
-    /// step/direction drive wired the real way takes its direction from its
-    /// own DIR input and needs nothing here.
-    pub fn bridge_pulse_out_with_direction(
-        mut self,
-        channel: usize,
-        direction_gpio_channel: usize,
-        active_direction: PulseDirection,
-    ) -> Self {
-        self.bridged_pulse_out.push((
-            channel,
-            Some(DirectionSource {
-                channel: direction_gpio_channel,
-                active_direction,
-            }),
-        ));
+        self.bridged_pulse_out.push(channel);
         self
     }
 
@@ -566,39 +550,21 @@ impl McuBuilder {
                     })?;
             // Two plain digital pins: the UART is framed onto the net as
             // levels, so there is no byte route to declare.
-            pins.push(PinDecl {
-                number: claim(config.tx_pin)?,
-                name: None,
-                kind: PinKind::DigitalOut,
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            });
-            pins.push(PinDecl {
-                number: claim(config.rx_pin)?,
-                name: None,
-                kind: PinKind::DigitalIn,
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            });
+            pins.push(PinDecl::digital_out(claim(config.tx_pin)?));
+            pins.push(PinDecl::digital_in(
+                claim(config.rx_pin)?,
+                BRIDGED_INPUT_THRESHOLDS,
+            ));
             bridges.push(SerialBridge { channel, config });
         }
 
-        let gpio_kind = |direction: GpioDirection| match direction {
-            GpioDirection::Input => PinKind::DigitalIn,
-            GpioDirection::Output => PinKind::DigitalOut,
+        let gpio_pin = |number: &'static str, direction: GpioDirection| match direction {
+            GpioDirection::Input => PinDecl::digital_in(number, BRIDGED_INPUT_THRESHOLDS),
+            GpioDirection::Output => PinDecl::digital_out(number),
         };
 
         for (config, direction) in &self.gpio {
-            pins.push(PinDecl {
-                number: claim(config.pin)?,
-                name: None,
-                kind: gpio_kind(*direction),
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            });
+            pins.push(gpio_pin(claim(config.pin)?, *direction));
         }
 
         let mut gpio_bridges: Vec<GpioBridge> = Vec::new();
@@ -612,14 +578,7 @@ impl McuBuilder {
                         table_len: self.gpio_table.len(),
                     })?;
             let pin = claim(config.pin)?;
-            pins.push(PinDecl {
-                number: pin,
-                name: None,
-                kind: gpio_kind(direction),
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            });
+            pins.push(gpio_pin(pin, direction));
             gpio_bridges.push(GpioBridge {
                 channel,
                 config,
@@ -629,40 +588,18 @@ impl McuBuilder {
         }
 
         let mut pulse_bridges: Vec<PulseBridge> = Vec::new();
-        for &(channel, direction_gpio) in &self.bridged_pulse_out {
+        for &channel in &self.bridged_pulse_out {
             let config = *self.pulse_out_table.get(channel).ok_or(
                 McuBuildError::UnknownPulseOutChannel {
                     channel,
                     table_len: self.pulse_out_table.len(),
                 },
             )?;
-            if let Some(source) = direction_gpio {
-                let bridged_as_output = gpio_bridges
-                    .iter()
-                    .any(|b| b.channel == source.channel && b.direction == GpioDirection::Output);
-                if !bridged_as_output {
-                    return Err(McuBuildError::DirectionChannelNotBridged {
-                        pulse_channel: channel,
-                        gpio_channel: source.channel,
-                    });
-                }
-            }
             let pin = claim(config.pin)?;
-            // A step clock is a push-pull output that also holds a resolvable
-            // idle level; the train itself rides the pulse route.
-            pins.push(PinDecl {
-                number: pin,
-                name: None,
-                kind: PinKind::DigitalOut,
-                stream: Some(StreamRole::PulseSource),
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            });
-            pulse_bridges.push(PulseBridge {
-                channel,
-                pin,
-                direction_gpio,
-            });
+            // A step clock is a push-pull output whose every rate change is
+            // one periodic drive on it.
+            pins.push(PinDecl::digital_out(pin));
+            pulse_bridges.push(PulseBridge { channel, pin });
         }
 
         let mut encoder_bridges: Vec<EncoderBridge> = Vec::new();
@@ -678,14 +615,7 @@ impl McuBuilder {
             let pin_a = claim(config.pin_a)?;
             let pin_b = claim(config.pin_b)?;
             for pin in [pin_a, pin_b] {
-                pins.push(PinDecl {
-                    number: pin,
-                    name: None,
-                    kind: PinKind::DigitalIn,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                });
+                pins.push(PinDecl::digital_in(pin, BRIDGED_INPUT_THRESHOLDS));
             }
             encoder_bridges.push(EncoderBridge {
                 channel,
@@ -715,6 +645,9 @@ impl McuBuilder {
             own_instance,
             entry: Mutex::new(self.entry),
             entry_thread: None,
+            pad_ports: None,
+            running: Arc::new(AtomicBool::new(false)),
+            power_on: Vec::new(),
         })
     }
 }
@@ -801,8 +734,6 @@ struct PulseBridge {
     channel: usize,
     /// The `"P{n}"` STEP pin name (validated at build).
     pin: &'static str,
-    /// Bridged GPIO output channel supplying the train's direction, if any.
-    direction_gpio: Option<DirectionSource>,
 }
 
 /// One bridged encoder channel, prepared at build.
@@ -816,65 +747,44 @@ struct EncoderBridge {
     pin_b: &'static str,
 }
 
-/// Shared state of one live pulse bridge: the pin's write half, the channel
-/// it mirrors, and the direction currently stamped onto its segments.
-///
-/// Holds the peripheral instance **weakly**: the instance owns this bridge's
-/// `on_rate_change` callback, so a strong handle here would be a reference
-/// cycle that leaks the whole peripheral bank.
+/// Shared state of one live pulse bridge: the STEP pin's handle.
 struct PulseBridgeState {
-    tx: PulseTx,
-    channel: usize,
-    instance: Weak<PeripheralInstance>,
-    /// `true` = [`PulseDirection::Reverse`]. Only ever written by the bridged
-    /// direction GPIO's change hook; [`PulseDirection::Forward`] without one.
-    reverse: AtomicBool,
+    pin: PinHandle,
+    name: &'static str,
+    ports: Option<PadPorts>,
     shutdown: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 }
 
 impl PulseBridgeState {
-    /// The direction currently stamped onto published segments.
-    fn direction(&self) -> PulseDirection {
-        if self.reverse.load(Ordering::Relaxed) {
-            PulseDirection::Reverse
-        } else {
-            PulseDirection::Forward
+    /// Publish a segment onto the STEP pin: one periodic drive, between the
+    /// pad's own high and low ports — released when either has no supply.
+    fn publish(&self, segment: PeriodicSchedule) {
+        if self.shutdown.load(Ordering::Relaxed) || !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+        match step_drive(self.ports.as_ref(), self.name, segment) {
+            Some(drive) => self.pin.drive(drive),
+            None => self.pin.release(),
         }
     }
+}
 
-    /// Publish a segment onto the STEP pin with the current direction.
-    fn publish(&self, segment: PulseSegment) {
-        if self.shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-        self.tx.set_train(PulseTrain {
-            pulses: segment,
-            direction: self.direction(),
-        });
-    }
-
-    /// Apply a new direction, re-publishing the channel's *current* segment
-    /// re-based at this instant so pulses already emitted keep the old sign
-    /// and the running count stays exact across a reversal.
-    fn set_direction(&self, direction: PulseDirection) {
-        let reverse = direction == PulseDirection::Reverse;
-        if self.shutdown.load(Ordering::Relaxed)
-            || self.reverse.swap(reverse, Ordering::Relaxed) == reverse
-        {
-            return;
-        }
-        let Some(instance) = self.instance.upgrade() else {
-            return;
-        };
-        // No clock yet means no elapsed time to re-base against, so the
-        // un-advanced segment is the right (and only) answer.
-        let now = if virtual_clock::is_initialized() {
-            virtual_clock::virtual_us()
-        } else {
-            0
-        };
-        self.publish(instance.pulse_out.segment(self.channel).rebased_at(now));
-    }
+/// The periodic drive a bridged STEP pin presents for `segment`: the pad's
+/// own high and low ports ([`pad_drive`] — for an MCU on a board of its
+/// own [`crate::net::digital_drive`], the Thevenin every bridged GPIO
+/// output of this MCU drives) alternated by the peripheral's own schedule;
+/// `None` when either port has no supply.
+fn step_drive(
+    ports: Option<&PadPorts>,
+    pin: &'static str,
+    segment: PeriodicSchedule,
+) -> Option<Drive> {
+    Some(Drive::Periodic {
+        hi: pad_drive(ports, pin, Level::High)?,
+        lo: pad_drive(ports, pin, Level::Low)?,
+        segment,
+    })
 }
 
 /// ×4 quadrature decode state for one bridged encoder channel.
@@ -984,6 +894,15 @@ pub struct McuComponent {
     /// The spawned entry thread. Never joined — a firmware entry typically
     /// never returns; see the module docs' shutdown notes.
     entry_thread: Option<JoinHandle<()>>,
+    /// The host's ports for the bridged pads ([`Self::host_pads`]); `None`
+    /// for an MCU on a board of its own.
+    pad_ports: Option<PadPorts>,
+    /// Whether the bridged outputs publish: from attach for an MCU on a
+    /// board of its own, from [`Component::start`] for a hosted one.
+    running: Arc<AtomicBool>,
+    /// A hosted MCU's power-on publishes, held from attach to
+    /// [`Component::start`].
+    power_on: Vec<PowerOn>,
 }
 
 impl std::fmt::Debug for McuComponent {
@@ -1023,6 +942,21 @@ impl McuComponent {
     pub fn entry_running(&self) -> bool {
         self.entry_thread.as_ref().is_some_and(|t| !t.is_finished())
     }
+
+    /// Host this MCU inside a package that decides when it runs and what
+    /// its pads drive at (`embsim-boards`' P2 package): every bridged pad
+    /// drives through `ports` — the level's port as the host reads it at
+    /// the instant of the drive, released when the host says its driver
+    /// has no supply — and nothing is published before
+    /// [`Component::start`], which the host runs at the instant the chip
+    /// can run. At start the bridged outputs present their power-on state
+    /// (the GPIO outputs' levels, the serial lines' idle, the step
+    /// channels' segments), then the firmware entry runs. A chip in reset
+    /// drives nothing: that is the state the pads rest in until then.
+    /// Call before [`Component::attach`].
+    pub fn host_pads(&mut self, ports: PadPorts) {
+        self.pad_ports = Some(ports);
+    }
 }
 
 impl Component for McuComponent {
@@ -1038,6 +972,12 @@ impl Component for McuComponent {
             Some(own) => Arc::clone(own),
             None => embsim_peripherals::instance::current(),
         };
+        // An MCU on a board of its own publishes from attach; a hosted one
+        // from the start its host runs it at, its power-on publishes held
+        // until then.
+        let hosted = self.pad_ports.is_some();
+        self.running.store(!hosted, Ordering::Relaxed);
+        let mut power_on: Vec<PowerOn> = Vec::new();
 
         let mut level_channels: Vec<LevelChannel> = Vec::new();
         for bridge in &self.bridges {
@@ -1070,24 +1010,36 @@ impl Component for McuComponent {
             // the engine thread, so the write must never block: a full pipe
             // drops the byte with a trace.
             let channel = bridge.channel;
-            let level = Arc::new(SerialLevelBridge::new(
+            let mut line = SerialLevelBridge::new(
                 UartFraming::new_8n1(bridge.config.baud),
                 io.pin(tx_name)?,
                 io.clone(),
                 Arc::clone(&shutdown),
-            ));
+            );
+            if let Some(ports) = &self.pad_ports {
+                let ports = Arc::clone(ports);
+                line = line.with_ports(move |level| ports(tx_name, level));
+            }
+            let level = Arc::new(line);
             // Hold the line at idle before the firmware runs: a peer that saw
             // it floating would have no reference for the first start bit's
-            // falling edge.
-            level.idle();
+            // falling edge. A hosted MCU does so at its start, the first
+            // instant it drives anything.
+            if hosted {
+                let level = Arc::clone(&level);
+                power_on.push(Box::new(move || level.idle()));
+            } else {
+                level.idle();
+            }
             {
                 let level = Arc::clone(&level);
                 let shutdown = Arc::clone(&shutdown);
-                io.on_sense(rx_name, move |state| {
+                let rx = io.pin(rx_name)?;
+                io.on_sense(rx_name, move |sense| {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    deliver_rx(component_fd, channel, level.receive_sense(state));
+                    deliver_rx(component_fd, channel, level.receive_sense(&rx, &sense));
                 })?;
             }
             level_channels.push(LevelChannel {
@@ -1151,39 +1103,41 @@ impl Component for McuComponent {
             });
         }
 
-        // Pulse bridges first: a GPIO channel that supplies a train's
-        // direction hooks the same `on_change` slot the GPIO bridge installs,
-        // so its state must exist before that slot is written.
-        let mut direction_of_gpio: Vec<(DirectionSource, Arc<PulseBridgeState>)> = Vec::new();
         for bridge in &self.pulse_bridges {
             let state = Arc::new(PulseBridgeState {
-                tx: io.pulse_tx(bridge.pin)?,
-                channel: bridge.channel,
-                instance: Arc::downgrade(&instance),
-                reverse: AtomicBool::new(false),
+                pin: io.pin(bridge.pin)?,
+                name: bridge.pin,
+                ports: self.pad_ports.clone(),
                 shutdown: Arc::clone(&self.shutdown),
+                running: Arc::clone(&self.running),
             });
             // Establish the channel on the net before the firmware runs, so a
             // sink attaching later has a baseline to fold against. The bank's
             // own segment rather than a synthetic idle — normally identical to
-            // [`PulseSegment::IDLE`], but correct even if a channel is already
+            // [`PeriodicSchedule::IDLE`], but correct even if a channel is already
             // running when this component attaches. Reads state, never the
-            // clock, so it is safe before `virtual_clock::init`.
-            state.publish(instance.pulse_out.segment(bridge.channel));
+            // clock, so it is safe before `virtual_clock::init`. A hosted MCU
+            // does so at its start, from the segment the bank holds then.
+            if hosted {
+                let state = Arc::clone(&state);
+                let instance = Arc::clone(&instance);
+                let channel = bridge.channel;
+                power_on.push(Box::new(move || {
+                    state.publish(instance.pulse_out.segment(channel));
+                }));
+            } else {
+                state.publish(instance.pulse_out.segment(bridge.channel));
+            }
             {
                 let state = Arc::clone(&state);
                 instance
                     .pulse_out
                     .on_rate_change(bridge.channel, move |segment| state.publish(segment));
             }
-            if let Some(source) = bridge.direction_gpio {
-                direction_of_gpio.push((source, Arc::clone(&state)));
-            }
             tracing::debug!(
                 mcu = %self.name,
                 channel = bridge.channel,
                 step = bridge.pin,
-                direction_gpio = ?bridge.direction_gpio,
                 "pulse-out channel bridged to a step pin"
             );
         }
@@ -1193,36 +1147,41 @@ impl Component for McuComponent {
             match bridge.direction {
                 GpioDirection::Output => {
                     let handle = io.pin(bridge.pin)?;
-                    // Drive the channel's power-on state now: an MCU that has
-                    // not written yet must still present a level, not float.
-                    let initial = instance.gpio.get_active(bridge.channel);
-                    handle.set_drive(Some(output_drive(level_of_active(initial, active_low))));
-
-                    // `(train, direction while this channel is active)` for
-                    // every pulse channel that named this GPIO as its source.
-                    let directions: Vec<(Arc<PulseBridgeState>, PulseDirection)> =
-                        direction_of_gpio
-                            .iter()
-                            .filter(|(source, _)| source.channel == bridge.channel)
-                            .map(|(source, state)| (Arc::clone(state), source.active_direction))
-                            .collect();
-                    // The train's direction must already agree with the pin
-                    // the bridge just drove, or the first segment published
-                    // before any GPIO write would carry the wrong sign.
-                    for (state, active_direction) in &directions {
-                        state.set_direction(direction_of_active(initial, *active_direction));
+                    let pin = bridge.pin;
+                    let ports = self.pad_ports.clone();
+                    // Drive the channel's power-on state: an MCU that has not
+                    // written yet must still present a level, not float — from
+                    // attach on a board of its own, from its start when hosted.
+                    {
+                        let handle = handle.clone();
+                        let ports = ports.clone();
+                        let instance = Arc::clone(&instance);
+                        let channel = bridge.channel;
+                        let publish = move || {
+                            let initial = instance.gpio.get_active(channel);
+                            handle.set_drive(pad_drive(
+                                ports.as_ref(),
+                                pin,
+                                level_of_active(initial, active_low),
+                            ));
+                        };
+                        if hosted {
+                            power_on.push(Box::new(publish));
+                        } else {
+                            publish();
+                        }
                     }
                     let shutdown = Arc::clone(&self.shutdown);
+                    let running = Arc::clone(&self.running);
                     instance.gpio.on_change(bridge.channel, move |active| {
-                        if shutdown.load(Ordering::Relaxed) {
+                        if shutdown.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
                             return;
                         }
-                        handle.set_drive(Some(output_drive(level_of_active(active, active_low))));
-                        // Same write, one meaning further on: this channel is
-                        // a step train's direction.
-                        for (state, active_direction) in &directions {
-                            state.set_direction(direction_of_active(active, *active_direction));
-                        }
+                        handle.set_drive(pad_drive(
+                            ports.as_ref(),
+                            pin,
+                            level_of_active(active, active_low),
+                        ));
                     });
                 }
                 GpioDirection::Input => {
@@ -1230,11 +1189,15 @@ impl Component for McuComponent {
                     let shutdown = Arc::clone(&self.shutdown);
                     let channel = bridge.channel;
                     let pin = bridge.pin;
-                    io.on_sense(bridge.pin, move |state| {
+                    let handle = io.pin(bridge.pin)?;
+                    io.on_sense(bridge.pin, move |sense| {
                         if shutdown.load(Ordering::Relaxed) {
                             return;
                         }
-                        match level_of(state) {
+                        // The pin's own projection, its last level the one
+                        // the firmware's register holds.
+                        let last = level_of_active(instance.gpio.get_active(channel), active_low);
+                        match handle.level(&sense, Some(last)) {
                             // An *external* write: it must not re-enter the
                             // firmware's own change callback, which is what
                             // `set_state` (unlike `set_active`) guarantees.
@@ -1243,7 +1206,7 @@ impl Component for McuComponent {
                                 .set_state(channel, active_of_level(level, active_low)),
                             None => tracing::trace!(
                                 pin,
-                                ?state,
+                                ?sense,
                                 "GPIO input has no logic level; holding the last value"
                             ),
                         }
@@ -1267,14 +1230,24 @@ impl Component for McuComponent {
                 let instance = Arc::clone(&instance);
                 let shutdown = Arc::clone(&self.shutdown);
                 let channel = bridge.channel;
-                io.on_sense(pin, move |net_state| {
+                let handle = io.pin(pin)?;
+                io.on_sense(pin, move |sense| {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    let Some(level) = level_of(net_state) else {
+                    let last = {
+                        let state = state.lock().expect("quadrature state never poisoned");
+                        if is_a {
+                            state.a
+                        } else {
+                            state.b
+                        }
+                    }
+                    .map(|high| if high { Level::High } else { Level::Low });
+                    let Some(level) = handle.level(&sense, last) else {
                         tracing::trace!(
                             pin,
-                            ?net_state,
+                            ?sense,
                             "encoder phase has no logic level; holding the last count"
                         );
                         return;
@@ -1319,10 +1292,19 @@ impl Component for McuComponent {
         }
 
         self.instance = Some(instance);
+        self.power_on = power_on;
         Ok(())
     }
 
     fn start(&mut self) {
+        // A hosted MCU's first drives: the host runs `start` at the instant
+        // the chip can run, and every bridged output presents its power-on
+        // state there, before the firmware entry runs.
+        if !self.running.swap(true, Ordering::Relaxed) {
+            for publish in self.power_on.drain(..) {
+                publish();
+            }
+        }
         // Facade mode: nothing to run. (`get_mut`: the mutex is a Sync
         // shim, never contended — see the field docs.)
         let Some(entry) = self.entry.get_mut().expect("never poisoned").take() else {
@@ -1524,16 +1506,6 @@ pub enum McuBuildError {
         /// How many entries the table has.
         table_len: usize,
     },
-    /// A pulse channel named a direction GPIO channel that is not itself
-    /// bridged as a [`GpioDirection::Output`] — the direction hook shares
-    /// that channel's single `on_change` slot, so it cannot be installed on
-    /// its own.
-    DirectionChannelNotBridged {
-        /// The pulse channel that asked for a direction source.
-        pulse_channel: usize,
-        /// The GPIO channel it named.
-        gpio_channel: usize,
-    },
     /// A referenced physical pin is past the P63 ceiling.
     PinOutOfRange {
         /// The offending pin index.
@@ -1564,14 +1536,6 @@ impl std::fmt::Display for McuBuildError {
             McuBuildError::UnknownEncoderChannel { channel, table_len } => write!(
                 f,
                 "encoder channel {channel} is not in the table ({table_len} entries)"
-            ),
-            McuBuildError::DirectionChannelNotBridged {
-                pulse_channel,
-                gpio_channel,
-            } => write!(
-                f,
-                "pulse channel {pulse_channel} takes its direction from GPIO channel \
-                 {gpio_channel}, which is not bridged as an output"
             ),
             McuBuildError::PinOutOfRange { pin } => {
                 write!(f, "pin {pin} is past the P63 ceiling")
@@ -1617,16 +1581,14 @@ mod tests {
             .iter()
             .find(|p| p.number == "P2")
             .expect("TX pin declared");
-        assert_eq!(tx.kind, PinKind::DigitalOut);
-        assert_eq!(tx.stream, None, "TX clocks out edges, not a byte route");
+        assert_eq!(*tx, PinDecl::digital_out("P2"));
 
         let rx = mcu
             .pins()
             .iter()
             .find(|p| p.number == "P0")
             .expect("RX pin declared");
-        assert_eq!(rx.kind, PinKind::DigitalIn);
-        assert_eq!(rx.stream, None, "RX reads edges, not routed bytes");
+        assert_eq!(*rx, PinDecl::digital_in("P0", BRIDGED_INPUT_THRESHOLDS));
     }
 
     /// Channels that are not bridged are not declared at all — the facade
@@ -1671,10 +1633,9 @@ mod tests {
             .expect("builds");
 
         let ena = mcu.pins().iter().find(|p| p.number == "P6").expect("P6");
-        assert_eq!(ena.kind, PinKind::DigitalOut);
-        assert_eq!(ena.stream, None);
+        assert_eq!(*ena, PinDecl::digital_out("P6"));
         let esd = mcu.pins().iter().find(|p| p.number == "P16").expect("P16");
-        assert_eq!(esd.kind, PinKind::DigitalIn);
+        assert_eq!(*esd, PinDecl::digital_in("P16", BRIDGED_INPUT_THRESHOLDS));
     }
 
     /// Builder validation: unknown channel, out-of-range pin, and duplicate
@@ -1749,12 +1710,6 @@ mod tests {
         assert!(McuBuildError::DuplicatePin { pin: 2 }
             .to_string()
             .contains("P2"));
-        assert!(McuBuildError::DirectionChannelNotBridged {
-            pulse_channel: 0,
-            gpio_channel: 4,
-        }
-        .to_string()
-        .contains('4'));
         for error in [
             McuBuildError::UnknownGpioChannel {
                 channel: 1,
@@ -1778,7 +1733,7 @@ mod tests {
     // ========================================================
 
     /// A bridged pulse-out channel declares exactly one STEP pin: a push-pull
-    /// output (so the net still resolves to a level) carrying the pulse route.
+    /// output whose rate changes are periodic drives on it.
     #[rstest]
     fn a_bridged_pulse_channel_declares_one_step_pin() {
         let mcu = McuComponent::builder("p2")
@@ -1790,8 +1745,52 @@ mod tests {
         assert_eq!(mcu.pins().len(), 1);
         let step = &mcu.pins()[0];
         assert_eq!(step.number, "P8");
-        assert_eq!(step.kind, PinKind::DigitalOut);
-        assert_eq!(step.stream, Some(StreamRole::PulseSource));
+        assert_eq!(*step, PinDecl::digital_out("P8"));
+        assert_eq!(step.idle, Some(output_drive(Level::High)));
+    }
+
+    /// The STEP drive is the pad's own high and low ports around the
+    /// peripheral's segment, carried whole.
+    #[rstest]
+    fn a_step_drive_swings_between_the_pads_own_ports() {
+        let segment = PeriodicSchedule {
+            emitted: 7,
+            freq_hz: 20_000,
+            total: Some(4_000),
+            since_ns: 1_000_000,
+        };
+        assert_eq!(
+            step_drive(None, "P8", segment),
+            Some(Drive::Periodic {
+                hi: output_drive(Level::High),
+                lo: output_drive(Level::Low),
+                segment,
+            })
+        );
+        // A hosted pad swings between its host's ports, and presents
+        // nothing when either has no supply.
+        let at_bank: PadPorts = Arc::new(|_pin, level| {
+            Some(TheveninDrive {
+                volts: if level == Level::High { 1.8 } else { 0.0 },
+                impedance: 18.0,
+            })
+        });
+        assert_eq!(
+            step_drive(Some(&at_bank), "P8", segment),
+            Some(Drive::Periodic {
+                hi: TheveninDrive {
+                    volts: 1.8,
+                    impedance: 18.0
+                },
+                lo: TheveninDrive {
+                    volts: 0.0,
+                    impedance: 18.0
+                },
+                segment,
+            })
+        );
+        let unpowered: PadPorts = Arc::new(|_pin, _level| None);
+        assert_eq!(step_drive(Some(&unpowered), "P8", segment), None);
     }
 
     /// A bridged encoder channel declares its phase pair as sensed inputs with
@@ -1810,48 +1809,8 @@ mod tests {
         let names: Vec<&str> = mcu.pins().iter().map(|p| p.number).collect();
         assert_eq!(names, ["P20", "P21"]);
         for pin in mcu.pins() {
-            assert_eq!(pin.kind, PinKind::DigitalIn);
-            assert_eq!(pin.stream, None);
+            assert_eq!(pin.senses_at_build(), Some(crate::SenseKind::Digital));
         }
-    }
-
-    /// A pulse channel may only take its direction from a GPIO channel that is
-    /// itself bridged as an output — the hook shares that channel's single
-    /// `on_change` slot, so a silent second installation is refused.
-    #[rstest]
-    fn a_direction_source_must_be_a_bridged_gpio_output() {
-        let build = |direction: GpioDirection| {
-            McuComponent::builder("p2")
-                .pulse_out_table(vec![PulseOutChannelConfig { pin: 8 }])
-                .gpio_table(vec![GpioChannelConfig {
-                    pin: 9,
-                    active_low: false,
-                }])
-                .bridge_gpio(0, direction)
-                .bridge_pulse_out_with_direction(0, 0, PulseDirection::Reverse)
-                .build()
-        };
-        assert!(build(GpioDirection::Output).is_ok());
-        assert_eq!(
-            build(GpioDirection::Input).unwrap_err(),
-            McuBuildError::DirectionChannelNotBridged {
-                pulse_channel: 0,
-                gpio_channel: 0,
-            }
-        );
-
-        // Naming a channel that is not bridged at all fails the same way.
-        assert_eq!(
-            McuComponent::builder("p2")
-                .pulse_out_table(vec![PulseOutChannelConfig { pin: 8 }])
-                .bridge_pulse_out_with_direction(0, 3, PulseDirection::Forward)
-                .build()
-                .unwrap_err(),
-            McuBuildError::DirectionChannelNotBridged {
-                pulse_channel: 0,
-                gpio_channel: 3,
-            }
-        );
     }
 
     /// Every motion channel validates its index against its own table, and pin
@@ -1920,22 +1879,6 @@ mod tests {
     ) {
         assert_eq!(level_of_active(active, active_low), expect);
         assert_eq!(active_of_level(expect, active_low), active);
-    }
-
-    /// A direction GPIO's active state maps to the declared direction and its
-    /// inactive state to the opposite — the mapping is the consumer's, not a
-    /// hard-coded polarity.
-    #[rstest]
-    #[case::active_means_reverse(PulseDirection::Reverse, true, PulseDirection::Reverse)]
-    #[case::inactive_means_forward(PulseDirection::Reverse, false, PulseDirection::Forward)]
-    #[case::active_means_forward(PulseDirection::Forward, true, PulseDirection::Forward)]
-    #[case::inactive_means_reverse(PulseDirection::Forward, false, PulseDirection::Reverse)]
-    fn a_direction_gpio_maps_to_the_declared_direction(
-        #[case] active_direction: PulseDirection,
-        #[case] active: bool,
-        #[case] expect: PulseDirection,
-    ) {
-        assert_eq!(direction_of_active(active, active_direction), expect);
     }
 
     // ========================================================

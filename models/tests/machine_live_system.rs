@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, IdleDrive, Level,
-    NetState, PartRegistry, PinDecl, PinHandle, PinKind, SenseKind, System, SystemHandle,
-    TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand,
+    EndpointRef, Finding, Harness, Level, NetState, PartRegistry, PinDecl, PinHandle, SenseKind,
+    System, SystemHandle, TheveninDrive,
 };
 use embsim_models::machine::{end_switch, quadrature_encoder, stepper_motor};
 use embsim_models::machine::{
@@ -69,8 +69,10 @@ impl FakeMcu {
     fn new(outputs: &[&'static str], inputs: &[&'static str]) -> Self {
         let pins = outputs
             .iter()
-            .map(|number| pin(number, PinKind::DigitalOut))
-            .chain(inputs.iter().map(|number| pin(number, PinKind::DigitalIn)))
+            .map(|number| PinDecl::digital_out(number))
+            .chain(inputs.iter().map(|number| {
+                PinDecl::digital_in(number, jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+            }))
             .collect();
         Self {
             pins,
@@ -79,17 +81,6 @@ impl FakeMcu {
             handles: Arc::new(Mutex::new(HashMap::new())),
             log: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-}
-
-fn pin(number: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -105,7 +96,7 @@ impl Component for FakeMcu {
         for number in &self.inputs {
             let log = Arc::clone(&self.log);
             let number = *number;
-            io.on_sense(number, move |state| {
+            io.on_net_report(number, move |state| {
                 log.lock().unwrap().push((number, state));
             })?;
         }
@@ -500,8 +491,8 @@ fn an_open_contact_with_no_pull_up_leaves_the_net_floating() {
         .start()
         .expect("live system starts");
 
-    // The engine assigns every DigitalOut an idle-high drive at assembly;
-    // attach releases it, so the settled state is Floating.
+    // A push-pull output idles high from assembly by declaration; attach
+    // releases it, so the settled state is Floating.
     assert!(
         wait_for(
             || system.net_state("SW.NO") == Some(NetState::Floating),

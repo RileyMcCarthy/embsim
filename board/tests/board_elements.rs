@@ -610,6 +610,12 @@ fn drive_input_board(series_ohms: u32) -> Board {
 /// millivolts above the isolated ground; a heavy one (220 Ω) asks for
 /// more than the base supports and the collector sags to volts, the
 /// current exactly the base's hundredfold.
+///
+/// `IC14` measures its secondary supply against its own `GND2` pins, which
+/// the schematic leaves on a net only `C26` shares (`edgeboard.rs`,
+/// `the_servo_isolator_secondary_ground_is_unconnected`): as drawn its
+/// secondary side is down and `OUTC` drives nothing. The bench wires that
+/// net to `EN_GND` — the rework the defect needs, said out loud.
 #[rstest]
 #[case::light_load_saturates(1_000, true)]
 #[case::heavy_load_sags(220, false)]
@@ -623,7 +629,8 @@ fn the_servo_enable_transistor_saturates_under_a_light_load_and_sags_under_a_hea
         given: "the MaD EdgeBoard under its bench rails with the servo-enable jumper on its \
                 transistor position, the P2's enable finger held high, and a bench servo drive \
                 whose enable input is an optocoupler LED from its own 5 volts through 1 kilohm \
-                and then through 220 ohms onto the board's enable line",
+                and then through 220 ohms onto the board's enable line, the servo isolator's \
+                secondary ground wired to the servo ground",
     });
     expect!(
         "base-at-the-knee",
@@ -651,7 +658,12 @@ fn the_servo_enable_transistor_saturates_under_a_light_load_and_sags_under_a_hea
         .board(EDGE, edge_board())
         .board("DRIVE", drive_input_board(series_ohms))
         .harness(bench_rails(EDGE))
-        .harness(Harness::new().connect(ep("DRIVE.J1.1"), ep(&format!("{EDGE}.J21.7"))))
+        .harness(
+            Harness::new()
+                .connect(ep("DRIVE.J1.1"), ep(&format!("{EDGE}.J21.7")))
+                // The rework: `IC14`'s orphaned `GND2` net onto `EN_GND`.
+                .connect(ep(&format!("{EDGE}.IC14.9")), ep(&format!("{EDGE}.J21.8"))),
+        )
         .scenario(
             Scenario::default()
                 // JP1 pole 1 (pads 2–3): Q1's collector on SC_ENA.

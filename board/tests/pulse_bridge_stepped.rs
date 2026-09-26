@@ -15,7 +15,7 @@
 //!   with `schedule_at` and makes its HAL-style calls from `on_wake`, so every
 //!   `pulse_out::*` / `gpio::*` call happens on the engine thread at an exact
 //!   virtual instant. A test-thread script would sample virtual time at a
-//!   wall-determined moment and stamp it into the segment's `since_us` —
+//!   wall-determined moment and stamp it into the segment's `since_ns` —
 //!   `DETERMINISM.md` T1 §4's "take your time from the engine", applied to a
 //!   peripheral bridge.
 //! - The script **stops re-arming**, so the wheel empties, virtual time stops,
@@ -24,6 +24,11 @@
 //! - The rate-carried representation is what makes this affordable: the whole
 //!   run's step traffic is a handful of records, so a golden comparison is
 //!   over engine *decisions*, not over a hundred thousand edges.
+//!
+//! Beside it, the fidelity the periodic drive exists for: a step line fought
+//! by a stuck driver is resolved like any other net, so the fight is
+//! `Contention` with a finding naming both pins, and the drive at the far end
+//! is handed no clock.
 
 use rstest::rstest;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,11 +39,12 @@ use embsim_board::mcu::{
     EncoderChannelConfig, GpioChannelConfig, GpioDirection, PulseOutChannelConfig,
 };
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EventLog, Harness, IdleDrive, McuComponent, PinDecl,
-    PinKind, PulseDirection, StreamRole, System, TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, EventLog,
+    Finding, Harness, McuComponent, NetState, PinDecl, PinRef, System, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_peripherals::{encoder, gpio, pulse_out};
+use vibes_behaviour::{behaviour, expect, Test};
 
 /// How many times the scenario runs. `DETERMINISM.md` specifies N = 5.
 const RUNS: usize = 5;
@@ -170,7 +176,8 @@ impl Component for Firmware {
                 // Enable the drive, then commit to 1 mm/s.
                 0 => gpio::set_active(ENA_CHANNEL, true),
                 1 => pulse_out::start_velocity(0, STEPS_PER_MM),
-                // Reverse mid-train: the segment is re-anchored and re-signed.
+                // Reverse mid-train: the DIR net changes, the STEP segment
+                // does not.
                 2 => gpio::set_active(DIR_CHANNEL, true),
                 // Retarget to 2 mm/s, still reversing.
                 3 => pulse_out::set_frequency(0, 2 * STEPS_PER_MM),
@@ -204,20 +211,26 @@ impl Component for Firmware {
 }
 
 fn output(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_out(number)
 }
 
-/// The drive at the far end: a pulse sink plus two sensed logic inputs, so the
-/// event log carries the trains *and* the DIR/ENA transitions.
+/// Every state the drive's `STEP` sense was handed.
+type StepStates = Arc<Mutex<Vec<NetState>>>;
+
+/// The drive at the far end: three sensed logic inputs, so the event log
+/// carries the STEP segments *and* the DIR/ENA transitions.
 struct StepDrive {
     pins: [PinDecl; 3],
+    step: StepStates,
+}
+
+impl StepDrive {
+    fn new(step: StepStates) -> Self {
+        Self {
+            pins: [input("STEP"), input("DIR"), input("ENA")],
+            step,
+        }
+    }
 }
 
 impl Component for StepDrive {
@@ -226,23 +239,17 @@ impl Component for StepDrive {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        io.on_pulse("STEP", |_train| {})?;
+        let step = Arc::clone(&self.step);
+        io.on_net_report("STEP", move |state| step.lock().unwrap().push(state))?;
         for pin in ["DIR", "ENA"] {
-            io.on_sense(pin, |_state| {})?;
+            io.on_net_report(pin, |_state| {})?;
         }
         Ok(())
     }
 }
 
-fn input(number: &'static str, stream: Option<StreamRole>) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+fn input(number: &'static str) -> PinDecl {
+    PinDecl::digital_in(number, jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
 }
 
 // ============================================================
@@ -264,7 +271,7 @@ fn run_scenario() -> EventLog {
         .bridge_gpio(DIR_CHANNEL, GpioDirection::Output)
         .bridge_gpio(ESTOP_CHANNEL, GpioDirection::Input)
         .pulse_out_table(PULSE_TABLE.to_vec())
-        .bridge_pulse_out_with_direction(0, DIR_CHANNEL, PulseDirection::Reverse)
+        .bridge_pulse_out(0)
         .encoder_table(ENCODER_TABLE.to_vec())
         .bridge_encoder(0)
         .build()
@@ -288,13 +295,7 @@ fn run_scenario() -> EventLog {
         .component("MCU", Box::new(mcu))
         .component(
             "DRIVE",
-            Box::new(StepDrive {
-                pins: [
-                    input("STEP", Some(StreamRole::PulseSink)),
-                    input("DIR", None),
-                    input("ENA", None),
-                ],
-            }),
+            Box::new(StepDrive::new(Arc::new(Mutex::new(Vec::new())))),
         )
         .component(
             "FW",
@@ -351,7 +352,12 @@ fn stepped_bridge_logs_are_identical_across_runs() {
     );
     // The bridges must actually be in the log, or this asserts the determinism
     // of a system that did nothing.
-    for expect in ["pulse ", "freq=8192hz", "dir=rev", "freq=16384hz"] {
+    for expect in [
+        "drive=periodic hi=",
+        "freq=8192hz",
+        "freq=16384hz",
+        "state=periodic:high:low:",
+    ] {
         assert!(
             baseline.iter().any(|record| record.contains(expect)),
             "no record contains {expect:?}; the pulse bridge did not run.\n{}",
@@ -384,4 +390,157 @@ fn stepped_bridge_logs_are_identical_across_runs() {
          byte-identical including every v_us",
         baseline.len()
     );
+}
+
+// ============================================================
+// A fought step line
+// ============================================================
+
+/// A part that holds its one pin low at 25 Ω from the instant the script
+/// tells it to — the stuck-low driver on a step line.
+struct Stuck {
+    pins: [PinDecl; 1],
+    at_us: u64,
+}
+
+impl Component for Stuck {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let pin = io.pin("OUT")?;
+        io.on_wake(move |_now_us| pin.set_drive(Some(LOW)));
+        io.schedule_at(self.at_us);
+        Ok(())
+    }
+}
+
+/// A clock on the step line and, from 2 ms, a second pin holding the same
+/// line low: the fight is on the net, where the pulse channel could not see
+/// it.
+#[rstest]
+fn a_step_line_fought_by_a_stuck_driver_is_contention() {
+    behaviour!(Test {
+        id: "mcu.fought-step-line-is-contention",
+        covers: Some("board/src/mcu.rs#McuBuilder::bridge_pulse_out"),
+        given: "a microcontroller clocking a stepper drive's step input at 8192 pulses a \
+                second, and from 2 milliseconds a second part holding the same line low at \
+                the pad's own strength",
+    });
+    expect!(
+        "clock-before-the-fight",
+        "until the second part drives, the drive's step input carries the clock's rate",
+        "the step clock is a drive on the net and resolves like one"
+    );
+    expect!(
+        "contention",
+        "once the second part drives, the step line is in contention",
+        "a clock against a comparable static driver is a fight for half of every cycle"
+    );
+    expect!(
+        "both-named",
+        "the run reports a contention finding on the step line naming the microcontroller's \
+         step pin and the second part's pin"
+    );
+    expect!(
+        "no-clock-delivered",
+        "the drive's step input is handed no rate once the line is fought"
+    );
+
+    let _suite = suite_lock();
+    let _stepped = Stepped::enter();
+    gpio::init(GPIO_TABLE.len(), None);
+    pulse_out::init(PULSE_TABLE.len());
+
+    let mcu = McuComponent::builder("p2")
+        .pulse_out_table(PULSE_TABLE.to_vec())
+        .bridge_pulse_out(0)
+        .build()
+        .expect("MCU builds from the channel table");
+    let step: StepStates = Arc::new(Mutex::new(Vec::new()));
+    /// When the stuck driver starts holding the line.
+    const STUCK_AT_US: u64 = 2_000;
+
+    // The firmware's side, engine-hosted: commit to 1 mm/s at 1 ms.
+    struct Start {
+        pins: [PinDecl; 0],
+    }
+    impl Component for Start {
+        fn pins(&self) -> &[PinDecl] {
+            &self.pins
+        }
+        fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+            io.on_wake(|_now_us| pulse_out::start_velocity(0, STEPS_PER_MM));
+            io.schedule_at(STEP_PERIOD_US);
+            Ok(())
+        }
+    }
+
+    let system = System::new()
+        .component("MCU", Box::new(mcu))
+        .component("DRIVE", Box::new(StepDrive::new(Arc::clone(&step))))
+        .component(
+            "STUCK",
+            Box::new(Stuck {
+                pins: [PinDecl {
+                    idle: None,
+                    ..output("OUT")
+                }],
+                at_us: STUCK_AT_US,
+            }),
+        )
+        .component("FW", Box::new(Start { pins: [] }))
+        .harness(
+            Harness::new()
+                .connect_str("MCU.P8", "DRIVE.STEP")
+                .expect("endpoints parse")
+                .connect_str("MCU.P8", "STUCK.OUT")
+                .expect("endpoints parse"),
+        )
+        .start()
+        .expect("live system starts");
+
+    let fight = || {
+        system.findings().into_iter().find_map(|f| match f {
+            Finding::Contention { net, drivers } if net == "MCU.P8" => Some(drivers),
+            _ => None,
+        })
+    };
+    assert!(
+        wait_for(|| fight().is_some(), Duration::from_secs(10)),
+        "the fight is reported; findings {:?}, STEP saw {:?}",
+        system.findings(),
+        step.lock().unwrap()
+    );
+    let seen = step.lock().unwrap().clone();
+    let clocked = seen
+        .iter()
+        .position(|state| {
+            matches!(state, NetState::Periodic { segment, .. } if segment.freq_hz == STEPS_PER_MM)
+        })
+        .unwrap_or_else(|| panic!("the clock reached the drive before the fight: {seen:?}"));
+    assert_eq!(
+        seen.last(),
+        Some(&NetState::Contention),
+        "the fought line carries no clock: {seen:?}"
+    );
+    assert!(
+        seen[clocked..]
+            .iter()
+            .skip(1)
+            .all(|state| !matches!(state, NetState::Periodic { .. })),
+        "nothing periodic after the fight: {seen:?}"
+    );
+    assert_eq!(system.net_state("MCU.P8"), Some(NetState::Contention));
+    let mut named = fight().expect("reported");
+    named.sort_by(|a, b| (&a.reference, &a.pin).cmp(&(&b.reference, &b.pin)));
+    assert_eq!(
+        named,
+        vec![PinRef::new("MCU", "P8"), PinRef::new("STUCK", "OUT")]
+    );
+
+    system.shutdown();
+    pulse_out::reset();
+    gpio::reset();
 }

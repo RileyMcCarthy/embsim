@@ -76,8 +76,7 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms, PinDecl, PinHandle,
-    PinKind, PinReference, TheveninDrive, Volts,
+    AttachError, Component, ComponentNetIo, Ohms, PinDecl, PinHandle, Sense, TheveninDrive, Volts,
 };
 use embsim_core::virtual_clock;
 
@@ -169,7 +168,7 @@ pub enum DetectorRole {
     Vcc,
     /// The ground reference (`PowerIn`).
     Vss,
-    /// The open-drain active-low output (`DigitalOut`, released).
+    /// The open-drain active-low output (sinks only, released).
     Out,
 }
 
@@ -208,24 +207,20 @@ pub const STM1061_PINS_SOT23: [DetectorPin; 3] = [
     detector_pin("3", Some("VCC"), DetectorRole::Vcc),
 ];
 
-fn declare(pin: &DetectorPin, r_ol_ohms: Ohms) -> PinDecl {
-    match pin.role {
-        DetectorRole::Vcc | DetectorRole::Vss => PinDecl {
-            number: pin.number,
-            name: pin.name,
-            kind: PinKind::PowerIn,
-            stream: None,
-            drive_impedance: None,
-            idle: IdleDrive::KindDefault,
-        },
-        DetectorRole::Out => PinDecl {
-            number: pin.number,
-            name: pin.name,
-            kind: PinKind::DigitalOut,
-            stream: None,
-            drive_impedance: Some(r_ol_ohms),
-            idle: IdleDrive::Released,
-        },
+/// Turn one pin-table row into a [`PinDecl`]: `V_CC` measured against
+/// `V_SS` — the reference the build's domain lints read
+/// (`embsim_board::Finding::UnreferencedDomain`) — and `~OUT` the
+/// open-drain output the part is (it sinks at `R_OL`, published per drive,
+/// and releases), resting released.
+fn declare(pin: &DetectorPin, vss: &'static str) -> PinDecl {
+    let decl = match pin.role {
+        DetectorRole::Vcc => PinDecl::power_in(pin.number).with_reference(vss),
+        DetectorRole::Vss => PinDecl::power_in(pin.number),
+        DetectorRole::Out => PinDecl::digital_out(pin.number).sink_only(),
+    };
+    match pin.name {
+        Some(name) => decl.with_name(name),
+        None => decl,
     }
 }
 
@@ -233,15 +228,12 @@ fn declare(pin: &DetectorPin, r_ol_ohms: Ohms) -> PinDecl {
 // Core
 // ============================================================
 
-/// The voltage a supply or ground pin reads: a solved voltage, 0 V for a
-/// low level, nothing for a high level or a node no source reaches.
-fn read_volts(state: NetState) -> Option<Volts> {
-    match state {
-        NetState::Analog(v) if v.is_finite() => Some(v),
-        NetState::Driven(Level::Low) | NetState::Pulled(Level::Low, _) => Some(0.0),
-        _ => None,
-    }
-}
+/// A pin nothing has been handed yet: no voltage, no clock.
+const NOTHING: Sense = Sense {
+    volts: None,
+    periodic: None,
+    at_ns: 0,
+};
 
 /// What the comparator decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,8 +248,11 @@ enum Verdict {
 
 #[derive(Debug)]
 struct State {
-    vcc: NetState,
-    vss: NetState,
+    /// `V_CC` as handed: against `V_SS`.
+    vcc: Sense,
+    /// `V_SS` as handed: in the engine's frame (it declares no reference),
+    /// the voltage the output sinks to.
+    vss: Sense,
     verdict: Verdict,
     /// The instant the verdict last changed.
     decided_at_ns: Option<u64>,
@@ -277,11 +272,13 @@ struct Core {
 }
 
 impl Core {
+    /// The comparator on `V_CC − V_SS`, the voltage `V_CC` is handed: none
+    /// — nothing reaches `V_CC`, nothing holds `V_SS`, a clock names no
+    /// supply (the wildcard audit, `NODES.md` §12 item 5) — is undefined.
     fn verdict(&self, state: &State) -> Verdict {
-        let (Some(vcc), Some(vss)) = (read_volts(state.vcc), read_volts(state.vss)) else {
+        let Some(supply) = state.vcc.volts else {
             return Verdict::Undefined;
         };
-        let supply = vcc - vss;
         if supply < self.config.v_cc_valid_volts {
             Verdict::Undefined
         } else if supply < self.config.v_th_minus_volts {
@@ -309,9 +306,12 @@ impl Core {
         }
     }
 
+    /// The open-drain output sinking to `VSS` behind `R_OL` — at the
+    /// voltage `VSS` names, and released where it names none: no ground is
+    /// implied (`DESIGN.md` rule 6).
     fn sink_drive(&self, state: &State) -> Option<TheveninDrive> {
-        Some(TheveninDrive {
-            volts: read_volts(state.vss).unwrap_or(0.0),
+        state.vss.volts.map(|volts| TheveninDrive {
+            volts,
             impedance: self.config.r_ol_ohms,
         })
     }
@@ -444,7 +444,6 @@ impl DetectorMonitor {
 #[derive(Debug)]
 pub struct VoltageDetector {
     pins: Vec<PinDecl>,
-    references: Vec<PinReference>,
     table: &'static [DetectorPin],
     core: Arc<Core>,
 }
@@ -461,17 +460,16 @@ impl VoltageDetector {
                 .expect("a detector table carries one pin of each role")
         };
         Self {
-            pins: table.iter().map(|p| declare(p, config.r_ol_ohms)).collect(),
-            references: vec![PinReference {
-                pin: pin_of(DetectorRole::Vcc),
-                reference: pin_of(DetectorRole::Vss),
-            }],
+            pins: table
+                .iter()
+                .map(|p| declare(p, pin_of(DetectorRole::Vss)))
+                .collect(),
             table,
             core: Arc::new(Core {
                 config,
                 state: Mutex::new(State {
-                    vcc: NetState::Floating,
-                    vss: NetState::Floating,
+                    vcc: NOTHING,
+                    vss: NOTHING,
                     verdict: Verdict::Undefined,
                     decided_at_ns: None,
                     pending: None,
@@ -503,10 +501,6 @@ impl VoltageDetector {
 impl Component for VoltageDetector {
     fn pins(&self) -> &[PinDecl] {
         &self.pins
-    }
-
-    fn references(&self) -> &[PinReference] {
-        &self.references
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
@@ -542,6 +536,15 @@ mod tests {
 
     use super::*;
 
+    /// A pin handed `volts`.
+    fn handed(volts: Option<Volts>) -> Sense {
+        Sense {
+            volts,
+            periodic: None,
+            at_ns: 0,
+        }
+    }
+
     #[rstest]
     fn the_n16_part_carries_the_datasheet_typicals() {
         let config = Config::stm1061n16();
@@ -562,14 +565,14 @@ mod tests {
         let detector = VoltageDetector::new(Config::stm1061n16(), &STM1061_PINS_BY_FUNCTION);
         let core = Arc::clone(&detector.core);
         let mut state = core.state.lock().unwrap();
-        state.vss = NetState::Analog(0.0);
+        state.vss = handed(Some(0.0));
 
-        state.vcc = NetState::Analog(0.5);
+        state.vcc = handed(Some(0.5));
         core.on_supply(&mut state, 0);
         assert_eq!(state.verdict, Verdict::Undefined);
         assert_eq!(state.published, None);
 
-        state.vcc = NetState::Analog(1.2);
+        state.vcc = handed(Some(1.2));
         core.on_supply(&mut state, 1);
         assert_eq!(state.verdict, Verdict::Asserted);
         assert_eq!(
@@ -582,7 +585,7 @@ mod tests {
         );
         assert_eq!(state.pending, None);
 
-        state.vcc = NetState::Analog(1.65);
+        state.vcc = handed(Some(1.65));
         core.on_supply(&mut state, 2);
         assert_eq!(
             state.verdict,
@@ -591,7 +594,7 @@ mod tests {
         );
         assert_eq!(state.drives, 1);
 
-        state.vcc = NetState::Analog(1.813);
+        state.vcc = handed(Some(1.813));
         core.on_supply(&mut state, 1_000);
         assert_eq!(state.verdict, Verdict::Released);
         assert_eq!(state.pending, Some((1_000 + STM1061_T_PR_NS, false)));
@@ -601,7 +604,7 @@ mod tests {
         core.on_wake(&mut state, 1_000 + STM1061_T_PR_NS);
         assert_eq!(state.published, None);
 
-        state.vcc = NetState::Analog(1.62);
+        state.vcc = handed(Some(1.62));
         core.on_supply(&mut state, 2_000);
         assert_eq!(
             state.verdict,
@@ -609,12 +612,35 @@ mod tests {
             "inside the band from above"
         );
 
-        state.vcc = NetState::Analog(1.5);
+        state.vcc = handed(Some(1.5));
         core.on_supply(&mut state, 3_000);
         assert_eq!(state.pending, Some((3_000 + STM1061_T_PD_NS, true)));
         core.on_wake(&mut state, 3_000 + STM1061_T_PD_NS);
         assert!(state.published.is_some());
         assert_eq!(state.drives, 3);
+    }
+
+    /// An asserted output sinks to the voltage `VSS` names and is released
+    /// where `VSS` names none: no ground is implied. (On a board `VCC` is
+    /// measured against `VSS`, so a `VSS` naming nothing hands `VCC`
+    /// nothing and the verdict is undefined first; the state is set here
+    /// directly to reach the sink with no ground under it.)
+    #[rstest]
+    #[case::held_ground(Some(0.0), Some(TheveninDrive { volts: 0.0, impedance: STM1061_R_OL_OHMS }))]
+    #[case::ground_above_zero(Some(0.2), Some(TheveninDrive { volts: 0.2, impedance: STM1061_R_OL_OHMS }))]
+    #[case::no_ground(None, None)]
+    fn an_asserted_output_sinks_to_the_voltage_vss_names(
+        #[case] vss: Option<Volts>,
+        #[case] expected: Option<TheveninDrive>,
+    ) {
+        let detector = VoltageDetector::new(Config::stm1061n16(), &STM1061_PINS_BY_FUNCTION);
+        let core = Arc::clone(&detector.core);
+        let mut state = core.state.lock().unwrap();
+        state.vss = handed(vss);
+        state.vcc = handed(Some(1.2));
+        core.on_supply(&mut state, 0);
+        assert_eq!(state.verdict, Verdict::Asserted, "1.2 V is under V_TH-");
+        assert_eq!(state.published, expected);
     }
 
     /// A crossing reversed before its delay elapses publishes nothing.
@@ -623,13 +649,13 @@ mod tests {
         let detector = VoltageDetector::new(Config::stm1061n16(), &STM1061_PINS_BY_FUNCTION);
         let core = Arc::clone(&detector.core);
         let mut state = core.state.lock().unwrap();
-        state.vss = NetState::Analog(0.0);
-        state.vcc = NetState::Analog(1.2);
+        state.vss = handed(Some(0.0));
+        state.vcc = handed(Some(1.2));
         core.on_supply(&mut state, 0);
-        state.vcc = NetState::Analog(1.8);
+        state.vcc = handed(Some(1.8));
         core.on_supply(&mut state, 10);
         let (at_ns, _) = state.pending.unwrap();
-        state.vcc = NetState::Analog(1.2);
+        state.vcc = handed(Some(1.2));
         core.on_supply(&mut state, 20);
         core.on_wake(&mut state, at_ns);
         assert!(state.published.is_some(), "asserted throughout");
@@ -643,11 +669,16 @@ mod tests {
             let out = detector
                 .pins()
                 .iter()
-                .find(|p| p.kind == PinKind::DigitalOut)
+                .find(|p| p.drives())
                 .expect("an output");
-            assert_eq!(out.idle, IdleDrive::Released);
-            assert_eq!(out.drive_impedance, Some(STM1061_R_OL_OHMS));
-            assert_eq!(detector.references().len(), 1);
+            assert_eq!(out.idle, None);
+            assert!(out.can_sink && !out.can_source, "open drain");
+            let referenced: Vec<_> = detector
+                .pins()
+                .iter()
+                .filter(|p| p.reference.is_some())
+                .collect();
+            assert_eq!(referenced.len(), 1, "V_CC against V_SS");
         }
     }
 }

@@ -54,10 +54,9 @@ use std::sync::{Arc, Mutex};
 use embsim_core::virtual_clock;
 
 use crate::component::Drive;
-use crate::component::{PulseDirection, PulseTrain};
 use crate::diagnostics::Finding;
 use crate::engine::{ComponentId, EndpointId};
-use crate::net::{Level, NetId, NetState};
+use crate::net::{Level, NetId, NetState, PeriodicSchedule};
 
 // ============================================================
 // Constants
@@ -100,8 +99,8 @@ pub enum EngineEvent {
         seq: u64,
         /// Endpoint whose contribution changed.
         endpoint: EndpointId,
-        /// New contribution — Thevenin or current injection — or release to
-        /// high-Z.
+        /// New contribution — Thevenin, current injection or periodic — or
+        /// release to high-Z.
         drive: Option<Drive>,
     },
     /// A net's resolved state changed on a resolution pass.
@@ -124,21 +123,9 @@ pub enum EngineEvent {
         /// Component whose wake handler ran.
         component: ComponentId,
     },
-    /// A pulse train crossed a derived pulse route to one sink — one record
-    /// per **rate change**, never per pulse (that is the representation's
-    /// point; see [`crate::component::StreamRole::PulseSource`]). The record
-    /// carries the whole segment, so a trace comparison catches a wrong
-    /// frequency, direction, ceiling or baseline count, not just "a train
-    /// happened".
-    PulseUpdate {
-        /// Source endpoint the train was published on.
-        source: EndpointId,
-        /// Sink endpoint it was delivered to.
-        sink: EndpointId,
-        /// The constant-rate segment.
-        train: PulseTrain,
-    },
-    /// A stream-routing pass ran, publishing a topology epoch.
+    /// The topology epoch was published (at spawn, and on any
+    /// topology-affecting change). The record keeps its historical name, the
+    /// second line of every golden trace.
     Reroute {
         /// Topology epoch after the pass.
         epoch: u64,
@@ -199,16 +186,6 @@ impl EngineEventRecord {
                 format!("sense net={} state={}", net.0, state_form(state))
             }
             EngineEvent::Wake { component } => format!("wake component={}", component.0),
-            EngineEvent::PulseUpdate {
-                source,
-                sink,
-                train,
-            } => format!(
-                "pulse source={} sink={} {}",
-                source.0,
-                sink.0,
-                train_form(train)
-            ),
             EngineEvent::Reroute { epoch } => format!("reroute epoch={epoch}"),
             EngineEvent::Finding(finding) => {
                 format!("finding {}", elide_host_paths(&format!("{finding:?}")))
@@ -251,27 +228,27 @@ fn state_form(state: &NetState) -> String {
         ),
         NetState::Analog(volts) => format!("analog:{}uv", quantize(*volts, VOLT_QUANTUM_PER_V)),
         NetState::Contention => "contention".to_string(),
+        NetState::Periodic { hi, lo, segment } => format!(
+            "periodic:{}:{}:{}",
+            level_form(*hi),
+            level_form(*lo),
+            segment_form(segment)
+        ),
     }
 }
 
-/// Canonical encoding of a pulse train. Every field is an integer already —
-/// counts, hertz, microseconds — so nothing here needs quantizing, which is
-/// exactly why a rate is a better thing to put on a golden trace than a
-/// reconstructed edge sequence.
-fn train_form(train: &PulseTrain) -> String {
-    let total = match train.pulses.total {
+/// Canonical encoding of a periodic segment. Every field is an integer
+/// already — counts, hertz, nanoseconds — so nothing here needs
+/// quantizing, which is exactly why a rate is a better thing to put on a
+/// golden trace than a reconstructed edge sequence.
+fn segment_form(segment: &PeriodicSchedule) -> String {
+    let total = match segment.total {
         Some(total) => total.to_string(),
         None => "unbounded".to_string(),
     };
     format!(
-        "freq={}hz dir={} emitted={} total={total} since={}us",
-        train.pulses.freq_hz,
-        match train.direction {
-            PulseDirection::Forward => "fwd",
-            PulseDirection::Reverse => "rev",
-        },
-        train.pulses.emitted,
-        train.pulses.since_us,
+        "freq={}hz emitted={} total={total} since={}ns",
+        segment.freq_hz, segment.emitted, segment.since_ns,
     )
 }
 
@@ -293,6 +270,14 @@ fn drive_form(drive: Option<&Drive>) -> String {
             quantize(drive.impedance, OHM_QUANTUM_PER_OHM)
         ),
         Some(Drive::Current { amps }) => format!("{}na", quantize(*amps, AMP_QUANTUM_PER_A)),
+        Some(Drive::Periodic { hi, lo, segment }) => format!(
+            "periodic hi={}uv@{}mohm lo={}uv@{}mohm {}",
+            quantize(hi.volts, VOLT_QUANTUM_PER_V),
+            quantize(hi.impedance, OHM_QUANTUM_PER_OHM),
+            quantize(lo.volts, VOLT_QUANTUM_PER_V),
+            quantize(lo.impedance, OHM_QUANTUM_PER_OHM),
+            segment_form(segment)
+        ),
     }
 }
 

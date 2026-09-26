@@ -21,10 +21,11 @@
 //!
 //! The P2 is the QEMU core inside the P2 **package** (`embsim_boards::p2`):
 //! the package declares the 86 pins the netlist gives `U100`, holds the
-//! core until the chip can run — its **START gate**: `RESN` released and
-//! `VDD` inside the datasheet's window, which on this module is the
-//! instant the bucks' 2.5 ms soft-start elapses and `U402` raises the core
-//! rail past the detector's threshold — and the crystal the core's PLL
+//! core until the chip can run — its **START gate**: the datasheet's 3 ms
+//! restart delay after `RESN` reads released with `VDD` inside its window,
+//! which on this module happens the instant the bucks' 2.5 ms soft-start
+//! elapses and `U402` raises the core rail past the detector's threshold,
+//! so the core starts at 5.5 ms — and the crystal the core's PLL
 //! would multiply is the rate the board delivers on `XI`: the module's
 //! TCXO, up from the same rail, through its buffer, not a number handed to
 //! the node. The boot itself runs on RCFAST and never selects it.
@@ -40,11 +41,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    level_of, AttachError, Component, ComponentNetIo, EndpointRef, Harness, IdleDrive, JumperState,
-    Level, NetState, PinDecl, PinKind, Scenario, System,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver,
+    EndpointRef, Harness, JumperState, Level, NetState, PinDecl, Scenario, System,
 };
 use embsim_boards::ec32mb::{Ec32mb, FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE};
-use embsim_boards::p2::P2Package;
+use embsim_boards::p2::{P2Package, P2_RESTART_DELAY_NS};
 use embsim_core::virtual_clock;
 use embsim_p2_qemu::{flashimage, P2Qemu, P2QemuError};
 
@@ -56,14 +57,19 @@ const DEBUG_TX: u8 = 62;
 /// (`drvh`/`drvl` back to back) are one instruction, 100 ns, apart.
 const ROM_INSTRUCTION_NS: u64 = 100;
 
-/// The START instant on this module: the AP62301 bucks' soft-start, 2.5 ms
-/// after the carrier's 5 V arrives (Diodes DS41958 Rev. 4-2, `t_SS`;
-/// `embsim_models::rail::AP62301_SOFT_START_NS`). `U402` steps the core
-/// rail to 1.813 V there — inside the P2's 1.7–1.9 V window — the LDOs
-/// step the bank rails with it, and the STM1061 releases `RESN` at the
-/// same instant (its supply steps from nothing past its release
-/// threshold, no crossing to delay), so the package starts the core there.
-const START_NS: u64 = 2_500_000;
+/// The instant the chip's reset releases on this module: the AP62301
+/// bucks' soft-start, 2.5 ms after the carrier's 5 V arrives (Diodes
+/// DS41958 Rev. 4-2, `t_SS`; `embsim_models::rail::AP62301_SOFT_START_NS`).
+/// `U402` steps the core rail to 1.813 V there — inside the P2's 1.7–1.9 V
+/// window — the LDOs step the bank rails with it, and the STM1061 releases
+/// `RESN` at the same instant (its supply steps from nothing past its
+/// release threshold, no crossing to delay).
+const RESET_RELEASE_NS: u64 = 2_500_000;
+
+/// The START instant: the datasheet's restart delay after the reset
+/// releases ("Propeller restarts 3 ms after RESn transitions from low to
+/// high", P2X8C4M64P Datasheet, Pin Descriptions, p. 6) — 5.5 ms.
+const START_NS: u64 = RESET_RELEASE_NS + P2_RESTART_DELAY_NS;
 
 /// `U402`'s setpoint from its divider, `R401` 13.3 kΩ over `R403` 10.5 kΩ
 /// at `V_FB` = 0.800 V (DS41958 Eq. 8): 1.8133 V — the P2's `VDD`.
@@ -76,14 +82,17 @@ const TCXO_HZ: u64 = 20_000_000;
 /// Cluster solves the run escalates to the solver, accounted for, all
 /// before the first edge: the polarity FET `U401`'s element cluster
 /// (`VIN_Edge`/`VIN_Edge_Protected`, the 5 V finger sourcing through it)
-/// three times at t = 0 — the start pass, then once per full pass that
-/// applies a batch of the QEMU core's 64 pad-read declarations, every
-/// element solve starting cold — and the two bucks' feedback dividers once
-/// each when their rails rise at [`START_NS`]: two comparable sources (the
-/// rail through `R_top`, ground through `R_bot`) that rule 2 solves. None
-/// per edge: the boot's 16 901 edges are projections, as they were with
-/// the rails stuck from the bench (0 then, since nothing sourced the FET).
-const ESCALATED_SOLVES: u64 = 5;
+/// once, in the start pass at t = 0, and the two bucks' feedback dividers
+/// once each when their rails rise at [`RESET_RELEASE_NS`]: two comparable sources
+/// (the rail through `R_top`, ground through `R_bot`) that rule 2 solves.
+/// The QEMU core's 64 pad-read declarations resolve only the pads'
+/// clusters (`Resolver::declare_reads`, the sense task, `NODES.md` §12
+/// item 5): until then each drain batch of them was a full pass that
+/// re-solved the FET cluster, two batches for five in all, three — a sixth
+/// solve — when the attaching thread's commands split three ways. None per
+/// edge: the boot's 16 901 edges are projections, as they were with the
+/// rails stuck from the bench (0 then, since nothing sourced the FET).
+const ESCALATED_SOLVES: u64 = 3;
 
 fn ep(endpoint: &str) -> EndpointRef {
     EndpointRef::parse(endpoint).expect("endpoint parses")
@@ -106,14 +115,10 @@ impl Scope {
     fn new() -> (Self, Arc<Mutex<Vec<u64>>>) {
         let instants = Arc::new(Mutex::new(Vec::new()));
         let scope = Self {
-            pins: [PinDecl {
-                number: "A",
-                name: None,
-                kind: PinKind::DigitalIn,
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            }],
+            pins: [PinDecl::digital_in(
+                "A",
+                jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+            )],
             instants: Arc::clone(&instants),
         };
         (scope, instants)
@@ -127,14 +132,15 @@ impl Component for Scope {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let instants = Arc::clone(&self.instants);
         let last = Mutex::new(None::<Level>);
-        io.on_sense("A", move |state| {
-            let Some(level) = level_of(state) else {
+        let receiver = DigitalReceiver::new(io.pin("A")?);
+        io.on_sense("A", move |sense| {
+            let Some(level) = receiver.read(&sense) else {
                 return;
             };
             let mut last = last.lock().unwrap();
             if *last != Some(level) {
                 *last = Some(level);
-                instants.lock().unwrap().push(virtual_clock::virtual_ns());
+                instants.lock().unwrap().push(sense.at_ns);
             }
         })
     }
@@ -295,13 +301,15 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         package_handle.start_state(),
     );
 
-    // The START gate: the core ran from the instant the module could run
-    // it — the bucks' soft-start elapsed, the core rail inside the P2's
-    // window, the detector's `RESN` released — and not one edge before.
+    // The START gate: the core ran from the datasheet's restart delay
+    // after the instant the module released its reset — the bucks'
+    // soft-start elapsed, the core rail inside the P2's window, the
+    // detector's `RESN` released — and not one edge before.
+    assert_eq!(START_NS, 5_500_000);
     assert_eq!(
         package_handle.started_at_ns(),
         Some(START_NS),
-        "the package starts the core at the bucks' soft-start instant; nets={nets:?}"
+        "the package starts the core 3 ms after the bucks' soft-start instant; nets={nets:?}"
     );
     assert!(
         package_handle.reset().out_of_reset(),
@@ -372,10 +380,11 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     // every later phase is measured against: edges the flash clock carried,
     // yields and publishes the P2 made, wall time from `start` to the byte,
     // the START instant — and how many cluster solves the run escalated to
-    // the solver. On this board every SPI edge is a 25 Ω pad against a
-    // 10.5 kΩ pull-up to a terminal, so nothing disagrees within a factor
+    // the solver. On this board every SPI edge is a fast pad (17.99 Ω, the
+    // datasheet fit `P2_FAST_OHMS`) against a 10.5 kΩ pull-up to a
+    // terminal, so nothing disagrees within a factor
     // of ten and no analog sense asks: the whole boot is projections
-    // (`DESIGN.md` rule 8). The five solves the count carries are the
+    // (`DESIGN.md` rule 8). The three solves the count carries are the
     // power tree's before the first edge (`ESCALATED_SOLVES`) — none per
     // edge; the count is held exactly, as the budget it is. A phase that
     // changes it says so.
@@ -398,7 +407,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
 
     // The crystal is the rate the board delivers on XI, and on this module
     // it is the TCXO's: `X100` runs from `Common_VDD`, the core rail
-    // `U402` raises at the START instant, and its 20 MHz reaches `XI`
+    // `U402` raises at the reset release, and its 20 MHz reaches `XI`
     // through the buffer and the coupling capacitor once its own start-up
     // elapses. The ROM runs on RCFAST and never selects the crystal, so
     // the boot is the same either way; `crystal_pll.rs` proves the XI →

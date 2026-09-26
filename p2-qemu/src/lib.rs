@@ -19,12 +19,13 @@
 //! # When the guest starts
 //!
 //! The package's **START gate** decides: the core is started — and its
-//! first wake delivered — only once `RESN` reads released and `VDD` reads
-//! a voltage inside the datasheet's window (`embsim_boards::p2`). The
+//! first wake delivered — the datasheet's 3 ms restart delay after `RESN`
+//! reads released with `VDD` inside its window (`embsim_boards::p2`). The
 //! START instant is where the guest's clock begins: [`P2Core::start`]
 //! anchors clock segment 0 at the virtual instant it runs, so a guest
-//! started 2.5 ms in (the P2-EC32MB from its carrier's 5 V, its bucks'
-//! soft-start elapsed) stamps its first instruction there, and every edge
+//! started 5.5 ms in (the P2-EC32MB from its carrier's 5 V: its bucks'
+//! soft-start elapsed at 2.5 ms, which releases the reset, and the restart
+//! delay after it) stamps its first instruction there, and every edge
 //! after it at its own instant from there.
 //!
 //! # Where the CPU runs
@@ -87,7 +88,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use embsim_board::{level_of, AttachError, Level, PinHandle, TheveninDrive, WEAK_DRIVE_OHMS};
+use embsim_board::{AttachError, Level, PinHandle, TheveninDrive, WEAK_DRIVE_OHMS};
 use embsim_boards::p2::{self, BankSupplies, P2Core, P2Pads, P2ResetState, PadDrive};
 use embsim_core::virtual_clock;
 
@@ -243,10 +244,13 @@ struct Shared {
     /// in hertz, 0 while nothing reaches the pin.
     crystal_hz: AtomicU64,
     /// The reset inputs, as the package last delivered them. Information:
-    /// the START gate that acts on them is the package's, and a change
-    /// after the start (a rail dropping) changes nothing here until the
-    /// target has a reset entry.
+    /// the START gate that acts on them is the package's, and a rail
+    /// dropping after the start reaches the core as [`P2Core::reset`].
     reset: Mutex<P2ResetState>,
+    /// The package held the core ([`P2Core::reset`]): a brownout without a
+    /// reset. No slice runs from here, and the pads keep what they last
+    /// published.
+    held: AtomicBool,
     /// The guest selected a clock derived from the crystal while none
     /// reached `XI`, and is not running until one does.
     stalled: AtomicBool,
@@ -325,6 +329,12 @@ impl P2QemuHandle {
     /// crystal on `XI`.
     pub fn stalled(&self) -> bool {
         self.shared.stalled.load(Ordering::Relaxed)
+    }
+
+    /// Whether the package held the core — `VDD` left its window while the
+    /// guest ran with `RESN` not asserted ([`P2Core::reset`]).
+    pub fn held(&self) -> bool {
+        self.shared.held.load(Ordering::Relaxed)
     }
 }
 
@@ -507,10 +517,20 @@ impl Bus {
     /// instant the guest made the change, or — for a crystal that arrived
     /// while the guest was stalled — at `now`, the wake that found it.
     /// Cheap when nothing changed: two loads and two compares.
-    fn poll_clock_mode(&mut self, now: u64) {
+    ///
+    /// A changed word is reported to the package first
+    /// ([`P2Pads::set_clock_mode`]): its `%CC` field is `XI`'s mode, which
+    /// decides the crystal the package reads on `XI`, and the package
+    /// answers through `on_crystal` before the call returns — so the
+    /// crystal is taken again before the word is decoded against it.
+    fn poll_clock_mode(&mut self, now: u64, pads: &P2Pads) {
         // SAFETY: plain reads of two globals the target owns.
         let mode = unsafe { ffi::p2host_clock_mode() };
         let mode_changed = mode != self.clock_mode;
+        if mode_changed {
+            pads.set_clock_mode(mode);
+            self.drain_crystal();
+        }
         let crystal_changed = self.crystal_hz != self.clocked_crystal_hz;
         if !mode_changed && !crystal_changed {
             return;
@@ -1000,11 +1020,11 @@ impl P2Core for P2Qemu {
             bus.published[usize::from(pin)] = Some(None);
             bus.handles[usize::from(pin)] = Some(handle);
             let shared = Arc::clone(&self.shared);
-            pads.on_pad_sense(pin, move |state| {
+            pads.on_pad_sense(pin, move |level| {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                let Some(level) = level_of(state) else {
+                let Some(level) = level else {
                     return;
                 };
                 shared
@@ -1039,7 +1059,9 @@ impl P2Core for P2Qemu {
         let shared = Arc::clone(&self.shared);
         let arm = pads.clone();
         pads.on_wake_ns(move |now| {
-            if shared.shutdown.load(Ordering::Relaxed) {
+            if shared.shutdown.load(Ordering::Relaxed) || shared.held.load(Ordering::Relaxed) {
+                // Torn down, or held by the package: no clock, no
+                // instructions — the stall path, for good.
                 return;
             }
             THREAD_ATTACHED.with(|attached| {
@@ -1083,6 +1105,14 @@ impl P2Core for P2Qemu {
             "p2-qemu: START; the guest's clock counts from here"
         );
     }
+
+    /// Held by the package — a brownout without a reset: the guest runs no
+    /// further slice, the way a stalled guest runs none, and its pads keep
+    /// the drives they last published.
+    fn reset(&mut self) {
+        self.shared.held.store(true, Ordering::Relaxed);
+        tracing::info!("p2-qemu: held by the package; the guest runs no further");
+    }
 }
 
 /// One wake: publish a pending pad change at its instant, or run the guest
@@ -1092,7 +1122,7 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
     // the guest can read a pin, and take the crystal as it stands.
     bus.drain_edges();
     bus.drain_crystal();
-    bus.poll_clock_mode(now);
+    bus.poll_clock_mode(now, arm);
     if bus.stalled {
         // No clock, no instructions. The crystal's arrival re-arms.
         shared.stalled.store(true, Ordering::Relaxed);
@@ -1148,7 +1178,7 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
             if yielded {
                 shared.yields.fetch_add(1, Ordering::Relaxed);
             }
-            bus.poll_clock_mode(now);
+            bus.poll_clock_mode(now, arm);
             if bus.stalled {
                 // No clock, no instructions. The crystal's arrival re-arms,
                 // and the pending pad change (if the slice made one) is

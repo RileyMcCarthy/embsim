@@ -15,10 +15,13 @@
 //!
 //! The four claims under test, one per section below:
 //!
-//! 1. a step train crosses to the drive **as a rate**, and the pulse count the
-//!    peer reconstructs is exactly the firmware's;
-//! 2. a mid-train direction reversal splits the count at the instant `DIR`
-//!    changed — no pulse is re-signed and none is lost;
+//! 1. a step train crosses to the drive **as a rate** — a periodic drive on
+//!    the STEP net — and the pulse count the peer reconstructs is exactly the
+//!    firmware's;
+//! 2. a mid-train direction reversal is the DIR net changing and nothing
+//!    else: the STEP segment is not re-published, and the drive's own
+//!    counter, folding it at the instants its DIR receiver changed, splits
+//!    the count exactly — no pulse re-signed, none lost, none of phase;
 //! 3. GPIO bridges **both** ways at the channel's own `active_low` polarity —
 //!    firmware writes drive the net, and an external drive senses back (the
 //!    endstop path);
@@ -40,9 +43,9 @@ use embsim_board::mcu::{
     EncoderChannelConfig, GpioChannelConfig, GpioDirection, PulseOutChannelConfig,
 };
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EngineEvent, Harness, IdleDrive, Level, McuComponent,
-    NetState, PinDecl, PinHandle, PinKind, PulseDirection, PulseTrain, StreamRole, System,
-    SystemHandle,
+    jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver,
+    Drive, EngineEvent, Harness, Level, McuComponent, NetState, PeriodicSchedule, PinDecl,
+    PinHandle, System, SystemHandle,
 };
 use embsim_core::virtual_clock;
 use embsim_peripherals::{encoder, gpio, pulse_out};
@@ -117,36 +120,64 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 // Peer: a step/direction drive that observes the pins
 // ============================================================
 
-type TrainLog = Arc<Mutex<Vec<PulseTrain>>>;
-type SenseLog = Arc<Mutex<Vec<(&'static str, NetState)>>>;
+/// Every segment the STEP net carried, in the order the drive was handed
+/// them.
+type TrainLog = Arc<Mutex<Vec<PeriodicSchedule>>>;
+/// Every state the drive's DIR and ENA inputs were handed, with the virtual
+/// instant (µs) of the handing.
+type SenseLog = Arc<Mutex<Vec<(&'static str, NetState, u64)>>>;
 
-/// The drive at the far end of the harness: `STEP` is a
-/// [`StreamRole::PulseSink`] (so a rate-carried train routes to it), `DIR` and
-/// `ENA` are plain sensed inputs. It integrates nothing — it records what
-/// arrived, so the assertions are about the *wire*, not about a plant.
+/// What the drive's own step counter holds: every pulse it was handed,
+/// signed by the direction it read on `DIR` when the pulse went out, and
+/// unsigned.
+#[derive(Debug, Default)]
+struct StepCount {
+    /// The segment `STEP` carries now, and how much of it is counted.
+    segment: Option<PeriodicSchedule>,
+    counted: u64,
+    /// `DIR` read high: reverse on this machine.
+    reverse: bool,
+    signed: i64,
+    unsigned: u64,
+}
+
+impl StepCount {
+    /// Count the current segment's pulses up to `at_ns` under the direction
+    /// in force.
+    fn fold(&mut self, at_ns: u64) {
+        let Some(segment) = self.segment else {
+            return;
+        };
+        let now = segment.emitted_at_ns(at_ns);
+        let pulses = now.saturating_sub(self.counted);
+        self.counted = now.max(self.counted);
+        self.unsigned += pulses;
+        let pulses = i64::try_from(pulses).expect("a test's pulses fit");
+        self.signed += if self.reverse { -pulses } else { pulses };
+    }
+}
+
+/// The drive at the far end of the harness: `STEP`, `DIR` and `ENA` are plain
+/// sensed inputs, and a periodic drive on the STEP net hands `STEP` its
+/// segment. It records what arrived, so the assertions are about the
+/// *wire*, and it keeps a step counter the way a drive does — folding each
+/// segment it was handed at the instants its own `DIR` receiver changed
+/// (`NODES.md` §11, contract line 6: a node that consumes a clock
+/// integrates the segment itself).
 struct StepDrive {
     pins: [PinDecl; 3],
     trains: TrainLog,
     senses: SenseLog,
+    count: Arc<Mutex<StepCount>>,
 }
 
 impl StepDrive {
-    fn new(trains: TrainLog, senses: SenseLog) -> Self {
+    fn new(trains: TrainLog, senses: SenseLog, count: Arc<Mutex<StepCount>>) -> Self {
         Self {
-            pins: [
-                PinDecl {
-                    number: "STEP",
-                    name: None,
-                    kind: PinKind::DigitalIn,
-                    stream: Some(StreamRole::PulseSink),
-                    drive_impedance: None,
-                    idle: IdleDrive::KindDefault,
-                },
-                input("DIR"),
-                input("ENA"),
-            ],
+            pins: [input("STEP"), input("DIR"), input("ENA")],
             trains,
             senses,
+            count,
         }
     }
 }
@@ -157,11 +188,43 @@ impl Component for StepDrive {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        // The counter: DIR first, so a segment is folded against the
+        // direction already read.
+        let count = Arc::clone(&self.count);
+        let dir = DigitalReceiver::new(io.pin("DIR")?);
+        io.on_sense("DIR", move |sense| {
+            let reverse = dir.read(&sense) == Some(Level::High);
+            let mut count = count.lock().unwrap();
+            count.fold(sense.at_ns);
+            count.reverse = reverse;
+        })?;
+        let count = Arc::clone(&self.count);
+        io.on_sense("STEP", move |sense| {
+            let mut count = count.lock().unwrap();
+            let Some(clock) = sense.periodic else {
+                count.fold(sense.at_ns);
+                count.segment = None;
+                return;
+            };
+            // The outgoing segment up to where the new one picks up.
+            count.fold(clock.segment.since_ns);
+            count.segment = Some(clock.segment);
+            count.counted = clock.segment.emitted;
+        })?;
         let trains = Arc::clone(&self.trains);
-        io.on_pulse("STEP", move |train| trains.lock().unwrap().push(train))?;
+        io.on_net_report("STEP", move |state| {
+            if let NetState::Periodic { segment, .. } = state {
+                trains.lock().unwrap().push(segment);
+            }
+        })?;
         for pin in ["DIR", "ENA"] {
             let senses = Arc::clone(&self.senses);
-            io.on_sense(pin, move |state| senses.lock().unwrap().push((pin, state)))?;
+            io.on_net_report(pin, move |state| {
+                senses
+                    .lock()
+                    .unwrap()
+                    .push((pin, state, virtual_clock::virtual_ns()))
+            })?;
         }
         Ok(())
     }
@@ -202,25 +265,11 @@ impl Component for Driver {
 }
 
 const fn input(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_in(number, jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
 }
 
 const fn output(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_out(number)
 }
 
 const HIGH: embsim_board::TheveninDrive = embsim_board::TheveninDrive {
@@ -242,6 +291,8 @@ struct Rig {
     system: SystemHandle,
     trains: TrainLog,
     senses: SenseLog,
+    /// The drive's own step counter.
+    count: Arc<Mutex<StepCount>>,
     /// `SW.OUT`, `ENC.A`, `ENC.B` — the pins the *test* drives into the MCU.
     external: Arc<Mutex<Vec<(&'static str, PinHandle)>>>,
 }
@@ -258,13 +309,13 @@ impl Rig {
             .unwrap_or_else(|| panic!("{number} attached"))
     }
 
-    /// Every train the drive has seen so far.
-    fn trains(&self) -> Vec<PulseTrain> {
+    /// Every segment the drive has seen so far.
+    fn trains(&self) -> Vec<PeriodicSchedule> {
         self.trains.lock().unwrap().clone()
     }
 
-    /// Block until the drive has seen `n` trains.
-    fn await_trains(&self, n: usize) -> Vec<PulseTrain> {
+    /// Block until the drive has seen `n` segments.
+    fn await_trains(&self, n: usize) -> Vec<PeriodicSchedule> {
         assert!(
             wait_for(
                 || self.trains.lock().unwrap().len() >= n,
@@ -283,8 +334,29 @@ impl Rig {
             .unwrap()
             .iter()
             .rev()
-            .find(|(name, _)| *name == pin)
-            .map(|(_, state)| *state)
+            .find(|(name, _, _)| *name == pin)
+            .map(|(_, state, _)| *state)
+    }
+
+    /// Block until the drive's `pin` input has been handed `state`, and
+    /// return the virtual instant it was.
+    fn await_sense(&self, pin: &str, state: NetState) -> u64 {
+        assert!(
+            wait_for(
+                || self.last_sense(pin) == Some(state),
+                Duration::from_secs(5)
+            ),
+            "drive's {pin} saw {:?}, expected {state:?}",
+            self.last_sense(pin)
+        );
+        self.senses
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(name, _, _)| *name == pin)
+            .map(|(_, _, at)| *at)
+            .expect("just seen")
     }
 }
 
@@ -301,6 +373,7 @@ fn rig(event_log: bool) -> Rig {
 
     let trains: TrainLog = Arc::new(Mutex::new(Vec::new()));
     let senses: SenseLog = Arc::new(Mutex::new(Vec::new()));
+    let count = Arc::new(Mutex::new(StepCount::default()));
     let external = Arc::new(Mutex::new(Vec::new()));
 
     let mcu = McuComponent::builder("p2")
@@ -309,8 +382,7 @@ fn rig(event_log: bool) -> Rig {
         .bridge_gpio(DIR_CHANNEL, GpioDirection::Output)
         .bridge_gpio(ESTOP_CHANNEL, GpioDirection::Input)
         .pulse_out_table(PULSE_TABLE.to_vec())
-        // The reference machine's convention: DIR active means reverse.
-        .bridge_pulse_out_with_direction(0, DIR_CHANNEL, PulseDirection::Reverse)
+        .bridge_pulse_out(0)
         .encoder_table(ENCODER_TABLE.to_vec())
         .bridge_encoder(0)
         .build()
@@ -334,7 +406,11 @@ fn rig(event_log: bool) -> Rig {
         .component("MCU", Box::new(mcu))
         .component(
             "DRIVE",
-            Box::new(StepDrive::new(Arc::clone(&trains), Arc::clone(&senses))),
+            Box::new(StepDrive::new(
+                Arc::clone(&trains),
+                Arc::clone(&senses),
+                Arc::clone(&count),
+            )),
         )
         .component("SW", Box::new(Driver::new(&["OUT"], Arc::clone(&external))))
         .component(
@@ -351,6 +427,7 @@ fn rig(event_log: bool) -> Rig {
         system,
         trains,
         senses,
+        count,
         external,
     }
 }
@@ -441,10 +518,10 @@ fn settle_encoder(rig: &Rig, phase: usize) {
 // ============================================================
 
 /// A finite train started through `HAL_pulseOut_start` reaches the drive as
-/// **one** [`PulseTrain`] carrying frequency, ceiling and baseline — and the
-/// count the drive reconstructs from it at any instant is bit-identical to the
-/// peripheral's own integration, which is what `HAL_pulseOut_run` hands the
-/// firmware.
+/// **one** segment on the STEP net carrying frequency, ceiling and baseline —
+/// and the count the drive reconstructs from it at any instant is
+/// bit-identical to the peripheral's own integration, which is what
+/// `HAL_pulseOut_run` hands the firmware.
 #[rstest]
 fn a_step_train_reaches_the_drive_as_a_rate_with_an_exact_count() {
     let _suite = suite_lock();
@@ -455,8 +532,8 @@ fn a_step_train_reaches_the_drive_as_a_rate_with_an_exact_count() {
     let attached = rig.await_trains(1);
     assert_eq!(
         attached[0],
-        PulseTrain::IDLE,
-        "an unstarted channel presents a held train, not nothing"
+        PeriodicSchedule::IDLE,
+        "an unstarted channel presents a held segment, not nothing"
     );
 
     // Firmware: enable the drive, then 4000 steps at 20 kHz.
@@ -470,28 +547,36 @@ fn a_step_train_reaches_the_drive_as_a_rate_with_an_exact_count() {
         "one event for the start, not one per pulse"
     );
     let train = trains[1];
-    assert_eq!(train.pulses.freq_hz, 20_000);
-    assert_eq!(train.pulses.total, Some(4_000));
-    assert_eq!(train.pulses.emitted, 0, "a fresh train starts from zero");
-    assert_eq!(train.direction, PulseDirection::Forward);
+    assert_eq!(train.freq_hz, 20_000);
+    assert_eq!(train.total, Some(4_000));
+    assert_eq!(train.emitted, 0, "a fresh train starts from zero");
+    assert_eq!(
+        rig.system.net_state("MCU.P8"),
+        Some(NetState::Periodic {
+            hi: Level::High,
+            lo: Level::Low,
+            segment: train,
+        }),
+        "the STEP net is the square wave, between the pad's own levels"
+    );
 
     // Read-time integration: exact at every probe, clamped at the ceiling.
-    let t0 = train.pulses.since_us;
-    assert_eq!(train.emitted_at(t0), 0);
+    let t0 = train.since_ns;
+    assert_eq!(train.emitted_at_ns(t0), 0);
     assert_eq!(
-        train.emitted_at(t0 + 100_000),
+        train.emitted_at_ns(t0 + 100_000_000),
         2_000,
         "half of 4000 at 20 kHz"
     );
-    assert_eq!(train.emitted_at(t0 + 200_000), 4_000);
+    assert_eq!(train.emitted_at_ns(t0 + 200_000_000), 4_000);
     assert_eq!(
-        train.emitted_at(t0 + 10_000_000),
+        train.emitted_at_ns(t0 + 10_000_000_000),
         4_000,
         "the ceiling holds forever after"
     );
     assert_eq!(
         train.completes_at(),
-        Some(t0 + 200_000),
+        Some(t0 + 200_000_000),
         "the drive knows when the last pulse goes out without being told"
     );
 
@@ -500,21 +585,21 @@ fn a_step_train_reaches_the_drive_as_a_rate_with_an_exact_count() {
     // instant: reading each at its own `now` would compare two different
     // moments of a live train and differ by a pulse whenever they straddle a
     // period boundary.
-    let now = virtual_clock::virtual_us();
+    let now = virtual_clock::virtual_ns();
     assert_eq!(
-        train.emitted_at(now),
-        pulse_out::segment(0).emitted_at(now),
+        train.emitted_at_ns(now),
+        pulse_out::segment(0).emitted_at_ns(now),
         "the wire and the firmware must never disagree about the count"
     );
 
     // Stopping freezes the train at its exact final count.
     pulse_out::stop(0);
     let stopped = rig.await_trains(3)[2];
-    assert_eq!(stopped.pulses.freq_hz, 0);
-    assert_eq!(stopped.pulses.total, Some(stopped.pulses.emitted));
+    assert_eq!(stopped.freq_hz, 0);
+    assert_eq!(stopped.total, Some(stopped.emitted));
     assert_eq!(
-        stopped.emitted_at(u64::MAX),
-        stopped.pulses.emitted,
+        stopped.emitted_at_ns(u64::MAX),
+        stopped.emitted,
         "a stopped train emits nothing more, however long you wait"
     );
 
@@ -525,91 +610,90 @@ fn a_step_train_reaches_the_drive_as_a_rate_with_an_exact_count() {
 // 2. Direction reversal, including mid-train
 // ============================================================
 
-/// Flipping the direction GPIO **mid-train** re-publishes the train re-based
-/// at the change instant. The pulses on each side of the reversal keep their
-/// own sign, so the signed total a consumer folds is exact — this is the case
-/// an edge-free representation has to get right or it is not usable.
+/// Flipping the direction GPIO **mid-train** changes the DIR net and nothing
+/// else: the STEP segment is not re-published, because the wire carries no
+/// direction. The drive's own counter, folding the one segment at the
+/// instants its DIR receiver changed, splits the count exactly — the pulses
+/// on each side keep their own sign, and the three legs add up to the
+/// firmware's own count with not a pulse of phase lost. This is the case an
+/// edge-free representation has to get right or it is not usable.
 #[rstest]
 fn a_mid_train_reversal_splits_the_count_at_the_instant_dir_changed() {
     let _suite = suite_lock();
     virtual_clock::init(0.0, 1_000_000);
     let rig = rig(false);
     rig.await_trains(1);
+    let released = rig.await_sense("DIR", NetState::Driven(Level::Low));
 
     gpio::set_active(ENA_CHANNEL, true);
     pulse_out::start_velocity(0, STEPS_PER_MM as u32); // 1 mm/s
-    let forward = rig.await_trains(2)[1];
-    assert_eq!(forward.direction, PulseDirection::Forward);
-    assert_eq!(forward.pulses.total, None, "a velocity train is unbounded");
+    let train = rig.await_trains(2)[1];
+    assert_eq!(train.total, None, "a velocity train is unbounded");
 
     // Jump virtual time so pulses accumulate, then reverse.
     virtual_clock::wait_virtual_us(5_000);
     gpio::set_active(DIR_CHANNEL, true);
-    let reverse = rig.await_trains(3)[2];
+    let reversed = rig.await_sense("DIR", NetState::Driven(Level::High));
 
-    assert_eq!(
-        reverse.direction,
-        PulseDirection::Reverse,
-        "DIR active means reverse on this machine"
-    );
-    assert_eq!(
-        reverse.pulses.freq_hz, forward.pulses.freq_hz,
-        "a direction change is not a rate change"
-    );
-    assert_eq!(
-        reverse.pulses.emitted,
-        forward.emitted_at(reverse.pulses.since_us),
-        "the reverse segment picks up exactly where the forward one stopped"
-    );
-    assert!(
-        reverse.pulses.emitted > 0,
-        "the reversal must land mid-train, not before the first pulse"
-    );
-
-    // Reverse again: back to forward, re-anchored a second time. Each split
-    // re-anchors against the peripheral's own live count, so the handover is
-    // exact to within the one pulse of phase a re-anchor costs — the fidelity
-    // limit `PulseTrain` documents, asserted here rather than assumed.
+    // Reverse again: back to forward.
     virtual_clock::wait_virtual_us(5_000);
     gpio::set_active(DIR_CHANNEL, false);
-    let again = rig.await_trains(4)[3];
-    assert_eq!(again.direction, PulseDirection::Forward);
-    let handover = reverse.emitted_at(again.pulses.since_us);
+    let restored = rig.await_sense("DIR", NetState::Driven(Level::Low));
     assert!(
-        again.pulses.emitted >= handover && again.pulses.emitted - handover <= 1,
-        "the second split handed over {} against {handover} — a re-anchor may \
-         trail by one pulse of phase, never more and never ahead",
-        again.pulses.emitted
+        released <= train.since_ns && train.since_ns < reversed && reversed < restored,
+        "DIR low at {released}, clock from {}, reversed at {reversed}, restored at {restored}",
+        train.since_ns
     );
 
-    // Folding the segments reconstructs the signed position, and the unsigned
-    // total is exactly what the firmware emitted — no pulse counted twice,
-    // none dropped. Each segment is folded up to the instant its successor
-    // began, which is the contract [`PulseTrain`] states.
     pulse_out::stop(0);
-    let trains = rig.await_trains(5);
-    let now = virtual_clock::virtual_us();
-    let (mut signed, mut unsigned) = (0i64, 0u64);
-    for (index, train) in trains.iter().enumerate() {
-        let until = trains
-            .get(index + 1)
-            .map_or(now, |next| next.pulses.since_us);
-        signed += train.delta_at(until);
-        unsigned += train.emitted_at(until) - train.pulses.emitted;
-    }
-    // Two direction splits, so up to two pulses of re-anchor phase — and that
-    // is the *whole* budget: the fold itself neither drops nor duplicates.
-    let firmware = pulse_out::emitted(0);
-    assert!(
-        unsigned <= firmware && firmware - unsigned <= 2,
-        "folded segments totalled {unsigned} against the peripheral's {firmware}; \
-         two reversals may cost at most two pulses of phase"
+    let trains = rig.await_trains(3);
+    assert_eq!(
+        trains.len(),
+        3,
+        "idle, start and stop — a direction change publishes no segment: {trains:?}"
     );
+    let stopped = trains[2];
+
+    // Fold the one running segment at the instants DIR changed: every pulse
+    // is counted once, from the anchor the peripheral published.
+    let at = |t: u64| train.emitted_at_ns(t) - train.emitted;
+    let forward = at(reversed);
+    let reverse = at(restored) - at(reversed);
+    let forward_again = at(stopped.since_ns) - at(restored);
     assert!(
-        signed.unsigned_abs() < unsigned,
-        "a there-and-back move nets out below its travelled distance \
-         (signed {signed}, travelled {unsigned})"
+        forward > 0 && reverse > 0,
+        "the reversal must land mid-train (forward {forward}, reverse {reverse})"
     );
+    assert_eq!(
+        forward + reverse + forward_again,
+        pulse_out::emitted(0),
+        "the three legs are exactly the firmware's own count — no pulse of phase lost"
+    );
+    assert_eq!(
+        stopped.emitted,
+        train.emitted_at_ns(stopped.since_ns),
+        "the stop picks up exactly where the running segment was"
+    );
+    let signed = forward as i64 - reverse as i64 + forward_again as i64;
+    assert!(
+        signed.unsigned_abs() < forward + reverse + forward_again,
+        "a there-and-back move nets out below its travelled distance"
+    );
+
+    // The drive's own counter — the segments it was handed, folded at the
+    // instants its DIR receiver changed — holds the same split: the net
+    // travel, and every pulse the firmware emitted, once.
+    let count = rig.count.lock().unwrap();
+    assert_eq!(
+        count.signed, signed,
+        "the drive counts forward, back and forward again at the instants it read DIR change"
+    );
+    assert_eq!(
+        count.unsigned,
+        pulse_out::emitted(0),
+        "the drive counted exactly the firmware's pulses — none lost, none twice"
+    );
+    drop(count);
 
     teardown(rig);
 }
@@ -744,12 +828,19 @@ fn a_quadrature_pin_pair_produces_the_counts_firmware_reads() {
 /// pulse update the rig produces, start-up included — and it is a constant:
 /// it does not move when the profile runs longer or faster.
 ///
-/// Measured on the reference host at the time of writing: **31 events for
-/// ~150 000 pulses**, and 31 on every repeat while the pulse count moved by
-/// tens of thousands — the number really is independent of the rate. The
-/// headroom below is for incidental engine bookkeeping, not for per-pulse
-/// traffic: a regression that reintroduced edges would miss this ceiling by
-/// three orders of magnitude.
+/// Measured on the reference host: **31 events for 65 536 pulses** while the
+/// train rode a pulse channel beside the net (5 pulse updates; the phase-4
+/// tree), **46 events** for the same 65 536 since it is a periodic drive
+/// on the STEP net, and **52** since the drive keeps its own step counter
+/// (`STEP` and `DIR` subscriptions beside the recorders: six more sense
+/// deliveries, `NODES.md` §12 item 5, the review) —
+/// each rate change a drive, a resolution and a sense like any other drive,
+/// `sil-unified-drive.md`'s "a rate change gets more expensive", measured
+/// here; the same count on every repeat while the pulse count moved by tens
+/// of thousands — the number really is independent of the rate. The headroom
+/// below is for incidental engine bookkeeping, not for per-pulse traffic: a
+/// regression that reintroduced edges would miss this ceiling by three
+/// orders of magnitude.
 const ENGINE_EVENT_CEILING: usize = 64;
 
 /// A realistic step rate costs a bounded number of engine events, and the
@@ -776,16 +867,24 @@ fn a_realistic_step_rate_costs_a_bounded_number_of_engine_events() {
 
     // IDLE + start + two retargets + stop.
     let trains = rig.await_trains(5);
-    let now = virtual_clock::virtual_us();
+    let now = virtual_clock::virtual_ns();
     let pulses: u64 = trains
         .iter()
-        .map(|train| train.emitted_at(now) - train.pulses.emitted)
+        .map(|train| train.emitted_at_ns(now) - train.emitted)
         .sum();
 
     let records = log.records();
     let pulse_updates = records
         .iter()
-        .filter(|r| matches!(r.event, EngineEvent::PulseUpdate { .. }))
+        .filter(|r| {
+            matches!(
+                r.event,
+                EngineEvent::DriveApplied {
+                    drive: Some(Drive::Periodic { .. }),
+                    ..
+                }
+            )
+        })
         .count();
 
     assert!(
@@ -794,7 +893,7 @@ fn a_realistic_step_rate_costs_a_bounded_number_of_engine_events() {
     );
     assert_eq!(
         pulse_updates, 5,
-        "one pulse event per rate change and no more"
+        "one periodic drive per rate change and no more"
     );
     assert!(
         records.len() <= ENGINE_EVENT_CEILING,
@@ -803,8 +902,8 @@ fn a_realistic_step_rate_costs_a_bounded_number_of_engine_events() {
         records.len()
     );
     println!(
-        "[budget] {pulses} pulses delivered in {} engine events ({pulse_updates} pulse \
-         updates); one engine event per STEP edge would have been at least {pulses}",
+        "[budget] {pulses} pulses delivered in {} engine events ({pulse_updates} periodic \
+         drives); one engine event per STEP edge would have been at least {pulses}",
         records.len()
     );
 

@@ -4,14 +4,16 @@
 3 v=0 reroute epoch=0
 4 v=0 sense net=2 state=analog:0uv
 5 v=0 drive_applied seq=0 endpoint=0 drive=3300000uv@23700mohm
-6 v=0 drive_applied seq=1 endpoint=1 drive=190000uv@31100mohm
-7 v=0 drive_applied seq=2 endpoint=0 drive=3190000uv@24700mohm
-8 v=0 drive_applied seq=3 endpoint=1 drive=260000uv@32100mohm
-9 v=0 drive_applied seq=4 endpoint=0 drive=3080000uv@25700mohm
-10 v=0 drive_applied seq=5 endpoint=1 drive=330000uv@33100mohm
-11 v=0 drive_applied seq=6 endpoint=0 drive=2970000uv@26700mohm
-12 v=0 drive_applied seq=7 endpoint=1 drive=400000uv@34100mohm
-13 v=0 drive_applied seq=8 endpoint=0 drive=2860000uv@27700mohm
-14 v=0 drive_applied seq=9 endpoint=1 drive=470000uv@35100mohm
-15 v=0 drive_applied seq=10 endpoint=0 drive=2750000uv@28700mohm
-16 v=0 drive_applied seq=11 endpoint=1 drive=540000uv@36100mohm
+6 v=0 finding Contention { net: "DRV.A", drivers: [PinRef { reference: "DRV", pin: "A" }] }
+7 v=0 drive_applied seq=1 endpoint=1 drive=190000uv@31100mohm
+8 v=0 finding Contention { net: "DRV.A", drivers: [PinRef { reference: "DRV", pin: "A" }, PinRef { reference: "DRV", pin: "B" }] }
+9 v=0 drive_applied seq=2 endpoint=0 drive=3190000uv@24700mohm
+10 v=0 drive_applied seq=3 endpoint=1 drive=260000uv@32100mohm
+11 v=0 drive_applied seq=4 endpoint=0 drive=3080000uv@25700mohm
+12 v=0 drive_applied seq=5 endpoint=1 drive=330000uv@33100mohm
+13 v=0 drive_applied seq=6 endpoint=0 drive=2970000uv@26700mohm
+14 v=0 drive_applied seq=7 endpoint=1 drive=400000uv@34100mohm
+15 v=0 drive_applied seq=8 endpoint=0 drive=2860000uv@27700mohm
+16 v=0 drive_applied seq=9 endpoint=1 drive=470000uv@35100mohm
+17 v=0 drive_applied seq=10 endpoint=0 drive=2750000uv@28700mohm
+18 v=0 drive_applied seq=11 endpoint=1 drive=540000uv@36100mohm

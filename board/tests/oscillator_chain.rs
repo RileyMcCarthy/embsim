@@ -1,9 +1,11 @@
-//! The P2-EC32MB's clock chain, live: the TCXO `X100` publishes its 20 MHz
-//! as a **rate** at its start-up instant, the rate crosses the coupling
-//! capacitor `C132`, the oscillator buffer `U101` relays it stage by stage
-//! and rests its self-biased stage mid-rail in one pass, and the P2's `XI`
-//! net carries the rate — `NODES.md` §8 phase 2's proof for the
-//! oscillator, the gate's rate mode and rate routing through a capacitor.
+//! The P2-EC32MB's clock chain, live: the TCXO `X100` drives its 20 MHz as a
+//! **periodic drive** at its start-up instant, the rate crosses the coupling
+//! capacitor `C132`, the oscillator buffer `U101` relays it stage by stage,
+//! settling its self-biased stage in one pass, and the P2's `XI` net carries
+//! the square wave — `NODES.md` §8 phase 2's proof for the oscillator, the
+//! gate's rate mode and a rate through a capacitor, re-expressed in
+//! `NODES.md` §12 item 5 for the one drive type (`Drive::Periodic`,
+//! `sil-unified-drive.md` step 4).
 //!
 //! Beside it, the AC-coupling rule on a bench fixture: a capacitor too
 //! small to couple the rate stops it, with a finding that names the
@@ -12,7 +14,9 @@
 //! scenario — is an AC short to its reference, so a rate coupled into it
 //! is shunted there rather than forwarded through the next capacitor, and
 //! two sources that merely share decoupling to it do not face each other;
-//! the same node left undeclared is one more node on the path.
+//! the same node left undeclared is one more node on the path. And which
+//! fed-back stages are self-biased: an inverting stage with a plain input
+//! only (`NODES.md` §12 item 5, the final pass).
 //!
 //! Every case runs in stepped mode (`TESTING.md` rule 9), in its own binary
 //! (rule 5): the cases pin the process-global clock and its mode.
@@ -25,15 +29,17 @@ use std::time::{Duration, Instant};
 
 use embsim_board::netlist;
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EndpointRef, Finding, Harness, IdleDrive,
-    NetState, PartRegistry, PinDecl, PinKind, PulseDirection, PulseSegment, PulseTrain, PulseTx,
-    Scenario, StreamRole, System, SystemHandle,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, Drive,
+    EndpointRef, Finding, Harness, Level, NetState, PartRegistry, PeriodicSchedule, PinDecl,
+    PinHandle, Scenario, System, SystemHandle, TheveninDrive,
 };
 use embsim_boards::ec32mb::{Ec32mb, INVERTER_PART, NETLIST, TCXO_HZ, TCXO_PART};
 use embsim_boards::p2::{P2Package, P2PackageHandle};
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::logic_gate::{
-    self, LogicGate, LogicGateMonitor, Mode, LVC2G04_PINS_BY_FUNCTION, LVC2G04_R_OH_OHMS,
+    self, LogicGate, LogicGateMonitor, Mode, LVC1G14_PINS_SOT23, LVC1G14_T_PD_NS,
+    LVC2G04_PINS_BY_FUNCTION, LVC2G04_PINS_SOT363, LVC2G04_R_OH_OHMS, LVC2G04_R_OL_OHMS,
+    LVC2G04_T_PD_NS,
 };
 use embsim_models::oscillator::{self, Oscillator, OscillatorMonitor, TG2520SMN_START_UP_NS};
 use embsim_models::rail::AP62301_SOFT_START_NS;
@@ -71,13 +77,13 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 const SETTLE: Duration = Duration::from_secs(5);
 const MODULE: &str = "EC32MB";
 
-/// Every train a probe was delivered.
-type Trains = Arc<Mutex<Vec<PulseTrain>>>;
+/// Every segment a probe's net carried.
+type Trains = Arc<Mutex<Vec<PeriodicSchedule>>>;
 /// Every state a probe's net took.
 type States = Arc<Mutex<Vec<NetState>>>;
 
-/// A bench pulse sink: one pin that records every train it is delivered
-/// and every state its net takes.
+/// A bench probe: one sensed pin that records every state its net takes,
+/// and every segment a square wave on it carries.
 struct RateProbe {
     pins: [PinDecl; 1],
     trains: Trains,
@@ -88,14 +94,10 @@ impl RateProbe {
     /// A probe whose one pin is `number`, logging into the given vectors.
     fn logging(number: &'static str, trains: Trains, states: States) -> Self {
         Self {
-            pins: [PinDecl {
+            pins: [PinDecl::digital_in(
                 number,
-                name: None,
-                kind: PinKind::DigitalIn,
-                stream: Some(StreamRole::PulseSink),
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            }],
+                jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+            )],
             trains,
             states,
         }
@@ -117,9 +119,13 @@ impl Component for RateProbe {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let pin = self.pins[0].number;
         let trains = Arc::clone(&self.trains);
-        io.on_pulse(pin, move |train| trains.lock().unwrap().push(train))?;
         let states = Arc::clone(&self.states);
-        io.on_sense(pin, move |state| states.lock().unwrap().push(state))?;
+        io.on_net_report(pin, move |state| {
+            if let NetState::Periodic { segment, .. } = state {
+                trains.lock().unwrap().push(segment);
+            }
+            states.lock().unwrap().push(state);
+        })?;
         Ok(())
     }
 }
@@ -197,7 +203,7 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
         id: "oscillator.rate-reaches-xi",
         covers: Some("models/src/oscillator.rs#Oscillator"),
         given: "the P2-EC32MB module started live with its rails at their unmodelled level, \
-                a pulse probe on the P2's XI net, and virtual time then released",
+                a probe on the P2's XI net, and virtual time then released",
     });
     expect!(
         "held-before-start-up",
@@ -207,25 +213,31 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     );
     expect!(
         "twenty-megahertz-after-the-rails",
-        "once time runs, the probe on XI is delivered a 20 megahertz rate that began 3.5 \
-         milliseconds after the carrier's 5 volts arrived",
+        "once time runs, the XI net carries a 20 megahertz rate that began 3.5 milliseconds \
+         after the carrier's 5 volts arrived",
         "the core buck's datasheet soft-start is 2.5 ms and the TCXO's start-up 1.0 ms from \
          its supply, and the two inverter stages relay the rate across the coupling capacitor"
     );
     expect!(
-        "mid-rail-fixed-point",
-        "the self-biased input, the feedback node and the XI net all rest at half the \
-         inverters' supply",
-        "a stage carrying a rate drives the rate's time-average through its output \
-         resistance, and a 100 kilohm feedback resistor carries that average back to the \
-         input"
+        "chain-carries-the-segment",
+        "the self-biased input carries the TCXO's small swing, the feedback node and XI a \
+         full swing, all three with the TCXO's one segment",
+        "the coupling capacitor passes the TCXO's swing, each inverter stage drives its own \
+         two output levels around the segment it relays, and the 100 kilohm feedback resistor \
+         yields to the rate arriving across the capacitor"
+    );
+    expect!(
+        "tcxo-net-floats-at-dc",
+        "the TCXO's own output net floats",
+        "the datasheet names no DC level or source impedance for the clipped-sine output, so \
+         its clock sources nothing at DC"
     );
     expect!(
         "one-drive-per-stage",
-        "each inverter stage drives its output exactly once and relays the rate exactly \
-         once",
-        "the rate arrives as one event, the stage answers with one drive and one relay, and \
-         the level its own drive puts on its input changes nothing"
+        "each inverter stage drives its output exactly once, and that drive relays the rate \
+         between the part's own output levels",
+        "the rate arrives as one state, the stage answers with one drive, and the square wave \
+         its own drive puts back on its input is the same segment"
     );
     expect!(
         "clock-chain-escalates-nothing",
@@ -295,11 +307,7 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     system.release_time();
     assert!(
         wait_for(
-            || trains
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|t| t.pulses.freq_hz == TCXO_HZ),
+            || trains.lock().unwrap().iter().any(|t| t.freq_hz == TCXO_HZ),
             SETTLE
         ),
         "the rate reaches XI; delivered {:?}, findings {:?}",
@@ -307,35 +315,61 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
         system.findings()
     );
     let delivered = *trains.lock().unwrap().last().unwrap();
-    assert_eq!(delivered.pulses.freq_hz, 20_000_000);
-    assert_eq!(delivered.direction, PulseDirection::Forward);
+    assert_eq!(delivered.freq_hz, 20_000_000);
     assert_eq!(
-        delivered.pulses.since_us,
-        (AP62301_SOFT_START_NS + TG2520SMN_START_UP_NS) / 1_000,
+        delivered.since_ns,
+        AP62301_SOFT_START_NS + TG2520SMN_START_UP_NS,
         "published at the start-up instant: t_SS after the input arrived at t = 0, when the \
          core rail rose and the TCXO saw its supply, then t_str"
     );
     assert_eq!(tcxo.publish_count(), 1, "one publish, nothing per edge");
 
-    // The DC operating point the rate leaves behind.
+    // The square wave the rate puts on every node of the chain: the TCXO's
+    // own swing on the self-biased input, the inverters' full swing on the
+    // feedback node and on XI, one segment throughout.
     let u101 = watched.gate("U101");
-    let rail = u101.config().nominal_supply_volts;
-    for net in ["Net-(U101-2A)", "Net-(U101-2Y)", "XTAL_XI"] {
+    // The gate's `V_CC` as its supply pin is handed it: the bank rail it
+    // sits on, against the ground the fingers hold at 0 V.
+    let NetState::Analog(rail) = state(&system, "VIO_24_31") else {
+        panic!("U101's supply is a rail: {:?}", state(&system, "VIO_24_31"));
+    };
+    for (net, hi, lo) in [
+        ("Net-(U101-2A)", Level::Low, Level::Low),
+        ("Net-(U101-2Y)", Level::High, Level::Low),
+        ("XTAL_XI", Level::High, Level::Low),
+    ] {
+        let expected = NetState::Periodic {
+            hi,
+            lo,
+            segment: delivered,
+        };
         assert!(
-            wait_for(
-                || state(&system, net) == NetState::Analog(rail * 0.5),
-                SETTLE
-            ),
-            "{net} rests mid-rail; got {:?}",
+            wait_for(|| state(&system, net) == expected, SETTLE),
+            "{net} carries the TCXO's segment; got {:?}",
             state(&system, net)
         );
     }
+    assert_eq!(
+        state(&system, "Net-(X100-OUT)"),
+        NetState::Floating,
+        "the TCXO's clock sources nothing at DC"
+    );
     assert_eq!(u101.mode(1), Mode::Rate, "2A→2Y carries the rate");
     assert_eq!(u101.mode(0), Mode::Rate, "1A→1Y carries the rate");
     assert_eq!(
-        u101.output_drive(1).map(|d| d.impedance),
-        Some(LVC2G04_R_OH_OHMS),
-        "the average is driven through the datasheet output resistance"
+        u101.output(1),
+        Some(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: rail,
+                impedance: LVC2G04_R_OH_OHMS,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: LVC2G04_R_OL_OHMS,
+            },
+            segment: delivered,
+        }),
+        "the rate is relayed between the datasheet's own output ports"
     );
     assert_eq!(
         u101.drive_count(1),
@@ -358,7 +392,7 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
         !system
             .findings()
             .iter()
-            .any(|f| matches!(f, Finding::PulseNotCoupled { .. })),
+            .any(|f| matches!(f, Finding::PeriodicNotCoupled { .. })),
         "C132 couples 20 MHz: {:?}",
         system.findings()
     );
@@ -370,6 +404,56 @@ fn the_tcxo_rate_reaches_xi_across_the_coupling_capacitor() {
     );
 
     assert_eq!(state(&system, "XTAL_XO"), NetState::Floating);
+    drop(system);
+}
+
+/// The module's two 74LVC2G04s as the build finds them: `U101`'s second
+/// stage has `R101` (100 kΩ) from `2Y` back to `2A`, so its input is
+/// self-biased and relays the TCXO's 0.8 V swing coupled onto it; its first
+/// stage (`1A` on the `2Y` node) and both stages of the LED buffer `U601`
+/// have no resistor back from their output, so a clock must cross their
+/// input thresholds to be relayed.
+#[rstest]
+fn only_the_oscillator_buffers_fed_back_stage_is_self_biased() {
+    behaviour!(Test {
+        id: "logic-gate.self-bias-from-the-netlist",
+        covers: Some("models/src/logic_gate.rs#LogicGate"),
+        given: "the P2-EC32MB module built from its vendor netlist, whose oscillator inverter \
+                has a 100 kilohm resistor from its second output back to its second input",
+    });
+    expect!(
+        "fed-back-stage-self-biased",
+        "that stage's input is treated as self-biased: any running clock it carries is relayed",
+        "the resistor holds the input at the stage's own switching point, so a swing coupled \
+         onto it crosses that point every cycle"
+    );
+    expect!(
+        "other-stages-plain",
+        "the oscillator inverter's first stage and both stages of the LED inverter are plain \
+         inputs, whose clock must cross their thresholds"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let watched = Watched::default();
+    let system = System::new()
+        .board(MODULE, watched.board())
+        .harness(
+            Harness::new()
+                .power(ep("CARRIER.5V"), ep(&format!("{MODULE}.J203.41")), 5.0)
+                .power(ep("CARRIER.GND"), ep(&format!("{MODULE}.J203.43")), 0.0),
+        )
+        .hold_time()
+        .start()
+        .expect("the module starts");
+    let u101 = watched.gate("U101");
+    let u601 = watched.gate("U601");
+    assert!(u101.self_biased(1), "R101 joins 2Y back to 2A");
+    assert!(!u101.self_biased(0), "nothing joins 1Y back to 1A");
+    assert!(
+        !u601.self_biased(0) && !u601.self_biased(1),
+        "the LED buffer"
+    );
     drop(system);
 }
 
@@ -396,10 +480,23 @@ const COUPLING_FIXTURE: &str = r#"(export (version "E")
     (net (code "3") (name "GND") (class "Default")
       (node (ref "R1") (pin "2") (pintype "passive")))))"#;
 
-/// A source that publishes one 20 MHz train when the system starts.
+/// A clock buffer that drives one 20 MHz square wave from 0 V to
+/// `hi_volts` — rail to rail at 3.3 V on the coupling fixtures — at 25 Ω,
+/// when the system starts.
 struct Src {
     pins: [PinDecl; 1],
-    tx: Option<PulseTx>,
+    out: Option<PinHandle>,
+    hi_volts: f64,
+}
+
+impl Src {
+    fn swinging_to(hi_volts: f64) -> Self {
+        Self {
+            pins: [PinDecl::digital_out("OUT").with_idle(None)],
+            out: None,
+            hi_volts,
+        }
+    }
 }
 
 impl Component for Src {
@@ -408,38 +505,33 @@ impl Component for Src {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        self.tx = Some(io.pulse_tx("OUT")?);
+        self.out = Some(io.pin("OUT")?);
         Ok(())
     }
 
     fn start(&mut self) {
-        self.tx.as_ref().unwrap().set_train(PulseTrain {
-            pulses: PulseSegment {
+        self.out.as_ref().unwrap().drive(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: self.hi_volts,
+                impedance: 25.0,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: 25.0,
+            },
+            segment: PeriodicSchedule {
                 emitted: 0,
                 freq_hz: 20_000_000,
                 total: None,
-                since_us: 0,
+                since_ns: 0,
             },
-            direction: PulseDirection::Forward,
         });
     }
 }
 
-fn coupling_board(fixture: &str, delivered: Arc<Mutex<Vec<PulseTrain>>>) -> Board {
+fn coupling_board(fixture: &str, delivered: Trains) -> Board {
     let mut registry = PartRegistry::new();
-    registry.register("Src", |_decl| {
-        Box::new(Src {
-            pins: [PinDecl {
-                number: "OUT",
-                name: None,
-                kind: PinKind::DigitalOut,
-                stream: Some(StreamRole::PulseSource),
-                drive_impedance: None,
-                idle: IdleDrive::Released,
-            }],
-            tx: None,
-        })
-    });
+    registry.register("Src", |_decl| Box::new(Src::swinging_to(3.3)));
     registry.register("Snk", move |_decl| {
         Box::new(RateProbe::logging(
             "A",
@@ -462,26 +554,27 @@ fn a_rate_crosses_a_capacitor_only_when_its_reactance_is_small_against_the_far_n
 ) {
     behaviour!(Test {
         id: "engine.rate-through-capacitor",
-        covers: Some("board/src/engine.rs#Resolver::route_pulses"),
-        given: "a 20 megahertz pulse source reaching a pulse sink only through a series \
-                capacitor, the sink's node tied to ground through 1 kilohm, the capacitor \
-                10 picofarads or 100 nanofarads",
+        covers: Some("board/src/engine.rs#overlay_arrivals"),
+        given: "a 20 megahertz clock reaching a sensing pin only through a series capacitor, \
+                the sensing pin's node tied to ground through 1 kilohm, the capacitor 10 \
+                picofarads or 100 nanofarads",
     });
     expect!(
         "coupled-when-reactance-is-small",
-        "with 100 nanofarads the sink is delivered the rate",
+        "with 100 nanofarads the sensing pin's node carries the clock's rate",
         "the capacitor's reactance at the rate is far below a tenth of the resistance at \
          the node it feeds, so for the signal it is a short"
     );
     expect!(
         "stopped-when-reactance-is-large",
-        "with 10 picofarads the sink is delivered nothing, and the run reports which \
+        "with 10 picofarads the sensing pin is handed no rate, and the run reports which \
          capacitor stopped which rate with the two impedances it compared",
         "796 ohms of reactance against a 1 kilohm node divides the signal away"
     );
     expect!(
         "dc-stays-open",
-        "at DC the sink's node is ground through its resistor either way",
+        "with the rate refused, the sensing pin's node is ground through its 1 kilohm \
+         resistor alone",
         "a coupling capacitor is a path for a rate and never a conduction edge"
     );
 
@@ -503,7 +596,7 @@ fn a_rate_crosses_a_capacitor_only_when_its_reactance_is_small_against_the_far_n
 
     let not_coupled = || {
         system.findings().into_iter().find_map(|f| match f {
-            Finding::PulseNotCoupled {
+            Finding::PeriodicNotCoupled {
                 net,
                 capacitor,
                 hz,
@@ -519,7 +612,15 @@ fn a_rate_crosses_a_capacitor_only_when_its_reactance_is_small_against_the_far_n
             "the rate crosses 100 nF: findings {:?}",
             system.findings()
         );
-        assert_eq!(delivered.lock().unwrap()[0].pulses.freq_hz, 20_000_000);
+        assert_eq!(delivered.lock().unwrap()[0].freq_hz, 20_000_000);
+        assert!(
+            matches!(
+                system.net_state("B.IN"),
+                Some(NetState::Periodic { segment, .. }) if segment.freq_hz == 20_000_000
+            ),
+            "the far node carries the rate: {:?}",
+            system.net_state("B.IN")
+        );
         assert_eq!(not_coupled(), None);
     } else {
         assert!(
@@ -538,12 +639,12 @@ fn a_rate_crosses_a_capacitor_only_when_its_reactance_is_small_against_the_far_n
         assert_eq!(far, 1_000.0);
         std::thread::sleep(Duration::from_millis(50));
         assert!(delivered.lock().unwrap().is_empty(), "nothing crossed");
+        assert_eq!(
+            system.net_state("B.IN"),
+            Some(NetState::Pulled(Level::Low, 1_000.0)),
+            "at DC the capacitor is open and the node is ground through R1"
+        );
     }
-    assert_eq!(
-        system.net_state("B.IN"),
-        Some(NetState::Pulled(embsim_board::Level::Low, 1_000.0)),
-        "at DC the capacitor is open and the node is ground through R1"
-    );
     drop(system);
 }
 
@@ -602,8 +703,8 @@ const SHARED_DECOUPLING_FIXTURE: &str = r#"(export (version "E")
       (node (ref "X2") (pin "OUT") (pintype "output"))
       (node (ref "C2") (pin "1") (pintype "passive")))))"#;
 
-/// The findings a run reports about pulse routing, for the assertions
-/// below.
+/// The findings a run reports about the clocks, for the assertions below:
+/// a fight, or a rate a capacitor refused.
 fn routing_findings(system: &SystemHandle) -> Vec<Finding> {
     system
         .findings()
@@ -611,7 +712,7 @@ fn routing_findings(system: &SystemHandle) -> Vec<Finding> {
         .filter(|f| {
             matches!(
                 f,
-                Finding::StreamMismatch { .. } | Finding::PulseNotCoupled { .. }
+                Finding::Contention { .. } | Finding::PeriodicNotCoupled { .. }
             )
         })
         .collect()
@@ -625,27 +726,28 @@ fn routing_findings(system: &SystemHandle) -> Vec<Finding> {
 fn a_terminal_shunts_a_rate_coupled_into_it(#[case] held: bool, #[case] crosses: bool) {
     behaviour!(Test {
         id: "engine.terminal-shunts-a-coupled-rate",
-        covers: Some("board/src/engine.rs#Resolver::route_pulses"),
-        given: "a 20 megahertz pulse source reaching a pulse sink only through two 100 \
-                nanofarad capacitors in series with a ground node between them, the sink's \
-                node biased to that ground through 1 kilohm, and the ground either held at 0 \
-                volts by the scenario or left undeclared",
+        covers: Some("board/src/engine.rs#overlay_arrivals"),
+        given: "a 20 megahertz clock reaching a sensing pin only through two 100 nanofarad \
+                capacitors in series with a ground node between them, the sensing pin's node \
+                biased to that ground through 1 kilohm, and the ground either held at 0 volts \
+                by the scenario or left undeclared",
     });
     expect!(
         "shunted-at-a-terminal",
-        "with the ground held at 0 volts the sink is delivered nothing and the run raises no \
-         routing finding",
+        "with the ground held at 0 volts the sensing pin is handed no rate and the run \
+         reports neither a fight nor a refused rate",
         "a held node is an AC short to its reference, and a rate coupled into it ends there"
     );
     expect!(
         "crossed-when-undeclared",
-        "with the ground undeclared the sink is delivered the 20 megahertz rate",
+        "with the ground undeclared the sensing pin's node carries the 20 megahertz rate",
         "an undeclared node is one more node on the path, and two capacitors in series still \
          couple the rate"
     );
     expect!(
         "dc-stays-open",
-        "at DC the sink's node is its ground through the resistor either way",
+        "with the ground held, the sensing pin's node is that ground through its 1 kilohm \
+         resistor",
         "a coupling capacitor is a path for a rate and never a conduction edge"
     );
 
@@ -669,7 +771,7 @@ fn a_terminal_shunts_a_rate_coupled_into_it(#[case] held: bool, #[case] crosses:
             "two capacitors in series couple the rate through an undeclared node: findings {:?}",
             system.findings()
         );
-        assert_eq!(delivered.lock().unwrap()[0].pulses.freq_hz, 20_000_000);
+        assert_eq!(delivered.lock().unwrap()[0].freq_hz, 20_000_000);
     } else {
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -678,17 +780,12 @@ fn a_terminal_shunts_a_rate_coupled_into_it(#[case] held: bool, #[case] crosses:
             delivered.lock().unwrap()
         );
         assert_eq!(routing_findings(&system), Vec::<Finding>::new());
+        assert_eq!(
+            system.net_state("B.IN"),
+            Some(NetState::Pulled(Level::Low, 1_000.0)),
+            "at DC both capacitors are open and the node is its ground through R1"
+        );
     }
-    let expected = if held {
-        NetState::Pulled(embsim_board::Level::Low, 1_000.0)
-    } else {
-        NetState::Floating
-    };
-    assert_eq!(
-        system.net_state("B.IN"),
-        Some(expected),
-        "at DC both capacitors are open and the node is its ground through R1"
-    );
     drop(system);
 }
 
@@ -700,34 +797,35 @@ fn a_terminal_shunts_a_rate_coupled_into_it(#[case] held: bool, #[case] crosses:
 fn two_sources_decoupled_to_one_terminal_do_not_face_each_other(#[case] held: bool) {
     behaviour!(Test {
         id: "engine.shared-decoupling-is-not-a-fight",
-        covers: Some("board/src/engine.rs#Resolver::route_pulses"),
-        given: "two 20 megahertz pulse sources each decoupled to one ground node through 100 \
-                nanofarads, a pulse sink on the first source's net, which 1 kilohm biases to \
+        covers: Some("board/src/engine.rs#overlay_arrivals"),
+        given: "two 20 megahertz clocks each decoupled to one ground node through 100 \
+                nanofarads, a sensing pin on the first clock's net, which 1 kilohm biases to \
                 that ground, and the ground either held at 0 volts by the scenario or left \
                 undeclared",
     });
     expect!(
         "no-mismatch-at-a-terminal",
-        "with the ground held at 0 volts the run reports no sources facing each other",
+        "with the ground held at 0 volts the run reports no fight between the clocks",
         "the two capacitors meet only at a held node, which shunts each rate and carries \
-         neither across to the other source"
+         neither across to the other clock"
     );
     expect!(
         "delivered-at-a-terminal",
-        "with the ground held at 0 volts the sink is delivered its own source's rate",
-        "the sink shares the first source's net, and the shunt at the ground touches nothing \
-         on it"
+        "with the ground held at 0 volts the sensing pin's net carries its own clock's rate",
+        "the sensing pin shares the first clock's net, and the shunt at the ground touches \
+         nothing on it"
     );
     expect!(
         "facing-when-undeclared",
-        "with the ground undeclared the run reports the two sources facing each other on the \
-         first source's net",
-        "an undeclared node between two capacitors is a path from one source to the other"
+        "undeclared, it is a fight: one contention finding names both clocks where the sensing \
+         pin reads",
+        "an undeclared node between two capacitors is a path from one clock to the other, and \
+         two rates on one net are contention"
     );
     expect!(
         "undelivered-when-facing",
-        "with the ground undeclared the sink is delivered nothing",
-        "a net two sources reach carries neither cleanly"
+        "with the ground undeclared the first clock's net ends in contention, carrying no rate",
+        "a net two clocks reach carries neither cleanly"
     );
 
     let _lock = suite_lock();
@@ -747,43 +845,278 @@ fn two_sources_decoupled_to_one_terminal_do_not_face_each_other(#[case] held: bo
         .start()
         .expect("the fixture starts");
 
-    let facing: Vec<(String, Vec<String>)> = system
-        .findings()
-        .into_iter()
-        .filter_map(|f| match f {
-            Finding::StreamMismatch { net, producers } => Some((
-                net,
-                producers
-                    .iter()
-                    .map(|p| format!("{}.{}", p.reference, p.pin))
-                    .collect(),
-            )),
-            _ => None,
-        })
-        .collect();
+    let facing = || -> Vec<(String, Vec<String>)> {
+        system
+            .findings()
+            .into_iter()
+            .filter_map(|f| match f {
+                Finding::Contention { net, drivers } => Some((
+                    net,
+                    drivers
+                        .iter()
+                        .map(|p| format!("{}.{}", p.reference, p.pin))
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    };
     if held {
-        assert_eq!(facing, Vec::<(String, Vec<String>)>::new());
         assert!(
             wait_for(|| !delivered.lock().unwrap().is_empty(), SETTLE),
-            "the sink on X1's own net is delivered X1's rate: findings {:?}",
+            "the sensing pin on X1's own net sees X1's rate: findings {:?}",
             system.findings()
         );
-        assert_eq!(delivered.lock().unwrap()[0].pulses.freq_hz, 20_000_000);
+        assert_eq!(delivered.lock().unwrap()[0].freq_hz, 20_000_000);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(facing(), Vec::<(String, Vec<String>)>::new());
         assert_eq!(routing_findings(&system), Vec::<Finding>::new());
     } else {
-        assert_eq!(
-            facing,
-            vec![(
-                "B.OSC1".to_string(),
-                vec!["X1.OUT".to_string(), "X2.OUT".to_string()]
-            )],
-            "through an undeclared node the two sources reach each other"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+        let on_osc1 = || {
+            facing()
+                .into_iter()
+                .find(|(net, _)| net == "B.OSC1")
+                .map(|(_, mut pins)| {
+                    pins.sort();
+                    pins
+                })
+        };
         assert!(
-            delivered.lock().unwrap().is_empty(),
-            "a net two sources face on carries neither"
+            wait_for(|| on_osc1().is_some(), SETTLE),
+            "through an undeclared node the two clocks reach each other: {:?}",
+            system.findings()
+        );
+        assert_eq!(
+            on_osc1(),
+            Some(vec!["X1.OUT".to_string(), "X2.OUT".to_string()])
+        );
+        assert!(
+            wait_for(
+                || system.net_state("B.OSC1") == Some(NetState::Contention),
+                SETTLE
+            ),
+            "a net two clocks reach carries neither: {:?}",
+            system.net_state("B.OSC1")
         );
     }
+    drop(system);
+}
+
+// ============================================================
+// Which fed-back stages are self-biased
+// ============================================================
+
+/// Three stages on one bench, each with `R` (100 kΩ) from its output back
+/// to its input and `C` (100 nF) coupling one 0.8 V, 20 MHz swing from `X1`
+/// onto that input: `U1` a 74LVC2G04 inverter (`1A`, `1Y`), `U2` a buffer
+/// with the 74LVC2G04's input figures on the same pins, `U3` an
+/// SN74LVC1G14 Schmitt inverter (`A`, `Y`). Every other pin is on a net of
+/// its own; the supplies are the harness's.
+const FED_BACK_FIXTURE: &str = r#"(export (version "E")
+  (components
+    (comp (ref "X1") (value "Swing"))
+    (comp (ref "U1") (value "Inverter"))
+    (comp (ref "U2") (value "Buffer"))
+    (comp (ref "U3") (value "Schmitt"))
+    (comp (ref "C1") (value "100nF") (libsource (lib "Device") (part "C_Small") (description "")))
+    (comp (ref "C2") (value "100nF") (libsource (lib "Device") (part "C_Small") (description "")))
+    (comp (ref "C3") (value "100nF") (libsource (lib "Device") (part "C_Small") (description "")))
+    (comp (ref "R1") (value "100k") (libsource (lib "Device") (part "R_Small") (description "")))
+    (comp (ref "R2") (value "100k") (libsource (lib "Device") (part "R_Small") (description "")))
+    (comp (ref "R3") (value "100k") (libsource (lib "Device") (part "R_Small") (description ""))))
+  (nets
+    (net (code "1") (name "OSC")
+      (node (ref "X1") (pin "OUT")) (node (ref "C1") (pin "1"))
+      (node (ref "C2") (pin "1")) (node (ref "C3") (pin "1")))
+    (net (code "2") (name "A1") (node (ref "C1") (pin "2")) (node (ref "R1") (pin "1")) (node (ref "U1") (pin "1")))
+    (net (code "3") (name "Y1") (node (ref "R1") (pin "2")) (node (ref "U1") (pin "6")))
+    (net (code "4") (name "A2") (node (ref "C2") (pin "2")) (node (ref "R2") (pin "1")) (node (ref "U2") (pin "1")))
+    (net (code "5") (name "Y2") (node (ref "R2") (pin "2")) (node (ref "U2") (pin "6")))
+    (net (code "6") (name "A3") (node (ref "C3") (pin "2")) (node (ref "R3") (pin "1")) (node (ref "U3") (pin "2")))
+    (net (code "7") (name "Y3") (node (ref "R3") (pin "2")) (node (ref "U3") (pin "4")))
+    (net (code "8") (name "VCC") (node (ref "U1") (pin "5")) (node (ref "U2") (pin "5")) (node (ref "U3") (pin "5")))
+    (net (code "9") (name "GND") (node (ref "U1") (pin "2")) (node (ref "U2") (pin "2")) (node (ref "U3") (pin "3")))
+    (net (code "10") (name "U1_2A") (node (ref "U1") (pin "3")))
+    (net (code "11") (name "U1_2Y") (node (ref "U1") (pin "4")))
+    (net (code "12") (name "U2_2A") (node (ref "U2") (pin "3")))
+    (net (code "13") (name "U2_2Y") (node (ref "U2") (pin "4")))
+    (net (code "14") (name "U3_NC") (node (ref "U3") (pin "1")))))"#;
+
+/// The TCXO's swing on the EC32MB, 0.8 V (`oscillator::TG2520SMN`'s
+/// clipped sine), as a bench square wave.
+const SWING_VOLTS: f64 = 0.8;
+
+/// The fed-back bench: the three stages' monitors by reference.
+fn fed_back_board(gates: &Arc<Mutex<HashMap<String, LogicGateMonitor>>>) -> Board {
+    let mut registry = PartRegistry::new();
+    registry.register("Swing", |_decl| Box::new(Src::swinging_to(SWING_VOLTS)));
+    let parts: [(&str, logic_gate::Config, &'static [logic_gate::GatePin]); 3] = [
+        (
+            "Inverter",
+            logic_gate::Config::lvc2g04(),
+            &LVC2G04_PINS_SOT363,
+        ),
+        (
+            "Buffer",
+            logic_gate::Config {
+                inverting: false,
+                ..logic_gate::Config::lvc2g04()
+            },
+            &LVC2G04_PINS_SOT363,
+        ),
+        (
+            "Schmitt",
+            logic_gate::Config::lvc1g14(),
+            &LVC1G14_PINS_SOT23,
+        ),
+    ];
+    for (value, config, pins) in parts {
+        let gates = Arc::clone(gates);
+        registry.register(value, move |decl| {
+            let gate = LogicGate::new(config.clone(), pins).expect("valid");
+            gates
+                .lock()
+                .unwrap()
+                .insert(decl.reference.clone(), gate.monitor());
+            Box::new(gate)
+        });
+    }
+    let parsed = netlist::parse(FED_BACK_FIXTURE).expect("the fixture parses");
+    Board::from_netlist(parsed, &registry).expect("the fixture builds")
+}
+
+/// The virtual time the fed-back case hands the engine before it reads:
+/// 1 ms, past every instant the bench arms — each stage's `t_pd`
+/// (74LVC2G04 and SN74LVC1G14, 5 ns on the wheel: [`LVC2G04_T_PD_NS`],
+/// [`LVC1G14_T_PD_NS`]); the swing is driven at start. The window is the
+/// harness's: any span past the longest armed instant reads the same.
+const FED_BACK_SETTLE_NS: u64 = 1_000_000;
+const _: () = assert!(FED_BACK_SETTLE_NS > LVC2G04_T_PD_NS && FED_BACK_SETTLE_NS > LVC1G14_T_PD_NS);
+
+/// The build's self-bias test is the circuit's: a resistor from a stage's
+/// output back to its input rests the input at the stage's own switching
+/// point only on an inverting stage with a plain input. On the buffer it is
+/// positive feedback, holding the input at the rail its output drives, and
+/// the buffer reads the swing through its thresholds as what it is there:
+/// 0.8 V is at the 74LVC2G04's `V_IL` max (0.8 V, Table 7), a steady low.
+/// On the Schmitt inverter the resistor charges `C` toward the output until
+/// a threshold flips it — a relaxation oscillator's shape (`R`·`C` = 10 ms),
+/// no bias — and the engine does not model that relaxation: it hands the
+/// coupled input the swing without the DC `R` sets (`NODES.md` §12 item 5,
+/// the final pass, Open). So of the Schmitt stage the case asserts what the
+/// build decided and the circuit supports: it is not self-biased, and its
+/// output drives levels, relaying none of the swing.
+///
+/// The case's thread is a registered actor from the moment the system is
+/// assembled, and reads only after a settle ([`FED_BACK_SETTLE_NS`] of
+/// virtual time), so each read is the bench at rest — never a wall-clock
+/// poll a stage's first drive could satisfy on its way elsewhere.
+#[rstest]
+fn only_an_inverting_stage_with_a_plain_input_is_self_biased() {
+    behaviour!(Test {
+        id: "logic-gate.self-bias-needs-a-plain-inverter",
+        covers: Some("models/src/logic_gate.rs#Config::biases_itself"),
+        given: "a 74LVC2G04 inverter, a non-inverting stage with its inputs and an \
+                SN74LVC1G14 Schmitt inverter, each fed back through 100 kilohms, with one 0.8 \
+                volt, 20 megahertz swing coupled onto their inputs",
+    });
+    expect!(
+        "inverter-relays",
+        "the inverter relays the swing at its own rate between the part's own output levels",
+        "the resistor returns the inverter's average output to its input, which rests at the \
+         stage's own switching point, so the swing crosses that point every cycle"
+    );
+    expect!(
+        "non-inverting-reads-a-steady-low",
+        "the non-inverting stage reads the swing as a steady low and holds its output low",
+        "on a stage that does not invert, the resistor is positive feedback that holds the \
+         input at the rail the output drives, and 0.8 volts is at the input's low threshold"
+    );
+    expect!(
+        "schmitt-drives-levels",
+        "the Schmitt inverter drives its output as levels and relays none of the swing's cycles",
+        "through a resistor from its output a Schmitt input charges toward that output until a \
+         threshold flips it, and never rests at a switching point for the swing to cross"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let gates = Arc::new(Mutex::new(HashMap::new()));
+    let system = System::new()
+        .board("B", fed_back_board(&gates))
+        .harness(
+            Harness::new()
+                .power(ep("BENCH.3V3"), ep("B.U1.5"), 3.3)
+                .power(ep("BENCH.GND"), ep("B.U1.2"), 0.0),
+        )
+        .hold_time()
+        .start()
+        .expect("the bench starts");
+    let actor = virtual_clock::register_actor("fed-back-case");
+    system.release_time();
+    virtual_clock::wait_virtual_ns(FED_BACK_SETTLE_NS);
+
+    let gate = |reference: &str| gates.lock().unwrap()[reference].clone();
+    let (inverter, buffer, schmitt) = (gate("U1"), gate("U2"), gate("U3"));
+    let segment = PeriodicSchedule {
+        emitted: 0,
+        freq_hz: 20_000_000,
+        total: None,
+        since_ns: 0,
+    };
+
+    assert!(inverter.self_biased(0), "R1 joins 1Y back to 1A");
+    assert!(!buffer.self_biased(0), "R2 joins 1Y back to 1A on a buffer");
+    assert!(
+        !schmitt.self_biased(0),
+        "R3 joins Y back to A on a Schmitt input"
+    );
+
+    assert_eq!(
+        inverter.output(0),
+        Some(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: LVC2G04_R_OH_OHMS,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: LVC2G04_R_OL_OHMS,
+            },
+            segment,
+        }),
+        "the inverter relays the swing: findings {:?}",
+        system.findings()
+    );
+    assert_eq!(
+        buffer.output_drive(0),
+        Some(TheveninDrive {
+            volts: 0.0,
+            impedance: LVC2G04_R_OL_OHMS,
+        }),
+        "the buffer drives a steady low: findings {:?}",
+        system.findings()
+    );
+    assert_eq!((buffer.mode(0), buffer.train_count(0)), (Mode::Level, 0));
+    assert_eq!(
+        (schmitt.mode(0), schmitt.train_count(0)),
+        (Mode::Level, 0),
+        "the Schmitt inverter drives levels and relays nothing: findings {:?}",
+        system.findings()
+    );
+    let findings = system.findings();
+    assert!(
+        !findings
+            .iter()
+            .any(|f| matches!(f, Finding::PeriodicNotCoupled { .. })),
+        "100 nF couples 20 MHz onto a 100 kΩ node: {findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| matches!(f, Finding::QuiescenceTimeout { .. })),
+        "the engine waited for the case's thread at every advance: {findings:?}"
+    );
+    drop(actor);
     drop(system);
 }
