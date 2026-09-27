@@ -17,10 +17,11 @@
 //! # Threading
 //!
 //! Nothing on a net-resolution path may block on a file descriptor, so reading
-//! the host is a pump thread's job. The engine thread only ever *queues* bytes
-//! for the host (`deliver`) and the pump drains whatever the PTY would not
-//! take — see that function for why dropping instead would be much worse than
-//! it looks.
+//! the host is a pump thread's job. The engine thread queues guest bytes and
+//! makes one non-blocking write attempt (`deliver`); the pump drains whatever
+//! the PTY would not take — see that function for why dropping instead would
+//! be much worse than it looks. The pump reads the host only while the wire
+//! queue has room, and counts every byte it has to shed.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
@@ -53,6 +54,41 @@ const PUMP_WRITE_CHUNK: usize = 4096;
 /// it. Only a host that has genuinely stopped reading reaches this.
 const OUTBOUND_MAX: usize = 1 << 20;
 
+/// Counts a [`HostPty`] publishes so a test can see a dropped byte.
+///
+/// Taken with [`HostPty::counters`] before the component is moved into a
+/// system. Every field is monotonic.
+pub struct HostPtyCounters {
+    /// Guest bytes the PTY accepted.
+    pub to_host: AtomicU64,
+    /// Host bytes accepted onto the wire.
+    pub from_host: AtomicU64,
+    /// Frames the wire delivered that failed their stop bit.
+    pub framing_errors: AtomicU64,
+    /// Guest bytes discarded because the host stopped reading.
+    pub dropped_outbound: AtomicU64,
+    /// Host bytes the wire queue would not take.
+    pub shed_inbound: AtomicU64,
+}
+
+impl std::fmt::Debug for HostPtyCounters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostPtyCounters")
+            .field("to_host", &self.to_host.load(Ordering::Relaxed))
+            .field("from_host", &self.from_host.load(Ordering::Relaxed))
+            .field(
+                "framing_errors",
+                &self.framing_errors.load(Ordering::Relaxed),
+            )
+            .field(
+                "dropped_outbound",
+                &self.dropped_outbound.load(Ordering::Relaxed),
+            )
+            .field("shed_inbound", &self.shed_inbound.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// A serial link whose far end is a PTY the host can open.
 pub struct HostPty {
     pins: [PinDecl; 2],
@@ -60,13 +96,11 @@ pub struct HostPty {
     /// Kept alive for the component's life: dropping it closes the PTY and
     /// removes the symlink.
     pty: Pty,
-    bridge: Arc<Mutex<Option<Arc<SerialLevelBridge>>>>,
+    counters: Arc<HostPtyCounters>,
     shutdown: Arc<AtomicBool>,
     pump: Option<JoinHandle<()>>,
     /// Guest bytes the PTY has not accepted yet. See `deliver`.
     outbound: Arc<Mutex<VecDeque<u8>>>,
-    /// Bytes discarded because the host stopped reading entirely.
-    dropped: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for HostPty {
@@ -95,9 +129,14 @@ impl HostPty {
             ],
             framing: UartFraming::new_8n1(baud_hz),
             pty: Pty::new(symlink_path)?,
-            bridge: Arc::new(Mutex::new(None)),
+            counters: Arc::new(HostPtyCounters {
+                to_host: AtomicU64::new(0),
+                from_host: AtomicU64::new(0),
+                framing_errors: AtomicU64::new(0),
+                dropped_outbound: AtomicU64::new(0),
+                shed_inbound: AtomicU64::new(0),
+            }),
             outbound: Arc::new(Mutex::new(VecDeque::new())),
-            dropped: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             pump: None,
         })
@@ -108,23 +147,9 @@ impl HostPty {
         &self.pty.symlink_path
     }
 
-    /// Outbound bytes discarded because the host stopped reading.
-    ///
-    /// The pump queues guest bytes when the PTY will not accept them; only when
-    /// that queue exceeds its hold limit are bytes dropped and counted here.
-    /// Happy-path tests assert this is zero after a successful round-trip —
-    /// see the note on the overflow path in `drain_outbound`.
-    pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-
-    /// Shared view of [`Self::dropped`]'s atomic.
-    ///
-    /// Take a clone before moving this component into a [`crate::System`]: after
-    /// attach the `HostPty` itself is no longer reachable, but the counter still
-    /// is. Loads use the same `Ordering::Relaxed` as [`Self::dropped`].
-    pub fn dropped_counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.dropped)
+    /// The counters, shared with the pump after this component is moved.
+    pub fn counters(&self) -> Arc<HostPtyCounters> {
+        Arc::clone(&self.counters)
     }
 }
 
@@ -143,14 +168,14 @@ impl Component for HostPty {
         // An idle asynchronous line still drives: without it the far end has no
         // reference against which the first start bit is a falling edge.
         bridge.idle();
-        *self.bridge.lock().expect("bridge slot never poisoned") = Some(Arc::clone(&bridge));
 
         let master: RawFd = self.pty.master.as_raw_fd();
+        let counters = Arc::clone(&self.counters);
 
         // Net → host: whatever the wire spells goes out the PTY.
         {
             let (bridge, shutdown) = (Arc::clone(&bridge), Arc::clone(&self.shutdown));
-            let (outbound, dropped) = (Arc::clone(&self.outbound), Arc::clone(&self.dropped));
+            let (outbound, counters) = (Arc::clone(&self.outbound), Arc::clone(&counters));
             let rx = io.pin("RX")?;
             io.on_sense("RX", move |sense| {
                 if shutdown.load(Ordering::Relaxed) {
@@ -159,19 +184,19 @@ impl Component for HostPty {
                 deliver(
                     master,
                     &outbound,
-                    &dropped,
+                    &counters,
                     bridge.receive_sense(&rx, &sense),
                 );
             })?;
         }
         {
             let (bridge, shutdown) = (Arc::clone(&bridge), Arc::clone(&self.shutdown));
-            let (outbound, dropped) = (Arc::clone(&self.outbound), Arc::clone(&self.dropped));
+            let (outbound, counters) = (Arc::clone(&self.outbound), Arc::clone(&counters));
             io.on_wake_ns(move |now_ns| {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                deliver(master, &outbound, &dropped, bridge.service(now_ns));
+                deliver(master, &outbound, &counters, bridge.service(now_ns));
             });
         }
 
@@ -182,8 +207,8 @@ impl Component for HostPty {
         let thread = std::thread::Builder::new()
             .name("host-pty-pump".to_string())
             .spawn({
-                let (outbound, dropped) = (Arc::clone(&self.outbound), Arc::clone(&self.dropped));
-                move || pump_loop(master, &bridge, &shutdown, &outbound, &dropped)
+                let (outbound, counters) = (Arc::clone(&self.outbound), counters);
+                move || pump_loop(master, &bridge, &shutdown, &outbound, &counters)
             })
             .map_err(|e| AttachError::Failed {
                 message: format!("host PTY: cannot spawn pump thread: {e}"),
@@ -215,7 +240,7 @@ impl Drop for HostPty {
 fn deliver(
     master: RawFd,
     outbound: &Mutex<VecDeque<u8>>,
-    dropped: &AtomicU64,
+    counters: &HostPtyCounters,
     frames: Vec<Result<u8, FramingError>>,
 ) {
     let mut queue = outbound.lock().expect("outbound queue never poisoned");
@@ -223,18 +248,19 @@ fn deliver(
         match frame {
             Ok(byte) => queue.push_back(byte),
             Err(error) => {
+                counters.framing_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(?error, "host PTY: frame dropped (bad framing on the wire)")
             }
         }
     }
-    drain_outbound(master, &mut queue, dropped);
+    drain_outbound(master, &mut queue, counters);
 }
 
 /// Write as much of the queue as the PTY will accept, and keep the rest.
 ///
 /// Returns having written nothing if the master is full; that is the normal
 /// case under load, not an error.
-fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, dropped: &AtomicU64) {
+fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, counters: &HostPtyCounters) {
     while !queue.is_empty() {
         let take = queue.len().min(PUMP_WRITE_CHUNK);
         let chunk: Vec<u8> = queue.iter().take(take).copied().collect();
@@ -246,6 +272,9 @@ fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, dropped: &AtomicU64) 
             Ok(0) => break,
             Ok(written) => {
                 queue.drain(..written);
+                counters
+                    .to_host
+                    .fetch_add(written as u64, Ordering::Relaxed);
             }
             // The PTY is full; the pump retries. EWOULDBLOCK is the same
             // errno as EAGAIN on every platform this builds for.
@@ -257,11 +286,13 @@ fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, dropped: &AtomicU64) 
         }
     }
     // Only a host that has truly stopped reading gets here. Counted, not
-    // logged, so a test can assert `HostPty::dropped()` is zero.
+    // logged, so a test can assert `dropped_outbound` is zero.
     if queue.len() > OUTBOUND_MAX {
         let excess = queue.len() - OUTBOUND_MAX;
         queue.drain(..excess);
-        dropped.fetch_add(excess as u64, Ordering::Relaxed);
+        counters
+            .dropped_outbound
+            .fetch_add(excess as u64, Ordering::Relaxed);
     }
 }
 
@@ -271,25 +302,30 @@ fn pump_loop(
     bridge: &SerialLevelBridge,
     shutdown: &AtomicBool,
     outbound: &Mutex<VecDeque<u8>>,
-    dropped: &AtomicU64,
+    counters: &HostPtyCounters,
 ) {
     let mut buf = [0u8; PUMP_READ_CHUNK];
     while !shutdown.load(Ordering::Relaxed) {
         // Anything the engine could not hand over goes now. `POLLOUT` only
         // when there is something waiting, so an idle link still blocks in
-        // `poll` rather than spinning.
+        // `poll` rather than spinning. `POLLIN` only while the wire queue
+        // has room: reading a byte the queue will shed loses it.
         let pending = {
             let mut queue = outbound.lock().expect("outbound queue never poisoned");
-            drain_outbound(master, &mut queue, dropped);
+            drain_outbound(master, &mut queue, counters);
             !queue.is_empty()
         };
+        let room = bridge.tx_room();
+        let mut events = 0;
+        if room > 0 {
+            events |= libc::POLLIN;
+        }
+        if pending {
+            events |= libc::POLLOUT;
+        }
         let mut pollfd = libc::pollfd {
             fd: master,
-            events: if pending {
-                libc::POLLIN | libc::POLLOUT
-            } else {
-                libc::POLLIN
-            },
+            events,
             revents: 0,
         };
         // SAFETY: `pollfd` is a valid, exclusively borrowed array of one.
@@ -302,17 +338,31 @@ fn pump_loop(
             tracing::debug!(error = %err, "host PTY: poll failed; pump stopping");
             return;
         }
-        if rc == 0 {
-            continue; // timeout — re-check the shutdown flag
+        if rc == 0 || room == 0 || pollfd.revents & libc::POLLIN == 0 {
+            continue; // timeout, a full wire queue, or nothing to read
         }
         // SAFETY: the master stays open until the owning component joins this
         // thread in `Drop`.
         let fd = unsafe { BorrowedFd::borrow_raw(master) };
         loop {
-            match nix::unistd::read(fd, &mut buf) {
+            let room = bridge.tx_room();
+            if room == 0 {
+                break;
+            }
+            let cap = room.min(PUMP_READ_CHUNK);
+            match nix::unistd::read(fd, &mut buf[..cap]) {
                 Ok(0) => break, // no host attached yet; poll again
                 Ok(n) => {
-                    bridge.transmit(&buf[..n]);
+                    let shed = bridge.transmit(&buf[..n]);
+                    if shed > 0 {
+                        counters
+                            .shed_inbound
+                            .fetch_add(shed as u64, Ordering::Relaxed);
+                        tracing::warn!(shed, "host PTY: inbound bytes shed");
+                    }
+                    counters
+                        .from_host
+                        .fetch_add(n.saturating_sub(shed) as u64, Ordering::Relaxed);
                 }
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(nix::errno::Errno::EINTR) => continue,

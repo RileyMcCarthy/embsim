@@ -34,19 +34,25 @@ pub type Amps = f64;
 /// Default push-pull digital drive impedance: what a push-pull output idles
 /// behind ([`crate::component::PinDecl::digital_out`]), overridable per pin
 /// ([`crate::component::PinDecl::with_impedance`]).
+///
+/// 25 Ω is embsim's stated bench default, not a figure from a pad table.
 pub const DEFAULT_PUSH_PULL_IMPEDANCE: Ohms = 25.0;
 
 /// Rail a push-pull digital output drives High at.
 ///
-/// One value for the whole crate rather than a per-part knob: a component on
-/// another rail models the level shifter *as a component*, which is the same
-/// answer `mcu` has always given for its GPIO outputs.
+/// embsim's stated bench default, JESD8C.01's nominal supply. A pad whose
+/// rail is its own bank drives through [`crate::SerialLevelBridge::with_ports`]
+/// or [`crate::PadPorts`] ([`crate::McuComponent::host_pads`]) instead.
 pub const LOGIC_HIGH_VOLTS: Volts = 3.3;
 
-/// The engine's own single split of a solved voltage into a level for its
-/// report ([`level_of`] on [`NetState::Analog`]): mid-rail of the 3.3 V
-/// logic rail. A receiver never reads through it — a node projects its own
-/// [`crate::Sense`] through its declared thresholds.
+/// The engine's own split of a solved voltage into a level for its report
+/// ([`level_of`] on [`NetState::Analog`]).
+///
+/// This is embsim's report-only split inside the JESD8C.01 `V_IL`..`V_IH`
+/// band. It never decides what a receiver reads: a node projects its own
+/// [`crate::Sense`] through its declared thresholds. It also never decides
+/// whether two sources agree — that comparison is their open-circuit
+/// voltages ([`crate::engine`] rule 2).
 pub const LOGIC_THRESHOLD_VOLTS: Volts = 1.5;
 
 /// The coupled reach: how far a periodic drive reaches across a coupling

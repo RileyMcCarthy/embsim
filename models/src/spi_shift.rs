@@ -1,15 +1,17 @@
-//! A byte-wide serial shift register, MSB first — the bit-level engine every
-//! SPI-mode device model here is built on ([`crate::spi_flash`], the serial
-//! NOR flash; [`crate::psram`], the QSPI PSRAM in its SPI mode), so a second
-//! device is a command state machine and nothing else.
+//! A byte-wide serial shift register, MSB first — the bit-level engine the
+//! serial NOR flash ([`crate::spi_flash`]) and the QSPI PSRAM in SPI mode
+//! ([`crate::psram`]) share, so each of those devices is a command state
+//! machine and nothing else. The SD card keeps its own shifter
+//! ([`crate::sd_card_component`]): it changes its output on the falling edge.
 //!
 //! The engine samples data-in on the **rising** clock edge and presents the
-//! data-out bit **for that pulse before advancing** — the rule
-//! [`crate::spi_flash`]'s module docs settle for a bit-banging master that
-//! reads the line after driving the clock, and one a peripheral-clocked
-//! master sampling mid-pulse sees identically. A repeated clock level is not
-//! an edge, so a caller may forward every sense of the clock net without
-//! tracking edges itself.
+//! data-out bit on that same edge, before the position advances. A master
+//! reads the bit **after** the rising edge. A master that samples and then
+//! raises the clock reads the previous bit. The reason is recorded in
+//! `NODES.md` (the SPI output-timing decision): the P2 model reads a pad
+//! with no registered input delay, so a falling-edge presentation arrives
+//! one bit late. A repeated clock level is not an edge, so a caller may
+//! forward every sense of the clock net without tracking edges itself.
 //!
 //! What the engine does not know: which byte comes next. A device answers
 //! [`RisingEdge::finished_out`] by loading the next out byte with
@@ -183,6 +185,22 @@ mod tests {
             Some(0x81),
             "and the eighth edge says the byte is done"
         );
+    }
+
+    /// A master that samples MISO and then raises the clock reads the
+    /// previous bit: the MSB presented at select, then each bit the rising
+    /// edge before this one presented. `0xDE` (1101_1110) comes back
+    /// `0xEF` (1110_1111).
+    #[test]
+    fn a_sample_before_the_rising_edge_reads_the_previous_bit() {
+        let mut shift = ByteShifter::new();
+        shift.begin(0xDE);
+        let mut seen = 0u8;
+        for _ in 0..8 {
+            seen = (seen << 1) | u8::from(shift.dout());
+            pulse(&mut shift, true);
+        }
+        assert_eq!(seen, 0xEF);
     }
 
     #[test]

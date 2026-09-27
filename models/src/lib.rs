@@ -14,7 +14,7 @@
 //! - [`sd_card_component`] — that model as a live `embsim-board` component
 //!   (microSD or by-function pin facade, active-low CS, DO released when
 //!   deselected)
-//! - [`spi_flash`] — a serial NOR flash, bit-level and bus-agnostic: anything
+//! - [`spi_flash`] — a serial NOR flash, bit-level: anything
 //!   that can produce a chip select, a clock edge and a data bit can talk to
 //!   it, whether bit-banged or peripheral-clocked
 //! - [`spi_flash_component`] — that model as a live `embsim-board` component

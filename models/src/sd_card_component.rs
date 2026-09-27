@@ -33,6 +33,12 @@
 //! for either. A host that inverts its clock output (CPOL = 1) gets the same
 //! byte stream as one that does not.
 //!
+//! The NOR flash and the PSRAM present on the rising edge instead
+//! ([`crate::spi_shift`]). That presentation belongs to the P2 pad model,
+//! which reads an input with no registered delay; this adapter follows the
+//! card specification. The two shifters stay separate until that delay exists
+//! (`NODES.md`, the SPI output-timing decision).
+//!
 //! # Idle, and the pull-up the host is assuming
 //!
 //! A deselected card releases MISO — this adapter drives nothing at all rather
@@ -115,7 +121,7 @@ pub const SD_CARD_PINS_MICROSD: [PinDecl; 8] = [
     input("2", "4", "6").with_name("CS"),
     input("3", "4", "6").with_name("DI"),
     PinDecl::power_in("4").with_name("VDD").with_reference("6"),
-    input("5", "4", "6"), // CLK, aliased below
+    input("5", "4", "6").with_name("CLK"),
     PinDecl::power_in("6").with_name("VSS"),
     PinDecl::digital_out("7").with_name("DO"),
     input("8", "4", "6").with_name("DAT1"),

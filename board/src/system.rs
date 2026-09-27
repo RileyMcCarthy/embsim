@@ -1102,8 +1102,9 @@ impl System {
         // -- scenario: BOM overrides + jumpers ----------------------------
         let mut detached: HashSet<(usize, PinRef)> = HashSet::new();
         {
-            // Jumpers and switches share one mechanism: a jumper is a
-            // one-pole switch, so `jumper(ref, s)` is `switch(ref, 0, s)`.
+            // Scenario positions. A jumper is a one-pole switch, so
+            // `jumper(ref, s)` is `switch(ref, 0, s)`. The short itself is
+            // the identity union below, with the closed switch poles.
             let positions: Vec<(String, usize, JumperState)> = self
                 .scenario
                 .jumpers()
@@ -1243,15 +1244,18 @@ impl System {
             }
         }
 
-        // -- closed switch poles and inductors: identity unions -------------
+        // -- DC shorts: identity unions ------------------------------------
         // A closed pole is the same merge a `pin_short` fault makes — its two
         // pins' nets become one electrical node — and it honours a detached
         // pin the same way a passive edge does: a lifted contact conducts
         // nothing. Membership is fixed at build (`NODES.md` §2, rule 3), so
-        // this is the whole of a switch's electrical existence. An inductor
-        // is the same merge: the DC short it has always been (`NODES.md` §2,
-        // the Inductor row), with a closed pole's semantics rather than a
-        // 0 Ω conduction edge's — so a regulator's output inductor makes the
+        // this is the whole of a switch's electrical existence. An inductor,
+        // a closed two-pad jumper and a 0 Ω resistor are the same merge: the
+        // DC short (`NODES.md` §2), with a closed pole's semantics rather
+        // than a 0 Ω conduction edge's. A conduction edge between two
+        // declared terminals belongs to no cluster, so a rail-to-rail short
+        // through one would keep each rail's own voltage and report nothing.
+        // The inductor form is what makes a regulator's output inductor the
         // rail *the terminal's node*, a boundary of its loads' clusters,
         // where a 0 Ω edge from the switch node made the rail a member of
         // every load's cluster (the Edge board's `+3.3V` with its nine LED
@@ -1270,6 +1274,17 @@ impl System {
                     PartClass::Passive {
                         kind: PassiveKind::Inductor,
                         ..
+                    } if record.pins.len() == 2 => {
+                        vec![(record.pins[0].clone(), record.pins[1].clone())]
+                    }
+                    PartClass::Passive {
+                        kind: PassiveKind::Resistor,
+                        value: Some(ohms),
+                    } if record.pins.len() == 2 && *ohms == 0.0 => {
+                        vec![(record.pins[0].clone(), record.pins[1].clone())]
+                    }
+                    PartClass::Jumper {
+                        state: JumperState::Closed,
                     } if record.pins.len() == 2 => {
                         vec![(record.pins[0].clone(), record.pins[1].clone())]
                     }
@@ -1410,26 +1425,17 @@ impl System {
                                 PassiveKind::Resistor => value.unwrap_or(0.0),
                                 _ => 0.0,
                             };
-                            self.passive_edge(
-                                bi,
-                                record,
-                                ohms,
-                                &net_of_pin,
-                                &detached,
-                                &mut resolver,
-                            );
-                        }
-                    }
-                    PartClass::Jumper { state } => {
-                        if *state == JumperState::Closed && record.pins.len() >= 2 {
-                            self.passive_edge(
-                                bi,
-                                record,
-                                0.0,
-                                &net_of_pin,
-                                &detached,
-                                &mut resolver,
-                            );
+                            // A 0 Ω resistor is the identity union above.
+                            if !(*kind == PassiveKind::Resistor && ohms == 0.0) {
+                                self.passive_edge(
+                                    bi,
+                                    record,
+                                    ohms,
+                                    &net_of_pin,
+                                    &detached,
+                                    &mut resolver,
+                                );
+                            }
                         }
                     }
                     PartClass::Registered { pins, branches } => {
@@ -1571,7 +1577,10 @@ impl System {
                             }
                         }
                     }
-                    PartClass::Boundary | PartClass::Switch { .. } | PartClass::Probe => {}
+                    PartClass::Boundary
+                    | PartClass::Switch { .. }
+                    | PartClass::Jumper { .. }
+                    | PartClass::Probe => {}
                 }
             }
         }

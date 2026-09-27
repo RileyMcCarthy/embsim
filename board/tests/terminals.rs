@@ -544,8 +544,63 @@ fn two_sources_that_disagree_on_a_terminal_fight_once() {
     assert_eq!(built.escalated_solves(), 2);
 }
 
-/// A current instrument on a `PowerOut` pin is refused at attach: a
-/// terminal's current spans clusters.
+/// A closed two-pad link between two declared voltages is one terminal.
+/// A 0 Ω conduction edge between two terminals belongs to no cluster, so
+/// the link has to be the identity union a closed switch pole already is.
+#[rstest]
+#[case::solder_jumper("SolderJumper_2_Bridged", "Jumper", "bridged", "JP1")]
+#[case::zero_ohm("R", "Device", "0R", "R1")]
+fn a_dc_short_between_two_declared_voltages_is_one_fight(
+    #[case] part: &str,
+    #[case] lib: &str,
+    #[case] value: &str,
+    #[case] reference: &str,
+) {
+    behaviour!(Test {
+        id: "terminal.dc-short-is-one-fight",
+        covers: Some("board/src/system.rs#SystemBuilder::build"),
+        given: "5 volts declared on one net and 3.3 volts on another, the two nets joined by a closed two-pad link",
+    });
+    expect!(
+        "one-contention",
+        "one contention finding is reported, and both nets read the same fought voltage"
+    );
+    let text = format!(
+        r#"(export (version "E")
+  (components
+    (comp (ref "{reference}") (value "{value}") (libsource (lib "{lib}") (part "{part}"))))
+  (nets
+    (net (code "1") (name "A") (node (ref "{reference}") (pin "1")))
+    (net (code "2") (name "B") (node (ref "{reference}") (pin "2")))))"#
+    );
+    let board =
+        Board::from_netlist(parse(&text), &PartRegistry::new()).expect("the link classifies");
+    let built = System::new()
+        .board("B", board)
+        .scenario(
+            Scenario::default()
+                .net_stuck("B.A", 5.0)
+                .net_stuck("B.B", 3.3),
+        )
+        .build()
+        .expect("builds");
+    let state = |name: &str| built.nets()[built.net_id(name).unwrap().0].state;
+    let findings = built.diagnostics().findings();
+    let contention: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| matches!(f, Finding::Contention { .. }))
+        .collect();
+    assert_eq!(contention.len(), 1, "{findings:?}");
+    assert_eq!(state("B.A"), state("B.B"), "{findings:?}");
+    let volts = match state("B.A") {
+        NetState::Analog(v) => v,
+        other => panic!("expected the divided voltage, got {other:?} ({findings:?})"),
+    };
+    assert!(
+        (volts - 4.15).abs() < 1e-9,
+        "{part} in {lib}: {volts} ({findings:?})"
+    );
+}
 #[rstest]
 fn a_current_instrument_is_refused_on_a_power_out_pin() {
     behaviour!(Test {

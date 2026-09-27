@@ -265,6 +265,63 @@ fn a_fought_node_under_an_analog_reader_reports_its_fight_beside_its_voltage() {
     );
 }
 
+/// Two strong drivers at different open-circuit voltages fight, on either
+/// side of the report split and in either wiring order. The split decides
+/// the report level of one source; it does not decide whether two sources
+/// agree.
+#[rstest]
+#[case::above_the_split(3.3, 1.8, 2.55)]
+#[case::below_the_split(1.4, 0.0, 0.7)]
+fn two_strong_drivers_at_different_voltages_fight_in_either_order(
+    #[case] hi: f64,
+    #[case] lo: f64,
+    #[case] mid: f64,
+) {
+    behaviour!(Test {
+        id: "rules.different-voltages-fight",
+        covers: Some("board/src/engine.rs#project_root"),
+        given: "two 25 ohm drivers on one node, at two different voltages, wired in either order",
+    });
+    expect!(
+        "same-voltage",
+        "both wirings publish the voltage halfway between the two drivers"
+    );
+    expect!("both-named", "one contention finding names both drivers");
+    let _guard = stepped();
+    for (first, second, first_v, second_v) in [("HI", "LO", hi, lo), ("LO", "HI", lo, hi)] {
+        let (a, _) = Driver::new(Some(TheveninDrive {
+            volts: first_v,
+            impedance: PAD_OHMS,
+        }));
+        let (b, _) = Driver::new(Some(TheveninDrive {
+            volts: second_v,
+            impedance: PAD_OHMS,
+        }));
+        let built = System::new()
+            .component(first, Box::new(a))
+            .component(second, Box::new(b))
+            .harness(Harness::new().connect(ep(&format!("{first}.Q")), ep(&format!("{second}.Q"))))
+            .build()
+            .expect("the bench builds");
+        let state = built.nets()[built.net_id(&format!("{first}.Q")).unwrap().0].state;
+        let volts = match state {
+            NetState::Analog(v) => v,
+            other => panic!("expected the divided voltage, got {other:?}"),
+        };
+        assert!((volts - mid).abs() < 1e-9, "{first} then {second}: {volts}");
+        let findings = built.diagnostics().findings();
+        let drivers = findings
+            .iter()
+            .find_map(|f| match f {
+                Finding::Contention { drivers, .. } => Some(drivers.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a contention finding: {findings:?}"));
+        assert!(drivers.contains(&PinRef::new(first, "Q")), "{drivers:?}");
+        assert!(drivers.contains(&PinRef::new(second, "Q")), "{drivers:?}");
+    }
+}
+
 /// A rail and a short to 0 V on one net an analog reader reads: two
 /// terminal sources fighting on one root.
 #[rstest]

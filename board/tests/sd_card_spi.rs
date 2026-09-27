@@ -62,8 +62,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::{
     digital_drive, jesd8c01_lvcmos_thresholds, level_of, netlist, AttachError, Board, Component,
-    ComponentNetIo, DeadBand, Finding, Harness, Level, PartRegistry, PinDecl, PinHandle, System,
-    SystemHandle,
+    ComponentNetIo, DeadBand, Finding, Harness, Level, PartRegistry, PinDecl, PinHandle, Scenario,
+    System, SystemHandle,
 };
 use embsim_core::virtual_clock::{self, Actor, ClockMode};
 use embsim_models::sd_card::{SdCard, BLOCK_LEN};
@@ -71,6 +71,7 @@ use embsim_models::sd_card_component::{
     SdCardComponent, SD_CARD_PINS_BY_FUNCTION, SD_CARD_PINS_MICROSD, SD_CARD_PINS_SPI_ONLY,
 };
 use machine_parts::ec32mb_registry;
+use vibes_behaviour::{behaviour, expect, Test};
 
 /// The netlist's `value` for `J301`, which is the registry key.
 const SOCKET_PART: &str = "MicroSD Socket";
@@ -649,6 +650,74 @@ fn the_card_initialises_over_nets_driven_bit_by_bit() {
         card.lock().expect("card").initialised,
         "the card behind the nets really did initialise"
     );
+    drop(pins);
+    bench.finish();
+}
+
+#[test]
+fn the_numbered_microsd_pinout_answers_cmd0() {
+    behaviour!(Test {
+        id: "sd-card.numbered-pinout-answers-idle",
+        covers: Some("models/src/sd_card_component.rs#SD_CARD_PINS_MICROSD"),
+        given: "a microSD card whose pins are numbered 1 through 8 on a bench netlist, powered at 3.3 volts, and sent the go-idle command",
+    });
+    expect!("idle", "the card answers that it is idle");
+    let suite = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    const NUMBERED: &str = r#"(export (version "E")
+  (components
+    (comp (ref "J1") (value "card") (libsource (lib "Connector") (part "microSD"))))
+  (nets
+    (net (code "1") (name "DAT2") (node (ref "J1") (pin "1")))
+    (net (code "2") (name "CS") (node (ref "J1") (pin "2")))
+    (net (code "3") (name "DI") (node (ref "J1") (pin "3")))
+    (net (code "4") (name "VDD") (node (ref "J1") (pin "4")))
+    (net (code "5") (name "CLK") (node (ref "J1") (pin "5")))
+    (net (code "6") (name "VSS") (node (ref "J1") (pin "6")))
+    (net (code "7") (name "DO") (node (ref "J1") (pin "7")))
+    (net (code "8") (name "DAT1") (node (ref "J1") (pin "8")))))"#;
+    let mut registry = PartRegistry::new();
+    registry.register("microSD", |_| {
+        Box::new(SdCardComponent::blank(CARD_CAPACITY).with_pins(&SD_CARD_PINS_MICROSD))
+    });
+    let board = Board::from_netlist(netlist::parse(NUMBERED).expect("parses"), &registry)
+        .expect("the numbered facade mounts");
+    let handles = Arc::new(Mutex::new(MasterPins::default()));
+    // The netlist numbers the pads. The adapter still looks the clock up
+    // by the name CLK, which is the alias on pad 5.
+    let harness = Harness::new()
+        .connect_str("MASTER.CS", "CARD.J1.2")
+        .expect("cs")
+        .connect_str("MASTER.CLK", "CARD.J1.5")
+        .expect("clk")
+        .connect_str("MASTER.DI", "CARD.J1.3")
+        .expect("di")
+        .connect_str("MASTER.DO", "CARD.J1.7")
+        .expect("do");
+    let system = System::new()
+        .board("CARD", board)
+        .component("MASTER", Box::new(BitBangMaster::new(Arc::clone(&handles))))
+        .harness(harness)
+        .scenario(
+            Scenario::default()
+                .net_stuck("CARD.VSS", 0.0)
+                .net_stuck("CARD.VDD", 3.3),
+        )
+        .hold_time()
+        .start()
+        .expect("the numbered card starts");
+    let actor = virtual_clock::register_actor("sd-numbered-pinout");
+    system.release_time();
+    settle();
+    let bench = Bench {
+        actor,
+        system,
+        handles,
+        _suite: suite,
+    };
+    let pins = bench.handles.lock().expect("master pins");
+    open_bus(&pins);
+    assert_eq!(net_command(&pins, 0, 0, 1), vec![0x01]);
     drop(pins);
     bench.finish();
 }

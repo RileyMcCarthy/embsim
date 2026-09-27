@@ -505,7 +505,7 @@ matching):
 |---|---|---|
 | auto | part `R*`/`C*`/`L*`/`LED`/`D_*` from `Device` (or rescue thereof) | passive primitive; value parsed from the **first token** of the field (`47R`, `4k7`, `0.1uF`, `4.7uF 6.3V`, `47uH/3A`); **pin-count validated** — a 2-terminal class with ≠2 pins is a hard classification error. A `LED`/`D_*` symbol **yields to a registry entry** (by part name, manufacturer part number or value): the symbol is a guess that the part is DC-open, an entry a statement about the purchasable part; with no entry it stays the DC-open passive |
 | auto | `Conn*`/`Screw_Terminal*` parts, plus any part name the consumer passes to `PartRegistry::register_boundary` | board boundary pins (harness attachment points) |
-| auto | `Jumper*` parts | stateful short; default from name (`_NO`/`_Open` → open, `_NC`/`_Bridged` → closed; 3-pin `Jumper_3_*` variants get a selectable position) |
+| auto | `Jumper*` parts | stateful short; default from name (`_NO`/`_Open` → open, `_NC`/`_Bridged` → closed; 3-pin `Jumper_3_*` variants get a selectable position). A closed two-pad jumper is an identity union of its pins' nets, the same merge as a closed switch pole; a 0 Ω resistor is that merge too |
 | auto | two-pin `SW_*` parts | a **switch** with one open pole across pins `1` and `2` (the KiCad `Switch` library's two-terminal pinout) — unless the part name is registered: the pairing is a guess from the library convention, and an explicit registration beats it |
 | auto | `TestPoint*` | one pin: a **probe** node (senses, never drives); no net: a **mechanical** node (a pad); more pins: whatever the registry says of the part name, else a pin-count error |
 | auto | `MountingHole*`/`Logo*`/`Fiducial*` | a **mechanical** node: pads recorded, nothing electrical |

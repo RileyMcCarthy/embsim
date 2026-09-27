@@ -129,19 +129,12 @@ use crate::event_log::{EngineEvent, EventLog};
 use crate::net::{
     level_of, Amps, Level, Net, NetId, NetState, NetVolts, Ohms, PeriodicSchedule, PinRef,
     TheveninDrive, Volts, COUPLED_REACH_OHMS, COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO,
-    V_IH, V_IL, WEAK_DRIVE_OHMS,
+    LOGIC_THRESHOLD_VOLTS, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
 
 // ============================================================
 // Constants
 // ============================================================
-
-/// Digital projection threshold for a *source's* open-circuit voltage: at or
-/// above this a source is a [`Level::High`] source, below it a
-/// [`Level::Low`] one — the level a `Driven`/`Pulled` projection carries.
-/// A *solved* node voltage is projected through the [`V_IL`]/[`V_IH`] dead
-/// band instead ([`project_root`]).
-const DIGITAL_LEVEL_THRESHOLD_VOLTS: Volts = 1.5;
 
 /// Max commands handled before returning to the timer wheel. A live flood
 /// can keep `try_recv` non-empty forever; without a cap, time never jumps.
@@ -1019,7 +1012,8 @@ pub(crate) struct Resolver {
     /// The per-cluster lists a pass fills and empties, kept between passes
     /// at their capacity ([`ClusterScratch`]).
     scratch: std::cell::RefCell<ClusterScratch>,
-    /// Conduction edges (resistors, inductors, closed jumpers): (a, b, ohms).
+    /// Conduction edges (resistors): (a, b, ohms). A closed jumper, a 0 Ω
+    /// resistor and an inductor are identity unions, not edges.
     edges: Vec<(usize, usize, f64)>,
     /// Coupling capacitors: AC paths for rate routing only, never
     /// conduction (see [`CouplingCapacitor`]).
@@ -4255,7 +4249,11 @@ fn project_root(
     let contest_is_strong = !strongest.is_pull();
     let contends = |s: &ReachingSource| !loses(s) && (!contest_is_strong || !s.is_pull());
     let level = strongest.level();
-    let disagree = reaching.iter().any(|s| contends(s) && s.level() != level);
+    // Open-circuit voltage, not the 1.5 V report split: 3.3 V and 1.8 V
+    // are both High and still a fight. −0.0 folds to 0.0; NaN never arrives.
+    let disagree = reaching
+        .iter()
+        .any(|s| contends(s) && (s.volts + 0.0).to_bits() != (strongest.volts + 0.0).to_bits());
     let strong_slots = || -> Vec<usize> {
         reaching
             .iter()
@@ -4707,7 +4705,7 @@ fn at_one_voltage(a: Option<Volts>, b: Option<Volts>) -> bool {
 /// Digital projection of a source voltage (NaN — an unmodeled rail — never
 /// reaches this: callers skip NaN sources).
 fn level_of_volts(volts: Volts) -> Level {
-    if volts >= DIGITAL_LEVEL_THRESHOLD_VOLTS {
+    if volts >= LOGIC_THRESHOLD_VOLTS {
         Level::High
     } else {
         Level::Low

@@ -72,7 +72,7 @@ pub use diagnostics::{
 };
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
-pub use host_pty::HostPty;
+pub use host_pty::{HostPty, HostPtyCounters};
 pub use mcu::{McuBuildError, McuBuilder, McuComponent, PadPorts};
 pub use net::{
     digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
