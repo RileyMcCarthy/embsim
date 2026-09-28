@@ -550,4 +550,131 @@ mod tests {
         assert_eq!(net.nodes.len(), 2);
         assert_eq!(net.state, NetState::Floating);
     }
+
+    // ========================================================
+    // Rate changes, not edges — the `PeriodicSchedule` seam
+    // ========================================================
+
+    /// A segment integrates the *same* floor-division `run()` does, so the two
+    /// views of a train can never disagree by a pulse.
+    #[rstest]
+    #[case::exact(8_192, 1_000_000_000, 8_192)]
+    #[case::half_second(8_192, 500_000_000, 4_096)]
+    #[case::truncates_down(3, 1_000_000, 0)]
+    #[case::one_pulse_worth(1_000, 1_000_000, 1)]
+    #[case::one_nanosecond_short(1_000, 999_999, 0)]
+    #[case::sub_microsecond_anchor(20_000_000, 150, 3)]
+    fn a_segment_integrates_like_run(
+        #[case] freq_hz: u32,
+        #[case] elapsed_ns: u64,
+        #[case] expect: u64,
+    ) {
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz,
+            total: None,
+            since_ns: 7,
+        };
+        assert_eq!(segment.emitted_at_ns(7 + elapsed_ns), expect);
+    }
+
+    /// The integration is exact over spans a 64-bit product would
+    /// saturate: an hour of a 10 MHz train is 36 000 000 000 pulses.
+    #[rstest]
+    fn a_long_fast_train_counts_without_overflow() {
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz: 10_000_000,
+            total: None,
+            since_ns: 0,
+        };
+        let hour_ns = 3_600 * 1_000_000_000u64;
+        assert_eq!(segment.emitted_at_ns(hour_ns), 36_000_000_000);
+    }
+
+    /// A finite segment clamps at its ceiling, and `completes_at` names the
+    /// instant past which the count no longer moves.
+    #[rstest]
+    fn a_finite_segment_clamps_and_reports_its_completion() {
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz: 1_000,
+            total: Some(10),
+            since_ns: 0,
+        };
+        let end = segment.completes_at().expect("finite trains complete");
+        assert_eq!(end, 10_000_000, "10 pulses at 1 kHz is 10 ms");
+        assert_eq!(segment.emitted_at_ns(end - 1), 9, "one nanosecond short");
+        assert_eq!(segment.emitted_at_ns(end), 10);
+        assert_eq!(
+            segment.emitted_at_ns(end * 100),
+            10,
+            "past completion the count is frozen"
+        );
+        assert_eq!(
+            PeriodicSchedule {
+                total: None,
+                ..segment
+            }
+            .completes_at(),
+            None,
+            "an unbounded train never completes"
+        );
+        assert_eq!(PeriodicSchedule::IDLE.completes_at(), None);
+    }
+
+    /// Re-basing hands over the exact count at the re-base instant, and is
+    /// idempotent there — so folding baseline differences across a re-base can
+    /// neither double-count a pulse nor lose one.
+    #[rstest]
+    #[case::at_start(0)]
+    #[case::mid(333_000)]
+    #[case::later(1_000_000_000)]
+    #[case::between_microseconds(333_333)]
+    fn rebasing_a_segment_hands_over_the_exact_count(#[case] at_ns: u64) {
+        let segment = PeriodicSchedule {
+            emitted: 17,
+            freq_hz: 8_192,
+            total: None,
+            since_ns: 0,
+        };
+        let rebased = segment.rebased_at_ns(at_ns);
+        assert_eq!(
+            rebased.emitted, // the handover point
+            segment.emitted_at_ns(at_ns),
+            "the re-based baseline is the count at that instant"
+        );
+        assert_eq!(
+            rebased.rebased_at_ns(at_ns),
+            rebased,
+            "re-basing twice at the same instant is a no-op"
+        );
+    }
+
+    /// The documented cost of a re-base: it discards the source's pulse
+    /// *phase*, so from then on the re-based segment can trail the original by
+    /// at most one pulse — never more, and never ahead of it. This is the
+    /// fidelity limit that makes "re-base at segment boundaries, not on every
+    /// read" a rule rather than a preference.
+    #[rstest]
+    #[case::odd_rate(8_192, 333_000)]
+    #[case::prime_rate(9_973, 1_237_000)]
+    #[case::slow(37, 500_001_000)]
+    #[case::between_microseconds(9_973, 1_237_417)]
+    fn rebasing_trails_the_original_by_at_most_one_pulse(#[case] freq_hz: u32, #[case] at_ns: u64) {
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz,
+            total: None,
+            since_ns: 0,
+        };
+        let rebased = segment.rebased_at_ns(at_ns);
+        for probe in [at_ns, at_ns + 1, at_ns + 125_000_000, at_ns + 9_000_001_000] {
+            let (original, after) = (segment.emitted_at_ns(probe), rebased.emitted_at_ns(probe));
+            assert!(
+                original >= after && original - after <= 1,
+                "at {probe}ns the re-based segment read {after} against {original}"
+            );
+        }
+    }
 }
