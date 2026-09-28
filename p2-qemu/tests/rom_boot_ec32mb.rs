@@ -22,6 +22,8 @@
 //! reached the debug pin. And that every edge was the P2's own: the flash saw
 //! real clock edges over the net, delivered one instant at a time.
 
+#![cfg(qemu_linked)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -130,14 +132,8 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         Some(path) => vec!["-d", "cpu", "-D", path],
         None => Vec::new(),
     };
-    let p2 = match P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &extra) {
-        Ok(p2) => p2,
-        Err(P2QemuError::Unavailable) => {
-            eprintln!("\n*** SKIPPED: built without a QEMU tree (EMBSIM_QEMU_P2_BUILD). Asserted NOTHING.\n");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    };
+    let p2 = P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &extra)
+        .expect("this test is built only when QEMU is linked");
     let handle = p2.handle();
 
     virtual_clock::init(0.0, 160_000_000);
@@ -265,6 +261,11 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     assert!(
         (ROM_INSTRUCTION_NS..=4 * ROM_INSTRUCTION_NS).contains(&median),
         "the typical gap is the ROM's own clock loop, not a slice; median {median} ns"
+    );
+    let second = P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &[]);
+    assert!(
+        matches!(second, Err(P2QemuError::AlreadyBooted)),
+        "a second P2 in this process is refused, got {second:?}"
     );
     drop(system);
 }

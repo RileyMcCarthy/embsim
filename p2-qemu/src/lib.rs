@@ -1015,6 +1015,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn without_a_linked_qemu_the_node_is_unavailable() {
+        if ffi::linked() {
+            return;
+        }
+        let err = P2Qemu::with_boot_rom(&[], &[]).expect_err("a stub build has no machine");
+        assert!(matches!(err, P2QemuError::Unavailable), "{err}");
+    }
+
+    #[test]
     fn the_facade_is_the_ec32mb_u100_slot() {
         let pins = p2x8c4m64p_pins();
         assert_eq!(pins.len(), 86);
