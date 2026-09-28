@@ -360,7 +360,8 @@ impl PulseOut {
     }
 
     /// Register a per-channel callback fired **only when the commanded rate
-    /// changes** — `start`, `start_velocity`, `set_frequency`, `stop` — with
+    /// changes** — `start`, `start_velocity`, `set_frequency`, `stop`, and
+    /// natural completion of a finite train in [`PulseOut::run`] — with
     /// the constant-rate [`PeriodicSchedule`] that just began.
     ///
     /// This is the low-rate seam a pulse train crosses a net on
@@ -586,7 +587,31 @@ impl PulseOut {
 
         self.fire_progress(channel, emitted);
 
-        if !done {
+        if done {
+            // First observation of completion: bank the count and publish the
+            // same held segment `stop` builds (`freq_hz == 0`, ceiling at the
+            // final count), so the board rests without an explicit stop.
+            // Idempotent if `stop` follows — already held is a no-op here.
+            let now = embsim_core::virtual_clock::virtual_ns();
+            let held = {
+                let mut state = self.state.lock().unwrap();
+                let s = &mut state[channel];
+                if s.total_pulses == 0 {
+                    None
+                } else {
+                    let frozen = s.segment().emitted_at_ns(now);
+                    s.emitted_base = frozen;
+                    s.total_pulses = 0;
+                    s.velocity_mode = false;
+                    s.frequency = 0;
+                    s.start_ns = now;
+                    Some(s.segment())
+                }
+            };
+            if let Some(segment) = held {
+                self.fire_rate_change(channel, segment);
+            }
+        } else {
             sleep_virtual_us(POLL_TICK_US);
         }
 
@@ -1215,7 +1240,7 @@ mod tests {
 
     /// One event per *rate change* — not per pulse and not per poll. A finite
     /// train at 20 kHz emits 200 pulses and exactly two rate-change events
-    /// (the start and the stop).
+    /// (the start and natural completion's held segment).
     #[rstest]
     fn rate_changes_fire_once_per_command_never_per_pulse() {
         let _g = crate::test_support::guard();
@@ -1228,13 +1253,12 @@ mod tests {
 
         start(0, 200, 20_000);
         while !run(0).1 {}
-        stop(0);
 
         let events = events.lock().unwrap();
         assert_eq!(
             events.len(),
             2,
-            "start + stop only; got {events:?} — one event per pulse would be 200"
+            "start + completion hold only; got {events:?} — one event per pulse would be 200"
         );
         assert_eq!(events[0].freq_hz, 20_000);
         assert_eq!(events[0].total, Some(200));
@@ -1247,8 +1271,51 @@ mod tests {
                 total: Some(200),
                 since_ns: events[1].since_ns,
             },
-            "the stop event freezes the train's exact final count"
+            "natural completion freezes the train's exact final count"
         );
+    }
+
+    /// Advancing past `completes_at` without calling `stop` publishes the same
+    /// held segment `stop` builds, and a later `stop` keeps the frozen count.
+    #[rstest]
+    fn a_finite_train_publishes_held_segment_on_completion_without_stop() {
+        let _g = crate::test_support::guard();
+        test_setup(1);
+        let events = Arc::new(Mutex::new(Vec::<PeriodicSchedule>::new()));
+        {
+            let events = Arc::clone(&events);
+            on_rate_change(0, move |segment| events.lock().unwrap().push(segment));
+        }
+
+        start(0, 40, 20_000);
+        let started = segment(0);
+        let end = started.completes_at().expect("finite train completes");
+        while !run(0).1 {}
+
+        let held = segment(0);
+        assert_eq!(held.freq_hz, 0, "completion holds the rate");
+        assert_eq!(held.total, Some(40));
+        assert_eq!(held.emitted, 40);
+        assert_eq!(emitted(0), 40);
+        assert_eq!(frequency(0), 0);
+        assert!(
+            embsim_core::virtual_clock::virtual_ns() >= end,
+            "run reached past completes_at"
+        );
+
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 2, "start + held; got {events:?}");
+            assert_eq!(events[1], held);
+        }
+
+        // Explicit stop after natural completion keeps the frozen count and
+        // may re-publish the same held shape (idempotent for subscribers).
+        stop(0);
+        assert_eq!(emitted(0), 40);
+        assert_eq!(segment(0).freq_hz, 0);
+        assert_eq!(segment(0).total, Some(40));
+        assert_eq!(run(0), (0, true));
     }
 
     /// A velocity retarget banks the pulses already emitted into the new

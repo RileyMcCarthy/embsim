@@ -9448,6 +9448,88 @@ mod tests {
             );
         }
 
+        /// A finite clock still carries its rate past `completes_at` until the
+        /// source publishes a held segment — then it rests at its low port
+        /// with no rate, the same resting state an explicit stop proves.
+        #[rstest]
+        fn a_finite_clock_rests_at_lo_once_held_past_completes_at() {
+            behaviour!(Test {
+                id: "engine.finite-clock-held-after-completes-at",
+                covers: Some("board/src/engine.rs#combine_phases"),
+                given: "a pin whose finite train of 400 pulses at 20 kHz has reached completes_at still publishing that running segment, then the same pin republished as held at the final count",
+            });
+            expect!(
+                "running-past-ceiling-still-rates",
+                "past completes_at the running segment still names a non-zero rate and has no resting DC — emitted is clamped, the schedule is not yet held"
+            );
+            expect!(
+                "held-rests-low",
+                "once the source publishes the held segment, the net carries no rate and a sensing pin is handed the low port's 0 volts",
+                "PulseOut::run at done publishes the same held shape stop does, so the board rests without an explicit stop",
+            );
+            let running = PeriodicSchedule {
+                emitted: 0,
+                freq_hz: 20_000,
+                total: Some(400),
+                since_ns: 1_000_000,
+            };
+            let end = running.completes_at().expect("finite");
+            assert_eq!(end, 1_000_000 + 20_000_000);
+            assert_eq!(running.emitted_at_ns(end), 400);
+            assert_eq!(
+                running.emitted_at_ns(end + 1_000_000_000),
+                400,
+                "the ceiling holds forever after"
+            );
+
+            let mut resolver = Resolver::new(1, Dsu::new(1));
+            let step = resolver.add_endpoint_with(
+                0,
+                PinRef::new("U1", "STEP"),
+                clock(25.0, 25.0, running),
+            );
+            let mut net_table = nets(1);
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            assert_eq!(
+                net_table[0].state,
+                NetState::Periodic {
+                    hi: Level::High,
+                    lo: Level::Low,
+                    segment: running,
+                }
+            );
+            assert_eq!(
+                net_table[0].volts.dc, None,
+                "a still-running schedule has no resting DC even past completes_at"
+            );
+
+            let held = PeriodicSchedule {
+                emitted: 400,
+                freq_hz: 0,
+                total: Some(400),
+                since_ns: end,
+            };
+            resolver.set_drive(step, clock(25.0, 25.0, held));
+            let mut diags = Diagnostics::new();
+            resolver.resolve(&mut net_table, &mut diags, &QuasiStaticMna);
+            assert_eq!(
+                net_table[0].state,
+                NetState::Periodic {
+                    hi: Level::High,
+                    lo: Level::Low,
+                    segment: held,
+                }
+            );
+            assert_eq!(
+                net_table[0].volts,
+                NetVolts {
+                    dc: Some(0.0),
+                    phases: Some((Some(3.3), Some(0.0))),
+                }
+            );
+        }
+
         /// A rail is not a clock: a periodic drive on a rail's terminal
         /// releases it, and nothing crosses a capacitor from it.
         #[rstest]
