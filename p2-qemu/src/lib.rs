@@ -1296,13 +1296,24 @@ mod tests {
         bus
     }
 
+    /// Stub builds report Unavailable before touching BOOTED. A second call
+    /// must stay Unavailable — never a false AlreadyBooted when unlinked.
+    /// Linked builds exercise AlreadyBooted in `tests/rom_boot_ec32mb.rs`.
     #[test]
     fn without_a_linked_qemu_the_node_is_unavailable() {
         if ffi::linked() {
             return;
         }
-        let err = P2Qemu::with_boot_rom(&[], &[]).expect_err("a stub build has no machine");
-        assert!(matches!(err, P2QemuError::Unavailable), "{err}");
+        let first = P2Qemu::with_boot_rom(&[], &[]);
+        assert!(
+            matches!(first, Err(P2QemuError::Unavailable)),
+            "stub with_boot_rom must return Unavailable; got {first:?}"
+        );
+        let second = P2Qemu::with_boot_rom(&[], &[]);
+        assert!(
+            matches!(second, Err(P2QemuError::Unavailable)),
+            "stub must stay Unavailable on a second call (not AlreadyBooted); got {second:?}"
+        );
     }
 
     #[test]
