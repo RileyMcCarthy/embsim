@@ -21,7 +21,8 @@
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{Harness, HostPty, System};
@@ -91,6 +92,10 @@ fn read_until(file: &mut std::fs::File, want: usize, timeout: Duration) -> Vec<u
 struct NullModem {
     a: std::fs::File,
     b: std::fs::File,
+    /// Same atomics [`HostPty::dropped`] reads — kept because the components
+    /// themselves are moved into the system and are no longer reachable.
+    dropped_a: Arc<AtomicU64>,
+    dropped_b: Arc<AtomicU64>,
     _system: embsim_board::SystemHandle,
 }
 
@@ -100,6 +105,11 @@ fn null_modem(test: &str, baud_a: u32, baud_b: u32) -> NullModem {
     let (path_a, path_b) = (link_path(test, "a"), link_path(test, "b"));
     let port_a = HostPty::open(&path_a, baud_a).expect("a PTY opens");
     let port_b = HostPty::open(&path_b, baud_b).expect("a PTY opens");
+    // Observe overflow after the components move into the system.
+    let dropped_a = port_a.dropped_counter();
+    let dropped_b = port_b.dropped_counter();
+    assert_eq!(port_a.dropped(), 0, "a freshly opened host PTY has dropped nothing");
+    assert_eq!(port_b.dropped(), 0, "a freshly opened host PTY has dropped nothing");
 
     // A null-modem cable crosses the pair: each end's transmit is the other's
     // receive.
@@ -119,11 +129,21 @@ fn null_modem(test: &str, baud_a: u32, baud_b: u32) -> NullModem {
     NullModem {
         a: open_host_end(&path_a),
         b: open_host_end(&path_b),
+        dropped_a,
+        dropped_b,
         _system: system,
     }
 }
 
 impl NullModem {
+    /// `HostPty::dropped()` for each end — zero on a healthy round-trip.
+    fn dropped(&self) -> (u64, u64) {
+        (
+            self.dropped_a.load(Ordering::Relaxed),
+            self.dropped_b.load(Ordering::Relaxed),
+        )
+    }
+
     /// Wait until a byte actually crosses, then start from quiet.
     ///
     /// The two ends are separate components and the engine attaches them in its
@@ -175,6 +195,12 @@ fn a_byte_written_to_one_host_port_arrives_at_the_other() {
         b"World!",
         "the return pair carries too"
     );
+
+    assert_eq!(
+        link.dropped(),
+        (0, 0),
+        "a successful round-trip must not overflow the outbound hold"
+    );
 }
 
 #[test]
@@ -199,6 +225,11 @@ fn every_byte_value_survives_the_wire() {
         payload.len()
     );
     assert_eq!(got, payload, "and none of them changed on the way");
+    assert_eq!(
+        link.dropped(),
+        (0, 0),
+        "delivering every byte value must not overflow the outbound hold"
+    );
 }
 
 #[test]
