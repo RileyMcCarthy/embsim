@@ -215,9 +215,18 @@ cargo test -p embsim-board --test resolution_rules
 # traced boot, comparison) are in `p2-qemu/README.md`, "The state trace and
 # the p2core differential". Run it when the node's instruction path moves.
 # The pulse-out schedule (`PeriodicSchedule`, nanoseconds since the
-# interface phase) and the stepper plant that folds it are unit-tested in
-# their crates: an hour of a 10 MHz train counts exactly, a rate change
-# between two microseconds folds each side exactly.
+# interface phase) lives in `board/src/net.rs`; its arithmetic unit tests
+# (floor-division, 128-bit span, clamp, rebase fidelity) run under the board
+# lib. The stepper plant that folds it is unit-tested in models: an hour of
+# a 10 MHz train counts exactly, a rate change between two microseconds
+# folds each side exactly.
+cargo test -p embsim-board --lib a_segment_integrates_like_run
+cargo test -p embsim-board --lib a_long_fast_train_counts_without_overflow
+cargo test -p embsim-board --lib a_finite_segment_clamps_and_reports_its_completion
+cargo test -p embsim-board --lib rebasing_a_segment_hands_over_the_exact_count
+cargo test -p embsim-board --lib rebasing_trails_the_original_by_at_most_one_pulse
+# Or all schedule-arithmetic cases together:
+# cargo test -p embsim-board --lib
 cargo test -p embsim-models --lib stepper_motor
 ```
 
