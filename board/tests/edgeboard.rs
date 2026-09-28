@@ -64,9 +64,10 @@ use embsim_board::{
     System, SystemHandle,
 };
 use embsim_core::virtual_clock::{self, Actor, ClockMode};
+use embsim_models::isolation::{iso67xx, Iso67xx};
 use embsim_models::logic_gate::LVC1G14_T_PD_NS;
 use embsim_models::rail::UCC12040_RISE_NS;
-use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731_pins};
+use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep};
 
 /// Registered component count: the instances of the active part types
 /// that are components (the reset button is a switch; the polarity FET,
@@ -584,7 +585,9 @@ fn the_force_gauge_uart_crosses_the_isolator_between_socket_and_connector() {
 /// have to: the UART is on the net as levels, so an isolator is an isolator.
 #[rstest]
 fn every_isolator_channel_is_a_plain_level_repeater() {
-    let pins = iso6731_pins();
+    let config = iso67xx::Config::from_part_name("ISO6731DWR").expect("ISO6731DWR is an ISO67xx");
+    let isolator = Iso67xx::new(config).expect("a valid isolator configuration");
+    let pins = isolator.pins();
     let pin = |number: &str| {
         pins.iter()
             .find(|p| p.number == number)
