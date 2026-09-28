@@ -43,8 +43,11 @@ EMBSIM_QEMU_P2_BUILD=/path/to/qemu/build-p2 cargo test -p embsim-p2-qemu
 ```
 
 Unset, the crate compiles to a stub: `P2Qemu::with_boot_rom` returns
-`Err(P2QemuError::Unavailable)`, the integration test prints `SKIPPED` and
-asserts nothing, and the workspace builds on a machine with no QEMU.
+`Err(P2QemuError::Unavailable)`, and `tests/rom_boot_ec32mb.rs` is not built
+(`cfg(qemu_linked)`), so a stub `cargo test -p embsim-p2-qemu` cannot report
+the boot as a passing test. Unit tests in `lib.rs` / `flashimage.rs` still
+run. The workspace builds on a machine with no QEMU; CI's `p2-qemu-boot` job
+is the real boot gate.
 
 Making that tree is [`qemu-target/README.md`](qemu-target/README.md): QEMU
 `v10.1.0`, the `target/p2` and `hw/p2` sources from this directory, two

@@ -36,6 +36,10 @@
 //! real clock edges over the net, delivered one instant at a time, none
 //! before the START instant.
 
+// Built only when linked against a QEMU tree (`EMBSIM_QEMU_P2_BUILD` →
+// `cfg(qemu_linked)`). Stub workspace builds do not compile this binary,
+// so `cargo test -p embsim-p2-qemu` without QEMU cannot report a
+// false-green boot. Unit tests in `lib.rs` / `flashimage.rs` still run.
 #![cfg(qemu_linked)]
 
 use std::path::PathBuf;
