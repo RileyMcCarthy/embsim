@@ -108,8 +108,16 @@ fn null_modem(test: &str, baud_a: u32, baud_b: u32) -> NullModem {
     // Observe overflow after the components move into the system.
     let dropped_a = port_a.dropped_counter();
     let dropped_b = port_b.dropped_counter();
-    assert_eq!(port_a.dropped(), 0, "a freshly opened host PTY has dropped nothing");
-    assert_eq!(port_b.dropped(), 0, "a freshly opened host PTY has dropped nothing");
+    assert_eq!(
+        port_a.dropped(),
+        0,
+        "a freshly opened host PTY has dropped nothing"
+    );
+    assert_eq!(
+        port_b.dropped(),
+        0,
+        "a freshly opened host PTY has dropped nothing"
+    );
 
     // A null-modem cable crosses the pair: each end's transmit is the other's
     // receive.
