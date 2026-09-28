@@ -363,11 +363,6 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         (ROM_INSTRUCTION_NS..=4 * ROM_INSTRUCTION_NS).contains(&median),
         "the typical gap is the ROM's own clock loop, not a slice; median {median} ns"
     );
-    let second = P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &[]);
-    assert!(
-        matches!(second, Err(P2QemuError::AlreadyBooted)),
-        "a second P2 in this process is refused, got {second:?}"
-    );
 
     // The boot's cost, as the baseline `NODES.md` §8 phase 0 records and
     // every later phase is measured against: edges the flash clock carried,
@@ -395,6 +390,11 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         escalated, ESCALATED_SOLVES,
         "the ROM boot is projections only: the power tree's solves before the first edge and \
          none per edge"
+    );
+    let second = P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &[]);
+    assert!(
+        matches!(second, Err(P2QemuError::AlreadyBooted)),
+        "a second P2 in this process is refused, got {second:?}"
     );
 
     // The crystal is the rate the board delivers on XI, and on this module
