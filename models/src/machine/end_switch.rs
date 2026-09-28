@@ -108,8 +108,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, NetState, Ohms, PinDecl, PinHandle, PinKind,
-    TheveninDrive, Volts,
+    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms, PinDecl, PinHandle,
+    PinKind, TheveninDrive, Volts,
 };
 use embsim_core::event::Observers;
 use embsim_core::virtual_clock;
@@ -286,6 +286,7 @@ pub const END_SWITCH_PINS: [PinDecl; 2] = [
         kind: PinKind::DigitalIn,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     },
     PinDecl {
         number: "NO",
@@ -295,6 +296,7 @@ pub const END_SWITCH_PINS: [PinDecl; 2] = [
         // The contact resistance is applied per drive (it is configuration,
         // not a `&'static` constant), so the declaration carries no default.
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     },
 ];
 

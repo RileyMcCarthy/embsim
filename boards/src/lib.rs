@@ -11,8 +11,13 @@
 //! real module awkward — is the fixture that makes the test worth running.
 //!
 //! - [`ec32mb`] — the Parallax P2-EC32MB Propeller 2 module
-//! - [`stub`] — pin facades for the parts of a board that are real but not
-//!   exercised, and the rule for choosing their pin directions
+//! - [`p2`] — the Propeller 2 package as a node: the 86-pin facade around
+//!   a core (QEMU, an instruction-set simulator, the native firmware) or
+//!   around no core at all, held in reset
+//!
+//! There is no stub tier (`DESIGN.md` rule 1): every part on a board here
+//! is a node whose class has behaviour, and a part nobody has modelled is
+//! a build error naming it.
 
 pub mod ec32mb;
-pub mod stub;
+pub mod p2;

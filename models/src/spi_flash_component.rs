@@ -11,7 +11,8 @@
 //!  ~CS  on_sense ──active low──► set_selected(!high) ──► phase reset
 //!  DI   on_sense ─────────────► remembered, sampled at the next clock edge
 //!  CLK  on_sense ─────────────► clock(high, di) ──────► shift / consume
-//!  DO   ◄── digital_drive(miso()) ◄── after every ~CS or CLK sense
+//!  DO   ◄── digital_drive(miso()) while selected, released while not
+//!           ◄── after every ~CS or CLK sense
 //! ```
 //!
 //! # Why the data line is driven from the sense callbacks
@@ -61,8 +62,8 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, Level, PinDecl, PinHandle,
-    PinKind,
+    digital_drive, level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, PinDecl,
+    PinHandle, PinKind,
 };
 use tracing::trace;
 
@@ -75,6 +76,22 @@ const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
+    }
+}
+
+/// The data-out pin: an output that idles **released**, because a
+/// deselected part's DO is at high impedance (W25Q128JV §4.1 "Chip Select
+/// (/CS)", p.9) and the part comes up deselected. The adapter drives it
+/// only while `~CS` is low ([`publish_do`]).
+const fn data_out(number: &'static str) -> PinDecl {
+    PinDecl {
+        number,
+        name: Some("DO"),
+        kind: PinKind::DigitalOut,
+        stream: None,
+        drive_impedance: None,
+        idle: IdleDrive::Released,
     }
 }
 
@@ -88,6 +105,7 @@ const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
         kind,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -95,7 +113,7 @@ const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
 /// for a netlist that numbers its pins, as a KiCad export does.
 pub const SPI_FLASH_PINS_SOIC8: [PinDecl; 8] = [
     pin("1", "~CS", PinKind::DigitalIn),
-    pin("2", "DO", PinKind::DigitalOut),
+    data_out("2"),
     pin("3", "~WP", PinKind::DigitalIn),
     pin("4", "GND", PinKind::PowerIn),
     pin("5", "DI", PinKind::DigitalIn),
@@ -109,7 +127,7 @@ pub const SPI_FLASH_PINS_SOIC8: [PinDecl; 8] = [
 /// them.
 pub const SPI_FLASH_PINS_BY_FUNCTION: [PinDecl; 8] = [
     pin("CSn", "~CS", PinKind::DigitalIn),
-    pin("DO_IO1", "DO", PinKind::DigitalOut),
+    data_out("DO_IO1"),
     pin("WPn", "~WP", PinKind::DigitalIn),
     pin("VSS", "GND", PinKind::PowerIn),
     pin("DI_IO0", "DI", PinKind::DigitalIn),
@@ -127,7 +145,7 @@ pub const SPI_FLASH_PINS_SPI_ONLY: [PinDecl; 4] = [
     pin("CS", "~CS", PinKind::DigitalIn),
     pin_unaliased("CLK", PinKind::DigitalIn),
     pin("MOSI", "DI", PinKind::DigitalIn),
-    pin("MISO", "DO", PinKind::DigitalOut),
+    data_out("MISO"),
 ];
 
 /// Shared between the sense callbacks, which the engine delivers serially from
@@ -250,19 +268,22 @@ impl FlashView {
     }
 }
 
-/// Publish the device's current data-out level, or release the line when the
-/// part is not selected.
+/// Publish the device's current data-out level while it is selected, or
+/// release the line: a deselected part's DO is at high impedance
+/// (W25Q128JV §4.1 "Chip Select (/CS)", p.9), so whatever else is on the
+/// net — a pull-up, another device the bus is shared with — decides it.
 fn publish_do(shared: &Mutex<Shared>, data_out: &PinHandle) {
     let guard = shared.lock().expect("flash mutex");
-    let drive = if guard.flash.present() {
+    let drive = if guard.flash.present() && guard.flash.selected() {
         Some(digital_drive(if guard.flash.miso() {
             Level::High
         } else {
             Level::Low
         }))
     } else {
-        // No array fitted: never drive, so a pull-up decides and a master
-        // reads all-ones and concludes there is no device.
+        // Deselected, or no array fitted: never drive. With no array a
+        // pull-up decides and a master reads all-ones and concludes there
+        // is no device.
         None
     };
     drop(guard);

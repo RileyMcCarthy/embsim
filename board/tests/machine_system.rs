@@ -56,7 +56,8 @@ use std::time::{Duration, Instant};
 use rstest::rstest;
 
 use embsim_board::{
-    BuiltSystem, Finding, JumperState, Level, NetState, PinRef, Scenario, System, SystemHandle,
+    BuiltSystem, Finding, JumperState, Level, NetState, PinRef, RailDownReason, Scenario, System,
+    SystemHandle,
 };
 use embsim_models::machine::{
     end_switch, quadrature_encoder, stepper_motor, ActuationSense, EndSwitch, QuadratureEncoder,
@@ -64,9 +65,8 @@ use embsim_models::machine::{
 };
 use embsim_peripherals::serial;
 use machine_parts::{
-    bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, edge_polarity_fet_conducting,
-    encoder_jumpers_closed, force_domain_rails, force_gauge_harness, machine_harness,
-    module_polarity_fet_conducting, module_socket_harness,
+    bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, encoder_jumpers_closed,
+    force_domain_ground, force_gauge_harness, machine_harness, module_socket_harness,
 };
 
 /// Board names used throughout.
@@ -95,15 +95,14 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 // The machine, assembled
 // ============================================================
 
-/// The scenario every assembly shares: both boards' reverse-polarity pass FETs
-/// conducting, the encoder's ground/enable jumpers closed, the DS2 add-on's
-/// input jumpers closed, and the reset bodge the DS2 board needs (its `~RESET`
-/// net has exactly one pin — the July 2026 bench bug, still true of the
-/// netlist).
+/// The scenario every assembly shares: the encoder's ground/enable jumpers
+/// closed, the DS2 add-on's input jumpers closed, and the reset bodge the
+/// DS2 board needs (its `~RESET` net has exactly one pin — the July 2026
+/// bench bug, still true of the netlist). Both boards' reverse-polarity
+/// pass FETs are elements the solve turns on from the bench supplies
+/// (`NODES.md` §8 phase 3); nothing here says they conduct.
 fn machine_scenario() -> Scenario {
-    let scenario = module_polarity_fet_conducting(Scenario::default(), MODULE);
-    let scenario = edge_polarity_fet_conducting(scenario, EDGE);
-    let scenario = encoder_jumpers_closed(scenario, EDGE);
+    let scenario = encoder_jumpers_closed(Scenario::default(), EDGE);
     scenario
         .jumper(&format!("{DS2}.JP1"), JumperState::Closed)
         .jumper(&format!("{DS2}.JP2"), JumperState::Closed)
@@ -111,8 +110,10 @@ fn machine_scenario() -> Scenario {
 }
 
 /// Every harness: the module in its socket, the force-gauge cable, the machine
-/// cables, and the bench supplies for both the primary and the isolated
-/// domains.
+/// cables, the bench supplies for the primary and servo domains, and the
+/// isolated force domain's references — its 5 V is the Edge board's own
+/// `IC4`, so the bench holds only its return and the add-on's analog
+/// supply ([`force_domain_ground`]).
 fn machine_system() -> System {
     let mut system = System::new()
         .board(MODULE, ec32mb_board())
@@ -122,7 +123,7 @@ fn machine_system() -> System {
         .harness(force_gauge_harness(EDGE, DS2))
         .harness(machine_harness(EDGE))
         .harness(bench_rails(EDGE))
-        .harness(force_domain_rails(DS2))
+        .harness(force_domain_ground(DS2))
         .scenario(machine_scenario());
 
     // The machine components. The motor's shaft feeds the encoder — the one
@@ -221,16 +222,24 @@ fn the_whole_machine_builds_without_contention() {
     );
 }
 
-/// The unsourced power domains of the assembled machine are exactly the ports
-/// nothing is plugged into, plus one board defect — the same list
-/// `edgeboard.rs` derives for a bare board, minus everything the module and the
-/// cables now supply.
+/// The unsourced power domains of the assembled machine **in the build
+/// snapshot** — the state before the first wake — are the ports nothing is
+/// plugged into, one board defect, and every rail a regulator with a
+/// soft-start has not yet raised: the module's bucks rise 2.5 ms after the
+/// carrier's 5 V reaches them and its eight LDOs with them, the isolated
+/// force domain 750 µs after the Edge board's `IC4` sees its input, and
+/// the isolated I/O domain never, on this bench, for want of a return
+/// ([`Finding::RailDown`] names each). `power_tree.rs` steps the assembled
+/// machine past the soft-starts and asserts the rails up.
 ///
-/// | Domain | Why it is still unsourced |
+/// | Domain | Why it is unsourced at build |
 /// |---|---|
 /// | `RPI_5V` / `RPI_GND` | no Raspberry Pi on the J4 header |
 /// | `ISS_5V` / `ISS_GND` | nothing on the isolated servo-serial port J23 |
 /// | `Net-(IC14-GND2_1)` | the servo isolator's secondary ground is unwired on the schematic (see `edgeboard.rs`) |
+/// | `5V_IO` / `GND_IO` | the isolated I/O domain's return is tied to nothing on the board and this bench |
+/// | `Common_VDD`, `Common_LDOin`, the eight `VIO_*` | the module's bucks are in their 2.5 ms soft-start; the LDOs' input is the buck's |
+/// | `IFG_5V` (the add-on's `+3V3`) | `IC4` is in its 750 µs rise |
 #[rstest]
 fn the_assembled_machine_leaves_only_the_unplugged_ports_unsourced() {
     let system = build_machine();
@@ -252,12 +261,65 @@ fn the_assembled_machine_leaves_only_the_unplugged_ports_unsourced() {
             "EdgeBoard./MaD_Edge_Sheet3/ISS_5V".to_string(),
             "EdgeBoard./MaD_Edge_Sheet3/ISS_GND".to_string(),
             "EdgeBoard.Net-(IC14-GND2_1)".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/5V_IO".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/GND_IO".to_string(),
+            "EdgeBoard./MaD_Edge_Sheet2/IFG_5V".to_string(),
+            "EC32MB.Common_VDD".to_string(),
+            "EC32MB.Common_LDOin".to_string(),
+            "EC32MB.VIO_00_07".to_string(),
+            "EC32MB.VIO_08_15".to_string(),
+            "EC32MB.VIO_16_23".to_string(),
+            "EC32MB.VIO_24_31".to_string(),
+            "EC32MB.VIO_32_39".to_string(),
+            "EC32MB.VIO_40_47".to_string(),
+            "EC32MB.VIO_48_55".to_string(),
+            "EC32MB.VIO_56_63".to_string(),
         ])
     );
 
-    // Everything the module supplies is now live — including the P2 bank rails
-    // the EdgeBoard's own pull-ups hang off.
-    for rail in ["EC32MB.VIO_16_23", "EdgeBoard./MaD_Edge_Sheet3/SC_5V"] {
+    // The rails the snapshot is early for are reported as such, each with
+    // what the build can see: the bucks' inputs are sourced (the FET
+    // passes the 5 V) and they hold their outputs anyway — the soft-start;
+    // the LDOs' input is the buck's down rail; `IC4`'s input is up and its
+    // return held over the cable — the rise; `IC3`'s return is unheld.
+    let down = |part: &str, pin: &str, reason: RailDownReason| {
+        assert!(
+            system.diagnostics().contains(&Finding::RailDown {
+                part: part.to_string(),
+                pin: pin.to_string(),
+                reason,
+            }),
+            "{part}.{pin}: {:?}",
+            system.diagnostics().findings()
+        );
+    };
+    down("EC32MB.U402", "SW", RailDownReason::HeldDown);
+    down("EC32MB.U403", "SW", RailDownReason::HeldDown);
+    for ldo in 501..=508 {
+        down(
+            &format!("EC32MB.U{ldo}"),
+            "OUT",
+            RailDownReason::InputUnsourced {
+                pin: "IN".to_string(),
+            },
+        );
+    }
+    down("EdgeBoard.IC4", "14", RailDownReason::HeldDown);
+    down(
+        "EdgeBoard.IC3",
+        "14",
+        RailDownReason::ReferenceUnheld {
+            pin: "15".to_string(),
+        },
+    );
+    // What the bench and the cables do supply is live in the snapshot —
+    // the servo domain, the primary rails, the add-on's analog supply.
+    for rail in [
+        "EdgeBoard./MaD_Edge_Sheet3/SC_5V",
+        "EdgeBoard.+5V",
+        "EdgeBoard.+3.3V",
+        "DS2Addon.VDDA",
+    ] {
         assert!(
             !unsourced.contains(rail),
             "{rail} must be sourced in the assembled machine"
@@ -323,25 +385,39 @@ fn every_declared_finger_is_one_node_across_the_socket() {
         state_of(&system, "EdgeBoard.P2"),
         NetState::Driven(Level::High)
     );
-    // EdgeBoard → module: the force isolator's MCU-side output drives P0.
+    // EdgeBoard → module: the force isolator's MCU-side output lands on
+    // P0 — one node across the socket. In the build snapshot the isolator
+    // drives nothing: its isolated side runs from the force domain, the
+    // Edge board's `IC4`, 750 µs from its input, and a repeater with one
+    // side dark releases; the byte exchange below is where the drive is
+    // seen, once the domain has risen.
+    assert!(
+        system.names_are_merged("EdgeBoard.P0", "EC32MB.P2_IO0"),
+        "the isolator's output and the P2's force-gauge RX pin are one node"
+    );
     assert_eq!(
         state_of(&system, "EdgeBoard.P0"),
         state_of(&system, "EC32MB.P2_IO0")
     );
     assert!(
-        matches!(state_of(&system, "EC32MB.P2_IO0"), NetState::Driven(_)),
-        "the isolator drives the P2's force-gauge RX pin; got {:?}",
+        matches!(state_of(&system, "EC32MB.P2_IO0"), NetState::Floating),
+        "before the force domain rises the isolator releases its output; got {:?}",
         state_of(&system, "EC32MB.P2_IO0")
     );
 }
 
-/// The socket pins for signals the module keeps for itself stay dark: the
-/// EdgeBoard breaks out all 80 fingers, the module connects 58, and every
-/// position in the P40..P57 / V40 / V48 block the PSRAMs own resolves floating.
-/// Asserting it makes the absence deliberate — a consumer wiring something to
-/// socket pin 76 gets a finding, not silence.
+/// The socket pins for signals the module keeps for itself get nothing
+/// from the module: the EdgeBoard breaks out all 80 fingers, the module
+/// connects 58, and every position in the P40..P57 / V40 / V48 block the
+/// PSRAMs own resolves to what the EdgeBoard alone makes of it — floating,
+/// except the two the Raspberry-Pi block's isolator `IC2` drives from its
+/// P2 side: with nothing on the Pi header its far side is unpowered, and the
+/// ISO6742's function table puts its outputs at their default high (TI
+/// SLLSFJ6G §9.4 Table 9-2, `VCCI` PD / `VCCO` PU). Asserting it makes the
+/// absence deliberate — a consumer wiring something to socket pin 76 gets a
+/// finding, not silence, and one wiring pin 61 meets the isolator.
 #[rstest]
-fn socket_pins_the_module_never_connects_stay_floating() {
+fn socket_pins_the_module_never_connects_get_nothing_from_it() {
     let system = build_machine();
     let map = net_of_pin(&system);
     let harnessed: BTreeSet<u32> = edge_fingers().collect();
@@ -353,12 +429,17 @@ fn socket_pins_the_module_never_connects_stay_floating() {
         }
         let net = net_named(&map, EDGE, "J3", &finger.to_string());
         // Fingers 1/2 are the socket's own no-connect pads (their EdgeBoard net
-        // is an `unconnected-(…)` stub); everything else in the block is a
-        // broken-out signal or bank supply with nothing behind it.
+        // is an `unconnected-(…)` stub); 61/62 are `IC2`'s `OUTC`/`OUTD`;
+        // everything else in the block is a broken-out signal or bank supply
+        // with nothing behind it.
+        let expected = match finger {
+            61 | 62 => NetState::Driven(Level::High),
+            _ => NetState::Floating,
+        };
         assert_eq!(
             state_of(&system, &net),
-            NetState::Floating,
-            "socket pin {finger} ({net}) has nothing behind it"
+            expected,
+            "socket pin {finger} ({net}) gets nothing from the module"
         );
         checked += 1;
     }
@@ -483,6 +564,20 @@ fn the_force_path_carries_a_command_and_a_conversion_end_to_end() {
             system.net_state(net)
         );
     }
+
+    // The isolated force domain is the Edge board's own `IC4`, up 750 µs
+    // after its input arrives (the UCC12040's rise time): a command sent
+    // before that reaches an unpowered ADC. Wait for the domain's 5 V, as
+    // firmware waits out a power-on delay before its first command.
+    let force_rail = "EdgeBoard./MaD_Edge_Sheet2/IFG_5V";
+    assert!(
+        wait_for(
+            || matches!(system.net_state(force_rail), Some(NetState::Analog(v)) if (v - 5.0).abs() < 1e-9),
+            Duration::from_secs(5)
+        ),
+        "the force domain rises to the isolated DC/DC's 5 V; got {:?}",
+        system.net_state(force_rail)
+    );
 
     // SYNC + RDATA (0x55 0x10 — TI SBAS752B §8.5.3.4), written the way the
     // firmware writes it.
@@ -681,15 +776,32 @@ fn the_end_switch_loops_reach_the_p2_through_pulled_up_inputs() {
     );
     assert_eq!(net_named(&map, EDGE, "U7", "7"), "EdgeBoard.P20");
 
-    // With the module plugged in, the eight isolated inputs are pulled up.
+    // With the module plugged in, the eight isolated inputs' pull-up rail
+    // is the module's `U503` — a real LDO, whose input is the module's
+    // 3.65 V buck, 2.5 ms of soft-start after the carrier's 5 V. The build
+    // snapshot is before that instant, so here the eight inputs float and
+    // their bank rail is reported down for want of its input;
+    // `power_tree.rs` steps the assembled machine past the soft-start and
+    // reads them at their pull-ups.
     for pin in 16..=23u32 {
         let net = format!("EdgeBoard.P{pin}");
-        assert!(
-            matches!(state_of(&system, &net), NetState::Pulled(Level::High, _)),
-            "{net} must idle at its pull-up now the module powers VIO_16_23; got {:?}",
-            state_of(&system, &net)
+        assert_eq!(
+            state_of(&system, &net),
+            NetState::Floating,
+            "{net} floats before the module's LDO has risen"
         );
     }
+    assert!(
+        system.diagnostics().contains(&Finding::RailDown {
+            part: "EC32MB.U503".to_string(),
+            pin: "OUT".to_string(),
+            reason: RailDownReason::InputUnsourced {
+                pin: "IN".to_string()
+            },
+        }),
+        "{:?}",
+        system.diagnostics().findings()
+    );
 }
 
 // ============================================================
@@ -741,13 +853,7 @@ fn moving_the_shaft_changes_the_encoder_nets_the_board_reads() {
             machine_parts::ep("ENC.A"),
             machine_parts::ep("EdgeBoard.J20.1"),
         ))
-        .scenario(encoder_jumpers_closed(
-            edge_polarity_fet_conducting(
-                module_polarity_fet_conducting(Scenario::default(), MODULE),
-                EDGE,
-            ),
-            EDGE,
-        ))
+        .scenario(encoder_jumpers_closed(Scenario::default(), EDGE))
         .component("ENC", Box::new(encoder))
         .start()
         .expect("the axis starts");

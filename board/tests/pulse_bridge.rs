@@ -40,8 +40,9 @@ use embsim_board::mcu::{
     EncoderChannelConfig, GpioChannelConfig, GpioDirection, PulseOutChannelConfig,
 };
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, EngineEvent, Harness, Level, McuComponent, NetState,
-    PinDecl, PinHandle, PinKind, PulseDirection, PulseTrain, StreamRole, System, SystemHandle,
+    AttachError, Component, ComponentNetIo, EngineEvent, Harness, IdleDrive, Level, McuComponent,
+    NetState, PinDecl, PinHandle, PinKind, PulseDirection, PulseTrain, StreamRole, System,
+    SystemHandle,
 };
 use embsim_core::virtual_clock;
 use embsim_peripherals::{encoder, gpio, pulse_out};
@@ -139,6 +140,7 @@ impl StepDrive {
                     kind: PinKind::DigitalIn,
                     stream: Some(StreamRole::PulseSink),
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
                 input("DIR"),
                 input("ENA"),
@@ -206,6 +208,7 @@ const fn input(number: &'static str) -> PinDecl {
         kind: PinKind::DigitalIn,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -216,6 +219,7 @@ const fn output(number: &'static str) -> PinDecl {
         kind: PinKind::DigitalOut,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 

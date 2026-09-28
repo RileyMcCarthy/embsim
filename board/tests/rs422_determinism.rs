@@ -26,9 +26,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use embsim_board::{Level, NetState, Scenario, System, SystemHandle};
-use machine_parts::{
-    bench_rails, edge_board, edge_polarity_fet_conducting, encoder_jumpers_closed,
-};
+use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed};
 use vibes_behaviour::{behaviour, expect, Test};
 
 /// The isolator input the P2 reads as P9 — the receiver's channel-1 output.
@@ -55,11 +53,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 /// closed jumper, so the receiver should decode a logic high.
 fn start_forward() -> SystemHandle {
     ensure_clock();
-    let scenario = encoder_jumpers_closed(
-        edge_polarity_fet_conducting(Scenario::default(), "EdgeBoard"),
-        "EdgeBoard",
-    )
-    .net_stuck(A_PLUS, 3.3);
+    let scenario = encoder_jumpers_closed(Scenario::default(), "EdgeBoard").net_stuck(A_PLUS, 3.3);
     System::new()
         .board("EdgeBoard", edge_board())
         .harness(bench_rails("EdgeBoard"))
@@ -118,6 +112,27 @@ fn settle_once() -> (NetState, Vec<String>) {
 /// So whoever picks this up: the mechanism is still open, this test is the
 /// sharpest instrument available for it, and the honest first step is a
 /// reproduction that fires on demand rather than another plausible story.
+///
+/// **Phase 0 of `NODES.md` (2026-09-23).** Recipe:
+///
+/// ```text
+/// cargo test -p embsim-board --test rs422_determinism -- --ignored --nocapture
+/// ```
+///
+/// It fired on the first invocation that day: one run of twelve rested
+/// `Floating`, in 0.2 s of wall time for all twelve, and the two traces were
+/// the same 175 events until event 162, where the good run delivered
+/// `sense net=44 state=analog:5000000uv` and the bad run applied
+/// `drive_applied seq=26 endpoint=91 drive=release` first — a component's
+/// attach-time release reaching the drive table before or after a
+/// resolution pass delivers its senses. That is the free-running
+/// interleaving `DETERMINISM.md` documents as unfixed at T0, landing on a
+/// scenario whose settled state depends on it. The mechanism stays open;
+/// what phase 0 decided is the rule in `TESTING.md` (rule 9): until this
+/// closes, every new model's proving test runs in stepped mode, where the
+/// engine quiesces every actor before it advances. Run this a few times if
+/// it does not fire at once — the rate has ranged from one in two to zero
+/// across sessions on one commit.
 #[ignore = "reproduces an open engine nondeterminism; run with --ignored"]
 #[test]
 fn the_rs422_receiver_settles_the_same_way_every_time() {

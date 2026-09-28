@@ -1,12 +1,13 @@
 //! A serial NOR flash, device side — generic, bit-level, bus-agnostic.
 //!
-//! The model is a shift register with a command state machine and a backing
-//! image. It knows nothing about which MCU is driving it, which pins it sits
-//! on, or whether those pins are bit-banged by software or clocked by a
-//! peripheral: the whole surface is [`SpiNorFlash::set_selected`],
-//! [`SpiNorFlash::clock`] and [`SpiNorFlash::miso`]. Anything that can produce
-//! a chip select, a clock edge and a data bit can talk to it, which is what
-//! makes it reusable across boards and MCUs.
+//! The model is a shift register ([`crate::spi_shift::ByteShifter`], shared
+//! with the PSRAM) with a command state machine and a backing image. It
+//! knows nothing about which MCU is driving it, which pins it sits on, or
+//! whether those pins are bit-banged by software or clocked by a peripheral:
+//! the whole surface is [`SpiNorFlash::set_selected`], [`SpiNorFlash::clock`]
+//! and [`SpiNorFlash::miso`]. Anything that can produce a chip select, a
+//! clock edge and a data bit can talk to it, which is what makes it reusable
+//! across boards and MCUs.
 //!
 //! Mounting it on a netlist — deciding that CS is *this* pin and CLK is *that*
 //! one — is the board adapter's job, not this module's.
@@ -65,6 +66,8 @@
 //! (the byte is AND-ed into place), so writing without erasing first gives the
 //! wrong answer here exactly as it would on the part. Erase sets `$FF`. The
 //! write-enable latch clears after each program or erase, as on silicon.
+
+use crate::spi_shift::ByteShifter;
 
 /// The JEDEC (`9Fh`) triple of a **W25Q128JV-IM/JM**: manufacturer `EFh`,
 /// device ID `7018h` (§8.1.1, p.21).
@@ -127,15 +130,9 @@ pub struct SpiNorFlash {
     page_size: u32,
 
     selected: bool,
-    clk_high: bool,
-    /// Bits shifted in this byte, MSB first.
-    in_bits: u8,
-    in_count: u32,
-    /// The byte being shifted out and how far through it we are.
-    out_byte: u8,
-    out_count: u32,
-    /// The bit currently held on MISO, updated as the clock moves.
-    miso_bit: bool,
+    /// The bit-level engine: clock tracking, the byte in, the byte out and
+    /// the bit on MISO.
+    shift: ByteShifter,
     phase: Phase,
     addr_acc: u32,
     read_addr: u32,
@@ -172,14 +169,13 @@ impl SpiNorFlash {
     /// it return `$FF`, as an address past the end of a real part's array
     /// would after erase.
     pub fn with_image(image: Vec<u8>) -> Self {
-        let mut flash = Self {
+        Self {
             image,
             jedec_id: JEDEC_ID_W25Q128JV_IM,
             page_size: DEFAULT_PAGE_SIZE,
+            shift: ByteShifter::new(),
             ..Self::default()
-        };
-        flash.miso_bit = true;
-        flash
+        }
     }
 
     /// Report a different manufacturer/type/capacity triple for `$9F`.
@@ -214,12 +210,23 @@ impl SpiNorFlash {
     }
 
     /// The bit currently on the data-out line, DO (IO1) — pin 2 of the SOIC-8
-    /// (§3.3, p.5).
+    /// (§3.3, p.5) — while the part is selected. Deselected, the pin is at
+    /// high impedance (§4.1 "Chip Select (/CS)", p.9: "When /CS is high the
+    /// device is deselected and the Serial Data Output … pins are at high
+    /// impedance"); a caller with no net to read reads the line as the high
+    /// a pull-up would give, and a board adapter releases the pin instead —
+    /// see [`SpiNorFlash::selected`].
     pub fn miso(&self) -> bool {
         if !self.selected {
             return true; // a released line idles high on its pull-up
         }
-        self.miso_bit
+        self.shift.dout()
+    }
+
+    /// Whether the part is selected (`/CS` low). While it is not, DO is at
+    /// high impedance (§4.1, p.9) and a board adapter drives nothing.
+    pub fn selected(&self) -> bool {
+        self.selected
     }
 
     /// Chip select changed. `selected` is the ASSERTED sense — the caller
@@ -241,13 +248,10 @@ impl SpiNorFlash {
             // latch drops with it, so the next write needs its own `$06`.
             self.wel = false;
         }
-        self.in_count = 0;
-        self.in_bits = 0;
-        self.out_count = 0;
         self.jedec_idx = 0;
         self.phase = Phase::Command;
-        self.out_byte = self.next_out();
-        self.miso_bit = self.out_bit();
+        let first = self.next_out();
+        self.shift.begin(first);
     }
 
     /// Move the clock to `high`, sampling `mosi`. Returns after updating the
@@ -258,33 +262,25 @@ impl SpiNorFlash {
     /// edges. A caller may therefore forward every sense of the clock net
     /// without tracking edges itself.
     pub fn clock(&mut self, high: bool, mosi: bool) {
-        if self.clk_high == high || !self.selected {
-            self.clk_high = high;
+        if !self.selected {
+            self.shift.track_clock(high);
             return;
         }
-        self.clk_high = high;
-        if !high {
-            return; // the falling edge carries nothing
-        }
-        // Input: sample MOSI and assemble the byte.
-        self.in_bits = (self.in_bits << 1) | u8::from(mosi);
-        self.in_count += 1;
-        if self.in_count == 8 {
-            self.in_count = 0;
-            let byte = self.in_bits;
-            self.in_bits = 0;
+        let Some(edge) = self.shift.clock(high, mosi) else {
+            return; // a repeated level, or the falling edge: nothing
+        };
+        // Input: a byte assembled on this edge is decoded before the next
+        // out byte is chosen, so the phase it selects is the one that
+        // answers.
+        if let Some(byte) = edge.byte_in {
             self.consume(byte);
         }
-        // Output: present the current bit NOW, then step -- see the module
-        // note on bit presentation. Stepping first reads back one bit late.
-        self.miso_bit = self.out_bit();
-        self.out_count += 1;
-        if self.out_count == 8 {
+        if let Some(served) = edge.finished_out {
             if self.served.len() < DIAG_LIMIT {
-                self.served.push(self.out_byte);
+                self.served.push(served);
             }
-            self.out_count = 0;
-            self.out_byte = self.next_out();
+            let next = self.next_out();
+            self.shift.load_out(next);
         }
     }
 
@@ -315,11 +311,6 @@ impl SpiNorFlash {
             }
             _ => 0xFF,
         }
-    }
-
-    /// The bit at the current output position of `out_byte`.
-    fn out_bit(&self) -> bool {
-        self.out_byte >> (7 - self.out_count.min(7)) & 1 != 0
     }
 
     /// Program one byte. A page program writes "at previously erased (FFh)

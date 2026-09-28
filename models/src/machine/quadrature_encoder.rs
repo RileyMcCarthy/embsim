@@ -90,7 +90,7 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE;
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, Ohms, PinDecl, PinHandle, PinKind,
+    AttachError, Component, ComponentNetIo, IdleDrive, Level, Ohms, PinDecl, PinHandle, PinKind,
     TheveninDrive, Volts,
 };
 use embsim_core::event::Observers;
@@ -210,6 +210,7 @@ fn output(number: &'static str, impedance: Ohms) -> PinDecl {
         kind: PinKind::DigitalOut,
         stream: None,
         drive_impedance: Some(impedance),
+        idle: IdleDrive::KindDefault,
     }
 }
 

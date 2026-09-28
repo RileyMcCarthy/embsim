@@ -166,8 +166,8 @@ use embsim_peripherals::instance::PeripheralInstance;
 use embsim_peripherals::pulse_out::PulseSegment;
 
 use crate::component::{
-    AttachError, Component, ComponentNetIo, PinDecl, PinKind, PulseDirection, PulseTrain, PulseTx,
-    StreamRole,
+    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, PulseDirection,
+    PulseTrain, PulseTx, StreamRole,
 };
 use crate::net::Level;
 use crate::serial_levels::SerialLevelBridge;
@@ -572,6 +572,7 @@ impl McuBuilder {
                 kind: PinKind::DigitalOut,
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             });
             pins.push(PinDecl {
                 number: claim(config.rx_pin)?,
@@ -579,6 +580,7 @@ impl McuBuilder {
                 kind: PinKind::DigitalIn,
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             });
             bridges.push(SerialBridge { channel, config });
         }
@@ -595,6 +597,7 @@ impl McuBuilder {
                 kind: gpio_kind(*direction),
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             });
         }
 
@@ -615,6 +618,7 @@ impl McuBuilder {
                 kind: gpio_kind(direction),
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             });
             gpio_bridges.push(GpioBridge {
                 channel,
@@ -652,6 +656,7 @@ impl McuBuilder {
                 kind: PinKind::DigitalOut,
                 stream: Some(StreamRole::PulseSource),
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             });
             pulse_bridges.push(PulseBridge {
                 channel,
@@ -679,6 +684,7 @@ impl McuBuilder {
                     kind: PinKind::DigitalIn,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 });
             }
             encoder_bridges.push(EncoderBridge {

@@ -9,7 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use embsim_board::uart::{FramingError, UartFraming};
-use embsim_board::{AttachError, Component, ComponentNetIo, PinDecl, PinKind, SerialLevelBridge};
+use embsim_board::{
+    AttachError, Component, ComponentNetIo, IdleDrive, PinDecl, PinKind, SerialLevelBridge,
+};
 use embsim_core::virtual_clock;
 
 use crate::guest::Guest;
@@ -249,6 +251,7 @@ impl QemuNode {
                     kind: PinKind::DigitalOut,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
                 PinDecl {
                     number: "RX",
@@ -256,6 +259,7 @@ impl QemuNode {
                     kind: PinKind::DigitalIn,
                     stream: None,
                     drive_impedance: None,
+                    idle: IdleDrive::KindDefault,
                 },
             ],
             framing: UartFraming::new_8n1(baud_hz),

@@ -26,3 +26,7 @@ proptest.workspace = true
 # the live ADS122U04 component and share its pin-facade table, so the board
 # tests import the models crate that depends on this one.
 embsim-models = { path = "../models" }
+# Same dev-only cycle: the cluster census (`tests/cluster_census.rs`) measures
+# the P2-EC32MB as `embsim-boards` ships it, beside the two boards whose
+# fixtures live here.
+embsim-boards = { path = "../boards" }

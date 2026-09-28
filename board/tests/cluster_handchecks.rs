@@ -51,6 +51,7 @@ fn divider_47r_over_4k7_matches_closed_form() {
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 0.0), source(2, 0.0, 0.0)],
+        ..Default::default()
     };
     let solution = QuasiStaticMna.solve(&cluster, &inputs);
     let expected_mid = 3.3 * 4_700.0 / 4_747.0;
@@ -90,6 +91,7 @@ fn wheatstone_bridge_mad_strain_gauge_matches_bridge_equation() {
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, v_exc, 0.0), source(1, 0.0, 0.0)],
+        ..Default::default()
     };
     let solution = QuasiStaticMna.solve(&cluster, &inputs);
 
@@ -124,6 +126,7 @@ fn stiff_sources_fighting_through_series_resistor_sit_between_rails() {
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 25.0), source(1, 0.0, 25.0)],
+        ..Default::default()
     };
     let solution = QuasiStaticMna.solve(&cluster, &inputs);
 
@@ -152,6 +155,7 @@ fn disconnected_island_reports_floating_only_for_unsourced_nodes() {
     };
     let inputs = ClusterInputs {
         sources: vec![source(0, 3.3, 25.0)],
+        ..Default::default()
     };
     let solution = QuasiStaticMna.solve(&cluster, &inputs);
 

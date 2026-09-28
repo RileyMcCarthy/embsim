@@ -5,7 +5,7 @@
 //! tooling can consume the same bus later. The [`Diagnostics`] collector is
 //! Vec-based; every reported finding is also emitted as a `tracing` warning.
 
-use crate::net::{PinRef, Volts};
+use crate::net::{Ohms, PinRef, Volts};
 
 // ============================================================
 // Findings
@@ -43,11 +43,41 @@ pub enum PinMismatchDirection {
     PresentButUndeclared,
 }
 
+/// Why a rail is down at build ([`Finding::RailDown`]): what the build can
+/// see of the part from the outside — its supply pins and its declared
+/// reference — with the part's own gate (its threshold, its enable, its
+/// soft-start) the third case, named as such.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RailDownReason {
+    /// A power-in pin of the part is on a net no source reaches: the rail
+    /// has nothing to regulate from.
+    InputUnsourced {
+        /// The unsourced power-in pin.
+        pin: String,
+    },
+    /// The output's declared reference pin is on a net no source reaches:
+    /// the rail has nothing to measure its voltage against, so it publishes
+    /// none (`NODES.md` §2, the Regulator row: an unheld reference is a
+    /// floating output).
+    ReferenceUnheld {
+        /// The reference pin.
+        pin: String,
+    },
+    /// The part's supply and reference are sourced and it holds the output
+    /// released anyway: its input is below its threshold, its enable is
+    /// off, or its soft-start has not elapsed — the build snapshot is the
+    /// state before the first wake, and a rail with a soft-start is down in
+    /// it (`NODES.md` §5). The part's own monitor says which.
+    HeldDown,
+}
+
 /// One structured diagnostic finding. A finding, never a panic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Finding {
-    /// ≥ 2 push-pull sources fighting on one net (directly or through
-    /// collapsed low-value series resistance).
+    /// Strong sources (under [`crate::net::WEAK_DRIVE_OHMS`] in total)
+    /// fighting on one net: one lost to a source ten times stronger, or
+    /// comparable ones solved to a divided voltage. Names every strong pin
+    /// on the net; an ideal source (a rail, a `net_stuck`) has none to name.
     Contention {
         /// Net name.
         net: String,
@@ -62,12 +92,69 @@ pub enum Finding {
         /// Digital or analog sense domain.
         kind: SenseKind,
     },
-    /// A solved voltage inside a digital sense's `V_IL`/`V_IH` dead band.
+    /// Disagreeing sources of comparable strength solved to a node voltage
+    /// strictly inside the [`crate::net::V_IL`]/[`crate::net::V_IH`] dead
+    /// band: neither a valid low nor a valid high, so the net projects
+    /// [`crate::NetState::Contention`] and this names the voltage it
+    /// actually sits at. Reported beside the fight's `Contention` finding.
     AmbiguousLevel {
         /// Net name.
         net: String,
         /// The solved node voltage that fell inside the dead band.
         volts: Volts,
+    },
+    /// A [`crate::Drive::Current`] injected into a net no Thevenin source
+    /// reaches. A current source has no open-circuit voltage and no return
+    /// path here, so the net stays [`crate::NetState::Floating`] and the
+    /// injection goes nowhere — a modelling error, never an invented
+    /// voltage.
+    CurrentIntoFloatingNode {
+        /// Net name.
+        net: String,
+        /// The injecting pin.
+        pin: PinRef,
+    },
+    /// A pulse train reached a coupling capacitor whose reactance at the
+    /// train's rate is not small against the far node's resistance
+    /// (`1/(2π·f·C) > R_far /` [`crate::net::COUPLING_REACTANCE_RATIO`]), so
+    /// the rate does not cross: the train stops at the capacitor and the
+    /// sink beyond it is not delivered. Live only — the rate is known at
+    /// delivery, not at build. Reported once per distinct occurrence like
+    /// every live finding (the bus dedups on equality): a train re-published
+    /// segment after segment at one rate raises it once, and a rate that
+    /// changes is a new verdict with its own reactance.
+    PulseNotCoupled {
+        /// The net on the far side of the capacitor.
+        net: String,
+        /// The capacitor's reference designator.
+        capacitor: String,
+        /// The train's rate.
+        hz: u32,
+        /// The capacitor's reactance at that rate.
+        reactance_ohms: Ohms,
+        /// The far node's resistance estimate the reactance was judged
+        /// against (the smallest resistor touching the node; `+∞` for none).
+        far_ohms: Ohms,
+    },
+    /// A cluster's piecewise-linear elements found no consistent set of
+    /// regions: the flip loop — every element off, then the first element
+    /// whose region test disagrees with its state flipped, one per solve,
+    /// in declaration order — ran its bound of
+    /// [`crate::cluster::PWL_SOLVES_PER_ELEMENT`] solves per element and a
+    /// test still disagreed. Two elements whose tests chase each other (an
+    /// inverting loop with no rest state) do this. The cluster then has no
+    /// operating point: every node of it publishes
+    /// [`crate::NetState::Floating`] (a terminal keeps its constant) — never
+    /// `NaN`, never the last set of regions tried — and this names the
+    /// elements and the solve count (`NODES.md` §7).
+    NonConvergent {
+        /// The cluster, named by its lowest-indexed net.
+        cluster: String,
+        /// The elements in the cluster, in declaration order, as
+        /// `Board.Reference`.
+        elements: Vec<String>,
+        /// Linear solves the loop ran before giving up: the bound.
+        solves: usize,
     },
     /// A power net with no `PowerOut` source anywhere (board or harness);
     /// presents as down (0 V into cluster solves).
@@ -149,6 +236,69 @@ pub enum Finding {
         pin: String,
         /// Which side declared the pin the other lacks.
         direction: PinMismatchDirection,
+    },
+    /// A rail — a `PowerOut` pin's net — that sources nothing at build: the
+    /// terminal is released, by the part or because nothing holds it.
+    /// Raised by the build for every such pin that is not itself another
+    /// pin's declared reference (an isolated ground is held by the board or
+    /// the harness, never a rail), with the reason the build can see
+    /// ([`RailDownReason`]).
+    RailDown {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The `PowerOut` pin.
+        pin: String,
+        /// Why.
+        reason: RailDownReason,
+    },
+    /// A pin whose net a source reaches while the net of its declared
+    /// reference pin ([`crate::PinReference`]) reaches none: the domain is
+    /// live and its voltages are measured against nothing. An isolator
+    /// whose secondary ground is unwired, an isolated supply whose
+    /// return nothing ties down.
+    UnreferencedDomain {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The live pin.
+        pin: String,
+        /// Its reference pin, on a net no source reaches.
+        reference: String,
+    },
+    /// A power-in pin with no capacitor between its node and its declared
+    /// reference pin's node: a supply pin the layout does not decouple. Two
+    /// caps on the same two nodes are one; a cap to any other node is none.
+    UndecoupledPowerPin {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The power-in pin.
+        pin: String,
+        /// Its reference pin.
+        reference: String,
+    },
+    /// A mechanical node's pad — a mounting hole, a fiducial, a layout node
+    /// — shares a net with a pin that drives it: a driver is loaded by a
+    /// pad the schematic meant to be ground or nothing. A pad on a declared
+    /// terminal (a ground the harness holds) or on no net raises nothing.
+    MechanicalOnDrivenNet {
+        /// The mechanical part, as `Board.Reference`.
+        part: String,
+        /// The net.
+        net: String,
+        /// The pins driving it.
+        drivers: Vec<PinRef>,
+    },
+    /// The build-time fixed point did not settle within its bound: after
+    /// `passes` rounds of replaying the drives components issued in response
+    /// to the states they were delivered, some component was still changing
+    /// its drive. The build snapshot then describes the last pass, not a
+    /// rest state, and cannot be relied on to equal the live system's
+    /// pre-wake state (`System::build`). Names the nets whose states were
+    /// still moving on the last pass.
+    BuildNotSettled {
+        /// Rounds of the fixed point that ran (the bound).
+        passes: usize,
+        /// Nets whose state changed on the last round, by name.
+        nets: Vec<String>,
     },
 }
 

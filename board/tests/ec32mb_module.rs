@@ -34,15 +34,14 @@ mod machine_parts;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rstest::rstest;
+use vibes_behaviour::{behaviour, expect, Test};
 
 use embsim_board::netlist::parse;
 use embsim_board::{
-    Board, Component, Finding, Level, NetState, PinRef, Scenario, SenseKind, System,
+    Board, Component, Finding, Level, NetState, PartClass, PinRef, RailDownReason, SenseKind,
+    System,
 };
-use machine_parts::{
-    ec32mb_board, ec32mb_registry, edge_fingers, ep, module_polarity_fet_conducting, P2EdgeModule,
-    EC32MB_STUB_REFS,
-};
+use machine_parts::{ec32mb_board, ec32mb_registry, edge_fingers, ep, p2_edge_module};
 
 const EC32MB: &str = include_str!("fixtures/p2_ec32mb.net");
 
@@ -92,11 +91,11 @@ fn members<'a>(board: &'a Board, net: &str) -> Vec<&'a PinRef> {
 // ============================================================
 
 /// The whole module classifies. With no libsource anywhere, this is the test
-/// that the reference-designator fallback plus a ten-entry value-keyed registry
-/// is enough to build a 114-component vendor board — and, because
-/// `Board::from_netlist_with_stubs` validates every registered component's
-/// facade against the netlist in both directions, that all 22 hand-written pin
-/// tables match the transcription exactly.
+/// that the reference-designator fallback plus a value-keyed registry is
+/// enough to build a 114-component vendor board with every part a node — and,
+/// because `Board::from_netlist` validates every registered component's
+/// facade and every switch's poles against the netlist in both directions,
+/// that all the hand-written pin tables match the transcription exactly.
 #[rstest]
 fn the_module_builds_with_no_unclassified_parts() {
     let parsed = parse(EC32MB).expect("the module fixture parses");
@@ -114,22 +113,46 @@ fn the_module_builds_with_no_unclassified_parts() {
         "the transcribed netlist carries no libsource part names"
     );
 
-    let board = Board::from_netlist_with_stubs(parsed, &ec32mb_registry(), &EC32MB_STUB_REFS)
+    let board = Board::from_netlist(parsed, &ec32mb_registry())
         .expect("the module builds with no unclassified-part errors");
 
-    // The 22 registered components: the P2, two inverters, the TCXO, the DIP
-    // switch, the flash, four PSRAMs, the polarity FET, two bucks, the
-    // brownout detector and eight LDOs. Everything else is an auto-classified
-    // primitive, a boundary, or one of the two BOM-only reference designators.
+    // The 20 registered components: the P2, two inverters, the TCXO, the
+    // flash, four PSRAMs, two bucks, the brownout detector and eight LDOs
+    // — every one a model. The polarity FET `U401` and the
+    // white LEDs `D601`/`D602` are elements by specification, not
+    // components. Everything else is an auto-classified primitive, a
+    // boundary, a switch or a mechanical node.
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert_eq!(
         registered,
         BTreeSet::from([
-            "U100", "U101", "U301", "U302", "U303", "U304", "U305", "U401", "U402", "U403", "U404",
-            "U501", "U502", "U503", "U504", "U505", "U506", "U507", "U508", "U601", "X100", "S301",
+            "U100", "U101", "U301", "U302", "U303", "U304", "U305", "U402", "U403", "U404", "U501",
+            "U502", "U503", "U504", "U505", "U506", "U507", "U508", "U601", "X100",
         ]),
         "exactly the module's active silicon is registered"
     );
+    for element in ["U401", "D601", "D602"] {
+        assert!(
+            matches!(board.node_class(element), Some(PartClass::Pwl { .. })),
+            "{element} is an element by specification: {:?}",
+            board.node_class(element)
+        );
+    }
+    // Every one of the 114 parts is a node.
+    assert_eq!(board.nodes().count(), EXPECTED_COMPONENTS);
+    assert!(
+        matches!(board.node_class("S301"), Some(PartClass::Switch { poles }) if poles.len() == 4)
+    );
+    assert!(
+        matches!(board.node_class("J101"), Some(PartClass::Switch { poles }) if poles.len() == 1)
+    );
+    for mechanical in ["J701", "J702", "PCB", "NC_Net"] {
+        assert_eq!(
+            board.node_class(mechanical),
+            Some(&PartClass::Mechanical),
+            "{mechanical}"
+        );
+    }
 }
 
 /// Without the fallback the same netlist is entirely unclassifiable — the
@@ -139,7 +162,7 @@ fn without_the_reference_fallback_the_module_does_not_build() {
     let mut registry = ec32mb_registry();
     registry.classify_unnamed_by_reference(false);
     let parsed = parse(EC32MB).expect("fixture parses");
-    let error = Board::from_netlist_with_stubs(parsed, &registry, &EC32MB_STUB_REFS)
+    let error = Board::from_netlist(parsed, &registry)
         .expect_err("no part names and no fallback cannot classify a resistor");
     assert!(
         error.to_string().contains("classification"),
@@ -189,8 +212,10 @@ fn every_p2_io_pin_is_reachable() {
         "the P2 package facade is 64 I/O + VDD + GND + TEST + RESN + XI + XO + 16 bank supplies"
     );
 
-    // The bridged force-gauge channel, as `P2EdgeModule` declares it.
-    let p2 = P2EdgeModule::new("p2");
+    // The bridged force-gauge channel sits on two of the package's pads,
+    // which the package declares like every other pad: bidirectional and
+    // released until the core drives one.
+    let p2 = p2_edge_module("p2");
     let rx = p2
         .pins()
         .iter()
@@ -204,12 +229,15 @@ fn every_p2_io_pin_is_reachable() {
     // The channel carries levels, so neither pin declares a byte route: the
     // framing lives in the MCU component, and what is on the net is edges.
     assert_eq!(rx.stream, None, "P0 reads edges, not routed bytes");
-    assert_eq!(rx.kind, embsim_board::PinKind::DigitalIn);
+    assert_eq!(rx.kind, embsim_board::PinKind::DigitalBidir);
+    assert_eq!(rx.idle, embsim_board::IdleDrive::Released);
     assert_eq!(tx.stream, None, "P2 clocks out edges, not a byte route");
+    assert_eq!(tx.kind, embsim_board::PinKind::DigitalBidir);
     assert_eq!(
-        tx.kind,
-        embsim_board::PinKind::DigitalOut,
-        "P2 is the force-gauge TX pin, and the only one this slice drives"
+        tx.idle,
+        embsim_board::IdleDrive::Released,
+        "P2 is the force-gauge TX pin: the bridge drives it at attach, the package declares \
+         it released like every pad"
     );
 }
 
@@ -452,9 +480,12 @@ fn p38_and_p39_also_reach_the_on_module_led_buffer() {
 // ============================================================
 
 /// Build the module alone as a system, powered the way a carrier powers it:
-/// 5 V into the two `5V` fingers, 0 V into the three `GND` fingers, and the
-/// reverse-polarity FET conducting. Everything else — bucks, inductors,
-/// eight LDOs, sixteen bank rails — comes from the netlist.
+/// 5 V into the two `5V` fingers and 0 V into the three `GND` fingers.
+/// Everything else — the reverse-polarity FET, bucks, inductors, eight
+/// LDOs, sixteen bank rails — comes from the netlist: the FET is an
+/// element whose channel the solve turns on (its gate is on the carrier's
+/// ground, 5 V below its source), so nothing in the scenario says it
+/// conducts.
 fn powered_module() -> embsim_board::BuiltSystem {
     let harness = embsim_board::Harness::new()
         .power(ep("CARRIER.5V"), ep("EC32MB.J203.41"), 5.0)
@@ -466,34 +497,94 @@ fn powered_module() -> embsim_board::BuiltSystem {
     System::new()
         .board("EC32MB", ec32mb_board())
         .harness(harness)
-        .scenario(module_polarity_fet_conducting(
-            Scenario::default(),
-            "EC32MB",
-        ))
         .build()
         .expect("the powered module resolves")
 }
 
-/// The whole power tree resolves from two fingers: no supply pin anywhere on
-/// the module reports an unsourced rail, and nothing contends.
-///
-/// That is a real chain — 5 V fingers → polarity FET → two bucks → their
-/// output inductors → `Common_VDD` and `Common_LDOin` → eight LDOs → sixteen
-/// P2 bank-supply pins — and every hop of it is a netlist component the
-/// registry classified, not a hand-written wire.
+/// The polarity FET passes the carrier's 5 V to the protected input on its
+/// own: with the drain on the 5 V fingers and the gate on the carrier's
+/// ground, the gate sits 5 V below the source once the body diode has
+/// lifted it, the channel turns on, and the protected rail reads the
+/// input less nothing (no load draws through the 36 mΩ channel: a rail
+/// model senses its input and loads it with nothing, `NODES.md` §2). No
+/// `pin_short` stands in for it.
 #[rstest]
-fn the_powered_module_sources_every_rail_without_contention() {
+fn the_polarity_fet_passes_the_carrier_input_to_the_protected_rail() {
+    behaviour!(Test {
+        id: "ec32mb.polarity-fet-passes-the-input",
+        covers: Some("board/src/cluster.rs#QuasiStaticMna::solve"),
+        given: "the P2-EC32MB module built with 5 volts on its 5V edge fingers and 0 volts on \
+                its GND fingers, and no scenario line about its reverse-polarity FET",
+    });
+    expect!(
+        "protected-rail-at-the-input",
+        "the protected input rail behind the FET reads the carrier's 5 volts",
+        "the FET's gate is on the carrier's ground, 5 volts below the source the body diode \
+         lifts, so the channel conducts and only its on-resistance stands between the two"
+    );
+    expect!(
+        "no-current-without-a-load",
+        "the FET carries no current",
+        "the bucks behind the rail sense their input and load it with nothing: a rail's \
+         input current is not modelled"
+    );
+    let system = powered_module();
+    let protected = system.nets()[system.net_id("EC32MB.VIN_Edge_Protected").unwrap().0].state;
+    assert!(
+        matches!(protected, NetState::Analog(v) if (v - 5.0).abs() < 1e-6),
+        "{protected:?}"
+    );
+    let channel = system
+        .pin_current("EC32MB.U401.S")
+        .expect("the FET's cluster solved");
+    assert!(channel.abs() < 1e-9, "{channel}");
+}
+
+/// The whole power tree hangs off two fingers — 5 V fingers → polarity FET
+/// → two bucks → their output inductors → `Common_VDD` and `Common_LDOin`
+/// → eight LDOs → sixteen P2 bank-supply pins — and every hop of it is a
+/// netlist component the registry classified, not a hand-written wire.
+/// Nothing contends. But the tree has a clock: the bucks are AP62301s with
+/// a 2.5 ms soft-start, and a build snapshot is the state before the first
+/// wake, so in it every module rail is down and says why
+/// ([`Finding::RailDown`]) — the bucks holding their outputs with their
+/// input up (the soft-start), the LDOs with no input (the buck's down
+/// rail) — and every load on them is an unsourced power net.
+/// `power_tree.rs` steps the module past the soft-start and reads every
+/// rail at its setpoint.
+#[rstest]
+fn the_powered_module_holds_its_rails_down_before_the_soft_start_without_contention() {
+    behaviour!(Test {
+        id: "ec32mb.power-tree-before-the-soft-start",
+        covers: Some("board/src/system.rs#lint_build"),
+        given: "the P2-EC32MB module analyzed at build with 5 volts on its 5V edge fingers \
+                and 0 volts on its GND fingers",
+    });
+    expect!(
+        "no-contention",
+        "no two parts fight over any net",
+        "the module has one driver, the P2's bridged transmit pin, and every rail is one \
+         declared terminal"
+    );
+    expect!(
+        "bucks-in-soft-start",
+        "both bucks report their output down with their input sourced — held by the part",
+        "the polarity FET passes the carrier's 5 volts to their input, and their 2.5 \
+         millisecond soft-start has not elapsed before the first wake"
+    );
+    expect!(
+        "ldos-without-input",
+        "each of the eight LDOs reports its output down for want of its input",
+        "the LDOs' input is the second buck's output, down until its soft-start elapses"
+    );
+    expect!(
+        "loads-unsourced",
+        "the unsourced power nets are exactly the two buck rails and the eight bank rails",
+        "every load on the module hangs off a rail that has not risen"
+    );
     let system = powered_module();
     let findings = system.diagnostics().findings();
 
-    let unsourced: Vec<&Finding> = findings
-        .iter()
-        .filter(|f| matches!(f, Finding::PowerNetUnsourced { .. }))
-        .collect();
-    assert!(
-        unsourced.is_empty(),
-        "every rail must be sourced through the module's own power tree; got {unsourced:?}"
-    );
     let contention: Vec<&Finding> = findings
         .iter()
         .filter(|f| matches!(f, Finding::Contention { .. }))
@@ -502,92 +593,172 @@ fn the_powered_module_sources_every_rail_without_contention() {
         contention.is_empty(),
         "the module has exactly one driver (the P2's bridged TX pin); got {contention:?}"
     );
+    for buck in ["U402", "U403"] {
+        assert!(
+            system.diagnostics().contains(&Finding::RailDown {
+                part: format!("EC32MB.{buck}"),
+                pin: "SW".to_string(),
+                reason: RailDownReason::HeldDown,
+            }),
+            "{buck}: {findings:?}"
+        );
+    }
+    for ldo in 501..=508 {
+        assert!(
+            system.diagnostics().contains(&Finding::RailDown {
+                part: format!("EC32MB.U{ldo}"),
+                pin: "OUT".to_string(),
+                reason: RailDownReason::InputUnsourced {
+                    pin: "IN".to_string()
+                },
+            }),
+            "U{ldo}: {findings:?}"
+        );
+    }
+    let unsourced: BTreeSet<String> = findings
+        .iter()
+        .filter_map(|f| match f {
+            Finding::PowerNetUnsourced { net } => Some(net.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unsourced,
+        BTreeSet::from([
+            "EC32MB.Common_VDD".to_string(),
+            "EC32MB.Common_LDOin".to_string(),
+            "EC32MB.VIO_00_07".to_string(),
+            "EC32MB.VIO_08_15".to_string(),
+            "EC32MB.VIO_16_23".to_string(),
+            "EC32MB.VIO_24_31".to_string(),
+            "EC32MB.VIO_32_39".to_string(),
+            "EC32MB.VIO_40_47".to_string(),
+            "EC32MB.VIO_48_55".to_string(),
+            "EC32MB.VIO_56_63".to_string(),
+        ])
+    );
 }
 
-/// The P2's reset pin is held high by the module's own 10.5 kΩ pull-up — not
-/// floating, and not driven by anything. Cutting the pull-up out (a lifted
-/// `R100` pad) makes the reset node float and the P2's `RESN` sense report it:
-/// the failure mode a carrier sees as "the module never boots".
+/// Before the rails rise the P2's reset node floats: its 10.5 kΩ pull-up
+/// `R100` returns to `VIO_56_63`, the LDO `U508`'s output, and the brownout
+/// detector `U404` that would hold it low runs from `Common_VDD` — both
+/// down in the build snapshot (the bucks' soft-start), and a detector with
+/// no supply drives nothing (the STM1061 guarantees its output only from
+/// 0.7 V). So the P2's `RESN` sense reports the float. The pulled-up node
+/// and the lifted-pad failure are live claims — `power_tree.rs`.
 #[rstest]
-fn the_reset_node_is_pulled_up_and_floats_without_the_pull_up() {
+fn the_reset_node_floats_before_the_rails_rise() {
+    behaviour!(Test {
+        id: "ec32mb.reset-node-before-the-rails",
+        covers: Some("board/src/system.rs#System::build"),
+        given: "the P2-EC32MB module analyzed at build with 5 volts on its 5V edge fingers \
+                and 0 volts on its GND fingers",
+    });
+    expect!(
+        "reset-floats",
+        "the P2's reset node floats and its reset input reports the float",
+        "the pull-up's rail and the brownout detector's supply are both bank rails the \
+         bucks have not raised before the first wake"
+    );
     let system = powered_module();
     let reset = system
         .nets()
         .iter()
         .find(|n| n.name == "EC32MB.P2_RESN")
         .expect("the reset net exists");
+    assert_eq!(reset.state, NetState::Floating, "{:?}", reset.state);
     assert!(
-        matches!(reset.state, NetState::Pulled(Level::High, _)),
-        "the 10.5 kΩ pull-up must hold reset released; got {:?}",
-        reset.state
-    );
-    assert!(
-        !system.diagnostics().contains(&Finding::FloatingSense {
+        system.diagnostics().contains(&Finding::FloatingSense {
             net: "EC32MB.P2_RESN".to_string(),
             kind: SenseKind::Digital,
         }),
-        "a pulled-up reset must not report floating"
-    );
-
-    // Lift one pad of the pull-up.
-    let harness = embsim_board::Harness::new()
-        .power(ep("CARRIER.5V"), ep("EC32MB.J203.41"), 5.0)
-        .power(ep("CARRIER.GND"), ep("EC32MB.J203.43"), 0.0);
-    let _guard = machine_parts::lock_module_instance();
-    let broken = System::new()
-        .board("EC32MB", ec32mb_board())
-        .harness(harness)
-        .scenario(
-            module_polarity_fet_conducting(Scenario::default(), "EC32MB")
-                .pin_detach("EC32MB.R100.1"),
-        )
-        .build()
-        .expect("the module still builds with a lifted pad");
-    assert!(
-        broken.diagnostics().contains(&Finding::FloatingSense {
-            net: "EC32MB.P2_RESN".to_string(),
-            kind: SenseKind::Digital,
-        }),
-        "with R100 lifted the reset node must float; got {:?}",
-        broken.diagnostics().findings()
+        "the P2's RESN sense reports the float; got {:?}",
+        system.diagnostics().findings()
     );
 }
 
-/// Two honest floating reports the module *should* produce, and one the DIP
-/// switch explains.
+/// Three honest floating nets the build analysis *should* produce: two
+/// the clock chain explains, one the DIP switch does.
 ///
-/// - `XTAL_XI` / `XTAL_XO`: the emulator models no oscillator, so the TCXO and
-///   its inverter buffer are stubs and the P2's crystal pins see nothing. On
-///   real silicon `XI` is driven by the TCXO chain and `XO` is unused (the
-///   vendor's own note), so `XTAL_XO` is a one-pin net by design.
+/// - `XTAL_XI`: the TCXO publishes its 20 MHz as a rate one millisecond
+///   after its supply comes up — a scheduled wake, which the build analysis
+///   (the state before any wake) has not reached — so at build the buffer
+///   has nothing to relay and the P2's `XI` net floats, and since `XI` is
+///   a sense the package declares, the float is a reported finding. Live,
+///   once time runs, `XI` carries the rate: `oscillator_chain.rs` proves it.
+/// - `XTAL_XO`: unused (the vendor's own note), a one-pin net by design;
+///   the package's `XO` is the crystal driver, a released output, so the
+///   net floats and nothing senses it.
 /// - `P2_IO59`: the guide's P59 pull-up/pull-down is *selected by the DIP
-///   switch*, and with every gang open neither resistor conducts — so the boot
-///   strap floats. Turning a gang on is a switch-position scenario the engine
-///   does not model yet, and this assertion is what will change when it does.
+///   switch*, and with every pole open (as shipped) neither resistor reaches
+///   the pin — so the boot strap floats. A pad is a released bidirectional
+///   pin, so the float is the net's state, read by the core when it
+///   samples the strap. Closing a pole is
+///   `Scenario::switch("EC32MB.S301", pole, JumperState::Closed)`
+///   (`one_pipeline.rs` closes each and reads the strap it selects).
 #[rstest]
-fn unmodeled_oscillator_and_open_dip_switch_float_their_nets() {
+fn the_clock_chain_rests_before_start_up_and_the_open_dip_switch_floats_its_strap() {
     let system = powered_module();
-    let floating = |net: &str| {
-        system.diagnostics().contains(&Finding::FloatingSense {
-            net: net.to_string(),
-            kind: SenseKind::Digital,
-        })
+    let state = |net: &str| {
+        system
+            .nets()
+            .iter()
+            .find(|n| n.name == net)
+            .map(|n| n.state)
+            .unwrap_or_else(|| panic!("{net} exists"))
     };
-    assert!(floating("EC32MB.XTAL_XI"), "the oscillator chain is a stub");
-    assert!(floating("EC32MB.XTAL_XO"), "XO is unused on this module");
     assert!(
-        floating("EC32MB.P2_IO59"),
+        system.diagnostics().contains(&Finding::FloatingSense {
+            net: "EC32MB.XTAL_XI".to_string(),
+            kind: SenseKind::Digital,
+        }),
+        "before the TCXO's start-up instant the buffer relays nothing"
+    );
+    assert_eq!(
+        state("EC32MB.XTAL_XO"),
+        NetState::Floating,
+        "XO is unused on this module"
+    );
+    assert_eq!(
+        state("EC32MB.P2_IO59"),
+        NetState::Floating,
         "with every DIP gang open the P59 strap floats; got {:?}",
         system.diagnostics().findings()
     );
 }
 
-/// The P2's bridged transmit pin is the module's only driver, and it idles high
-/// — a UART line at rest — while the debug-serial pins next to it sit at their
-/// pull-ups. Nothing else on 114 components drives a net, which is the point of
-/// the stub pin-kind rule.
+/// Every driver on the module is a registered model, and before the rails
+/// rise exactly one drives: the P2's bridged transmit pin, idling high — a
+/// UART line at rest. Nothing else on 114 components drives a net in the
+/// snapshot: the live parts rest released (the boot flash's data-out is at
+/// high impedance while its `~CS` sits at the pull-up, W25Q128JV §4.1; the
+/// gates have no level to answer; the PSRAMs are deselected), the brownout
+/// detector's open-drain output is released with its supply down (the
+/// STM1061 guarantees nothing under 0.7 V), and the rails are terminals,
+/// not drivers. The debug-serial pins beside the transmit pin float here:
+/// their 100 kΩ pull-ups return to `VIO_56_63`, an LDO output the bucks'
+/// soft-start has not raised — `power_tree.rs` reads them at the pull-ups
+/// once it has.
 #[rstest]
-fn the_bridged_tx_pin_is_the_only_driver() {
+fn every_driver_is_a_registered_model() {
+    behaviour!(Test {
+        id: "ec32mb.every-driver-a-model",
+        covers: Some("board/src/system.rs#System::build"),
+        given: "the P2-EC32MB module analyzed at build with 5 volts on its 5V edge fingers \
+                and 0 volts on its GND fingers",
+    });
+    expect!(
+        "one-driven-net",
+        "exactly one net on the module is push-pull driven, the P2's transmit line, and it \
+         idles high",
+        "every other output rests released before the first wake: the flash deselected, \
+         the gates without a level, the detector without a supply"
+    );
+    expect!(
+        "debug-serial-floats",
+        "the two debug-serial pins float",
+        "their pull-ups return to a bank rail the bucks' soft-start has not raised"
+    );
     let system = powered_module();
     let tx = system
         .nets()
@@ -612,7 +783,6 @@ fn the_bridged_tx_pin_is_the_only_driver() {
         "exactly one net on the module is push-pull driven"
     );
 
-    // The debug-serial pins are pulled, not driven — their 100 kΩ resistors.
     for net in ["EC32MB.P2_IO62_TXD", "EC32MB.P2_IO63_RXD"] {
         let state = system
             .nets()
@@ -620,9 +790,10 @@ fn the_bridged_tx_pin_is_the_only_driver() {
             .find(|n| n.name == net)
             .map(|n| n.state)
             .expect("net exists");
-        assert!(
-            matches!(state, NetState::Pulled(Level::High, _)),
-            "{net} must sit at its pull-up; got {state:?}"
+        assert_eq!(
+            state,
+            NetState::Floating,
+            "{net} floats until its pull-up rail rises"
         );
     }
 }

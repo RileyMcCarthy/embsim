@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, Level, NetState, PartRegistry, PinDecl,
-    PinHandle, PinKind, StreamRole, System, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, Finding, IdleDrive, Level, NetState,
+    PartRegistry, PinDecl, PinHandle, PinKind, StreamRole, System, TheveninDrive,
 };
 
 /// U1.1 (driver) and U2.1 (sensor) share the `SIG` net.
@@ -39,6 +39,7 @@ const DRIVER_PINS: [PinDecl; 1] = [PinDecl {
     kind: PinKind::DigitalOut,
     stream: NONE,
     drive_impedance: None,
+    idle: IdleDrive::KindDefault,
 }];
 
 const SENSOR_PINS: [PinDecl; 1] = [PinDecl {
@@ -47,6 +48,7 @@ const SENSOR_PINS: [PinDecl; 1] = [PinDecl {
     kind: PinKind::DigitalIn,
     stream: NONE,
     drive_impedance: None,
+    idle: IdleDrive::KindDefault,
 }];
 
 const LOW: TheveninDrive = TheveninDrive {

@@ -9,7 +9,7 @@
 //!
 //! # What the mounting test actually proves
 //!
-//! `Board::from_netlist_with_stubs` validates every registered component's pin
+//! `Board::from_netlist` validates every registered component's pin
 //! facade against the netlist in BOTH directions, matching on `PinDecl::number`
 //! verbatim. A facade that is right for the *part* and wrong for the netlist's
 //! identifier convention fails here and nowhere else: a model's own unit tests
@@ -41,14 +41,14 @@ use std::time::{Duration, Instant};
 
 use embsim_board::{
     digital_drive, level_of, netlist, AttachError, Board, Component, ComponentNetIo, Harness,
-    Level, PartRegistry, PinDecl, PinHandle, PinKind, System,
+    IdleDrive, Level, PartRegistry, PinDecl, PinHandle, PinKind, System,
 };
 use embsim_core::virtual_clock;
 use embsim_models::sd_card::{SdCard, BLOCK_LEN};
 use embsim_models::sd_card_component::{
     SdCardComponent, SD_CARD_PINS_BY_FUNCTION, SD_CARD_PINS_MICROSD, SD_CARD_PINS_SPI_ONLY,
 };
-use machine_parts::{ec32mb_registry, EC32MB_STUB_REFS};
+use machine_parts::ec32mb_registry;
 
 /// The netlist's `value` for `J301`, which is the registry key.
 const SOCKET_PART: &str = "MicroSD Socket";
@@ -72,12 +72,8 @@ fn registry_with_live_card(pins: &'static [PinDecl]) -> PartRegistry {
 fn the_card_mounts_on_a_real_socket_in_place_of_a_board_boundary() {
     let parsed =
         netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
-    let board = Board::from_netlist_with_stubs(
-        parsed,
-        &registry_with_live_card(&SD_CARD_PINS_BY_FUNCTION),
-        &EC32MB_STUB_REFS,
-    )
-    .expect("the live card's pin facade matches J301 in both directions");
+    let board = Board::from_netlist(parsed, &registry_with_live_card(&SD_CARD_PINS_BY_FUNCTION))
+        .expect("the live card's pin facade matches J301 in both directions");
 
     let registered: BTreeSet<&str> = board.component_refs().collect();
     assert!(
@@ -91,12 +87,8 @@ fn the_card_mounts_on_a_real_socket_in_place_of_a_board_boundary() {
 fn the_full_card_pinout_does_not_mount_on_a_socket_wired_for_spi() {
     let parsed =
         netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
-    let error = Board::from_netlist_with_stubs(
-        parsed,
-        &registry_with_live_card(&SD_CARD_PINS_MICROSD),
-        &EC32MB_STUB_REFS,
-    )
-    .expect_err("pin \"1\" is not a pin this netlist has, and DAT1/DAT2 have no nodes");
+    let error = Board::from_netlist(parsed, &registry_with_live_card(&SD_CARD_PINS_MICROSD))
+        .expect_err("pin \"1\" is not a pin this netlist has, and DAT1/DAT2 have no nodes");
     let rendered = format!("{error}");
     assert!(
         rendered.contains("J301"),
@@ -374,6 +366,7 @@ impl BitBangMaster {
             kind,
             stream: None,
             drive_impedance: None,
+            idle: IdleDrive::KindDefault,
         };
         Self {
             pins: [

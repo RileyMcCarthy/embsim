@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::{UartDecoder, UartFraming};
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EventLog, Harness, PartRegistry, PinDecl,
-    PinHandle, PinKind, Scenario, SerialLevelBridge, System, SystemHandle, TheveninDrive,
+    AttachError, Board, Component, ComponentNetIo, EventLog, Harness, IdleDrive, PartRegistry,
+    PinDecl, PinHandle, PinKind, Scenario, SerialLevelBridge, System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -156,6 +156,7 @@ const fn analog_pin(name: &'static str) -> PinDecl {
         kind: PinKind::Analog,
         stream: None,
         drive_impedance: None,
+        idle: IdleDrive::KindDefault,
     }
 }
 
@@ -246,6 +247,7 @@ impl LinkTx {
                 kind: PinKind::DigitalOut,
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             }],
             bridge,
         }
@@ -291,6 +293,7 @@ impl LinkRx {
                 kind: PinKind::DigitalIn,
                 stream: None,
                 drive_impedance: None,
+                idle: IdleDrive::KindDefault,
             }],
             rx,
         }
