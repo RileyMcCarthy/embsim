@@ -28,8 +28,9 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::{UartDecoder, UartFraming};
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, EventLog, Harness, IdleDrive, PartRegistry,
-    PinDecl, PinHandle, PinKind, Scenario, SerialLevelBridge, System, SystemHandle, TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, EventLog,
+    Harness, PartRegistry, PinDecl, PinHandle, Scenario, SerialLevelBridge, System, SystemHandle,
+    TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -110,6 +111,9 @@ struct ScriptedDriver {
 impl ScriptedDriver {
     fn new(a: PinSlot, b: PinSlot) -> Self {
         Self {
+            // Analog readers that drive, as the two analog goldens record
+            // them (rule 7: byte-identical); the drives are traced as
+            // contradicting the declaration.
             pins: [analog_pin("A"), analog_pin("B")],
             a,
             b,
@@ -144,20 +148,13 @@ impl Component for Probe {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let seen = Arc::clone(&self.seen);
-        io.on_sense("P", move |_| *seen.lock().unwrap() += 1)?;
+        io.on_net_report("P", move |_| *seen.lock().unwrap() += 1)?;
         Ok(())
     }
 }
 
 const fn analog_pin(name: &'static str) -> PinDecl {
-    PinDecl {
-        number: name,
-        name: None,
-        kind: PinKind::Analog,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::analog(name)
 }
 
 /// A component whose **only** stimulus is the engine's timer wheel: it arms a
@@ -241,14 +238,7 @@ struct LinkTx {
 impl LinkTx {
     fn new(bridge: BridgeSlot) -> Self {
         Self {
-            pins: [PinDecl {
-                number: "1",
-                name: Some("TX"),
-                kind: PinKind::DigitalOut,
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            }],
+            pins: [PinDecl::digital_out("1").with_name("TX")],
             bridge,
         }
     }
@@ -287,14 +277,10 @@ struct LinkRx {
 impl LinkRx {
     fn new(rx: ByteLog) -> Self {
         Self {
-            pins: [PinDecl {
-                number: "1",
-                name: Some("RX"),
-                kind: PinKind::DigitalIn,
-                stream: None,
-                drive_impedance: None,
-                idle: IdleDrive::KindDefault,
-            }],
+            pins: [
+                PinDecl::digital_in("1", jesd8c01_lvcmos_thresholds(DeadBand::Unknown))
+                    .with_name("RX"),
+            ],
             rx,
         }
     }
@@ -309,10 +295,11 @@ impl Component for LinkRx {
         let decoder = Arc::new(Mutex::new(UartDecoder::new(link_framing())));
         {
             let (log, decoder, io_arm) = (Arc::clone(&self.rx), Arc::clone(&decoder), io.clone());
-            io.on_sense("RX", move |state| {
-                let now = virtual_clock::virtual_ns();
+            let receiver = embsim_board::DigitalReceiver::new(io.pin("RX")?);
+            io.on_sense("RX", move |sense| {
+                let now = sense.at_ns;
                 let mut rx = decoder.lock().unwrap();
-                if let Some(level) = embsim_board::level_of(state) {
+                if let Some(level) = receiver.read(&sense) {
                     rx.on_level(level, now);
                 }
                 while let Some(Ok(byte)) = rx.poll(now) {
@@ -481,6 +468,11 @@ fn wake_ladder_scenario() -> EventLog {
         .component(
             "LADDER",
             Box::new(WakeLadder {
+                // An analog reader that drives, on purpose: the golden
+                // records its floating read at build (`FloatingSense` on
+                // `LADDER.P`), and rule 7 keeps the golden byte-identical.
+                // The drive is traced as contradicting the declaration
+                // (`PinDecl::analog_source` is the source's constructor).
                 pins: [analog_pin("P")],
                 ticks: LADDER_TICKS,
                 period_us: LADDER_PERIOD_US,

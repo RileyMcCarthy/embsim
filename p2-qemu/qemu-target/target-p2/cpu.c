@@ -1,5 +1,6 @@
 /*
  * Parallax Propeller 2 CPU. SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  *
  * One QEMU vCPU is one cog (design D1): eight of them under single-threaded
  * TCG with icount, which is what makes the interleaving deterministic.

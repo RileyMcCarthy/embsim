@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::{
     digital_drive, Amps, AttachError, Board, BoardError, Component, ComponentNetIo, EndpointRef,
-    Finding, Harness, IdleDrive, Level, NetState, PartRegistry, PinDecl, PinHandle, PwlCurve,
-    PwlSpec, RegionTest, Scenario, System, SystemError, PWL_SOLVES_PER_ELEMENT,
+    Finding, Harness, Level, NetState, PartRegistry, PinDecl, PinHandle, PwlCurve, PwlSpec,
+    RegionTest, Scenario, System, SystemError, PWL_SOLVES_PER_ELEMENT,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::pwl_library::{self, SS36_VF_VOLTS};
@@ -862,7 +862,7 @@ fn the_current_into_a_low_sink_is_the_pull_ups_current() {
     let handle = Arc::new(Mutex::new(None));
     let readings: Arc<Mutex<Vec<Option<Amps>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Sink {
-        pins: [PinDecl::digital_out("Q").with_idle(IdleDrive::Thevenin(digital_drive(Level::Low)))],
+        pins: [PinDecl::digital_out("Q").with_idle(Some(digital_drive(Level::Low)))],
         handle: Arc::clone(&handle),
         readings: Arc::clone(&readings),
     };

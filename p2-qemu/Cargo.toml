@@ -3,7 +3,9 @@ name = "embsim-p2-qemu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# The node (Rust, hostdrive.c) is MIT; the QEMU target it carries in
+# qemu-target/ is LGPL-2.1-or-later (LICENSES/, qemu-target/README.md).
+license = "MIT AND LGPL-2.1-or-later"
 repository.workspace = true
 description = "The QEMU Propeller 2 target as an embsim board component: a node that drives pins as edges on nets and boots the way silicon does"
 keywords = ["embedded", "emulator", "simulation", "sil", "qemu"]

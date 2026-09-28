@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Board, BoardError, Component, ComponentNetIo, Finding,
-    IdleDrive, Level, NetId, NetState, PartRegistry, PinDecl, PinHandle, PinKind, System,
-    SystemError, TheveninDrive, BUILD_FIXED_POINT_BOUND,
+    digital_drive, jesd8c01_lvcmos_thresholds, AttachError, Board, BoardError, Component,
+    ComponentNetIo, DeadBand, DigitalReceiver, Finding, Level, NetId, NetState, PartRegistry,
+    PinDecl, PinHandle, System, SystemError, TheveninDrive, BUILD_FIXED_POINT_BOUND,
 };
 use embsim_core::virtual_clock;
 use machine_parts::{edge_board, shipped_ec32mb_board};
@@ -108,10 +108,10 @@ struct Repeater {
 }
 
 impl Repeater {
-    fn new(invert: bool, idle: IdleDrive) -> Self {
+    fn new(invert: bool, idle: Option<TheveninDrive>) -> Self {
         Self {
             pins: [
-                PinDecl::digital_in("1"),
+                PinDecl::digital_in("1", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)),
                 PinDecl::digital_out("2").with_idle(idle),
             ],
             invert,
@@ -126,8 +126,9 @@ impl Component for Repeater {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let out: PinHandle = io.pin("2")?;
         let invert = self.invert;
-        io.on_sense("1", move |state| {
-            let drive = level_of(state).map(|level| {
+        let input = DigitalReceiver::new(io.pin("1")?);
+        io.on_sense("1", move |sense| {
+            let drive = input.read(&sense).map(|level| {
                 let level = if invert {
                     match level {
                         Level::High => Level::Low,
@@ -169,7 +170,7 @@ impl Component for Sensor {
     }
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let seen = Arc::clone(&self.seen);
-        io.on_sense("1", move |state| seen.lock().unwrap().push(state))
+        io.on_net_report("1", move |state| seen.lock().unwrap().push(state))
     }
 }
 
@@ -240,9 +241,7 @@ const IDLE: &str = r#"(export (version "E")
 fn chain_board() -> Board {
     let mut registry = PartRegistry::new();
     registry.register("SOURCE", |_| Box::new(Source::new()));
-    registry.register("REPEATER", |_| {
-        Box::new(Repeater::new(false, IdleDrive::Released))
-    });
+    registry.register("REPEATER", |_| Box::new(Repeater::new(false, None)));
     Board::from_netlist(embsim_board::netlist::parse(CHAIN).unwrap(), &registry).unwrap()
 }
 
@@ -292,15 +291,24 @@ fn a_chain_of_sense_to_drive_components_settles_in_the_build() {
     );
 }
 
+/// What an output's declaration says it idles at: a declared idle drive
+/// (`None` released), or what [`PinDecl::digital_out`] declares when the
+/// declaration names none.
+#[derive(Debug, Clone, Copy)]
+enum Idle {
+    Declared(Option<TheveninDrive>),
+    ConstructorDefault,
+}
+
 /// The declared idle drive is the pin's state from attach: released by
-/// declaration floats, the kind's default drives high, a declared Thevenin
-/// drives what it says.
+/// declaration floats, the push-pull constructor's default drives high, a
+/// declared Thevenin drives what it says.
 #[rstest]
-#[case::released(IdleDrive::Released, NetState::Floating)]
-#[case::kind_default(IdleDrive::KindDefault, NetState::Driven(Level::High))]
-#[case::declared_low(IdleDrive::Thevenin(TheveninDrive { volts: 0.0, impedance: 25.0 }), NetState::Driven(Level::Low))]
+#[case::released(Idle::Declared(None), NetState::Floating)]
+#[case::kind_default(Idle::ConstructorDefault, NetState::Driven(Level::High))]
+#[case::declared_low(Idle::Declared(Some(TheveninDrive { volts: 0.0, impedance: 25.0 })), NetState::Driven(Level::Low))]
 fn a_pins_declared_idle_drive_is_its_state_at_build(
-    #[case] idle: IdleDrive,
+    #[case] idle: Idle,
     #[case] expected: NetState,
 ) {
     behaviour!(Test {
@@ -311,8 +319,8 @@ fn a_pins_declared_idle_drive_is_its_state_at_build(
     });
     expect!(
         "net-as-declared",
-        "the net reads what the declaration says: floating for a released idle, driven \
-         high for the kind's default, the declared level for a declared drive",
+        "the net reads floating for a released idle, driven high for the output's default, \
+         and the declared level for a declared drive",
         "the drive a pin presents until its component drives it is a static fact of the \
          part, declared once on the pin"
     );
@@ -325,13 +333,20 @@ fn a_pins_declared_idle_drive_is_its_state_at_build(
     let sink = Arc::clone(&seen);
     let mut registry = PartRegistry::new();
     registry.register("IDLER", move |_| {
+        let pin = PinDecl::digital_out("1");
         Box::new(Idler {
-            pins: [PinDecl::digital_out("1").with_idle(idle)],
+            pins: [match idle {
+                Idle::Declared(drive) => pin.with_idle(drive),
+                Idle::ConstructorDefault => pin,
+            }],
         })
     });
     registry.register("SENSOR", move |_| {
         Box::new(Sensor {
-            pins: [PinDecl::digital_in("1")],
+            pins: [PinDecl::digital_in(
+                "1",
+                jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+            )],
             seen: Arc::clone(&sink),
         })
     });
@@ -361,10 +376,7 @@ fn a_ring_that_never_settles_is_reported_within_the_bound() {
 
     let mut registry = PartRegistry::new();
     registry.register("INVERTER", |_| {
-        Box::new(Repeater::new(
-            true,
-            IdleDrive::Thevenin(digital_drive(Level::High)),
-        ))
+        Box::new(Repeater::new(true, Some(digital_drive(Level::High))))
     });
     let board =
         Board::from_netlist(embsim_board::netlist::parse(RING).unwrap(), &registry).unwrap();
@@ -403,7 +415,10 @@ fn the_build_releases_every_sense_callback_it_recorded() {
     let mut registry = PartRegistry::new();
     registry.register("HOLDER", move |_| {
         Box::new(Holder {
-            pins: [PinDecl::digital_in("1")],
+            pins: [PinDecl::digital_in(
+                "1",
+                jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+            )],
             token: Arc::clone(&token),
         })
     });
@@ -434,21 +449,18 @@ enum Route {
 /// `PowerOut` pin's slot is its terminal's, and its idle drive is what the
 /// rail holds before its part publishes (`board/tests/terminals.rs`).
 #[rstest]
-#[case::power_in_released(PinKind::PowerIn, IdleDrive::Released)]
-#[case::power_in_thevenin(PinKind::PowerIn, IdleDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 0.1 }))]
-#[case::passive_released(PinKind::Passive, IdleDrive::Released)]
-#[case::passive_thevenin(PinKind::Passive, IdleDrive::Thevenin(TheveninDrive { volts: 0.0, impedance: 25.0 }))]
+#[case::power_in_thevenin(PinDecl::power_in, TheveninDrive { volts: 3.3, impedance: 0.1 })]
+#[case::passive_thevenin(PinDecl::passive, TheveninDrive { volts: 0.0, impedance: 25.0 })]
 fn an_idle_drive_on_a_pin_without_a_drive_slot_is_refused_at_build(
-    #[case] kind: PinKind,
-    #[case] idle: IdleDrive,
+    #[case] pin: fn(&'static str) -> PinDecl,
+    #[case] idle: TheveninDrive,
     #[values(Route::Netlist, Route::Bench)] route: Route,
 ) {
     behaviour!(Test {
         id: "pin.idle-drive-needs-a-drive-slot",
-        covers: Some("board/src/board.rs#validate_idle_drives"),
-        given: "a part declaring an idle drive — released, or a voltage behind an impedance — \
-                on a power-in or passive pin, brought to the build as a netlist part or as a \
-                bench component",
+        covers: Some("board/src/board.rs#validate_pin_declarations"),
+        given: "a part declaring an idle drive — a voltage behind an impedance — on a power-in \
+                or passive pin, brought to the build as a netlist part or as a bench component",
     });
     expect!(
         "build-refused",
@@ -457,14 +469,17 @@ fn an_idle_drive_on_a_pin_without_a_drive_slot_is_refused_at_build(
          engine could only drop; refusing it keeps every declaration honoured"
     );
 
-    let decl = PinDecl::new("1", kind).with_idle(idle);
+    let decl = pin("1").with_idle(Some(idle));
     match route {
         Route::Netlist => {
             let mut registry = PartRegistry::new();
             registry.register("IDLER", move |_| Box::new(Idler { pins: [decl] }));
             registry.register("SENSOR", |_| {
                 Box::new(Sensor {
-                    pins: [PinDecl::digital_in("1")],
+                    pins: [PinDecl::digital_in(
+                        "1",
+                        jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+                    )],
                     seen: Arc::default(),
                 })
             });

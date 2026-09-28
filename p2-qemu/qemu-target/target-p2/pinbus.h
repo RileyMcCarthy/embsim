@@ -1,12 +1,14 @@
 /*
  * The CPU's only outward surface.
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  *
- * This mirrors p2core's `PinBus` trait (SIL/p2core/src/pins.rs) deliberately:
- * the CPU forwards what the firmware executed and nothing electrical lives on
- * this side of the line. Smart-pin state machines, nets and UART peers belong
- * to the implementation behind these ops, which is how embsim will eventually
- * plug in without the target changing.
+ * This mirrors p2core's `PinBus` trait (MaD's `SIL/p2core/src/pins.rs`)
+ * deliberately: the CPU forwards what the firmware executed and nothing
+ * electrical lives on this side of the line. Smart-pin state machines, nets
+ * and UART peers belong to the implementation behind these ops: the bring-up
+ * model (pinbus.c) or the flash bus (hw/p2/flashbus.c) in the standalone
+ * binary; embsim-p2-qemu's bus (its hostdrive.c) on the engine thread.
  *
  * Polarity, from p2core's trait documentation -- both of these hang the guest
  * if inverted:
@@ -95,18 +97,5 @@ extern bool p2_host_driven;
  */
 extern uint32_t p2_clock_mode;
 extern uint64_t p2_clock_mode_at;
-/* Install the bring-up model -- see pinbus.c. */
-void p2_pinbus_bringup_init(void);
-
-/*
- * Install the board model with the boot flash on it -- see flashbus.c. The
- * part is `capacity` bytes with `len` bytes of `image` at offset zero; the
- * rest reads $FF, as an erased array does.
- */
-void p2_flashbus_init(const uint8_t *image, size_t len, size_t capacity);
-/* What the guest has written to the debug pin since reset. */
-const char *p2_flashbus_console(void);
-/* Read start-addresses the flash has served, oldest first; returns the count. */
-size_t p2_flashbus_reads(uint32_t *out, size_t cap);
 
 #endif

@@ -58,10 +58,11 @@
 //!
 //! Two rows deserve their reasoning stated rather than assumed:
 //!
-//! - **"INx open" is any input the engine will not put a level on.** A
-//!   floating net, a fought-over net, and a node voltage inside the
-//!   `V_IL`..`V_IH` dead band all mean the same thing to the input buffer, and
-//!   the datasheet's answer for all of them is the default output state. This
+//! - **"INx open" is any input the receiver reads no level on.** A floating
+//!   net, a net fought to a voltage inside the `V_IL`..`V_IH` dead band, and
+//!   any other voltage inside it all mean the same thing to the input buffer
+//!   ([`embsim_board::DeadBand::Unknown`]), and the datasheet's answer for all
+//!   of them is the default output state. This
 //!   is what makes an isolator fed by a dead upstream part still present a
 //!   *defined* output — the behavior the F suffix is bought for.
 //! - **"Undetermined" is modeled as high impedance.** With its own supply
@@ -70,17 +71,35 @@
 //!   (`FloatingSense`, or whatever the board's own pull does), which is the
 //!   same choice [`crate::ads122u04_component`] makes for an unpowered chip.
 //!
-//! # Channel roles
+//! # A clock crosses as a clock
 //!
-//! A channel carries a **level** by default. Two other roles exist because the
-//! isolator is a hop on a path, and an opaque hop breaks the path:
-//!
-//! - [`ChannelRole::Pulse`] — the input pin declares
-//!   [`StreamRole::PulseSink`], the output pin [`StreamRole::PulseSource`],
-//!   and a received [`PulseTrain`] is republished verbatim. This is what lets
-//!   a step clock cross the barrier: the segment carries its own anchor and
-//!   count, so relaying it costs **one engine event per rate change**, not one
-//!   per edge, and the downstream count stays bit-identical to the firmware's.
+//! Every channel is just a channel: it senses its input net and drives its
+//! output net. When the input net carries a square wave — a
+//! [`embsim_board::PeriodicSense`], a step clock's
+//! [`embsim_board::Drive::Periodic`] resolved on the P2's side — the channel
+//! drives its output as a
+//! [`embsim_board::Drive::Periodic`] too: its **own** output ports (the
+//! output side's rail and ground behind [`Config::output_impedance_ohms`])
+//! around the input's segment **forwarded verbatim** — the source's own
+//! rate, accumulated count, ceiling and anchor, never re-anchored at the
+//! instant the isolator re-drove. That is a decision, not a discovery
+//! (`sil-unified-drive.md`, "The consequence worth deciding deliberately"):
+//! the output depends on the far side's rail, so a supply that moves re-drives
+//! the channel, and a re-anchoring relay would quietly desynchronise the
+//! carriage; forwarding the segment keeps the downstream count bit-identical
+//! to the firmware's, and relaying it costs **one drive per rate change**, not
+//! one per edge. The channel relays a running square wave only where its
+//! two phases settle to two levels through the channel's own input
+//! thresholds, `0.3/0.7 × VCCI` ([`embsim_board::PeriodicSense::rate`], as
+//! every consumer of a rate takes it: the input then switches every cycle);
+//! a held segment — the stop that ends a relayed train and carries its
+//! final count — is forwarded where its phases settle to two levels the
+//! same way. Any other wave is the level the input reads from it
+//! ([`embsim_board::Sense::level`]: one level where both phases settle to
+//! it) or, where it reads none — a phase inside the dead band — an open
+//! input, and the output presents the default state. A channel that stops
+//! passing (its input side down) presents its default state, a level, and
+//! the clock stops at the barrier.
 //!
 //! A UART needs no role of its own. It used to have one — the input pin a
 //! stream `Consumer`, the output a `Producer`, bytes relayed one for one and
@@ -108,23 +127,22 @@
 //! - **A strongly driven input weakly powering a floating VCC** through the
 //!   internal protection diode (Table 9-2 note (3)). An unpowered side stays
 //!   unpowered here however hard its inputs are driven.
-//! - **Supply voltage is read as the VCC net's own node voltage**, not as
-//!   `VCCx - GNDx`. The two sides' grounds are separate nets in the netlist
-//!   and the engine solves both against one global reference, so an isolated
-//!   ground sitting at a different potential is not represented — the same
-//!   simplification [`crate::ads122u04_component`] makes.
+//! - **Supply voltage is read as `VCCx − GNDx`** — each side's supply pin
+//!   is measured against that side's ground ([`embsim_board::Sense`]), and
+//!   a side whose ground nothing holds is down — but the outputs **drive**
+//!   that voltage above 0 V in the engine's frame, not above `GNDx`: exact
+//!   while a side's ground sits at 0 V there, which every board's grounds
+//!   do. An isolated ground at another potential is not represented.
 //! - **Supply current, level translation limits, ESD, and thermals.**
 
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, IdleDrive, Level, NetState, Ohms, PinDecl, PinHandle,
-    PinKind, PinReference, PulseTrain, PulseTx, StreamRole, TheveninDrive, Volts,
+    AttachError, Component, ComponentNetIo, DeadBand, Drive, Level, Ohms, PeriodicSchedule,
+    PinDecl, PinHandle, Sense, TheveninDrive, Thresholds, Volts,
 };
 
-use super::{
-    level_drive, rail_volts, require_positive, supply_up, threshold_level, PartConfigError,
-};
+use super::{level_drive, require_positive, supply_volts, PartConfigError};
 
 // ============================================================
 // Datasheet constants
@@ -134,10 +152,6 @@ use super::{
 /// `VCC >= 1.71 V` (SLLSFJ6G §9.4 Table 9-2, note 1 — the same number as the
 /// rising UVLO threshold maximum in §7.3).
 pub const DEFAULT_SUPPLY_MIN_VOLTS: Volts = 1.71;
-
-/// Nominal supply used to project thresholds and drive levels while a VCC net
-/// has no numeric solve.
-pub const DEFAULT_NOMINAL_SUPPLY_VOLTS: Volts = 3.3;
 
 /// `V_IH = 0.7 x VCCI` (SLLSFJ6G §7.3 Recommended Operating Conditions).
 pub const DEFAULT_VIH_RATIO: f64 = 0.7;
@@ -476,15 +490,6 @@ impl Variant {
 // Configuration
 // ============================================================
 
-/// What one channel carries across the barrier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelRole {
-    /// A logic level: sense the input net, drive the output net. The default.
-    Level,
-    /// A rate-carried pulse train (a step clock). See the module docs.
-    Pulse,
-}
-
 /// Isolator configuration. Build with [`Config::new`] and relax the fields a
 /// particular part needs.
 #[derive(Debug, Clone)]
@@ -497,9 +502,6 @@ pub struct Config {
     /// Supply at or above which a side is powered up
     /// ([`DEFAULT_SUPPLY_MIN_VOLTS`]).
     pub supply_min_volts: Volts,
-    /// Supply voltage assumed while a VCC net has no numeric solve
-    /// ([`DEFAULT_NOMINAL_SUPPLY_VOLTS`]).
-    pub nominal_supply_volts: Volts,
     /// `V_IH` as a fraction of the input supply ([`DEFAULT_VIH_RATIO`]).
     pub vih_ratio: f64,
     /// `V_IL` as a fraction of the input supply ([`DEFAULT_VIL_RATIO`]).
@@ -507,8 +509,6 @@ pub struct Config {
     /// Output Thevenin source impedance
     /// ([`DEFAULT_OUTPUT_IMPEDANCE_OHMS`]).
     pub output_impedance_ohms: Ohms,
-    /// Per-channel role, indexed `A`..`D`.
-    roles: [ChannelRole; 4],
 }
 
 impl Config {
@@ -519,11 +519,9 @@ impl Config {
             variant,
             fail_safe: false,
             supply_min_volts: DEFAULT_SUPPLY_MIN_VOLTS,
-            nominal_supply_volts: DEFAULT_NOMINAL_SUPPLY_VOLTS,
             vih_ratio: DEFAULT_VIH_RATIO,
             vil_ratio: DEFAULT_VIL_RATIO,
             output_impedance_ohms: DEFAULT_OUTPUT_IMPEDANCE_OHMS,
-            roles: [ChannelRole::Level; 4],
         }
     }
 
@@ -548,15 +546,13 @@ impl Config {
         self
     }
 
-    /// Carry `channel` as a rate-carried pulse train instead of a level.
-    pub fn with_pulse_channel(mut self, channel: Channel) -> Self {
-        self.roles[channel.index()] = ChannelRole::Pulse;
-        self
-    }
-
-    /// The role configured for a channel.
-    pub fn role(&self, channel: Channel) -> ChannelRole {
-        self.roles[channel.index()]
+    /// The inputs' (and enables') thresholds, **relative** to the input
+    /// side's supply: `V_IL`/`V_IH` as [`Self::vil_ratio`]/[`Self::vih_ratio`]
+    /// of `VCCI` (SLLSFJ6G §7.3), no hysteresis named, and between the two
+    /// the function table's indeterminate input — no level
+    /// ([`DeadBand::Unknown`]).
+    pub fn input_thresholds(&self) -> Thresholds {
+        Thresholds::new(self.vil_ratio, self.vih_ratio, 0.0, DeadBand::Unknown)
     }
 
     /// The default output state: low for an `F` part, high otherwise
@@ -571,7 +567,6 @@ impl Config {
 
     fn validate(&self) -> Result<(), PartConfigError> {
         require_positive("supply_min_volts", self.supply_min_volts)?;
-        require_positive("nominal_supply_volts", self.nominal_supply_volts)?;
         require_positive("output_impedance_ohms", self.output_impedance_ohms)?;
         require_positive("vih_ratio", self.vih_ratio)?;
         require_positive("vil_ratio", self.vil_ratio)?;
@@ -580,18 +575,6 @@ impl Config {
                 vil_ratio: self.vil_ratio,
                 vih_ratio: self.vih_ratio,
             });
-        }
-        // A role assigned to a channel the variant does not have is a system
-        // description bug, not something to drop on the floor.
-        for channel in Channel::ALL {
-            if self.roles[channel.index()] != ChannelRole::Level
-                && !self.variant.has_channel(channel)
-            {
-                return Err(PartConfigError::NoSuchChannel {
-                    variant: self.variant.label(),
-                    channel: channel.label(),
-                });
-            }
         }
         Ok(())
     }
@@ -609,7 +592,6 @@ struct Wiring {
     output_pin: &'static str,
     input_side: Side,
     output_side: Side,
-    role: ChannelRole,
 }
 
 // ============================================================
@@ -620,43 +602,54 @@ struct Wiring {
 /// thread.
 #[derive(Debug)]
 struct CoreState {
-    /// Last published state of each side's `VCC` net.
-    vcc: [NetState; 2],
-    /// Last published state of each side's enable net. A side with no enable
-    /// pin stays [`NetState::Floating`], which the datasheet reads as "open"
-    /// and therefore enabled.
-    enable: [NetState; 2],
-    /// Last published state of each channel's input net.
-    input: [NetState; 4],
+    /// What each side's `VCC` pin was last handed (against that side's
+    /// ground).
+    vcc: [Sense; 2],
+    /// What each side's enable pin was last handed. A side with no enable
+    /// pin keeps [`NOTHING`] — no source reaches it — which the datasheet
+    /// reads as "open" and therefore enabled.
+    enable: [Sense; 2],
+    /// The level each side's enable last read — its receiver's last level.
+    enable_level: [Option<Level>; 2],
+    /// What each channel's input pin was last handed.
+    input: [Sense; 4],
+    /// The level each channel's input last read — its receiver's last
+    /// level.
+    input_level: [Option<Level>; 4],
     /// Output pin handles, `None` until attach (and in unit tests, where the
     /// drive decision is bookkeeping only).
     output: [Option<PinHandle>; 4],
     /// Last drive applied per channel: `None` = never applied,
-    /// `Some(None)` = released, `Some(Some(d))` = driving `d`.
-    applied: [Option<Option<TheveninDrive>>; 4],
-    /// Pulse publishers, per channel.
-    pulse_tx: [Option<PulseTx>; 4],
-    /// Last train received on a pulse channel's input.
-    train_in: [Option<PulseTrain>; 4],
-    /// Last train published on a pulse channel's output.
-    train_out: [Option<PulseTrain>; 4],
-    /// Count of `set_drive` calls actually issued — the event-cost meter.
+    /// `Some(None)` = released — every output from power-on, as declared —
+    /// `Some(Some(d))` = driving `d`.
+    applied: [Option<Option<Drive>>; 4],
+    /// Count of level drives (a level or a release) actually issued — the
+    /// event-cost meter.
     drives: u64,
-    /// Count of `set_train` calls actually issued.
+    /// Count of periodic drives actually issued: one per relayed rate
+    /// change.
     trains: u64,
 }
+
+/// A pin nothing has been handed yet: no voltage, no clock — what the
+/// engine hands a net no source reaches.
+const NOTHING: Sense = Sense {
+    volts: None,
+    periodic: None,
+    at_ns: 0,
+};
 
 impl CoreState {
     fn new() -> Self {
         Self {
-            vcc: [NetState::Floating; 2],
-            enable: [NetState::Floating; 2],
-            input: [NetState::Floating; 4],
+            vcc: [NOTHING; 2],
+            enable: [NOTHING; 2],
+            enable_level: [None; 2],
+            input: [NOTHING; 4],
+            input_level: [None; 4],
             output: Default::default(),
-            applied: Default::default(),
-            pulse_tx: Default::default(),
-            train_in: Default::default(),
-            train_out: Default::default(),
+            // Every output as declared: released.
+            applied: [Some(None); 4],
             drives: 0,
             trains: 0,
         }
@@ -672,26 +665,75 @@ struct Core {
 }
 
 impl Core {
+    /// A side's supply voltage when it is up, against that side's ground.
+    fn side_rail(&self, state: &CoreState, side: Side) -> Option<Volts> {
+        supply_volts(&state.vcc[side.index()], self.config.supply_min_volts)
+    }
+
     /// Whether a side's supply is up.
     fn side_up(&self, state: &CoreState, side: Side) -> bool {
-        supply_up(state.vcc[side.index()], self.config.supply_min_volts)
+        self.side_rail(state, side).is_some()
+    }
+
+    /// The level a sense projects to through the channel thresholds of a
+    /// side powered at `rail` — the receiver's projection, chosen by its
+    /// `last` level. A side that is down projects nothing.
+    fn project(&self, sense: &Sense, rail: Option<Volts>, last: Option<Level>) -> Option<Level> {
+        sense.level(&self.config.input_thresholds().scaled(rail?), last)
+    }
+
+    /// A side's `VCC` pin was handed `sensed`: every threshold on that
+    /// side moves with it, so every receiver re-projects, then every
+    /// channel re-evaluates.
+    fn on_vcc(&self, state: &mut CoreState, side: Side, sensed: Sense) {
+        state.vcc[side.index()] = sensed;
+        self.reproject(state);
+        self.refresh_all(state);
+    }
+
+    /// A side's enable pin was handed `sensed`.
+    fn on_enable(&self, state: &mut CoreState, side: Side, sensed: Sense) {
+        state.enable[side.index()] = sensed;
+        self.reproject(state);
+        self.refresh_all(state);
+    }
+
+    /// A channel's input pin was handed `sensed`: its receiver projects it,
+    /// and that channel alone re-evaluates.
+    fn on_input(&self, state: &mut CoreState, wiring: &Wiring, sensed: Sense) {
+        let index = wiring.channel.index();
+        state.input[index] = sensed;
+        let rail = self.side_rail(state, wiring.input_side);
+        state.input_level[index] = self.project(&sensed, rail, state.input_level[index]);
+        self.refresh(state, wiring);
+    }
+
+    /// Re-project a side's enable and every input on it, keeping each
+    /// receiver's last level — after its supply or its own sense moved.
+    fn reproject(&self, state: &mut CoreState) {
+        for side in [Side::One, Side::Two] {
+            let rail = self.side_rail(state, side);
+            let i = side.index();
+            state.enable_level[i] = self.project(&state.enable[i], rail, state.enable_level[i]);
+        }
+        for wiring in &self.wiring {
+            let rail = self.side_rail(state, wiring.input_side);
+            let i = wiring.channel.index();
+            state.input_level[i] = self.project(&state.input[i], rail, state.input_level[i]);
+        }
     }
 
     /// Whether a side's outputs are enabled. `ENx` high **or open** enables
-    /// (SLLSFJ6G Table 6-1); low disables. A fought-over enable is treated as
-    /// disabled — the conservative reading, and the one that does not invent
-    /// a winner.
+    /// (SLLSFJ6G Table 6-1); low disables. Open is a pin no source reaches
+    /// — handed no voltage and no clock. A fought-over enable, or one inside
+    /// its dead band, is treated as disabled — the conservative reading,
+    /// and the one that does not invent a winner.
     fn side_enabled(&self, state: &CoreState, side: Side) -> bool {
-        let enable = state.enable[side.index()];
-        if matches!(enable, NetState::Floating) {
+        let enable = &state.enable[side.index()];
+        if enable.volts.is_none() && enable.periodic.is_none() {
             return true;
         }
-        let rail = rail_volts(state.vcc[side.index()], self.config.nominal_supply_volts);
-        threshold_level(
-            enable,
-            self.config.vil_ratio * rail,
-            self.config.vih_ratio * rail,
-        ) == Some(Level::High)
+        state.enable_level[side.index()] == Some(Level::High)
     }
 
     /// Whether the output buffer can drive at all: its own supply up and its
@@ -713,86 +755,71 @@ impl Core {
         if !self.side_up(state, wiring.input_side) {
             return self.config.default_level();
         }
-        let rail = rail_volts(
-            state.vcc[wiring.input_side.index()],
-            self.config.nominal_supply_volts,
-        );
-        threshold_level(
-            state.input[wiring.channel.index()],
-            self.config.vil_ratio * rail,
-            self.config.vih_ratio * rail,
-        )
-        .unwrap_or_else(|| self.config.default_level())
+        state.input_level[wiring.channel.index()].unwrap_or_else(|| self.config.default_level())
     }
 
-    /// The drive a level or pulse channel's output pin should present.
-    fn desired_drive(&self, state: &CoreState, wiring: &Wiring) -> Option<TheveninDrive> {
+    /// The drive a channel's output pin should present: released while the
+    /// output stage is not live; a square wave forwarded **verbatim** while
+    /// the channel is passing a clock — a running segment whose phases
+    /// settle to two levels through the input's thresholds
+    /// ([`embsim_board::PeriodicSense::rate`]), or a held one whose phases
+    /// do (the module docs, "A clock crosses as a clock"); otherwise the
+    /// level the function table gives for the level the input reads. The
+    /// ports are the output side's rail against its ground and that ground,
+    /// in the engine's frame while the ground sits at 0 V there — every
+    /// board's grounds do; a ground offset is not modelled.
+    fn desired_drive(&self, state: &CoreState, wiring: &Wiring) -> Option<Drive> {
         if !self.output_live(state, wiring) {
             return None;
         }
-        let rail = rail_volts(
-            state.vcc[wiring.output_side.index()],
-            self.config.nominal_supply_volts,
-        );
-        Some(level_drive(
-            self.output_level(state, wiring),
-            rail,
-            self.config.output_impedance_ohms,
-        ))
+        let rail = self.side_rail(state, wiring.output_side)?;
+        let port = |level| level_drive(level, rail, self.config.output_impedance_ohms);
+        if let (Some(input_rail), Some(clock)) = (
+            self.side_rail(state, wiring.input_side),
+            state.input[wiring.channel.index()].periodic,
+        ) {
+            let thresholds = self.config.input_thresholds().scaled(input_rail);
+            // Two levels need both phases outside the dead band, on
+            // opposite sides, whatever the input read before.
+            if let (Some(hi), Some(lo)) = clock.levels(&thresholds, None) {
+                let relayed =
+                    clock.rate(&thresholds).is_some() || (clock.segment.freq_hz == 0 && hi != lo);
+                if relayed {
+                    return Some(Drive::Periodic {
+                        hi: port(hi),
+                        lo: port(lo),
+                        segment: clock.segment,
+                    });
+                }
+            }
+        }
+        Some(Drive::Thevenin(port(self.output_level(state, wiring))))
     }
 
     /// Apply a channel's output — **only when it changed**.
     ///
     /// This is the whole event-cost discipline: a repeater that re-drove on
     /// every delivery would multiply engine resolutions by its channel count
-    /// and by every unrelated supply wobble.
-    fn apply_level(&self, state: &mut CoreState, wiring: &Wiring) {
+    /// and by every unrelated supply wobble. A relayed clock is one drive per
+    /// rate change, the segment carried as the source published it.
+    fn refresh(&self, state: &mut CoreState, wiring: &Wiring) {
         let index = wiring.channel.index();
         let desired = self.desired_drive(state, wiring);
         if state.applied[index] == Some(desired) {
             return;
         }
         state.applied[index] = Some(desired);
-        state.drives += 1;
-        if let Some(pin) = &state.output[index] {
-            pin.set_drive(desired);
-        }
-    }
-
-    /// Republish a pulse channel's train — again, only when it changed.
-    ///
-    /// A relayed segment is passed through **verbatim**: it carries its own
-    /// anchor (`since_us`) and accumulated count, so forwarding it neither
-    /// re-bases nor double-counts, and the downstream plant folds exactly what
-    /// the source published. A channel that is not passing publishes a held
-    /// train once, rather than leaving the last rate running forever.
-    fn apply_train(&self, state: &mut CoreState, wiring: &Wiring) {
-        if wiring.role != ChannelRole::Pulse {
-            return;
-        }
-        let index = wiring.channel.index();
-        let desired = if self.passing(state, wiring) {
-            state.train_in[index]
+        if matches!(desired, Some(Drive::Periodic { .. })) {
+            state.trains += 1;
         } else {
-            state.train_in[index].map(|_| PulseTrain::IDLE)
-        };
-        let Some(train) = desired else {
-            return;
-        };
-        if state.train_out[index] == Some(train) {
-            return;
+            state.drives += 1;
         }
-        state.train_out[index] = Some(train);
-        state.trains += 1;
-        if let Some(tx) = &state.pulse_tx[index] {
-            tx.set_train(train);
+        if let Some(pin) = &state.output[index] {
+            match desired {
+                Some(drive) => pin.drive(drive),
+                None => pin.release(),
+            }
         }
-    }
-
-    /// Re-evaluate one channel's outputs.
-    fn refresh(&self, state: &mut CoreState, wiring: &Wiring) {
-        self.apply_level(state, wiring);
-        self.apply_train(state, wiring);
     }
 
     /// Re-evaluate every channel — for a supply or enable change, which is
@@ -821,10 +848,14 @@ pub struct Iso67xxMonitor {
 }
 
 impl Iso67xxMonitor {
-    /// The drive the channel's output pin is presenting, or `None` when the
-    /// pin is released (unpowered output side, or disabled by `ENx`).
+    /// The level drive the channel's output pin is presenting, or `None`
+    /// when the pin is released (unpowered output side, or disabled by
+    /// `ENx`) or relaying a clock ([`Self::relayed_segment`]).
     pub fn output_drive(&self, channel: Channel) -> Option<TheveninDrive> {
-        self.core.state.lock().unwrap().applied[channel.index()].flatten()
+        match self.core.state.lock().unwrap().applied[channel.index()].flatten() {
+            Some(Drive::Thevenin(drive)) => Some(drive),
+            _ => None,
+        }
     }
 
     /// The logic level the channel's output is presenting, or `None` when the
@@ -832,8 +863,11 @@ impl Iso67xxMonitor {
     pub fn output_level(&self, channel: Channel) -> Option<Level> {
         let state = self.core.state.lock().unwrap();
         let wiring = self.core.wiring.iter().find(|w| w.channel == channel)?;
-        // A released pin has no level; only a driving one does.
-        state.applied[channel.index()].flatten()?;
+        // A released pin has no level, and neither does a relayed clock;
+        // only a level drive does.
+        let Some(Drive::Thevenin(_)) = state.applied[channel.index()].flatten() else {
+            return None;
+        };
         Some(self.core.output_level(&state, wiring))
     }
 
@@ -849,12 +883,18 @@ impl Iso67xxMonitor {
             .is_some_and(|wiring| self.core.passing(&state, wiring))
     }
 
-    /// The train last published on a pulse channel's output.
-    pub fn relayed_train(&self, channel: Channel) -> Option<PulseTrain> {
-        self.core.state.lock().unwrap().train_out[channel.index()]
+    /// The segment the channel's output is relaying as a clock right now —
+    /// the input's own, verbatim — or `None` while it presents a level or is
+    /// released.
+    pub fn relayed_segment(&self, channel: Channel) -> Option<PeriodicSchedule> {
+        match self.core.state.lock().unwrap().applied[channel.index()].flatten() {
+            Some(Drive::Periodic { segment, .. }) => Some(segment),
+            _ => None,
+        }
     }
 
-    /// Total `set_drive` calls this part has issued since construction.
+    /// Total level drives (a level or a release) this part has issued since
+    /// construction.
     ///
     /// The event-cost meter: a level change on one channel costs exactly one,
     /// and an unchanged re-evaluation costs zero.
@@ -862,7 +902,8 @@ impl Iso67xxMonitor {
         self.core.state.lock().unwrap().drives
     }
 
-    /// Total `set_train` calls this part has issued since construction.
+    /// Total periodic drives this part has issued since construction: one per
+    /// relayed rate change.
     pub fn train_count(&self) -> u64 {
         self.core.state.lock().unwrap().trains
     }
@@ -890,19 +931,20 @@ impl Iso67xxMonitor {
 /// assert_eq!(config.variant, Variant::Iso6741);
 /// assert!(!config.fail_safe);
 ///
-/// // STEP crosses as a rate-carried train, not as edges.
-/// let isolator = Iso67xx::new(config.with_pulse_channel(Channel::A)).expect("valid");
+/// // Every channel is a channel: a level crosses as a level, a clock as a
+/// // clock.
+/// let isolator = Iso67xx::new(config).expect("valid");
 /// assert_eq!(isolator.pins().len(), 16);
 /// ```
 #[derive(Debug)]
 pub struct Iso67xx {
+    /// The pin table ([`declare`]): each side's supply measured against
+    /// that side's first ground pin — the declaration the build's domain
+    /// lint reads (`embsim_board::Finding::UnreferencedDomain`): a side
+    /// whose supply a source reaches while its ground floats is a domain
+    /// measured against nothing — and every input and enable reading
+    /// through the datasheet's ratios of its own side's supply.
     pins: Vec<PinDecl>,
-    /// Each side's supply against that side's first ground pin — the
-    /// declaration the build's domain lint reads
-    /// (`embsim_board::Finding::UnreferencedDomain`): a side whose supply
-    /// a source reaches while its ground floats is a domain measured
-    /// against nothing.
-    references: Vec<PinReference>,
     core: Arc<Core>,
 }
 
@@ -912,17 +954,9 @@ impl Iso67xx {
         config.validate()?;
         let specs = config.variant.pin_specs();
         let wiring = wiring_for(&config);
-        let pins = specs.iter().map(|spec| declare(spec, &config)).collect();
-        let references = [Side::One, Side::Two]
-            .into_iter()
-            .filter_map(|side| {
-                let vcc = specs.iter().find(|s| s.role == Role::Vcc(side))?;
-                let gnd = specs.iter().find(|s| s.role == Role::Gnd(side))?;
-                Some(PinReference {
-                    pin: vcc.number,
-                    reference: gnd.number,
-                })
-            })
+        let pins = specs
+            .iter()
+            .map(|spec| declare(spec, specs, &config))
             .collect();
         tracing::info!(
             variant = config.variant.label(),
@@ -932,7 +966,6 @@ impl Iso67xx {
         );
         Ok(Self {
             pins,
-            references,
             core: Arc::new(Core {
                 config,
                 wiring,
@@ -979,46 +1012,46 @@ fn wiring_for(config: &Config) -> Vec<Wiring> {
                 output_pin: find(false),
                 input_side,
                 output_side,
-                role: config.role(channel),
             }
         })
         .collect()
 }
 
-/// Turn one pin-table row into a [`PinDecl`], applying the channel's role.
-fn declare(spec: &PinSpec, config: &Config) -> PinDecl {
-    let (kind, stream) = match spec.role {
-        Role::Vcc(_) | Role::Gnd(_) => (PinKind::PowerIn, None),
+/// Turn one pin-table row into a [`PinDecl`]: a side's supply measured
+/// against that side's first ground pin, an input or enable reading
+/// through the configuration's `V_IL`/`V_IH` ratios of its own side's
+/// supply (SLLSFJ6G §7.3, [`DEFAULT_VIL_RATIO`]/[`DEFAULT_VIH_RATIO`]; the
+/// datasheet names no input hysteresis) against that side's ground.
+fn declare(spec: &PinSpec, specs: &[PinSpec], config: &Config) -> PinDecl {
+    let side_pin = |want: Role| specs.iter().find(|s| s.role == want).map(|s| s.number);
+    let referenced = |pin: PinDecl, side: Side| match side_pin(Role::Gnd(side)) {
+        Some(gnd) => pin.with_reference(gnd),
+        None => pin,
+    };
+    let pin = match spec.role {
+        Role::Vcc(side) => referenced(PinDecl::power_in(spec.number), side),
+        Role::Gnd(_) => PinDecl::power_in(spec.number),
         // A no-connect pad is declared (the netlist has a node for it, on an
         // `unconnected-(...)` net) but contributes and senses nothing, so a
         // deliberately dangling pin raises no finding.
-        Role::NoConnect => (PinKind::Passive, None),
-        Role::Enable(_) => (PinKind::DigitalIn, None),
-        Role::Input(channel, _) => (
-            PinKind::DigitalIn,
-            match config.role(channel) {
-                ChannelRole::Level => None,
-                ChannelRole::Pulse => Some(StreamRole::PulseSink),
-            },
-        ),
-        Role::Output(channel, _) => (
-            PinKind::DigitalOut,
-            match config.role(channel) {
-                ChannelRole::Level => None,
-                ChannelRole::Pulse => Some(StreamRole::PulseSource),
-            },
-        ),
+        Role::NoConnect => PinDecl::passive(spec.number),
+        Role::Enable(side) | Role::Input(_, side) => {
+            let pin = referenced(
+                PinDecl::digital_in(spec.number, config.input_thresholds()),
+                side,
+            );
+            match side_pin(Role::Vcc(side)) {
+                Some(vcc) => pin.with_supply(vcc),
+                None => pin,
+            }
+        }
+        // The drive impedance is applied per drive: it is configuration,
+        // not a `&'static` constant.
+        // Released from power-on: an isolator with no rails yet drives
+        // nothing, and the declaration says so.
+        Role::Output(..) => PinDecl::digital_out(spec.number).with_idle(None),
     };
-    PinDecl {
-        number: spec.number,
-        name: Some(spec.name),
-        kind,
-        stream,
-        // Applied per drive: the impedance is configuration, not a
-        // `&'static` constant.
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    pin.with_name(spec.name)
 }
 
 impl Component for Iso67xx {
@@ -1026,23 +1059,15 @@ impl Component for Iso67xx {
         &self.pins
     }
 
-    fn references(&self) -> &[PinReference] {
-        &self.references
-    }
-
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        // 1. Claim the output pins and settle every channel to its
-        //    unpowered state. The engine gave each `DigitalOut` an idle-high
-        //    drive at assembly, so releasing them is the first thing that must
-        //    happen — an isolator with no rails yet drives nothing.
+        // 1. Claim the output pins. Each output is declared released from
+        //    power-on, which is every channel's unpowered state, so there is
+        //    nothing to publish until a rail or an input moves it.
         {
             let mut state = self.core.state.lock().unwrap();
             for wiring in &self.core.wiring {
                 let index = wiring.channel.index();
                 state.output[index] = Some(io.pin(wiring.output_pin)?);
-                if wiring.role == ChannelRole::Pulse {
-                    state.pulse_tx[index] = Some(io.pulse_tx(wiring.output_pin)?);
-                }
             }
             self.core.refresh_all(&mut state);
         }
@@ -1055,16 +1080,14 @@ impl Component for Iso67xx {
                     let core = Arc::clone(&self.core);
                     io.on_sense(spec.number, move |sensed| {
                         let mut state = core.state.lock().unwrap();
-                        state.vcc[side.index()] = sensed;
-                        core.refresh_all(&mut state);
+                        core.on_vcc(&mut state, side, sensed);
                     })?;
                 }
                 Role::Enable(side) => {
                     let core = Arc::clone(&self.core);
                     io.on_sense(spec.number, move |sensed| {
                         let mut state = core.state.lock().unwrap();
-                        state.enable[side.index()] = sensed;
-                        core.refresh_all(&mut state);
+                        core.on_enable(&mut state, side, sensed);
                     })?;
                 }
                 _ => {}
@@ -1076,28 +1099,11 @@ impl Component for Iso67xx {
         //    channel.
         for wiring in &self.core.wiring {
             let wiring = *wiring;
-            let index = wiring.channel.index();
-
-            {
-                let core = Arc::clone(&self.core);
-                io.on_sense(wiring.input_pin, move |sensed| {
-                    let mut state = core.state.lock().unwrap();
-                    state.input[index] = sensed;
-                    core.refresh(&mut state, &wiring);
-                })?;
-            }
-
-            match wiring.role {
-                ChannelRole::Level => {}
-                ChannelRole::Pulse => {
-                    let core = Arc::clone(&self.core);
-                    io.on_pulse(wiring.input_pin, move |train| {
-                        let mut state = core.state.lock().unwrap();
-                        state.train_in[index] = Some(train);
-                        core.apply_train(&mut state, &wiring);
-                    })?;
-                }
-            }
+            let core = Arc::clone(&self.core);
+            io.on_sense(wiring.input_pin, move |sensed| {
+                let mut state = core.state.lock().unwrap();
+                core.on_input(&mut state, &wiring, sensed);
+            })?;
         }
         Ok(())
     }
@@ -1119,9 +1125,18 @@ mod tests {
 
     use super::*;
 
-    const V3V3: NetState = NetState::Analog(3.3);
-    const V5V: NetState = NetState::Analog(5.0);
-    const DOWN: NetState = NetState::Analog(0.0);
+    /// A pin handed `volts` against its ground.
+    const fn at(volts: Volts) -> Sense {
+        Sense {
+            volts: Some(volts),
+            periodic: None,
+            at_ns: 0,
+        }
+    }
+
+    const V3V3: Sense = at(3.3);
+    const V5V: Sense = at(5.0);
+    const DOWN: Sense = at(0.0);
 
     fn isolator(config: Config) -> (Iso67xx, Iso67xxMonitor) {
         let isolator = Iso67xx::new(config).expect("valid config");
@@ -1130,28 +1145,25 @@ mod tests {
     }
 
     /// Drive the shared state directly, as the sense callbacks would.
-    fn set_vcc(iso: &Iso67xx, side: Side, state: NetState) {
+    fn set_vcc(iso: &Iso67xx, side: Side, sensed: Sense) {
         let mut guard = iso.core.state.lock().unwrap();
-        guard.vcc[side.index()] = state;
-        iso.core.refresh_all(&mut guard);
+        iso.core.on_vcc(&mut guard, side, sensed);
     }
 
-    fn set_enable(iso: &Iso67xx, side: Side, state: NetState) {
+    fn set_enable(iso: &Iso67xx, side: Side, sensed: Sense) {
         let mut guard = iso.core.state.lock().unwrap();
-        guard.enable[side.index()] = state;
-        iso.core.refresh_all(&mut guard);
+        iso.core.on_enable(&mut guard, side, sensed);
     }
 
-    fn set_input(iso: &Iso67xx, channel: Channel, state: NetState) {
+    fn set_input(iso: &Iso67xx, channel: Channel, sensed: Sense) {
         let mut guard = iso.core.state.lock().unwrap();
-        guard.input[channel.index()] = state;
         let wiring = *iso
             .core
             .wiring
             .iter()
             .find(|w| w.channel == channel)
             .expect("channel exists");
-        iso.core.refresh(&mut guard, &wiring);
+        iso.core.on_input(&mut guard, &wiring, sensed);
     }
 
     /// Both rails up, so the part is in its normal-operation row.
@@ -1292,25 +1304,9 @@ mod tests {
     // -- configuration validation -----------------------------------
 
     #[rstest]
-    fn a_role_on_a_channel_the_variant_lacks_is_rejected() {
-        let error = Iso67xx::new(Config::new(Variant::Iso6721).with_pulse_channel(Channel::D))
-            .expect_err("ISO6721 has no channel D");
-        assert_eq!(
-            error,
-            PartConfigError::NoSuchChannel {
-                variant: "Iso6721",
-                channel: "D"
-            }
-        );
-        // A *level* role on an absent channel is the default for every
-        // channel, so it must not be an error.
-        assert!(Iso67xx::new(Config::new(Variant::Iso6721)).is_ok());
-    }
-
-    #[rstest]
     #[case::zero_impedance(Config { output_impedance_ohms: 0.0, ..Config::new(Variant::Iso6741) })]
     #[case::negative_supply(Config { supply_min_volts: -1.0, ..Config::new(Variant::Iso6741) })]
-    #[case::nan_nominal(Config { nominal_supply_volts: f64::NAN, ..Config::new(Variant::Iso6741) })]
+    #[case::nan_supply(Config { supply_min_volts: f64::NAN, ..Config::new(Variant::Iso6741) })]
     fn invalid_parameters_are_rejected(#[case] config: Config) {
         assert!(Iso67xx::new(config).is_err());
     }
@@ -1337,9 +1333,9 @@ mod tests {
     #[rstest]
     #[case::high(V3V3, Level::High)]
     #[case::low(DOWN, Level::Low)]
-    #[case::driven_high(NetState::Driven(Level::High), Level::High)]
-    #[case::pulled_low(NetState::Pulled(Level::Low, 4_700.0), Level::Low)]
-    fn a_powered_channel_follows_its_input(#[case] input: NetState, #[case] expect: Level) {
+    #[case::at_vih(at(2.31), Level::High)]
+    #[case::under_vil(at(0.98), Level::Low)]
+    fn a_powered_channel_follows_its_input(#[case] input: Sense, #[case] expect: Level) {
         let (iso, monitor) = isolator(Config::new(Variant::Iso6741));
         power_up(&iso);
         set_input(&iso, Channel::A, input);
@@ -1347,14 +1343,14 @@ mod tests {
         assert!(monitor.is_passing(Channel::A));
     }
 
-    /// Row 2: an input the engine will not put a level on is "open", and the
+    /// Row 2: an input the receiver reads no level on is "open", and the
     /// output goes to its default state — high for a plain part, low for an
-    /// `F` part.
+    /// `F` part: a floating input, and one fought or resting inside the
+    /// dead band (two 25 Ω drivers settle at 1.65 V).
     #[rstest]
-    #[case::floating(NetState::Floating)]
-    #[case::contention(NetState::Contention)]
-    #[case::dead_band(NetState::Analog(1.65))]
-    fn an_undecidable_input_gets_the_default_output(#[case] input: NetState) {
+    #[case::floating(Sense { volts: None, periodic: None, at_ns: 0 })]
+    #[case::dead_band(at(1.65))]
+    fn an_undecidable_input_gets_the_default_output(#[case] input: Sense) {
         for (fail_safe, expect) in [(false, Level::High), (true, Level::Low)] {
             let (iso, monitor) = isolator(Config::new(Variant::Iso6740).fail_safe(fail_safe));
             power_up(&iso);
@@ -1426,13 +1422,12 @@ mod tests {
     /// Row 3: `ENx` low puts that side's outputs into high impedance;
     /// high **or open** enables them (SLLSFJ6G Table 6-1).
     #[rstest]
-    #[case::open(NetState::Floating, true)]
+    #[case::open(Sense { volts: None, periodic: None, at_ns: 0 }, true)]
     #[case::high(V3V3, true)]
-    #[case::driven_high(NetState::Driven(Level::High), true)]
+    #[case::at_vih(at(2.31), true)]
     #[case::low(DOWN, false)]
-    #[case::driven_low(NetState::Driven(Level::Low), false)]
-    #[case::contention(NetState::Contention, false)]
-    fn the_enable_pin_gates_its_own_sides_outputs(#[case] enable: NetState, #[case] enabled: bool) {
+    #[case::fought_in_the_band(at(1.65), false)]
+    fn the_enable_pin_gates_its_own_sides_outputs(#[case] enable: Sense, #[case] enabled: bool) {
         let (iso, monitor) = isolator(Config::new(Variant::Iso6741));
         power_up(&iso);
         set_input(&iso, Channel::A, V3V3);
@@ -1471,7 +1466,7 @@ mod tests {
         let (iso, monitor) = isolator(Config::new(Variant::Iso6740).fail_safe(true));
         set_vcc(&iso, Side::Two, V3V3);
         set_vcc(&iso, Side::One, V3V3);
-        set_input(&iso, Channel::A, NetState::Analog(2.4));
+        set_input(&iso, Channel::A, at(2.4));
         assert_eq!(monitor.output_level(Channel::A), Some(Level::High));
 
         set_vcc(&iso, Side::One, V5V);
@@ -1510,7 +1505,7 @@ mod tests {
 
         // A different analog voltage that projects to the same level is also
         // no change.
-        set_input(&iso, Channel::A, NetState::Analog(3.0));
+        set_input(&iso, Channel::A, at(3.0));
         assert_eq!(monitor.drive_count(), after_first);
 
         // The other channels never moved.
@@ -1539,47 +1534,101 @@ mod tests {
         assert_eq!(monitor.drive_count(), settled + 3);
     }
 
-    // -- pulse relay --------------------------------------------------
+    // -- clock relay --------------------------------------------------
 
-    fn train(freq_hz: u32, since_us: u64) -> PulseTrain {
-        use embsim_board::{PulseDirection, PulseSegment};
-        PulseTrain {
-            pulses: PulseSegment {
-                emitted: 0,
-                freq_hz,
-                total: None,
-                since_us,
-            },
-            direction: PulseDirection::Forward,
+    fn segment(freq_hz: u32, since_ns: u64) -> PeriodicSchedule {
+        PeriodicSchedule {
+            emitted: 0,
+            freq_hz,
+            total: None,
+            since_ns,
         }
     }
 
-    fn deliver_train(iso: &Iso67xx, channel: Channel, train: PulseTrain) {
-        let mut guard = iso.core.state.lock().unwrap();
-        guard.train_in[channel.index()] = Some(train);
-        let wiring = *iso
-            .core
-            .wiring
-            .iter()
-            .find(|w| w.channel == channel)
-            .expect("channel exists");
-        iso.core.apply_train(&mut guard, &wiring);
+    /// A square wave swinging rail to rail against the input's ground.
+    fn clock(freq_hz: u32, since_ns: u64) -> Sense {
+        Sense {
+            volts: None,
+            periodic: Some(embsim_board::PeriodicSense {
+                hi: Some(3.3),
+                lo: Some(0.0),
+                segment: segment(freq_hz, since_ns),
+            }),
+            at_ns: 0,
+        }
     }
 
-    /// A pulse channel relays its segment **verbatim** — same rate, same
-    /// anchor, same accumulated count — so the downstream count cannot drift
-    /// from the source's.
+    /// A channel handed a square wave relays its segment **verbatim** —
+    /// same rate, same anchor, same accumulated count — between its own
+    /// output ports, so the downstream count cannot drift from the
+    /// source's.
     #[rstest]
-    fn a_pulse_channel_relays_its_segment_verbatim() {
-        let config = Config::new(Variant::Iso6741).with_pulse_channel(Channel::A);
-        let (iso, monitor) = isolator(config);
+    fn a_clock_crosses_with_its_segment_verbatim() {
+        let (iso, monitor) = isolator(Config::new(Variant::Iso6741));
         power_up(&iso);
 
-        let segment = train(8_192, 1_000);
-        deliver_train(&iso, Channel::A, segment);
-        assert_eq!(monitor.relayed_train(Channel::A), Some(segment));
-        // The relayed train integrates identically to the source's.
-        assert_eq!(segment.emitted_at(1_001_000), 8_192);
+        set_input(&iso, Channel::A, clock(8_192, 1_000_000));
+        let segment = segment(8_192, 1_000_000);
+        assert_eq!(monitor.relayed_segment(Channel::A), Some(segment));
+        assert_eq!(monitor.output_drive(Channel::A), None, "no level: a clock");
+        // The relayed segment integrates identically to the source's.
+        assert_eq!(segment.emitted_at_ns(1_001_000_000), 8_192);
+        // Between the output side's own rail and ground.
+        let applied = iso.core.state.lock().unwrap().applied[Channel::A.index()];
+        let Some(Some(Drive::Periodic { hi, lo, .. })) = applied else {
+            panic!("a periodic drive: {applied:?}");
+        };
+        assert_eq!((hi.volts, lo.volts), (3.3, 0.0));
+        assert_eq!(hi.impedance, iso.core.config.output_impedance_ohms);
+    }
+
+    /// A square wave swinging `hi`/`lo` volts against the input's ground.
+    fn swinging(freq_hz: u32, hi: Volts, lo: Volts) -> Sense {
+        Sense {
+            volts: None,
+            periodic: Some(embsim_board::PeriodicSense {
+                hi: Some(hi),
+                lo: Some(lo),
+                segment: segment(freq_hz, 1_000_000),
+            }),
+            at_ns: 0,
+        }
+    }
+
+    /// A channel relays a clock only where its phases settle to two levels
+    /// through the input's thresholds (0.99 V / 2.31 V at 3.3 V): a
+    /// 0 V / 1.2 V wave puts its high phase in the dead band, so the input
+    /// reads no level from it — an open input, the default state, high for
+    /// a plain part and low for an `F` part; a 0 V / 0.9 V wave is a steady
+    /// low, relayed as that level by both. A held segment whose phases
+    /// cross — the stop that ends a relayed train — is forwarded verbatim.
+    #[rstest]
+    #[case::high_phase_in_the_band_plain(swinging(8_192, 1.2, 0.0), false, Level::High)]
+    #[case::high_phase_in_the_band_fail_safe(swinging(8_192, 1.2, 0.0), true, Level::Low)]
+    #[case::a_steady_low_plain(swinging(8_192, 0.9, 0.0), false, Level::Low)]
+    #[case::a_steady_low_fail_safe(swinging(8_192, 0.9, 0.0), true, Level::Low)]
+    fn a_clock_that_does_not_cross_the_input_is_a_level(
+        #[case] input: Sense,
+        #[case] fail_safe: bool,
+        #[case] expect: Level,
+    ) {
+        let (iso, monitor) = isolator(Config::new(Variant::Iso6741).fail_safe(fail_safe));
+        power_up(&iso);
+        set_input(&iso, Channel::A, input);
+        assert_eq!(monitor.relayed_segment(Channel::A), None, "no relay");
+        assert_eq!(monitor.train_count(), 0);
+        assert_eq!(monitor.output_level(Channel::A), Some(expect));
+        assert_eq!(
+            monitor.output_drive(Channel::A).map(|drive| drive.volts),
+            Some(if expect == Level::High { 3.3 } else { 0.0 })
+        );
+
+        // The same channel handed a held segment that crosses forwards it.
+        set_input(&iso, Channel::A, clock(0, 2_000_000));
+        assert_eq!(
+            monitor.relayed_segment(Channel::A),
+            Some(segment(0, 2_000_000))
+        );
     }
 
     /// A rate change costs one relay; re-delivering the same segment costs
@@ -1587,57 +1636,61 @@ mod tests {
     /// engine traffic with the step rate.
     #[rstest]
     fn relaying_costs_one_event_per_rate_change() {
-        let config = Config::new(Variant::Iso6741).with_pulse_channel(Channel::A);
-        let (iso, monitor) = isolator(config);
+        let (iso, monitor) = isolator(Config::new(Variant::Iso6741));
         power_up(&iso);
 
-        deliver_train(&iso, Channel::A, train(8_192, 1_000));
+        set_input(&iso, Channel::A, clock(8_192, 1_000_000));
         assert_eq!(monitor.train_count(), 1);
-        deliver_train(&iso, Channel::A, train(8_192, 1_000));
+        set_input(&iso, Channel::A, clock(8_192, 1_000_000));
         assert_eq!(
             monitor.train_count(),
             1,
-            "an unchanged train relays nothing"
+            "an unchanged segment relays nothing"
         );
-        deliver_train(&iso, Channel::A, train(16_384, 2_000));
+        set_input(&iso, Channel::A, clock(16_384, 2_000_000));
         assert_eq!(monitor.train_count(), 2, "a rate change relays once");
     }
 
-    /// A channel that stops passing holds its train — once — rather than
-    /// leaving the last rate running across a dead barrier forever.
+    /// A channel that stops passing presents its default state, a level:
+    /// the clock stops at a dead barrier rather than running on.
     #[rstest]
-    fn losing_a_supply_holds_the_relayed_train() {
-        let config = Config::new(Variant::Iso6741).with_pulse_channel(Channel::A);
-        let (iso, monitor) = isolator(config);
+    fn losing_the_input_side_stops_the_relayed_clock() {
+        let (iso, monitor) = isolator(Config::new(Variant::Iso6741));
         power_up(&iso);
-        deliver_train(&iso, Channel::A, train(8_192, 1_000));
+        set_input(&iso, Channel::A, clock(8_192, 1_000_000));
 
         set_vcc(&iso, Side::One, DOWN);
-        assert_eq!(monitor.relayed_train(Channel::A), Some(PulseTrain::IDLE));
-        let held = monitor.train_count();
-        set_vcc(&iso, Side::Two, DOWN);
-        assert_eq!(monitor.train_count(), held, "already held; no second event");
+        assert_eq!(monitor.relayed_segment(Channel::A), None);
+        assert_eq!(monitor.output_level(Channel::A), Some(Level::High));
+        let trains = monitor.train_count();
+        set_vcc(&iso, Side::One, DOWN);
+        assert_eq!(monitor.train_count(), trains, "no second event");
     }
 
-    /// A pulse channel declares the stream roles that make the route form; a
-    /// level channel declares none, and a channel carrying a UART is a level
-    /// channel like any other.
+    /// Every channel declares plain pins: a level channel and a clock
+    /// channel are the same channel, an input a sense and an output a
+    /// drive.
     #[rstest]
-    fn channel_roles_shape_the_stream_declarations() {
-        let config = Config::new(Variant::Iso6741).with_pulse_channel(Channel::A);
-        let (iso, _) = isolator(config);
-        let stream = |number: &str| {
-            iso.pins()
-                .iter()
-                .find(|p| p.number == number)
-                .expect("pin")
-                .stream
-        };
-        assert_eq!(stream("3"), Some(StreamRole::PulseSink)); // INA
-        assert_eq!(stream("14"), Some(StreamRole::PulseSource)); // OUTA
-        assert_eq!(stream("4"), None); // INB, a level channel
-        assert_eq!(stream("13"), None); // OUTB
-        assert_eq!(stream("5"), None); // INC
-        assert_eq!(stream("12"), None); // OUTC
+    fn every_channel_declares_plain_pins() {
+        let (iso, _) = isolator(Config::new(Variant::Iso6741));
+        let pin = |number: &str| *iso.pins().iter().find(|p| p.number == number).expect("pin");
+        let ina = pin("3");
+        assert_eq!(
+            ina.senses_at_build(),
+            Some(embsim_board::SenseKind::Digital)
+        );
+        assert_eq!(
+            ina.thresholds,
+            Some(Thresholds::new(
+                DEFAULT_VIL_RATIO,
+                DEFAULT_VIH_RATIO,
+                0.0,
+                DeadBand::Unknown
+            )),
+            "INA reads through the datasheet's ratios"
+        );
+        assert_eq!(ina.supply, Some("1"), "of side 1's VCC1");
+        let outa = pin("14");
+        assert!(outa.drives() && outa.senses_at_build().is_none()); // OUTA
     }
 }

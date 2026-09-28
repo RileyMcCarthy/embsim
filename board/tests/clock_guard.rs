@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, Finding, IdleDrive, Level, NetState,
-    PartRegistry, PinDecl, PinHandle, PinKind, StreamRole, System, TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, Finding,
+    Level, NetState, PartRegistry, PinDecl, PinHandle, System, TheveninDrive,
 };
 
 /// U1.1 (driver) and U2.1 (sensor) share the `SIG` net.
@@ -31,25 +31,10 @@ const NETLIST: &str = r#"(export (version "E")
       (node (ref "U1") (pin "1") (pintype "output"))
       (node (ref "U2") (pin "1") (pintype "input")))))"#;
 
-const NONE: Option<StreamRole> = None;
+const DRIVER_PINS: [PinDecl; 1] = [PinDecl::digital_out("1").with_name("OUT")];
 
-const DRIVER_PINS: [PinDecl; 1] = [PinDecl {
-    number: "1",
-    name: Some("OUT"),
-    kind: PinKind::DigitalOut,
-    stream: NONE,
-    drive_impedance: None,
-    idle: IdleDrive::KindDefault,
-}];
-
-const SENSOR_PINS: [PinDecl; 1] = [PinDecl {
-    number: "1",
-    name: Some("IN"),
-    kind: PinKind::DigitalIn,
-    stream: NONE,
-    drive_impedance: None,
-    idle: IdleDrive::KindDefault,
-}];
+const SENSOR_PINS: [PinDecl; 1] =
+    [PinDecl::digital_in("1", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)).with_name("IN")];
 
 const LOW: TheveninDrive = TheveninDrive {
     volts: 0.0,

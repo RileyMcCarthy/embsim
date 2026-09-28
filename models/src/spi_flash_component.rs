@@ -62,22 +62,54 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    digital_drive, level_of, AttachError, Component, ComponentNetIo, IdleDrive, Level, PinDecl,
-    PinHandle, PinKind,
+    digital_drive, AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver, Level,
+    PinDecl, PinHandle, Thresholds, Volts,
 };
 use tracing::trace;
 
 use crate::spi_flash::SpiNorFlash;
 
-const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: Some(name),
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+/// `V_IL` max as a fraction of `VCC`: 0.3 · VCC (Winbond W25Q128JV,
+/// Revision F, §9.4 "DC Electrical Characteristics", p. 62).
+pub const W25Q128JV_VIL_VCC_RATIO: f64 = 0.3;
+
+/// `V_IH` min as a fraction of `VCC`: 0.7 · VCC (the same table).
+pub const W25Q128JV_VIH_VCC_RATIO: f64 = 0.7;
+
+/// The supply range, 2.7 V to 3.6 V (Revision F, §9.2 "Operating Ranges",
+/// the 104 MHz and 133 MHz rows together).
+pub const W25Q128JV_VCC_MIN_VOLTS: Volts = 2.7;
+/// See [`W25Q128JV_VCC_MIN_VOLTS`].
+pub const W25Q128JV_VCC_MAX_VOLTS: Volts = 3.6;
+
+/// The inputs' thresholds, **relative** to `VCC` and measured against the
+/// ground pin: 0.3 · VCC / 0.7 · VCC; the datasheet names no hysteresis,
+/// so between the two it guarantees neither level ([`DeadBand::Unknown`]).
+pub const W25Q128JV_INPUT_THRESHOLDS: Thresholds = Thresholds::new(
+    W25Q128JV_VIL_VCC_RATIO,
+    W25Q128JV_VIH_VCC_RATIO,
+    0.0,
+    DeadBand::Unknown,
+);
+
+/// The same thresholds **absolute**, for a facade that declares no supply
+/// pin: each ratio evaluated at the corner of the supply range where it
+/// holds at every supply — `V_IL` 0.3 × 2.7 = 0.81 V, `V_IH` 0.7 × 3.6 =
+/// 2.52 V.
+pub const W25Q128JV_INPUT_THRESHOLDS_ANY_VCC: Thresholds = Thresholds::new(
+    W25Q128JV_VIL_VCC_RATIO * W25Q128JV_VCC_MIN_VOLTS,
+    W25Q128JV_VIH_VCC_RATIO * W25Q128JV_VCC_MAX_VOLTS,
+    0.0,
+    DeadBand::Unknown,
+);
+
+/// An input reading through the datasheet's ratios of the supply pin
+/// `vcc`, against the ground pin `gnd` (identifiers as the table names
+/// them).
+const fn input(number: &'static str, vcc: &'static str, gnd: &'static str) -> PinDecl {
+    PinDecl::digital_in(number, W25Q128JV_INPUT_THRESHOLDS)
+        .with_supply(vcc)
+        .with_reference(gnd)
 }
 
 /// The data-out pin: an output that idles **released**, because a
@@ -85,55 +117,37 @@ const fn pin(number: &'static str, name: &'static str, kind: PinKind) -> PinDecl
 /// (/CS)", p.9) and the part comes up deselected. The adapter drives it
 /// only while `~CS` is low ([`publish_do`]).
 const fn data_out(number: &'static str) -> PinDecl {
-    PinDecl {
-        number,
-        name: Some("DO"),
-        kind: PinKind::DigitalOut,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::Released,
-    }
-}
-
-/// A pin whose netlist identifier already IS its function, so it needs no
-/// alias. Declaring one anyway makes the handle table insert the same key
-/// twice, which a bench system rejects as a duplicate endpoint.
-const fn pin_unaliased(number: &'static str, kind: PinKind) -> PinDecl {
-    PinDecl {
-        number,
-        name: None,
-        kind,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    }
+    PinDecl::digital_out(number).with_name("DO").with_idle(None)
 }
 
 /// The SOIC-8 facade with datasheet pin NUMBERS as identifiers (§3.3, p.5) —
-/// for a netlist that numbers its pins, as a KiCad export does.
+/// for a netlist that numbers its pins, as a KiCad export does. The supply
+/// is measured against `GND`.
 pub const SPI_FLASH_PINS_SOIC8: [PinDecl; 8] = [
-    pin("1", "~CS", PinKind::DigitalIn),
+    input("1", "8", "4").with_name("~CS"),
     data_out("2"),
-    pin("3", "~WP", PinKind::DigitalIn),
-    pin("4", "GND", PinKind::PowerIn),
-    pin("5", "DI", PinKind::DigitalIn),
-    pin("6", "CLK", PinKind::DigitalIn),
-    pin("7", "~HOLD", PinKind::DigitalIn),
-    pin("8", "VCC", PinKind::PowerIn),
+    input("3", "8", "4").with_name("~WP"),
+    PinDecl::power_in("4").with_name("GND"),
+    input("5", "8", "4").with_name("DI"),
+    input("6", "8", "4").with_name("CLK"),
+    input("7", "8", "4").with_name("~HOLD"),
+    PinDecl::power_in("8").with_name("VCC").with_reference("4"),
 ];
 
 /// The same facade keyed by FUNCTION, which is how a netlist transcribed from
 /// a schematic names its pins — the Parallax P2-EC32MB module's `U301` among
-/// them.
+/// them. A pin whose netlist identifier already IS its function (`CLK`,
+/// `VCC`) takes no alias: declaring one anyway makes the handle table insert
+/// the same key twice, which a bench system rejects as a duplicate endpoint.
 pub const SPI_FLASH_PINS_BY_FUNCTION: [PinDecl; 8] = [
-    pin("CSn", "~CS", PinKind::DigitalIn),
+    input("CSn", "VCC", "VSS").with_name("~CS"),
     data_out("DO_IO1"),
-    pin("WPn", "~WP", PinKind::DigitalIn),
-    pin("VSS", "GND", PinKind::PowerIn),
-    pin("DI_IO0", "DI", PinKind::DigitalIn),
-    pin_unaliased("CLK", PinKind::DigitalIn),
-    pin("HOLDn", "~HOLD", PinKind::DigitalIn),
-    pin_unaliased("VCC", PinKind::PowerIn),
+    input("WPn", "VCC", "VSS").with_name("~WP"),
+    PinDecl::power_in("VSS").with_name("GND"),
+    input("DI_IO0", "VCC", "VSS").with_name("DI"),
+    input("CLK", "VCC", "VSS"),
+    input("HOLDn", "VCC", "VSS").with_name("~HOLD"),
+    PinDecl::power_in("VCC").with_reference("VSS"),
 ];
 
 /// A bare four-wire facade, for a bench netlist that names the SPI signals and
@@ -141,10 +155,12 @@ pub const SPI_FLASH_PINS_BY_FUNCTION: [PinDecl; 8] = [
 ///
 /// `~WP` and `~HOLD` are absent rather than declared-and-ignored: a bench that
 /// does not wire them should not have to, and neither is modelled anyway.
+/// With no supply pin to scale by, the inputs read through the absolute
+/// pair ([`W25Q128JV_INPUT_THRESHOLDS_ANY_VCC`]).
 pub const SPI_FLASH_PINS_SPI_ONLY: [PinDecl; 4] = [
-    pin("CS", "~CS", PinKind::DigitalIn),
-    pin_unaliased("CLK", PinKind::DigitalIn),
-    pin("MOSI", "DI", PinKind::DigitalIn),
+    PinDecl::digital_in("CS", W25Q128JV_INPUT_THRESHOLDS_ANY_VCC).with_name("~CS"),
+    PinDecl::digital_in("CLK", W25Q128JV_INPUT_THRESHOLDS_ANY_VCC),
+    PinDecl::digital_in("MOSI", W25Q128JV_INPUT_THRESHOLDS_ANY_VCC).with_name("DI"),
     data_out("MISO"),
 ];
 
@@ -302,8 +318,9 @@ impl Component for SpiNorFlashComponent {
         // level change on its own moves nothing.
         {
             let shared = Arc::clone(&self.shared);
-            io.on_sense("DI", move |state| {
-                if let Some(level) = level_of(state) {
+            let rx_di = DigitalReceiver::new(io.pin("DI")?);
+            io.on_sense("DI", move |sense| {
+                if let Some(level) = rx_di.read(&sense) {
                     shared.lock().expect("flash mutex").di = level == Level::High;
                 }
                 // A floating DI keeps its last value rather than guessing: the
@@ -316,11 +333,12 @@ impl Component for SpiNorFlashComponent {
         {
             let shared = Arc::clone(&self.shared);
             let data_out = data_out.clone();
-            io.on_sense("~CS", move |state| {
-                let Some(level) = level_of(state) else {
+            let rx_cs = DigitalReceiver::new(io.pin("~CS")?);
+            io.on_sense("~CS", move |sense| {
+                let Some(level) = rx_cs.read(&sense) else {
                     // Floating chip select is not a state the part can act on;
                     // hold, and let the engine's own diagnostics report it.
-                    trace!(?state, "SPI flash: ~CS has no level; holding selection");
+                    trace!(?sense, "SPI flash: ~CS has no level; holding selection");
                     return;
                 };
                 shared
@@ -338,9 +356,10 @@ impl Component for SpiNorFlashComponent {
         {
             let shared = Arc::clone(&self.shared);
             let data_out = data_out.clone();
-            io.on_sense("CLK", move |state| {
-                let Some(level) = level_of(state) else {
-                    trace!(?state, "SPI flash: CLK has no level; no edge");
+            let rx_clk = DigitalReceiver::new(io.pin("CLK")?);
+            io.on_sense("CLK", move |sense| {
+                let Some(level) = rx_clk.read(&sense) else {
+                    trace!(?sense, "SPI flash: CLK has no level; no edge");
                     return;
                 };
                 {

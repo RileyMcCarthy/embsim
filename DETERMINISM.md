@@ -82,13 +82,17 @@ is real, but it is not the class of bug this machine's SIL suite is hunting.
 - **Hash-order hygiene is mostly already right** — and fully right as of D0.
   `resolve` sorts everywhere
   iteration order could reach an outcome (`driver_roots.sort_unstable()`,
-  `fighting.sort_unstable()`, `extra_clusters.sort_unstable()`), and the
-  engine's `HashMap` fields (`sense_subs`, `wake_subs`, `pulse_routes`) are
-  only ever accessed by key — sense delivery walks `self.nets` by index, and
-  per-net callbacks are a `Vec` in registration order. `route_pulses` walks
-  `self.streams` in registration order and sorts `path_roots`. (Historical:
-  the byte-route maps `routes` / `stream_subs` / `drop_state` and
-  `route_streams` were deleted with `Producer`/`Consumer`.)
+  `fighting.sort_unstable()`, `extra_clusters.sort_unstable()`), the
+  engine's subscriptions (`sense_subs`, `wake_subs`) are dense `Vec`s by
+  net and by component (`NODES.md` §12 item 5), and the wheel's
+  `armed_wakes` set is only ever accessed by key — sense delivery walks
+  `self.nets` by index, and per-net callbacks are a `Vec` in registration
+  order. The coupling rule walks the
+  periodic slots in ascending order and sorts each clock's AC reach by root.
+  (Historical: the byte-route maps `routes` / `stream_subs` / `drop_state`
+  and `route_streams` were deleted with `Producer`/`Consumer`, and the pulse
+  routing maps with the pulse channel in the interface phase, `NODES.md`
+  §12 item 5.)
 - **Timer tie-breaks.** `TimerEntry::cmp` orders by `(deadline_us, seq)`, so
   simultaneous and late deadlines fire in schedule order.
 - **Per-source pulse FIFO.** `Command::PulseUpdate` carries no seq because

@@ -1,6 +1,7 @@
 /*
  * The cog-exec interpreter.
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  *
  * Cog RAM is both the register file and the instruction store, and Spike 0b
  * measured what that costs each way. Making it ordinary guest RAM is dead by

@@ -30,7 +30,9 @@ cost that lets a whole boot run in a fifth of a second.
 
 Every part contributes to one quasi-static nodal solve. Resistors, closed
 switch poles and on-state channels are conductances; rails are declared
-terminals, sources referenced to their own ground pin, entering every
+terminals, sources referenced to their own ground pin (a drive's volts are
+in the engine's frame and a sense is against the pin's reference, so a rail
+publishes its sensed ground's voltage plus its set point), entering every
 dependent solve as constants and forming cluster boundaries; pads are
 Thevenin sources at the device's real strength; diodes, LEDs, FETs and BJTs
 are piecewise-linear elements whose region is chosen by a bounded, ordered
@@ -60,22 +62,33 @@ the last eleven facades (`cluster_census.rs`, `no_board_contains_a_stub_part`
 over all three boards — a never-rises gate).
 
 **Rule 2 — One interface.** Between a node and the engine there is exactly
-this: static facts declared once on `PinDecl` (idle drive, clamps, input
-port, capacitance, thresholds with hysteresis, reference and supply pins,
-`can_source`) and on `Component::branches()` (nonlinear elements as branches
-between two of the part's pins) — the reference pin sits beside the branches,
-on `Component::references()`, until phase 5 rebuilds `PinDecl` and moves it
-onto the pin; one per-instant message, `Drive`, with three
+this: static facts declared once on `PinDecl` (its role, idle drive, clamps,
+input port, capacitance, thresholds with hysteresis, reference and supply
+pins, `can_source` and `can_sink`) and on `Component::branches()` (nonlinear
+elements as branches between two of the part's pins); one per-instant
+message, `Drive`, with three
 encodings — `Thevenin { volts, ohms }`, `Current { amps }`, `Periodic { hi,
 lo, segment }` — all sequenced through one command; one delivery, `Sense {
-volts: Option<Volts> }`, relative to the pin's reference, `None` meaning no
-source reaches the node; the receiver's own projection to a level through its
-declared thresholds; and wake scheduling. No open-drain or push-pull kinds:
-open-drain is a sink that releases. No second channel: the pulse train is an
-encoding of `Drive`, kept because 820 000 edges a second was measured and
-refused. Current into a pin is an instrument, not the normal path.
-*Enforced by:* the API surface itself — there is no other way to reach a
-net — and the facade check that refuses a pin the netlist does not have.
+volts: Option<Volts>, periodic, at_ns }`, relative to the pin's reference,
+`None` meaning no source reaches the node, a periodic node's phase voltages
+and segment beside it; the receiver's own projection to a level through its
+declared thresholds, its hysteresis and its declared dead-band policy; and
+wake scheduling. No open-drain or push-pull kinds: open-drain is a sink that
+releases. No second channel: the pulse train is an encoding of `Drive`, kept
+because 820 000 edges a second was measured and refused. Current into a pin,
+and the engine's own report of a net (`NetState`), are instruments, not the
+normal path.
+*Enforced by:* the API surface itself, which is the one interface and no
+other — `PinRole` and the declarations beside it on `PinDecl`, validated at
+build on both routes (`validate_pin_declarations`); `Drive::{Thevenin,
+Current, Periodic}` through one sequenced command; `Sense` handed through
+`on_sense`, the level the receiver's own. There is no second channel:
+`PinKind`, `StreamRole`, `pulse_tx`/`on_pulse` and `NetState` as a delivery
+are gone from every `.rs` file, the step clock's schedule is the periodic
+drive's own (`PeriodicSchedule`, nanoseconds), and a node another node
+hosts reaches the engine's clock only through its host's `WakeGate` (`NODES.md`
+§12 item 5). And the facade check that refuses a pin the netlist does not
+have.
 
 **Rule 3 — Publish at your own instant.** A producer publishes what it
 drives on its own pin, at the instant it drove it, never the net's result.
@@ -115,8 +128,10 @@ an inductor the identity union a DC short is, so a regulator's rail is its
 terminal's node and not a member of its loads' cluster; asserted as
 `every_board_under_its_reference_harness_is_within_rule_4s_bound` with the
 ROM boot beside it — the module from its fingers, every rail a part's
-output, boots at five escalated solves before its first edge and none per
-edge (`NODES.md` §8, the phase-4 record, and `cluster_census.rs`).
+output, boots at three escalated solves before its first edge and none per
+edge (`NODES.md` §8, the phase-4 record, and `cluster_census.rs`; five
+until the sense task of §12 item 5 stopped the core's pad-read
+declarations re-solving the board's element clusters).
 
 **Rule 5 — No timestep, ever.** Time enters only as scheduled instants and
 closed forms: a single-pole RC, a linear ramp, a periodic segment. Regions
@@ -143,7 +158,12 @@ bits. Instants are integer nanoseconds; the RC log is embsim's own
 fixed-point function, not a platform `ln`; no hash-ordered iteration on the
 resolution path; every armed instant carries its solve generation and fires
 in (deadline, sequence) order. Golden traces must pass without re-blessing
-unless the phase that changes them says so and reviews the diff.
+unless the phase that changes them says so and reviews the diff — as §12
+item 5 of `NODES.md` did once, for `nominal_analog_cluster` and
+`net_stuck_shared_node`: retiring phase 1's operating-point precedence added
+the fight findings an analog reader had silenced and moved no state line
+(the rules task's record gives the diff line by line); `serial_levels` and
+`wake_ladder` stayed byte-identical.
 *Enforced by:* the determinism job and its goldens.
 
 **Rule 8 — Fast by construction.** Nothing on the fast path pays for a
@@ -153,7 +173,12 @@ root with one reaching source delivers its open-circuit voltage without a
 solve. Step trains travel as rates. Measured budgets are CI gates, and a
 feature that regresses them is not done.
 *Enforced by:* the ROM-boot edge count and wall time, the solve benchmark,
-and the cluster census.
+and the cluster census; the single-source rule by
+`resolution_rules::one_source_reaching_an_analog_reader_is_its_open_circuit_voltage_unsolved`
+(a rail through one resistor into an ADC input: 3.3 V exactly, no solve,
+then one solve once a second source reaches the node) and
+`engine::tests::analog_sense_escalates_sourced_cluster_but_pull_up_stays_pulled`
+(zero solves), since `NODES.md` §12 item 5's rules task.
 
 **Rule 9 — Every model has provenance and a proving test.** A node's numbers
 cite a datasheet; a phase is done when an observable assertion says so, not

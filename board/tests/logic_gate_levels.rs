@@ -1,7 +1,9 @@
 //! A logic gate on the net, live: the output changes exactly the datasheet
 //! propagation delay after the input, driven through the datasheet output
 //! resistance, and a Schmitt-trigger input does not flip inside its
-//! hysteresis band — `NODES.md` §8 phase 2's proof for `LogicGate`.
+//! hysteresis band — `NODES.md` §8 phase 2's proof for `LogicGate`. And a
+//! clock driven straight onto a plain input is relayed only when its phases
+//! cross the input's thresholds (`NODES.md` §12 item 5, the cleanup).
 //!
 //! The rig is a bench: a driver pin, the gate, a probe on both of its nets
 //! that stamps every state it is delivered with the virtual instant it
@@ -13,13 +15,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, AttachError, Component, ComponentNetIo, Drive, EndpointRef, Harness, IdleDrive,
-    Level, NetState, PinDecl, PinHandle, PinKind, System, TheveninDrive,
+    digital_drive, jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand,
+    Drive, EndpointRef, Harness, Level, NetState, PeriodicSchedule, PinDecl, PinHandle, System,
+    TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::logic_gate::{
-    self, GatePin, LogicGate, LogicGateMonitor, LVC1G14_PINS_SOT23, LVC1G14_R_OH_OHMS,
-    LVC1G14_R_OL_OHMS, LVC1G14_T_PD_NS, LVC2G04_PINS_SOT363, LVC2G04_T_PD_NS,
+    self, GatePin, LogicGate, LogicGateMonitor, Mode, LVC1G14_PINS_SOT23, LVC1G14_R_OH_OHMS,
+    LVC1G14_R_OL_OHMS, LVC1G14_T_PD_NS, LVC2G04_PINS_SOT363, LVC2G04_R_OH_OHMS, LVC2G04_R_OL_OHMS,
+    LVC2G04_T_PD_NS,
 };
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
@@ -89,7 +93,7 @@ impl Component for Probe {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         for (pin, log) in [("A", Arc::clone(&self.a)), ("Y", Arc::clone(&self.y))] {
-            io.on_sense(pin, move |state| {
+            io.on_net_report(pin, move |state| {
                 log.lock()
                     .unwrap()
                     .push((virtual_clock::virtual_ns(), state));
@@ -122,14 +126,7 @@ fn bench(config: logic_gate::Config, pins: &'static [GatePin], input: &str, outp
     let handle = Arc::new(Mutex::new(None));
     let a: Stamped = Arc::new(Mutex::new(Vec::new()));
     let y: Stamped = Arc::new(Mutex::new(Vec::new()));
-    let sense = |number| PinDecl {
-        number,
-        name: None,
-        kind: PinKind::DigitalIn,
-        stream: None,
-        drive_impedance: None,
-        idle: IdleDrive::KindDefault,
-    };
+    let sense = |number| PinDecl::digital_in(number, jesd8c01_lvcmos_thresholds(DeadBand::Unknown));
     let (vcc, gnd) = {
         let find = |name: &str| {
             pins.iter()
@@ -143,14 +140,7 @@ fn bench(config: logic_gate::Config, pins: &'static [GatePin], input: &str, outp
         .component(
             "DRV",
             Box::new(Driver {
-                pins: [PinDecl {
-                    number: "Q",
-                    name: None,
-                    kind: PinKind::DigitalOut,
-                    stream: None,
-                    drive_impedance: None,
-                    idle: IdleDrive::Released,
-                }],
+                pins: [PinDecl::digital_out("Q").with_idle(None)],
                 handle: Arc::clone(&handle),
             }),
         )
@@ -282,11 +272,11 @@ fn an_inverter_toggles_its_output_t_pd_after_the_input_edge() {
 
 /// The input taken high, then to a voltage inside the band, then below it.
 /// The band is the datasheet's: for the SN74LVC1G14 `V_T−` min 0.84 V to
-/// `V_T+` max 1.87 V; for the 74LVC2G04 `V_IL` max 0.8 V to `V_IH` min
-/// 2.0 V.
+/// `V_T+` max 1.87 V, where the Schmitt input keeps its state (its
+/// declared dead-band policy, `HoldLast`). The 74LVC2G04 has no such band
+/// to hold in: [`a_plain_input_reads_no_level_inside_its_band`].
 #[rstest]
 #[case::lvc1g14(logic_gate::Config::lvc1g14(), &LVC1G14_PINS_SOT23, "2", "4", 1.3, 0.5, LVC1G14_T_PD_NS)]
-#[case::lvc2g04(logic_gate::Config::lvc2g04(), &LVC2G04_PINS_SOT363, "1", "6", 1.5, 0.5, LVC2G04_T_PD_NS)]
 fn a_schmitt_input_does_not_flip_inside_its_hysteresis_band(
     #[case] config: logic_gate::Config,
     #[case] pins: &'static [GatePin],
@@ -385,5 +375,221 @@ fn a_schmitt_input_does_not_flip_inside_its_hysteresis_band(
     let (t_y, _) = last(&b.y).unwrap();
     assert_eq!(t_y, t_a + t_pd);
     drop(a);
+    drop(b.system);
+}
+
+/// The 74LVC2G04's input — `V_IL` max 0.8 V, `V_IH` min 2.0 V (Table 7),
+/// no hysteresis named — taken high, then to 1.5 V, then below `V_IL`.
+/// Between its two figures the datasheet guarantees neither level, so the
+/// input reads none (its declared dead-band policy, `Unknown`) and the
+/// gate's answer for an input with no level applies: the output is
+/// released, one propagation delay later.
+#[rstest]
+fn a_plain_input_reads_no_level_inside_its_band() {
+    behaviour!(Test {
+        id: "logic-gate.plain-input-dead-band",
+        covers: Some("models/src/logic_gate.rs#LogicGate"),
+        given: "a 74LVC2G04 inverter on a 3.3 V bench, its input driven to the rail, then to \
+                1.5 volts between its input thresholds, then below them",
+    });
+    expect!(
+        "released-inside-the-band",
+        "the output is released one propagation delay after the input enters the band",
+        "the datasheet guarantees neither level between the two thresholds and names no \
+         hysteresis, so the input reads no level, and the gate drives nothing from an input \
+         with no level"
+    );
+    expect!(
+        "high-below-the-band",
+        "the output goes high one propagation delay after the input drops below the low \
+         threshold"
+    );
+
+    let _lock = suite_lock();
+    let b = bench(
+        logic_gate::Config::lvc2g04(),
+        &LVC2G04_PINS_SOT363,
+        "1",
+        "6",
+    );
+    let inside = 1.5;
+
+    b.q.drive(Drive::Thevenin(digital_drive(Level::High)));
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Driven(Level::Low)))),
+            SETTLE
+        ),
+        "Y low after a high input"
+    );
+
+    b.q.drive(Drive::Thevenin(TheveninDrive {
+        volts: inside,
+        impedance: 25.0,
+    }));
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Floating))),
+            SETTLE
+        ),
+        "Y released inside the band: {:?}",
+        b.y.lock().unwrap()
+    );
+    let (t_inside, _) =
+        *b.a.lock()
+            .unwrap()
+            .iter()
+            .find(|(_, s)| matches!(s, NetState::Analog(v) if *v == inside))
+            .expect("the mid-band voltage was delivered");
+    let (t_released, _) = last(&b.y).unwrap();
+    assert_eq!(t_released, t_inside + LVC2G04_T_PD_NS);
+
+    b.q.drive(Drive::Thevenin(TheveninDrive {
+        volts: 0.5,
+        impedance: 25.0,
+    }));
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Driven(Level::High)))),
+            SETTLE
+        ),
+        "Y high after the input dropped below the band"
+    );
+    let mut y: Vec<NetState> = b.y.lock().unwrap().iter().map(|(_, s)| *s).collect();
+    y.dedup();
+    assert_eq!(
+        y,
+        vec![
+            NetState::Floating,
+            NetState::Driven(Level::Low),
+            NetState::Floating,
+            NetState::Driven(Level::High)
+        ],
+        "released, low, released, high"
+    );
+    assert_eq!(b.gate.drive_count(0), 3, "one drive per input change");
+    drop(b.system);
+}
+
+// ============================================================
+// A clock on a plain input
+// ============================================================
+
+/// A square wave the bench drives straight onto the input — no capacitor
+/// between — from 0 V to `high_volts`, both phases behind 25 Ω, at 1 MHz
+/// from `since_ns`.
+fn square_wave(high_volts: f64, since_ns: u64) -> Drive {
+    Drive::Periodic {
+        hi: TheveninDrive {
+            volts: high_volts,
+            impedance: 25.0,
+        },
+        lo: TheveninDrive {
+            volts: 0.0,
+            impedance: 25.0,
+        },
+        segment: PeriodicSchedule {
+            emitted: 0,
+            freq_hz: 1_000_000,
+            total: None,
+            since_ns,
+        },
+    }
+}
+
+/// The 74LVC2G04's input — `V_IL` max 0.8 V, `V_IH` min 2.0 V (Table 7),
+/// no level between — first held high, then driven by a 0 V / 1.2 V square
+/// wave, then by a 0 V / 3.3 V one. A receiver sees a clock only when its
+/// input crosses its switching point every cycle: the 1.2 V phase sits in
+/// the band, where the input reads no level, so the wave is no clock and no
+/// level there — the output is released, as for any input with no level;
+/// the 3.3 V wave crosses both thresholds and is relayed at its own rate.
+/// Nothing on the bench joins the output back to the input, so the input is
+/// not self-biased.
+#[rstest]
+fn a_clock_on_a_plain_input_is_relayed_only_when_it_crosses_the_thresholds() {
+    behaviour!(Test {
+        id: "logic-gate.clock-must-cross-the-input",
+        covers: Some("models/src/logic_gate.rs#LogicGate"),
+        given: "a 74LVC2G04 inverter on a 3.3 volt bench whose input, first held high, is \
+                driven directly by a square wave from 0 to 1.2 volts, then from 0 to 3.3 volts",
+    });
+    expect!(
+        "low-swing-released",
+        "while the 1.2 volt wave runs, the output rests released",
+        "1.2 volts sits between the input's 0.8 and 2.0 volt thresholds, where the datasheet \
+         guarantees no level, so that phase reads none and the input sees no edge"
+    );
+    expect!(
+        "full-swing-relayed",
+        "the 3.3 volt wave is relayed at its own rate between the part's own output levels",
+        "each phase crosses a threshold, so the input switches every cycle"
+    );
+
+    let _lock = suite_lock();
+    let b = bench(
+        logic_gate::Config::lvc2g04(),
+        &LVC2G04_PINS_SOT363,
+        "1",
+        "6",
+    );
+    assert!(!b.gate.self_biased(0), "nothing joins 1Y back to 1A");
+
+    b.q.drive(Drive::Thevenin(digital_drive(Level::High)));
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Driven(Level::Low)))),
+            SETTLE
+        ),
+        "Y low after a high input"
+    );
+
+    let low_swing = square_wave(1.2, virtual_clock::virtual_ns());
+    b.q.drive(low_swing);
+    assert!(
+        wait_for(
+            || matches!(last(&b.y), Some((_, NetState::Floating))),
+            SETTLE
+        ),
+        "Y released under the 1.2 V wave: y={:?} a={:?}",
+        b.y.lock().unwrap(),
+        b.a.lock().unwrap()
+    );
+    assert!(
+        matches!(last(&b.a), Some((_, NetState::Periodic { .. }))),
+        "the input carries the wave: {:?}",
+        last(&b.a)
+    );
+    assert_eq!(b.gate.mode(0), Mode::Level);
+    assert_eq!(b.gate.relayed_segment(0), None);
+    assert_eq!(b.gate.train_count(0), 0, "no rate relayed");
+
+    let full_swing = square_wave(3.3, virtual_clock::virtual_ns());
+    let Drive::Periodic { segment, .. } = full_swing else {
+        unreachable!()
+    };
+    b.q.drive(full_swing);
+    assert!(
+        wait_for(|| b.gate.relayed_segment(0) == Some(segment), SETTLE),
+        "the 3.3 V wave is relayed: y={:?}",
+        b.y.lock().unwrap()
+    );
+    assert_eq!(b.gate.mode(0), Mode::Rate);
+    assert_eq!(
+        b.gate.output(0),
+        Some(Drive::Periodic {
+            hi: TheveninDrive {
+                volts: 3.3,
+                impedance: LVC2G04_R_OH_OHMS,
+            },
+            lo: TheveninDrive {
+                volts: 0.0,
+                impedance: LVC2G04_R_OL_OHMS,
+            },
+            segment,
+        }),
+        "between the datasheet's own output ports"
+    );
+    assert_eq!(b.gate.train_count(0), 1, "one relayed rate");
     drop(b.system);
 }

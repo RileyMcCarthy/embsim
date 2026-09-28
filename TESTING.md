@@ -24,7 +24,13 @@ cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 cargo test -p embsim-board --test pulse_bridge --test carriage_seam -- --nocapture
 cargo test -p embsim-board --test pulse_bridge_stepped -- --nocapture
 
-# The isolation parts, promoted from stubs on the real EdgeBoard netlist:
+# The EdgeBoard's RS-422 pair live, an SD card driven bit by bit over nets,
+# and the RS-422 receiver started twelve times in one process (each stepped,
+# its own binary; live reads at a settled instant, rule 9).
+cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_determinism
+
+# The isolation parts, promoted from stubs on the real EdgeBoard netlist
+# (stepped, own binary; every read after a 1 ms virtual settle, rule 9):
 # levels and a rate-carried step train crossing the barrier, the fail-safe
 # output of an unpowered side, and the end-switch current loop. `--nocapture`
 # prints the measured engine-event cost of a step train at two rates a
@@ -102,18 +108,35 @@ cargo test -p embsim-board --lib source_strength
 # capacitor with the buffer's self-biased stage at its mid-rail fixed point,
 # and the AC-coupling rule stopping a rate at a capacitor too small for it;
 # a gate's output moving exactly t_pd after its input through the datasheet
-# output resistance, and a Schmitt input holding inside its band; a PSRAM
-# Read ID answered over the module's own nets.
+# output resistance, a Schmitt input holding inside its band and a plain
+# one reading no level there (its output released); a PSRAM
+# Read ID answered over the module's own nets. Since the interface phase's
+# cleanup: only the buffer's fed-back stage is self-biased (the build finds
+# `R101` from `2Y` back to `2A`), and a clock driven straight onto a plain
+# input is relayed only when its phases cross the input's thresholds. The
+# final pass: a fed-back stage is self-biased only where it inverts with a
+# plain input — a buffer fed back the same way reads a coupled 0.8 V swing
+# as a steady low, and a Schmitt inverter drives levels and relays none of
+# it (read at a settled instant, the case's thread an actor).
 cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --test psram_spi
 # Phase 2, the P2 package (stepped, own binary): the rate on XI is the
 # crystal the package reports, the reset inputs as it projects them, every
 # pad released with no core so a bench pin takes one without a fight. Phase
-# 4 added the START gate — a core started, and its first wake delivered, at
-# the instant VDD enters the datasheet's 1.7–1.9 V window with RESN
-# released; held with the reason readable under, over, or with reset low —
-# and pads at their bank's supply: a pad in a 1.8 V bank sits at 1.8 V, a
-# pad in a bank whose supply pin reaches nothing floats and the bank is
-# named.
+# 4 added the START gate — a core held with the reason readable under, over,
+# or with reset low — and pads at their bank's supply: a pad in a 1.8 V bank
+# sits at 1.8 V, a pad in a bank whose supply pin reaches nothing floats and
+# the bank is named. The interface phase (`NODES.md` §12 item 5, the P2
+# task) added the datasheet's 3 ms restart: a core started, and its first
+# wake delivered, 3 ms after RESN rises inside VDD's 1.7–1.9 V window and
+# reported restarting in between, a release shorter than the delay starting
+# nothing; the brownout without a reset (VDD out of its window while the
+# core runs and RESN is not asserted: reported, the core held, its wakes
+# stopped — and nothing with RESN asserted first); the native firmware
+# image's pads through the package's bank supplies, floating before START;
+# and the fast pad's strength fitted to the datasheet's output table. The
+# final pass: a coupled 0.8 V swing on `XI` is the crystal from the instant
+# the core's clock word turns `XI`'s 1 MΩ feedback on, and none in the
+# clock mode the chip starts in.
 cargo test -p embsim-board --test p2_package
 # Phase 3, the solver half (stepped, own binary): a diode from the element
 # library conducts at (V − V_F)/R and blocks reversed, a switched channel
@@ -152,20 +175,57 @@ cargo run -p embsim-board --release --example solve_bench
 # The QEMU core inside the package (needs a QEMU P2 tree): the ROM boot
 # prints its edges / yields / publishes / START instant / wall time and
 # holds its escalated-solve count exactly (since phase 4 the module is
-# powered from its J203 fingers, nothing stuck: the core starts at the
-# bucks' 2.5 ms soft-start, the TCXO's 20 MHz reaches XI, and the count is
-# the power tree's five solves before the first edge — none per edge);
+# powered from its J203 fingers, nothing stuck: the reset releases at the
+# bucks' 2.5 ms soft-start and the core starts the datasheet's 3 ms later,
+# at 5.5 ms, the TCXO's 20 MHz reaches XI, and the count is the power
+# tree's three solves before the first edge — none per edge, and none for
+# the core's pad-read declarations since the sense task);
 # `pad_modes` runs a hand-assembled guest whose 15 kΩ pull-up reads the
 # sink holding its net low through `testp`; `crystal_pll` stalls a guest
 # that selected the PLL with nothing on XI, then clocks it at 160 MHz from
 # the 20 MHz that arrives — the scope reads its pad writes 12–13 ns apart,
 # and one yield per pad write. Both benches supply VDD, RESN and the bank
-# the guest drives, as the START gate and the pads' bank rule need.
+# the guest drives, as the START gate and the pads' bank rule need; their
+# guests start 3 ms in, the restart delay after the build.
 EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocapture
+# The interface phase's sense task (`NODES.md` §12 item 5; stepped, own
+# binary): what a pin is handed is a
+# voltage against its declared reference, and the level is the receiver's
+# own projection — a 1.2 V node read low, high, low through a Schmitt
+# receiver's hysteresis, a holding receiver against one that reads no level
+# inside the dead band, the same 1.5 V read high by a P2 pad in a 1.8 V bank
+# and no level by an LVCMOS receiver, a reader against a reference pin at
+# 1 V, a floating sense handed no voltage with its finding, a fought net
+# handed its 1.65 V operating point with the contention beside it, a supply
+# move re-delivering a pad's sense (waited on as the reading itself), and —
+# the cleanup — a stepper counting a step clock only when its phases cross
+# its `STEP` thresholds; the final pass — a step clock that stops crossing
+# and crosses again under one schedule counted once per pulse, from the
+# instant it crosses again, wherever that lands against the drive's own
+# position samples, and a build's senses carrying instant 0 whatever the
+# clock reads.
+cargo test -p embsim-board --test receiver_projection --test pin_declarations
+# The interface phase's rules task (stepped, own binary): a fought node
+# under an ADC
+# input reads its 1.65 V operating point with the contention beside it (two
+# pads, and a rail against a short); a rail through one resistor into an ADC
+# input is handed 3.3 V exactly with no solve, and one solve once a pad
+# drives the node; an AM26LV32's open inputs sit at their own 0.83 V /
+# 0.70 V bias and the fail-safe holds the output high until a pad pulls A
+# low; a clamped pin sits one knee above its supply; an open drain no
+# pull-up reaches is a build finding. The two analog goldens were re-blessed
+# by this task (`NODES.md` §12 item 5) — finding lines only.
+cargo test -p embsim-board --test resolution_rules
 # The p2core differential behind "60 000 states identical" is a manual run
 # against MaD's `SIL/p2core`; the exact commands (flash image, reference,
 # traced boot, comparison) are in `p2-qemu/README.md`, "The state trace and
 # the p2core differential". Run it when the node's instruction path moves.
+# The pulse-out schedule (`PeriodicSchedule`, nanoseconds since the
+# interface phase) and the stepper plant that folds it are unit-tested in
+# their crates: an hour of a 10 MHz train counts exactly, a rate change
+# between two microseconds folds each side exactly.
+cargo test -p embsim-peripherals --lib pulse_out
+cargo test -p embsim-models --lib stepper_motor
 ```
 
 Per-crate iteration:
@@ -218,7 +278,12 @@ cargo llvm-cov --workspace --summary-only
 
 4. **Assert contracts, not wall flakiness.** Prefer virtual-time schedules,
    monotonicity, clamps, and ε windows. Dedicated paced-stream tests that pin
-   scale and assert wall delay are the exception (document why).
+   scale and assert wall delay are the exception (document why). A wall-clock
+   wait for what a stepped run must do *eventually* — a burst to finish
+   crossing, a node to reach its next slice — is sized for a hang, never for
+   a speed: the wall time a stepped run takes is the engine's cost per edge
+   times its edges, and the runner decides that (`qemu/tests/loopback.rs`'s
+   `EVENTUALLY`, with the measurements that sized it).
 
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`
@@ -266,21 +331,40 @@ cargo llvm-cov --workspace --summary-only
    free-running *does* diverge where stepped does not, and requires every named
    case to have a golden.
 
-9. **A model's proving tests run in stepped mode.** A free-running system
-   with no firmware in it can still settle two ways from one input:
-   `board/tests/rs422_determinism.rs` holds an open divergence of exactly
-   that kind (the receiver output rests `Floating` in about one run in twelve,
-   a drive release from a component's attach interleaving differently with a
-   sense delivery — reproduced 2026-09-23, see the test's docs for the
-   recipe). Until it is closed, a new model's proving test — the tests
+9. **A model's proving tests run in stepped mode, and read at a settled
+   instant.** A free-running read cannot tell a settled system from a cascade
+   in flight: `System::start` returns with the attach cascade still running,
+   and a wall-clock poll for the state a case expects passes early whenever
+   that state is also a pin's idle. The AM26LV32's `1Y` idles `Driven(High)`
+   and is released twice on its way to driving it (the test-tree model
+   publishes at its supply's delivery and `G`'s, before `~G` enables it), so
+   a poll that accepted the idle and then read again read `Floating`. That was
+   `board/tests/rs422_determinism.rs`'s one run in twelve — reproduced
+   2026-09-23 and taken then for a system settling two ways from one input,
+   root-caused 2026-09-25 as this read race (`NODES.md` §12 item 5, the flake
+   record and the performance and stepped-tests record: every run reached the
+   one settled state) — and the `Floating` reads that flaked
+   `isolation_bridge.rs` and `edgeboard.rs`; a fixed wall wait for a card's
+   answer flaked `sd_card_spi.rs`. So a new model's proving test — the tests
    `NODES.md` §8 lists as each phase's proof — starts its system in stepped
-   mode (`virtual_clock::init_mode(ClockMode::Stepped, …)`, the pattern in
-   `determinism.rs` and `pulse_bridge_stepped.rs`), where the engine quiesces
-   every actor before it advances and the interleaving is the engine's own.
-   A free-running case may still exist beside it to measure divergence, under
-   rule 8; it is not the proof. Every sense→drive cascade a new model adds is
-   one more place the open divergence can show, which is why the rule lands
-   before the models do.
+   mode (`virtual_clock::init_mode(ClockMode::Stepped, …)`), and a case that
+   reads a live system follows `isolation_bridge.rs`: a suite lock, the clock
+   re-anchored stepped, the system started with time held, the case's thread
+   registered as a virtual-clock actor and time released, every wait a virtual
+   `settle()` longer than any instant the rig arms (asserted at compile time),
+   and no `QuiescenceTimeout` at the end. The engine then advances only while
+   the case is parked, so a read between two settles is deterministic: every
+   wake due before the settle's deadline has fired. One due at the deadline
+   itself fires after the case parks again (at an instant, released actors
+   run before the engine fires what is due there), which is why the window
+   is longer than any span the rig arms after a settled instant — then no
+   wake falls on a deadline and the read is the system at rest. The order of
+   the held start-up instant is still the attach thread's race with the
+   engine's deliveries — the state it comes to rest in is not — so such a case
+   compares states at rest, not start-up logs. A free-running case may still
+   exist beside it to measure divergence, under rule 8; it is not the proof,
+   and it never waits for a value an idle can satisfy. Every sense→drive
+   cascade a new model adds is one more transient such a wait can land in.
 
 ## What each layer should cover
 

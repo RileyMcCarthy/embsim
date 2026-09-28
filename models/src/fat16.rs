@@ -11,8 +11,9 @@
 //!
 //! # The constraints, and where they come from
 //!
-//! These are read out of a real FatFs `ffconf.h` rather than assumed, and they
-//! are the common embedded configuration:
+//! These are read out of FatFs R0.14b's `ffconf.h` as FlexC 7.4.3 ships it
+//! (`include/filesys/fatfs/ffconf.h`, `FFCONF_DEF` 86631) rather than assumed,
+//! and they are the common embedded configuration:
 //!
 //! | knob | value | consequence |
 //! |---|---|---|
@@ -32,11 +33,15 @@
 //!
 //! The FAT type is **derived from the cluster count**, not from the label in
 //! the boot sector, so geometry that lands outside FAT16's window is read as
-//! FAT12 or FAT32 whatever the image claims to be. [`build`] refuses that case
-//! rather than emitting a volume that mounts as the wrong thing — see
-//! [`ImageError::NotFat16`].
+//! FAT12 or FAT32 whatever the image claims to be. The window is 4086..=65524
+//! data clusters: the counts that both FatFs R0.14b (`MAX_FAT12` and
+//! `MAX_FAT16` in `ff.c`) and Microsoft's fatgen103 v1.03 ("FAT Type
+//! Determination") read as FAT16. The two disagree at 4085, which FatFs reads
+//! as FAT12, and at 65525, which fatgen103 reads as FAT32, so neither is in it.
+//! [`build`] refuses a size outside the window rather than emitting a volume
+//! that mounts as the wrong thing — see [`ImageError::NotFat16`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Bytes per sector. Not a choice — `FF_MIN_SS == FF_MAX_SS == 512`.
@@ -55,17 +60,47 @@ const ROOT_ENTRIES: usize = 512;
 /// One directory entry is 32 bytes.
 const DIR_ENTRY: usize = 32;
 
-/// Below this cluster count a volume is FAT12, whatever the boot sector says —
-/// the type is *derived* from the count, so an image that lands under it would
-/// be misread however it labels itself.
-const FAT16_MIN_CLUSTERS: usize = 4085;
-/// And above this it is FAT32, for the same reason.
+/// The fewest data clusters a FAT16 volume can have, for every reader this
+/// image is for. The type is *derived* from the count, whatever the boot
+/// sector says, so an image under this is misread however it labels itself.
+///
+/// - FatFs R0.14b (`ff.c`, as FlexC 7.4.3 ships it) defines
+///   `MAX_FAT12 0xFF5` and classifies `nclst <= MAX_FAT12` as FAT12, so it
+///   reads 4085 clusters as FAT12. Its `nclst` is counted the way [`build`]
+///   counts: sectors past the reserved area, the FATs and the root directory,
+///   divided by sectors per cluster.
+/// - Microsoft fatgen103 v1.03, "FAT Type Determination": FAT12 below 4085,
+///   FAT16 below 65525, so it reads 4085 as FAT16.
+///
+/// They disagree at exactly 4085; 4086 is the first count both call FAT16.
+const FAT16_MIN_CLUSTERS: usize = 4086;
+/// The most data clusters a FAT16 volume can have, for every reader.
+///
+/// - FatFs R0.14b defines `MAX_FAT16 0xFFF5` and classifies
+///   `nclst <= MAX_FAT16` as FAT16, so up to 65525.
+/// - fatgen103 v1.03, "FAT Type Determination": FAT16 below 65525, FAT32 from
+///   there, so up to 65524.
+///
+/// `FAT16_MIN_CLUSTERS..=FAT16_MAX_CLUSTERS`, 4086..=65524, is the window both
+/// read as FAT16.
 const FAT16_MAX_CLUSTERS: usize = 65524;
 
 /// First cluster number that addresses data. 0 and 1 are reserved.
 const FIRST_DATA_CLUSTER: u16 = 2;
 
 const ATTR_DIRECTORY: u8 = 0x10;
+
+/// `BPB_Media`: fatgen103 v1.03, "Boot Sector and BPB Structure" — 0xF8 is
+/// the standard value for fixed (non-removable) media, and whatever is put
+/// there must also be the low byte of `FAT[0]` ("FAT Data Structure").
+const MEDIA_FIXED: u8 = 0xF8;
+/// `BS_VolID`. fatgen103 has a formatter derive it from the date and time;
+/// this is a fixed value instead, so an image built twice from the same tree
+/// is byte-identical — the same reason as the fixed timestamp in `dir_entry`.
+const VOLUME_SERIAL: u32 = 0x1234_5678;
+/// `BS_VolLab`: fatgen103 v1.03, "FAT12 and FAT16 Structure Starting at
+/// Offset 36" — `"NO NAME    "` is the value when a volume has no label.
+const VOLUME_LABEL: &[u8; 11] = b"NO NAME    ";
 
 /// A directory being built, before it is laid out on the card.
 #[derive(Debug, Default)]
@@ -92,33 +127,38 @@ impl Dir {
 
     /// Mirror a host directory onto the card.
     ///
-    /// Deliberately shallow about errors: a missing source directory yields an
-    /// empty one rather than failing, because the SD fixture is optional and a
-    /// card with the right *shape* is what the firmware needs to mount.
-    pub fn from_host_dir(path: &Path) -> Self {
+    /// Every I/O error comes back with the path it happened on; a caller whose
+    /// fixture is optional checks `path.exists()` first.
+    ///
+    /// A symlink is followed, to a file or a directory alike. An entry that is
+    /// still neither a file nor a directory (a socket, a FIFO, a device) is
+    /// skipped, and so is a dotfile, which has no 8.3 form.
+    pub fn from_host_dir(path: &Path) -> std::io::Result<Dir> {
         let mut out = Dir::new();
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return out;
-        };
-        for entry in entries.flatten() {
+        for entry in std::fs::read_dir(path).map_err(at_path(path))? {
+            let entry = entry.map_err(at_path(path))?;
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') {
                 continue;
             }
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => {
-                    *out.dirs.entry(name).or_default() = Dir::from_host_dir(&entry.path());
-                }
-                Ok(t) if t.is_file() => {
-                    if let Ok(bytes) = std::fs::read(entry.path()) {
-                        out.files.insert(name, bytes);
-                    }
-                }
-                _ => {}
+            let entry_path = entry.path();
+            // `metadata`, not `entry.file_type()`: the latter describes a
+            // symlink as itself, which is neither a file nor a directory.
+            let meta = std::fs::metadata(&entry_path).map_err(at_path(&entry_path))?;
+            if meta.is_dir() {
+                out.dirs.insert(name, Dir::from_host_dir(&entry_path)?);
+            } else if meta.is_file() {
+                let bytes = std::fs::read(&entry_path).map_err(at_path(&entry_path))?;
+                out.files.insert(name, bytes);
             }
         }
-        out
+        Ok(out)
     }
+}
+
+/// Wrap an I/O error with the path it happened on, keeping its kind.
+fn at_path(path: &Path) -> impl FnOnce(std::io::Error) -> std::io::Error + '_ {
+    move |e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 /// Why an image could not be built.
@@ -147,6 +187,13 @@ pub enum ImageError {
         /// Which directory.
         name: String,
     },
+    /// Two names in one directory fold to the same 8.3 entry — `a.bin` and
+    /// `A.BIN`, or a file and a subdirectory both called `data` — and a
+    /// directory that lists one short name twice is corrupt.
+    DuplicateName {
+        /// The second of the two, in the order the directory is laid out.
+        name: String,
+    },
 }
 
 impl std::fmt::Display for ImageError {
@@ -170,6 +217,10 @@ impl std::fmt::Display for ImageError {
                 )
             }
             ImageError::DirFull { name } => write!(f, "directory {name:?} has too many entries"),
+            ImageError::DuplicateName { name } => write!(
+                f,
+                "{name:?} folds to the same 8.3 entry as another name in its directory"
+            ),
         }
     }
 }
@@ -303,13 +354,29 @@ fn build_dir(
         entries.extend_from_slice(&dir_entry(dotdot, ATTR_DIRECTORY, parent_cluster, 0));
     }
 
+    // Every short name this directory lists, files and subdirectories alike.
+    // Two host names can fold to one (`a.bin` and `A.BIN`), and a directory
+    // that lists the same entry twice is corrupt, so a collision is refused
+    // before anything is allocated for it.
+    let mut listed: BTreeSet<[u8; 11]> = BTreeSet::new();
+    let mut claim = |name: &str| -> Result<[u8; 11], ImageError> {
+        let short = short_name(name)?;
+        if !listed.insert(short) {
+            return Err(ImageError::DuplicateName {
+                name: name.to_string(),
+            });
+        }
+        Ok(short)
+    };
+
     for (name, contents) in &dir.files {
+        let short = claim(name)?;
         let first = layout.alloc(contents.len())?;
         if first != 0 {
             layout.write_chain(first, contents);
         }
         entries.extend_from_slice(&dir_entry(
-            short_name(name)?,
+            short,
             0x20, // archive
             first,
             contents.len() as u32,
@@ -317,6 +384,7 @@ fn build_dir(
     }
 
     for (name, sub) in &dir.dirs {
+        let short = claim(name)?;
         // A directory always occupies at least one cluster, even when empty:
         // it has to hold `.` and `..`.
         let cluster = layout.alloc(1)?;
@@ -325,7 +393,7 @@ fn build_dir(
             return Err(ImageError::DirFull { name: name.clone() });
         }
         layout.write_chain(cluster, &sub_entries);
-        entries.extend_from_slice(&dir_entry(short_name(name)?, ATTR_DIRECTORY, cluster, 0));
+        entries.extend_from_slice(&dir_entry(short, ATTR_DIRECTORY, cluster, 0));
     }
 
     Ok(entries)
@@ -372,8 +440,10 @@ pub fn build(size_bytes: usize, root: &Dir) -> Result<Vec<u8>, ImageError> {
         total_clusters: clusters,
         next_free: FIRST_DATA_CLUSTER,
     };
-    // The two reserved FAT entries: media byte, then an end-of-chain marker.
-    layout.fat[0] = 0xFFF8;
+    // The two reserved FAT entries, fatgen103 v1.03 "FAT Data Structure":
+    // FAT[0] holds BPB_Media in its low byte with every other bit set, and
+    // FAT[1] holds the end-of-chain mark a formatter writes there.
+    layout.fat[0] = 0xFF00 | u16::from(MEDIA_FIXED);
     layout.fat[1] = 0xFFFF;
 
     let root_entries = build_dir(&mut layout, root, 0, 0, true)?;
@@ -384,28 +454,54 @@ pub fn build(size_bytes: usize, root: &Dir) -> Result<Vec<u8>, ImageError> {
     }
 
     // -- boot sector ---------------------------------------------------
+    // Field by field from Microsoft fatgen103 v1.03: offsets 0..36 are its
+    // "Boot Sector and BPB Structure" table, 36..62 its "FAT12 and FAT16
+    // Structure Starting at Offset 36" table. Fields not written stay zero:
+    // BPB_HiddSec is 0 because nothing precedes this volume (no partition
+    // table), and BS_Reserved1 is 0 as the table requires.
     let bs = &mut layout.bytes[0..SECTOR];
-    bs[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]); // jmp short + nop
-    bs[3..11].copy_from_slice(b"MSWIN4.1"); // OEM name FatFs is happy with
-    bs[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes());
-    bs[13] = SECTORS_PER_CLUSTER as u8;
-    bs[14..16].copy_from_slice(&(RESERVED_SECTORS as u16).to_le_bytes());
-    bs[16] = NUM_FATS as u8;
-    bs[17..19].copy_from_slice(&(ROOT_ENTRIES as u16).to_le_bytes());
+
+    // BS_jmpBoot, the short-jump form EB xx 90. 0x3C lands on offset 0x3E,
+    // the first byte past BS_FilSysType, where FAT12/16 boot code starts.
+    // FatFs's `check_fs` only takes a sector whose first byte is a jump.
+    bs[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+    // BS_OEMName: fatgen103 recommends "MSWIN4.1" as the value least likely
+    // to cause compatibility problems.
+    bs[3..11].copy_from_slice(b"MSWIN4.1");
+
+    bs[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes()); // BPB_BytsPerSec
+    bs[13] = SECTORS_PER_CLUSTER as u8; // BPB_SecPerClus
+    bs[14..16].copy_from_slice(&(RESERVED_SECTORS as u16).to_le_bytes()); // BPB_RsvdSecCnt
+    bs[16] = NUM_FATS as u8; // BPB_NumFATs
+    bs[17..19].copy_from_slice(&(ROOT_ENTRIES as u16).to_le_bytes()); // BPB_RootEntCnt
+
+    // BPB_TotSec16 when the count fits sixteen bits; otherwise that field is
+    // 0 and the count goes in BPB_TotSec32.
     if total_sectors < 0x1_0000 {
         bs[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
     } else {
         bs[32..36].copy_from_slice(&(total_sectors as u32).to_le_bytes());
     }
-    bs[21] = 0xF8; // fixed disk
-    bs[22..24].copy_from_slice(&(sectors_per_fat as u16).to_le_bytes());
-    bs[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track
-    bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
-    bs[36] = 0x80; // drive number
-    bs[38] = 0x29; // extended boot signature: the three fields below are valid
-    bs[39..43].copy_from_slice(&0x1234_5678u32.to_le_bytes()); // volume serial
-    bs[43..54].copy_from_slice(b"MAD SIL    ");
+    bs[21] = MEDIA_FIXED; // BPB_Media
+    bs[22..24].copy_from_slice(&(sectors_per_fat as u16).to_le_bytes()); // BPB_FATSz16
+
+    // BPB_SecPerTrk and BPB_NumHeads are INT 13h geometry, which fatgen103
+    // says matters only to media INT 13h sees; FatFs reads neither. 63
+    // sectors by 255 heads is what FatFs R0.14b's own `f_mkfs` writes.
+    bs[24..26].copy_from_slice(&63u16.to_le_bytes()); // BPB_SecPerTrk
+    bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // BPB_NumHeads
+
+    // BS_DrvNum: 0x80 for a hard disk, 0x00 for a floppy.
+    bs[36] = 0x80;
+    // BS_BootSig: 0x29 says the three fields after it are present.
+    bs[38] = 0x29;
+    bs[39..43].copy_from_slice(&VOLUME_SERIAL.to_le_bytes()); // BS_VolID
+    bs[43..54].copy_from_slice(VOLUME_LABEL); // BS_VolLab
+
+    // BS_FilSysType: informational only. fatgen103 is explicit that the type
+    // is never decided from this string; see `FAT16_MIN_CLUSTERS`.
     bs[54..62].copy_from_slice(b"FAT16   ");
+    // The signature fatgen103 requires at offsets 510 and 511 of sector 0.
     bs[510] = 0x55;
     bs[511] = 0xAA;
 
@@ -426,6 +522,7 @@ pub fn build(size_bytes: usize, root: &Dir) -> Result<Vec<u8>, ImageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// 32 MiB at 2 KiB clusters lands mid-window, not near either edge where a
     /// small geometry change would silently reclassify the volume.
@@ -445,6 +542,101 @@ mod tests {
         // it FAT16 would produce an image every driver reads differently.
         let err = build(1024 * 1024, &Dir::new()).expect_err("must refuse");
         assert!(matches!(err, ImageError::NotFat16 { .. }), "got {err:?}");
+    }
+
+    /// FatFs classifies `nclst <= MAX_FAT12` (`0xFF5`) as FAT12, so it reads
+    /// exactly 4085 clusters as FAT12 although fatgen103 calls that FAT16. A
+    /// FAT16-structured image there mounts as the wrong thing, so it is
+    /// refused. 16 405 sectors is where the sizing lands on 4085; 16 409 is
+    /// where it first lands on 4086, and that image must build — and count
+    /// 4086 clusters when read back the way `ff.c` counts them.
+    #[test]
+    fn a_4085_cluster_volume_is_refused_because_fatfs_reads_it_as_fat12() {
+        // `.err()` rather than `expect_err`: an unexpected Ok would print the
+        // whole 8 MiB image.
+        assert_eq!(
+            build(16_405 * 512, &Dir::new()).err(),
+            Some(ImageError::NotFat16 { clusters: 4085 }),
+            "4085 clusters is FAT12 to FatFs"
+        );
+
+        let img = build(16_409 * 512, &Dir::new()).expect("4086 clusters is FAT16 to both");
+        let (reserved, fats, spf, root_entries) = bpb(&img);
+        let total_sectors = u16::from_le_bytes([img[19], img[20]]) as usize;
+        let system_sectors = reserved + fats * spf + root_entries * DIR_ENTRY / SECTOR;
+        let clusters = (total_sectors - system_sectors) / img[13] as usize;
+        assert_eq!(
+            clusters, 4086,
+            "the cluster count FatFs derives from the BPB"
+        );
+    }
+
+    /// Names are upper-cased on the way to 8.3, so two host names can fold to
+    /// one entry. Writing both would list one short name twice — a corrupt
+    /// directory in which a driver only ever finds the first.
+    #[rstest]
+    #[case::two_files_differing_only_in_case(&["a.bin", "A.BIN"], &[], "a.bin")]
+    #[case::a_file_and_a_directory_of_one_name(&["data"], &["data"], "data")]
+    fn two_names_that_fold_to_one_8_3_entry_are_refused(
+        #[case] files: &[&str],
+        #[case] dirs: &[&str],
+        #[case] second: &str,
+    ) {
+        let mut root = Dir::new();
+        for name in files {
+            root.file(name, vec![1]);
+        }
+        for name in dirs {
+            root.dir(name);
+        }
+        assert_eq!(
+            build(32 * 1024 * 1024, &root).err(),
+            Some(ImageError::DuplicateName {
+                name: second.to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_missing_host_directory_is_an_error_that_names_it() {
+        let path = std::env::temp_dir().join(format!("embsim-fat16-{}-absent", std::process::id()));
+        let err = Dir::from_host_dir(&path).expect_err("a missing directory is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "the error names the path: {err}"
+        );
+    }
+
+    /// One file, one subdirectory and (on Unix) a symlink to the file, all of
+    /// which must reach the card's root directory under their 8.3 names.
+    #[test]
+    fn a_host_directory_mirrors_onto_the_card() {
+        let host = std::env::temp_dir().join(format!("embsim-fat16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host);
+        std::fs::create_dir_all(host.join("gcode")).expect("make the subdirectory");
+        std::fs::write(host.join("profile.bin"), [1, 2, 3]).expect("write the file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(host.join("profile.bin"), host.join("link.bin"))
+            .expect("make the symlink");
+        let mirrored = Dir::from_host_dir(&host);
+        // Clean up before asserting, so a failure leaves nothing behind.
+        std::fs::remove_dir_all(&host).expect("remove the tree");
+
+        let img = build(32 * 1024 * 1024, &mirrored.expect("the tree reads")).expect("builds");
+        let root_start = find_root_offset(&img);
+        let names: Vec<String> = img[root_start..root_start + 512 * 32]
+            .chunks(32)
+            .take_while(|e| e[0] != 0)
+            .map(|e| String::from_utf8_lossy(&e[0..11]).to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "PROFILE BIN"), "got {names:?}");
+        assert!(names.iter().any(|n| n == "GCODE      "), "got {names:?}");
+        #[cfg(unix)]
+        assert!(
+            names.iter().any(|n| n == "LINK    BIN"),
+            "a symlink to a file is followed: {names:?}"
+        );
     }
 
     #[test]

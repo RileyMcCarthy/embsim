@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 20611f158c6781077b633670ce857d3e3ff184941f8dbec940bb7b0c52796532 # shrinks to spec = Spec { n: 2, merges: [], edges: [], endpoints: [(0, None)], power: [], stuck: [], digital_senses: [], analog_senses: [], instruments: [], power_senses: [], elements: [], rails: [0], couplings: [(0, 1, 1e-11)] }, ops = [Rail(0, Some(Periodic { hi: TheveninDrive { volts: 3.3, impedance: 25.0 }, lo: TheveninDrive { volts: 0.0, impedance: 25.0 }, segment: PeriodicSchedule { emitted: 0, freq_hz: 0, total: None, since_ns: 0 } }))]
+cc e2551a6e67257e9bb171142a9daf580b688fc8dde6920049db07b82a34434d3d # shrinks to spec = Spec { n: 2, merges: [], edges: [(1, 0, 4700.0)], endpoints: [(0, Some(Thevenin(TheveninDrive { volts: 0.0, impedance: 25.0 }))), (0, None)], power: [], stuck: [], digital_senses: [], analog_senses: [], instruments: [], power_senses: [], elements: [(0, 0, Diode { vf: 0.75, r_d: 0.0 }, None)], rails: [], couplings: [] }, ops = [Drive(1, Some(Periodic { hi: TheveninDrive { volts: 3.3, impedance: 15000.0 }, lo: TheveninDrive { volts: 0.0, impedance: 25.0 }, segment: PeriodicSchedule { emitted: 0, freq_hz: 0, total: None, since_ns: 0 } }))]

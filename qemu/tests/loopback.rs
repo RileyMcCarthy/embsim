@@ -46,6 +46,29 @@ impl Drop for Stepped {
     }
 }
 
+/// How long a test waits for what must happen **eventually** — a burst to
+/// finish crossing the line, a node to complete its next slices — before it
+/// calls the run a hang. Every such wait in this file uses it.
+///
+/// It is not a performance claim, and no runner's speed may decide it. Both
+/// nodes run on the stepped clock, so the wall time a burst takes is the
+/// engine's cost per edge times the edges the burst is, which is the
+/// runner's, not the line's: the 256 KiB burst below is 1.31 s of line time
+/// (262 144 bytes × 10 bits at 2 Mbaud) and takes 20–25 s in a debug build
+/// on an idle development host, and CI's Ubuntu runner had carried 238 999 of
+/// its bytes, and its coverage job 222 599, when an earlier 60 s bound
+/// expired on d982742 — some 66 s and 71 s for the whole burst. 300 s is
+/// four times the slowest of those, is reached only by a run that has
+/// stopped, and costs nothing when the bytes arrive: every wait returns the
+/// moment its condition holds.
+///
+/// What this file does assert against the wall clock is a claim, with its
+/// reason where it is asserted: the guest's blocking write completes in
+/// under 5 s (the node drains the socket whatever the line does), and the
+/// node's metering keeps the board within a slice of the guest and its
+/// books within a scheduling hiccup (2 ms) of the guest's own stopwatch.
+const EVENTUALLY: Duration = Duration::from_secs(300);
+
 fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -237,7 +260,7 @@ fn the_guest_runs_only_as_far_as_the_board_has_advanced() {
     // board advances 10 ms of virtual time each time the guest has lived
     // 10 ms of wall time: the two clocks run in lockstep at wall speed.
     assert!(
-        wait_for(|| stats.slices() >= 20, Duration::from_secs(5)),
+        wait_for(|| stats.slices() >= 20, EVENTUALLY),
         "expected 20 slices, got {}",
         stats.slices()
     );
@@ -317,8 +340,8 @@ fn bytes_cross_the_net_in_both_directions() {
     far_a.write_all(from_a).unwrap();
     far_b.write_all(from_b).unwrap();
 
-    let got_b = read_until(&mut far_b, from_a.len(), Duration::from_secs(5));
-    let got_a = read_until(&mut far_a, from_b.len(), Duration::from_secs(5));
+    let got_b = read_until(&mut far_b, from_a.len(), EVENTUALLY);
+    let got_a = read_until(&mut far_a, from_b.len(), EVENTUALLY);
     assert_eq!(got_b, from_a, "B did not hear A");
     assert_eq!(got_a, from_b, "A did not hear B");
 
@@ -358,7 +381,7 @@ fn a_burst_longer_than_a_slice_arrives_intact_and_in_order() {
 
     let burst: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
     far_a.write_all(&burst).unwrap();
-    let got = read_until(&mut far_b, burst.len(), Duration::from_secs(10));
+    let got = read_until(&mut far_b, burst.len(), EVENTUALLY);
     assert_eq!(
         got.len(),
         burst.len(),
@@ -402,6 +425,14 @@ fn a_guest_that_outruns_the_line_is_never_blocked() {
     // bridge's queue must complete promptly, and the bytes still arrive in
     // order once the line has carried them (256 KiB at 2 Mbaud is ~1.3 s of
     // line time, spanning a thousand slices).
+    //
+    // The two bounds are different kinds. The write's 5 s is the claim: the
+    // node's pump drains the socket into its own queue whatever the line or
+    // the engine is doing, so the write takes a socket copy's time on any
+    // runner. The read's is `EVENTUALLY`: when the last byte arrives is the
+    // engine's speed on this runner times the 2.6 million bits the burst is,
+    // which is no claim this test makes — only that every byte arrives, in
+    // order, none shed.
     let burst: Vec<u8> = (0..(256 * 1024u32)).map(|i| (i % 253) as u8).collect();
     far_a
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -416,7 +447,7 @@ fn a_guest_that_outruns_the_line_is_never_blocked() {
         "the guest was held up for {took:?} writing {} bytes",
         burst.len()
     );
-    let got = read_until(&mut far_b, burst.len(), Duration::from_secs(60));
+    let got = read_until(&mut far_b, burst.len(), EVENTUALLY);
     assert_eq!(
         got.len(),
         burst.len(),
@@ -506,7 +537,7 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
     cable_a.plug().expect("replug");
     assert!(cable_a.is_plugged(), "the port came back");
     far_b.write_all(b"back again").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EVENTUALLY;
     let mut seen = Vec::new();
     while Instant::now() < deadline && seen.len() < b"back again".len() {
         let mut buf = [0u8; 64];
@@ -542,9 +573,10 @@ fn an_unplugged_port_carries_nothing_and_the_guest_still_runs() {
 }
 
 /// Wait until the node has completed at least `want` slices, and report where
-/// it got to. Bounded so a stalled node fails the test rather than hanging it.
+/// it got to. Bounded so a stalled node fails the test rather than hanging it
+/// ([`EVENTUALLY`]).
 fn wait_for_slices(stats: &Arc<NodeStats>, want: u64) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EVENTUALLY;
     loop {
         let now = stats.slices();
         if now >= want || Instant::now() > deadline {

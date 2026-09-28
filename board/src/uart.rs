@@ -174,6 +174,13 @@ impl UartDecoder {
         }
     }
 
+    /// The level the decoder holds the line at: the last level it was fed,
+    /// idle high before any — what a receiver projecting its next sense
+    /// holds as its last level.
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
     /// Record a level transition observed at `at_ns` of virtual time.
     ///
     /// A falling edge on an idle line opens a frame. A transition arriving

@@ -38,8 +38,7 @@ use vibes_behaviour::{behaviour, expect, Test};
 
 use embsim_board::netlist::parse;
 use embsim_board::{
-    Board, Component, Finding, Level, NetState, PartClass, PinRef, RailDownReason, SenseKind,
-    System,
+    Board, Component, Finding, NetState, PartClass, PinRef, RailDownReason, SenseKind, System,
 };
 use machine_parts::{ec32mb_board, ec32mb_registry, edge_fingers, ep, p2_edge_module};
 
@@ -228,16 +227,13 @@ fn every_p2_io_pin_is_reachable() {
         .expect("P2 declared");
     // The channel carries levels, so neither pin declares a byte route: the
     // framing lives in the MCU component, and what is on the net is edges.
-    assert_eq!(rx.stream, None, "P0 reads edges, not routed bytes");
-    assert_eq!(rx.kind, embsim_board::PinKind::DigitalBidir);
-    assert_eq!(rx.idle, embsim_board::IdleDrive::Released);
-    assert_eq!(tx.stream, None, "P2 clocks out edges, not a byte route");
-    assert_eq!(tx.kind, embsim_board::PinKind::DigitalBidir);
+    assert!(rx.reads_when_subscribed());
+    assert_eq!(rx.idle, None);
+    assert!(tx.reads_when_subscribed());
     assert_eq!(
-        tx.idle,
-        embsim_board::IdleDrive::Released,
-        "P2 is the force-gauge TX pin: the bridge drives it at attach, the package declares \
-         it released like every pad"
+        tx.idle, None,
+        "P2 is the force-gauge TX pin: the bridge drives it from the START instant, the \
+         package declares it released like every pad"
     );
 }
 
@@ -728,8 +724,10 @@ fn the_clock_chain_rests_before_start_up_and_the_open_dip_switch_floats_its_stra
 }
 
 /// Every driver on the module is a registered model, and before the rails
-/// rise exactly one drives: the P2's bridged transmit pin, idling high — a
-/// UART line at rest. Nothing else on 114 components drives a net in the
+/// rise none drives: the P2 has not started — its package runs the core
+/// only the datasheet's restart delay after its reset releases, and a chip
+/// in reset floats every pad — so its bridged transmit pad presents
+/// nothing, and nothing else on 114 components drives a net in the
 /// snapshot: the live parts rest released (the boot flash's data-out is at
 /// high impedance while its `~CS` sits at the pull-up, W25Q128JV §4.1; the
 /// gates have no level to answer; the PSRAMs are deselected), the brownout
@@ -748,11 +746,10 @@ fn every_driver_is_a_registered_model() {
                 and 0 volts on its GND fingers",
     });
     expect!(
-        "one-driven-net",
-        "exactly one net on the module is push-pull driven, the P2's transmit line, and it \
-         idles high",
-        "every other output rests released before the first wake: the flash deselected, \
-         the gates without a level, the detector without a supply"
+        "no-net-driven",
+        "no net on the module is push-pull driven, and the P2's transmit line floats",
+        "every output rests released before the first wake: the P2 not yet started, the \
+         flash deselected, the gates without a level, the detector without a supply"
     );
     expect!(
         "debug-serial-floats",
@@ -767,8 +764,8 @@ fn every_driver_is_a_registered_model() {
         .expect("the P2 TX net exists");
     assert_eq!(
         tx.state,
-        NetState::Driven(Level::High),
-        "the bridged UART TX idles high"
+        NetState::Floating,
+        "the bridged UART TX floats until the P2 starts"
     );
 
     let driven = system
@@ -779,8 +776,8 @@ fn every_driver_is_a_registered_model() {
         .collect::<Vec<_>>();
     assert_eq!(
         driven,
-        vec!["EC32MB.P2_IO2"],
-        "exactly one net on the module is push-pull driven"
+        Vec::<&str>::new(),
+        "no net on the module is push-pull driven"
     );
 
     for net in ["EC32MB.P2_IO62_TXD", "EC32MB.P2_IO63_RXD"] {

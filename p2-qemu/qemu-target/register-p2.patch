@@ -1,3 +1,13 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (c) 2026 Riley McCarthy
+
+register-p2.patch: the five edits that register the P2 target with QEMU
+v10.1.0 (both Kconfig files, both meson.build files, and QEMU_ARCH_P2 in
+include/system/arch_init.h, on a bit no other architecture uses). None of
+the files it modifies carries a licence notice of its own, so QEMU's
+LICENSE makes them GPL-2.0-or-later, and this patch is under the same
+licence. Applied by stage.sh; see README.md.
+
 diff --git a/hw/Kconfig b/hw/Kconfig
 index 9e6c789..68e3379 100644
 --- a/hw/Kconfig
@@ -23,17 +33,17 @@ index 791ce21..fcf8b21 100644
  subdir('remote')
  subdir('riscv')
 diff --git a/include/system/arch_init.h b/include/system/arch_init.h
-index 51e24c3..8e89d3d 100644
+index 51e24c3..ce38dee 100644
 --- a/include/system/arch_init.h
 +++ b/include/system/arch_init.h
-@@ -21,6 +21,7 @@ enum {
-     QEMU_ARCH_RISCV = (1 << 19),
-     QEMU_ARCH_RX = (1 << 20),
+@@ -23,6 +23,7 @@ enum {
      QEMU_ARCH_AVR = (1 << 21),
-+    QEMU_ARCH_P2 = (1 << 22),
      QEMU_ARCH_HEXAGON = (1 << 22),
      QEMU_ARCH_LOONGARCH = (1 << 23),
++    QEMU_ARCH_P2 = (1 << 24),
  };
+ 
+ bool qemu_arch_available(unsigned qemu_arch_mask);
 diff --git a/target/Kconfig b/target/Kconfig
 index d0c7b59..2c182e1 100644
 --- a/target/Kconfig

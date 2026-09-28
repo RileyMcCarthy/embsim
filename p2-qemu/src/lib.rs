@@ -19,12 +19,13 @@
 //! # When the guest starts
 //!
 //! The package's **START gate** decides: the core is started — and its
-//! first wake delivered — only once `RESN` reads released and `VDD` reads
-//! a voltage inside the datasheet's window (`embsim_boards::p2`). The
+//! first wake delivered — the datasheet's 3 ms restart delay after `RESN`
+//! reads released with `VDD` inside its window (`embsim_boards::p2`). The
 //! START instant is where the guest's clock begins: [`P2Core::start`]
 //! anchors clock segment 0 at the virtual instant it runs, so a guest
-//! started 2.5 ms in (the P2-EC32MB from its carrier's 5 V, its bucks'
-//! soft-start elapsed) stamps its first instruction there, and every edge
+//! started 5.5 ms in (the P2-EC32MB from its carrier's 5 V: its bucks'
+//! soft-start elapsed at 2.5 ms, which releases the reset, and the restart
+//! delay after it) stamps its first instruction there, and every edge
 //! after it at its own instant from there.
 //!
 //! # Where the CPU runs
@@ -87,7 +88,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use embsim_board::{level_of, AttachError, Level, PinHandle, TheveninDrive, WEAK_DRIVE_OHMS};
+use embsim_board::{AttachError, Level, PinHandle, TheveninDrive, WEAK_DRIVE_OHMS};
 use embsim_boards::p2::{self, BankSupplies, P2Core, P2Pads, P2ResetState, PadDrive};
 use embsim_core::virtual_clock;
 
@@ -135,7 +136,20 @@ pub const RCSLOW_HZ: u64 = 20_000;
 /// is NOT used: the boot ROM overwrites that long with its base64 table,
 /// and the clock is a fact of the hardware the guest set, not a value it
 /// stored.
+///
+/// `SS` is read with the fields the datasheet's `%SS` notes name
+/// (P2X8C4M64P Datasheet, System Clock, p. 18): `XI` (`%10`) needs
+/// "CC != %00" and the PLL (`%11`) "CC != %00 and E=1" — in `%CC` = `%00`
+/// "XI status" is "ignored", and `%E` is "PLL off/on". A word that selects
+/// either without them selects a source that never runs, and yields `None`
+/// whatever the crystal: the clock selector waits for a positive edge on
+/// the new source before switching over to it (PLL Example, p. 19), so the
+/// chip has no clock, and no rate reaching an ignored `XI` gives it one
+/// (`source_runs`).
 pub fn clock_hz(mode: u32, crystal_hz: Option<u64>) -> Option<u64> {
+    if !source_runs(mode) {
+        return None;
+    }
     match mode & 0b11 {
         0b00 => Some(RCFAST_HZ),
         0b01 => Some(RCSLOW_HZ),
@@ -155,6 +169,20 @@ pub fn clock_hz(mode: u32, crystal_hz: Option<u64>) -> Option<u64> {
 /// the PLL).
 const fn derives_from_crystal(mode: u32) -> bool {
     matches!(mode & 0b11, 0b10 | 0b11)
+}
+
+/// Whether the source a HUBSET clock word selects runs at all, by the
+/// datasheet's `%SS` notes (System Clock, p. 18): RCFAST and RCSLOW always;
+/// `XI` only with its input on, `%CC` ≠ `%00`; the PLL only with `XI` on
+/// and `%E` set.
+const fn source_runs(mode: u32) -> bool {
+    let xi_on = (mode >> 2) & 0b11 != 0;
+    let pll_on = (mode >> 24) & 1 == 1;
+    match mode & 0b11 {
+        0b10 => xi_on,
+        0b11 => xi_on && pll_on,
+        _ => true,
+    }
 }
 
 /// Cog register addresses the bus is told about.
@@ -243,10 +271,13 @@ struct Shared {
     /// in hertz, 0 while nothing reaches the pin.
     crystal_hz: AtomicU64,
     /// The reset inputs, as the package last delivered them. Information:
-    /// the START gate that acts on them is the package's, and a change
-    /// after the start (a rail dropping) changes nothing here until the
-    /// target has a reset entry.
+    /// the START gate that acts on them is the package's, and a rail
+    /// dropping after the start reaches the core as [`P2Core::reset`].
     reset: Mutex<P2ResetState>,
+    /// The package held the core ([`P2Core::reset`]): a brownout without a
+    /// reset. No slice runs from here, and the pads keep what they last
+    /// published.
+    held: AtomicBool,
     /// The guest selected a clock derived from the crystal while none
     /// reached `XI`, and is not running until one does.
     stalled: AtomicBool,
@@ -325,6 +356,12 @@ impl P2QemuHandle {
     /// crystal on `XI`.
     pub fn stalled(&self) -> bool {
         self.shared.stalled.load(Ordering::Relaxed)
+    }
+
+    /// Whether the package held the core — `VDD` left its window while the
+    /// guest ran with `RESN` not asserted ([`P2Core::reset`]).
+    pub fn held(&self) -> bool {
+        self.shared.held.load(Ordering::Relaxed)
     }
 }
 
@@ -507,10 +544,20 @@ impl Bus {
     /// instant the guest made the change, or — for a crystal that arrived
     /// while the guest was stalled — at `now`, the wake that found it.
     /// Cheap when nothing changed: two loads and two compares.
-    fn poll_clock_mode(&mut self, now: u64) {
+    ///
+    /// A changed word is reported to the package first
+    /// ([`P2Pads::set_clock_mode`]): its `%CC` field is `XI`'s mode, which
+    /// decides the crystal the package reads on `XI`, and the package
+    /// answers through `on_crystal` before the call returns — so the
+    /// crystal is taken again before the word is decoded against it.
+    fn poll_clock_mode(&mut self, now: u64, pads: &P2Pads) {
         // SAFETY: plain reads of two globals the target owns.
         let mode = unsafe { ffi::p2host_clock_mode() };
         let mode_changed = mode != self.clock_mode;
+        if mode_changed {
+            pads.set_clock_mode(mode);
+            self.drain_crystal();
+        }
         let crystal_changed = self.crystal_hz != self.clocked_crystal_hz;
         if !mode_changed && !crystal_changed {
             return;
@@ -548,6 +595,15 @@ impl Bus {
                     from_ns,
                     hz,
                 });
+            }
+            None if !source_runs(mode) => {
+                tracing::warn!(
+                    mode = format_args!("{mode:#010x}"),
+                    "p2-qemu: HUBSET selected XI with its input off (%CC = %00) or the PLL \
+                     with it or %E off; the source never runs, so the guest has no clock and \
+                     stalls for good"
+                );
+                self.stalled = true;
             }
             None => {
                 tracing::warn!(
@@ -1000,11 +1056,11 @@ impl P2Core for P2Qemu {
             bus.published[usize::from(pin)] = Some(None);
             bus.handles[usize::from(pin)] = Some(handle);
             let shared = Arc::clone(&self.shared);
-            pads.on_pad_sense(pin, move |state| {
+            pads.on_pad_sense(pin, move |level| {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                let Some(level) = level_of(state) else {
+                let Some(level) = level else {
                     return;
                 };
                 shared
@@ -1039,7 +1095,9 @@ impl P2Core for P2Qemu {
         let shared = Arc::clone(&self.shared);
         let arm = pads.clone();
         pads.on_wake_ns(move |now| {
-            if shared.shutdown.load(Ordering::Relaxed) {
+            if shared.shutdown.load(Ordering::Relaxed) || shared.held.load(Ordering::Relaxed) {
+                // Torn down, or held by the package: no clock, no
+                // instructions — the stall path, for good.
                 return;
             }
             THREAD_ATTACHED.with(|attached| {
@@ -1083,6 +1141,14 @@ impl P2Core for P2Qemu {
             "p2-qemu: START; the guest's clock counts from here"
         );
     }
+
+    /// Held by the package — a brownout without a reset: the guest runs no
+    /// further slice, the way a stalled guest runs none, and its pads keep
+    /// the drives they last published.
+    fn reset(&mut self) {
+        self.shared.held.store(true, Ordering::Relaxed);
+        tracing::info!("p2-qemu: held by the package; the guest runs no further");
+    }
 }
 
 /// One wake: publish a pending pad change at its instant, or run the guest
@@ -1092,7 +1158,7 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
     // the guest can read a pin, and take the crystal as it stands.
     bus.drain_edges();
     bus.drain_crystal();
-    bus.poll_clock_mode(now);
+    bus.poll_clock_mode(now, arm);
     if bus.stalled {
         // No clock, no instructions. The crystal's arrival re-arms.
         shared.stalled.store(true, Ordering::Relaxed);
@@ -1148,7 +1214,7 @@ fn wake(bus: &mut Bus, shared: &Arc<Shared>, arm: &P2Pads, now: u64) {
             if yielded {
                 shared.yields.fetch_add(1, Ordering::Relaxed);
             }
-            bus.poll_clock_mode(now);
+            bus.poll_clock_mode(now, arm);
             if bus.stalled {
                 // No clock, no instructions. The crystal's arrival re-arms,
                 // and the pending pad change (if the slice made one) is
@@ -1407,6 +1473,9 @@ mod tests {
         assert!(bus.testp(62));
     }
 
+    /// `%CC` = `%10`, the 15 pF crystal mode: `XI`'s input on.
+    const CC_CRYSTAL_15PF: u32 = 0b10 << 2;
+
     /// HUBSET's word selects the oscillator or multiplies the crystal —
     /// and the crystal is the rate delivered on `XI`, so a PLL word yields
     /// 160 MHz from a delivered 20 MHz and nothing from no crystal.
@@ -1415,21 +1484,54 @@ mod tests {
         let crystal = Some(20_000_000);
         assert_eq!(clock_hz(0, crystal), Some(RCFAST_HZ));
         assert_eq!(clock_hz(0b01, crystal), Some(RCSLOW_HZ));
-        assert_eq!(clock_hz(0b10, crystal), Some(20_000_000));
-        // flexspin's 160 MHz from a 20 MHz crystal: D=0, M=7, P=%1111, PLL on.
-        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
+        let xi = CC_CRYSTAL_15PF | 0b10;
+        assert_eq!(clock_hz(xi, crystal), Some(20_000_000));
+        // flexspin's 160 MHz from a 20 MHz crystal, `$010007FB`: D=0, M=7,
+        // P=%1111, %CC=%10, PLL on.
+        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | CC_CRYSTAL_15PF | 0b11;
+        assert_eq!(pll, 0x0100_07FB);
         assert_eq!(clock_hz(pll, crystal), Some(160_000_000));
         // P=%0000 divides the VCO by two.
-        let halved = (1 << 24) | (15 << 8) | 0b11;
+        let halved = (1 << 24) | (15 << 8) | CC_CRYSTAL_15PF | 0b11;
         assert_eq!(clock_hz(halved, crystal), Some(160_000_000));
+        // The datasheet's own example (PLL Example, p. 19): a 20 MHz crystal
+        // divided by 40 and multiplied by 297, the VCO direct — 148.5 MHz.
+        assert_eq!(clock_hz(0x019D_28FB, crystal), Some(148_500_000));
 
         // No crystal: the internal oscillators still run, nothing derived
         // from XI does.
         assert_eq!(clock_hz(0, None), Some(RCFAST_HZ));
-        assert_eq!(clock_hz(0b10, None), None);
+        assert_eq!(clock_hz(xi, None), None);
         assert_eq!(clock_hz(pll, None), None);
-        assert!(derives_from_crystal(pll) && derives_from_crystal(0b10));
+        assert!(derives_from_crystal(pll) && derives_from_crystal(xi));
         assert!(!derives_from_crystal(0) && !derives_from_crystal(0b01));
+    }
+
+    /// The `%SS` notes (datasheet, System Clock, p. 18): `XI` needs
+    /// `%CC` ≠ `%00`, the PLL that and `%E` — a word that selects either
+    /// without them has no clock, whatever rate reaches the pin; the
+    /// internal oscillators run in any `%CC`.
+    #[test]
+    fn a_source_the_word_leaves_off_gives_no_clock() {
+        let crystal = Some(20_000_000);
+        // XI selected with its input ignored.
+        assert_eq!(clock_hz(0b10, crystal), None);
+        // The PLL selected with XI ignored: `$010007F3`, the word the
+        // `crystal_pll` guest selected before the decode read `%CC`.
+        assert_eq!(clock_hz(0x0100_07F3, crystal), None);
+        // The PLL selected with XI on and the PLL off.
+        assert_eq!(clock_hz(0x0000_07FB, crystal), None);
+        // RCFAST and RCSLOW with any `%CC`, the PLL word's first step among
+        // them (`$010007F8`: "enable crystal+PLL, stay in RCFAST mode",
+        // PLL Example, p. 19).
+        assert_eq!(clock_hz(0x0100_07F8, crystal), Some(RCFAST_HZ));
+        assert_eq!(clock_hz(0b11_01, crystal), Some(RCSLOW_HZ));
+        for word in [0b10, 0x0100_07F3, 0x0000_07FB] {
+            assert!(!source_runs(word), "{word:#010x}");
+        }
+        for word in [0, 0b01, 0x0100_07F8, 0x0100_07FB, 0x019D_28FB, 0b01_10] {
+            assert!(source_runs(word), "{word:#010x}");
+        }
     }
 
     /// The package delivers the rate on XI; the bus takes it at its next
@@ -1443,7 +1545,7 @@ mod tests {
         shared.crystal_hz.store(20_000_000, Ordering::Relaxed);
         bus.drain_crystal();
         assert_eq!(bus.crystal_hz, Some(20_000_000));
-        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | 0b11;
+        let pll = (1 << 24) | (7 << 8) | (0xF << 4) | CC_CRYSTAL_15PF | 0b11;
         assert_eq!(clock_hz(pll, bus.crystal_hz), Some(160_000_000));
         shared.crystal_hz.store(0, Ordering::Relaxed);
         bus.drain_crystal();

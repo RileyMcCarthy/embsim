@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    AttachError, Board, Component, ComponentNetIo, IdleDrive, Level, NetState, PartRegistry,
-    PinDecl, PinHandle, PinKind, StreamRole, System, TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, Level,
+    NetState, PartRegistry, PinDecl, PinHandle, System, TheveninDrive,
 };
 
 // ============================================================
@@ -31,25 +31,10 @@ const NETLIST: &str = r#"(export (version "E")
       (node (ref "U1") (pin "1") (pintype "output"))
       (node (ref "U2") (pin "1") (pintype "input")))))"#;
 
-const NONE: Option<StreamRole> = None;
+const DRIVER_PINS: [PinDecl; 1] = [PinDecl::digital_out("1").with_name("OUT")];
 
-const DRIVER_PINS: [PinDecl; 1] = [PinDecl {
-    number: "1",
-    name: Some("OUT"),
-    kind: PinKind::DigitalOut,
-    stream: NONE,
-    drive_impedance: None,
-    idle: IdleDrive::KindDefault,
-}];
-
-const SENSOR_PINS: [PinDecl; 1] = [PinDecl {
-    number: "1",
-    name: Some("IN"),
-    kind: PinKind::DigitalIn,
-    stream: NONE,
-    drive_impedance: None,
-    idle: IdleDrive::KindDefault,
-}];
+const SENSOR_PINS: [PinDecl; 1] =
+    [PinDecl::digital_in("1", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)).with_name("IN")];
 
 const LOW: TheveninDrive = TheveninDrive {
     volts: 0.0,
@@ -94,7 +79,7 @@ impl Component for FakeSensor {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let seen = Arc::clone(&self.seen);
-        io.on_sense("IN", move |state| seen.lock().unwrap().push(state))?;
+        io.on_net_report("IN", move |state| seen.lock().unwrap().push(state))?;
         Ok(())
     }
 }
@@ -180,7 +165,7 @@ fn live_system_routes_schedule_drive_and_sense_through_the_engine() {
         ),
         "cross-thread drive must resolve"
     );
-    assert_eq!(pin.sense(), NetState::Driven(Level::High));
+    assert_eq!(pin.net_report(), NetState::Driven(Level::High));
     assert!(
         sensor_seen
             .lock()

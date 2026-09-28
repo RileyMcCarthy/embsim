@@ -1,0 +1,37 @@
+Licence for the netlists in this directory
+==========================================
+
+The rest of embsim is MIT (see LICENSE at the repository root). The files
+listed here are not: each is a transcription of a vendor schematic published
+under Creative Commons Attribution-ShareAlike 4.0, and is distributed under
+that licence.
+
+p2_ec32mb.net
+-------------
+
+Original work : "Propeller 2 Edge Module with 32MB RAM" schematic,
+                part number P2-EC32MB, revision B, last update 29 Mar 2022,
+                file P2-EC32MB-RevB-SCHEMATIC.pdf (8 pages), published by
+                Parallax with the P2-EC32MB product downloads at
+                https://www.parallax.com/
+
+Creator       : Parallax Inc., 599 Menlo Drive, Rocklin, CA 95765
+
+Copyright     : Copyright 2022 Parallax Incorporated.
+
+Licence       : The schematic's title block states that it is Open Source
+                Hardware licensed under the Creative Commons
+                Attribution-ShareAlike 4.0 International License
+                (CC BY-SA 4.0), https://creativecommons.org/licenses/by-sa/4.0/
+
+Changes       : Transcribed by hand from the vendor PDF to KiCad netlist form
+                (the KiCad netlist-export s-expression dialect). The eight
+                schematic pages are merged into one netlist, and pin
+                identifiers are normalised; the file's header records the
+                conventions and how the transcription was checked.
+
+This transcription is itself distributed under CC BY-SA 4.0,
+https://creativecommons.org/licenses/by-sa/4.0/ — as the licence's
+ShareAlike term requires, and not under embsim's MIT licence. It is provided
+as-is, without warranties of any kind; see section 5 of the licence. Its use
+here does not imply that Parallax endorses embsim.

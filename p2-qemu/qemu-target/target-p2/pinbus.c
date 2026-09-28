@@ -1,9 +1,10 @@
 /*
  * The bring-up pin bus: a line-for-line mirror of p2core's `SmartPins`
- * (SIL/p2core/src/model.rs), which is the model the differential harness runs
- * the reference against.
+ * (MaD's `SIL/p2core/src/model.rs`), which is the model the differential
+ * harness runs the reference against.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (c) 2026 Riley McCarthy
  *
  * It is deliberately NOT the full board model. p2core has two PinBus
  * implementations -- `SmartPins` (this one) and `Board`, which carries an SD
@@ -132,10 +133,3 @@ void *p2_pinbus_opaque = &p2_bringup;
 bool p2_pinbus_yield;
 bool p2_pin_ops_end_tb;
 bool p2_host_driven;
-
-void p2_pinbus_bringup_init(void)
-{
-    memset(&p2_bringup, 0, sizeof(p2_bringup));
-    p2_bringup.idle_value = 0xFF;
-    p2_pinbus_set(&p2_bringup_ops, &p2_bringup);
-}

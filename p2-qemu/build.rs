@@ -4,9 +4,11 @@
 //! of several hundred object files plus a few archives, and the way to put it
 //! inside a foreign binary is to replay that list — minus the one object that
 //! defines `main()`. This build script scrapes the list out of a configured
-//! QEMU build tree's `build.ninja`, the way spike 1c did by hand.
+//! QEMU build tree's `build.ninja`.
 //!
-//! The tree is named by `EMBSIM_QEMU_P2_BUILD`. When it is unset the crate
+//! The tree is named by `EMBSIM_QEMU_P2_BUILD`. It must be staged from this
+//! crate's `qemu-target/` and configured for the node
+//! (`qemu-target/README.md`); both are checked. When it is unset the crate
 //! compiles to a stub that reports the node unavailable, so a workspace still
 //! builds on a machine with no QEMU — a CI job that only runs the models must
 //! not need a ten-minute QEMU build first.
@@ -41,8 +43,19 @@ fn main() {
 
     let link = LinkLine::scrape(&ninja, &build_dir);
 
+    // Cargo does not fingerprint `rustc-link-arg` inputs, and ninja rebuilds
+    // an object without touching build.ninja, so without these a QEMU rebuilt
+    // after a target edit would leave the old one linked. A rerun rebuilds
+    // the crate and relinks its test binaries.
+    for input in link.objects.iter().chain(&link.archives) {
+        println!("cargo:rerun-if-changed={}", input.display());
+    }
+    check_staged(&ninja, &build_dir);
+
     // The C shim: the few functions Rust calls into QEMU with, compiled against
-    // QEMU's own headers with QEMU's own flags.
+    // QEMU's own headers with QEMU's own flags. QEMU's headers are not
+    // -Wextra clean (sign-compare, unused-parameter in inline helpers), and
+    // QEMU compiles them with its own -W set, which this does not replay.
     let mut cc = cc::Build::new();
     cc.file("hostdrive.c").warnings(false);
     for flag in &link.cflags {
@@ -64,6 +77,82 @@ fn main() {
         println!("cargo:rustc-link-arg={framework}");
     }
     println!("cargo:rustc-cfg=qemu_linked");
+}
+
+/// The tree must hold the target this crate carries, and QEMU must carry
+/// `host-thread.patch`. Neither fails anywhere else in time: a tree that was
+/// not re-staged after a `qemu-target/` edit links and tests the old target,
+/// and a tree without the patch fails only at run time, on the
+/// `tcg_register_thread` assert the patch exists to avoid.
+///
+/// One direction only: every file in `qemu-target/target-p2` and `hw-p2` must
+/// be in the tree byte for byte. Files only the tree has (the build's own
+/// outputs) are not this crate's to judge.
+fn check_staged(ninja: &str, build_dir: &Path) {
+    let manifest =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
+    let ours = manifest.join("qemu-target");
+    println!("cargo:rerun-if-changed={}", ours.display());
+
+    // The source tree is wherever the target's own objects are compiled from:
+    // `build libqemu-p2-softmmu.a.p/target_p2_op_helper.c.o: c_COMPILER
+    // ../target/p2/op_helper.c`, three levels below the source root.
+    let key = "build libqemu-p2-softmmu.a.p/target_p2_op_helper.c.o: c_COMPILER ";
+    let op_helper = ninja
+        .lines()
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("build.ninja has no target_p2_op_helper.c.o rule to find the source tree by");
+    let src = build_dir
+        .join(op_helper)
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .expect("op_helper.c sits three levels below the QEMU source root");
+    let src = fs::canonicalize(&src).unwrap_or(src);
+    let restage = format!(
+        "re-stage with p2-qemu/qemu-target/stage.sh {} (qemu-target/README.md), then run \
+         ninja -C {}",
+        src.display(),
+        build_dir.display()
+    );
+
+    for (dir, staged) in [("target-p2", "target/p2"), ("hw-p2", "hw/p2")] {
+        let dir = ours.join(dir);
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()))
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        for name in names {
+            let mine = dir.join(&name);
+            let theirs = src.join(staged).join(&name);
+            let want =
+                fs::read(&mine).unwrap_or_else(|e| panic!("cannot read {}: {e}", mine.display()));
+            let verdict = match fs::read(&theirs) {
+                Ok(got) if got == want => continue,
+                Ok(_) => "differs from",
+                Err(_) => "is missing, the tree's copy of",
+            };
+            panic!(
+                "{} {verdict} p2-qemu/qemu-target/{}/{}: {restage}",
+                theirs.display(),
+                dir.file_name().unwrap_or_default().to_string_lossy(),
+                name.to_string_lossy()
+            );
+        }
+    }
+
+    // The symbol host-thread.patch introduces.
+    let rr = src.join("accel/tcg/tcg-accel-ops-rr.c");
+    if !fs::read_to_string(&rr).is_ok_and(|text| text.contains("rr_host_driven")) {
+        panic!(
+            "host-thread.patch is not applied to {}: {restage}",
+            src.display()
+        );
+    }
 }
 
 /// Everything the emulator's own link line says, minus `main()`.
@@ -114,28 +203,35 @@ impl LinkLine {
             }
         };
 
-        // Two objects and one archive stay behind.
-        //
-        // system_main.c.o is the ONLY definition of main(); it must not come
-        // along. The UI backends still reference the `qemu_main` pointer it
-        // owns, which the Rust side defines instead.
-        //
-        // flashbus.c.o is the standalone emulator's flash bus, and it pulls
-        // in libembsim_cffi.a -- a Rust staticlib carrying its own copy of
-        // std. Two Rust runtimes in one binary is a duplicate-symbol wall
-        // (`rust_eh_personality`, the allocator shims). The node has no use
-        // for either: its flash is a component on the board. The shim
-        // defines the three `p2_flashbus_*` symbols the board still calls.
-        let excluded_object =
-            |t: &str| t.ends_with("system_main.c.o") || t.ends_with("target_p2_flashbus.c.o");
+        // One object stays behind: system_main.c.o is the ONLY definition of
+        // main(); it must not come along. The UI backends still reference the
+        // `qemu_main` pointer it owns, which the Rust side defines instead.
         let objects: Vec<PathBuf> = first_line
             .split_whitespace()
-            .filter(|t| t.ends_with(".o") && !excluded_object(t))
+            .filter(|t| t.ends_with(".o") && !t.ends_with("system_main.c.o"))
             .map(absify)
             .collect();
+        // The standalone emulator's flash bus links embsim-cffi, a Rust
+        // staticlib carrying its own copy of std, and two Rust runtimes in one
+        // binary is a duplicate-symbol wall (`rust_eh_personality`, the
+        // allocator shims). The node's tree is configured without it.
+        if let Some(flashbus) = objects
+            .iter()
+            .find(|o| o.to_string_lossy().ends_with("_flashbus.c.o"))
+        {
+            panic!(
+                "{} is in the link line: this tree was configured for the standalone \
+                 qemu-system-p2 (CONFIG_P2_EMBSIM_FLASH). Configure the node's tree with \
+                 --with-devices-p2=node and no embsim-cffi flags (qemu-target/README.md).",
+                flashbus.display()
+            );
+        }
+        // Archives are read from the whole line, implicit inputs (after `|`)
+        // included, on purpose: meson lists libqemuutil.a and the
+        // --extra-ldflags archives only there.
         let archives: Vec<PathBuf> = first_line
             .split_whitespace()
-            .filter(|t| t.ends_with(".a") && !t.ends_with("libembsim_cffi.a"))
+            .filter(|t| t.ends_with(".a"))
             .map(absify)
             .collect();
 
@@ -146,10 +242,7 @@ impl LinkLine {
         let args: Vec<&str> = link_args.split_whitespace().collect();
         let libs: Vec<String> = args
             .iter()
-            .filter(|a| {
-                (a.starts_with("-l") || a.ends_with(".dylib") || a.ends_with(".so"))
-                    && !a.ends_with("libembsim_cffi.a")
-            })
+            .filter(|a| a.starts_with("-l") || a.ends_with(".dylib") || a.ends_with(".so"))
             .map(|a| a.to_string())
             .collect();
         let mut frameworks: Vec<String> = args
@@ -168,8 +261,10 @@ impl LinkLine {
             "scraped only {} objects; the link line did not parse",
             objects.len()
         );
-        println!(
-            "cargo:warning=embsim-p2-qemu: linking {} objects, {} archives, {} libs, {} frameworks from {}",
+        // Informational: on the build script's own output (`cargo build -vv`),
+        // not a warning on every linked build.
+        eprintln!(
+            "embsim-p2-qemu: linking {} objects, {} archives, {} libs, {} frameworks from {}",
             objects.len(),
             archives.len(),
             libs.len(),
@@ -193,9 +288,9 @@ impl LinkLine {
     /// compiles under the per-target defines (`COMPILING_PER_TARGET`,
     /// `CONFIG_TARGET`, the `-Itarget/p2` include).
     ///
-    /// Two things that are not obvious, both from spike 1c: `-iquote` takes a
-    /// SEPARATE argument, and QEMU's `-I` paths are relative to the build
-    /// directory. Get either wrong and the shim cannot find `qemu/osdep.h`.
+    /// Two things that are not obvious: `-iquote` takes a SEPARATE argument,
+    /// and QEMU's `-I` paths are relative to the build directory. Get either
+    /// wrong and the shim cannot find `qemu/osdep.h`.
     fn scrape_cflags(ninja: &str, build_dir: &Path) -> Vec<String> {
         let key = "build libqemu-p2-softmmu.a.p/target_p2_op_helper.c.o:";
         let start = ninja

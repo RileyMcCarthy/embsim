@@ -1,4 +1,4 @@
-//! A serial NOR flash, device side — generic, bit-level, bus-agnostic.
+//! A serial NOR flash, device side — generic and bit-level.
 //!
 //! The model is a shift register ([`crate::spi_shift::ByteShifter`], shared
 //! with the PSRAM) with a command state machine and a backing image. It
@@ -33,11 +33,11 @@
 //! are the JEDEC-standard SPI NOR set, so the model serves Macronix MX25 and
 //! Micron N25Q parts of the same generation; their ID triples differ.
 //!
-//! The bit-presentation rule above is the one thing NOT taken from the
-//! datasheet: it describes when a *master* may sample, and it was settled by
-//! running the P2 boot ROM's `try_spi` and loadp2's `flash_loader` stub as
-//! real machine code (the validation lives in MaD's `p2core`, whose
-//! `src/flash.rs` this was ported from).
+//! A master samples MISO after the rising edge. Presenting on that edge is
+//! the P2 pad model's compensation: the core reads a pad with no registered
+//! input delay, and a falling-edge bit arrives one clock late (`NODES.md`,
+//! the SPI output-timing decision). The Winbond sheet's own falling-edge
+//! change is what the SD card adapter follows.
 //!
 //! ## Deliberate simplifications
 //!

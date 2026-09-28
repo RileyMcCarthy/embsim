@@ -1,8 +1,27 @@
+SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+Copyright (c) 2026 Riley McCarthy
+
+host-thread.patch: embsim host-driven mode for round-robin TCG, against
+QEMU v10.1.0. With `rr_host_driven` set, QEMU's own vCPU thread parks at
+start-up and a host thread runs the cogs (../hostdrive.c). Each hunk
+carries the licence of the file it modifies: accel/tcg/tcg-accel-ops-rr.c
+is MIT (its own header), accel/tcg/tcg-accel-ops-rr.h is GPL-2.0-or-later
+(its own header). Applied by stage.sh; see README.md.
+
 diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
-index 6eec5c9..c661ea6 100644
+index 6eec5c9..b3f0f44 100644
 --- a/accel/tcg/tcg-accel-ops-rr.c
 +++ b/accel/tcg/tcg-accel-ops-rr.c
-@@ -186,7 +186,21 @@ static void *rr_cpu_thread_fn(void *arg)
+@@ -37,6 +37,8 @@
+ #include "tcg-accel-ops-rr.h"
+ #include "tcg-accel-ops-icount.h"
+ 
++bool rr_host_driven;
++
+ /* Kick all RR vCPUs */
+ void rr_kick_vcpu_thread(CPUState *unused)
+ {
+@@ -186,7 +188,21 @@ static void *rr_cpu_thread_fn(void *arg)
      rcu_register_thread();
      force_rcu.notify = rr_force_rcu;
      rcu_add_force_rcu_notifier(&force_rcu);
@@ -19,13 +38,13 @@ index 6eec5c9..c661ea6 100644
 +     * Everything else it does still runs: RCU registration, the created-signal
 +     * `qemu_init` blocks on, and the kick timer.
 +     */
-+    if (!getenv("EMBSIM_QEMU_HOST_THREAD")) {
++    if (!rr_host_driven) {
 +        tcg_register_thread();
 +    }
  
      bql_lock();
      qemu_thread_get_self(cpu->thread);
-@@ -214,6 +228,31 @@ static void *rr_cpu_thread_fn(void *arg)
+@@ -214,6 +230,31 @@ static void *rr_cpu_thread_fn(void *arg)
      /* process any pending work */
      cpu->exit_request = 1;
  
@@ -44,10 +63,10 @@ index 6eec5c9..c661ea6 100644
 +     * variable. A `TCGAccelOps.create_vcpu_thread` override is the tidier
 +     * form and a separate change.
 +     *
-+     * The BQL must be dropped: the host takes it around its own icount
-+     * bookkeeping, and holding it here would deadlock on the first slice.
++     * The BQL must be dropped: the host slices without it, as the round-robin
++     * loop does, and a parked holder would deadlock the first slice.
 +     */
-+    if (getenv("EMBSIM_QEMU_HOST_THREAD")) {
++    if (rr_host_driven) {
 +        bql_unlock();
 +        while (1) {
 +            g_usleep(1000 * 1000);
@@ -57,3 +76,19 @@ index 6eec5c9..c661ea6 100644
      while (1) {
          /* Only used for icount_enabled() */
          int64_t cpu_budget = 0;
+diff --git a/accel/tcg/tcg-accel-ops-rr.h b/accel/tcg/tcg-accel-ops-rr.h
+index 2a76a29..78c6791 100644
+--- a/accel/tcg/tcg-accel-ops-rr.h
++++ b/accel/tcg/tcg-accel-ops-rr.h
+@@ -18,4 +18,11 @@ void rr_kick_vcpu_thread(CPUState *unused);
+ /* start the round robin vcpu thread */
+ void rr_start_vcpu_thread(CPUState *cpu);
+ 
++/*
++ * embsim host-driven mode: a host thread outside the main loop runs the
++ * vCPUs, and the round-robin thread parks. Set before qemu_init; never
++ * changed after.
++ */
++extern bool rr_host_driven;
++
+ #endif /* TCG_ACCEL_OPS_RR_H */

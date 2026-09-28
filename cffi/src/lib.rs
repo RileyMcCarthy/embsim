@@ -11,6 +11,7 @@
 //! embsim's board engine is the natural place to attach a device, and for a
 //! peripheral-clocked bus it is the right one. A **CPU-bit-banged** bus is
 //! different: a boot ROM drives a clock edge and samples the data line
+//! after that rising edge — sampling first reads the previous bit —
 //! microseconds later, far sooner than the engine resolves a net between wakes,
 //! and the P2's boot ROM does roughly 16 600 edges to load one kilobyte. So the
 //! transport here is a direct call — nanoseconds — and the *model* is still the

@@ -69,7 +69,7 @@ use std::collections::BTreeSet;
 
 mod machine_parts;
 
-use embsim_board::{Board, BuiltSystem, EndpointRef, Harness, PartClass, System};
+use embsim_board::{Board, BuiltSystem, EndpointRef, Finding, Harness, PartClass, System};
 use machine_parts::{
     bench_rails, ds2_board, ec32mb_board, edge_board, force_domain_ground, force_domain_rails,
     force_gauge_harness, module_socket_harness, shipped_ec32mb_board,
@@ -651,6 +651,38 @@ fn every_board_under_its_reference_harness_is_within_rule_4s_bound() {
             largest <= RULE_4_LARGEST_CLUSTER_ROOTS,
             "{name}: the largest cluster holds {largest} roots: {names:?}"
         );
+    }
+}
+
+/// Every open drain the reference boards carry has its pull-up: the
+/// module's supervisor output on `P2_RESN` through `R100`, the Edge
+/// board's opto collectors on `P16`–`P23` through their pull-ups to the
+/// module's `VIO_16_23` — and the three open drains the board only brings
+/// out to a connector or leaves unconnected (`U4`'s collector on `J10`,
+/// `IC3`/`IC4`'s `SYNC_OK`) have nothing on the board to pull or read.
+#[rstest]
+fn no_reference_system_has_an_open_drain_without_a_pull_up() {
+    behaviour!(Test {
+        id: "census.open-drains-pulled-up",
+        covers: Some("board/src/system.rs#open_drains_without_pull_up"),
+        given: "each reference board under its declared supplies: the module from its \
+                fingers, the add-on under its rails, the EdgeBoard alone with its \
+                module-sourced finger at 3.3 volts, and the assembled machine",
+    });
+    expect!(
+        "no-missing-pull-up",
+        "none of the four systems reports an open-drain output without a pull-up",
+        "the supervisor's reset output and the opto collectors each reach a rail through a \
+         resistor on the board, even before the rail has risen"
+    );
+    for (name, built) in reference_systems() {
+        let missing: Vec<&Finding> = built
+            .diagnostics()
+            .findings()
+            .iter()
+            .filter(|f| matches!(f, Finding::OpenDrainWithoutPullUp { .. }))
+            .collect();
+        assert!(missing.is_empty(), "{name}: {missing:?}");
     }
 }
 

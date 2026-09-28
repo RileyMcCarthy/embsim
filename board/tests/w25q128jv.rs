@@ -31,7 +31,7 @@ mod machine_parts;
 
 use std::collections::BTreeSet;
 
-use embsim_board::{netlist, Board, IdleDrive, PartRegistry};
+use embsim_board::{jesd8c01_lvcmos_thresholds, netlist, Board, DeadBand, PartRegistry};
 use embsim_models::spi_flash::{SpiNorFlash, JEDEC_ID_W25Q128JV_IM};
 use embsim_models::spi_flash_component::SpiNorFlashComponent;
 use machine_parts::ec32mb_registry;
@@ -140,7 +140,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
-    digital_drive, level_of, ComponentNetIo, Harness, Level, NetState, PinHandle, PinKind, System,
+    digital_drive, level_of, ComponentNetIo, Harness, Level, NetState, PinHandle, System,
 };
 use embsim_core::virtual_clock;
 use embsim_models::spi_flash_component::SPI_FLASH_PINS_BY_FUNCTION;
@@ -164,20 +164,16 @@ struct BitBangMaster {
 
 impl BitBangMaster {
     fn new(handles: Arc<Mutex<MasterPins>>) -> Self {
-        let decl = |number, name, kind| embsim_board::PinDecl {
-            number,
-            name: Some(name),
-            kind,
-            stream: None,
-            drive_impedance: None,
-            idle: IdleDrive::KindDefault,
-        };
         Self {
             pins: [
-                decl("1", "CS", PinKind::DigitalOut),
-                decl("2", "CLK", PinKind::DigitalOut),
-                decl("3", "DI", PinKind::DigitalOut),
-                decl("4", "DO", PinKind::DigitalIn),
+                embsim_board::PinDecl::digital_out("1").with_name("CS"),
+                embsim_board::PinDecl::digital_out("2").with_name("CLK"),
+                embsim_board::PinDecl::digital_out("3").with_name("DI"),
+                embsim_board::PinDecl::digital_in(
+                    "4",
+                    jesd8c01_lvcmos_thresholds(DeadBand::Unknown),
+                )
+                .with_name("DO"),
             ],
             handles,
         }
@@ -211,7 +207,7 @@ fn drive_and_settle(pin: &PinHandle, level: Level) {
 fn sense_bit(pin: &PinHandle) -> bool {
     // A pull-up would decide a released line; here the flash drives DO
     // whenever it is selected, so a missing level means the handshake failed.
-    level_of(pin.sense()) == Some(Level::High)
+    level_of(pin.net_report()) == Some(Level::High)
 }
 
 /// Shift a byte out to the device, MSB first.
@@ -289,7 +285,7 @@ fn without_a_yield_between_edges_the_part_reads_as_absent() {
     virtual_clock::init(50.0, 1_000_000);
 
     let handles = Arc::new(Mutex::new(MasterPins::default()));
-    let harness = Harness::new()
+    let harness = powered(Harness::new())
         .connect_str("MASTER.CS", "FLASH.CSn")
         .expect("endpoints parse")
         .connect_str("MASTER.CLK", "FLASH.CLK")
@@ -352,7 +348,7 @@ fn the_part_answers_a_jedec_id_read_driven_bit_by_bit_over_nets() {
     virtual_clock::init(50.0, 1_000_000);
 
     let handles = Arc::new(Mutex::new(MasterPins::default()));
-    let harness = Harness::new()
+    let harness = powered(Harness::new())
         .connect_str("MASTER.CS", "FLASH.CSn")
         .expect("endpoints parse")
         .connect_str("MASTER.CLK", "FLASH.CLK")
@@ -401,12 +397,25 @@ fn the_part_answers_a_jedec_id_read_driven_bit_by_bit_over_nets() {
     );
 }
 
+/// The flash's supply from the bench: `VCC` at 3.3 V against `VSS` held at
+/// 0 V. The part's inputs read through 0.3/0.7 × `VCC` against `VSS`, and
+/// neither is implicit (`DESIGN.md` rule 6): a flash with no supply reads no
+/// level, as one on the bench would.
+fn powered(harness: Harness) -> Harness {
+    let ep = |endpoint: &str| embsim_board::EndpointRef::parse(endpoint).expect("endpoint parses");
+    harness.power(ep("BENCH.GND"), ep("FLASH.VSS"), 0.0).power(
+        ep("BENCH.VCC"),
+        ep("FLASH.VCC"),
+        3.3,
+    )
+}
+
 /// Bring up a master opposite a flash on a bench system, and hand back the
 /// master's pins. The system is returned too: dropping it stops the engine.
 fn bench(flash: SpiNorFlash) -> (embsim_board::SystemHandle, Arc<Mutex<MasterPins>>) {
     virtual_clock::init(50.0, 1_000_000);
     let handles = Arc::new(Mutex::new(MasterPins::default()));
-    let harness = Harness::new()
+    let harness = powered(Harness::new())
         .connect_str("MASTER.CS", "FLASH.CSn")
         .expect("endpoints parse")
         .connect_str("MASTER.CLK", "FLASH.CLK")
@@ -656,7 +665,7 @@ fn the_data_line_floats_while_the_part_is_deselected() {
     // The master idles ~CS high, so the part comes up deselected.
     std::thread::sleep(Duration::from_millis(5));
     assert_eq!(
-        dout.sense(),
+        dout.net_report(),
         NetState::Floating,
         "with ~CS high the part drives nothing onto DO"
     );
@@ -664,14 +673,14 @@ fn the_data_line_floats_while_the_part_is_deselected() {
     drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
     drive_and_settle(pins.cs.as_ref().unwrap(), Level::Low);
     assert!(
-        matches!(dout.sense(), NetState::Driven(_)),
+        matches!(dout.net_report(), NetState::Driven(_)),
         "selected, the part presents its bit on DO: {:?}",
-        dout.sense()
+        dout.net_report()
     );
 
     drive_and_settle(pins.cs.as_ref().unwrap(), Level::High);
     assert_eq!(
-        dout.sense(),
+        dout.net_report(),
         NetState::Floating,
         "deselected again, DO is released"
     );

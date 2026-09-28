@@ -8,7 +8,8 @@
 //! us is a QEMU target build, where the feedback loop is minutes long.
 //!
 //! So this compiles `embsim.h` against `libembsim_cffi.a` with the system C
-//! compiler and runs the result. It is skipped, loudly, where there is no `cc`.
+//! compiler and runs the result. Where there is no `cc` it is skipped, loudly —
+//! except in CI (`CI` set), where a missing compiler fails it instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -118,6 +119,12 @@ fn static_library() -> PathBuf {
 fn a_c_program_links_against_the_static_library_and_runs() {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     if Command::new(&cc).arg("--version").output().is_err() {
+        // A CI runner always has a compiler; a skip there would be a green
+        // tick that proved nothing, so there it is a failure instead.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no `{cc}` on a CI runner; this test must not skip in CI"
+        );
         eprintln!("\n*** SKIPPED: no `{cc}` to compile with. This test asserted NOTHING.\n");
         return;
     }
@@ -148,11 +155,9 @@ fn a_c_program_links_against_the_static_library_and_runs() {
         .arg(&lib)
         .arg("-o")
         .arg(&bin);
-    // A Rust staticlib carries the std runtime's own dependencies; these are
-    // what a C host has to add, and naming them here is how a QEMU build knows
-    // what to put in its link line.
+    // These are the flags `embsim.h` names; keep the two in step.
     if cfg!(target_os = "macos") {
-        cmd.args(["-framework", "CoreFoundation", "-framework", "Security"]);
+        cmd.args(["-liconv", "-lSystem", "-lc", "-lm"]);
     } else {
         cmd.args(["-lpthread", "-ldl", "-lm"]);
     }
