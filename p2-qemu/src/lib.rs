@@ -1465,6 +1465,80 @@ mod tests {
         assert_eq!(bus.strong[0], 0, "nothing strong: nothing drives");
     }
 
+    /// Pads are the OR of eight cogs' DIR/OUT. Driving through
+    /// `dir_out_changed` (not poking `bus.dir` / `bus.out`) is what exercises
+    /// the load-bearing reduction; seeding `pending_at_ns` keeps the stub from
+    /// hitting `p2host_request_yield`. `pad_drive` is the post-#62 stand-in
+    /// for the old DIR-gated `output_level`.
+    #[test]
+    fn two_cogs_or_their_dir_out_and_releasing_one_leaves_the_other() {
+        let mut bus = bench_bus();
+        // Skip cog_ns + yield: a pending instant already open means later
+        // changes in the same "instruction" share it.
+        bus.pending_at_ns = Some(0);
+
+        // Cog 0 drives P0 high and P1 low; cog 1 drives P1 low and P2 high.
+        // Their DIR/OUT overlap on P1.
+        bus.dir_out_changed(0, REG_DIRA, 0b0011);
+        bus.dir_out_changed(0, REG_OUTA, 0b0001);
+        bus.dir_out_changed(1, REG_DIRA, 0b0110);
+        bus.dir_out_changed(1, REG_OUTA, 0b0100);
+
+        assert_eq!(bus.dir_cog[0][0], 0b0011);
+        assert_eq!(bus.out_cog[0][0], 0b0001);
+        assert_eq!(bus.dir_cog[1][0], 0b0110);
+        assert_eq!(bus.out_cog[1][0], 0b0100);
+        assert_eq!(bus.dir[0], 0b0111);
+        assert_eq!(bus.out[0], 0b0101);
+        bus.publish_pending();
+        assert_eq!(
+            bus.pad_drive(0),
+            Some(TheveninDrive {
+                volts: BENCH_VIO_VOLTS,
+                impedance: P2_FAST_OHMS
+            })
+        );
+        assert_eq!(
+            bus.pad_drive(1),
+            Some(TheveninDrive {
+                volts: 0.0,
+                impedance: P2_FAST_OHMS
+            })
+        );
+        assert_eq!(
+            bus.pad_drive(2),
+            Some(TheveninDrive {
+                volts: BENCH_VIO_VOLTS,
+                impedance: P2_FAST_OHMS
+            })
+        );
+        assert_eq!(bus.pad_drive(3), None);
+
+        // Clearing cog 0's DIR must not erase cog 1's drive on the shared pin.
+        bus.pending_at_ns = Some(0);
+        bus.dir_out_changed(0, REG_DIRA, 0);
+        assert_eq!(bus.dir_cog[0][0], 0);
+        assert_eq!(bus.dir_cog[1][0], 0b0110);
+        assert_eq!(bus.dir[0], 0b0110);
+        assert_eq!(bus.out[0], 0b0101);
+        bus.publish_pending();
+        assert_eq!(bus.pad_drive(0), None);
+        assert_eq!(
+            bus.pad_drive(1),
+            Some(TheveninDrive {
+                volts: 0.0,
+                impedance: P2_FAST_OHMS
+            })
+        );
+        assert_eq!(
+            bus.pad_drive(2),
+            Some(TheveninDrive {
+                volts: BENCH_VIO_VOLTS,
+                impedance: P2_FAST_OHMS
+            })
+        );
+    }
+
     #[test]
     fn testp_reads_the_level_of_an_unconfigured_pin_and_no_byte_on_a_receiver() {
         let mut bus = Bus::new(Arc::new(Shared::default()));
