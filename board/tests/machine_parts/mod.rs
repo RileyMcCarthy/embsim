@@ -68,9 +68,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver,
-    EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PinDecl, PinHandle,
-    Scenario, SwitchPole, TheveninDrive, Thresholds, Volts,
+    AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver, Drive,
+    EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PeriodicSchedule,
+    PinDecl, PinHandle, Scenario, Sense, SwitchPole, TheveninDrive, Thresholds, Volts,
 };
 use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
@@ -172,7 +172,13 @@ fn drive(level: Level, rail_volts: Volts) -> TheveninDrive {
 //
 // Behavior modeled
 //   Per channel, when the outputs are enabled: Y follows the channel's A
-//   input and Z is its complement — the differential pair. When disabled or
+//   input and Z is its complement — the differential pair. When A carries a
+//   running (or held, crossing) periodic whose phases settle to two different
+//   levels through `AM26LS31_INPUT_THRESHOLDS`, the pair is published as
+//   `Drive::Periodic` around that segment — the same "relay when it crosses"
+//   contract as the ISO67xx / logic-gate rate path. A non-crossing wave or a
+//   single-level input stays on today's level (or release) path; nothing
+//   invents a differential for an ambiguous input. When disabled or
 //   unpowered, both outputs are released to high-Z (the function table's
 //   high-impedance row).
 //   Enable is the datasheet's OR structure: outputs are active when G is high
@@ -241,6 +247,21 @@ pub const AM26LS31_PINS: [PinDecl; 16] = [
 /// wires.
 const AM26LS31_CHANNELS: [(&str, &str, &str); 2] = [("1", "2", "3"), ("7", "6", "5")];
 
+/// What one enabled channel's pair should present: a static differential
+/// level, or a differential square wave around a relayed segment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChannelOut {
+    /// `Y` at `level`, `Z` at its complement.
+    Level(Level),
+    /// `Y` swings `hi`/`lo` (as levels) around `segment`; `Z` is the
+    /// complement of each phase — the differential pair of a relayed clock.
+    Periodic {
+        hi: Level,
+        lo: Level,
+        segment: PeriodicSchedule,
+    },
+}
+
 /// Mutable driver state. Every field is written only from engine-thread sense
 /// callbacks, so the mutex is uncontended in practice and exists to keep the
 /// component `Sync`.
@@ -249,13 +270,15 @@ struct DriverState {
     powered: bool,
     enable_high: Option<Level>,
     enable_low: Option<Level>,
-    inputs: [Option<Level>; 2],
+    inputs: [Option<ChannelOut>; 2],
     outputs: Vec<(PinHandle, PinHandle)>,
-    /// What each channel's pair last published: `Some(level)` driving `Y`
-    /// at `level` (and `Z` at its complement), `None` released; `None` in
-    /// the outer option before the first publish. A pair re-issued
-    /// unchanged would resolve nothing and cost an engine event per sense.
-    applied: [Option<Option<Level>>; 2],
+    /// What each channel's pair last published: `Some(out)` driving the
+    /// differential, `None` released; `None` in the outer option before the
+    /// first publish. A pair re-issued unchanged would resolve nothing and
+    /// cost an engine event per sense — the same discipline as the isolator
+    /// and the gates, so `isolation_bridge` event budgets do not regress from
+    /// republishing an identical pair.
+    applied: [Option<Option<ChannelOut>>; 2],
 }
 
 struct DriverCore {
@@ -276,21 +299,33 @@ impl DriverCore {
     fn apply(&self, state: &mut DriverState) {
         let active = state.powered && Self::enabled(state);
         for (channel, (y, z)) in state.outputs.iter().enumerate() {
-            // Disabled, unpowered, or an input with no defensible level:
-            // high-Z, never a guessed differential.
+            // Disabled, unpowered, or an input with no defensible level /
+            // crossing clock: high-Z, never a guessed differential.
             let desired = if active { state.inputs[channel] } else { None };
             if state.applied[channel] == Some(desired) {
                 continue;
             }
             state.applied[channel] = Some(desired);
             match desired {
-                Some(level) => {
+                Some(ChannelOut::Level(level)) => {
                     y.set_drive(Some(drive(level, self.rail_volts)));
                     z.set_drive(Some(drive(invert(level), self.rail_volts)));
                 }
+                Some(ChannelOut::Periodic { hi, lo, segment }) => {
+                    y.drive(Drive::Periodic {
+                        hi: drive(hi, self.rail_volts),
+                        lo: drive(lo, self.rail_volts),
+                        segment,
+                    });
+                    z.drive(Drive::Periodic {
+                        hi: drive(invert(hi), self.rail_volts),
+                        lo: drive(invert(lo), self.rail_volts),
+                        segment,
+                    });
+                }
                 None => {
-                    y.set_drive(None);
-                    z.set_drive(None);
+                    y.release();
+                    z.release();
                 }
             }
         }
@@ -303,6 +338,29 @@ fn invert(level: Level) -> Level {
         Level::High => Level::Low,
         Level::Low => Level::High,
     }
+}
+
+/// What the channel's A input asks the pair to present: a relayed crossing
+/// clock (running, or a held segment whose phases still cross — the
+/// isolator's held-segment rule), else a single level, else release.
+fn channel_out_from_sense(receiver: &DigitalReceiver, sensed: &Sense) -> Option<ChannelOut> {
+    if let Some(clock) = sensed.periodic {
+        if let (Some(hi), Some(lo)) = clock.levels(&AM26LS31_INPUT_THRESHOLDS, None) {
+            let relayed = clock.rate(&AM26LS31_INPUT_THRESHOLDS).is_some()
+                || (clock.segment.freq_hz == 0 && hi != lo);
+            if relayed {
+                // Keep the receiver's last level in step with the delivery so
+                // a later single-level path starts from a known last.
+                let _ = receiver.read(sensed);
+                return Some(ChannelOut::Periodic {
+                    hi,
+                    lo,
+                    segment: clock.segment,
+                });
+            }
+        }
+    }
+    receiver.read(sensed).map(ChannelOut::Level)
 }
 
 /// TI AM26LS31 quad differential line driver — see the provenance block above.
@@ -370,7 +428,7 @@ impl Component for Rs422Driver {
             let receiver = DigitalReceiver::new(io.pin(a)?);
             io.on_sense(a, move |sensed| {
                 let mut state = core.state.lock().unwrap();
-                state.inputs[channel] = receiver.read(&sensed);
+                state.inputs[channel] = channel_out_from_sense(&receiver, &sensed);
                 core.apply(&mut state);
             })?;
         }
