@@ -429,9 +429,9 @@ see the consumer decision record for the rationale and revisit trigger).
 There is no second channel (`DESIGN.md` rule 2). A step clock is the third
 encoding of the one per-instant message, `Drive::Periodic { hi, lo, segment }`
 (`NODES.md` §10/§11, the §12 item 5 record): two Thevenin ports and the
-integer `PeriodicSchedule` that alternates them — the half of the drive a
-peripheral owns (`embsim_peripherals::pulse_out`), anchored and integrated in
-the engine's nanoseconds. UART bytes are framed onto ordinary
+integer `PeriodicSchedule` that alternates them —
+[`embsim_board::PeriodicSchedule`](board/src/net.rs), owned by the board
+crate and anchored/integrated in the engine's nanoseconds. UART bytes are framed onto ordinary
 digital pins as timed levels by
 [`SerialLevelBridge`](board/src/serial_levels.rs) (codec in
 `board/src/uart.rs`). There used to be `Producer`/`Consumer` byte-route roles,
@@ -582,96 +582,31 @@ as a bare endpoint, with full electrical descriptors).
 Deliberately wrong harnesses (swapped pins) are valid fixtures — the
 `Contention`/`Floating` findings are the assertion targets.
 
-## The MCU as a component
+## The CPU core in the package
 
-A platform crate (per `CONTRACT.md`) provides the MCU component:
+The Propeller 2 sits on the board as [`P2Package`](boards/src/p2.rs) around a
+[`P2Core`](boards/src/p2.rs): today that is the QEMU core (`p2-qemu`), and a
+package may also be built [`held_in_reset`](boards/src/p2.rs) with no running
+core. The native HAL path (`McuComponent` / `McuBuilder` / `Emulator::run`,
+`board/src/mcu.rs`, and the peripherals stack) was removed in
+[PR #83](https://github.com/RileyMcCarthy/embsim/pull/83); do not treat those
+names as live design.
 
-1. **Firmware image**: the consumer's static library. The engine **spawns**
-   the entry on a component-owned thread: `McuBuilder::entry` puts the
-   component in owned-execution mode, and `Component::start` — called by
-   `System::start` strictly after every component has attached — spawns the
-   entry bound to the component's own `PeripheralInstance`. CONTRACT.md's
-   init-ordering section is re-stated for the board engine: `attach()` and
-   net service are live before the firmware entry's first instruction, and
-   peripheral-bank sizing performed *inside* the entry commutes with the
-   bridges attach installed (`serial::init` preserves installed FDs).
-   Entry-less components stay in facade mode: `Emulator::run` on the
-   caller's thread against the default instance keeps working unchanged.
-   Inside a P2 package (`embsim_boards::p2::P2Package`) the core's start
-   is gated once more, by the chip: the package holds `P2Core::start` —
-   the firmware entry, a QEMU core's first wake — and every wake the core
-   asks for until the datasheet's 3 ms restart delay has run out after
-   `RESN` read released with `VDD` inside its window, and starts it then,
-   on the engine thread, in a wake of its own (`NODES.md` §2 "MCU node
-   (P2)", the START gate). A core's wakes reach the engine through the
-   package's `WakeGate` whichever way it schedules — through `P2Pads`, or
-   on the net I/O it was handed (`ComponentNetIo::with_wake_gate`) — so the
-   native firmware image is held like any other core; its bridged pads
-   publish nothing before START and drive at their bank's supply after it
-   (`McuComponent::host_pads`).
-2. **Peripherals**: the generic peripheral emulations become fields of the MCU
-   component instance rather than process globals. The full global-state
-   inventory this de-globalizes: serial (`CHANNEL_FDS`/baud/pacing), GPIO
-   (state + callbacks), pulse-out, encoder, i2c, plus the MCU-internal ones
-   that gain no pins but still must be per-instance — locks, the thread
-   registry, the filesystem mount, and per-MCU clock frequency. The
-   `#[no_mangle]` trampolines then need **thread-identity routing** to the
-   owning instance (registered at `startThread` time). This is a CONTRACT.md
-   revision — the current contract explicitly assumes no indirection — and is
-   why de-globalization is its own phase. (A given firmware image's own C
-   statics still limit that image to one instance per process.)
-3. **Pin facade**: the HAL-channel → physical-pin map is read from the
-   firmware's HAL config tables. **Prerequisite (consumer-side):** those tables
-   must exist in the natively-linked binary — extracted into *data-only*
-   translation units (no HAL function definitions, no MCU intrinsics) with
-   **external linkage**, unique `HAL_`-prefixed names, and
-   `__attribute__((used))`, compiled into the consumer's native library. The
-   read path is `embsim-memory-inspect`'s **SymbolResolver + DWARF layout**
-   (reading initialized data values by symbol — a different path from the
-   DWARF-type-only enum lookup consumers use today, same crate). A CI check
-   asserts the tables are present and non-empty before the emulator boots, so
-   "table optimized away" is a build failure, not a mystery unwired pin.
+**START gate** (`NODES.md` §2 "MCU node (P2)"): the package holds
+`P2Core::start` — and every wake the core asks for — until the datasheet's
+3 ms restart delay has run after `RESN` reads released with `VDD` inside its
+1.7–1.9 V window, then starts the core on the engine thread in a wake of its
+own. Wakes reach the engine through the package's `WakeGate` (through
+`P2Pads`, or the net I/O handed via `ComponentNetIo::with_wake_gate`). Pads
+publish nothing before START and drive at their bank's supply after it. A
+`VDD` that leaves its window mid-run with `RESN` not asserted is reported as
+brownout-without-reset and holds the core (`P2Core::reset`).
 
-Channel behavior stays HAL-granular (GPIO levels, pulse rates, and — where a
-bridge still uses the peripheral serial bank — socketpair byte FDs); pins are
-topology. Baud and channel parameters come from the same tables — the
-emulator stops inventing its own defaults (consumers may keep explicit pacing
-overrides for tests). Level-framed serial (`SerialLevelBridge`) puts bits on
-the pin facade directly rather than through a derived byte route.
-
-> **Slice status (2026-08):** the MCU-as-a-component pattern ships in
-> `board/src/mcu.rs` for **all four channel kinds**, each opt-in per channel
-> through `McuBuilder`: serial (socketpair bridges into the peripheral serial
-> bank, baud from the table), GPIO (**bidirectional** — firmware writes drive
-> the net, external drives sense back into the bank, both honouring the
-> table's `active_low`), pulse-out (one STEP pin, below), and encoder (a
-> quadrature pin pair ×4-decoded into the bank as *increments*, so firmware
-> homing re-bases rather than being overwritten). The entry inversion in
-> point 1 is **delivered**: `McuBuilder::entry` + `Component::start` spawn the
-> firmware on a component-owned instance (facade mode without an entry keeps
-> the `Emulator::run` flow working). Point 3's table read path is
-> `embsim-memory-inspect`'s `hal_tables` module (symbol names parameterized;
-> the reference consumer's names are the documented defaults).
->
-> **A step clock is a rate on the wire, not edges.** Channel behavior stays
-> HAL-granular everywhere else, but a pulse-out channel is the one signal
-> whose edge count runs orders of magnitude ahead of the rest of the board: at
-> the reference machine's 8192 steps/mm, one mm/s is 8192 edges/s, each of
-> which would be a drive, a cluster resolution and a sense delivery through
-> the single-writer engine. So the STEP pin carries a `Drive::Periodic` —
-> the pad's high and low ports around the peripheral's `PeriodicSchedule`
-> (frequency, accumulated count, ceiling and an anchor nanosecond) — published
-> **once per rate change**, resolved on the net like any drive, and
-> integrated by the consumer at *read* time, the discipline
-> `DETERMINISM.md` mandates. Counts stay exact: `PeriodicSchedule::emitted_at_ns`
-> is the same integer arithmetic `HAL_pulseOut_run` hands the firmware; the
-> wire carries no direction (the drive reads its own DIR pin). Measured: a
-> four-segment motion profile delivering 65 536 pulses costs **46 engine
-> events** (52 with the rig's drive keeping its own step counter — two more
-> subscriptions, six more deliveries), unchanged as the pulse count moves by
-> tens of thousands (`board/tests/pulse_bridge.rs`). The fidelity this trades away — no edges,
-> no pulse width, no per-edge DIR sampling — is enumerated on
-> `Drive::Periodic`.
+**Step clocks** stay `Drive::Periodic` on the one channel (see [Step clocks
+and serial](#step-clocks-and-serial-one-drive-type-serial-is-levels) above): a
+rate on the wire, published once per rate change, resolved phase by phase,
+integrated at read time — not per edge. The schedule type is
+`embsim_board::PeriodicSchedule` in `board/src/net.rs`.
 
 Behavioral fidelity boundary, stated explicitly: **no cycle-accurate silicon
 emulation.** Raising fidelity of one peripheral later (bit-timed serial, PWM
