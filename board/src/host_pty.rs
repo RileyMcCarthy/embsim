@@ -113,6 +113,25 @@ impl HostPty {
     pub fn symlink_path(&self) -> &str {
         &self.pty.symlink_path
     }
+
+    /// Outbound bytes discarded because the host stopped reading.
+    ///
+    /// The pump queues guest bytes when the PTY will not accept them; only when
+    /// that queue exceeds its hold limit are bytes dropped and counted here.
+    /// Happy-path tests assert this is zero after a successful round-trip —
+    /// see the note on the overflow path in `drain_outbound`.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Shared view of [`Self::dropped`]'s atomic.
+    ///
+    /// Take a clone before moving this component into a [`crate::System`]: after
+    /// attach the `HostPty` itself is no longer reachable, but the counter still
+    /// is. Loads use the same `Ordering::Relaxed` as [`Self::dropped`].
+    pub fn dropped_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.dropped)
+    }
 }
 
 impl Component for HostPty {
@@ -238,7 +257,7 @@ fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, dropped: &AtomicU64) 
         }
     }
     // Only a host that has truly stopped reading gets here. Counted, not
-    // logged, so a test can assert it is zero.
+    // logged, so a test can assert `HostPty::dropped()` is zero.
     if queue.len() > OUTBOUND_MAX {
         let excess = queue.len() - OUTBOUND_MAX;
         queue.drain(..excess);
