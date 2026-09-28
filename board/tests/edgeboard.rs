@@ -438,13 +438,14 @@ fn probe_pin() -> PinDecl {
 }
 
 /// Start the servo-domain board with an engine-hosted settle probe on the
-/// receiver output. The returned `NetState` was captured on the engine thread
-/// after the attach cascade, so it cannot be a mid-resolution transient.
+/// given receiver output pin (e.g. `EdgeBoard.U25.3` for channel-1 `1Y`).
+/// The returned `NetState` was captured on the engine thread after the attach
+/// cascade, so it cannot be a mid-resolution transient.
 ///
 /// One live engine at a time: two engines sharing the process clock will
 /// advance a settle wake for each other mid-cascade (the reverse case then
 /// samples failsafe High instead of the injected differential).
-fn start_servo_settled(scenario: Scenario) -> NetState {
+fn start_servo_settled_on(scenario: Scenario, probe_at: &str) -> NetState {
     static LIVE: Mutex<()> = Mutex::new(());
     let _guard = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_clock();
@@ -458,7 +459,7 @@ fn start_servo_settled(scenario: Scenario) -> NetState {
     let system = System::new()
         .board("EdgeBoard", edge_board())
         .component("SETTLE", Box::new(probe))
-        .harness(bench_rails("EdgeBoard").connect(ep("SETTLE.Y"), ep("EdgeBoard.U25.3")))
+        .harness(bench_rails("EdgeBoard").connect(ep("SETTLE.Y"), ep(probe_at)))
         .scenario(scenario)
         .start()
         .expect("the servo-domain system starts");
@@ -472,6 +473,11 @@ fn start_servo_settled(scenario: Scenario) -> NetState {
         .expect("settle wake fired without capturing");
     system.shutdown();
     got
+}
+
+/// Probe the receiver's channel-1 output (`U25.1Y` / `Net-(IC16-INA)`).
+fn start_servo_settled(scenario: Scenario) -> NetState {
+    start_servo_settled_on(scenario, "EdgeBoard.U25.3")
 }
 
 fn encoder_scenario(jumpers_closed: bool, sources: &[(&str, f64)]) -> Scenario {
@@ -663,6 +669,10 @@ fn the_z_ground_jumper_closed_enables_the_encoder_receiver() {
 /// Channel 4 of the receiver has its inputs marked no-connect while its output
 /// is wired to the encoder isolator — the datasheet's open-input failsafe, on
 /// this board by construction. The `4Y` net must sit high, not float.
+///
+/// Uses the engine-hosted settle probe (same TOCTOU harden as the channel-1
+/// failsafe cases): wall-clock `settled_state` can observe a transient High
+/// then re-read Floating on loaded macos runners.
 #[rstest]
 fn the_unwired_receiver_channel_rides_its_open_input_failsafe() {
     let board = edge_board();
@@ -672,17 +682,11 @@ fn the_unwired_receiver_channel_rides_its_open_input_failsafe() {
     assert!(net_named(&map, "U25", "15").starts_with("unconnected-("));
     assert_eq!(net_named(&map, "U25", "13"), "Net-(IC16-IND)");
 
-    let system = start_servo_domain(true, &[]);
     assert_eq!(
-        settled_state(
-            &system,
-            "EdgeBoard.Net-(IC16-IND)",
-            NetState::Driven(Level::High)
-        ),
+        start_servo_settled_on(encoder_scenario(true, &[]), "EdgeBoard.U25.13"),
         NetState::Driven(Level::High),
         "an open differential input fails safe high"
     );
-    system.shutdown();
 }
 
 // ============================================================
