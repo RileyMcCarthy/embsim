@@ -894,6 +894,36 @@ mod tests {
         ));
     }
 
+    /// The J301 story from PR #61 / issue #66: with the reference fallback on,
+    /// an unnamed `J…` refdes synthesizes `Conn` / Boundary — but an explicit
+    /// registry entry for that component's **value** must win, otherwise a
+    /// live microSD registered under `"MicroSD Socket"` is silently ignored
+    /// and the board builds without the card.
+    #[rstest]
+    fn registered_value_beats_synthetic_j_prefix_boundary() {
+        let mut registry = PartRegistry::new();
+        registry.classify_unnamed_by_reference(true);
+        registry.register("MicroSD Socket", |_| Box::new(NullComponent));
+
+        assert_eq!(
+            registry.classify(&unnamed("J301", "MicroSD Socket"), 8),
+            Ok(Classification::Registered)
+        );
+    }
+
+    /// Companion negative: the same unnamed `J…` shape with no registry entry
+    /// for its value stays a synthetic Boundary (`Conn` from the `J` prefix).
+    #[rstest]
+    fn synthetic_j_prefix_stays_boundary_without_a_registry_entry() {
+        let mut registry = PartRegistry::new();
+        registry.classify_unnamed_by_reference(true);
+
+        assert_eq!(
+            registry.classify(&unnamed("J301", "MicroSD Socket"), 8),
+            Ok(Classification::Boundary)
+        );
+    }
+
     /// The fallback fires only for an EMPTY part name: a component that names
     /// its symbol keeps classifying on the symbol, even when its reference
     /// prefix says something else.
