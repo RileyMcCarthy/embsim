@@ -525,9 +525,9 @@ impl System {
     /// whose drives, sense subscriptions, and schedules route to the engine.
     ///
     /// The returned [`SystemHandle`] owns the components and the engine;
-    /// dropping it shuts the engine down cleanly (shutdown message + join —
-    /// see [`crate::engine`] for why joining cannot deadlock with in-flight
-    /// senses).
+    /// dropping it joins components first, then shuts the engine down
+    /// (shutdown message + join — see [`crate::engine`] for why joining
+    /// cannot deadlock with in-flight senses).
     pub fn start(self) -> Result<SystemHandle, SystemError> {
         let event_log = self.event_log.clone();
         let quiescence_timeout = self.quiescence_timeout;
@@ -562,12 +562,14 @@ impl System {
                         error,
                     },
                 };
-                // The same drop order SystemHandle documents as
-                // load-bearing must hold on this path too: components
-                // (including the failing one — it may have registered
-                // callbacks or spawned protocol threads before erroring)
-                // must never be dropped while the engine thread is still
-                // delivering callbacks. Shut the engine down first.
+                // Attach failed before `release_time`: the engine is still
+                // holding virtual time and will not advance. Joining a pump
+                // that is parked on the clock would hang until authority is
+                // released — so this path is the opposite of the live
+                // [`SystemHandle`] Drop order: shut the engine down first
+                // (authority drop wakes parked waiters), then drop
+                // components (including the failing one, which may have
+                // registered callbacks or spawned protocol threads).
                 attached.push((prepared.reference, prepared.component));
                 drop(engine);
                 drop(attached);
@@ -1228,12 +1230,17 @@ impl BuiltSystem {
 /// A running live system: the net-engine thread plus the attached
 /// components, created by [`System::start`].
 ///
-/// Dropping the handle shuts the engine down first (shutdown message +
-/// join — in-flight sense/wake callbacks complete, and joining cannot
-/// deadlock because callbacks run with no engine lock held), then drops the
-/// components.
+/// Dropping the handle joins/drops components **first** (MCU serial pumps
+/// and any other joined clock actors), then shuts the engine down
+/// (shutdown message + join, which releases the last [`embsim_core::virtual_clock::TimeAuthority`]).
+/// That order matters: a pump parked on the virtual clock can still be
+/// retired by engine advances while authority is held. Joining the engine
+/// first would release authority before those joins and hang unless the
+/// last-authority wake safety net fires. Prefer the explicit [`Drop`] impl
+/// over relying on field declaration order alone.
 pub struct SystemHandle {
-    // Field order is load-bearing: the engine joins before components drop.
+    // Explicit [`Drop`] drains `components` before the engine field is
+    // destroyed; declaration order is not the contract.
     engine: EngineHandle,
     net_names: Vec<String>,
     components: Vec<(String, Box<dyn Component>)>,
@@ -1295,6 +1302,20 @@ impl SystemHandle {
 
     /// Shut the live system down explicitly (equivalent to dropping it).
     pub fn shutdown(self) {}
+}
+
+impl Drop for SystemHandle {
+    fn drop(&mut self) {
+        // Components before engine: join MCU pumps (and other joined clock
+        // actors) while the engine still holds time authority and can
+        // advance virtual time past their park deadlines. Draining here is
+        // the contract — do not rely on struct field order alone.
+        for (_reference, component) in self.components.drain(..) {
+            drop(component);
+        }
+        // `engine` (and inert `net_names`) then drop via field destruction:
+        // shutdown message + join, releasing the last time authority.
+    }
 }
 
 // ============================================================

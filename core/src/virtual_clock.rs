@@ -431,8 +431,10 @@ impl Drop for TimeAuthority {
         // This went unnoticed while the only actors parked at shutdown were
         // detached threads nobody joined. It becomes a hang the moment a joined
         // thread parks on the virtual clock — which is exactly what the MCU
-        // serial pump now does, and `SystemHandle` joins the engine (releasing
-        // this authority) BEFORE it drops the components that join their pumps.
+        // serial pump does. `SystemHandle` now drops components before the
+        // engine so the common shutdown path does not need this nudge; keep
+        // it as a safety net for any other joined waiter still parked when
+        // the last authority goes away (attach-failure teardown, tests, etc.).
         //
         // One nudge is enough to become self-sustaining: a waiter woken here
         // returns, and the next time it parks it takes the no-authority branch
@@ -466,7 +468,12 @@ pub fn take_time_authority() -> TimeAuthority {
     TimeAuthority { _priv: () }
 }
 
-fn has_time_authority() -> bool {
+/// True while at least one [`TimeAuthority`] is held.
+///
+/// Shutdown-order regression tests use this so a component `Drop` can assert
+/// that time authority is still held (engine not yet joined) when components
+/// are torn down first.
+pub fn has_time_authority() -> bool {
     TIME_AUTHORITY.load(Ordering::Acquire) != 0
 }
 
@@ -1029,9 +1036,9 @@ mod tests {
     /// this, every actor parked at that instant sleeps forever.
     ///
     /// That is a shutdown hang, not a slow path, and it is reachable from any
-    /// joined thread that parks on the virtual clock: `SystemHandle` joins the
-    /// engine (releasing its authority) before it drops the components that
-    /// join their own threads.
+    /// joined thread that parks on the virtual clock when the last authority
+    /// is released before the joiner runs — the attach-failure teardown path
+    /// still does that, and this wake remains the safety net.
     #[rstest]
     fn releasing_the_last_time_authority_wakes_parked_waiters() {
         let _g = lock_or_recover();

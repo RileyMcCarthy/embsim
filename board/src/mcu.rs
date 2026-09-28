@@ -143,10 +143,11 @@
 //! the same byte, the same code, one wire with a second driver on it, and only
 //! the contended one fails.
 //! - **Shutdown**: dropping the component flags every pump, joins its
-//!   thread (bounded by the poll timeout), disconnects the channel from the
+//!   thread (bounded by the poll interval), disconnects the channel from the
 //!   peripheral bank, and closes both FDs — no detached-thread leak.
-//!   [`crate::system::SystemHandle`] drops the engine before its components,
-//!   so no `on_byte` delivery can race the FD close.
+//!   [`crate::system::SystemHandle`] drops components before joining the
+//!   engine so parked pumps can still be retired under time authority;
+//!   sense/wake callbacks check the shutdown flag before touching FDs.
 //!
 //! # Ordering with today's boot flow
 //!
@@ -761,9 +762,9 @@ fn deliver_rx(
                 continue;
             }
         };
-        // SAFETY: `component_fd` stays open until the owning component drops,
-        // which happens only after the engine (and with it this callback) has
-        // shut down — see `SystemHandle`'s documented drop order.
+        // SAFETY: `component_fd` stays open until the owning component Drop
+        // closes it. Callers gate on the pump shutdown flag first; a late
+        // write after close surfaces as EBADF and is traced below.
         let fd = unsafe { BorrowedFd::borrow_raw(component_fd) };
         if let Err(e) = nix::unistd::write(fd, &[byte]) {
             tracing::trace!(
@@ -1366,9 +1367,9 @@ impl Drop for McuComponent {
                 instance.serial.init_channel_fd(pump.channel, -1);
             }
             // SAFETY: both FDs were created by this component's attach and
-            // are not used past this point: the pump thread is joined, the
-            // engine (RX callback) shut down before component drop, and the
-            // peripheral bank was just disconnected.
+            // are not used past this point: the pump thread is joined, every
+            // sense/wake callback gates on the shutdown flag set above, and
+            // the peripheral bank was just disconnected.
             unsafe {
                 libc::close(pump.component_fd);
                 libc::close(pump.firmware_fd);

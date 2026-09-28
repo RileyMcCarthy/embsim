@@ -206,10 +206,9 @@ fn the_serial_pump_is_a_registered_clock_actor() {
         virtual_clock::registered_actor_names(),
     );
 
-    // Dropping the system joins the engine — releasing the time authority —
-    // before it joins this pump. A pump parked on the virtual clock can only
-    // be woken after that by `TimeAuthority::drop` handing idle-jumping back,
-    // so this drop returning at all is the other half of the fix.
+    // Dropping the system joins this pump *before* joining the engine /
+    // releasing time authority (`SystemHandle` Drop). The authority-drop wake
+    // remains a safety net; this drop returning is still required.
     drop(system);
 }
 
@@ -310,8 +309,8 @@ fn bridged_serial_channel_roundtrips_to_a_peer_board() {
         "peer bytes must be readable on the firmware side; got {got:?}"
     );
 
-    // Clean shutdown: the engine joins first (SystemHandle drop order),
-    // then each pump thread — bounded, no detached-thread leak.
+    // Clean shutdown: components (pump threads) join first, then the engine
+    // — SystemHandle drop order; bounded, no detached-thread leak.
     let start = Instant::now();
     drop(system);
     assert!(

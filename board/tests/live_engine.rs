@@ -4,7 +4,7 @@
 //! shutdown through the public API only, without any consumer firmware.
 
 use rstest::rstest;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{
@@ -109,11 +109,28 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 // ============================================================
+// Clock / authority serialization
+// ============================================================
+
+/// The virtual clock's time-authority counter is process-global; serialize
+/// tests that assert on it so a sibling live system cannot keep the count
+/// non-zero after this handle drops.
+static AUTHORITY_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_authority() -> MutexGuard<'static, ()> {
+    AUTHORITY_LOCK.lock().unwrap_or_else(|poisoned| {
+        AUTHORITY_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+// ============================================================
 // The smoke test
 // ============================================================
 
 #[rstest]
 fn live_system_routes_schedule_drive_and_sense_through_the_engine() {
+    let _g = lock_authority();
     // The timer wheel samples the free-running virtual clock.
     embsim_core::virtual_clock::init(1.0, 1_000_000);
 
@@ -198,4 +215,74 @@ fn live_system_routes_schedule_drive_and_sense_through_the_engine() {
     // The shared handle survives shutdown; late drives are traced and
     // dropped, never a panic or a hang.
     pin.set_drive(None);
+}
+
+// ============================================================
+// SystemHandle drop order (issue #46)
+// ============================================================
+
+/// Records whether a [`embsim_core::virtual_clock::TimeAuthority`] was still
+/// held when this component dropped — the structural probe for
+/// `SystemHandle` joining components before the engine.
+struct DropOrderProbe {
+    authority_held_on_drop: Arc<Mutex<Option<bool>>>,
+}
+
+impl Component for DropOrderProbe {
+    fn pins(&self) -> &[PinDecl] {
+        &[]
+    }
+
+    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
+        Ok(())
+    }
+}
+
+impl Drop for DropOrderProbe {
+    fn drop(&mut self) {
+        *self.authority_held_on_drop.lock().unwrap() =
+            Some(embsim_core::virtual_clock::has_time_authority());
+    }
+}
+
+/// `SystemHandle` must drop/join components **before** joining the engine /
+/// releasing the last time authority.
+///
+/// Structural on purpose: if the engine is joined first, component `Drop`
+/// observes `has_time_authority() == false`. Timing tests cannot catch a
+/// regression that only hangs when a joined clock actor parks without the
+/// last-authority wake safety net.
+#[rstest]
+fn system_handle_drops_components_before_releasing_time_authority() {
+    let _g = lock_authority();
+    embsim_core::virtual_clock::init(0.0, 1_000_000);
+
+    let authority_held_on_drop: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let system = System::new()
+        .component(
+            "Probe",
+            Box::new(DropOrderProbe {
+                authority_held_on_drop: Arc::clone(&authority_held_on_drop),
+            }),
+        )
+        .start()
+        .expect("live system starts");
+
+    assert!(
+        embsim_core::virtual_clock::has_time_authority(),
+        "the live engine must hold time authority"
+    );
+
+    drop(system);
+
+    assert_eq!(
+        *authority_held_on_drop.lock().unwrap(),
+        Some(true),
+        "component Drop must run while the engine still holds time authority; \
+         Some(false) means SystemHandle joined/dropped the engine first again"
+    );
+    assert!(
+        !embsim_core::virtual_clock::has_time_authority(),
+        "time authority must be released once SystemHandle has fully dropped"
+    );
 }
