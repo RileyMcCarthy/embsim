@@ -1,0 +1,14 @@
+[package]
+name = "embsim-boards"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Off-the-shelf boards and modules for embsim, as netlists plus the components that populate them"
+keywords = ["embedded", "emulator", "simulation", "sil"]
+categories = ["embedded", "simulation"]
+
+[dependencies]
+embsim-board = { path = "../board" }
+embsim-models = { path = "../models" }

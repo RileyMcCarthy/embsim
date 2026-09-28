@@ -1,0 +1,18 @@
+[package]
+name = "embsim-cffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A C ABI over embsim's device models, so a C host (QEMU, a vendor SDK) can drive the same model a Rust bench does"
+keywords = ["embedded", "emulator", "simulation", "sil", "ffi"]
+categories = ["embedded", "simulation", "external-ffi-bindings"]
+
+[lib]
+# `staticlib` is what a C build links; `lib` keeps it usable from Rust so the
+# FFI surface can be tested in this workspace rather than only from C.
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+embsim-models = { path = "../models" }
