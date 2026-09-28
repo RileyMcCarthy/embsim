@@ -1082,44 +1082,42 @@ fn an_unpowered_optocoupler_leaves_p19_at_its_pull_up() {
 /// is ~8192 events per millimetre at the reference machine's resolution, so a
 /// regression would miss this count by orders of magnitude.
 ///
-/// **Measured, and asserted exactly: 57 events per
+/// **Measured, and asserted exactly: 65 events per
 /// four-change profile, at 8 192 Hz and at 819 200 Hz alike** (the test
 /// prints it). The step clock is a periodic drive on the STEP net, so a rate
 /// change is a drive like any other, and it reaches everything on the net
-/// that reads it — 12 records per running rate change: the source's drive
-/// with its net resolved (two identity nets) and handed to `IC14`'s input
-/// and to the `P8` indicator's SN74LVC1G14 (5); `IC14`'s relay, one periodic
-/// drive, with the isolated net resolved (two identity nets) and handed to
-/// the sink and to `U24`'s `1A` (5); and the indicator inverter's own relay
-/// onto its LED net (2). `U24` re-issues nothing it already drives (the
-/// harness model publishes a changed pair only, as the isolator and the
-/// gates do), so it costs only where its input changes meaning: the first
-/// rate change turns the resting line it drove from into a running clock it
-/// reads no level from, and it releases its pair (2 drives, 2 resolutions:
-/// 16); the stop hands it the held clock's resting low (the node names its
-/// low phase's voltage, `NODES.md` §12 item 5, the review) and it drives the
-/// pair again (4), while the inverter, out of rate mode, reads the same
-/// resting low and drives its LED high `t_pd` later (a wake, a drive and a
-/// resolution in place of its relay's two: 5 + 5 + 4 + 3 = 17). 16 + 12 +
-/// 12 + 17 = 57. While the train rode a pulse channel beside the net the
-/// same profile cost 19 events (the phase-4 tree, measured) against a
-/// ceiling of 32 — the ~7× per rate change `sil-unified-drive.md` measured for a
-/// drive on this rig ("level (drive) 14"; the two relays beyond it are the
-/// readers the channel never reached), bounded, and still independent of
-/// the rate, which is the property this guards.
-const RELAY_EVENTS: usize = 57;
+/// that reads it — 12 records on the STEP / isolated path per running rate
+/// change: the source's drive with its net resolved (two identity nets) and
+/// handed to `IC14`'s input and to the `P8` indicator's SN74LVC1G14 (5);
+/// `IC14`'s relay, one periodic drive, with the isolated net resolved (two
+/// identity nets) and handed to the sink and to `U24`'s `1A` (5); and the
+/// indicator inverter's own relay onto its LED net (2). `U24` relays a
+/// crossing clock as a differential `Drive::Periodic` on `SC_PUL±` (issue
+/// #80), and re-issues nothing it already drives — so every rate change
+/// whose segment differs costs its pair too (2 drives, 2 resolutions: +4).
+/// First running change and each middle retarget are therefore 16; the stop
+/// hands it a held crossing segment and the inverter, out of rate mode,
+/// reads the resting low and drives its LED high `t_pd` later (a wake, a
+/// drive and a resolution in place of its relay's two: 5 + 5 + 4 + 3 =
+/// 17). 16 + 16 + 16 + 17 = 65. While the train rode a pulse channel beside
+/// the net the same profile cost 19 events (the phase-4 tree, measured)
+/// against a ceiling of 32 — the ~7× per rate change `sil-unified-drive.md`
+/// measured for a drive on this rig ("level (drive) 14"; the two relays
+/// beyond it are the readers the channel never reached), bounded, and still
+/// independent of the rate, which is the property this guards.
+const RELAY_EVENTS: usize = 65;
 
 /// Engine events the one level-to-clock change costs: the STEP line, held
 /// at a level, becomes a clock at rest (a held segment) before a profile
 /// is measured. **Measured, and asserted exactly: 18.** The
 /// source's drive, its net resolved, handed to `IC14` and the indicator,
 /// its identity net resolved (5); `IC14`'s first relay onto the isolated
-/// net, resolved and handed on (5); `U24`, handed the held clock's resting
-/// low where it read the level's high, re-drives its pair (4); the
-/// inverter, reading the same low, drives its LED `t_pd` later (a wake, a
-/// drive, its two LED nets resolved: 4). Paid once per line, not per
-/// profile, and asserted exactly here so the level path's cost stays under
-/// test.
+/// net, resolved and handed on (5); `U24`, handed a held crossing clock
+/// where it drove a level, publishes the differential periodic pair (4);
+/// the inverter, reading the same resting low, drives its LED `t_pd` later
+/// (a wake, a drive, its two LED nets resolved: 4). Paid once per line, not
+/// per profile, and asserted exactly here so the level path's cost stays
+/// under test.
 const PRIME_EVENTS: usize = 18;
 
 /// Virtual time each segment of a profile holds for, the stop included: the
