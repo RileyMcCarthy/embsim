@@ -199,7 +199,6 @@ dependencies = [
  "embsim-boards",
  "embsim-core",
  "embsim-models",
- "embsim-peripherals",
  "libc",
  "nix",
  "proptest",
@@ -217,20 +216,6 @@ dependencies = [
  "embsim-models",
  "rstest",
  "tracing",
-]
-
-[[package]]
-name = "embsim-build"
-version = "0.1.0"
-dependencies = [
- "rstest",
-]
-
-[[package]]
-name = "embsim-cffi"
-version = "0.1.0"
-dependencies = [
- "embsim-models",
 ]
 
 [[package]]
@@ -261,17 +246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embsim-minimal-example"
-version = "0.1.0"
-dependencies = [
- "embsim-core",
- "embsim-memory-inspect",
- "embsim-peripherals",
- "embsim-runtime",
- "rstest",
-]
-
-[[package]]
 name = "embsim-models"
 version = "0.1.0"
 dependencies = [
@@ -279,18 +253,6 @@ dependencies = [
  "embsim-core",
  "libc",
  "nix",
- "rstest",
- "tracing",
-]
-
-[[package]]
-name = "embsim-p2"
-version = "0.1.0"
-dependencies = [
- "embsim-core",
- "embsim-peripherals",
- "embsim-runtime",
- "libc",
  "rstest",
  "tracing",
 ]
@@ -304,39 +266,6 @@ dependencies = [
  "embsim-boards",
  "embsim-core",
  "embsim-models",
- "tracing",
-]
-
-[[package]]
-name = "embsim-peripherals"
-version = "0.1.0"
-dependencies = [
- "embsim-core",
- "nix",
- "parking_lot",
- "rstest",
- "tracing",
-]
-
-[[package]]
-name = "embsim-qemu"
-version = "0.1.0"
-dependencies = [
- "embsim-board",
- "embsim-core",
- "libc",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "embsim-runtime"
-version = "0.1.0"
-dependencies = [
- "embsim-core",
- "embsim-memory-inspect",
- "embsim-peripherals",
- "rstest",
  "tracing",
 ]
 

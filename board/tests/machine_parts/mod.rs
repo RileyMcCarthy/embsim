@@ -18,7 +18,7 @@
 //!
 //! | Fixture | Board | Notes |
 //! |---|---|---|
-//! | `fixtures/p2_ec32mb.net` | Parallax P2-EC32MB Rev B module | transcribed from the vendor PDF; **no `libsource`** |
+//! | `embsim_boards::ec32mb::NETLIST` | Parallax P2-EC32MB Rev B module | transcribed from the vendor PDF; **no `libsource`** |
 //! | `fixtures/mad_edge.net` | MaD EdgeBoard (3 sheets) | `kicad-cli sch export netlist` |
 //! | `fixtures/ds2_addon.net` | MaD DS2 force-gauge add-on | `kicad-cli sch export netlist` |
 //!
@@ -66,12 +66,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use embsim_board::mcu::SerialChannelConfig;
 use embsim_board::registry::normalize_part;
 use embsim_board::{
     AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver,
-    EndpointRef, Harness, InputPort, JumperState, Level, McuComponent, Ohms, PartRegistry, PinDecl,
-    PinHandle, Scenario, SwitchPole, TheveninDrive, Thresholds, Volts,
+    EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PinDecl, PinHandle,
+    Scenario, SwitchPole, TheveninDrive, Thresholds, Volts,
 };
 use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
@@ -866,47 +865,13 @@ impl Component for SerialIsolator {
 // P2-EC32MB module: the P2 behind its full package facade
 // ============================================================
 
-/// The reference consumer's force-gauge serial channel, as its HAL config
-/// table declares it: RX on P0, TX on P2, 115.2 kbaud. Shared with
-/// `board/tests/mcu_component.rs` and MaD's own HAL-table test.
-pub const FORCE_GAUGE_CHANNEL: SerialChannelConfig = SerialChannelConfig {
-    rx_pin: 0,
-    tx_pin: 2,
-    baud: 115_200,
-};
-
-/// The 64 `"P{n}"` pin names. `PinDecl` needs `&'static str`, so they are
-/// spelled out (the same table [`McuComponent`] keeps privately).
-#[rustfmt::skip]
-/// The P2 as the EC32MB module's `U100`: the [`P2Package`] around the
-/// native [`McuComponent`].
-///
-/// The two live at different altitudes and the package is the seam between
-/// them. `McuComponent` declares exactly the pins its emulated peripherals
-/// bridge — two, for the bridged force-gauge UART — because that is what it
-/// knows. The *board* knows the package: 64 pads, a core supply, sixteen
-/// bank supplies, `RESN`, `TEST`, and the crystal pair, all of which the
-/// netlist has nodes for and all of which the build validates in both
-/// directions. The package declares those (every pad a released
-/// bidirectional pin, `XI` a rate sink, `XO` a released output) and hands
-/// the MCU the pads' net I/O, so it finds `"P2"` and `"P0"` in the handle
-/// table and bridges them exactly as it would on a board of its own.
-pub type P2EdgeModule = P2Package<McuComponent>;
-
-/// Build the module's P2 with the force-gauge channel bridged.
-pub fn p2_edge_module(name: &str) -> P2EdgeModule {
-    let channel = FORCE_GAUGE_CHANNEL;
-    let mcu = McuComponent::builder(name)
-        .serial_table(vec![channel])
-        .bridge_serial(0)
-        .build()
-        .expect("the force-gauge channel is in the table and inside P63");
-    P2Package::native(mcu)
+/// The P2 package with no core: every pad released. Tests that fill the
+/// module's processor slot without running a CPU use this.
+pub fn p2_edge_module(_name: &str) -> P2Package<embsim_boards::p2::HeldInReset> {
+    P2Package::held_in_reset()
 }
 
-/// A [`P2EdgeModule`] in facade mode bridges HAL serial channel 0 into the
-/// **process-default** peripheral instance, so only one system carrying one
-/// may exist at a time inside a test binary. Tests that build such a system
+/// One system at a time inside a test binary. Tests that build the module
 /// take this lock (poison-recovering, like the paced-stream suites).
 pub fn lock_module_instance() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -975,7 +940,7 @@ pub fn solder_link_poles() -> Vec<SwitchPole> {
     vec![SwitchPole::open("1", "2")]
 }
 
-/// Part registry for `fixtures/p2_ec32mb.net`.
+/// Part registry for the P2-EC32MB netlist.
 pub fn ec32mb_registry() -> PartRegistry {
     let mut registry = PartRegistry::new();
     // The netlist was transcribed from the vendor PDF and has no libsource, so
@@ -1047,8 +1012,8 @@ pub fn ec32mb_registry() -> PartRegistry {
 
 /// Build the P2-EC32MB module as a [`Board`].
 pub fn ec32mb_board() -> Board {
-    let parsed = embsim_board::netlist::parse(include_str!("../fixtures/p2_ec32mb.net"))
-        .expect("the EC32MB fixture parses");
+    let parsed = embsim_board::netlist::parse(embsim_boards::ec32mb::NETLIST)
+        .expect("the EC32MB netlist parses");
     Board::from_netlist(parsed, &ec32mb_registry()).expect("the EC32MB module builds")
 }
 
@@ -1117,8 +1082,8 @@ pub const UCC12040_PART: &str = "UCC12040DVER";
 pub const XL1509_PART: &str = "XL1509";
 
 /// Baud the EdgeBoard's isolated force-gauge UART runs at — the ADS122U04's
-/// fixed 115.2 kbaud, which is also [`FORCE_GAUGE_CHANNEL`]'s.
-pub const FORCE_GAUGE_BAUD_HZ: u32 = FORCE_GAUGE_CHANNEL.baud;
+/// fixed 115.2 kbaud.
+pub const FORCE_GAUGE_BAUD_HZ: u32 = 115_200;
 
 /// Rail voltage of the isolated servo domain (`SC_5V`), from connector J21.
 pub const SERVO_RAIL_VOLTS: Volts = 5.0;

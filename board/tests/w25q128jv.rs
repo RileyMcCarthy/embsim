@@ -23,7 +23,7 @@
 //!
 //! # Sources
 //!
-//! - `fixtures/p2_ec32mb.net` — `(comp (ref "U301"))`, value
+//! - `embsim_boards::ec32mb::NETLIST` — `(comp (ref "U301"))`, value
 //!   `"SPI Flash 16MB (128Mb)"`, MPN `W25Q128JVSIM TR`, manufacturer Winbond.
 //! - Winbond W25Q128JV datasheet, Revision F (27 March 2018).
 
@@ -57,8 +57,7 @@ fn registry_with_live_flash() -> PartRegistry {
 
 #[test]
 fn the_part_mounts_on_a_real_netlist() {
-    let parsed =
-        netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
+    let parsed = netlist::parse(embsim_boards::ec32mb::NETLIST).expect("the EC32MB netlist parses");
     let board = Board::from_netlist(parsed, &registry_with_live_flash())
         .expect("the live flash's pin facade matches U301 in both directions");
 
@@ -73,8 +72,7 @@ fn the_part_mounts_on_a_real_netlist() {
 fn a_facade_keyed_by_pin_number_does_not_mount_on_this_netlist() {
     use embsim_models::spi_flash_component::SPI_FLASH_PINS_SOIC8;
 
-    let parsed =
-        netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
+    let parsed = netlist::parse(embsim_boards::ec32mb::NETLIST).expect("the EC32MB netlist parses");
     let mut registry = ec32mb_registry();
     registry.register(FLASH_PART, |_decl| {
         Box::new(
@@ -94,7 +92,7 @@ fn a_facade_keyed_by_pin_number_does_not_mount_on_this_netlist() {
 
 #[test]
 fn the_default_jedec_id_matches_the_ordering_option_on_the_fixture() {
-    const FIXTURE: &str = include_str!("fixtures/p2_ec32mb.net");
+    const FIXTURE: &str = embsim_boards::ec32mb::NETLIST;
     let parsed = netlist::parse(FIXTURE).expect("the EC32MB fixture parses");
     let u301 = parsed
         .components

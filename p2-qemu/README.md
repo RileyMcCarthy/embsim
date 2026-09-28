@@ -52,9 +52,8 @@ is the real boot gate.
 Making that tree is [`qemu-target/README.md`](qemu-target/README.md): QEMU
 `v10.1.0`, the `target/p2` and `hw/p2` sources from this directory, two
 patches. `build.rs` then replays QEMU's own link line out of `build.ninja` —
-every object but `system_main.c.o` (the only `main()`) and
-`target_p2_flashbus.c.o` (the standalone emulator's flash bus, which drags in
-a second Rust runtime through `embsim-cffi`) — and compiles `hostdrive.c`
+every object but `system_main.c.o` (the only `main()`). A stale build that
+still contains `flashbus.c.o` is refused. It compiles `hostdrive.c`
 against QEMU's headers with the target's own flags. `.github/workflows/ci.yml`'s
 `p2-qemu-boot` job does all of it from a clean checkout.
 

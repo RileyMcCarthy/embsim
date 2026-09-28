@@ -11,10 +11,10 @@ shape, as `embsim` and `ProtoEmb` are to MaD.
 | path | goes to |
 |---|---|
 | `target-p2/` | `target/p2/` in the QEMU tree |
-| `hw-p2/` | `hw/p2/`: the board, and the standalone binary's flash bus |
+| `hw-p2/` | `hw/p2/`: the board |
 | `p2-softmmu.mak` | `configs/targets/p2-softmmu.mak` |
-| `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak`: the standalone build, flash bus on |
-| `p2-softmmu-node-devices.mak` | `configs/devices/p2-softmmu/node.mak`: `embsim-p2-qemu`'s build (`--with-devices-p2=node`), flash bus off |
+| `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak`: the standalone build |
+| `p2-softmmu-node-devices.mak` | `configs/devices/p2-softmmu/node.mak`: `embsim-p2-qemu`'s build (`--with-devices-p2=node`) |
 | `register-p2.patch` | the five registration edits (`target/meson.build`, `hw/meson.build`, both `Kconfig`s, `QEMU_ARCH_P2` in `include/system/arch_init.h`) |
 | `host-thread.patch` | parks QEMU's own vCPU thread when the host sets `rr_host_driven`, so a host thread — embsim's engine — can run the cogs itself (`../hostdrive.c`) |
 | `stage.sh` | puts all of the above into a QEMU source tree |
@@ -60,8 +60,7 @@ git clone --depth 1 --branch v10.1.0 https://gitlab.com/qemu-project/qemu.git <q
 p2-qemu/qemu-target/stage.sh <qemu>
 ```
 
-One staged tree builds two ways. `embsim-p2-qemu` links a tree configured with
-`--with-devices-p2=node`, which leaves the standalone flash bus out:
+`embsim-p2-qemu` links a tree configured with `--with-devices-p2=node`:
 
 ```bash
 mkdir <qemu>/build-p2 && cd <qemu>/build-p2
@@ -72,33 +71,22 @@ ninja qemu-system-p2
 EMBSIM_QEMU_P2_BUILD=<qemu>/build-p2 cargo test -p embsim-p2-qemu
 ```
 
-The standalone `qemu-system-p2` the MaD harnesses run keeps the default
-devices, flash bus included, and that bus links embsim's flash model as a
-static library (see "The flash is embsim's" below). Build it first with
-`cargo build -p embsim-cffi`, from this repository's root:
-
-```bash
-EMB=<embsim>
-mkdir <qemu>/build-sa && cd <qemu>/build-sa
-../configure --target-list=p2-softmmu --disable-containers --enable-pie \
-    --disable-docs --disable-werror \
-    --extra-cflags="-I$EMB/cffi/include" \
-    --extra-ldflags="$EMB/target/debug/libembsim_cffi.a -lpthread -ldl -lm"
-ninja qemu-system-p2
-```
+The standalone `qemu-system-p2` MaD's CPU differentials run (`difftest.sh`,
+`edgetest.sh`, `cogtest.sh`, `fwtest.sh`) is the same configure without
+`--with-devices-p2=node`. Its pin model is `target-p2/pinbus.c`. The boot
+ROM's flash is not a device of that binary: `romtest.sh` diffs p2core against
+the node, which bit-bangs the flash over the EC32MB nets.
 
 `--disable-containers` matters on macOS: `configure` otherwise hangs in
 `docker version`. `--enable-pie` is what lets the objects link into a Rust
 test binary, which is position-independent; leave it off on macOS, whose
 toolchain builds position-independent executables anyway and fails
-`configure`'s `-pie` probe. On macOS the standalone link needs
-`-liconv -lSystem -lc -lm` (what `cargo rustc -p embsim-cffi --lib --
---print native-static-libs` prints there) in place of `-lpthread -ldl -lm`.
+`configure`'s `-pie` probe.
 
 `embsim-p2-qemu`'s `build.rs` refuses a tree that is not what this directory
 says it should be: a file here that differs from the staged copy, a tree
-without `host-thread.patch`, or a tree configured with the flash bus. Re-stage
-and run `ninja` after an edit here, and the next `cargo test` relinks.
+without `host-thread.patch`, or a stale build that still links `flashbus.c.o`.
+Re-stage and run `ninja` after an edit here, and the next `cargo test` relinks.
 
 ## Adding an instruction
 
@@ -140,33 +128,18 @@ state, registers, flags, stack pointer and cycle count (MaD's
 mnemonic the firmware executes: 80 in hub space, 41 in cog space, measured over
 20 M instructions with MaD's `SIL/p2core/examples/ophist.rs`.
 
-It also **boots the way silicon does**. `qemu-system-p2 -M p2,flash=<image>
--bios <rom>` puts nothing in hub but Parallax's own 16 KB boot ROM; the ROM
-samples the pull-up strap on P61, bit-bangs the SPI flash, loads its first
-kilobyte, verifies the 256 longs sum to `"Prop"`, copies them into cog RAM and
-jumps. That kilobyte is this repository's stage-1 loader, which reads the
-application from flash `$400` and relaunches the cog on it. The whole chain is
-**identical to p2core's, state by state** (MaD's `SIL/p2core/tools/romtest.sh`),
-and the two things it actually DID -- the flash served reads at `0` and `$400`,
-and the booted payload's byte reached the console -- are the same assertions
-MaD's `SIL/p2core/tests/rom_boot_chain.rs` makes.
-
-## The flash is embsim's, not a copy
-
-`hw-p2/flashbus.c` is the standalone binary's second pin bus, mirroring
-p2core's `Board` far enough to boot. What it is NOT is a second flash model:
-the device is this repository's `models/src/spi_flash.rs`, reached from C
-through `embsim-cffi`. One model of the part, shared by every host that needs
-one -- a C reimplementation would be a second set of bugs, uncovered by the
-differential tests that make the first one trustworthy.
-
-`embsim-cffi` exists for a host with no net engine: the standalone
-`qemu-system-p2` runs QEMU's own main loop, so it calls the one Rust model
-in-process. Inside embsim every device is a node on nets, the flash included —
-`p2-qemu/tests/rom_boot_ec32mb.rs` boots the ROM through the node, bit-banging
-16 901 edges over the P2-EC32MB's nets. So the node's tree leaves this bus out
-(`CONFIG_P2_EMBSIM_FLASH`, off in `p2-softmmu-node-devices.mak`) and links
-neither it nor the archive.
+It also **boots the way silicon does**, on the node rather than in
+`qemu-system-p2`. `p2-qemu/tests/rom_boot_ec32mb.rs` puts nothing in hub but
+Parallax's own 16 KB boot ROM; the ROM samples the pull-up strap on P61,
+bit-bangs the module's SPI flash over the nets, loads its first kilobyte,
+verifies the 256 longs sum to `"Prop"`, copies them into cog RAM and jumps.
+That kilobyte is this repository's stage-1 loader, which reads the application
+from flash `$400` and relaunches the cog on it. The whole chain is **identical
+to p2core's, state by state** (MaD's `SIL/p2core/tools/romtest.sh`), and the
+two things it actually DID -- the flash served reads at `0` and `$400`, and
+the booted payload's byte reached the debug pin -- are the same assertions
+MaD's `SIL/p2core/tests/rom_boot_chain.rs` makes. The flash model is
+`models/src/spi_flash.rs`, a node on the nets.
 
 ## Two engines, one instruction set
 
@@ -225,7 +198,7 @@ All in MaD's `SIL/p2core/tools/`, all diffing against p2core state by state:
 | `edgetest.sh` | hand-built probes for stream edges a random program reaches only by luck |
 | `cogtest.sh` | two cogs: COGINIT, compared on final register state, not timing |
 | `fwtest.sh` | the real firmware |
-| `romtest.sh` | the boot ROM loading a program off SPI flash |
+| `romtest.sh` | the boot ROM on the node, diffed against p2core |
 
 Here, `p2-qemu/tests/rom_boot_ec32mb.rs` boots the same chain through the
 node, on the P2-EC32MB board, over nets — `p2-qemu-boot` in CI, in
@@ -234,10 +207,9 @@ node, on the P2-EC32MB board, over nets — `p2-qemu-boot` in CI, in
 ## What it does NOT do yet
 
 - **No SD card and no serial peer in the standalone binary.**
-  `hw-p2/flashbus.c` has the boot flash, which is all the ROM chain needs;
-  `target-p2/pinbus.c` remains the bring-up model for the CPU differential
-  tests. On embsim's engine (`embsim-p2-qemu`) the flash is already a board
-  component and the SD card can be; the UART peers are the next seam.
+  `target-p2/pinbus.c` is the bring-up model for the CPU differential tests.
+  On embsim's engine (`embsim-p2-qemu`) the flash is a board component and
+  the SD card can be; the UART peers are the next seam.
 - **No streamer** (`XINIT`/`XZERO`/`XCONT`/`SETXFRQ`), so the transition-mode
   smart-pin clock path halts rather than guessing.
 - **The refused set matches p2core's**, deliberately: an instruction the oracle

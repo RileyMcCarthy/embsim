@@ -345,10 +345,8 @@ const ENA_FINGER: &str = "34";
 /// A stand-in for the P2's driven pins: three push-pull outputs, `STEP`
 /// driven with a periodic drive when a test clocks it.
 ///
-/// Deliberately not an [`embsim_board::McuComponent`]: this binary needs no
-/// firmware and no peripheral banks, and a component that claimed the
-/// process-default banks would have to own its own suite lock (`TESTING.md`
-/// rule 5).
+/// Three push-pull outputs standing in for a core's pads. This binary
+/// needs no firmware.
 struct FakePins {
     pins: Vec<PinDecl>,
     handles: Arc<Mutex<HashMap<&'static str, PinHandle>>>,

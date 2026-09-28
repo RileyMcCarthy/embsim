@@ -1,12 +1,8 @@
 //! Model: limit / end-of-travel switch — a **dry contact** across `COM` and
 //! `NO`, with real-switch actuation hysteresis and optional contact bounce.
 //!
-//! [`crate::limit_switch`] is the pure-mechanism predecessor: an ideal position
-//! comparator that emits `bool` transitions and leaves electrical polarity to
-//! the consumer. Its provenance header lists actuation hysteresis and contact
-//! bounce as **not modeled**. Both are modeled here, because a board-engine
-//! component has somewhere to put them: it does not emit a boolean, it opens
-//! and closes a contact on a real net.
+//! A board-engine component does not emit a boolean. It opens and closes a
+//! contact on a real net, with actuation hysteresis and contact bounce.
 //!
 //! ```text
 //!            board / harness                     this component
@@ -59,8 +55,8 @@
 //!                                 open  when x >  release_mm   (release ≥ operate)
 //! ```
 //!
-//! `release_mm == operate_mm` degenerates to the ideal comparator
-//! [`crate::limit_switch`] implements, and is allowed; a `release_mm` on the
+//! `release_mm == operate_mm` degenerates to an ideal comparator, and is
+//! allowed; a `release_mm` on the
 //! *actuated* side of `operate_mm` is rejected at construction
 //! ([`crate::machine::MachineConfigError::InvertedHysteresis`]) because the
 //! contact could never reopen.
@@ -702,7 +698,7 @@ mod tests {
         assert!(real_actuator.is_closed());
 
         // Same wobble, zero differential travel: the ideal comparator toggles
-        // on every crossing. This is the behavior `crate::limit_switch` has.
+        // on every crossing.
         let ideal = switch(Config::new(10.0, ActuationSense::Increasing));
         let ideal_actuator = ideal.actuator();
         let ideal_log = recorder(&ideal_actuator);

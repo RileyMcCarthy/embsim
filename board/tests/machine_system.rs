@@ -63,7 +63,7 @@ use embsim_models::machine::{
     end_switch, quadrature_encoder, stepper_motor, ActuationSense, EndSwitch, QuadratureEncoder,
     StepperMotor,
 };
-use embsim_peripherals::serial;
+
 use machine_parts::{
     bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, encoder_jumpers_closed,
     force_domain_ground, force_gauge_harness, machine_harness, module_socket_harness,
@@ -510,127 +510,6 @@ fn the_force_gauge_route_reaches_the_adc_through_isolator_and_cable() {
     assert_eq!(net_named(&map, EDGE, "IC5", "13"), "EdgeBoard.P1");
 }
 
-/// The route carries bytes. A `SYNC` + `RDATA` command written through the
-/// firmware's own HAL serial call crosses the bridged MCU channel, the card
-/// edge, the isolation barrier, the force cable and two 47 Ω series resistors
-/// into the ADC — and the ADC's three-byte conversion comes all the way back.
-///
-/// This is the whole force path of the real machine, assembled from three
-/// netlists with no hand wiring anywhere: 313 components, and the only reason
-/// the byte arrives is that every hop resolved.
-///
-/// The MCU is in facade mode, so the bytes go in and out through the
-/// process-default peripheral bank exactly as the HAL trampolines would — which
-/// is why this test holds the module-instance lock for its whole duration.
-#[rstest]
-fn the_force_path_carries_a_command_and_a_conversion_end_to_end() {
-    ensure_clock();
-    let _guard = machine_parts::lock_module_instance();
-    // The runtime's role: size the default instance's serial bank before
-    // wiring, exactly as `Emulator::run` does. Channel 0 is the bridged
-    // force-gauge channel.
-    serial::init(1);
-
-    let system: SystemHandle = machine_system().start().expect("the machine starts");
-
-    // The link is closed end to end: both UART nets carry a level, not a
-    // float and not a fight. This is what "routes cleanly" means once the
-    // payload is on the net — there is no route to complain about any more,
-    // only a wire that either reaches the other end or does not.
-    for net in [
-        "EdgeBoard.P2",
-        "EdgeBoard./MaD_Edge_Sheet2/IFG_TX",
-        "DS2Addon.Net-(U1-RX)",
-        "DS2Addon.Net-(U1-TX)",
-    ] {
-        // Wait for the level rather than sampling for it. `start()` returning
-        // means the system has assembled, not that the engine has already
-        // resolved and published every net — that is the engine's own first
-        // pass, on its own thread. Reading straight through raced it, and lost
-        // on a loaded runner: this is the idiom the rest of the file uses for
-        // exactly this reason (see `settled_at`).
-        let carries_a_level = || {
-            matches!(
-                system.net_state(net),
-                Some(NetState::Driven(_) | NetState::Pulled(_, _) | NetState::Analog(_))
-            )
-        };
-        assert!(
-            wait_for(carries_a_level, Duration::from_secs(5)),
-            "{net} must carry a level for a byte to cross it; got {:?}",
-            system.net_state(net)
-        );
-    }
-
-    // The isolated force domain is the Edge board's own `IC4`, up 750 µs
-    // after its input arrives (the UCC12040's rise time): a command sent
-    // before that reaches an unpowered ADC. Wait for the domain's 5 V, as
-    // firmware waits out a power-on delay before its first command.
-    let force_rail = "EdgeBoard./MaD_Edge_Sheet2/IFG_5V";
-    assert!(
-        wait_for(
-            || matches!(system.net_state(force_rail), Some(NetState::Analog(v)) if (v - 5.0).abs() < 1e-9),
-            Duration::from_secs(5)
-        ),
-        "the force domain rises to the isolated DC/DC's 5 V; got {:?}",
-        system.net_state(force_rail)
-    );
-
-    // The P2's own bank rail too: its UART pins, `P0`/`P2`, read against
-    // 0.3/0.7 of `VIO_00_07`, the module's LDO output behind the bucks'
-    // 2.5 ms soft-start — a pad in a bank with no supply reads nothing, and
-    // a reply that arrived first would be lost, as it would be on the
-    // bench before the module's rails were up.
-    let bank_rail = format!("{MODULE}.VIO_00_07");
-    assert!(
-        wait_for(
-            || matches!(system.net_state(&bank_rail), Some(NetState::Analog(v)) if (v - 3.3).abs() < 1e-3),
-            Duration::from_secs(5)
-        ),
-        "the P2's bank rail rises to 3.3 V; got {:?}",
-        system.net_state(&bank_rail)
-    );
-
-    // SYNC + RDATA (0x55 0x10 — TI SBAS752B §8.5.3.4), written the way the
-    // firmware writes it.
-    serial::transmit_data(0, &[0x55, 0x10]);
-    let mut reply: Vec<u8> = Vec::new();
-    let arrived = wait_for(
-        || {
-            while let Some(byte) = serial::receive_byte(0) {
-                reply.push(byte);
-            }
-            reply.len() >= 3
-        },
-        Duration::from_secs(20),
-    );
-    assert!(
-        arrived,
-        "the ADC's conversion must reach the P2 through the whole machine; got {reply:?}"
-    );
-    assert_eq!(
-        reply.len(),
-        3,
-        "exactly one conversion frame; got {reply:?}"
-    );
-
-    drop(system);
-    serial::reset();
-}
-
-// ============================================================
-// The motion path
-// ============================================================
-
-/// The step/direction path from the P2 to the motor, hop by hop: MCU pin →
-/// card edge → servo isolator → RS-422 driver → differential pair →
-/// connector J21 → the motor component's `STEP` pin.
-///
-/// The isolator (`IC14`) is topology-only in this slice, so the chain is
-/// asserted as connectivity rather than as a pulse arriving; the RS-422 pair's
-/// own behavior is exercised live in `edgeboard.rs`. What this establishes is
-/// that the firmware pin the MaD consumer drives for `STEP` really is the one
-/// wired to the machine's motor.
 #[rstest]
 fn the_step_path_connects_a_p2_pin_to_the_motor_component() {
     let system = build_machine();
@@ -847,8 +726,6 @@ fn live_volts(system: &SystemHandle, net: &str) -> Option<f64> {
 #[rstest]
 fn moving_the_shaft_changes_the_encoder_nets_the_board_reads() {
     ensure_clock();
-    let _guard = machine_parts::lock_module_instance();
-    serial::init(1);
 
     // A separate assembly so the shaft handle survives into the test.
     let encoder = QuadratureEncoder::new(quadrature_encoder::Config::new(80.0)).expect("config");
@@ -911,7 +788,6 @@ fn moving_the_shaft_changes_the_encoder_nets_the_board_reads() {
     );
 
     drop(system);
-    serial::reset();
 }
 
 // ============================================================

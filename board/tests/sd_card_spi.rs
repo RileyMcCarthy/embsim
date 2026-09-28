@@ -26,7 +26,7 @@
 //!
 //! # Sources
 //!
-//! - `fixtures/p2_ec32mb.net` — `(comp (ref "J301"))`, value `"MicroSD Socket"`,
+//! - `embsim_boards::ec32mb::NETLIST` — `(comp (ref "J301"))`, value `"MicroSD Socket"`,
 //!   MPN `473092651`, manufacturer Molex.
 //! - SD Physical Layer Simplified Specification, for the SPI-mode command set,
 //!   response formats and pin roles.
@@ -93,8 +93,7 @@ fn registry_with_live_card(pins: &'static [PinDecl]) -> PartRegistry {
 
 #[test]
 fn the_card_mounts_on_a_real_socket_in_place_of_a_board_boundary() {
-    let parsed =
-        netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
+    let parsed = netlist::parse(embsim_boards::ec32mb::NETLIST).expect("the EC32MB netlist parses");
     let board = Board::from_netlist(parsed, &registry_with_live_card(&SD_CARD_PINS_BY_FUNCTION))
         .expect("the live card's pin facade matches J301 in both directions");
 
@@ -108,8 +107,7 @@ fn the_card_mounts_on_a_real_socket_in_place_of_a_board_boundary() {
 
 #[test]
 fn the_full_card_pinout_does_not_mount_on_a_socket_wired_for_spi() {
-    let parsed =
-        netlist::parse(include_str!("fixtures/p2_ec32mb.net")).expect("the EC32MB fixture parses");
+    let parsed = netlist::parse(embsim_boards::ec32mb::NETLIST).expect("the EC32MB netlist parses");
     let error = Board::from_netlist(parsed, &registry_with_live_card(&SD_CARD_PINS_MICROSD))
         .expect_err("pin \"1\" is not a pin this netlist has, and DAT1/DAT2 have no nodes");
     let rendered = format!("{error}");
@@ -121,7 +119,7 @@ fn the_full_card_pinout_does_not_mount_on_a_socket_wired_for_spi() {
 
 #[test]
 fn the_socket_facade_declares_exactly_the_nodes_the_netlist_gives_j301() {
-    const FIXTURE: &str = include_str!("fixtures/p2_ec32mb.net");
+    const FIXTURE: &str = embsim_boards::ec32mb::NETLIST;
     let parsed = netlist::parse(FIXTURE).expect("the EC32MB fixture parses");
     let j301 = parsed
         .components

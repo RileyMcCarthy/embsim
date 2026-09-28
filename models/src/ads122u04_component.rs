@@ -69,11 +69,7 @@
 //! # Slice note (deferred inversion)
 //!
 //! This slice makes the **chip** side of the force path a live board-engine
-//! component. The MCU-side inversion — the engine spawning the firmware
-//! entry (`BOARD_ENGINE.md`, "The MCU as a component", item 1) — is
-//! **deferred**: consumers keep booting firmware via
-//! `embsim_runtime::Emulator::run` on the main thread and bridge the MCU's
-//! serial channels to stream pins in their wiring layer.
+//! component. The chip's UART is levels on its pins.
 
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};

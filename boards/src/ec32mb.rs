@@ -8,7 +8,7 @@
 //! What this crate supplies is the module minus its processor. `U100` is a
 //! **slot** the consumer fills with a [`crate::p2::P2Package`] — the P2's
 //! 86-pin package around a core: QEMU's target, an instruction-set
-//! simulator, the native firmware behind `McuComponent`, or no core at all
+//! simulator, or no core at all
 //! ([`crate::p2::P2Package::held_in_reset`], the state any P2 is in before
 //! it runs) — because the CPU is the thing under test and the board is the
 //! fixture. Everything around it is here:
@@ -44,10 +44,9 @@
 //! # use embsim_boards::p2::P2Package;
 //! let board = Ec32mb::new()
 //!     .with_flash_image(std::fs::read("firmware.bin").unwrap())
-//!     .with_p2(|_decl| Box::new(P2Package::native(my_cpu())))
+//!     .with_p2(|_decl| Box::new(P2Package::held_in_reset()))
 //!     .build()
 //!     .expect("the module builds");
-//! # fn my_cpu() -> embsim_board::McuComponent { unimplemented!() }
 //! ```
 //!
 //! # The SPI bus is SHARED, and that is the interesting part

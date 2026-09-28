@@ -10,8 +10,7 @@
 //! experience contention, could not be corrupted by a fighting driver, and
 //! could not notice the line was floating.
 //!
-//! **One implementation, shared.** [`crate::mcu::McuComponent`] uses it for a
-//! bridged firmware channel; `embsim_models::ads122u04_component` uses it for
+//! **One implementation, shared.** `embsim_models::ads122u04_component` uses it for
 //! the chip's UART; a test probe uses it to be the other end of either. Bit
 //! order and framing are exactly the details that are cheapest to get subtly
 //! wrong in a second copy, so there is only one.

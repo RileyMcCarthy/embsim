@@ -15,7 +15,86 @@
 //! per constant-rate segment, never one per edge (`NODES.md` §10 row 3;
 //! `DESIGN.md` rule 2, "no second channel").
 
-pub use embsim_peripherals::pulse_out::PeriodicSchedule;
+/// The schedule of a square wave: one constant-rate segment of a
+/// [`crate::Drive::Periodic`].
+///
+/// A segment is the whole truth about the train from `since_ns` onward. A
+/// subscriber that keeps the latest segment computes the emitted count at any
+/// later virtual instant with [`PeriodicSchedule::emitted_at_ns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicSchedule {
+    /// Pulses emitted in this train before `since_ns`.
+    pub emitted: u64,
+    /// Pulse rate from `since_ns` onward, in Hz. `0` holds the count.
+    pub freq_hz: u32,
+    /// Cumulative pulse ceiling for a finite train, or `None` for an
+    /// unbounded train.
+    pub total: Option<u64>,
+    /// Virtual time (ns) at which this segment began.
+    pub since_ns: u64,
+}
+
+/// Pulses a rate emits over an elapsed time: `elapsed_ns × freq_hz /
+/// 1_000_000_000`, floored, in 128 bits so a long train does not overflow.
+fn pulses_in(elapsed_ns: u64, freq_hz: u32) -> u64 {
+    let pulses = u128::from(elapsed_ns) * u128::from(freq_hz) / NS_PER_S;
+    u64::try_from(pulses).unwrap_or(u64::MAX)
+}
+
+const NS_PER_S: u128 = 1_000_000_000;
+
+impl PeriodicSchedule {
+    /// A held channel: nothing emitted, no rate, ceiling zero.
+    pub const IDLE: Self = Self {
+        emitted: 0,
+        freq_hz: 0,
+        total: Some(0),
+        since_ns: 0,
+    };
+
+    /// Cumulative pulses emitted by this train at virtual time `now_ns`.
+    ///
+    /// `emitted + elapsed_ns × freq / 1_000_000_000`, floored, clamped to
+    /// `total`. A `now_ns` before `since_ns` reads the segment's baseline.
+    pub fn emitted_at_ns(&self, now_ns: u64) -> u64 {
+        let elapsed = now_ns.saturating_sub(self.since_ns);
+        let grown = self
+            .emitted
+            .saturating_add(pulses_in(elapsed, self.freq_hz));
+        match self.total {
+            Some(total) => grown.min(total),
+            None => grown,
+        }
+    }
+
+    /// Virtual time (ns) at which a finite train has emitted its last pulse,
+    /// or `None` for an unbounded or held train.
+    pub fn completes_at(&self) -> Option<u64> {
+        let total = self.total?;
+        if self.freq_hz == 0 {
+            return None;
+        }
+        let remaining = u128::from(total.saturating_sub(self.emitted));
+        let span = (remaining * NS_PER_S).div_ceil(u128::from(self.freq_hz));
+        Some(
+            self.since_ns
+                .saturating_add(u64::try_from(span).unwrap_or(u64::MAX)),
+        )
+    }
+
+    /// The same train re-anchored at `at_ns`: identical rate and ceiling,
+    /// with `emitted` advanced to the count at that instant.
+    ///
+    /// Re-base at a segment boundary. A consumer that wants a running count
+    /// reads [`Self::emitted_at_ns`] against the published anchor.
+    pub fn rebased_at_ns(&self, at_ns: u64) -> Self {
+        Self {
+            emitted: self.emitted_at_ns(at_ns),
+            since_ns: at_ns.max(self.since_ns),
+            ..*self
+        }
+    }
+}
 
 // ============================================================
 // Units
@@ -42,7 +121,7 @@ pub const DEFAULT_PUSH_PULL_IMPEDANCE: Ohms = 25.0;
 ///
 /// embsim's stated bench default, JESD8C.01's nominal supply. A pad whose
 /// rail is its own bank drives through [`crate::SerialLevelBridge::with_ports`]
-/// or [`crate::PadPorts`] ([`crate::McuComponent::host_pads`]) instead.
+/// or a pin whose ports name their own rail.
 pub const LOGIC_HIGH_VOLTS: Volts = 3.3;
 
 /// The engine's own split of a solved voltage into a level for its report
