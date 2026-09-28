@@ -59,7 +59,9 @@ use embsim_board::{netlist, Board, BoardError, Component, ComponentDecl, PartReg
 use embsim_models::sd_card::SdCard;
 use embsim_models::sd_card_component::{SdCardComponent, SD_CARD_PINS_BY_FUNCTION};
 use embsim_models::spi_flash::SpiNorFlash;
-use embsim_models::spi_flash_component::{SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION};
+use embsim_models::spi_flash_component::{
+    FlashView, SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION,
+};
 
 use crate::stub::{dig_in, passive, pwr_in, pwr_out, register_stub};
 
@@ -220,7 +222,10 @@ type P2Ctor = Box<dyn Fn(&ComponentDecl) -> Box<dyn Component> + Send + Sync>;
 /// A P2-EC32MB module, with its processor slot to fill.
 #[derive(Default)]
 pub struct Ec32mb {
-    flash_image: Option<Vec<u8>>,
+    /// The boot flash, built up front so a [`FlashView`] can be handed out
+    /// before the part moves into the board. Taken exactly once, at build.
+    flash: Option<std::sync::Mutex<Option<SpiNorFlashComponent>>>,
+    flash_view: Option<FlashView>,
     sd: Option<SdCard>,
     p2: Option<P2Ctor>,
 }
@@ -228,7 +233,7 @@ pub struct Ec32mb {
 impl std::fmt::Debug for Ec32mb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ec32mb")
-            .field("flash_image", &self.flash_image.as_ref().map(Vec::len))
+            .field("flash", &self.flash.as_ref().map(|_| "programmed"))
             .field("sd", &self.sd.as_ref().map(SdCard::capacity))
             .field("p2", &self.p2.as_ref().map(|_| "supplied"))
             .finish()
@@ -244,10 +249,27 @@ impl Ec32mb {
 
     /// Program the boot flash before the module comes up — what a loader would
     /// have left behind.
+    ///
+    /// The part is its real 16 MiB whatever the image's size: a boot image is
+    /// a few kilobytes, and a ROM that reads past it must see the `$FF` a
+    /// blank part gives rather than running off the end of a short array.
     #[must_use]
     pub fn with_flash_image(mut self, image: Vec<u8>) -> Self {
-        self.flash_image = Some(image);
+        let mut array = vec![0xFFu8; FLASH_CAPACITY];
+        let end = image.len().min(FLASH_CAPACITY);
+        array[..end].copy_from_slice(&image[..end]);
+        let component = SpiNorFlashComponent::new(SpiNorFlash::with_image(array))
+            .with_pins(&SPI_FLASH_PINS_BY_FUNCTION);
+        self.flash_view = Some(component.view());
+        self.flash = Some(std::sync::Mutex::new(Some(component)));
         self
+    }
+
+    /// A view of the programmed boot flash — what it served, what it was
+    /// told — that stays valid after the board is built and running. `None`
+    /// until [`with_flash_image`](Self::with_flash_image).
+    pub fn flash_view(&self) -> Option<FlashView> {
+        self.flash_view.clone()
     }
 
     /// Put a card in the socket. Without this the socket is empty, and a driver
@@ -277,19 +299,16 @@ impl Ec32mb {
     pub fn registry(self) -> PartRegistry {
         let mut registry = stub_registry();
 
-        let image = self.flash_image;
+        // A programmed part was built in `with_flash_image` so its view could
+        // be handed out; a blank one is built here. `U301` appears once in
+        // the netlist, so the slot is taken exactly once.
+        let slot = self.flash.unwrap_or_else(|| std::sync::Mutex::new(None));
         registry.register(FLASH_PART, move |_decl| {
-            // The part is its real 16 MiB whatever the image's size: a boot
-            // image is a few kilobytes, and a ROM that reads past it must see
-            // the $FF a blank part gives rather than running off the end of a
-            // short array.
-            let mut array = vec![0xFFu8; FLASH_CAPACITY];
-            if let Some(bytes) = image.as_deref() {
-                let end = bytes.len().min(FLASH_CAPACITY);
-                array[..end].copy_from_slice(&bytes[..end]);
-            }
-            let flash = SpiNorFlash::with_image(array);
-            Box::new(SpiNorFlashComponent::new(flash).with_pins(&SPI_FLASH_PINS_BY_FUNCTION))
+            let programmed = slot.lock().expect("flash slot never poisoned").take();
+            Box::new(programmed.unwrap_or_else(|| {
+                SpiNorFlashComponent::new(SpiNorFlash::blank(FLASH_CAPACITY))
+                    .with_pins(&SPI_FLASH_PINS_BY_FUNCTION)
+            }))
         });
 
         // An empty socket stays a board boundary: there is no card to model, and
