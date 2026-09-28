@@ -125,9 +125,8 @@ cargo test -p embsim-board --test oscillator_chain --test logic_gate_levels --te
 # reported restarting in between, a release shorter than the delay starting
 # nothing; the brownout without a reset (VDD out of its window while the
 # core runs and RESN is not asserted: reported, the core held, its wakes
-# stopped — and nothing with RESN asserted first); the native firmware
-# image's pads through the package's bank supplies, floating before START;
-# and the fast pad's strength fitted to the datasheet's output table. The
+# stopped — and nothing with RESN asserted first); and the fast pad's
+# strength fitted to the datasheet's output table. The
 # final pass: a coupled 0.8 V swing on `XI` is the crystal from the instant
 # the core's clock word turns `XI`'s 1 MΩ feedback on, and none in the
 # clock mode the chip starts in.
