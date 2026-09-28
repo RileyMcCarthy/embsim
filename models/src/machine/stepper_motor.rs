@@ -21,8 +21,7 @@
 //!    the only option for a source that really does toggle a pin, but it costs
 //!    the engine one drive + resolution + sense per step.
 //! 2. **A periodic drive** — a source that drives `STEP` with
-//!    [`embsim_board::Drive::Periodic`] (an [`embsim_board::McuComponent`]
-//!    with a bridged pulse-out channel) puts a square wave on the net, and
+//!    [`embsim_board::Drive::Periodic`] puts a square wave on the net, and
 //!    the drive's `STEP` sense is handed its segment
 //!    ([`embsim_board::PeriodicSense`]) — rate,
 //!    accumulated count, ceiling and anchor — **once per rate change**. The

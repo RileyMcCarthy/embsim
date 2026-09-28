@@ -21,9 +21,6 @@
 #include "hw/loader.h"
 #include "qemu/error-report.h"
 #include CONFIG_DEVICES
-#ifdef CONFIG_P2_EMBSIM_FLASH
-#include "flashbus.h"
-#endif
 
 /* One definition, in cpu.h: the CPU's ROM-boot base is derived from it. */
 #define P2_HUB_SIZE P2_HUB_BYTES
@@ -51,26 +48,6 @@
 #define P2_QUANTUM_NS 48
 
 static QEMUTimer *p2_quantum;
-
-/*
- * `-M p2,flash=<file>` -- the image the boot flash comes up holding, which is
- * what a loader would have left behind. 16 MiB is the density of the part on
- * the Parallax P2-EC32MB module (a Winbond W25Q128JV); an image shorter than
- * that leaves the rest erased, as a real part does.
- */
-#define P2_FLASH_CAPACITY (16 * 1024 * 1024)
-static char *p2_flash_file;
-
-static char *p2_get_flash(Object *obj, Error **errp)
-{
-    return g_strdup(p2_flash_file);
-}
-
-static void p2_set_flash(Object *obj, const char *value, Error **errp)
-{
-    g_free(p2_flash_file);
-    p2_flash_file = g_strdup(value);
-}
 
 static void p2_quantum_tick(void *opaque)
 {
@@ -139,9 +116,9 @@ static void p2_machine_init(MachineState *machine)
 
     /*
      * `-bios <rom>` boots the chip the way silicon does: the 16 KB Parallax
-     * boot ROM goes to the top of hub, cog 0 is seeded from its base, and
-     * everything else has to arrive over the flash bus. Nothing else is
-     * preloaded -- that is the whole point of the mode.
+     * boot ROM goes to the top of hub and cog 0 is seeded from its base.
+     * The flash the ROM bit-bangs is a board component on embsim's nets,
+     * not a device of this binary. Nothing else is preloaded.
      *
      * Loaded HERE, before the CPUs exist, for the same reason -kernel is: a
      * `-device loader` file is written by a reset handler registered after the
@@ -163,38 +140,6 @@ static void p2_machine_init(MachineState *machine)
         g_free(buf);
         g_free(path);
         p2_boot_from_rom = true;
-
-        /*
-         * And put the flash on the pins. Installed even with no image: an
-         * erased part that answers is a different thing from no part at all,
-         * and the ROM distinguishes them -- so a test for "the ROM gives up
-         * gracefully" needs the empty case to be reachable.
-         *
-         * Only in a build with the flash bus (CONFIG_P2_EMBSIM_FLASH).
-         * Without it the pins belong to whatever bus the host installs --
-         * embsim-p2-qemu's, where the flash is a component on the board.
-         */
-#ifdef CONFIG_P2_EMBSIM_FLASH
-        if (p2_flash_file) {
-            gsize flen;
-            char *fbuf;
-
-            if (!g_file_get_contents(p2_flash_file, &fbuf, &flen, NULL)) {
-                error_report("p2: cannot read flash image %s", p2_flash_file);
-                exit(1);
-            }
-            p2_flashbus_init((const uint8_t *)fbuf, flen, P2_FLASH_CAPACITY);
-            g_free(fbuf);
-        } else {
-            p2_flashbus_init(NULL, 0, P2_FLASH_CAPACITY);
-        }
-#else
-        if (p2_flash_file) {
-            error_report("p2: flash=%s needs a build with the flash bus "
-                         "(CONFIG_P2_EMBSIM_FLASH)", p2_flash_file);
-            exit(1);
-        }
-#endif
     }
 
     for (i = 0; i < P2_NUM_COGS; i++) {
@@ -215,10 +160,6 @@ static void p2_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
     mc->no_parallel = 1;
-
-    object_class_property_add_str(oc, "flash", p2_get_flash, p2_set_flash);
-    object_class_property_set_description(oc, "flash",
-        "Image the boot SPI flash comes up holding (with -bios)");
 }
 
 static const TypeInfo p2_machine_types[] = {

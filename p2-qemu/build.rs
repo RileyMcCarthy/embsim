@@ -211,18 +211,18 @@ impl LinkLine {
             .filter(|t| t.ends_with(".o") && !t.ends_with("system_main.c.o"))
             .map(absify)
             .collect();
-        // The standalone emulator's flash bus links embsim-cffi, a Rust
-        // staticlib carrying its own copy of std, and two Rust runtimes in one
-        // binary is a duplicate-symbol wall (`rust_eh_personality`, the
-        // allocator shims). The node's tree is configured without it.
+        // A build configured before the standalone flash bus was removed still
+        // has flashbus.c.o on the link line. That object is gone from this
+        // tree; refuse the stale build rather than fail at link with a
+        // missing file.
         if let Some(flashbus) = objects
             .iter()
             .find(|o| o.to_string_lossy().ends_with("_flashbus.c.o"))
         {
             panic!(
-                "{} is in the link line: this tree was configured for the standalone \
-                 qemu-system-p2 (CONFIG_P2_EMBSIM_FLASH). Configure the node's tree with \
-                 --with-devices-p2=node and no embsim-cffi flags (qemu-target/README.md).",
+                "{} is in the link line: this QEMU build still has the removed \
+                 standalone flash bus. Delete the build directory and reconfigure \
+                 (qemu-target/README.md).",
                 flashbus.display()
             );
         }

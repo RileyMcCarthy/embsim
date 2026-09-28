@@ -537,7 +537,7 @@ already knows how to be, and refuses to guess the rest, which then registers by
 so a `J`-prefixed solder link registers as the switch it is and a `J`-prefixed
 mounting hole as mechanical. It is opt-in because an empty part name in a real
 export means a damaged export, not a naming convention. Reference fixture:
-`board/tests/fixtures/p2_ec32mb.net` (Parallax P2-EC32MB module, 114
+`boards/netlists/p2_ec32mb.net` (Parallax P2-EC32MB module, 114
 components, zero part names — 85 passives and 2 pad/socket symbols classify, 2
 switches, 4 mechanical parts and 21 active parts register).
 

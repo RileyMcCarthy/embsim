@@ -109,7 +109,7 @@ const PACE_MIN_SLEEP: Duration = Duration::from_micros(50);
 /// Defaults to `0` (uninitialized) rather than any specific part's frequency,
 /// so a project that forgets to call `init` gets an obviously-wrong `0` from
 /// cycle math instead of silently inheriting another MCU's clock. Platform
-/// crates (e.g. `embsim-p2`) own their real frequency.
+/// crates own their real frequency.
 static CLOCK_FREQ: AtomicU32 = AtomicU32::new(0);
 
 /// 1 once [`init`] has run.
@@ -566,8 +566,8 @@ fn lock_sched() -> MutexGuard<'static, Sched> {
 /// thread that exits — or unwinds — stops holding the barrier). Binds the
 /// calling thread, so [`wait_until`] finds the identity without plumbing.
 ///
-/// Deliberately `!Send`, exactly like `embsim_peripherals::instance`'s binding
-/// guard: dropping it on another thread would clear the wrong thread's binding
+/// Deliberately `!Send`: dropping it on another thread would clear the wrong
+/// thread's binding
 /// and leave this one accounted as permanently runnable.
 #[derive(Debug)]
 pub struct Actor {

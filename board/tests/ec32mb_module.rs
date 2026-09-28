@@ -1,5 +1,5 @@
 //! The Parallax P2-EC32MB module as a [`Board`] — a whole vendor module
-//! ingested from its netlist, with the P2 itself as an [`McuComponent`].
+//! ingested from its netlist, with the P2 package filling `U100`.
 //!
 //! # What this binary is for
 //!
@@ -21,7 +21,7 @@
 //!
 //! # Sources
 //!
-//! - `fixtures/p2_ec32mb.net` — the module netlist (provenance in its header:
+//! - `embsim_boards::ec32mb::NETLIST` — the module netlist (provenance in its header:
 //!   Parallax P2-EC32MB Rev B schematic, 29 Mar 2022, CC BY-SA 4.0).
 //! - Parallax "P2 Edge Module with 32MB RAM" Rev B product guide, for the pin
 //!   map claims quoted at each assertion: P0-P39 free, P40-P57 consumed by the
@@ -42,7 +42,7 @@ use embsim_board::{
 };
 use machine_parts::{ec32mb_board, ec32mb_registry, edge_fingers, ep, p2_edge_module};
 
-const EC32MB: &str = include_str!("fixtures/p2_ec32mb.net");
+const EC32MB: &str = embsim_boards::ec32mb::NETLIST;
 
 /// Component count of the transcribed module netlist.
 const EXPECTED_COMPONENTS: usize = 114;
@@ -211,9 +211,7 @@ fn every_p2_io_pin_is_reachable() {
         "the P2 package facade is 64 I/O + VDD + GND + TEST + RESN + XI + XO + 16 bank supplies"
     );
 
-    // The bridged force-gauge channel sits on two of the package's pads,
-    // which the package declares like every other pad: bidirectional and
-    // released until the core drives one.
+    // Every pad is released until a core drives it.
     let p2 = p2_edge_module("p2");
     let rx = p2
         .pins()
@@ -225,15 +223,12 @@ fn every_p2_io_pin_is_reachable() {
         .iter()
         .find(|p| p.number == "P2")
         .expect("P2 declared");
-    // The channel carries levels, so neither pin declares a byte route: the
-    // framing lives in the MCU component, and what is on the net is edges.
     assert!(rx.reads_when_subscribed());
     assert_eq!(rx.idle, None);
     assert!(tx.reads_when_subscribed());
     assert_eq!(
         tx.idle, None,
-        "P2 is the force-gauge TX pin: the bridge drives it from the START instant, the \
-         package declares it released like every pad"
+        "every pad is released until a core drives it"
     );
 }
 

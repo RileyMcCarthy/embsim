@@ -7,8 +7,8 @@
  * deliberately: the CPU forwards what the firmware executed and nothing
  * electrical lives on this side of the line. Smart-pin state machines, nets
  * and UART peers belong to the implementation behind these ops: the bring-up
- * model (pinbus.c) or the flash bus (hw/p2/flashbus.c) in the standalone
- * binary; embsim-p2-qemu's bus (its hostdrive.c) on the engine thread.
+ * model (pinbus.c) in the standalone binary, or embsim-p2-qemu's bus
+ * (its hostdrive.c) on the engine thread.
  *
  * Polarity, from p2core's trait documentation -- both of these hang the guest
  * if inverted:

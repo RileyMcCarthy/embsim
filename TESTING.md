@@ -10,19 +10,13 @@ peripherals, models, board engine, runtime, and tools.
 cargo test --workspace --all-targets
 cargo test --workspace --doc
 cargo test -p embsim-trace --no-default-features   # headless recorder path
-cargo test -p embsim-peripherals -p embsim-board --release   # timing-sensitive smoke
+cargo test -p embsim-board --release   # timing-sensitive smoke
 
 # Determinism (Oracle 1). `--nocapture` prints, per case, the asserted stepped
 # identity and the measured free-running divergence; see rule 8 below.
 cargo test -p embsim-board --test determinism -- --nocapture
 # Stepped-clock mechanics (the barrier, the time-release, the wedge report).
 cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
-
-# Peripheral pin bridges. Each is its own binary because it owns the
-# process-default peripheral banks (see rule 5). `--nocapture` prints the
-# measured engine-event budget and the stepped N-run identity.
-cargo test -p embsim-board --test pulse_bridge --test carriage_seam -- --nocapture
-cargo test -p embsim-board --test pulse_bridge_stepped -- --nocapture
 
 # The EdgeBoard's RS-422 pair live, an SD card driven bit by bit over nets,
 # and the RS-422 receiver started twelve times in one process (each stepped,
@@ -224,7 +218,6 @@ cargo test -p embsim-board --test resolution_rules
 # interface phase) and the stepper plant that folds it are unit-tested in
 # their crates: an hour of a 10 MHz train counts exactly, a rate change
 # between two microseconds folds each side exactly.
-cargo test -p embsim-peripherals --lib pulse_out
 cargo test -p embsim-models --lib stepper_motor
 ```
 
@@ -232,17 +225,11 @@ Per-crate iteration:
 
 ```bash
 cargo test -p embsim-core
-cargo test -p embsim-peripherals
 cargo test -p embsim-models
-cargo test -p embsim-qemu            # QEMU node; the real-QEMU case skips loudly without qemu-system-aarch64
-cargo test -p embsim-runtime
 cargo test -p embsim-board
-cargo test -p embsim-p2
 cargo test -p embsim-memory-inspect
 cargo test -p embsim-trace
 cargo test -p embsim-ui
-cargo test -p embsim-build
-cargo test -p embsim-minimal-example
 cargo test -p embsim-cpu-oracle          # ISS-vs-silicon golden parse/diff
 ```
 
@@ -266,24 +253,13 @@ cargo llvm-cov --workspace --summary-only
    fn init_count_allowed(#[case] n: usize) { … }
    ```
 
-3. **Peripheral free-function tests** always start with:
-
-   ```rust
-   let _g = crate::test_support::guard();
-   crate::test_support::ensure_clock();
-   ```
-
-   Never call `virtual_clock::init` / `set_scale` from `embsim-peripherals`
-   tests (the shared clock is pinned once — see `peripherals/src/lib.rs`).
-
-4. **Assert contracts, not wall flakiness.** Prefer virtual-time schedules,
+3. **Assert contracts, not wall flakiness.** Prefer virtual-time schedules,
    monotonicity, clamps, and ε windows. Dedicated paced-stream tests that pin
    scale and assert wall delay are the exception (document why). A wall-clock
    wait for what a stepped run must do *eventually* — a burst to finish
    crossing, a node to reach its next slice — is sized for a hang, never for
    a speed: the wall time a stepped run takes is the engine's cost per edge
-   times its edges, and the runner decides that (`qemu/tests/loopback.rs`'s
-   `EVENTUALLY`, with the measurements that sized it).
+   times its edges, and the runner decides that.
 
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`
@@ -298,16 +274,6 @@ cargo llvm-cov --workspace --summary-only
    actor is allowed — the actor stays registered — so a binary whose cases
    spawn long-lived actor threads (the ADS122U04 model does) still belongs in
    its own test binary so leftover actors cannot hold a later case's barrier.
-
-   **The process-default peripheral banks are the same kind of global.** A case
-   that plays firmware through the `embsim-peripherals` free functions
-   (`pulse_out::start`, `gpio::set_active`, …) shares one bank with every other
-   case in its process, so those cases live in their own binary, take one suite
-   lock, and `reset()` the banks they used on the way out —
-   `pulse_bridge.rs`, `pulse_bridge_stepped.rs` and `carriage_seam.rs` are the
-   pattern. Keeping them out of `determinism.rs` is deliberate: its cases are
-   pure board components, and a global bank underneath them would make an
-   unrelated failure look like a determinism regression.
 
 6. **Property tests (`proptest`)** only for continuous domains (e.g. analog
    resistor ladders). Use fixed seeds when non-determinism would flake CI.

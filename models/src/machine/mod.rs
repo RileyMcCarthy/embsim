@@ -38,9 +38,8 @@
 //!   ([`stepper_motor::MotorShaft`], [`quadrature_encoder::EncoderInput`],
 //!   [`end_switch::EndSwitchActuator`]) is cloned out beforehand and is how
 //!   physics chains and tests read/drive the part afterwards.
-//! - **Pin identity is the signal name** (`"STEP"`, `"A"`, `"COM"`), matching
-//!   [`embsim_board::McuComponent`]'s `"P{n}"` convention: a bench-attached
-//!   component's pins become nets named `"{name}.{pin}"`
+//! - **Pin identity is the signal name** (`"STEP"`, `"A"`, `"COM"`): a
+//!   bench-attached component's pins become nets named `"{name}.{pin}"`
 //!   ([`embsim_board::System::component`]), so a harness reads
 //!   `"MOTOR.STEP"`. A netlist that *places* one of these parts must name the
 //!   matching pins through KiCad `pinfunction` (the netlist pin identity is

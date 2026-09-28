@@ -8,7 +8,6 @@
 //! - [`isolation`] — the parts between an MCU pin and the machine: the TI
 //!   ISO67xx digital isolator family, and the supply-gating and projection
 //!   helpers the interface models share
-//! - [`limit_switch`] — position-threshold limit switch
 //! - [`sd_card`] — an SD card, device side, in SPI mode: a byte-level protocol
 //!   model that knows nothing about who is clocking it
 //! - [`sd_card_component`] — that model as a live `embsim-board` component
@@ -64,7 +63,6 @@ pub mod ads122u04_component;
 pub mod edge;
 pub mod fat16;
 pub mod isolation;
-pub mod limit_switch;
 pub mod logic_gate;
 pub mod machine;
 pub mod opto;

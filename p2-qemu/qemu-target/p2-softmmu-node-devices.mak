@@ -4,6 +4,5 @@
 # embsim-p2-qemu's configuration for p2-softmmu, selected with
 # `--with-devices-p2=node`.
 #
-# The node's flash is a component on the board's nets, so the standalone flash
-# bus -- and the embsim-cffi archive it links -- stays out of the tree.
-CONFIG_P2_EMBSIM_FLASH=n
+# Same device set as the default: the board, and no flash device. The flash
+# the ROM bit-bangs is a component on the board's nets.

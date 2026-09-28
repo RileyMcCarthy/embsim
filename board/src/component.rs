@@ -177,10 +177,9 @@ pub enum Drive {
     ///   carries no direction: a step/direction drive reads its DIR input
     ///   at the instant the DIR net changes.
     /// - **Counts are exact at the peripheral's own truncation.**
-    ///   `emitted_at_ns` floors `elapsed_ns × freq / 1_000_000_000` exactly as
-    ///   `embsim_peripherals::pulse_out::PulseOut::run` does, so consumer
-    ///   and firmware agree bit for bit — both share that truncation, at the
-    ///   engine's own nanosecond.
+    ///   `emitted_at_ns` floors `elapsed_ns × freq / 1_000_000_000`, so every
+    ///   consumer of a segment agrees on the count, at the engine's own
+    ///   nanosecond.
     /// - **Phase is not modelled.** Two periodic sources that contend on one
     ///   root are contention whatever their segments say — two sources
     ///   agreeing by construction is a wiring the reference machine does not

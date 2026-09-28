@@ -394,8 +394,9 @@ case: one central scheduler, all actors parking with an explicit deadline.
 Which of today's actors fit:
 
 - **Engine thread** — it is the scheduler. Fits by construction.
-- **Pure components** — `models/src/limit_switch.rs`, and the gantry/sampling
-  models when they move onto the wheel. These are *not separate actors at all*:
+- **Pure components** — a machine part whose wake and sense callbacks run on
+  the engine thread, and the gantry/sampling models when they move onto the
+  wheel. These are *not separate actors at all*:
   their wake and sense callbacks run **on the engine thread**. This is the
   payoff of `BOARD_ENGINE.md`'s "no broadcast `tick()`, engine-owned wakeups"
   decision — every component that gets its time from `io.schedule_at` /
@@ -456,18 +457,6 @@ that answer it:
   **UI-driven E2E stays T0/T1-with-host-io**. The fully deterministic scenarios
   are the ones scripted inside the emulator process — which is what the
   bench-bug suite wants anyway.
-
-- **A computer node (`embsim-qemu`) is host I/O with a metered clock.** The
-  `QemuNode` runs a real OS and a real browser inside a VM, so its
-  scheduling, its network stack and its JIT are as non-reproducible as a
-  human at a terminal — a run with one in it is T1-with-host-io like the PTY
-  above, not T1. What it adds over the PTY is a *bound*: the node is a
-  registered actor that parks at every slice boundary and lets the guest run
-  only while it is awake, so the guest's clock and the virtual clock never
-  drift apart by more than one slice (`QemuNode::with_slice`, default 10 ms)
-  and a host-side timeout counts simulated time. That is the property to
-  assert about such a run — `NodeStats::skew_ns` bounded, `shed` zero — not
-  a golden trace.
 
 - **Wall-clock deadlines inside the simulation** must become virtual:
   `Serial::receive_data_timeout`'s `Instant` deadline and its EAGAIN sleep,

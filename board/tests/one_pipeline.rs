@@ -37,7 +37,7 @@ use machine_parts::{edge_board, shipped_ec32mb_board};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
-const EC32MB_NETLIST: &str = include_str!("fixtures/p2_ec32mb.net");
+const EC32MB_NETLIST: &str = embsim_boards::ec32mb::NETLIST;
 
 /// The system name the module is built under here.
 const MODULE: &str = "EC32MB";

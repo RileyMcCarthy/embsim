@@ -5,8 +5,8 @@
 //! supplies, reset and test, and the crystal pair. It declares those pins
 //! once, delivers what the board puts on them to the core, and puts on the
 //! nets what the core drives. The core is whatever executes instructions —
-//! QEMU's target (`embsim-p2-qemu`), an instruction-set simulator, or the
-//! native firmware image behind [`McuComponent`] — and it never sees a net:
+//! QEMU's target (`embsim-p2-qemu`) or an instruction-set simulator — and
+//! it never sees a net:
 //! it is handed [`P2Pads`], which is exactly the surface `NODES.md` §11
 //! gives a node, narrowed to the pads.
 //!
@@ -120,10 +120,9 @@
 //! (released), and the package reports the bank once, by its supply pin
 //! (`tracing::warn`, and [`P2PackageHandle::unpowered_banks_driven`]).
 //! The build already names such a pin: an unsourced `VIO_a_b` is a
-//! [`embsim_board::Finding::PowerNetUnsourced`] on its net. The native
-//! core's bridged pads drive the same way, through
-//! [`McuComponent::host_pads`] (its `P2Core` impl), in the fast mode
-//! [`NATIVE_PAD_MODE`], from the START instant on.
+//! [`embsim_board::Finding::PowerNetUnsourced`] on its net. A core that
+//! drives a pad does it in the fast mode [`NATIVE_PAD_MODE`], from the
+//! START instant on.
 //!
 //! # Pad drive strength (the `WRPIN` pin-configuration field)
 //!
@@ -193,15 +192,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use embsim_board::{
     jesd8c01_lvcmos_thresholds, Amps, AttachError, Component, ComponentNetIo, DeadBand,
-    DigitalReceiver, Level, McuComponent, Ohms, PinDecl, PinHandle, Sense, TheveninDrive,
-    Thresholds, Volts, WakeGate, WakeHandler,
+    DigitalReceiver, Level, Ohms, PinDecl, PinHandle, Sense, TheveninDrive, Thresholds, Volts,
+    WakeGate, WakeHandler,
 };
 use embsim_core::virtual_clock;
 
 /// The crate's nominal logic high, [`embsim_board::net::LOGIC_HIGH_VOLTS`]:
-/// what an [`McuComponent`] on a board of its own drives at. A pad any
-/// core publishes inside the package — the native core's included —
-/// drives at its bank's supply instead ([`BankSupplies`]).
+/// what a bench digital output drives at. A pad a core publishes inside
+/// the package drives at its bank's supply instead ([`BankSupplies`]).
 pub const LOGIC_HIGH_VOLTS: Volts = embsim_board::net::LOGIC_HIGH_VOLTS;
 
 /// I/O pads on the package.
@@ -1006,17 +1004,14 @@ impl WakeGate for CoreWakes {
 /// crystal on `XI`, the reset inputs), the bank supplies, and wake
 /// scheduling through the package's START gate. Handed to
 /// [`P2Core::attach`] once, by the package; a core keeps the handles it
-/// needs and subscribes to what it wants delivered. (The native core takes
-/// the underlying net I/O whole — see [`McuComponent`]'s `P2Core` impl —
-/// and that I/O's wakes go through the same gate.)
+/// needs and subscribes to what it wants delivered.
 ///
 /// A pad sense is also the declaration that the core **reads** that pad:
 /// every pad is a released bidirectional pin, an input until driven, and a
 /// pad the core subscribes to whose net floats is reported as
 /// [`embsim_board::Finding::FloatingSense`] — a pad nothing reads floats
 /// without one. A core subscribes to what it samples: the QEMU core to all
-/// 64 (a guest may `testp` any of them), the native core to the pads its
-/// HAL tables bridge, a core held in reset to none.
+/// 64 (a guest may `testp` any of them), a core held in reset to none.
 ///
 /// Wakes go through the START gate: a wake asked for before the core is
 /// started is held and lands at the START instant; one asked for after
@@ -1175,59 +1170,6 @@ impl P2Core for HeldInReset {
     }
 }
 
-/// The native firmware image is a core too: [`McuComponent`] already
-/// speaks the node interface, so the package hands it the pads' net I/O
-/// and it bridges the channels its HAL tables name, exactly as it would
-/// on a board of its own. The package still declares every pin and still
-/// runs its own `XI`/`RESN`/`VDD`/`VIO` senses beside it, and its START
-/// gate holds the firmware entry ([`McuComponent`]'s `start`) and every
-/// wake the core asks for, as it holds any core's.
-///
-/// What it is handed is the package's **whole** net I/O — the handle table
-/// carries `XI`, `XO`, `RESN`, `VDD` and the `VIO` pins beside the 64 pads
-/// — and the narrowing to the pads is by what the core names, not by a
-/// filter: its HAL tables name pads (`P0`, `P2`, …) and nothing else. The
-/// interface is the same one every node has, so nothing is reachable that
-/// a node could not reach; the package-level facts still arrive through
-/// the package's own senses, as for any core. Its wake handler and its
-/// schedules go through the START gate ([`ComponentNetIo::with_wake_gate`]).
-///
-/// Its pads are the package's like any core's ([`McuComponent::host_pads`]):
-/// a bridged pad drives through [`BankSupplies::pad_drive`] in
-/// [`NATIVE_PAD_MODE`] — high at its bank's `VIO_a_b`, at
-/// [`P2_FAST_OHMS`], nothing in a bank whose supply names no voltage, the
-/// bank reported once — and nothing before the START instant, where the
-/// package runs the core's `start` and the bridged outputs present their
-/// power-on state (a chip in reset floats every pad).
-impl P2Core for McuComponent {
-    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
-        let banks = pads.bank_supplies();
-        self.host_pads(Arc::new(move |pin, level| {
-            let pad = pad_of(pin)?;
-            match banks.pad_drive(pad, NATIVE_PAD_MODE, true, level == Level::High) {
-                PadDrive::Thevenin(drive) => Some(drive),
-                PadDrive::Released | PadDrive::CurrentSource(_) => None,
-            }
-        }));
-        Component::attach(self, pads.io)
-    }
-
-    fn start(&mut self) {
-        Component::start(self);
-    }
-
-    /// The native firmware runs on a thread of its own and cannot be
-    /// stopped from here: the package stops delivering its wakes, and says
-    /// that the firmware itself runs on.
-    fn reset(&mut self) {
-        tracing::warn!(
-            mcu = self.name(),
-            "p2: the native core cannot be held — its firmware runs on its own thread and \
-             keeps running; only its wakes stop"
-        );
-    }
-}
-
 /// A view of a package's delivered facts that outlives handing it to a
 /// `System`.
 #[derive(Clone)]
@@ -1343,13 +1285,6 @@ impl P2Package<HeldInReset> {
     /// `XI` accepting the rate — the state any P2 is in before it runs.
     pub fn held_in_reset() -> Self {
         Self::new(HeldInReset)
-    }
-}
-
-impl P2Package<McuComponent> {
-    /// The package around the native firmware image.
-    pub fn native(mcu: McuComponent) -> Self {
-        Self::new(mcu)
     }
 }
 

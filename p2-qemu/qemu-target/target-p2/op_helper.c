@@ -21,8 +21,8 @@
  * the SD driver bit-bangs one every 1-3 instructions.
  *
  * They forward to whatever P2PinBus is installed (pinbus.h) -- the bring-up
- * model (pinbus.c) or the flash bus (hw/p2/flashbus.c) in the standalone
- * binary; embsim-p2-qemu's bus (its hostdrive.c) on the engine thread.
+ * model (pinbus.c) in the standalone binary, or embsim-p2-qemu's bus
+ * (its hostdrive.c) on the engine thread.
  * Nothing electrical is decided here.
  */
 

@@ -2,19 +2,12 @@
 members = [
     "board",
     "core",
-    "peripherals",
-    "platforms/p2",
     "models",
     "boards",
-    "cffi",
     "p2-qemu",
-    "qemu",
-    "runtime",
-    "build-support",
     "tools/memory-inspect",
     "tools/ui",
     "tools/trace",
-    "examples/minimal",
     "cpu-oracle",
 ]
 resolver = "2"

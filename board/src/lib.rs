@@ -34,8 +34,6 @@
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
 //! - [`event_log`] — opt-in [`EventLog`]: the engine's totally-ordered event transcript
 //!   (determinism Oracle 1, `DETERMINISM.md`) with its normalization contract
-//! - [`mcu`] — [`McuComponent`]: the MCU as a component — serial, GPIO,
-//!   pulse-out and encoder channels bridged to physical pins
 //! - [`uart`] — asynchronous serial framing, so a byte-oriented peripheral
 //!   can put its bits on a net instead of bypassing it
 //! - [`serial_levels`] — [`SerialLevelBridge`]: that codec wired to a pin, with
@@ -48,7 +46,6 @@ pub mod diagnostics;
 pub mod engine;
 pub mod event_log;
 pub mod host_pty;
-pub mod mcu;
 pub mod net;
 pub mod netlist;
 pub mod registry;
@@ -73,7 +70,6 @@ pub use diagnostics::{
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use host_pty::{HostPty, HostPtyCounters};
-pub use mcu::{McuBuildError, McuBuilder, McuComponent, PadPorts};
 pub use net::{
     digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
     COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO, V_IH, V_IL, WEAK_DRIVE_OHMS,
