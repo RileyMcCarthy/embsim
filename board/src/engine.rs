@@ -9500,8 +9500,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                net_table[0].volts.dc,
-                None,
+                net_table[0].volts.dc, None,
                 "a still-running schedule has no resting DC even past completes_at"
             );
 
