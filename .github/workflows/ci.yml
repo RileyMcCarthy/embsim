@@ -291,8 +291,9 @@ jobs:
   # nets, with QEMU as the CPU (p2-qemu/README.md). QEMU is built from a clean
   # checkout with this repository's target sources and linked into the test
   # binary as a library; the build is cached on everything that changes it.
-  # Without EMBSIM_QEMU_P2_BUILD the crate is a stub and the test asserts
-  # nothing, so the ordinary `test` job cannot stand in for this one.
+  # Without EMBSIM_QEMU_P2_BUILD the crate is a stub: the boot test is not
+  # built, and a unit test asserts the node is unavailable. This job is the
+  # one that links QEMU and runs the boot.
   p2-qemu-boot:
     name: p2-qemu-boot
     runs-on: ubuntu-latest

@@ -107,18 +107,6 @@ pub const TCXO_PINS: [PinDecl; 4] = [
     passive("NC_GND"),
 ];
 
-/// `SPI Flash 16MB (128Mb)` — Winbond W25Q128JV (U301).
-pub const SPI_FLASH_STUB_PINS: [PinDecl; 8] = [
-    pwr_in("VSS"),
-    pwr_in("VCC"),
-    dig_in("CLK"),
-    dig_in("CSn"),
-    dig_in("DI_IO0"),
-    dig_in("DO_IO1"),
-    dig_in("HOLDn"),
-    dig_in("WPn"),
-];
-
 /// `PSRAM 64Mbit` — AP Memory APS6404L (U302..U305). `NC_EP` is the exposed
 /// pad, tied per the vendor's asymmetric routing note.
 pub const PSRAM_PINS: [PinDecl; 9] = [
@@ -185,7 +173,7 @@ pub const DIP_SWITCH_PINS: [PinDecl; 8] = [
 /// Reference designators the module netlist declares that have no electrical
 /// existence: `PCB` is the raw board (no nodes at all) and `NC_Net` a layout
 /// node. Passed to [`Board::from_netlist_with_stubs`].
-pub const EC32MB_STUB_REFS: [&str; 2] = ["PCB", "NC_Net"];
+pub const EC32MB_STUB_REFS: [&str; 2] = STUB_REFS;
 
 /// Every part that is a pin facade and nothing more. [`Ec32mb::registry`]
 /// layers the live models and the processor slot on top.
@@ -198,11 +186,8 @@ fn stub_registry() -> PartRegistry {
 
     register_stub(&mut registry, "74LVC2G04GW,125", &INVERTER_2G04_PINS);
     register_stub(&mut registry, "TG2520SMN 20.0000M-ECGNNM3", &TCXO_PINS);
-    register_stub(
-        &mut registry,
-        "SPI Flash 16MB (128Mb)",
-        &SPI_FLASH_STUB_PINS,
-    );
+    // The flash is always the live model (`Ec32mb::registry` registers
+    // `FLASH_PART`). A stub pin table here was overwritten on every build.
     register_stub(&mut registry, "PSRAM 64Mbit", &PSRAM_PINS);
     register_stub(&mut registry, "P Mosfet 30V 8A", &POLARITY_FET_PINS);
     register_stub(&mut registry, "DCDC 3A SOT563", &BUCK_PINS);

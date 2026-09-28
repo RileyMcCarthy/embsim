@@ -56,7 +56,7 @@ reference consumer.
 |-------|------|------------|
 | `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
 | `embsim-peripherals` | [`peripherals/`](peripherals) | GPIO, serial, encoder, pulse trains, timer, locks, threads, I2C, filesystem |
-| `embsim-models` | [`models/`](models) | Generic device/IC models (ADS122U04 ADC, limit switch, edge detector) |
+| `embsim-models` | [`models/`](models) | Generic device models: ADS122U04, a serial NOR flash, an SD card in SPI mode, a FAT16 image, limit switch, edge detector |
 | `embsim-qemu` | [`qemu/`](qemu) | A QEMU VM as a board component: guest clock metered by the virtual clock, serial port on a net |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets, every edge at its own instant. Carries the `target/p2` sources |
 | `embsim-boards` | [`boards/`](boards) | Real boards from vendor netlists (the P2-EC32MB), with slots for the parts under test |
