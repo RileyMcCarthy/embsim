@@ -531,3 +531,235 @@ impl SdCard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Enough image for a few block addresses without depending on any board
+    /// fixture.
+    const CAPACITY: usize = 16 * BLOCK_LEN;
+
+    fn powered() -> SdCard {
+        let mut card = SdCard::blank(CAPACITY);
+        card.set_selected(true);
+        card
+    }
+
+    /// 6-byte command frame, then clock until `want` response bytes whose first
+    /// has bit 7 clear (the R1 marker).
+    fn command(card: &mut SdCard, cmd: u8, arg: u32, want: usize) -> Vec<u8> {
+        let a = arg.to_be_bytes();
+        for b in [0x40 | cmd, a[0], a[1], a[2], a[3], 0x01] {
+            card.xfer(b);
+        }
+        let mut out = Vec::new();
+        for _ in 0..16 {
+            let b = card.xfer(0xFF);
+            if out.is_empty() && b & 0x80 != 0 {
+                continue;
+            }
+            out.push(b);
+            if out.len() == want {
+                break;
+            }
+        }
+        out
+    }
+
+    fn wait_ready(card: &mut SdCard) {
+        for _ in 0..16 {
+            if card.xfer(0xFF) == 0xFF {
+                return;
+            }
+        }
+        panic!("card never went ready");
+    }
+
+    /// CMD24 → R1 → `$FE` + payload + CRC → data-accepted. Locks the
+    /// `pending_write` / `after_responding` hand-off into `ReceivingBlock`.
+    #[test]
+    fn cmd24_enters_receiving_block_after_r1_and_accepts_the_payload() {
+        let mut card = powered();
+        let payload: Vec<u8> = (0..BLOCK_LEN).map(|i| (i % 251) as u8).collect();
+        let addr = 3u32;
+
+        assert_eq!(command(&mut card, 24, addr, 1), vec![R1_READY]);
+        assert_eq!(
+            card.phase,
+            Phase::ReceivingBlock { addr, got: 0 },
+            "after R1 drains, pending_write becomes ReceivingBlock"
+        );
+        assert!(card.pending_write.is_none(), "pending_write is consumed");
+        assert_eq!(card.writes, vec![addr]);
+
+        assert_eq!(card.xfer(TOKEN_START), 0xFF);
+        assert_eq!(
+            card.phase,
+            Phase::ReceivingBlock { addr, got: 1 },
+            "start token advances the receive counter"
+        );
+        for &b in &payload {
+            card.xfer(b);
+        }
+        card.xfer(0xFF);
+        card.xfer(0xFF);
+
+        assert_eq!(
+            card.xfer(0xFF) & 0x1F,
+            TOKEN_ACCEPTED,
+            "data-accepted token after payload + CRC"
+        );
+        wait_ready(&mut card);
+        assert_eq!(card.phase, Phase::Command);
+        assert_eq!(
+            &card.blocks[addr as usize * BLOCK_LEN..(addr as usize + 1) * BLOCK_LEN],
+            &payload[..]
+        );
+    }
+
+    /// Deselect mid-`ReceivingBlock` (CMD24 answered, no data token yet) must
+    /// abandon the transfer so a later command frame is not eaten as payload.
+    #[test]
+    fn deselect_mid_receiving_block_restores_command_acceptance() {
+        let mut card = powered();
+        assert_eq!(command(&mut card, 24, 1, 1), vec![R1_READY]);
+        assert!(matches!(card.phase, Phase::ReceivingBlock { .. }));
+
+        // Without a deselect, a later frame would be swallowed as payload.
+        assert_eq!(
+            command(&mut card, 0, 0, 1),
+            Vec::<u8>::new(),
+            "still ReceivingBlock: command frame is not answered"
+        );
+
+        card.set_selected(false);
+        assert!(!card.selected);
+        assert_eq!(card.phase, Phase::Command);
+        assert!(card.pending_write.is_none());
+        assert!(card.incoming.is_empty());
+        assert!(card.out.is_empty());
+
+        card.set_selected(true);
+        assert_eq!(
+            command(&mut card, 0, 0, 1),
+            vec![R1_IDLE],
+            "after deselect the card takes a command frame again"
+        );
+    }
+
+    /// Deselect after CMD24 but before R1 fully drains (pending_write still
+    /// set) also clears the pending path.
+    #[test]
+    fn deselect_while_cmd24_r1_is_draining_clears_pending_write() {
+        let mut card = powered();
+        let a = 2u32.to_be_bytes();
+        for b in [0x40 | 24, a[0], a[1], a[2], a[3], 0x01] {
+            card.xfer(b);
+        }
+        // Frame done: Responding with R1 queued, pending_write latched.
+        assert_eq!(card.phase, Phase::Responding);
+        assert_eq!(card.pending_write, Some(2));
+
+        card.set_selected(false);
+        assert!(card.pending_write.is_none());
+        assert_eq!(card.phase, Phase::Command);
+
+        card.set_selected(true);
+        assert_eq!(command(&mut card, 0, 0, 1), vec![R1_IDLE]);
+    }
+
+    /// CMD18 multi-block read ended by CMD12 leaves the card ready for a
+    /// later single-block command.
+    #[test]
+    fn cmd12_ends_a_multi_block_read_cleanly() {
+        let mut image = vec![0u8; CAPACITY];
+        for block in 0..CAPACITY / BLOCK_LEN {
+            image[block * BLOCK_LEN] = block as u8;
+        }
+        let mut card = SdCard::with_image(image);
+        card.set_selected(true);
+
+        assert_eq!(command(&mut card, 18, 4, 1), vec![R1_READY]);
+        assert_eq!(card.multi_read, Some(4));
+        assert_eq!(card.phase, Phase::MultiRead { addr: 4 });
+
+        // One block of the stream.
+        let mut token = 0xFF;
+        for _ in 0..8 {
+            token = card.xfer(0xFF);
+            if token != 0xFF {
+                break;
+            }
+        }
+        assert_eq!(token, TOKEN_START);
+        let first = card.xfer(0xFF);
+        assert_eq!(first, 4);
+        for _ in 1..BLOCK_LEN + 2 {
+            card.xfer(0xFF);
+        }
+        // Draining the last CRC byte already hands off via after_responding —
+        // another idle here would queue the next block.
+        assert_eq!(card.phase, Phase::MultiRead { addr: 5 });
+        assert_eq!(card.multi_read, Some(5));
+
+        assert_eq!(command(&mut card, 12, 0, 1), vec![R1_READY]);
+        assert!(card.multi_read.is_none());
+        assert_eq!(card.phase, Phase::Command);
+        assert_eq!(card.reads, vec![4]);
+
+        // A later single-block read still works.
+        assert_eq!(command(&mut card, 17, 0, 1), vec![R1_READY]);
+        let mut token = 0xFF;
+        for _ in 0..8 {
+            token = card.xfer(0xFF);
+            if token != 0xFF {
+                break;
+            }
+        }
+        assert_eq!(token, TOKEN_START);
+        assert_eq!(card.xfer(0xFF), 0);
+    }
+
+    /// CMD25 multi-block write ended by the `$FD` stop token clears
+    /// `multi_write` and returns to Command after the busy byte.
+    #[test]
+    fn stop_token_ends_a_multi_block_write_cleanly() {
+        let mut card = powered();
+        let payload: Vec<u8> = (0..BLOCK_LEN).map(|i| (i % 200) as u8).collect();
+
+        assert_eq!(command(&mut card, 25, 1, 1), vec![R1_READY]);
+        assert_eq!(card.multi_write, Some(1));
+        assert_eq!(
+            card.phase,
+            Phase::ReceivingBlock { addr: 1, got: 0 },
+            "after CMD25 R1, card waits for the first multi-block token"
+        );
+
+        card.xfer(TOKEN_MULTI_START);
+        for &b in &payload {
+            card.xfer(b);
+        }
+        card.xfer(0xFF);
+        card.xfer(0xFF);
+        assert_eq!(card.xfer(0xFF) & 0x1F, TOKEN_ACCEPTED);
+        wait_ready(&mut card);
+        assert_eq!(card.writes, vec![1]);
+        assert_eq!(card.multi_write, Some(2));
+        assert_eq!(card.phase, Phase::ReceivingBlock { addr: 2, got: 0 });
+        assert_eq!(
+            &card.blocks[BLOCK_LEN..2 * BLOCK_LEN],
+            &payload[..],
+            "first multi-block write landed"
+        );
+
+        // Stop token in place of another start token.
+        assert_eq!(card.xfer(TOKEN_STOP_TRAN), 0xFF);
+        wait_ready(&mut card);
+        assert!(card.multi_write.is_none());
+        assert_eq!(card.phase, Phase::Command);
+
+        // Subsequent command still accepted.
+        assert_eq!(command(&mut card, 0, 0, 1), vec![R1_IDLE]);
+    }
+}
