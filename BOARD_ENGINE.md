@@ -1,6 +1,6 @@
 # Board engine design (`embsim-board`)
 
-**Status:** design accepted, not yet implemented (2026-07-11, revised after adversarial review)
+**Status:** implemented (2026-09-28 — phases 0–5 via #64 / #65; plan/history in [`NODES.md`](NODES.md) §12). This document is the engine's current contract.
 
 `embsim-board` turns embsim from a firmware-centric emulator ("firmware in the
 middle, models hand-wired around it") into a **component-centric system
@@ -9,15 +9,15 @@ the MCU — is a `Component` with named pins, and an engine resolves the nets
 between them. Consumers stop writing wiring code and start writing *system
 descriptions*.
 
-This document specifies the generic engine. Consumer-side specifics (part
-registry entries, harness files, plant models) live in the consuming repo — see
-MaD's `docs/dev/sil-board-simulation-design.md` for the reference consumer and
-the decision record for why this is netlist-structural rather than SPICE.
+Consumer-side specifics (part registry entries, harness files, plant models)
+live in the consuming repo — see MaD's `docs/dev/sil-board-simulation-design.md`
+for the reference consumer and the decision record for why this is
+netlist-structural rather than SPICE.
 
 ## Crate layout
 
 ```
-board/                    # new workspace member: embsim-board
+board/                    # workspace member: embsim-board
 ├── src/netlist.rs        # KiCad s-expression netlist parser → ComponentDecl/NetDecl graph
 ├── src/component.rs      # Component trait, PinDecl, PinRole, Drive, ComponentNetIo
 ├── src/registry.rs       # PartRegistry: identity → constructor; auto-classification tiers
