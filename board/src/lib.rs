@@ -48,7 +48,9 @@ pub mod event_log;
 pub mod host_pty;
 pub mod net;
 pub mod netlist;
+pub mod project;
 pub mod registry;
+pub mod survey;
 pub mod serial_levels;
 pub mod system;
 pub mod uart;
@@ -75,11 +77,15 @@ pub use net::{
     COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
+pub use project::{
+    BoardSpec, Catalog, ComponentSpec, JumperSpec, Project, ProjectError, SwitchSpec, WireSpec,
+};
 pub use registry::{
     reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind, PwlBranch,
     PwlSpec, RegistryError, SwitchPole,
 };
 pub use serial_levels::SerialLevelBridge;
+pub use survey::{BoardSurvey, ConnectorReport, PinSite, UnmodelledPart};
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
     HarnessError, Scenario, System, SystemError, SystemHandle, BUILD_FIXED_POINT_BOUND,

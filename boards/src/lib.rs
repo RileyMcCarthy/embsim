@@ -19,5 +19,6 @@
 //! is a node whose class has behaviour, and a part nobody has modelled is
 //! a build error naming it.
 
+pub mod catalog;
 pub mod ec32mb;
 pub mod p2;
