@@ -366,6 +366,13 @@ jobs:
           EMBSIM_QEMU_P2_BUILD: ${{ github.workspace }}/qemu-build/build-p2
         run: cargo test -p embsim-p2-qemu -- --nocapture
 
+      # The same boot said by a project file and run by the `embsim`
+      # command (`core = "qemu"`), QEMU linked into the binary.
+      - name: Boot the P2 from a project with embsim run
+        env:
+          EMBSIM_QEMU_P2_BUILD: ${{ github.workspace }}/qemu-build/build-p2
+        run: cargo test -p embsim-cli -- --nocapture
+
   ci-gate:
     name: CI Gate
     needs:

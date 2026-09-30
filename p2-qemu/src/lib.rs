@@ -94,8 +94,28 @@ use embsim_core::virtual_clock;
 
 pub use embsim_boards::p2::{p2x8c4m64p_pins, pin_name};
 
+pub mod catalog;
 mod ffi;
 pub mod flashimage;
+
+/// Parallax's boot ROM, the program the chip carries into the top of hub
+/// at reset, trimmed to its boot path — the flash and serial loaders
+/// (`rom/README.md`; MIT, Copyright (c) 2019 Parallax Inc.,
+/// `rom/LICENSE-PARALLAX`). What [`P2Qemu::with_boot_rom`] takes when a
+/// program has no other ROM to give it.
+pub const BOOT_ROM: &[u8] = include_bytes!("../rom/rom_booter_v33k.bin");
+
+/// embsim's stage-1 flash loader (`rom/stage1.spin2`): the kilobyte the ROM
+/// loads off the flash, which [`flashimage::boot_flash`] puts in front of a
+/// program.
+pub const STAGE1: &[u8] = include_bytes!("../rom/stage1.bin");
+
+/// Whether this build carries QEMU: `EMBSIM_QEMU_P2_BUILD` named a QEMU
+/// tree when the crate compiled. Without one, [`P2Qemu::with_boot_rom`]
+/// returns [`P2QemuError::Unavailable`].
+pub const fn linked() -> bool {
+    ffi::linked()
+}
 
 /// How far past its own clock one wake may run the guest, in nanoseconds.
 /// Only bounds the work per wake; the engine is re-armed at wherever the

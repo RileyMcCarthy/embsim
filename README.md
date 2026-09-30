@@ -107,6 +107,7 @@ and refused.
 
 ```
    consumer      your board, your CPU core, your host on the PTY
+   command       embsim-cli        embsim survey / new / check / run
                       │
    boards        embsim-boards     off-the-shelf modules (P2-EC32MB) and the P2 package
    cpu           embsim-p2-qemu    QEMU Propeller 2, pads on nets
@@ -129,6 +130,7 @@ Project-specific wiring lives in the consumer's repo.
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets. Carries the `target/p2` sources |
 | `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
+| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked) |
 | `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from an archive |
 | `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
 | `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer mounts into |
@@ -193,6 +195,48 @@ wire's board end is a connector pin (`Board.Connector.Pin`); its other end is
 another board's connector, a bench component's pin, or, with `volts`, a supply.
 The part kinds and their options are listed in `boards/src/catalog.rs`; the
 example projects are in `boards/projects/`.
+
+### The `embsim` command
+
+`cargo install --path cli` (or `cargo run -p embsim-cli --`) gives the
+command that takes a netlist to a running system. Every step goes through the
+same project, catalog and survey as the Rust above.
+
+```bash
+embsim survey board.net                 # the checklist
+embsim new board.net -o board.toml      # a starter project
+embsim check board.toml                 # build it, time held; say what is left
+embsim run board.toml --for 20ms --net BOARD.VCC
+```
+
+- **`survey`** lists what the catalog populates (by class, and by part
+  number), each part that needs a model with the kinds that could be it (by
+  part number; else by a pin table with exactly its pins; else by pin count),
+  each part placed with a pin table the netlist does not use with the table
+  that fits, and every connector pin with its name and net.
+- **`new`** writes the project that answers the checklist as far as the
+  catalog can: the board, a `[[board.model]]` choosing the pin table that
+  fits for each part the catalog placed with another, a commented stub for
+  each part that needs a model (the kind filled in when exactly one fits),
+  and every connector's pins as the endpoints a `[[wire]]` names. Uncomment
+  the stubs, choose the kinds, wire the connectors.
+- **`check`** loads, surveys and builds the system and starts it with virtual
+  time held: every part attached, nothing yet run. It prints each board's
+  survey line and what the build found, and exits non-zero with the reason —
+  the survey, for a board with a part still unmodelled — on any refusal.
+- **`run`** starts the system on a stepped clock and runs it for `--for` of
+  virtual time (or until interrupted), printing findings and a P2's console
+  as the run reaches them, then the nets asked for with `--net`.
+
+`embsim` knows one more value for the `p2` kind's `core` than the standard
+catalog: `core = "qemu"` seats the QEMU P2 in the package, which boots its
+ROM (`rom = "file"` for another) off whatever the board gives it — on the
+P2-EC32MB, the flash, which `image = "boot.bin"` on the `w25q128jv` kind
+fills (`embsim_p2_qemu::flashimage` lays out stage-1 and a program). QEMU
+has to be linked when `embsim` is built (`EMBSIM_QEMU_P2_BUILD`, see
+`p2-qemu/README.md`); a build without it refuses the entry saying so. The
+boot as a project file is in `cli/tests/cli.rs`
+(`run_boots_the_p2_off_the_modules_flash`).
 
 ## Using embsim in your project
 

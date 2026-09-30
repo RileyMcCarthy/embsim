@@ -28,7 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use crate::netlist::{NetDecl, NodeDecl, ParsedNetlist};
-use crate::registry::{normalize_part, Classification, ModelFacade, PartRegistry, RegistryError};
+use crate::registry::{
+    normalize_part, Classification, Classified, ModelFacade, PartRegistry, RegistryError,
+};
 
 /// One pin of a part, as the netlist draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,13 +101,31 @@ impl ConnectorReport {
     }
 }
 
-/// One part as the survey found it.
+/// One part as the survey found it: the keys a model can be assigned by,
+/// the class the registry gave it, and what gave it that class.
 #[derive(Debug, Clone, PartialEq)]
-struct SurveyedPart {
-    /// Its class; `None` when the registry refused it.
-    class: Option<Classification>,
+pub struct SurveyedPart {
+    /// Reference designator (`"U402"`).
+    pub reference: String,
+    /// Normalized part name. Empty when the export has no libsource.
+    pub part: String,
+    /// Value field.
+    pub value: String,
+    /// Manufacturer part number, when the export carries one.
+    pub mpn: Option<String>,
+    /// Its class; `None` when the registry has none for it, or refused it.
+    pub class: Option<Classification>,
+    /// The registry key that gave it its class ([`crate::Classified::key`]):
+    /// the part name, manufacturer part number or value an entry was
+    /// registered under, or `None` when its symbol or reference designator
+    /// classified it by itself.
+    pub key: Option<String>,
+    /// The model its registration names, with its pin table
+    /// ([`ModelFacade::model`]), for a model registered with the pins it
+    /// declares.
+    pub model: Option<String>,
     /// Its pins, in pin order.
-    pins: Vec<PinSite>,
+    pub pins: Vec<PinSite>,
 }
 
 /// The checklist for one netlist.
@@ -167,13 +187,24 @@ impl BoardSurvey {
             let sites = pin_sites(nodes, &net_of);
             let netlist_pins: Vec<&str> = nodes.iter().map(|node| node.pin.as_str()).collect();
 
-            let class = match registry.classify(decl, nodes.len()) {
-                Ok(class) => {
+            let mut key = None;
+            let mut model = None;
+            let class = match registry.classify_with_key(decl, nodes.len()) {
+                Ok(Classified {
+                    class,
+                    key: classified_by,
+                }) => {
                     modelled += 1;
+                    key = classified_by;
                     let declared: Option<(String, Vec<String>)> = match &class {
-                        Classification::Registered => registry
-                            .facade(decl)
-                            .map(|ModelFacade { model, pins }| (model.clone(), pins.clone())),
+                        Classification::Registered => {
+                            registry
+                                .facade(decl)
+                                .map(|ModelFacade { model: name, pins }| {
+                                    model = Some(name.clone());
+                                    (name.clone(), pins.clone())
+                                })
+                        }
                         Classification::Switch { poles } => Some((
                             "a switch".to_string(),
                             poles
@@ -222,7 +253,19 @@ impl BoardSurvey {
                     None
                 }
             };
-            parts.insert(decl.reference.clone(), SurveyedPart { class, pins: sites });
+            parts.insert(
+                decl.reference.clone(),
+                SurveyedPart {
+                    reference: decl.reference.clone(),
+                    part: normalize_part(decl),
+                    value: decl.value.clone(),
+                    mpn: decl.mpn.clone(),
+                    class,
+                    key,
+                    model,
+                    pins: sites,
+                },
+            );
         }
 
         needs_model.sort_by(|a, b| natural_cmp(&a.reference, &b.reference));
@@ -278,14 +321,18 @@ impl BoardSurvey {
     /// Every part the registry classified, with its class, in reference
     /// order (`J2` before `J10`).
     pub fn classified(&self) -> impl Iterator<Item = (&str, &Classification)> {
-        let mut parts: Vec<(&str, &Classification)> = self
-            .parts
-            .iter()
-            .filter_map(|(reference, part)| {
-                part.class.as_ref().map(|class| (reference.as_str(), class))
-            })
-            .collect();
-        parts.sort_by(|a, b| natural_cmp(a.0, b.0));
+        self.parts().filter_map(|part| {
+            part.class
+                .as_ref()
+                .map(|class| (part.reference.as_str(), class))
+        })
+    }
+
+    /// Every part in the netlist as the survey found it, in reference order
+    /// (`J2` before `J10`) — the classified ones with what classified them.
+    pub fn parts(&self) -> impl Iterator<Item = &SurveyedPart> {
+        let mut parts: Vec<&SurveyedPart> = self.parts.values().collect();
+        parts.sort_by(|a, b| natural_cmp(&a.reference, &b.reference));
         parts.into_iter()
     }
 

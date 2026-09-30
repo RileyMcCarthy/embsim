@@ -57,6 +57,26 @@ still contains `flashbus.c.o` is refused. It compiles `hostdrive.c`
 against QEMU's headers with the target's own flags. `.github/workflows/ci.yml`'s
 `p2-qemu-boot` job does all of it from a clean checkout.
 
+### Linking it into a program of your own
+
+A link argument reaches the package that emits it only, so `build.rs` also
+hands QEMU's link line to a direct dependent: the crate declares `links =
+"qemu-p2"`, and a dependent's build script reads `DEP_QEMU_P2_LINKED` and
+the file `DEP_QEMU_P2_LINK_ARGS_FILE` names, one argument a line, and
+replays them (`cli/build.rs` does, for the `embsim` binary and its tests).
+
+## In a project
+
+`catalog::QemuCatalog` is the standard catalog with `core = "qemu"` for the
+`p2` part kind: the package holds a `P2Qemu` that boots `BOOT_ROM` (or the
+file the kind's `rom` option names) when the board is built, never when it
+is only surveyed. A build without QEMU refuses the entry with
+`P2QemuError::Unavailable`'s message; a key that reaches two parts is refused,
+QEMU being one machine per process. `QemuCatalog::seats` hands out the core's
+and the package's handles. The `embsim` command uses it: `embsim run` on a
+project whose P2 is `core = "qemu"` boots the ROM off the board's flash, as
+`tests/rom_boot_ec32mb.rs` does.
+
 ## Where the CPU runs, and why
 
 On the engine thread, called from the node's own wake — the same shape `p2iss`
