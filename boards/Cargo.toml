@@ -17,3 +17,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

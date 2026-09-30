@@ -227,6 +227,19 @@ cargo test -p embsim-board --lib rebasing_trails_the_original_by_at_most_one_pul
 # Or all schedule-arithmetic cases together:
 # cargo test -p embsim-board --lib
 cargo test -p embsim-models --lib stepper_motor
+# Projects (`board/src/project.rs`, `boards/src/catalog.rs`): a system written
+# down as a TOML file of boards, part models, wires and a scenario. Build
+# only: the P2-EC32MB from its netlist through the catalog equals the module
+# `Ec32mb` builds, part for part, net for net and cluster for cluster; the
+# checklist its netlist asks for with nothing assigned; the carrier file's
+# switch positions; and every refusal, with the text that says what to fix.
+cargo test -p embsim-boards --test ec32_project --test project_refusals
+# Live, stepped, each its own binary: the EC32 netlist project's power tree
+# from the carrier's fingers (every rail equal to the library module's); the
+# DS2 add-on project on its bench supplies (its ADC's protocol thread lives
+# for the process, rule 5); two boards joined connector to connector, a pad
+# on one read through the other's resistor.
+cargo test -p embsim-boards --test ec32_project_power --test ds2_project --test board_to_board
 ```
 
 Per-crate iteration:
@@ -359,7 +372,6 @@ cargo llvm-cov --workspace --summary-only
 
 When these land, each needs a dedicated integration binary:
 
-- `Harness::from_toml`
 - Live topology mutation after `System::start`
 - Dual-MCU firmware entry inversion (one image per process still applies)
 

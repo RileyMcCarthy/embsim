@@ -1,0 +1,36 @@
+# The DS2 force-gauge add-on from its KiCad netlist export, on the bench the
+# way its own tests power it: 3.3 V and ground on J1 (the digital side),
+# 3.3 V and ground on J2 (the isolated analog side, which the board brings
+# out and does not generate).
+#
+# U1 has no manufacturer part number in the export, so the survey names it;
+# it is the ADS122U04, assigned by its symbol's part name.
+
+[[board]]
+name = "DS2Addon"
+kind = "netlist"
+netlist = "../../board/tests/fixtures/ds2_addon.net"
+
+[[board.model]]
+part = "ADS122U04"
+kind = "ads122u04"
+
+[[wire]]
+from = "BENCH.3V3"
+to = "DS2Addon.J1.1"
+volts = 3.3
+
+[[wire]]
+from = "BENCH.GND"
+to = "DS2Addon.J1.2"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.3V3A"
+to = "DS2Addon.J2.1"
+volts = 3.3
+
+[[wire]]
+from = "BENCH.GNDA"
+to = "DS2Addon.J2.2"
+volts = 0.0
