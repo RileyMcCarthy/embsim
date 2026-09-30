@@ -17,4 +17,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
+# Part-kind options written as TOML, as a project file gives them.
+toml.workspace = true
 vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

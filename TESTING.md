@@ -240,6 +240,19 @@ cargo test -p embsim-boards --test ec32_project --test project_refusals
 # for the process, rule 5); two boards joined connector to connector, a pad
 # on one read through the other's resistor.
 cargo test -p embsim-boards --test ec32_project_power --test ds2_project --test board_to_board
+# The catalog's guide (`boards/src/catalog.rs`): every pin table it lists is
+# the one its kind registers, and how a part fits a kind — by part number,
+# by pins, by pin count.
+cargo test -p embsim-boards --lib catalog
+# The `embsim` command (`cli/`), run as a user runs it, a process a case:
+# survey the EC32's netlist (every connector pin, what needs a model and what
+# could be it, the pin table that fits); `new` then `check` for the header
+# board, the DS2 add-on (refused with its survey until its stub is filled)
+# and the EC32 (the pin tables the hand-written project chooses); `run` of
+# the EC32 project for 10 ms, its rails up, the report the same twice. With
+# EMBSIM_QEMU_P2_BUILD set, `run` also boots the P2 off the module's flash
+# (`core = "qemu"`); without it, the refusal that says how.
+cargo test -p embsim-cli
 ```
 
 Per-crate iteration:

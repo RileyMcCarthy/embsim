@@ -90,7 +90,9 @@ pub use registry::{
     PassiveKind, PwlBranch, PwlSpec, RegistryError, SwitchPole,
 };
 pub use serial_levels::SerialLevelBridge;
-pub use survey::{BoardSurvey, ConnectorReport, FacadeMismatch, PinSite, UnmodelledPart};
+pub use survey::{
+    BoardSurvey, ConnectorReport, FacadeMismatch, PinSite, SurveyedPart, UnmodelledPart,
+};
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
     HarnessError, Scenario, System, SystemError, SystemHandle, BUILD_FIXED_POINT_BOUND,
