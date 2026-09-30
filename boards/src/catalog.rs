@@ -1,74 +1,968 @@
-//! The board kinds embsim ships, as a [`Catalog`] a project file can name.
+//! The kinds embsim ships, as a [`Catalog`] a project file can name.
 //!
-//! A kind is a module this crate already knows how to build. The project
-//! says which one, and the options that module takes. `p2-ec32mb` is the
-//! Parallax module: its regulators, flash, and socket are the module's, and
-//! `core` says what sits in `U100`.
+//! # Board kinds
+//!
+//! | kind | what it is |
+//! |---|---|
+//! | `netlist` | any board, from its KiCad netlist export (`netlist = "board.net"`) |
+//! | `p2-ec32mb` | the Parallax P2-EC32MB module ([`crate::ec32mb`]), its processor slot `U100` left for a `[[board.model]]` |
+//!
+//! # Part kinds
+//!
+//! A `[[board.model]]` names one of these for every part its key reaches.
+//! Each kind is one model in `embsim-models` (or this crate) with the
+//! numbers its datasheet gives; the options choose between what the model
+//! already offers — a pin table, a device ID — and nothing else. Where a
+//! model reads data from the board (a feedback divider, a select strap),
+//! it reads it from the netlist at attach, as it does on any board.
+//!
+//! | kind | model | options |
+//! |---|---|---|
+//! | `p2` | the Propeller 2 package ([`crate::p2::P2Package`]) | `core` = `"held-in-reset"` (required) |
+//! | `tg2520smn` | EPSON TCXO; frequency from the part's value or number | `pins` = `"numbered"`, `"by-function"` |
+//! | `74lvc2g04` | NXP dual inverter | `pins` = `"sot363"`, `"by-function"` |
+//! | `sn74lvc1g14` | TI Schmitt inverter | `pins` = `"sot23"` |
+//! | `aps6404l` | AP Memory PSRAM | `pins` = `"sop8"`, `"by-function"` |
+//! | `w25q128jv` | Winbond serial NOR flash, blank | `pins` = `"soic8"`, `"by-function"`, `"spi-only"`; `id` = `"im"`, `"iq"` |
+//! | `sd-card` | a card in an SD socket | `image` = card image path (required); `pins` = `"microsd"`, `"by-function"`, `"spi-only"` |
+//! | `ap62301` | Diodes buck; setpoint from its feedback divider | `pins` = `"sot563"`, `"by-function"` |
+//! | `ncp114` | onsemi LDO; setpoint from the part's value or number | `pins` = `"udfn4"`, `"by-function"` |
+//! | `xl1509` | XLSEMI buck; version from the part's value or number | `pins` = `"sop8"` |
+//! | `ucc12040` | TI isolated DC/DC; setpoint from its `SEL` strap | `pins` = `"soic16"` |
+//! | `stm1061` | ST voltage detector, from its ordering code | `pins` = `"sot23"`, `"by-function"` |
+//! | `6n137` | Lite-On optocoupler | — |
+//! | `vo2631` | Vishay dual optocoupler | — |
+//! | `iso67xx` | TI digital isolator, the member the key names | — |
+//! | `ads122u04` | TI 24-bit ADC, as it comes out of reset | `pins` = `"tssop16"` |
+//! | `switch` | a switch whose poles pair the part's pins, each open | `poles` = `[["1", "2"], …]` (required) |
+//! | `mechanical` | a part with pads and nothing electrical | — |
+//! | `boundary` | a connector, by its symbol's part name | — |
+//!
+//! The first `pins` value is the default: the datasheet's numbered table,
+//! which is how an EDA export names pins. `by-function` is the table a
+//! netlist transcribed from a schematic uses.
+//!
+//! # The base registry
+//!
+//! A `kind = "netlist"` board starts from [`StandardCatalog::base_registry`]:
+//! the reference-designator fallback for a netlist with no libsource, the
+//! element library ([`embsim_models::pwl_library`]), and every model above
+//! under the manufacturer part numbers its datasheet and provenance name,
+//! with its default pin table. Two kinds are never placed by number: the
+//! processor, whose core is the thing under test, and a card socket, whose
+//! card is. A board kind's own registrations (the P2-EC32MB's, keyed on its
+//! netlist's values) stay with that board.
 
+use std::path::Path;
+
+use embsim_board::registry::ComponentCtor;
 use embsim_board::{
-    netlist, Board, BoardSpec, BoardSurvey, Catalog, Component, ComponentSpec, ProjectError,
+    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, Component, ComponentDecl, ComponentSpec,
+    KeyField, ModelFacade, PartOptions, PartRegistry, PinDecl, ProjectError, SwitchPole,
+};
+use embsim_models::ads122u04::Config as AdcConfig;
+use embsim_models::ads122u04_component::{Ads122u04Component, ADS122U04_PINS};
+use embsim_models::isolation::iso67xx::{self, Iso67xx};
+use embsim_models::logic_gate::{
+    self, GatePin, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION, LVC2G04_PINS_SOT363,
+};
+use embsim_models::opto::Opto;
+use embsim_models::oscillator::{self, Oscillator, TCXO_PINS_BY_FUNCTION, TCXO_PINS_NUMBERED};
+use embsim_models::psram::{Psram, PsramComponent, PSRAM_PINS_BY_FUNCTION, PSRAM_PINS_SOP8};
+use embsim_models::pwl_library;
+use embsim_models::rail::{
+    self, Rail, RailPin, AP62301_PINS_BY_FUNCTION, AP62301_PINS_SOT563, NCP114_PINS_BY_FUNCTION,
+    NCP114_PINS_UDFN4, UCC12040_PINS_SOIC16, XL1509_PINS_SOP8,
+};
+use embsim_models::sd_card::SdCard;
+use embsim_models::sd_card_component::{
+    SdCardComponent, SD_CARD_PINS_BY_FUNCTION, SD_CARD_PINS_MICROSD, SD_CARD_PINS_SPI_ONLY,
+};
+use embsim_models::spi_flash::{
+    SpiNorFlash, JEDEC_ID_W25Q128JV_IM, JEDEC_ID_W25Q128JV_IQ, W25Q128JV_CAPACITY_BYTES,
+};
+use embsim_models::spi_flash_component::{
+    SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION, SPI_FLASH_PINS_SOIC8, SPI_FLASH_PINS_SPI_ONLY,
+};
+use embsim_models::supervisor::{
+    self, DetectorPin, VoltageDetector, STM1061_PINS_BY_FUNCTION, STM1061_PINS_SOT23,
 };
 
-use crate::ec32mb::Ec32mb;
-use crate::p2::P2Package;
+use crate::ec32mb::{self, Ec32mb};
+use crate::p2::{p2x8c4m64p_pins, P2Package};
 
-/// Kinds this crate ships. A project that names another kind fails here.
-#[derive(Debug, Default)]
+/// The board kinds, part kinds and base registry this crate ships.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct StandardCatalog;
 
+/// The catalog board kinds.
+const BOARD_KINDS: [&str; 1] = ["p2-ec32mb"];
+
+/// One part kind: its name and how it registers.
+struct PartKind {
+    name: &'static str,
+    register: fn(&mut PartRegistry, &Assignment<'_>, PartOptions) -> Result<(), ProjectError>,
+}
+
+/// Every part kind, in the order the module docs list them.
+const PART_KINDS: &[PartKind] = &[
+    PartKind {
+        name: "p2",
+        register: p2_kind,
+    },
+    PartKind {
+        name: "tg2520smn",
+        register: tg2520smn_kind,
+    },
+    PartKind {
+        name: "74lvc2g04",
+        register: lvc2g04_kind,
+    },
+    PartKind {
+        name: "sn74lvc1g14",
+        register: lvc1g14_kind,
+    },
+    PartKind {
+        name: "aps6404l",
+        register: aps6404l_kind,
+    },
+    PartKind {
+        name: "w25q128jv",
+        register: w25q128jv_kind,
+    },
+    PartKind {
+        name: "sd-card",
+        register: sd_card_kind,
+    },
+    PartKind {
+        name: "ap62301",
+        register: ap62301_kind,
+    },
+    PartKind {
+        name: "ncp114",
+        register: ncp114_kind,
+    },
+    PartKind {
+        name: "xl1509",
+        register: xl1509_kind,
+    },
+    PartKind {
+        name: "ucc12040",
+        register: ucc12040_kind,
+    },
+    PartKind {
+        name: "stm1061",
+        register: stm1061_kind,
+    },
+    PartKind {
+        name: "6n137",
+        register: opto_6n137_kind,
+    },
+    PartKind {
+        name: "vo2631",
+        register: vo2631_kind,
+    },
+    PartKind {
+        name: "iso67xx",
+        register: iso67xx_kind,
+    },
+    PartKind {
+        name: "ads122u04",
+        register: ads122u04_kind,
+    },
+    PartKind {
+        name: "switch",
+        register: switch_kind,
+    },
+    PartKind {
+        name: "mechanical",
+        register: mechanical_kind,
+    },
+    PartKind {
+        name: "boundary",
+        register: boundary_kind,
+    },
+];
+
 impl Catalog for StandardCatalog {
-    fn board(&self, spec: &BoardSpec) -> Result<Board, ProjectError> {
+    fn board_kinds(&self) -> Vec<String> {
+        BOARD_KINDS.iter().map(|kind| (*kind).to_string()).collect()
+    }
+
+    fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
         match spec.kind.as_str() {
-            "p2-ec32mb" => ec32(spec),
+            "p2-ec32mb" => Ok(CatalogBoard {
+                netlist: netlist::parse(ec32mb::NETLIST).expect("the bundled EC32 netlist parses"),
+                // The module as `Ec32mb` builds it, the processor slot left
+                // for the project: `U100` is the part its survey names.
+                registry: Ec32mb::new().registry(),
+            }),
             other => Err(ProjectError::message(format!(
-                "board {name}: unknown kind {other:?}",
-                name = spec.name
+                "board {}: unknown kind {other:?}",
+                spec.name
             ))),
         }
     }
 
-    fn survey(&self, spec: &BoardSpec) -> Result<BoardSurvey, ProjectError> {
-        match spec.kind.as_str() {
-            "p2-ec32mb" => {
-                // The same module `board` builds, so the checklist and the
-                // build cannot disagree about which parts have a model.
-                let registry = seated(spec)?.registry();
-                let parsed = netlist::parse(crate::ec32mb::NETLIST)
-                    .expect("the bundled EC32 netlist parses");
-                Ok(BoardSurvey::of(&parsed, &registry))
-            }
-            "netlist" => Err(ProjectError::message(
-                "kind \"netlist\" is surveyed from the file's netlist path".to_string(),
-            )),
-            other => Err(ProjectError::message(format!(
-                "board {name}: unknown kind {other:?}",
-                name = spec.name
-            ))),
-        }
+    fn base_registry(&self) -> PartRegistry {
+        StandardCatalog::base_registry()
+    }
+
+    fn part_kinds(&self) -> Vec<String> {
+        PART_KINDS
+            .iter()
+            .map(|kind| kind.name.to_string())
+            .collect()
+    }
+
+    fn register_part(
+        &self,
+        registry: &mut PartRegistry,
+        assignment: &Assignment<'_>,
+        options: PartOptions,
+    ) -> Result<(), ProjectError> {
+        let kind = PART_KINDS
+            .iter()
+            .find(|kind| kind.name == assignment.kind)
+            .ok_or_else(|| assignment.error("not a part kind this catalog ships"))?;
+        (kind.register)(registry, assignment, options)
+    }
+
+    fn component_kinds(&self) -> Vec<String> {
+        Vec::new()
     }
 
     fn component(&self, spec: &ComponentSpec) -> Result<Box<dyn Component>, ProjectError> {
         Err(ProjectError::message(format!(
-            "component {name}: unknown kind {kind:?}",
-            name = spec.name,
-            kind = spec.kind
+            "component {}: unknown kind {:?}; this catalog has no component kinds",
+            spec.name, spec.kind
         )))
     }
 }
 
-fn seated(spec: &BoardSpec) -> Result<Ec32mb, ProjectError> {
-    let core = spec.core.as_deref().unwrap_or("held-in-reset");
-    match core {
-        "held-in-reset" => Ok(Ec32mb::new().with_p2(|_decl| Box::new(P2Package::held_in_reset()))),
-        other => Err(ProjectError::message(format!(
-            "board {name}: p2-ec32mb core {other:?} is not a core this catalog seats",
-            name = spec.name
-        ))),
+impl StandardCatalog {
+    /// The registry a `kind = "netlist"` board starts from (module docs,
+    /// "The base registry").
+    pub fn base_registry() -> PartRegistry {
+        let mut registry = PartRegistry::new();
+        // A netlist transcribed from a schematic carries no libsource; its
+        // passives and connectors classify by their reference designator.
+        registry.classify_unnamed_by_reference(true);
+        pwl_library::register(&mut registry);
+        for (number, model) in known_parts() {
+            model.register(&mut registry, number);
+        }
+        registry
     }
 }
 
-fn ec32(spec: &BoardSpec) -> Result<Board, ProjectError> {
-    seated(spec)?
-        .build()
-        .map_err(|err| ProjectError::message(format!("board {name}: {err}", name = spec.name)))
+// ============================================================
+// Models
+// ============================================================
+
+/// A model ready to register: the facade every component it builds
+/// declares, and its constructor.
+struct Model {
+    facade: ModelFacade,
+    ctor: ComponentCtor,
+}
+
+impl Model {
+    /// A model whose components declare the pin table `pins`.
+    fn with_table(
+        name: String,
+        pins: &[PinDecl],
+        ctor: impl Fn(&ComponentDecl) -> Box<dyn Component> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            facade: ModelFacade::of(name, pins),
+            ctor: Box::new(ctor),
+        }
+    }
+
+    /// A model whose facade is read off one component it builds — for a
+    /// model that derives its pins from a configuration, and whose
+    /// construction starts nothing.
+    fn built(
+        name: String,
+        ctor: impl Fn(&ComponentDecl) -> Box<dyn Component> + Send + Sync + 'static,
+    ) -> Self {
+        let prototype = ctor(&prototype_decl());
+        Self {
+            facade: ModelFacade::of(name, prototype.pins()),
+            ctor: Box::new(ctor),
+        }
+    }
+
+    fn register(self, registry: &mut PartRegistry, key: &str) {
+        let Model { facade, ctor } = self;
+        registry.register_model(key, facade, move |decl| ctor(decl));
+    }
+}
+
+/// The declaration a facade prototype is built from: none of the models
+/// [`Model::built`] serves reads it.
+fn prototype_decl() -> ComponentDecl {
+    ComponentDecl {
+        reference: String::new(),
+        value: String::new(),
+        footprint: String::new(),
+        lib: String::new(),
+        part: String::new(),
+        sheetpath: "/".to_string(),
+        dnp: false,
+        mpn: None,
+    }
+}
+
+/// The name a facade carries: the kind, and the pin table when the kind
+/// offers a choice.
+fn named(kind: &str, table: &str) -> String {
+    format!("{kind}, pins = {table:?}")
+}
+
+fn p2_model() -> Model {
+    Model::with_table(
+        "p2, core = \"held-in-reset\"".to_string(),
+        &p2x8c4m64p_pins(),
+        |_| Box::new(P2Package::held_in_reset()),
+    )
+}
+
+fn tcxo_model(config: oscillator::Config, table: (&'static str, &'static [PinDecl])) -> Model {
+    Model::with_table(named("tg2520smn", table.0), table.1, move |_| {
+        Box::new(Oscillator::new(config.clone()).with_pins(table.1))
+    })
+}
+
+fn gate_model(
+    kind: &'static str,
+    config: logic_gate::Config,
+    table: (&'static str, &'static [GatePin]),
+) -> Model {
+    Model::built(named(kind, table.0), move |_| {
+        Box::new(
+            LogicGate::new(config.clone(), table.1)
+                .expect("a gate configuration from its datasheet is valid"),
+        )
+    })
+}
+
+fn psram_model(table: (&'static str, &'static [PinDecl])) -> Model {
+    Model::with_table(named("aps6404l", table.0), table.1, move |_| {
+        Box::new(PsramComponent::new(Psram::new()).with_pins(table.1))
+    })
+}
+
+fn flash_model(id: (&'static str, [u8; 3]), table: (&'static str, &'static [PinDecl])) -> Model {
+    Model::with_table(
+        format!("w25q128jv, pins = {:?}, id = {:?}", table.0, id.0),
+        table.1,
+        move |_| {
+            Box::new(
+                SpiNorFlashComponent::new(
+                    SpiNorFlash::blank(W25Q128JV_CAPACITY_BYTES).with_jedec_id(id.1),
+                )
+                .with_pins(table.1),
+            )
+        },
+    )
+}
+
+fn rail_model(
+    kind: &'static str,
+    config: rail::Config,
+    table: (&'static str, &'static [RailPin]),
+) -> Model {
+    Model::built(named(kind, table.0), move |_| {
+        Box::new(Rail::new(config, table.1).expect("a rail's datasheet table carries every role"))
+    })
+}
+
+fn detector_model(
+    config: supervisor::Config,
+    table: (&'static str, &'static [DetectorPin]),
+) -> Model {
+    Model::built(named("stm1061", table.0), move |_| {
+        Box::new(VoltageDetector::new(config, table.1))
+    })
+}
+
+fn iso_model(config: iso67xx::Config) -> Model {
+    Model::built("iso67xx".to_string(), move |_| {
+        Box::new(Iso67xx::new(config.clone()).expect("a family member's configuration is valid"))
+    })
+}
+
+fn adc_model() -> Model {
+    Model::with_table(named("ads122u04", "tssop16"), &ADS122U04_PINS, |_| {
+        Box::new(Ads122u04Component::new(AdcConfig::at_reset()))
+    })
+}
+
+// ============================================================
+// Pin tables
+// ============================================================
+
+const TCXO_TABLES: [(&str, &[PinDecl]); 2] = [
+    ("numbered", &TCXO_PINS_NUMBERED),
+    ("by-function", &TCXO_PINS_BY_FUNCTION),
+];
+const LVC2G04_TABLES: [(&str, &[GatePin]); 2] = [
+    ("sot363", &LVC2G04_PINS_SOT363),
+    ("by-function", &LVC2G04_PINS_BY_FUNCTION),
+];
+const LVC1G14_TABLES: [(&str, &[GatePin]); 1] = [("sot23", &LVC1G14_PINS_SOT23)];
+const PSRAM_TABLES: [(&str, &[PinDecl]); 2] = [
+    ("sop8", &PSRAM_PINS_SOP8),
+    ("by-function", &PSRAM_PINS_BY_FUNCTION),
+];
+const FLASH_TABLES: [(&str, &[PinDecl]); 3] = [
+    ("soic8", &SPI_FLASH_PINS_SOIC8),
+    ("by-function", &SPI_FLASH_PINS_BY_FUNCTION),
+    ("spi-only", &SPI_FLASH_PINS_SPI_ONLY),
+];
+const FLASH_IDS: [(&str, [u8; 3]); 2] =
+    [("im", JEDEC_ID_W25Q128JV_IM), ("iq", JEDEC_ID_W25Q128JV_IQ)];
+const SD_TABLES: [(&str, &[PinDecl]); 3] = [
+    ("microsd", &SD_CARD_PINS_MICROSD),
+    ("by-function", &SD_CARD_PINS_BY_FUNCTION),
+    ("spi-only", &SD_CARD_PINS_SPI_ONLY),
+];
+const AP62301_TABLES: [(&str, &[RailPin]); 2] = [
+    ("sot563", &AP62301_PINS_SOT563),
+    ("by-function", &AP62301_PINS_BY_FUNCTION),
+];
+const NCP114_TABLES: [(&str, &[RailPin]); 2] = [
+    ("udfn4", &NCP114_PINS_UDFN4),
+    ("by-function", &NCP114_PINS_BY_FUNCTION),
+];
+const XL1509_TABLES: [(&str, &[RailPin]); 1] = [("sop8", &XL1509_PINS_SOP8)];
+const UCC12040_TABLES: [(&str, &[RailPin]); 1] = [("soic16", &UCC12040_PINS_SOIC16)];
+const STM1061_TABLES: [(&str, &[DetectorPin]); 2] = [
+    ("sot23", &STM1061_PINS_SOT23),
+    ("by-function", &STM1061_PINS_BY_FUNCTION),
+];
+
+/// Take option `name` as one of `tables`' names; the first is the default.
+fn choose<T: Copy>(
+    options: &mut PartOptions,
+    name: &'static str,
+    tables: &[(&'static str, T)],
+) -> Result<(&'static str, T), ProjectError> {
+    let names: Vec<&'static str> = tables.iter().map(|(name, _)| *name).collect();
+    let chosen = options.choice(name, &names)?.unwrap_or(names[0]);
+    Ok(*tables
+        .iter()
+        .find(|(name, _)| *name == chosen)
+        .expect("the choice is one of the names"))
+}
+
+// ============================================================
+// The base registry's numbers
+// ============================================================
+
+/// Every model the base registry places by number, with the number: the
+/// ordering codes each model's datasheet provenance names.
+fn known_parts() -> Vec<(&'static str, Model)> {
+    let tcxo = |number: &'static str| {
+        let config =
+            oscillator::Config::from_value(number).expect("the ordering code names its frequency");
+        (number, tcxo_model(config, TCXO_TABLES[0]))
+    };
+    let flash =
+        |number: &'static str, id: usize| (number, flash_model(FLASH_IDS[id], FLASH_TABLES[0]));
+    let xl1509 = |number: &'static str| {
+        let config =
+            rail::Config::xl1509_from_value(number).expect("the ordering code names its version");
+        (number, rail_model("xl1509", config, XL1509_TABLES[0]))
+    };
+    let iso = |number: &'static str| {
+        let config =
+            iso67xx::Config::from_part_name(number).expect("the number names a family member");
+        (number, iso_model(config))
+    };
+    vec![
+        // EPSON TG2520SMN (oscillator.rs provenance: the ordering key).
+        tcxo("TG2520SMN 20.0000M-ECGNNM3"),
+        // NXP 74LVC2G04 in the GW (SOT363) package.
+        (
+            "74LVC2G04GW,125",
+            gate_model(
+                "74lvc2g04",
+                logic_gate::Config::lvc2g04(),
+                LVC2G04_TABLES[0],
+            ),
+        ),
+        // TI SN74LVC1G14 in the DBV (SOT-23-5) package, reeled.
+        (
+            "SN74LVC1G14DBVR",
+            gate_model(
+                "sn74lvc1g14",
+                logic_gate::Config::lvc1g14(),
+                LVC1G14_TABLES[0],
+            ),
+        ),
+        (
+            "SN74LVC1G14DBVT",
+            gate_model(
+                "sn74lvc1g14",
+                logic_gate::Config::lvc1g14(),
+                LVC1G14_TABLES[0],
+            ),
+        ),
+        // AP Memory APS6404L-3SQR in SOP-8.
+        ("APS6404L-3SQR-ZR", psram_model(PSRAM_TABLES[0])),
+        // Winbond W25Q128JV: the IM option (and its reeled BOM spelling on
+        // the P2-EC32MB) and the IQ option (spi_flash.rs, the JEDEC IDs).
+        flash("W25Q128JVSIM", 0),
+        flash("W25Q128JVSIM TR", 0),
+        flash("W25Q128JVSIQ", 1),
+        // Diodes AP62301 in SOT563.
+        (
+            "AP62301Z6-7",
+            rail_model("ap62301", rail::Config::ap62301(), AP62301_TABLES[0]),
+        ),
+        // onsemi NCP114, Version A, 3.3 V, UDFN4.
+        (
+            "NCP114AMX330TCG",
+            rail_model(
+                "ncp114",
+                rail::Config::ncp114_from_part_number("NCP114AMX330TCG")
+                    .expect("the model cites this ordering code"),
+                NCP114_TABLES[0],
+            ),
+        ),
+        // XLSEMI XL1509 fixed versions (rail.rs: the ordering-code spelling).
+        xl1509("XL1509-3.3E1"),
+        xl1509("XL1509-5.0E1"),
+        xl1509("XL1509-12E1"),
+        // TI UCC12040 in the DVE SOIC-16 package.
+        (
+            "UCC12040DVE",
+            rail_model("ucc12040", rail::Config::ucc12040(), UCC12040_TABLES[0]),
+        ),
+        (
+            "UCC12040DVER",
+            rail_model("ucc12040", rail::Config::ucc12040(), UCC12040_TABLES[0]),
+        ),
+        // ST STM1061N16 (supervisor.rs: Table 8 Ordering Information).
+        (
+            "STM1061N16WX6F",
+            detector_model(supervisor::Config::stm1061n16(), STM1061_TABLES[0]),
+        ),
+        // The optocouplers, by the numbers their makers sell them under.
+        (
+            "6N137",
+            Model::built("6n137".to_string(), |_| Box::new(Opto::lite_on_6n137())),
+        ),
+        (
+            "VO2631",
+            Model::built("vo2631".to_string(), |_| Box::new(Opto::vo2631())),
+        ),
+        // TI ISO67xx family members, each configured from its number.
+        iso("ISO6721BDR"),
+        iso("ISO6731DWR"),
+        iso("ISO6740DWR"),
+        iso("ISO6740FDWR"),
+        iso("ISO6741DWR"),
+        iso("ISO6742DWR"),
+        // TI ADS122U04 in TSSOP-16.
+        ("ADS122U04IPW", adc_model()),
+        ("ADS122U04IPWR", adc_model()),
+    ]
+}
+
+// ============================================================
+// The part kinds
+// ============================================================
+
+/// One configuration for every part an entry matches, derived from each
+/// part by `derive`; parts that derive different ones are refused, since
+/// one key takes one model.
+fn one_config<C: PartialEq + Clone>(
+    assignment: &Assignment<'_>,
+    derive: impl Fn(&ComponentDecl) -> Option<C>,
+    cannot: impl Fn(&ComponentDecl) -> String,
+) -> Result<C, ProjectError> {
+    let mut found: Option<(C, &str)> = None;
+    for decl in assignment.parts {
+        let config = derive(decl)
+            .ok_or_else(|| assignment.error(format!("{}: {}", decl.reference, cannot(decl))))?;
+        match &found {
+            None => found = Some((config, decl.reference.as_str())),
+            Some((first, first_ref)) if *first != config => {
+                return Err(assignment.error(format!(
+                    "{first_ref} and {} take different configurations of this model; give each \
+                     its own [[board.model]] by a key that tells them apart",
+                    decl.reference
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    found
+        .map(|(config, _)| config)
+        .ok_or_else(|| assignment.error("matches no part"))
+}
+
+/// A part's fields, for a message: `value "…" and mpn "…"`.
+fn fields(decl: &ComponentDecl) -> String {
+    match &decl.mpn {
+        Some(mpn) => format!("value {:?} and mpn {mpn:?}", decl.value),
+        None => format!("value {:?} (no mpn)", decl.value),
+    }
+}
+
+/// The part's value, then its manufacturer part number, through `parse`.
+fn value_then_mpn<C>(decl: &ComponentDecl, parse: impl Fn(&str) -> Option<C>) -> Option<C> {
+    parse(&decl.value).or_else(|| decl.mpn.as_deref().and_then(&parse))
+}
+
+fn p2_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    options.choice("core", &["held-in-reset"])?.ok_or_else(|| {
+        assignment.error(
+            "options.core says what runs inside the package; this catalog seats \
+                 \"held-in-reset\", the chip before it runs (a core under test, QEMU or an \
+                 instruction-set simulator, is seated by the program that owns it)",
+        )
+    })?;
+    options.finish()?;
+    p2_model().register(registry, assignment.key);
+    Ok(())
+}
+
+fn tg2520smn_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &TCXO_TABLES)?;
+    options.finish()?;
+    let config = one_config(
+        assignment,
+        |decl| value_then_mpn(decl, oscillator::Config::from_value),
+        |decl| {
+            format!(
+                "the TCXO's frequency is read from its value or mpn (\"TG2520SMN \
+                 20.0000M-ECGNNM3\" names 20 MHz), and its {} name none",
+                fields(decl)
+            )
+        },
+    )?;
+    tcxo_model(config, table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn lvc2g04_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &LVC2G04_TABLES)?;
+    options.finish()?;
+    gate_model("74lvc2g04", logic_gate::Config::lvc2g04(), table)
+        .register(registry, assignment.key);
+    Ok(())
+}
+
+fn lvc1g14_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &LVC1G14_TABLES)?;
+    options.finish()?;
+    gate_model("sn74lvc1g14", logic_gate::Config::lvc1g14(), table)
+        .register(registry, assignment.key);
+    Ok(())
+}
+
+fn aps6404l_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &PSRAM_TABLES)?;
+    options.finish()?;
+    psram_model(table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn w25q128jv_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &FLASH_TABLES)?;
+    let id = choose(&mut options, "id", &FLASH_IDS)?;
+    options.finish()?;
+    flash_model(id, table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn sd_card_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &SD_TABLES)?;
+    let image = options.string("image")?.ok_or_else(|| {
+        assignment.error(
+            "options.image is the card in the socket: a card image file, relative to the \
+             project file",
+        )
+    })?;
+    options.finish()?;
+    let path = assignment.dir.join(&image);
+    let blocks = read_image(&path).map_err(|err| {
+        assignment.error(format!("cannot read card image {}: {err}", path.display()))
+    })?;
+    Model::with_table(named("sd-card", table.0), table.1, move |_| {
+        Box::new(SdCardComponent::new(SdCard::with_image(blocks.clone())).with_pins(table.1))
+    })
+    .register(registry, assignment.key);
+    Ok(())
+}
+
+fn read_image(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+fn ap62301_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &AP62301_TABLES)?;
+    options.finish()?;
+    rail_model("ap62301", rail::Config::ap62301(), table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn ncp114_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &NCP114_TABLES)?;
+    options.finish()?;
+    let config = one_config(
+        assignment,
+        |decl| {
+            rail::Config::ncp114_from_value(&decl.value).or_else(|| {
+                decl.mpn
+                    .as_deref()
+                    .and_then(rail::Config::ncp114_from_part_number)
+            })
+        },
+        |decl| {
+            format!(
+                "the LDO's output is read from its value (\"LDO 300mA, 3.3V\" names 3.3 V) or \
+                 from an ordering code the model cites (NCP114AMX330TCG), and its {} name \
+                 neither",
+                fields(decl)
+            )
+        },
+    )?;
+    rail_model("ncp114", config, table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn xl1509_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &XL1509_TABLES)?;
+    options.finish()?;
+    let config = one_config(
+        assignment,
+        |decl| value_then_mpn(decl, rail::Config::xl1509_from_value),
+        |decl| {
+            format!(
+                "the buck's fixed version is read from its value or mpn (\"XL1509-5V\", \
+                 \"XL1509-3.3E1\"), and its {} name none",
+                fields(decl)
+            )
+        },
+    )?;
+    rail_model("xl1509", config, table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn ucc12040_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &UCC12040_TABLES)?;
+    options.finish()?;
+    rail_model("ucc12040", rail::Config::ucc12040(), table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn stm1061_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &STM1061_TABLES)?;
+    options.finish()?;
+    let config = one_config(
+        assignment,
+        |decl| {
+            [
+                decl.mpn.as_deref(),
+                Some(decl.part.as_str()),
+                Some(decl.value.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|field| field.trim().starts_with("STM1061N16"))
+            .then(supervisor::Config::stm1061n16)
+        },
+        |decl| {
+            format!(
+                "the detector's threshold is read from its ordering code, and the model cites \
+                 the STM1061N16's; its {} name no STM1061N16…",
+                fields(decl)
+            )
+        },
+    )?;
+    detector_model(config, table).register(registry, assignment.key);
+    Ok(())
+}
+
+fn opto_6n137_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    options: PartOptions,
+) -> Result<(), ProjectError> {
+    options.finish()?;
+    Model::built("6n137".to_string(), |_| Box::new(Opto::lite_on_6n137()))
+        .register(registry, assignment.key);
+    Ok(())
+}
+
+fn vo2631_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    options: PartOptions,
+) -> Result<(), ProjectError> {
+    options.finish()?;
+    Model::built("vo2631".to_string(), |_| Box::new(Opto::vo2631()))
+        .register(registry, assignment.key);
+    Ok(())
+}
+
+fn iso67xx_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    options: PartOptions,
+) -> Result<(), ProjectError> {
+    options.finish()?;
+    let config = iso67xx::Config::from_part_name(assignment.key).ok_or_else(|| {
+        assignment.error(
+            "the isolator's family member is read from the part number it is assigned by \
+             (ISO6720, ISO6721, ISO6721R, ISO6731, ISO6740, ISO6741 or ISO6742, an F after \
+             the digits for the fail-safe-low option, then the package: \"ISO6741DWR\")",
+        )
+    })?;
+    iso_model(config).register(registry, assignment.key);
+    Ok(())
+}
+
+fn ads122u04_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    choose(&mut options, "pins", &[("tssop16", ())])?;
+    options.finish()?;
+    adc_model().register(registry, assignment.key);
+    Ok(())
+}
+
+fn switch_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let poles = options
+        .pairs("poles")?
+        .filter(|poles| !poles.is_empty())
+        .ok_or_else(|| {
+            assignment.error(
+                "options.poles pairs the part's pins into poles, each open until a [[switch]] \
+                 closes it: poles = [[\"1\", \"2\"]]; poles are numbered from 0 in this order",
+            )
+        })?;
+    options.finish()?;
+    registry.register_switch(
+        assignment.key,
+        poles
+            .into_iter()
+            .map(|(a, b)| SwitchPole::open(a, b))
+            .collect(),
+    );
+    Ok(())
+}
+
+fn mechanical_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    options: PartOptions,
+) -> Result<(), ProjectError> {
+    options.finish()?;
+    registry.register_mechanical(assignment.key);
+    Ok(())
+}
+
+fn boundary_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    options: PartOptions,
+) -> Result<(), ProjectError> {
+    options.finish()?;
+    if assignment.by != KeyField::Part {
+        return Err(assignment.error(
+            "a connector is declared by its symbol's part name (part = \"…\"); a part with no \
+             part name is a connector by its reference designator (J…, P…) already",
+        ));
+    }
+    registry.register_boundary(assignment.key);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    /// Every model the catalog places by number states the facade its
+    /// components declare: the survey's pin check is the build's.
+    #[rstest]
+    fn every_known_part_states_the_pins_its_component_declares() {
+        for (number, model) in known_parts() {
+            if number.starts_with("ADS122U04") {
+                // Construction starts the protocol thread; the facade is the
+                // component's own static table.
+                assert_eq!(model.facade.pins, ModelFacade::of("", &ADS122U04_PINS).pins);
+                continue;
+            }
+            let component = (model.ctor)(&prototype_decl());
+            let pins: Vec<String> = component
+                .pins()
+                .iter()
+                .map(|pin| pin.number.to_string())
+                .collect();
+            assert_eq!(model.facade.pins, pins, "{number}");
+        }
+    }
 }

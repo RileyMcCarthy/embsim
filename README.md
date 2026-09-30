@@ -125,10 +125,10 @@ Project-specific wiring lives in the consumer's repo.
 | Crate | Path | What it is |
 |-------|------|------------|
 | `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
-| `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface |
+| `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface, projects and the netlist survey |
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets. Carries the `target/p2` sources |
-| `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, and the P2 package a core sits in |
+| `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
 | `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from an archive |
 | `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
 | `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer mounts into |
@@ -149,6 +149,50 @@ let board = embsim_boards::ec32mb::Ec32mb::new()
     .with_p2(|_decl| Box::new(embsim_boards::p2::P2Package::new(p2)))
     .build()?;
 ```
+
+## Projects: a system in a file
+
+A project is the system written down: the boards, the model each part takes,
+the wires between connectors, and the scenario. The file names **kinds**; a
+catalog (`embsim_boards::catalog::StandardCatalog`) turns each into a netlist
+and registry, a part model, or a bench component. The file holds no
+behaviour: every number stays in its model, with its citation.
+
+```toml
+[[board]]
+name = "DS2Addon"
+kind = "netlist"                       # any KiCad netlist export
+netlist = "ds2_addon.net"              # relative to this file
+
+[[board.model]]                        # a part the survey named
+part = "ADS122U04"                     # exactly one of part, mpn, value
+kind = "ads122u04"
+
+[[wire]]                               # a supply of its own on a connector pin
+from = "BENCH.3V3"
+to = "DS2Addon.J1.1"
+volts = 3.3
+```
+
+```rust
+let project = embsim_board::Project::load("ds2-addon.toml")?;
+let system = project.instantiate(&embsim_boards::catalog::StandardCatalog)?.start()?;
+```
+
+Every board is built by `Board::from_netlist` with a part registry: a
+`kind = "netlist"` board from the catalog's base registry, which places every
+model it knows by its manufacturer part number, and a catalog board kind
+(`p2-ec32mb`) from its own. Before it builds, each board is **surveyed** with
+the registry it will build with (`Project::survey`): the parts with no model,
+named by the part name, number and value a `[[board.model]]` can key on; the
+parts whose model declares other pins than the netlist gives them (a numbered
+datasheet table against a netlist that names pins by function —
+`options.pins` picks the other table); and the connectors, with their pins. A
+board whose survey is not clean is refused with the survey as the error. A
+wire's board end is a connector pin (`Board.Connector.Pin`); its other end is
+another board's connector, a bench component's pin, or, with `volts`, a supply.
+The part kinds and their options are listed in `boards/src/catalog.rs`; the
+example projects are in `boards/projects/`.
 
 ## Using embsim in your project
 

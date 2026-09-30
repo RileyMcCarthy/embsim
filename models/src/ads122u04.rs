@@ -112,6 +112,27 @@ pub struct Config {
     pub zero_offset: i32,
 }
 
+/// The internal voltage reference, 2.048 V (SBAS752B p.1, Features), in
+/// millivolts — the reference `VREF[1:0]` = `00` selects, its reset value
+/// (§8.6.2.2 Configuration Register 1, p.42).
+pub const INTERNAL_VREF_MV: f64 = 2_048.0;
+
+/// The PGA gain `GAIN[2:0]` = `000` selects, 1, its reset value (SBAS752B
+/// §8.6.2.1 Configuration Register 0, p.41).
+pub const RESET_GAIN: f64 = 1.0;
+
+impl Config {
+    /// The part as it comes out of reset: the internal reference, gain 1,
+    /// no calibration offset.
+    pub const fn at_reset() -> Self {
+        Self {
+            vref_mv: INTERNAL_VREF_MV,
+            gain: RESET_GAIN,
+            zero_offset: 0,
+        }
+    }
+}
+
 // ============================================================
 // ADS122U04 instance
 // ============================================================

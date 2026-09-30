@@ -31,6 +31,10 @@
 //! - [`cluster`] — analog cluster types + [`ClusterSolver`] trait ([`QuasiStaticMna`] default)
 //! - [`board`] — [`Board::from_netlist`]: netlist + registry → components + nets
 //! - [`system`] — [`System`]: boards + harnesses + scenario overrides + fault algebra
+//! - [`survey`] — [`BoardSurvey`]: what a netlist still asks of a project — the
+//!   parts with no model, the pin tables that miss, the connectors a wire may use
+//! - [`project`] — [`Project`]: a system written down as a TOML file of boards,
+//!   part models, wires and a scenario, built through a [`Catalog`]
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
 //! - [`event_log`] — opt-in [`EventLog`]: the engine's totally-ordered event transcript
 //!   (determinism Oracle 1, `DETERMINISM.md`) with its normalization contract
@@ -50,8 +54,8 @@ pub mod net;
 pub mod netlist;
 pub mod project;
 pub mod registry;
-pub mod survey;
 pub mod serial_levels;
+pub mod survey;
 pub mod system;
 pub mod uart;
 
@@ -78,14 +82,15 @@ pub use net::{
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use project::{
-    BoardSpec, Catalog, ComponentSpec, JumperSpec, Project, ProjectError, SwitchSpec, WireSpec,
+    Assignment, BoardSpec, Catalog, CatalogBoard, ComponentSpec, ContactState, JumperSpec,
+    KeyField, ModelSpec, PartOptions, PinShortSpec, Project, ProjectError, SwitchSpec, WireSpec,
 };
 pub use registry::{
-    reference_designator_class, Classification, JumperState, PartRegistry, PassiveKind, PwlBranch,
-    PwlSpec, RegistryError, SwitchPole,
+    reference_designator_class, Classification, Classified, JumperState, ModelFacade, PartRegistry,
+    PassiveKind, PwlBranch, PwlSpec, RegistryError, SwitchPole,
 };
 pub use serial_levels::SerialLevelBridge;
-pub use survey::{BoardSurvey, ConnectorReport, PinSite, UnmodelledPart};
+pub use survey::{BoardSurvey, ConnectorReport, FacadeMismatch, PinSite, UnmodelledPart};
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
     HarnessError, Scenario, System, SystemError, SystemHandle, BUILD_FIXED_POINT_BOUND,

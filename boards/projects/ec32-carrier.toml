@@ -7,12 +7,20 @@
 # S301 pole 1 is position 2, labelled FLASH: closed, P61 joins the flash
 # chip-select. S301 pole 3 is position 4: closed, R303 holds P59 down, so a
 # ROM that has loaded a program boots it instead of waiting for a loader.
-# The processor slot is empty of a core. `held-in-reset` is the package with
-# its pads released, which is the chip before it runs.
+#
+# The module comes from the board library (`p2-ec32mb`), every part but the
+# processor placed. The processor slot takes the P2 package with no core
+# running inside it: `held-in-reset`, its pads released, the chip before it
+# runs.
 
 [[board]]
 name = "EC32"
 kind = "p2-ec32mb"
+
+[[board.model]]
+value = "P2X8C4M64P"
+kind = "p2"
+[board.model.options]
 core = "held-in-reset"
 
 [[wire]]

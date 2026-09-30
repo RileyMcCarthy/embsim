@@ -14,6 +14,9 @@
 //! - [`p2`] — the Propeller 2 package as a node: the 86-pin facade around
 //!   a core (QEMU, an instruction-set simulator, the native firmware) or
 //!   around no core at all, held in reset
+//! - [`catalog`] — [`catalog::StandardCatalog`], the board kinds and part
+//!   kinds a project file names ([`embsim_board::Project`]), and the base
+//!   registry that places every model here by its manufacturer part number
 //!
 //! There is no stub tier (`DESIGN.md` rule 1): every part on a board here
 //! is a node whose class has behaviour, and a part nobody has modelled is

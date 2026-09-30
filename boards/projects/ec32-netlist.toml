@@ -1,0 +1,128 @@
+# The Parallax P2-EC32MB built from its netlist alone, powered the way a
+# carrier powers it.
+#
+# The netlist was transcribed from the vendor schematic, so its pins are
+# named by function (1A, VIN, CSn) where a KiCad export would number them:
+# every model the catalog places by its part number comes up with the
+# datasheet's numbered pin table, and the survey lists each one against the
+# netlist's pins. The entries below pick the `by-function` table for each,
+# and give the parts the catalog cannot place their models: the processor
+# (with no core running: the chip before it runs), the DIP switch, and the
+# BOM-only lines.
+#
+# Three parts the survey lists as connectors are not: the transcription
+# draws them with `J` designators, and a part with no part name is
+# classified by its designator. J101 is the oscillator-option solder link,
+# one open pole; J701 and J702 are mounting holes.
+#
+# Built this way the board is the one `Ec32mb::new()` builds with the same
+# processor (boards/tests/ec32_project.rs).
+
+[[board]]
+name = "EC32"
+kind = "netlist"
+netlist = "../netlists/p2_ec32mb.net"
+
+# The processor: the P2 package, nothing running inside it.
+[[board.model]]
+mpn = "P2X8C4M64P"
+kind = "p2"
+[board.model.options]
+core = "held-in-reset"
+
+# Placed by number, with the table a transcribed netlist uses.
+[[board.model]]
+mpn = "TG2520SMN 20.0000M-ECGNNM3"
+kind = "tg2520smn"
+[board.model.options]
+pins = "by-function"
+
+[[board.model]]
+mpn = "74LVC2G04GW,125"
+kind = "74lvc2g04"
+[board.model.options]
+pins = "by-function"
+
+[[board.model]]
+mpn = "W25Q128JVSIM TR"
+kind = "w25q128jv"
+[board.model.options]
+pins = "by-function"
+
+[[board.model]]
+mpn = "APS6404L-3SQR-ZR"
+kind = "aps6404l"
+[board.model.options]
+pins = "by-function"
+
+[[board.model]]
+mpn = "AP62301Z6-7"
+kind = "ap62301"
+[board.model.options]
+pins = "by-function"
+
+[[board.model]]
+mpn = "NCP114AMX330TCG"
+kind = "ncp114"
+[board.model.options]
+pins = "by-function"
+
+[[board.model]]
+mpn = "STM1061N16WX6F"
+kind = "stm1061"
+[board.model.options]
+pins = "by-function"
+
+# S301, the four-way option switch: each position between its ON and OFF
+# pads, position n as pole n - 1, all open as the module ships.
+[[board.model]]
+mpn = "218-4LPSTJR"
+kind = "switch"
+[board.model.options]
+poles = [["1_ON", "1_OFF"], ["2_ON", "2_OFF"], ["3_ON", "3_OFF"], ["4_ON", "4_OFF"]]
+
+# J101, the solder link: one pole, unbridged.
+[[board.model]]
+value = "Solder Link Pads"
+kind = "switch"
+[board.model.options]
+poles = [["1", "2"]]
+
+# Pads and BOM lines with nothing electrical.
+[[board.model]]
+value = "Mounting Hole Vss"
+kind = "mechanical"
+
+[[board.model]]
+mpn = "300-64002"
+kind = "mechanical"
+
+[[board.model]]
+value = "Layout node"
+kind = "mechanical"
+
+# The carrier: 5 V on the two 5V fingers, 0 V on the three GND fingers.
+[[wire]]
+from = "CARRIER.5V"
+to = "EC32.J203.41"
+volts = 5.0
+
+[[wire]]
+from = "CARRIER.5Vb"
+to = "EC32.J203.42"
+volts = 5.0
+
+[[wire]]
+from = "CARRIER.GND"
+to = "EC32.J203.43"
+volts = 0.0
+
+[[wire]]
+from = "CARRIER.GNDb"
+to = "EC32.J203.44"
+volts = 0.0
+
+[[wire]]
+from = "CARRIER.GNDc"
+to = "EC32.J203.45"
+volts = 0.0
