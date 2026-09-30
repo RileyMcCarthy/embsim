@@ -1,0 +1,12 @@
+# A board the parse can finish on its own: one connector and one resistor.
+# J1's pins are the endpoints a wire may use. Nothing here needs a model.
+
+[[board]]
+name = "HDR"
+kind = "netlist"
+netlist = "projects/header.net"
+
+[[wire]]
+from = "BENCH.SIG"
+to = "HDR.J1.1"
+volts = 3.3

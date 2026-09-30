@@ -1,0 +1,51 @@
+# A P2-EC32MB powered the way a carrier powers it.
+#
+# 5 V on J203 fingers 41 and 42, ground on 43, 44 and 45. The module's own
+# power tree does the rest: the polarity FET, the two bucks, the eight LDOs,
+# the brownout detector. Nothing is stuck.
+#
+# S301 pole 1 is position 2, labelled FLASH: closed, P61 joins the flash
+# chip-select. S301 pole 3 is position 4: closed, R303 holds P59 down, so a
+# ROM that has loaded a program boots it instead of waiting for a loader.
+# The processor slot is empty of a core. `held-in-reset` is the package with
+# its pads released, which is the chip before it runs.
+
+[[board]]
+name = "EC32"
+kind = "p2-ec32mb"
+core = "held-in-reset"
+
+[[wire]]
+from = "CARRIER.5V"
+to = "EC32.J203.41"
+volts = 5.0
+
+[[wire]]
+from = "CARRIER.5Vb"
+to = "EC32.J203.42"
+volts = 5.0
+
+[[wire]]
+from = "CARRIER.GND"
+to = "EC32.J203.43"
+volts = 0.0
+
+[[wire]]
+from = "CARRIER.GNDb"
+to = "EC32.J203.44"
+volts = 0.0
+
+[[wire]]
+from = "CARRIER.GNDc"
+to = "EC32.J203.45"
+volts = 0.0
+
+[[switch]]
+part = "EC32.S301"
+pole = 1
+state = "closed"
+
+[[switch]]
+part = "EC32.S301"
+pole = 3
+state = "closed"
