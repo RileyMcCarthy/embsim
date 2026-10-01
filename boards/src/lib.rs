@@ -25,3 +25,10 @@
 pub mod catalog;
 pub mod ec32mb;
 pub mod p2;
+
+/// `PROJECTS.md` at the workspace root: every Rust example in it runs as a
+/// doc test of this crate, from this crate's directory, so the guide's code
+/// is the code that builds.
+#[cfg(doctest)]
+#[doc = include_str!("../../PROJECTS.md")]
+pub struct ProjectsGuide;
