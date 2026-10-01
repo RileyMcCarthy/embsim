@@ -63,7 +63,13 @@ over all three boards — a never-rises gate). And, for a board a project
 builds, the survey (`BoardSurvey`) run with the registry the board will build
 with, before `Board::from_netlist`: a part with no model refuses the board,
 and the error lists each such part by the keys a `[[board.model]]` can assign
-it a model by ([`PROJECTS.md`](PROJECTS.md) §4, §8).
+it a model by ([`PROJECTS.md`](PROJECTS.md) §4, §8). A kind a project assigns
+seats only on a part that is what it says
+(`StandardCatalog::check_parts_are_the_kind`): a model's kind on a part
+whose keys name its part family, `switch` and `boundary` where the board's
+designator, symbol or name says so, `mechanical` on a part whose pins sit on
+one net at most. A pin table that matches is not enough, and no kind
+without a model is a way past an integrated circuit.
 
 **Rule 2 — One interface.** Between a node and the engine there is exactly
 this: static facts declared once on `PinDecl` (its role, idle drive, clamps,

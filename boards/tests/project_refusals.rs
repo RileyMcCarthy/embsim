@@ -214,16 +214,196 @@ fn an_assignment_another_entry_comes_before_is_refused_naming_the_key_that_wins(
 
 #[rstest]
 fn an_assignment_a_parts_own_symbol_decides_is_refused() {
-    let message = refused(&header(
-        "[[board.model]]\nvalue = \"10k\"\nkind = \"mechanical\"\n",
+    // JP1 is a jumper by its symbol: a switch's poles cannot replace that.
+    let message = refused(&ds2(
+        "[[board.model]]\nvalue = \"A0_bypass\"\nkind = \"switch\"\n\
+         [board.model.options]\npoles = [[\"1\", \"2\"]]\n",
     ));
     assert_says(
         &message,
         &[
-            "[[board.model]] value = \"10k\" does not reach R1",
-            "its symbol makes it a passive (a resistor, capacitor or inductor) by itself",
+            "[[board.model]] value = \"A0_bypass\" does not reach JP1",
+            "its symbol makes it a jumper by itself",
         ],
     );
+}
+
+/// The MaD Edge board from its KiCad export, plus `rest`.
+fn edge(rest: &str) -> String {
+    format!(
+        "[[board]]\nname = \"EDGE\"\nkind = \"netlist\"\n\
+         netlist = \"../../board/tests/fixtures/mad_edge.net\"\n{rest}"
+    )
+}
+
+#[rstest]
+#[case::converter_as_mechanical(
+    ds2("[[board.model]]\npart = \"ADS122U04\"\nkind = \"mechanical\"\n"),
+    &[
+        "kind \"mechanical\" is for a part whose pads sit on one net at most",
+        "U1's pins join 16 nets",
+    ]
+)]
+#[case::converter_as_connector(
+    ds2("[[board.model]]\npart = \"ADS122U04\"\nkind = \"boundary\"\n"),
+    &[
+        "kind \"boundary\" is for a connector: designator J, P or CN, or a Conn… symbol",
+        "U1 (designator U, symbol \"ADS122U04\") is neither",
+    ]
+)]
+#[case::converter_as_switch(
+    ds2("[[board.model]]\npart = \"ADS122U04\"\nkind = \"switch\"\n\
+         [board.model.options]\npoles = [[\"1\", \"2\"]]\n"),
+    &["kind \"switch\" is for a switch or jumper", "U1 (designator U, symbol \"ADS122U04\") is neither"]
+)]
+#[case::converter_as_a_supply(
+    ds2("[[board.model]]\npart = \"ADS122U04\"\nkind = \"ucc12040\"\n"),
+    &[
+        "kind \"ucc12040\" is for a part whose part name, mpn or value contains UCC12040",
+        "U1's part name \"ADS122U04\" and value \"ADS122U04\" do not",
+    ]
+)]
+#[case::line_driver_as_a_converter(
+    edge("[[board.model]]\nmpn = \"AM26LS31CD\"\nkind = \"ads122u04\"\n"),
+    &[
+        "kind \"ads122u04\" is for a part whose part name, mpn or value contains ADS122U04",
+        "U24's part name \"AM26LS31CD\", mpn \"AM26LS31CD\" and value \"AM26LS31CD\" do not",
+    ]
+)]
+fn a_kind_the_board_says_a_part_is_not_is_refused(#[case] text: String, #[case] says: &[&str]) {
+    behaviour!(Test {
+        id: "project.refuses-kind-the-part-is-not",
+        covers: Some("boards/src/catalog.rs#StandardCatalog::check_parts_are_the_kind"),
+        given: "an integrated circuit given a kind its board says it is not: the force-gauge \
+                converter as mechanical, a connector, a switch or a supply, and the Edge line \
+                driver as the converter",
+    });
+    expect!(
+        "names-what-the-kind-is-for",
+        "the project is refused, naming the part, what the kind is for, and what the board says of it: its nets, designator and symbol, or names",
+        "a kind says what a part is, and a part whose pins match a kind's table is any part \
+         with as many pins"
+    );
+    expect!(
+        "says-a-model-is-needed",
+        "the refusal says a part no kind is for needs a model"
+    );
+    let message = refused(&text);
+    assert_says(&message, says);
+    assert_says(
+        &message,
+        &[
+            "is not the part this kind says it is",
+            "a part no kind is for needs a model (PROJECTS.md §7)",
+        ],
+    );
+}
+
+#[rstest]
+#[case::two_fields(
+    "value = \"ADS122U04\"\nkind = \"mechanical\"\n",
+    "[[board.model]] part = \"ADS122U04\" and value = \"ADS122U04\" are one registry key"
+)]
+#[case::one_field(
+    "part = \"ADS122U04\"\nkind = \"ads122u04\"\n",
+    "two [[board.model]] entries have part = \"ADS122U04\""
+)]
+fn two_entries_under_one_key_are_refused_whatever_fields_they_name(
+    #[case] second: &str,
+    #[case] says: &str,
+) {
+    behaviour!(Test {
+        id: "project.refuses-one-key-twice",
+        covers: Some("board/src/project.rs#Project::instantiate"),
+        given: "two model entries on the force-gauge add-on with the same key, the \
+                converter's name, once as its part name and again as its part name or as its \
+                value",
+    });
+    expect!(
+        "names-both",
+        "the project is refused, naming both entries and that they are one key",
+        "the registry looks every key up in one table, so the second entry would replace the \
+         first and the model the author gave the part would be gone without a word"
+    );
+    let message = refused(&ds2(&format!(
+        "[[board.model]]\npart = \"ADS122U04\"\nkind = \"ads122u04\"\n\
+         [[board.model]]\n{second}"
+    )));
+    assert_says(&message, &[says, "a key takes one model; keep one"]);
+}
+
+#[rstest]
+fn a_second_source_with_the_name_of_a_first_is_refused_naming_the_first() {
+    behaviour!(Test {
+        id: "project.refuses-two-sources-one-name",
+        covers: Some("board/src/project.rs#Project::instantiate"),
+        given: "two wires with a voltage from the same bench supply name, 0 volts onto one \
+                header board's ground and 5 volts onto another's",
+    });
+    expect!(
+        "names-the-first",
+        "the project is refused, naming the supply, the first wire's voltage and the first \
+         wire",
+        "two voltages on one name are two sources fighting through the boards, and a wire \
+         joining that name could not say which it joins"
+    );
+    expect!(
+        "says-how",
+        "the refusal says to join the supply with a wire that has no voltage, or to give the \
+         second source a name of its own"
+    );
+    let text = "[[board]]\nname = \"A\"\nkind = \"netlist\"\nnetlist = \"header.net\"\n\
+                [[board]]\nname = \"B\"\nkind = \"netlist\"\nnetlist = \"header.net\"\n\
+                [[wire]]\nfrom = \"BENCH.GND\"\nto = \"A.J1.2\"\nvolts = 0.0\n\
+                [[wire]]\nfrom = \"BENCH.GND\"\nto = \"B.J1.2\"\nvolts = 5.0\n";
+    let message = refused(text);
+    assert_says(
+        &message,
+        &[
+            "[[wire]] BENCH.GND to B.J1.2: BENCH.GND is already a source, at 0 V, made by \
+             [[wire]] BENCH.GND to A.J1.2",
+            "join it with a wire that has no volts, or give the second source a name of its own",
+        ],
+    );
+}
+
+#[rstest]
+#[case::a_pin_b_lacks(
+    "a = \"DS2.J1\"\nb = \"HDR.J1\"\n",
+    &["[[mate]] DS2.J1 to HDR.J1: HDR.J1 has no pin 3, 4, 5 that DS2.J1 has", "map = [[\"a pin\", \"b pin\"]"]
+)]
+#[case::not_a_connector(
+    "a = \"HDR.R1\"\nb = \"DS2.J1\"\n",
+    &["R1 is not a connector, and a mate joins two connectors", "HDR's connectors are J1"]
+)]
+#[case::map_names_a_missing_pin(
+    "a = \"HDR.J1\"\nb = \"DS2.J1\"\nmap = [[\"1\", \"9\"]]\n",
+    &["map names pin \"9\" of DS2.J1, which has pins 1, 2, 3, 4, 5"]
+)]
+#[case::map_names_a_pin_twice(
+    "a = \"HDR.J1\"\nb = \"DS2.J1\"\nmap = [[\"1\", \"3\"], [\"2\", \"3\"]]\n",
+    &["map names pin \"3\" of DS2.J1 twice; a pin has one mate"]
+)]
+fn a_mate_that_does_not_fit_its_connectors_is_refused(#[case] mate: &str, #[case] says: &[&str]) {
+    behaviour!(Test {
+        id: "project.refuses-mate-that-does-not-fit",
+        covers: Some("board/src/project.rs#Project::instantiate"),
+        given: "a project mating the add-on's five-pin header with a two-pin header: the wider in the narrower, a resistor as a connector, or a cable map naming a missing pin or one pin twice",
+    });
+    expect!(
+        "names-the-misfit",
+        "the project is refused, naming the pins one side lacks, the part that is no connector, or the pin the map names wrongly, and what exists",
+        "a mate joins every pin of its first connector, so a pin with nothing to land on is a \
+         connector pair that does not mate"
+    );
+    let text = format!(
+        "{}{}[[mate]]\n{mate}",
+        header(""),
+        "[[board]]\nname = \"DS2\"\nkind = \"netlist\"\n\
+         netlist = \"../../board/tests/fixtures/ds2_addon.net\"\n\
+         [[board.model]]\npart = \"ADS122U04\"\nkind = \"ads122u04\"\n"
+    );
+    assert_says(&refused(&text), says);
 }
 
 #[rstest]
@@ -295,4 +475,45 @@ fn a_switch_pole_the_part_does_not_have_is_refused() {
         &message,
         &["U100 is not a switch on EC32; its switches: J101, S301"],
     );
+}
+
+#[rstest]
+fn the_three_board_machine_project_waits_on_the_two_parts_the_catalog_lacks() {
+    behaviour!(Test {
+        id: "project.machine-waits-on-two-parts",
+        covers: Some("board/src/project.rs#Project::instantiate"),
+        given: "the shipped project of the MaD machine's three boards, the Edge carrier, the P2 \
+                module in its socket and the force-gauge add-on on its cable, built with the \
+                standard catalog alone",
+    });
+    expect!(
+        "names-the-two",
+        "the project is refused naming the carrier's RS-422 line driver and line receiver, \
+         and only them, as the parts that need a model",
+        "every other part of the three boards is placed by the catalog or by the file, and \
+         the catalog has no model of either line part yet"
+    );
+    let path = projects().join("edge-ec32-ds2.toml");
+    let message = Project::load(&path)
+        .expect("the project loads")
+        .instantiate(&StandardCatalog)
+        .expect_err("two parts have no model")
+        .to_string();
+    assert_says(
+        &message,
+        &[
+            "board EDGE is not ready to build",
+            "168 parts: 166 classified, 2 need a model, 0 with pins the netlist does not have, \
+             0 refused",
+            "U24  part \"AM26LS31CD\"",
+            "U25  part \"AM26LV32xD\"",
+        ],
+    );
+    let listed = message
+        .lines()
+        .skip_while(|line| *line != "needs a model:")
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .count();
+    assert_eq!(listed, 2, "{message}");
 }

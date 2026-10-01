@@ -18,7 +18,7 @@ A project holds four lists, and each one is part of the `System` it builds:
 |---|---|---|
 | `[[board]]`, each with its `[[board.model]]` entries | `System::board` | a board: a netlist, either a KiCad export or one a catalog board kind bundles, built with a part registry, and the model each part the registry cannot place takes |
 | `[[component]]` | `System::component` | a bench component: a part with pins and no board |
-| `[[wire]]` | `System::harness` | the harness: each wire joins two endpoints, or, with `volts`, sources one |
+| `[[wire]]`, `[[mate]]` | `System::harness` | the harness: each wire joins two endpoints, or, with `volts`, sources one; each mate joins two connectors pin for pin |
 | `[[switch]]`, `[[jumper]]`, `[[pin_short]]` | `System::scenario` | the scenario: switch poles and jumpers opened or closed, and two part pins shorted |
 
 The file names **kinds**. A catalog (`embsim_board::Catalog`) turns each
@@ -85,13 +85,17 @@ unknown field `colour`, expected one of `name`, `kind`, `netlist`, `model`
 | `[board.model.options]` | depends on the kind | the kind's options; one the kind does not take is refused, naming the ones it does |
 | `[[component]]` | `name`, `kind` | a bench component and its catalog kind; endpoints on it are `Name.Pin` |
 | `[[wire]]` | `from`, `to` | two endpoints; a board's is `Board.Connector.Pin` |
-| | `volts` | optional: `from` becomes a source at this voltage (section 6) |
+| | `volts` | optional: `from` becomes a source at this voltage (section 6); one `from` takes one `volts` |
+| `[[mate]]` | `a`, `b` | two connectors, `Board.Connector`: each pin of `a` joins `b`'s pin of the same number, and `b` may have more pins (section 6) |
+| | `map` | optional: `[["a pin", "b pin"], …]`, the pairs a cable joins when it does not join them by number; only these are joined |
 | `[[switch]]` | `part`, `pole`, `state` | a switch pole: `part = "EC32.S301"`, the pole numbered from 0 in the order the part declares its poles, `state = "open"` or `"closed"` |
 | `[[jumper]]` | `part`, `state` | a two-pad jumper (a `Jumper*` or `SolderJumper*` symbol), open or closed; a three-pad one is two switch poles (pads 1–2 and 2–3) |
 | `[[pin_short]]` | `a`, `b` | two part pins, `Board.Ref.Pin`, joined as one net: a scenario fault or a bodge wire |
 
 A board or component name is not empty and has no dot or space, and no two
-are the same. A path in the file (`netlist`, and the `image` and `rom`
+are the same. No two `[[board.model]]` entries on a board have the same key,
+whatever field each names it by: the registry looks every key up in one
+table, so `part = "X"` and `value = "X"` are one key. A path in the file (`netlist`, and the `image` and `rom`
 options) is relative to the project file's directory. `Project::parse` reads
 a project from text instead, with paths relative to the current directory
 unless `Project::relative_to` gives another.
@@ -173,13 +177,26 @@ with (section 4) and sorts the parts into these lists:
   carries, and the survey shows the key.
 - **Need a model.** A part the catalog cannot place is listed with the keys a
   `[[board.model]]` can name (its part name, value and manufacturer part
-  number), its pins, and the kinds that could be it. A kind fits by part
-  number first: compared on their letters and digits, one of the part's keys
-  and a number the kind is for are the same, or one starts with the other, as
-  `ADS122U04` starts `ADS122U04IPW`. A key with fewer than five letters and
-  digits names no part. Failing that, a kind fits by a pin table with exactly
-  the part's pins, and failing that, by a table with as many pins. The survey
-  shows only the strongest kind of fit any kind makes.
+  number), its pins, and what it could be:
+  - **The kinds its keys name.** A kind fits by part number first: compared
+    on their letters and digits, one of the part's keys and a number the kind
+    is for are the same, or one starts with the other, as `ADS122U04` starts
+    `ADS122U04IPW`. Failing that, a kind fits by part family: a key contains
+    the family the kind's model is for, as `TG2520SMN 26.0000M-ECGNNM3`
+    contains `TG2520SMN` (section 5, the "seats on" column). A key with fewer
+    than five letters and digits names no part. The survey shows only the
+    stronger kind of fit any kind makes.
+  - **Else, the kinds without a model the board allows** (section 3, step
+    3): `switch`, `boundary` or `mechanical`, each with what allows it, the
+    part's designator, symbol, name or nets.
+  - **Else, that it needs a model**, written for it (section 7).
+
+  Pins name no kind. An EDA export numbers every package's pins from 1, so
+  two parts with as many pins share a table whatever each is. A part whose
+  symbol names one part and whose manufacturer part number names another of
+  its family (the Edge board's `U25`: `AM26LV32xD` and `AM26LS32CD`) is
+  flagged: a model is one part's, and the netlist does not say which the
+  board carries.
 - **Placed with a pin table the netlist does not use.** The model's pins and
   the netlist's pins are shown side by side, with the table that fits.
 - **Refused.** A class the part cannot be, such as a resistor with three
@@ -209,8 +226,9 @@ The file answers the checklist as far as the catalog can:
   does not use, the file has a `[[board.model]]` choosing the one that fits,
   or, where no table of the model fits, a comment saying so.
 - **Model stubs.** Each part that needs a model gets a commented stub, keyed
-  by its manufacturer part number, else its part name, else its value. When
-  exactly one kind fits by part number or by pins, the stub names that kind.
+  by its manufacturer part number, else its part name, else its value, under
+  the survey's sentence for it. When exactly one kind fits by part number,
+  and the part's symbol and number agree, the stub names that kind.
   It also carries the options the kind cannot go without, each at an example
   value, and a `pins` line when the table that fits is not the default.
 - **Endpoints.** Every connector pin is listed as the endpoint a wire names.
@@ -254,7 +272,7 @@ needs a model:
   U1  part "ADS122U04"  value "ADS122U04"  (16 pins)
 connectors:
   …
-give each part that needs a model a [[board.model]] with its part, mpn or value and a kind; the part kinds are "p2", "tg2520smn", …
+give each part that needs a model a [[board.model]] with its part, mpn or value and the kind it is; a kind seats only on a part that is what the kind says, and a part no kind is for needs a model written for it (PROJECTS.md §7); the part kinds are "p2", "tg2520smn", …
 ```
 
 ### Step 3: give each part its model
@@ -292,12 +310,30 @@ kind = "74lvc2g04"
 pins = "by-function"
 ```
 
-Choose a kind by what the part is, and a table by the netlist's pins. When no
-kind fits, the part needs a model that nobody has written yet (section 7).
-Three kinds say what a part is without a model. `switch` pairs the part's
-pins into poles. `boundary` makes it a connector. `mechanical` says the part
-has nothing electrical: a PCB line, a layout node, a mounting hole. The build
-reports a mechanical pad on a net a pin drives (`MechanicalOnDrivenNet`).
+Choose a kind by what the part is, and a table by the netlist's pins. A
+kind seats only on a part it is (section 8): a model's kind on a part whose
+part name, manufacturer part number or value contains the family the model
+is for, whatever the part's pins.
+
+Three kinds say what a part is without a model, and each seats only where the
+board says the part is one:
+
+- `switch` pairs the part's pins into poles, for a part whose designator is
+  `S`, `SW`, `JP` or `SJ`, whose symbol is a `SW_…`, or whose symbol name or
+  value says switch, jumper or solder link (the P2-EC32MB's `J101`, "Solder
+  Link Pads").
+- `boundary` makes a part a connector, for one whose designator is `J`, `P`
+  or `CN` or whose symbol is a `Conn…`.
+- `mechanical` says the part has nothing electrical (a PCB line, a layout
+  node, a mounting hole), for one whose pins sit on one net at most. A part
+  whose pins join two nets carries current between them, and that is
+  behaviour. The build also reports a mechanical pad on a net a pin drives
+  (`MechanicalOnDrivenNet`).
+
+When no kind fits, the part needs a model. It may exist outside the catalog
+(section 9 lists the parts the catalog does not model yet, and where their
+models are) or need writing (section 7). Until it has one the board does not
+build: there is no stand-in.
 
 ### Step 4: wire the connectors
 
@@ -341,7 +377,7 @@ embsim check ds2.toml
 ```text
 project ds2.toml
   board DS2 (netlist): 31 parts: 31 classified, 0 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
-  1 board, 0 bench components, 4 wires
+  1 board, 0 bench components, 4 wires, 0 mates
 build findings (11), the system before its first wake:
   FloatingSense { net: "DS2.GPIO1", kind: Digital }
   FloatingSense { net: "DS2.GPIO0", kind: Digital }
@@ -372,23 +408,56 @@ embsim run ds2.toml --for 5ms --net DS2.+3V3 --net DS2.VDDA --net DS2.~RESET
 project ds2.toml
   …
 running for 5.000000 ms of virtual time
-[   0.000000 ms] FloatingSense { net: "DS2.GPIO1", kind: Digital }
-…
+findings at build, before any wake (11):
+  FloatingSense { net: "DS2.GPIO1", kind: Digital }
+  …
 ran 5.000000 ms of virtual time in 0.001 s
 net DS2.+3V3: Analog(3.3)
 net DS2.VDDA: Analog(3.3)
 net DS2.~RESET: Floating
-findings: 11
+findings: 11 (11 at build, 0 while running)
+at 5.000000 ms, each finding's net read again:
+  no longer true (0):
+  still true (11):
+    FloatingSense { net: "DS2.GPIO1", kind: Digital }
+    …
+  about the board as built and wired (0):
 ```
 
 `run` starts the system on a stepped virtual clock and runs it for `--for`
 of virtual time. The duration is a number and a unit: `ns`, `us` (or `µs`),
-`ms` or `s`. While it runs, `run` looks at the system every 100 µs of
-virtual time. It prints each new finding stamped with the instant of the
-look that found it, and, for a P2 running on QEMU (section 5), the instant
-its core started and its console output. At the end it prints the nets named
-with `--net` (`Board.Net`, as the board's netlist spells the net). A net the
-system does not have is refused before the run starts.
+`ms` or `s`. It prints the report in three parts:
+
+- **At build, before any wake.** The findings the build made, the system
+  before its first wake: every rail with a soft-start is down then, so a
+  board with regulators lists its rails as unsourced here.
+- **While it runs.** `run` looks at the system every 100 µs of virtual time.
+  It prints each new finding stamped with the instant of the look that found
+  it, and, for a P2 running on QEMU (section 5), the instant its core started
+  and its console output.
+- **At the end.** The nets named with `--net` (`Board.Net`, as the board's
+  netlist spells the net; a net the system does not have is refused before
+  the run starts), then every finding again, its net read once more. A
+  finding is about the system at an instant, and findings are not withdrawn
+  as a run goes on, so this is where a build finding the run cleared is
+  said to be: "no longer true", with what its net reads now (a rail that
+  came up reads its voltage). A floating sense, an unsourced power net and a
+  down rail hold while their net floats; a fight holds while its net reads
+  one. A finding with no net of its own to read again (an undecoupled
+  supply pin, an open drain with no pull-up) is listed as about the board
+  as built and wired.
+
+On the P2-EC32MB project (`boards/projects/ec32-netlist.toml`), run for
+10 ms, the build lists the module's ten rails as unsourced, and the end lists
+each as no longer true at the voltage its regulator holds:
+
+```text
+  no longer true (18):
+    …
+    PowerNetUnsourced { net: "EC32.Common_VDD" }: EC32.Common_VDD reads Analog(1.8133333333333335)
+    PowerNetUnsourced { net: "EC32.VIO_00_07" }: EC32.VIO_00_07 reads Analog(3.3)
+    …
+```
 
 Virtual time advances only to the next instant something happens, so two
 runs of a project print the same report, apart from the line with the wall
@@ -432,6 +501,11 @@ surveyed with that same registry first. A part gets its class in this order:
    name first, then its manufacturer part number, then its value. An entry
    is refused, with the reason, when:
    - it matches no part;
+   - another entry on the board has the same key, by any field;
+   - a part it reaches is not what the kind says it is: its keys do not
+     contain the family the model is for, or the board does not say it is a
+     switch, a connector or a part with nothing electrical (section 3, step
+     3);
    - another key of the same part comes first (the error names the key to
      use instead);
    - the part's symbol already makes it a resistor, a connector or another
@@ -470,28 +544,40 @@ here.
 ### Part kinds
 
 <!-- part-kinds:begin -->
-| kind | model | placed by part number | `pins` (the first is the default) | other options |
-|---|---|---|---|---|
-| `p2` | the Propeller 2 package | never (it is for `P2X8C4M64P`) | fixed: `P2X8C4M64P` (86 pins) | `core` = `"held-in-reset"` (required) |
-| `tg2520smn` | EPSON TCXO; frequency from the part's value or number | `TG2520SMN 20.0000M-ECGNNM3` | `"numbered"` (4 pins), `"by-function"` (4 pins) | — |
-| `74lvc2g04` | NXP dual inverter | `74LVC2G04GW,125` | `"sot363"` (6 pins), `"by-function"` (6 pins) | — |
-| `sn74lvc1g14` | TI Schmitt inverter | `SN74LVC1G14DBVR`, `SN74LVC1G14DBVT` | `"sot23"` (5 pins) | — |
-| `aps6404l` | AP Memory PSRAM | `APS6404L-3SQR-ZR` | `"sop8"` (8 pins), `"by-function"` (9 pins) | — |
-| `w25q128jv` | Winbond serial NOR flash, blank or holding an image | `W25Q128JVSIM`, `W25Q128JVSIM TR`, `W25Q128JVSIQ` | `"soic8"` (8 pins), `"by-function"` (8 pins), `"spi-only"` (4 pins) | `id` = `"im"`, `"iq"`; `image = "boot.bin"` — a file the part holds from address 0, the rest erased, relative to the project file |
-| `sd-card` | a card in an SD socket | — | `"microsd"` (8 pins), `"by-function"` (8 pins), `"spi-only"` (4 pins) | `image = "card.img"` — the card in the socket: a card image file, relative to the project file (required) |
-| `ap62301` | Diodes buck; setpoint from its feedback divider | `AP62301Z6-7` | `"sot563"` (6 pins), `"by-function"` (5 pins) | — |
-| `ncp114` | onsemi LDO; setpoint from the part's value or number | `NCP114AMX330TCG` | `"udfn4"` (4 pins), `"by-function"` (5 pins) | — |
-| `xl1509` | XLSEMI buck; version from the part's value or number | `XL1509-3.3E1`, `XL1509-5.0E1`, `XL1509-12E1` | `"sop8"` (8 pins) | — |
-| `ucc12040` | TI isolated DC/DC; setpoint from its SEL strap | `UCC12040DVE`, `UCC12040DVER` | `"soic16"` (16 pins) | — |
-| `stm1061` | ST voltage detector, from its ordering code | `STM1061N16WX6F` | `"sot23"` (3 pins), `"by-function"` (3 pins) | — |
-| `6n137` | Lite-On optocoupler | `6N137` | fixed: `6N137` (7 pins) | — |
-| `vo2631` | Vishay dual optocoupler | `VO2631` | fixed: `VO2631` (8 pins) | — |
-| `iso67xx` | TI digital isolator, the member the key names | `ISO6721BDR`, `ISO6731DWR`, `ISO6740DWR`, `ISO6740FDWR`, `ISO6741DWR`, `ISO6742DWR` | fixed, the member's: `ISO6721BDR` (8 pins), `ISO6731DWR` (16 pins), `ISO6740DWR` (16 pins), `ISO6740FDWR` (16 pins), `ISO6741DWR` (16 pins), `ISO6742DWR` (16 pins) | — |
-| `ads122u04` | TI 24-bit ADC, as it comes out of reset | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
-| `switch` | a switch whose poles pair the part's pins, each open | — | the part's own | `poles = [["1", "2"]]` — the part's pins paired into poles, each open until a [[switch]] closes it (required) |
-| `mechanical` | a part with pads and nothing electrical | — | the part's own | — |
-| `boundary` | a connector, by its symbol's part name | — | the part's own | — |
+| kind | model | seats on | placed by part number | `pins` (the first is the default) | other options |
+|---|---|---|---|---|---|
+| `p2` | the Propeller 2 package | a part whose part name, mpn or value contains P2X8C4M64P | never (it is for `P2X8C4M64P`) | fixed: `P2X8C4M64P` (86 pins) | `core` = `"held-in-reset"` (required) |
+| `tg2520smn` | EPSON TCXO; frequency from the part's value or number | a part whose part name, mpn or value contains TG2520SMN | `TG2520SMN 20.0000M-ECGNNM3` | `"numbered"` (4 pins), `"by-function"` (4 pins) | — |
+| `74lvc2g04` | NXP dual inverter | a part whose part name, mpn or value contains 74LVC2G04 | `74LVC2G04GW,125` | `"sot363"` (6 pins), `"by-function"` (6 pins) | — |
+| `sn74lvc1g14` | TI Schmitt inverter | a part whose part name, mpn or value contains 74LVC1G14 | `SN74LVC1G14DBVR`, `SN74LVC1G14DBVT` | `"sot23"` (5 pins) | — |
+| `aps6404l` | AP Memory PSRAM | a part whose part name, mpn or value contains APS6404L | `APS6404L-3SQR-ZR` | `"sop8"` (8 pins), `"by-function"` (9 pins) | — |
+| `w25q128jv` | Winbond serial NOR flash, blank or holding an image | a part whose part name, mpn or value contains W25Q128JV | `W25Q128JVSIM`, `W25Q128JVSIM TR`, `W25Q128JVSIQ` | `"soic8"` (8 pins), `"by-function"` (8 pins), `"spi-only"` (4 pins) | `id` = `"im"`, `"iq"`; `image = "boot.bin"` — a file the part holds from address 0, the rest erased, relative to the project file |
+| `sd-card` | a card in an SD socket | a connector: designator J, P or CN, or a Conn… symbol | — | `"microsd"` (8 pins), `"by-function"` (8 pins), `"spi-only"` (4 pins) | `image = "card.img"` — the card in the socket: a card image file, relative to the project file (required) |
+| `ap62301` | Diodes buck; setpoint from its feedback divider | a part whose part name, mpn or value contains AP62301 | `AP62301Z6-7` | `"sot563"` (6 pins), `"by-function"` (5 pins) | — |
+| `ncp114` | onsemi LDO; setpoint from the part's value or number | a part whose part name, mpn or value contains NCP114 | `NCP114AMX330TCG` | `"udfn4"` (4 pins), `"by-function"` (5 pins) | — |
+| `xl1509` | XLSEMI buck; version from the part's value or number | a part whose part name, mpn or value contains XL1509 | `XL1509-3.3E1`, `XL1509-5.0E1`, `XL1509-12E1` | `"sop8"` (8 pins) | — |
+| `ucc12040` | TI isolated DC/DC; setpoint from its SEL strap | a part whose part name, mpn or value contains UCC12040 | `UCC12040DVE`, `UCC12040DVER` | `"soic16"` (16 pins) | — |
+| `stm1061` | ST voltage detector, from its ordering code | a part whose part name, mpn or value contains STM1061 | `STM1061N16WX6F` | `"sot23"` (3 pins), `"by-function"` (3 pins) | — |
+| `6n137` | Lite-On optocoupler | a part whose part name, mpn or value contains 6N137 | `6N137` | fixed: `6N137` (7 pins) | — |
+| `vo2631` | Vishay dual optocoupler | a part whose part name, mpn or value contains VO2631 | `VO2631` | fixed: `VO2631` (8 pins) | — |
+| `iso67xx` | TI digital isolator, the member the key names | a part whose part name, mpn or value contains ISO6720, ISO6721, ISO6731, ISO6740, ISO6741 or ISO6742 | `ISO6721BDR`, `ISO6731DWR`, `ISO6740DWR`, `ISO6740FDWR`, `ISO6741DWR`, `ISO6742DWR` | fixed, the member's: `ISO6721BDR` (8 pins), `ISO6731DWR` (16 pins), `ISO6740DWR` (16 pins), `ISO6740FDWR` (16 pins), `ISO6741DWR` (16 pins), `ISO6742DWR` (16 pins) | — |
+| `ads122u04` | TI 24-bit ADC, as it comes out of reset | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
+| `switch` | a switch whose poles pair the part's pins, each open | a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that says switch, jumper or solder link | — | the part's own | `poles = [["1", "2"]]` — the part's pins paired into poles, each open until a [[switch]] closes it (required) |
+| `mechanical` | a part with pads and nothing electrical | a part whose pads sit on one net at most | — | the part's own | — |
+| `boundary` | a connector, by its symbol's part name | a connector: designator J, P or CN, or a Conn… symbol | — | the part's own | — |
 <!-- part-kinds:end -->
+
+**Seats on.** A kind seats only on a part that is what it says, and an entry
+that reaches any other part is refused, naming the part and what the kind is
+for (section 8). A model's kind is for a part family: a part whose part
+name, manufacturer part number or value contains it, compared on letters
+and digits, so `SN74LVC1G14DBVR` is a `74LVC1G14` and
+`TG2520SMN 26.0000M-ECGNNM3` a `TG2520SMN`. The model then reads what it
+needs from the part, or refuses it: the oscillator reads its frequency from
+the value. The `sd-card` kind sits in a socket, so it seats on a connector.
+`switch`, `boundary` and `mechanical` seat where the board says the part is
+one (section 3, step 3). A part's pins say nothing here: a pin table only
+has to match once the kind has seated.
 
 **Pin tables.** `pins` picks the table of pins the model declares, and the
 survey compares it with the netlist's pins as sets, in both directions. The
@@ -583,14 +669,21 @@ stage-1 and a program, as the test that boots this project does
 
 ## 6. Board to board
 
-A harness attaches to a board at its boundary. A wire's end on a board is a
-connector pin, `Board.Connector.Pin`. Its other end is one of these:
+A harness attaches to a board at its boundary. It is made of two tables:
 
-- a connector pin on the same board or another one;
-- a bench component's pin, `Name.Pin`;
-- a supply. A wire with `volts` makes its `from` a source at that voltage.
-  That end is usually a name no board or component has (`BENCH.5V`), and any
-  other wire may join it.
+- **`[[wire]]`** joins two endpoints. A wire's end on a board is a connector
+  pin, `Board.Connector.Pin`. Its other end is a connector pin on the same
+  board or another one, a bench component's pin (`Name.Pin`), or a supply.
+- **`[[mate]]`** joins two connectors at once, `a` and `b`, each
+  `Board.Connector`: a module seated in its socket, a header on a header, a
+  cable between two boards.
+
+A wire with `volts` makes its `from` a source at that voltage. That end is
+usually a name no board or component has (`BENCH.5V`), and any other wire
+may join it without `volts`. One name is one source: a second wire with
+`volts` from the same `from` is refused, naming the first, because two
+voltages on one name would be two sources fighting through whatever joins
+them. A second source takes a name of its own.
 
 A wire to a pin that is not on a connector is refused, and the error lists
 the connectors:
@@ -603,11 +696,24 @@ A `[[pin_short]]` is the one way to join two pins that are not on
 connectors. It is a scenario line, for a fault or a bodge wire, and it may
 join any two part pins on the boards.
 
-[`boards/projects/header-pair.toml`](boards/projects/header-pair.toml) wires
-two boards together. Each board is the header board (`header.net`), a
-two-pin connector `J1` with a 10 kΩ resistor from its `SIG` to its `GND`.
-The file joins the two `J1`s pin for pin and puts the bench's 0 V on the
-left one's ground:
+### Mates
+
+Without a `map`, a mate joins each pin of `a` to `b`'s pin of the same
+number. Every pin of `a` has to land: a pin `b` lacks is refused, naming the
+pins. `b` may have more pins than `a`, and those stay open, as the contacts
+of a socket wider than the card seated in it do. So `a` is the side with
+fewer pins: the module's fingers, the cable's plug.
+
+A cable that does not join pins by number says which it joins with `map`, a
+list of `["a pin", "b pin"]` pairs. Only those pairs are joined, so a pin a
+cable does not wire stays open. A pin the connector lacks, or a pin named
+twice on one side, is refused.
+
+[`boards/projects/header-pair.toml`](boards/projects/header-pair.toml)
+mates two boards. Each board is the header board (`header.net`), a two-pin
+connector `J1` with a 10 kΩ resistor from its `SIG` to its `GND`. The file
+mates the two `J1`s pin for pin and puts the bench's 0 V on the left one's
+ground:
 
 ```toml
 [[board]]
@@ -620,13 +726,9 @@ name = "RIGHT"
 kind = "netlist"
 netlist = "header.net"
 
-[[wire]]
-from = "LEFT.J1.1"
-to = "RIGHT.J1.1"
-
-[[wire]]
-from = "LEFT.J1.2"
-to = "RIGHT.J1.2"
+[[mate]]
+a = "LEFT.J1"
+b = "RIGHT.J1"
 
 [[wire]]
 from = "BENCH.GND"
@@ -642,17 +744,138 @@ embsim check boards/projects/header-pair.toml
 project boards/projects/header-pair.toml
   board LEFT (netlist): 2 parts: 2 classified, 0 need a model, 0 with pins the netlist does not have, 0 refused, 1 connectors
   board RIGHT (netlist): 2 parts: 2 classified, 0 need a model, 0 with pins the netlist does not have, 0 refused, 1 connectors
-  2 boards, 0 bench components, 3 wires
+  2 boards, 0 bench components, 1 wire, 1 mate
 build findings: none
 ok: boards/projects/header-pair.toml builds
 ```
 
-Each board keeps its own net names. The wire makes `LEFT.SIG` and
+Each board keeps its own net names. The mate makes `LEFT.SIG` and
 `RIGHT.SIG` one node, and `BuiltSystem::names_are_merged` says so (the
 first example in section 1).
 [`boards/tests/board_to_board.rs`](boards/tests/board_to_board.rs) proves
 it live. It drives a 25 Ω pad on `LEFT.J1.1`, and `RIGHT.SIG` reads
 3.3 V divided between the pad and both boards' resistors in parallel.
+[`boards/tests/mates.rs`](boards/tests/mates.rs) holds a crossed map and a
+one-wire map to the pins they name.
+
+### Which connectors mate, and how their pins map
+
+Nothing in two netlists says which of their connectors mate: that is the
+assembly, and the project says it. What the netlists do give is each
+connector's pins, with their names and nets, and `embsim survey` lists
+them:
+
+- `embsim survey board.net` lists every connector of a netlist board with
+  its pins, each pin's name and its net. A part the survey can make a
+  connector (a `J`, `P` or `CN` designator, a `Conn…` symbol) is listed with
+  the same table under "need a model", so the pins a mate will land on are
+  in front of you before it has its `boundary` entry.
+- `embsim survey --kind p2-ec32mb` lists a board kind the catalog ships the
+  same way, surveyed with the registry a project builds it with.
+
+Put the two lists side by side. Where the two connectors name each pin
+alike (the same signal name on the same number, or the same net name),
+they mate by number. Where they do not, the cable crosses, and the map says
+how. Write down why in a comment beside the mate: it is the one place the
+project records the assembly.
+
+### Seating a module in a carrier, and wiring a cable
+
+[`boards/projects/edge-ec32-ds2.toml`](boards/projects/edge-ec32-ds2.toml)
+is the MaD machine's electronics: the MaD Edge carrier, the P2-EC32MB
+module in its socket, and the DS2 force-gauge add-on on the carrier's force
+cable.
+
+**The module in its socket.** `embsim survey board/tests/fixtures/mad_edge.net`
+lists the Edge board's socket, `J3`, with its 80 pins. Its symbol is the
+board's own (`P2_EDGE_MODULE_SOCKET`), so the survey offers it `boundary`
+by its `J`, and lists its pins:
+
+```text
+  J3  part "P2_EDGE_MODULE_SOCKET"  value "P2_EDGE_MODULE_SOCKET"  mpn "450-00309"
+      80 pins:
+        pin  name             net
+        1    NC@1             unconnected-(J3-NC@1-Pad1)
+        2    NC@2             unconnected-(J3-NC@2-Pad2)
+        3    P37              P37
+        …
+        41   5V@1             +5V
+        …
+```
+
+`embsim survey --kind p2-ec32mb` lists the module's card edge, `J203`,
+with the 60 fingers its netlist declares:
+
+```text
+  J203  value "Edge Socket Pads"  60 pins
+    pin  name             net
+    1    NC               NC_Net
+    2    NC               NC_Net
+    3    P37              P2_IO37
+    …
+    41   5V               VIN_Edge
+    …
+```
+
+Both netlists number the card edge by finger, and both label each finger
+alike (`P37` on 3, `5V` on 41), so the module mates by number. The module's
+netlist leaves out the 20 fingers it keeps for its PSRAMs (55, 56, 59–67 and
+69–77: `P40`–`P57` and the `V40`/`V48` bank supplies), so `J203` has fewer
+pins than `J3` and is `a`:
+
+```toml
+[[board.model]]          # under the EDGE board
+part = "P2_EDGE_MODULE_SOCKET"
+kind = "boundary"
+
+[[mate]]
+a = "EC32.J203"
+b = "EDGE.J3"
+```
+
+**The force cable.** The carrier's `J9` ("Force", a six-way Molex 43045)
+and the add-on's `J1` ("MCU", a five-way 2.54 mm header) share no pin names
+and no net names:
+
+```text
+  J9  value "Force"  6 pins          J1  value "MCU"  5 pins
+    1    Pin_1  …/IFG_5V               1    Pin_1  +3V3
+    2    Pin_2  …/IFG_RX               2    Pin_2  GND
+    3    Pin_3  …/IFG_INT              3    Pin_3  Net-(J1-Pin_3)
+    4    Pin_4  …/IFG_TX               4    Pin_4  Net-(J1-Pin_4)
+    5    Pin_5  …/IFG_GND              5    Pin_5  Net-(J1-Pin_5)
+    6    Pin_6  SHIELD
+```
+
+The add-on's nets lead to its converter: `J1.3` through `R3` to its `RX`,
+`J1.4` through `R4` from its `TX`, `J1.5` through `R5` from its `~DRDY`. So
+the carrier's `TX` (`J9.4`) goes to `J1.3`, its `RX` (`J9.2`) to `J1.4`, and
+its interrupt (`J9.3`) to `J1.5`; the supply and its return go to `J1.1` and
+`J1.2`, and `J9.6`, the shield, to nothing:
+
+```toml
+[[mate]]
+a = "EDGE.J9"
+b = "DS2.J1"
+map = [["1", "1"], ["5", "2"], ["4", "3"], ["2", "4"], ["3", "5"]]
+```
+
+The rest of the file is the bench: 12 V and its return on the carrier's
+`J2`, the servo domain's 5 V and return on `J21`, and the force domain's
+return and the add-on's analog supply, which nothing on the boards makes.
+The module takes its 5 V from the carrier's own regulator, through the
+mate.
+
+`embsim check` refuses the project today, naming exactly two parts: the
+carrier's RS-422 line driver `U24` and line receiver `U25`, which the
+catalog does not model yet (section 9). Every other part of the three
+boards is placed, and the mates and wires are checked once the boards
+build. `board/tests/edge_project.rs` builds the file with those two parts
+given the models the board tests use, and holds the mates to the
+hand-written harnesses the machine tests use (every finger and every cable
+pin joined as they join it, every empty socket contact and the shield
+open); `board/tests/edge_project_live.rs` runs it, and the module's core
+rail and the add-on's supply come up from the carrier's rails.
 
 ## 7. Adding kinds: a catalog of your own
 
@@ -675,9 +898,15 @@ kind and passes every other kind, option and board to `StandardCatalog`.
   `ModelFacade` of the pins the component declares, so that the survey
   checks the pins without building anything. `assignment.parts` is every
   part the key reaches, for a kind that reads its configuration from a
-  part's value or number. `assignment.dir` is the project file's directory,
-  for a path an option names, and `assignment.error` puts the entry in
-  front of a message.
+  part's value or number, and that checks each is the part the kind is for
+  (`assignment.nets_of(reference)` gives the nets a part's pins join).
+  `assignment.dir` is the project file's directory, for a path an option
+  names, and `assignment.error` puts the entry in front of a message.
+- **What a part kind seats on.** A kind says what a part is, so a kind of
+  your own refuses a part it is not, as the standard catalog's do
+  (section 8). A catalog that registers one of the standard catalog's kinds
+  itself calls `StandardCatalog::check_parts_are_the_kind` first, as
+  `QemuCatalog` does for `p2`.
 - **What a kind may not do.** It must not start anything when it registers.
   A survey registers every entry and builds nothing, so a thread starts, or
   a chip boots, in the model's constructor, when the board is built.
@@ -753,6 +982,15 @@ impl Catalog for MyCatalog {
         }
         // This kind takes no options; `finish` refuses any it is given.
         options.finish()?;
+        // A kind says what the part is: this one is the module's CTS switch.
+        for part in assignment.parts {
+            if part.mpn.as_deref() != Some("218-4LPSTJR") {
+                return Err(assignment.error(format!(
+                    "{} is not the CTS 218-4LPSTJR this kind is for",
+                    part.reference
+                )));
+            }
+        }
         // Four poles, each position between its ON and OFF pads.
         registry.register_switch(assignment.key, dip_switch_poles());
         Ok(())
@@ -820,6 +1058,15 @@ A catalog of your own runs from Rust. The `embsim` binary's catalog is
   no stub, no facade-only part and no allow-list. The only way past the
   survey is a class that says what the part is: a model, a switch's poles, a
   connector, or `mechanical` for a part with nothing electrical.
+- **A kind is what the part is.** Every kind checks the parts an entry
+  reaches before it registers, and refuses one it is not, naming what the
+  kind is for and what the board says of the part. A model's kind seats on a
+  part whose part name, manufacturer part number or value contains the part
+  family the model is for. `switch` seats on a part whose designator, symbol
+  or name says switch or jumper; `boundary` and `sd-card` on one whose
+  designator or symbol says connector; `mechanical` on one whose pins sit on
+  one net at most. A pin table that matches says nothing: any part with as
+  many pins matches a numbered one.
 - **Nothing invented.** The file never holds a model's behaviour or numbers.
   An option chooses among what a model offers, and a model reads what it
   needs from the netlist or its datasheet. The numbers the file does hold,
@@ -827,17 +1074,39 @@ A catalog of your own runs from Rust. The `embsim` binary's catalog is
   the scenario (DESIGN.md rule 6: a scenario line). A board has no ground
   and no input supply until a wire gives it one.
 - **Wires land on connectors.** A harness joins boards at their boundary.
-  A wire's board end is a connector pin, and only a `[[pin_short]]`, a
-  scenario fault, joins any two part pins.
+  A wire's board end is a connector pin, a mate joins two connectors, and
+  only a `[[pin_short]]`, a scenario fault, joins any two part pins.
+- **One key, one model; one name, one source.** Two `[[board.model]]`
+  entries with one key, by any fields, are refused, and so are two wires
+  with `volts` from one `from`.
 - **Everything named is checked before the system starts.** An unknown key,
   kind or option is refused with the ones that exist. So are a key that
   reaches no part, a model that another key or the part's symbol comes
-  before, a wire endpoint that is not there, and a switch pole or jumper the
-  part does not have. The error text says what to fix.
+  before, a wire endpoint that is not there, a mate pin with nothing to land
+  on, and a switch pole or jumper the part does not have. The error text
+  says what to fix.
 - **Deterministic.** `run` is stepped: two runs of one project print the
   same report, apart from the line with the wall time.
 
 ## 9. Not yet
+
+### Parts the catalog does not model yet
+
+A part on a board embsim ships or tests, that no kind of the standard
+catalog is for. A project with one does not build until a kind for it ships
+(section 7 for a catalog of your own); the survey names each as needing a
+model.
+
+| Part | Board, reference | What exists, and what is owed |
+|---|---|---|
+| TI AM26LS31 quad RS-422 line driver (`AM26LS31CD`) | MaD Edge, `U24` (the servo step and direction pairs on `J21`) | `Rs422Driver` in `board/tests/machine_parts/mod.rs`, the model the board tests run the Edge board with. It is test-tree code, not a catalog model: its outputs drive through a 25 Ω source impedance no datasheet line gives; their high level is a voltage the test passes in (the servo domain's 5 V), not the part's own supply pin; its pin table declares channels 3 and 4 as passive pins because this board leaves them unwired; and its provenance block asks for per-behaviour datasheet citations (SLLS114N) before it moves out of the tests. |
+| TI AM26LV32 quad RS-422 line receiver | MaD Edge, `U25` (the encoder pairs on `J20`) | `Rs422Receiver`, beside the driver, with the same 25 Ω output, the same voltage passed in, and channel 4's inputs declared passive for this board; its input thresholds, input resistance and fail-safe bias are cited (SLLS202H). The netlist disagrees with itself here: the symbol is the 3.3 V `AM26LV32xD`, the manufacturer part number field the 5 V `AM26LS32CD`, and the alternate part number field `AM26LV32IDR`. A model is one part's, so which part the board carries has to be settled first; the survey flags the disagreement. |
+
+`boards/projects/edge-ec32-ds2.toml` waits on these two, and
+`board/tests/edge_project.rs` builds and runs it with the test models in a
+catalog of the test tree's own (`machine_parts::EdgeCatalog`).
+
+### The rest
 
 - The standard catalog has no bench component kinds. `[[component]]` parses,
   and every kind it names is refused.
@@ -854,6 +1123,12 @@ A catalog of your own runs from Rust. The `embsim` binary's catalog is
 - The `sd-card` kind needs a card image. There is no blank card.
 - There is no command that makes a P2 flash image (section 5).
 - `run` prints findings in their Rust form (`FloatingSense { … }`).
-  Interrupted, it prints no summary.
+  Interrupted, it prints no summary. At the end it reads again only the
+  findings about a net (a floating sense, an unsourced power net, a down
+  rail, a fight, a domain with no reference); every other finding is listed
+  as about the board, and the engine itself never withdraws a finding.
+- The mates of a module and its carrier, or of a cable, are written by
+  hand from the two surveys: nothing in the netlists says which connectors
+  mate.
 - `check` names the parts whose pin table does not fit but not the table
   that would. `survey` and `new` do name it.

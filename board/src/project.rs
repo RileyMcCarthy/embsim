@@ -36,6 +36,10 @@
 //! from = "ADDON.J1.3"
 //! to = "EC32.J203.12"
 //!
+//! [[mate]]                       # every pin of a to b's pin of its number
+//! a = "EC32.J203"
+//! b = "CARRIER.J3"
+//!
 //! [[switch]]
 //! part = "EC32.S301"
 //! pole = 1
@@ -75,8 +79,10 @@
 //! pins, or the board's connectors. The other end is a connector pin on the
 //! same or another board, a bench component's pin (`Name.Pin`), or — for a
 //! wire with `volts` — a source of its own the harness creates
-//! (`BENCH.5V`). A `[[pin_short]]` is a scenario fault, a bodge wire, and
-//! may join any two part pins on the boards.
+//! (`BENCH.5V`), one voltage per source. A `[[mate]]` joins two connectors
+//! at once: each pin of `a` to `b`'s pin of the same number, or the pairs a
+//! cable's `map` names. A `[[pin_short]]` is a scenario fault, a bodge
+//! wire, and may join any two part pins on the boards.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -86,7 +92,7 @@ use serde::Deserialize;
 
 use crate::netlist::{self, ComponentDecl, ParsedNetlist};
 use crate::registry::{normalize_part, Classification};
-use crate::survey::BoardSurvey;
+use crate::survey::{BoardSurvey, ConnectorReport};
 use crate::{Board, Component, EndpointRef, Harness, JumperState, PartRegistry, Scenario, System};
 
 // ============================================================
@@ -194,9 +200,22 @@ pub struct Assignment<'a> {
     /// The project file's directory: a path an option names is relative to
     /// it.
     pub dir: &'a Path,
+    /// The board's netlist, for a kind that checks what a part is by the
+    /// nets its pins join ([`Self::nets_of`]).
+    pub netlist: &'a ParsedNetlist,
 }
 
 impl Assignment<'_> {
+    /// The distinct nets the pins of the part `reference` sit on, by name.
+    pub fn nets_of(&self, reference: &str) -> BTreeSet<&str> {
+        self.netlist
+            .nets
+            .iter()
+            .filter(|net| net.nodes.iter().any(|node| node.reference == reference))
+            .map(|net| net.name.as_str())
+            .collect()
+    }
+
     /// The entry, as an error names it: `board EC32: [[board.model]] mpn =
     /// "AP62301Z6-7" (kind "ap62301")`.
     pub fn context(&self) -> String {
@@ -425,6 +444,24 @@ pub struct WireSpec {
     pub volts: Option<f64>,
 }
 
+/// Two connectors mated: a module seated in its socket, a cable between two
+/// headers. Each pin of `a` is joined to a pin of `b`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MateSpec {
+    /// The connector that plugs in, `Board.Connector`: every one of its
+    /// pins is joined, unless `map` names the ones that are.
+    pub a: String,
+    /// The connector it mates with, `Board.Connector`. Without `map` it has
+    /// a pin of each number `a` has; it may have more, which stay open (a
+    /// socket wider than the card seated in it).
+    pub b: String,
+    /// The pins a cable joins when it does not join them by number, as
+    /// `[["a pin", "b pin"], …]`: only these pairs are joined.
+    #[serde(default)]
+    pub map: Option<Vec<[String; 2]>>,
+}
+
 /// Open or closed, for a switch pole or a jumper.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -485,6 +522,8 @@ struct ProjectFile {
     component: Vec<ComponentSpec>,
     #[serde(default)]
     wire: Vec<WireSpec>,
+    #[serde(default)]
+    mate: Vec<MateSpec>,
     #[serde(default)]
     switch: Vec<SwitchSpec>,
     #[serde(default)]
@@ -571,6 +610,11 @@ impl Project {
         &self.file.wire
     }
 
+    /// The mated connector pairs, in file order.
+    pub fn mates(&self) -> &[MateSpec] {
+        &self.file.mate
+    }
+
     /// Build the [`System`] this project describes, its paths relative to
     /// [`Self::dir`]. The caller starts it; a test that wants the
     /// attach-time circuit and no later wake calls [`System::hold_time`]
@@ -617,18 +661,39 @@ impl Project {
             system = system.component(&spec.name, component);
         }
 
+        // Every source a wire's volts make is its own: one endpoint, one
+        // voltage. A second `volts` on the same `from` would be a second
+        // source fighting the first through whatever joins them.
+        let mut sources: BTreeMap<String, &WireSpec> = BTreeMap::new();
+        for wire in self.file.wire.iter().filter(|wire| wire.volts.is_some()) {
+            let Ok(from) = EndpointRef::parse(&wire.from) else {
+                continue;
+            };
+            let name = endpoint_text(&from);
+            if let Some(first) = sources.get(&name) {
+                return Err(ProjectError::message(format!(
+                    "[[wire]] {} to {}: {name} is already a source, at {} V, made by [[wire]] \
+                     {} to {}; join it with a wire that has no volts, or give the second \
+                     source a name of its own",
+                    wire.from,
+                    wire.to,
+                    first.volts.unwrap_or_default(),
+                    first.from,
+                    first.to
+                )));
+            }
+            sources.insert(name, wire);
+        }
         // The supplies the harness creates: a name of its own a wire with
         // volts starts at. Any other wire may join one.
-        let supplies: BTreeSet<String> = self
-            .file
-            .wire
-            .iter()
-            .filter(|wire| wire.volts.is_some())
-            .filter_map(|wire| EndpointRef::parse(&wire.from).ok())
-            .filter(|from| {
-                !surveys.contains_key(&from.board) && !bench_pins.contains_key(&from.board)
+        let supplies: BTreeSet<String> = sources
+            .keys()
+            .filter(|name| {
+                EndpointRef::parse(name).is_ok_and(|from| {
+                    !surveys.contains_key(&from.board) && !bench_pins.contains_key(&from.board)
+                })
             })
-            .map(|from| endpoint_text(&from))
+            .cloned()
             .collect();
         let places = Places {
             boards: &surveys,
@@ -657,7 +722,12 @@ impl Project {
                 None => harness.connect(from, to),
             };
         }
-        if !self.file.wire.is_empty() {
+        for mate in &self.file.mate {
+            for (a, b) in places.mate(mate)? {
+                harness = harness.connect(a, b);
+            }
+        }
+        if !harness.connections().is_empty() {
             system = system.harness(harness);
         }
 
@@ -772,7 +842,8 @@ fn not_ready_hint(survey: &BoardSurvey, catalog: &dyn Catalog) -> String {
     if !survey.needs_model.is_empty() {
         hint.push_str(
             "give each part that needs a model a [[board.model]] with its part, mpn or value \
-             and a kind",
+             and the kind it is; a kind seats only on a part that is what the kind says, and a \
+             part no kind is for needs a model written for it (PROJECTS.md §7)",
         );
         hint.push_str(&format!(
             "; {}\n",
@@ -839,7 +910,9 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
     };
 
     let part_kinds = catalog.part_kinds();
-    let mut assigned: BTreeSet<(String, String)> = BTreeSet::new();
+    // The registry has one namespace of keys, whatever field an entry names:
+    // a second entry under the same string would replace the first.
+    let mut assigned: BTreeMap<String, KeyField> = BTreeMap::new();
     let mut checks: Vec<(KeyField, String, Vec<usize>)> = Vec::new();
     for model in &spec.model {
         let (by, key) = model.key().ok_or_else(|| {
@@ -849,13 +922,18 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
                 spec.name, model.kind
             ))
         })?;
-        if !assigned.insert((by.to_string(), key.to_string())) {
+        if let Some(first) = assigned.get(key) {
+            let clash = if *first == by {
+                format!("two [[board.model]] entries have {by} = {key:?}")
+            } else {
+                format!("[[board.model]] {first} = {key:?} and {by} = {key:?} are one registry key")
+            };
             return Err(ProjectError::message(format!(
-                "board {}: two [[board.model]] entries have {by} = {key:?}; a key takes one \
-                 model",
+                "board {}: {clash}, and a key takes one model; keep one",
                 spec.name
             )));
         }
+        assigned.insert(key.to_string(), by);
         let matched: Vec<usize> = netlist
             .components
             .iter()
@@ -894,6 +972,7 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
             kind: &model.kind,
             parts: &reached,
             dir: base,
+            netlist: &netlist,
         };
         let options = PartOptions::new(assignment.context(), model.options.clone());
         catalog.register_part(&mut registry, &assignment, options)?;
@@ -1114,6 +1193,120 @@ impl Places<'_> {
             names(self.boards.keys()),
             names(self.bench.keys())
         )))
+    }
+
+    /// The connector `text` names, `Board.Connector`: its board's name, its
+    /// reference and its report.
+    fn connector<'s>(
+        &'s self,
+        what: &str,
+        text: &str,
+    ) -> Result<(&'s str, &'s ConnectorReport), ProjectError> {
+        let Some((board, reference)) = text.split_once('.') else {
+            return Err(ProjectError::message(format!(
+                "{what}: {text:?} names a connector as Board.Connector"
+            )));
+        };
+        let Some((name, survey)) = self.boards.get_key_value(board) else {
+            return Err(ProjectError::message(format!(
+                "{what}: {board} is not a board in this project; its boards: {}",
+                names(self.boards.keys())
+            )));
+        };
+        match survey.connector(reference) {
+            Some(report) => Ok((name.as_str(), report)),
+            None => {
+                let why = if survey.has_part(reference) {
+                    format!("{reference} is not a connector, and a mate joins two connectors")
+                } else {
+                    format!("{board} has no part {reference}")
+                };
+                Err(ProjectError::message(format!(
+                    "{what}: {why}; {}",
+                    connectors_of(board, survey)
+                )))
+            }
+        }
+    }
+
+    /// The pin pairs a mate joins: each pin of `a` with `b`'s pin of the
+    /// same number, or the pairs its `map` names.
+    fn mate(&self, mate: &MateSpec) -> Result<Vec<(EndpointRef, EndpointRef)>, ProjectError> {
+        let what = format!("[[mate]] {} to {}", mate.a, mate.b);
+        let (a_board, a) = self.connector(&what, &mate.a)?;
+        let (b_board, b) = self.connector(&what, &mate.b)?;
+        if a_board == b_board && a.reference == b.reference {
+            return Err(ProjectError::message(format!(
+                "{what}: a mate joins two different connectors"
+            )));
+        }
+        let has = |report: &ConnectorReport, pin: &str| report.pins.iter().any(|s| s.pin == pin);
+        let pairs: Vec<(String, String)> = match &mate.map {
+            None => {
+                let missing: Vec<&str> = a
+                    .pins
+                    .iter()
+                    .map(|site| site.pin.as_str())
+                    .filter(|pin| !has(b, pin))
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(ProjectError::message(format!(
+                        "{what}: {} has no pin {} that {} has; without a map each pin of a joins \
+                         b's pin of the same number, so a is the side with fewer pins (the \
+                         module's fingers, the cable's plug), and a cable that joins other \
+                         numbers says which with map = [[\"a pin\", \"b pin\"], …]",
+                        mate.b,
+                        missing.join(", "),
+                        mate.a
+                    )));
+                }
+                a.pins
+                    .iter()
+                    .map(|site| (site.pin.clone(), site.pin.clone()))
+                    .collect()
+            }
+            Some(map) => {
+                if map.is_empty() {
+                    return Err(ProjectError::message(format!(
+                        "{what}: map = [] joins no pins; leave map out to join every pin of a \
+                         by number"
+                    )));
+                }
+                let mut seen_a = BTreeSet::new();
+                let mut seen_b = BTreeSet::new();
+                for [pin_a, pin_b] in map {
+                    for (side, report, pin, seen) in [
+                        (&mate.a, a, pin_a, &mut seen_a),
+                        (&mate.b, b, pin_b, &mut seen_b),
+                    ] {
+                        if !has(report, pin) {
+                            return Err(ProjectError::message(format!(
+                                "{what}: map names pin {pin:?} of {side}, which has pins {}",
+                                report.pin_list()
+                            )));
+                        }
+                        if !seen.insert(pin.as_str()) {
+                            return Err(ProjectError::message(format!(
+                                "{what}: map names pin {pin:?} of {side} twice; a pin has one \
+                                 mate"
+                            )));
+                        }
+                    }
+                }
+                map.iter()
+                    .map(|[pin_a, pin_b]| (pin_a.clone(), pin_b.clone()))
+                    .collect()
+            }
+        };
+        let end = |board: &str, report: &ConnectorReport, pin: String| EndpointRef {
+            board: board.to_string(),
+            connector: Some(report.reference.clone()),
+            pin,
+        };
+        Ok(pairs
+            .into_iter()
+            .map(|(pin_a, pin_b)| (end(a_board, a, pin_a), end(b_board, b, pin_b)))
+            .collect())
     }
 
     fn board_part<'s>(

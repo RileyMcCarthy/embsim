@@ -187,9 +187,10 @@ fn the_survey_names_what_each_unmodelled_part_could_be_and_the_pin_table_that_fi
          choice"
     );
     expect!(
-        "switch-by-pin-count",
-        "the eight-pin option switch, whose number no kind is for, is listed with the kinds \
-         that have eight pins by other names"
+        "switch-by-designator",
+        "the eight-pin option switch, whose number no model is for, is offered the switch kind \
+         alone, by its S designator",
+        "a pin table says how many pins a part has, and the designator says what the part is"
     );
     expect!(
         "table-that-fits",
@@ -213,8 +214,8 @@ fn the_survey_names_what_each_unmodelled_part_could_be_and_the_pin_table_that_fi
         &text,
         &[
             "S301 value \"DIP Switch 4 way\" mpn \"218-4LPSTJR\"",
-            "8 pins: 1_OFF, 1_ON, 2_OFF, 2_ON, 3_OFF, 3_ON, 4_OFF, 4_ON",
-            "same pin count, pins named otherwise: aps6404l",
+            "8 pins: 1_OFF, 1_ON, 2_OFF, 2_ON, 3_OFF, 3_ON, 4_OFF, 4_ON\n\
+             no catalog model is for this part; it may be switch (its designator S)",
         ],
     );
     assert_says(
@@ -230,6 +231,100 @@ fn the_survey_names_what_each_unmodelled_part_could_be_and_the_pin_table_that_fi
             .count(),
         7,
         "one fix per model the catalog placed by number:\n{text}"
+    );
+}
+
+#[rstest]
+fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
+    behaviour!(Test {
+        id: "cli.survey-edge-gaps",
+        covers: Some("cli/src/checklist.rs#survey"),
+        given: "the MaD Edge board's KiCad export, surveyed from the command line",
+    });
+    expect!(
+        "line-parts-need-models",
+        "the RS-422 line driver and line receiver are listed as needing a model, each told it \
+         needs one written for it",
+        "no kind the catalog ships is for either part, by its numbers or by what the board \
+         says it is"
+    );
+    expect!(
+        "socket-is-a-connector",
+        "the module socket, a symbol of the board's own library, is offered the connector kind \
+         by its J designator"
+    );
+    expect!(
+        "names-disagree",
+        "the receiver is reported with its symbol and its manufacturer part number naming two \
+         different parts",
+        "the symbol names the 3.3 volt AM26LV32 and the part number the 5 volt AM26LS32, and a \
+         model is one part's"
+    );
+    let netlist = workspace().join("board/tests/fixtures/mad_edge.net");
+    let output = embsim(&["survey", path(&netlist)]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = squeezed(&stdout(&output));
+    assert_says(&text, &["168 parts", "3 need a model"]);
+    assert_says(
+        &text,
+        &[
+            "U24 part \"AM26LS31CD\" value \"AM26LS31CD\" mpn \"AM26LS31CD\"\n\
+             16 pins: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\n\
+             no catalog kind is for this part: it needs a model (PROJECTS.md §7)",
+            "U25 part \"AM26LV32xD\" value \"AM26LV32xD\" mpn \"AM26LS32CD\"\n\
+             16 pins: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\n\
+             its symbol names \"AM26LV32xD\" and its mpn \"AM26LS32CD\": two parts; give it the \
+             model of the one the board carries\n\
+             no catalog kind is for this part: it needs a model (PROJECTS.md §7)",
+            "J3 part \"P2_EDGE_MODULE_SOCKET\" value \"P2_EDGE_MODULE_SOCKET\" mpn \"450-00309\"",
+            "no catalog model is for this part; it may be boundary (its designator J)",
+        ],
+    );
+}
+
+#[rstest]
+fn a_board_kind_the_catalog_ships_is_surveyed_with_the_registry_it_builds_with() {
+    behaviour!(Test {
+        id: "cli.survey-kind",
+        covers: Some("cli/src/checklist.rs#survey_kind"),
+        given: "the P2-EC32MB board kind the catalog ships, surveyed from the command line by \
+                its kind",
+    });
+    expect!(
+        "slot-left",
+        "the processor is the one part left to the project, offered the P2 kind by its part \
+         number",
+        "the board kind places every other part of the module the way the board library \
+         builds it"
+    );
+    expect!(
+        "finger-rows",
+        "each edge finger is listed with its printed label and its net: 41 is 5V on the input \
+         rail, 43 is GND on ground",
+        "a project wires or mates the module by these connector pins"
+    );
+    let output = embsim(&["survey", "--kind", "p2-ec32mb"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = squeezed(&stdout(&output));
+    assert_says(
+        &text,
+        &[
+            "kind \"p2-ec32mb\": 114 parts",
+            "113 populated by the catalog",
+            "1 need a model",
+            "0 placed with a pin table the netlist does not use",
+            "U100 value \"P2X8C4M64P\" mpn \"P2X8C4M64P\"",
+            "could be: p2 (part number P2X8C4M64P)",
+            "J203 value \"Edge Socket Pads\" 60 pins",
+            "41 5V VIN_Edge",
+            "43 GND GND",
+        ],
+    );
+    let refused = embsim(&["survey", "--kind", "p2-ec64"]);
+    assert!(!refused.status.success());
+    assert_says(
+        &stderr(&refused),
+        &["unknown kind \"p2-ec64\"; the board kinds are \"netlist\", \"p2-ec32mb\""],
     );
 }
 
@@ -332,7 +427,7 @@ fn a_wire_to_the_pin_the_starter_project_lists_on_ground_holds_the_signal_low() 
     assert!(checked.status.success(), "{}", stderr(&checked));
     assert_says(
         &stdout(&checked),
-        &["1 board, 0 bench components, 1 wire", "ok:"],
+        &["1 board, 0 bench components, 1 wire, 0 mates", "ok:"],
     );
 
     let ran = embsim(&["run", path(&project), "--for", "1us", "--net", "HDR.SIG"]);
@@ -604,6 +699,17 @@ fn a_run_of_the_ec32_project_reads_its_rails_up_and_repeats_exactly() {
         "the two runs print the same report, line for line, but for the wall time they took",
         "virtual time is stepped: it advances only to the next instant something happens"
     );
+    expect!(
+        "build-findings-apart",
+        "the findings the build made are printed under a heading that says they are the \
+         system before its first wake",
+        "every rail with a soft-start is down then, and the build reports each as unsourced"
+    );
+    expect!(
+        "cleared-at-the-end",
+        "at the end, the core rail's unsourced finding is listed as cleared with the rail's \
+         voltage, and the undriven floating pins as still true"
+    );
     let project = workspace().join("boards/projects/ec32-netlist.toml");
     let args = [
         "run",
@@ -627,6 +733,17 @@ fn a_run_of_the_ec32_project_reads_its_rails_up_and_repeats_exactly() {
         .unwrap_or_else(|| panic!("the core rail reads a voltage:\n{text}"));
     assert!((core - 0.8 * (1.0 + 13.3 / 10.5)).abs() < 1e-9, "{core}");
     assert_says(&text, &["net EC32.VIO_56_63: Analog(3.3)"]);
+    assert_says(
+        &text,
+        &[
+            "findings at build, before any wake (35):\nFloatingSense",
+            "PowerNetUnsourced { net: \"EC32.Common_VDD\" }\n",
+            "findings: 35 (35 at build, 0 while running)",
+            "at 10.000000 ms, each finding's net read again:\nno longer true (18):",
+            "PowerNetUnsourced { net: \"EC32.Common_VDD\" }: EC32.Common_VDD reads Analog(1.81",
+            "still true (17):\nFloatingSense { net: \"EC32.P2_IO59\", kind: Digital }",
+        ],
+    );
     let second = embsim(&args);
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(virtual_report(&first), virtual_report(&second));

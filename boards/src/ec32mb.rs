@@ -83,20 +83,22 @@
 //! prefix and keys parts on their `value` field.
 
 use embsim_board::{
-    netlist, Board, BoardError, Component, ComponentDecl, PartRegistry, SwitchPole,
+    netlist, Board, BoardError, Component, ComponentDecl, ModelFacade, PartRegistry, SwitchPole,
 };
-use embsim_models::logic_gate::{self, LogicGate, LVC2G04_PINS_BY_FUNCTION};
-use embsim_models::oscillator::{self, Oscillator};
-use embsim_models::psram::{Psram, PsramComponent};
+use embsim_models::logic_gate;
+use embsim_models::oscillator;
 use embsim_models::pwl_library;
-use embsim_models::rail::{self, Rail, AP62301_PINS_BY_FUNCTION, NCP114_PINS_BY_FUNCTION};
+use embsim_models::rail;
 use embsim_models::sd_card::SdCard;
-use embsim_models::sd_card_component::{SdCardComponent, SD_CARD_PINS_BY_FUNCTION};
-use embsim_models::spi_flash::SpiNorFlash;
-use embsim_models::spi_flash_component::{
-    FlashView, SpiNorFlashComponent, SPI_FLASH_PINS_BY_FUNCTION,
+use embsim_models::spi_flash::{SpiNorFlash, W25Q128JV_CAPACITY_BYTES};
+use embsim_models::spi_flash_component::{FlashView, SpiNorFlashComponent};
+use embsim_models::supervisor;
+
+use crate::catalog::{
+    by_function, detector_model, flash_model, gate_model, psram_model, rail_model, sd_model,
+    tcxo_model, AP62301_TABLES, FLASH_IDS, FLASH_TABLES, LVC2G04_TABLES, NCP114_TABLES,
+    PSRAM_TABLES, SD_TABLES, STM1061_TABLES, TCXO_TABLES,
 };
-use embsim_models::supervisor::{self, VoltageDetector, STM1061_PINS_BY_FUNCTION};
 
 /// The vendor netlist this board is built from.
 pub const NETLIST: &str = include_str!("../netlists/p2_ec32mb.net");
@@ -108,8 +110,9 @@ pub const FLASH_PART: &str = "SPI Flash 16MB (128Mb)";
 /// Registry key for the card socket, `J301` (Molex `473092651`).
 pub const SOCKET_PART: &str = "MicroSD Socket";
 
-/// 128 M-bit = 16 MiB, the density the netlist states for `U301`.
-pub const FLASH_CAPACITY: usize = 16 * 1024 * 1024;
+/// 128 M-bit = 16 MiB, the density the netlist states for `U301`: the
+/// W25Q128JV's array ([`W25Q128JV_CAPACITY_BYTES`]).
+pub const FLASH_CAPACITY: usize = W25Q128JV_CAPACITY_BYTES;
 
 /// `S301` — the module's four-way option switch. Position 2 (both sides
 /// labelled "FLASH" in the netlist) closed ties `P2_IO61` to the flash `~CS`;
@@ -209,26 +212,24 @@ fn class_registry() -> PartRegistry {
     registry.register_mechanical(RAW_PCB_PART);
     registry.register_mechanical(LAYOUT_NODE_PART);
 
-    // Models. The TCXO publishes the rate its value names, one event, at
-    // its datasheet start-up instant; the oscillator buffer `U101` relays
-    // it across the AC-coupling capacitor `C132` to `XI` and rests its
-    // self-biased stage mid-rail; the LED buffer `U601` sinks the cathodes
-    // of `D601`/`D602` from `P38`/`P39`; the PSRAMs answer the SPI command
-    // set from an 8 MiB array each.
-    registry.register(TCXO_PART, |decl| {
-        let config = oscillator::Config::from_value(&decl.value)
-            .unwrap_or_else(|| oscillator::Config::tg2520smn(TCXO_HZ));
-        Box::new(Oscillator::new(config))
-    });
-    registry.register(INVERTER_PART, |_decl| {
-        Box::new(
-            LogicGate::new(logic_gate::Config::lvc2g04(), &LVC2G04_PINS_BY_FUNCTION)
-                .expect("the 74LVC2G04 configuration is the datasheet's"),
-        )
-    });
-    registry.register(PSRAM_PART, |_decl| {
-        Box::new(PsramComponent::new(Psram::new()))
-    });
+    // Models, each the catalog's own (`crate::catalog`): the model a
+    // project assigns by the same kind, with the pin table this
+    // transcription names, so the module and a project that builds it from
+    // its netlist are one model per part. The TCXO publishes the rate its
+    // value names, one event, at its datasheet start-up instant; the
+    // oscillator buffer `U101` relays it across the AC-coupling capacitor
+    // `C132` to `XI` and rests its self-biased stage mid-rail; the LED
+    // buffer `U601` sinks the cathodes of `D601`/`D602` from `P38`/`P39`;
+    // the PSRAMs answer the SPI command set from an 8 MiB array each.
+    let tcxo = oscillator::Config::from_value(TCXO_PART).expect("the TCXO's value names its rate");
+    tcxo_model(tcxo, by_function(&TCXO_TABLES)).register(&mut registry, TCXO_PART);
+    gate_model(
+        "74lvc2g04",
+        logic_gate::Config::lvc2g04(),
+        by_function(&LVC2G04_TABLES),
+    )
+    .register(&mut registry, INVERTER_PART);
+    psram_model(by_function(&PSRAM_TABLES)).register(&mut registry, PSRAM_PART);
 
     // The elements registered by specification (`NODES.md` §8 phase 3):
     // the polarity FET `U401` — a Si3417DV by its `MPN` field, its channel
@@ -239,26 +240,19 @@ fn class_registry() -> PartRegistry {
     // The power tree (`NODES.md` §8 phase 4): the two bucks from one key,
     // each reading its feedback divider at attach; the eight LDOs at the
     // voltage their value names; the detector at its 1.6 V threshold.
-    registry.register(BUCK_PART, |_decl| {
-        Box::new(
-            Rail::new(rail::Config::ap62301(), &AP62301_PINS_BY_FUNCTION)
-                .expect("the AP62301 table carries every role"),
-        )
-    });
-    registry.register(LDO_PART, |decl| {
-        let config = rail::Config::ncp114_from_value(&decl.value)
-            .unwrap_or_else(|| panic!("{}: the LDO value names no voltage", decl.reference));
-        Box::new(
-            Rail::new(config, &NCP114_PINS_BY_FUNCTION)
-                .expect("the NCP114 table carries every role"),
-        )
-    });
-    registry.register(BROWNOUT_DETECTOR_PART, |_decl| {
-        Box::new(VoltageDetector::new(
-            supervisor::Config::stm1061n16(),
-            &STM1061_PINS_BY_FUNCTION,
-        ))
-    });
+    rail_model(
+        "ap62301",
+        rail::Config::ap62301(),
+        by_function(&AP62301_TABLES),
+    )
+    .register(&mut registry, BUCK_PART);
+    let ldo = rail::Config::ncp114_from_value(LDO_PART).expect("the LDO's value names its output");
+    rail_model("ncp114", ldo, by_function(&NCP114_TABLES)).register(&mut registry, LDO_PART);
+    detector_model(
+        supervisor::Config::stm1061n16(),
+        by_function(&STM1061_TABLES),
+    )
+    .register(&mut registry, BROWNOUT_DETECTOR_PART);
     registry
 }
 
@@ -308,8 +302,11 @@ impl Ec32mb {
         let mut array = vec![0xFFu8; FLASH_CAPACITY];
         let end = image.len().min(FLASH_CAPACITY);
         array[..end].copy_from_slice(&image[..end]);
-        let component = SpiNorFlashComponent::new(SpiNorFlash::with_image(array))
-            .with_pins(&SPI_FLASH_PINS_BY_FUNCTION);
+        // The catalog's `w25q128jv` construction: ID IM, the transcription's
+        // by-function pins.
+        let component =
+            SpiNorFlashComponent::new(SpiNorFlash::with_image(array).with_jedec_id(FLASH_IDS[0].1))
+                .with_pins(by_function(&FLASH_TABLES).1);
         self.flash_view = Some(component.view());
         self.flash = Some(std::sync::Mutex::new(Some(component)));
         self
@@ -351,28 +348,32 @@ impl Ec32mb {
     pub fn registry(self) -> PartRegistry {
         let mut registry = class_registry();
 
-        // A programmed part was built in `with_flash_image` so its view could
-        // be handed out; a blank one is built here. `U301` appears once in
-        // the netlist, so the slot is taken exactly once.
-        let slot = self.flash.unwrap_or_else(|| std::sync::Mutex::new(None));
-        registry.register(FLASH_PART, move |_decl| {
-            let programmed = slot.lock().expect("flash slot never poisoned").take();
-            Box::new(programmed.unwrap_or_else(|| {
-                SpiNorFlashComponent::new(SpiNorFlash::blank(FLASH_CAPACITY))
-                    .with_pins(&SPI_FLASH_PINS_BY_FUNCTION)
-            }))
-        });
+        // A blank part is the catalog's `w25q128jv` model, ID IM (the
+        // W25Q128JVSIM the module carries). A programmed one was built in
+        // `with_flash_image` so its view could be handed out; `U301`
+        // appears once in the netlist, so its slot is taken exactly once.
+        let flash = (FLASH_IDS[0], by_function(&FLASH_TABLES));
+        match self.flash {
+            None => flash_model(flash.0, flash.1).register(&mut registry, FLASH_PART),
+            Some(slot) => {
+                let facade = ModelFacade::of(
+                    format!(
+                        "w25q128jv, pins = {:?}, id = {:?}, programmed",
+                        flash.1 .0, flash.0 .0
+                    ),
+                    flash.1 .1,
+                );
+                registry.register_model(FLASH_PART, facade, move |_decl| {
+                    let programmed = slot.lock().expect("flash slot never poisoned").take();
+                    Box::new(programmed.expect("U301 is built once, from its programmed slot"))
+                });
+            }
+        }
 
         // An empty socket stays a board boundary: there is no card to model, and
         // pretending otherwise would drive MISO for a slot with nothing in it.
         if let Some(card) = self.sd {
-            let blocks = card.blocks;
-            registry.register(SOCKET_PART, move |_decl| {
-                Box::new(
-                    SdCardComponent::new(SdCard::with_image(blocks.clone()))
-                        .with_pins(&SD_CARD_PINS_BY_FUNCTION),
-                )
-            });
+            sd_model(card.blocks, by_function(&SD_TABLES)).register(&mut registry, SOCKET_PART);
         }
 
         if let Some(ctor) = self.p2 {

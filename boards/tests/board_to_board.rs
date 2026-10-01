@@ -2,10 +2,10 @@
 //!
 //! `projects/header-pair.toml` builds two copies of the header board — a
 //! two-pin connector `J1` (`SIG`, `GND`) and a 10 kΩ resistor `R1` from
-//! `SIG` to `GND` — as `LEFT` and `RIGHT`, and joins their `J1`s pin for
-//! pin, the bench's 0 V on `LEFT`'s ground. The case adds one thing the
-//! project does not: a pad on `LEFT.J1.1` that it drives from its own
-//! thread, and it reads what arrives on `RIGHT`'s side of the wire.
+//! `SIG` to `GND` — as `LEFT` and `RIGHT`, and mates their `J1`s pin for
+//! pin (`[[mate]]`), the bench's 0 V on `LEFT`'s ground. The case adds one
+//! thing the project does not: a pad on `LEFT.J1.1` that it drives from its
+//! own thread, and it reads what arrives on `RIGHT`'s side of the mate.
 //!
 //! Stepped (`TESTING.md` rule 9), its own binary: the clock re-anchored
 //! stepped, the system started with time held, the case's thread a
@@ -82,7 +82,7 @@ fn a_level_driven_on_one_boards_connector_reads_on_the_other_board() {
         "high-divides-over-both",
         "the pad's 3.3 volts reach the second board divided between the pad's 25 ohms and \
          both resistors in parallel",
-        "the wire makes the two boards' signal pins one node, so both resistors load the pad"
+        "the mate makes the two boards' signal pins one node, so both resistors load the pad"
     );
     expect!(
         "pad-current",

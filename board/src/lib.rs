@@ -83,7 +83,8 @@ pub use net::{
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use project::{
     Assignment, BoardSpec, Catalog, CatalogBoard, ComponentSpec, ContactState, JumperSpec,
-    KeyField, ModelSpec, PartOptions, PinShortSpec, Project, ProjectError, SwitchSpec, WireSpec,
+    KeyField, MateSpec, ModelSpec, PartOptions, PinShortSpec, Project, ProjectError, SwitchSpec,
+    WireSpec,
 };
 pub use registry::{
     reference_designator_class, Classification, Classified, JumperState, ModelFacade, PartRegistry,

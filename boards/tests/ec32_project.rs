@@ -4,8 +4,11 @@
 //!   catalog's base registry and the file's `[[board.model]]` entries, and
 //!   the board it builds is the one `Ec32mb` builds with the same processor:
 //!   the same parts in the same classes, the same components, the same nets,
-//!   the same conduction clusters. Two paths to one board, and nothing
-//!   between them to tell apart.
+//!   the same conduction clusters, and every part the same model with the
+//!   same options. `Ec32mb` registers the catalog's own model constructors,
+//!   so the two paths share every model; what the comparison checks is that
+//!   the file chooses each the way the module does — its pin table, the
+//!   flash's ID — and that the switch poles it writes out are the module's.
 //! * The survey of that netlist with nothing assigned is the checklist the
 //!   file answers: the processor, the switch and the BOM lines with no model,
 //!   and every part placed by number listed against the pins the transcribed
@@ -19,9 +22,9 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use embsim_board::{Board, BuiltSystem, Project, System};
+use embsim_board::{netlist, Board, BoardSurvey, BuiltSystem, Project, System};
 use embsim_boards::catalog::StandardCatalog;
-use embsim_boards::ec32mb::Ec32mb;
+use embsim_boards::ec32mb::{self, Ec32mb, P2_PART};
 use embsim_boards::p2::P2Package;
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
@@ -91,6 +94,13 @@ fn the_ec32_built_from_its_netlist_is_the_board_ec32mb_builds() {
         "every net has the same name and the same member pins on both boards"
     );
     expect!(
+        "same-models",
+        "every part but the processor has the same model on both boards, named with its options: \
+         its pin table, and the flash's device ID",
+        "the module registers the catalog's own models, so a part a project models differently \
+         is a project that chose another option"
+    );
+    expect!(
         "same-census",
         "both boards have the same conduction clusters, 87 of them, the largest joining 6 \
          nodes — the module's committed census",
@@ -102,6 +112,38 @@ fn the_ec32_built_from_its_netlist_is_the_board_ec32mb_builds() {
         .build_board(&StandardCatalog, "EC32")
         .expect("the project builds the module");
     let from_library = shipped();
+
+    // Each part's model as its registration names it, options included,
+    // from the surveys the two registries make of the one netlist. The
+    // processor's slot is filled by a constructor the module cannot name.
+    let models = |survey: &BoardSurvey| {
+        survey
+            .parts()
+            .filter(|part| part.value != P2_PART)
+            .map(|part| (part.reference.clone(), part.model.clone()))
+            .collect::<Vec<_>>()
+    };
+    let project_survey = project
+        .survey(&StandardCatalog, "EC32")
+        .expect("the project surveys");
+    let library_survey = BoardSurvey::of(
+        &netlist::parse(ec32mb::NETLIST).expect("the bundled netlist parses"),
+        &Ec32mb::new()
+            .with_p2(|_decl| Box::new(P2Package::held_in_reset()))
+            .registry(),
+    );
+    let (project_models, library_models) = (models(&project_survey), models(&library_survey));
+    for (a, b) in project_models.iter().zip(&library_models) {
+        assert_eq!(a, b, "{} is another model on the two paths", a.0);
+    }
+    assert_eq!(project_models, library_models);
+    let modelled = project_models
+        .iter()
+        .filter(|(_, model)| model.is_some())
+        .count();
+    // The TCXO, the two inverters, the four PSRAMs, the flash, the two
+    // bucks, the eight LDOs and the detector.
+    assert_eq!(modelled, 19, "{project_models:?}");
 
     let classes = |board: &Board| {
         board

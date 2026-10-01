@@ -200,6 +200,11 @@ datasheet table against a netlist that names pins by function —
 board whose survey is not clean is refused with the survey as the error. A
 wire's board end is a connector pin (`Board.Connector.Pin`); its other end is
 another board's connector, a bench component's pin, or, with `volts`, a supply.
+A `[[mate]]` joins two connectors at once, pin for pin by number or by a
+cable's `map`: a module in its socket, a cable between two boards. A kind
+seats only on a part that is what it says (a model's kind on a part whose
+keys name its part family; `switch`, `boundary` and `mechanical` where the
+board says so), so a part no kind is for needs a model.
 The part kinds, their options and pin tables, the workflow from a netlist to
 a running system, wiring boards to each other, and adding kinds of your own
 are in [`PROJECTS.md`](PROJECTS.md); the example projects are in
@@ -220,13 +225,16 @@ embsim run board.toml --for 20ms --net BOARD.VCC
 
 - **`survey`** lists what the catalog populates (by class, and by part
   number), each part that needs a model with the kinds that could be it (by
-  part number; else by a pin table with exactly its pins; else by pin count),
-  each part placed with a pin table the netlist does not use with the table
-  that fits, and every connector pin with its name and net.
+  part number, else by part family; else the kinds without a model its
+  designator, symbol or nets allow; else that it needs a model), each part
+  placed with a pin table the netlist does not use with the table that fits,
+  and every connector pin with its name and net. `embsim survey --kind
+  p2-ec32mb` surveys a board kind the catalog ships the same way.
 - **`new`** writes the project that answers the checklist as far as the
   catalog can: the board, a `[[board.model]]` choosing the pin table that
   fits for each part the catalog placed with another, a commented stub for
-  each part that needs a model (the kind filled in when exactly one fits),
+  each part that needs a model (the kind filled in when exactly one part
+  number names it),
   and every connector's pins as the endpoints a `[[wire]]` names. Uncomment
   the stubs, choose the kinds, wire the connectors.
 - **`check`** loads, surveys and builds the system and starts it with virtual
@@ -234,8 +242,10 @@ embsim run board.toml --for 20ms --net BOARD.VCC
   survey line and what the build found, and exits non-zero with the reason —
   the survey, for a board with a part still unmodelled — on any refusal.
 - **`run`** starts the system on a stepped clock and runs it for `--for` of
-  virtual time (or until interrupted), printing findings and a P2's console
-  as the run reaches them, then the nets asked for with `--net`.
+  virtual time (or until interrupted), printing the build's findings, then
+  findings and a P2's console as the run reaches them, then the nets asked
+  for with `--net`, and at the end each finding's net read again: the ones
+  the run cleared (a rail that came up) apart from the ones still true.
 
 `embsim` knows one more value for the `p2` kind's `core` than the standard
 catalog: `core = "qemu"` seats the QEMU P2 in the package, which boots its

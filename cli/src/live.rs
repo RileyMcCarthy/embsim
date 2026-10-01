@@ -11,10 +11,11 @@
 //! a virtual wait, so a run for a duration ends at exactly that virtual
 //! instant and reads the system at rest there, the same on every machine.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use embsim_board::{Finding, Project, System, SystemHandle};
+use embsim_board::{Finding, NetState, Project, System, SystemHandle};
 use embsim_boards::p2::StartState;
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_p2_qemu::catalog::{QemuCatalog, QemuSeat};
@@ -71,10 +72,15 @@ fn ms(ns: u64) -> String {
     format!("{}.{:06} ms", ns / 1_000_000, ns % 1_000_000)
 }
 
+/// The net each board pin sits on: `Board.Ref.Pin` to `Board.Net`, from
+/// the boards' surveys — for a finding that names a pin.
+type PinNets = BTreeMap<String, String>;
+
 /// Load `path`, print each board's survey line, and build the system.
-fn build(path: &Path, catalog: &QemuCatalog) -> Result<System, String> {
+fn build(path: &Path, catalog: &QemuCatalog) -> Result<(System, PinNets), String> {
     let project = Project::load(path).map_err(|err| err.to_string())?;
     println!("project {}", path.display());
+    let mut pin_nets = PinNets::new();
     for spec in project.boards() {
         let survey = project
             .survey(catalog, &spec.name)
@@ -82,20 +88,73 @@ fn build(path: &Path, catalog: &QemuCatalog) -> Result<System, String> {
         let text = survey.to_string();
         let line = text.lines().next().unwrap_or_default();
         println!("  board {} ({}): {line}", spec.name, spec.kind);
+        for part in survey.parts() {
+            for site in &part.pins {
+                pin_nets.insert(
+                    format!("{}.{}.{}", spec.name, part.reference, site.pin),
+                    format!("{}.{}", spec.name, site.net),
+                );
+            }
+        }
     }
     let system = project
         .instantiate(catalog)
         .map_err(|err| err.to_string())?;
     println!(
-        "  {} board{}, {} bench component{}, {} wire{}",
+        "  {} board{}, {} bench component{}, {} wire{}, {} mate{}",
         project.boards().len(),
         plural(project.boards().len()),
         project.components().len(),
         plural(project.components().len()),
         project.wires().len(),
         plural(project.wires().len()),
+        project.mates().len(),
+        plural(project.mates().len()),
     );
-    Ok(system)
+    Ok((system, pin_nets))
+}
+
+/// What a finding says of the system now, read off its nets.
+enum Now {
+    /// What the finding names still reads as it did.
+    Holds,
+    /// It no longer does: the net and what it reads.
+    Cleared(String, NetState),
+    /// A fact about the board as it is built and wired, which a run does
+    /// not change: no net of its own to read again.
+    Standing,
+}
+
+/// Re-read the net a finding is about. A net no source reaches reads
+/// `Floating`: a floating sense, an unsourced power net and a down rail
+/// hold while their net does; a fight holds while its net reads one.
+fn now(finding: &Finding, system: &SystemHandle, pins: &PinNets) -> Now {
+    let read = |net: &str, holds: fn(&NetState) -> bool| match system.net_state(net) {
+        Some(state) if !holds(&state) => Now::Cleared(net.to_string(), state),
+        Some(_) => Now::Holds,
+        None => Now::Standing,
+    };
+    let floating = |state: &NetState| matches!(state, NetState::Floating);
+    let pin = |part: &str, pin: &str| pins.get(&format!("{part}.{pin}")).cloned();
+    match finding {
+        Finding::FloatingSense { net, .. } | Finding::PowerNetUnsourced { net } => {
+            read(net, floating)
+        }
+        Finding::Contention { net, .. } | Finding::AmbiguousLevel { net, .. } => {
+            read(net, |state| matches!(state, NetState::Contention))
+        }
+        Finding::RailDown { part, pin: out, .. } => match pin(part, out) {
+            Some(net) => read(&net, floating),
+            None => Now::Standing,
+        },
+        Finding::UnreferencedDomain {
+            part, reference, ..
+        } => match pin(part, reference) {
+            Some(net) => read(&net, floating),
+            None => Now::Standing,
+        },
+        _ => Now::Standing,
+    }
 }
 
 fn plural(count: usize) -> &'static str {
@@ -125,7 +184,7 @@ fn start_held(path: &Path, system: System) -> Result<SystemHandle, String> {
 pub fn check(path: &Path) -> Result<(), String> {
     start_clock();
     let catalog = QemuCatalog::new();
-    let system = build(path, &catalog)?;
+    let (system, _) = build(path, &catalog)?;
     let handle = start_held(path, system)?;
     let findings = handle.findings();
     if findings.is_empty() {
@@ -148,6 +207,8 @@ pub fn check(path: &Path) -> Result<(), String> {
 struct Reporter {
     seats: Vec<QemuSeat>,
     findings: usize,
+    /// How many of the findings the build made.
+    at_build: usize,
     started: Vec<bool>,
     halted: Vec<bool>,
     /// Console characters printed, per seat and pad.
@@ -160,10 +221,27 @@ impl Reporter {
         Self {
             seats,
             findings: 0,
+            at_build: 0,
             started: vec![false; count],
             halted: vec![false; count],
             console: vec![vec![0; usize::from(P2_PADS)]; count],
         }
+    }
+
+    /// Print the findings the build made, the system before its first
+    /// wake: every one is about that instant, and the run may clear it.
+    fn build_snapshot(&mut self, system: &SystemHandle) {
+        let findings = system.findings();
+        if findings.is_empty() {
+            println!("findings at build, before any wake: none");
+        } else {
+            println!("findings at build, before any wake ({}):", findings.len());
+        }
+        for finding in &findings {
+            println!("  {finding:?}");
+        }
+        self.findings = findings.len();
+        self.at_build = findings.len();
     }
 
     /// Print what appeared since the last look, stamped `now`.
@@ -247,7 +325,7 @@ impl Reporter {
 pub fn run(path: &Path, duration: Option<u64>, nets: &[String]) -> Result<(), String> {
     start_clock();
     let catalog = QemuCatalog::new();
-    let system = build(path, &catalog)?;
+    let (system, pin_nets) = build(path, &catalog)?;
     let handle = start_held(path, system)?;
     for net in nets {
         if handle.net_state(net).is_none() {
@@ -263,6 +341,7 @@ pub fn run(path: &Path, duration: Option<u64>, nets: &[String]) -> Result<(), St
     }
 
     let actor = virtual_clock::register_actor("embsim run");
+    reporter.build_snapshot(&handle);
     let wall = Instant::now();
     handle.release_time();
     let origin = virtual_clock::virtual_ns();
@@ -300,7 +379,37 @@ pub fn run(path: &Path, duration: Option<u64>, nets: &[String]) -> Result<(), St
     let stalled = findings
         .iter()
         .any(|finding| matches!(finding, Finding::QuiescenceTimeout { .. }));
-    println!("findings: {}", findings.len());
+    println!(
+        "findings: {} ({} at build, {} while running)",
+        findings.len(),
+        reporter.at_build,
+        findings.len() - reporter.at_build.min(findings.len())
+    );
+    if !findings.is_empty() {
+        let mut holds = Vec::new();
+        let mut cleared = Vec::new();
+        let mut standing = Vec::new();
+        for finding in &findings {
+            match now(finding, &handle, &pin_nets) {
+                Now::Holds => holds.push(format!("{finding:?}")),
+                Now::Cleared(net, state) => {
+                    cleared.push(format!("{finding:?}: {net} reads {state:?}"));
+                }
+                Now::Standing => standing.push(format!("{finding:?}")),
+            }
+        }
+        println!("at {}, each finding's net read again:", ms(elapsed));
+        for (title, lines) in [
+            ("no longer true", &cleared),
+            ("still true", &holds),
+            ("about the board as built and wired", &standing),
+        ] {
+            println!("  {title} ({}):", lines.len());
+            for line in lines {
+                println!("    {line}");
+            }
+        }
+    }
     if stalled {
         println!(
             "the engine advanced without waiting for a part (QuiescenceTimeout): this run is \

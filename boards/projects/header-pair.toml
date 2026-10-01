@@ -1,6 +1,7 @@
 # Two boards joined connector to connector: two copies of the header board,
-# J1 pin for pin, the bench's ground on the left one. Each board's R1 runs
-# from its SIG to its GND, so a signal on either J1.1 sees both resistors.
+# their J1s mated pin for pin, the bench's ground on the left one. Each
+# board's R1 runs from its SIG to its GND, so a signal on either J1.1 sees
+# both resistors.
 
 [[board]]
 name = "LEFT"
@@ -12,13 +13,10 @@ name = "RIGHT"
 kind = "netlist"
 netlist = "header.net"
 
-[[wire]]
-from = "LEFT.J1.1"
-to = "RIGHT.J1.1"
-
-[[wire]]
-from = "LEFT.J1.2"
-to = "RIGHT.J1.2"
+# Each pin of LEFT's J1 to RIGHT's J1 pin of the same number.
+[[mate]]
+a = "LEFT.J1"
+b = "RIGHT.J1"
 
 [[wire]]
 from = "BENCH.GND"
