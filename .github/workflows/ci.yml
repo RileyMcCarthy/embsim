@@ -373,6 +373,24 @@ jobs:
           EMBSIM_QEMU_P2_BUILD: ${{ github.workspace }}/qemu-build/build-p2
         run: cargo test -p embsim-cli -- --nocapture
 
+  # A project's own catalog crates (PROJECTS.md §10, "The runner"): the
+  # `embsim` binary writes a runner beside examples/custom-project, builds
+  # it with Cargo in the release profile and runs the project through it; a
+  # crate `embsim new --catalog` starts builds and runs outside any
+  # workspace; a crate that does not compile shows rustc's errors. Each case
+  # needs a build of embsim, so they are #[ignore]d in the test job's suites
+  # and run here, where the release build is paid once (and cached).
+  project-runner:
+    name: project-runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build a project's catalog crates into a runner and run it
+        run: cargo test -p embsim-cli --test runner -- --ignored --nocapture
+
   ci-gate:
     name: CI Gate
     needs:
@@ -384,6 +402,7 @@ jobs:
       - supply-chain
       - msrv
       - p2-qemu-boot
+      - project-runner
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

@@ -17,6 +17,8 @@ use embsim_board::{
 };
 use embsim_boards::catalog::CatalogSet;
 
+use crate::scaffold;
+
 /// The widest a line of references gets before it wraps.
 const LINE_WIDTH: usize = 100;
 
@@ -588,17 +590,47 @@ fn pin_table(
 // embsim new
 // ============================================================
 
-/// `embsim new <netlist> [--name N] [-o project.toml] [--force]`.
+/// What `embsim new <netlist>` was asked for besides the netlist.
+#[derive(Debug, Default)]
+pub struct NewOptions<'a> {
+    /// `--name`: the board's name in the project.
+    pub name: Option<&'a str>,
+    /// `-o`: where the project goes; standard output without it.
+    pub output: Option<&'a Path>,
+    /// `--force`: replace the output file.
+    pub force: bool,
+    /// `--catalog`: a catalog crate to start, named in the project's
+    /// `[catalog]`.
+    pub catalog: Option<&'a Path>,
+}
+
+/// `embsim new <netlist> [--name N] [-o project.toml] [--force] [--catalog
+/// DIR]`.
 pub fn new_project(
     set: &CatalogSet,
     netlist: &Path,
-    name: Option<&str>,
-    output: Option<&Path>,
-    force: bool,
+    options: &NewOptions<'_>,
     out: &mut dyn IoWrite,
 ) -> Result<(), String> {
+    let NewOptions {
+        name,
+        output,
+        force,
+        catalog,
+    } = *options;
     let name = name.map_or_else(|| default_name(netlist), str::to_string);
     let survey = survey_netlist(set, netlist, &name)?;
+    // Refuse before anything is written: an output that exists, a crate
+    // directory that is not empty.
+    if let Some(path) = output.filter(|path| path.exists() && !force) {
+        return Err(format!(
+            "{} exists; pass --force to replace it",
+            path.display()
+        ));
+    }
+    if let Some(dir) = catalog {
+        scaffold::check_free(dir)?;
+    }
 
     // The netlist, relative to where the project will live.
     let project_dir = match output {
@@ -613,13 +645,23 @@ pub fn new_project(
         || netlist.display().to_string(),
         |file| file.to_string_lossy().into_owned(),
     );
-    let text = starter_project(
+    let mut text = starter_project(
         &source,
         &name,
         &relative.to_string_lossy(),
         &survey,
         &set.guide(),
     );
+    // The crate first: the project names its directory as it is on disk.
+    let scaffold = match catalog {
+        Some(dir) => {
+            let scaffold = scaffold::write_crate(dir, &crate::source_dir())?;
+            let from_project = relative_path(dir, &project_dir)?;
+            text = scaffold::with_catalog_table(&text, &from_project.to_string_lossy());
+            Some(scaffold)
+        }
+        None => None,
+    };
     // What `new` writes is a project; a text that is not one is this
     // command's own error.
     Project::parse(&text)
@@ -629,12 +671,6 @@ pub fn new_project(
         let _ = write!(out, "{text}");
         return Ok(());
     };
-    if path.exists() && !force {
-        return Err(format!(
-            "{} exists; pass --force to replace it",
-            path.display()
-        ));
-    }
     std::fs::write(path, &text).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     let stubs = stub_groups(&survey).len();
     let _ = writeln!(out, "wrote {}", path.display());
@@ -674,11 +710,18 @@ pub fn new_project(
         },
         path.display()
     );
+    if let Some(scaffold) = scaffold {
+        scaffold.say(out);
+        let _ = writeln!(
+            out,
+            "  named in the project's [catalog]: `embsim check` builds the runner that holds it"
+        );
+    }
     Ok(())
 }
 
 /// `target` relative to the directory `base`, both resolved on disk.
-fn relative_path(target: &Path, base: &Path) -> Result<PathBuf, String> {
+pub(crate) fn relative_path(target: &Path, base: &Path) -> Result<PathBuf, String> {
     let target = target
         .canonicalize()
         .map_err(|err| format!("{}: {err}", target.display()))?;

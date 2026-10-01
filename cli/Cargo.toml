@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The embsim command: survey a netlist, start a project, check it, run it"
+description = "The embsim command: survey a netlist, start a project, check it, run it, with a project's own catalog crates built in"
 keywords = ["embedded", "emulator", "simulation", "sil", "cli"]
 categories = ["command-line-utilities", "simulation"]
 
@@ -14,9 +14,10 @@ categories = ["command-line-utilities", "simulation"]
 # are built only then.
 build = "build.rs"
 
-# The command is a library (`embsim_cli::main_with`, `embsim_cli::run`) and
-# the `embsim` binary is it over the catalogs embsim ships, so a project with
-# kinds of its own runs the same command from a binary of its own.
+# The command is a library (`embsim_cli::main_with`, `embsim_cli::run`,
+# `embsim_cli::runner_main`) and the `embsim` binary is the tool over it
+# (`embsim_cli::tool_main`): the catalogs embsim ships, and for a project
+# with kinds of its own, the runner it builds over the project's crates.
 [lib]
 name = "embsim_cli"
 path = "src/lib.rs"
@@ -34,8 +35,17 @@ clap.workspace = true
 # `run`'s SIGINT/SIGTERM handler: the first signal ends the run with its
 # summary.
 libc.workspace = true
+# Cargo's build report, read for the runner's binary and the embsim
+# libraries it links (`src/runner.rs`).
+serde_json.workspace = true
 toml.workspace = true
+# `embsim new --catalog --add-to`: a project's `[catalog]` edited in place,
+# its comments kept.
+toml_edit.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
+# The crate `embsim new --catalog` starts, run in process
+# (`tests/template.rs`).
+yourproject-catalog = { path = "catalog-template" }
 vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

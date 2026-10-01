@@ -761,9 +761,120 @@ pub struct PinShortSpec {
     pub b: String,
 }
 
+/// `[catalog]`: the project's own catalog crates, which the `embsim` tool
+/// builds into a runner and runs the project through (`PROJECTS.md` §10,
+/// "The runner"). A project without it runs on the catalogs embsim ships.
+///
+/// The table says where the crates are, and nothing about what they hold:
+/// the kinds they add are named in the rest of the file like any other.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogTable {
+    /// The catalog crates, each a directory holding a `Cargo.toml`,
+    /// relative to the project file. Their registration functions run in
+    /// this order, after the catalogs embsim ships.
+    pub crates: Vec<String>,
+    /// The embsim checkout (its workspace root, relative to the project
+    /// file) the runner builds embsim from; by default the checkout the
+    /// `embsim` tool was built from.
+    #[serde(default)]
+    pub embsim: Option<String>,
+}
+
+impl CatalogTable {
+    /// The `[catalog]` table of the project text `text`, reading nothing
+    /// else of it: what the `embsim` tool reads before it hands a project
+    /// to its runner, so a project the runner's embsim reads is never
+    /// refused by an older tool. `None` when the file has no `[catalog]`.
+    pub fn of_project_text(text: &str) -> Result<Option<Self>, ProjectError> {
+        /// The file, every table but `[catalog]` passed over unread.
+        #[derive(Deserialize)]
+        struct CatalogOnly {
+            #[serde(default)]
+            catalog: Option<CatalogTable>,
+        }
+        let file: CatalogOnly = toml::from_str(text)
+            .map_err(|err| ProjectError::message(format!("project does not parse: {err}")))?;
+        match file.catalog {
+            Some(catalog) => {
+                catalog.check()?;
+                Ok(Some(catalog))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The `[catalog]` table of the project file at `path`
+    /// ([`Self::of_project_text`]).
+    pub fn of_project(path: &Path) -> Result<Option<Self>, ProjectError> {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            ProjectError::message(format!("cannot read project {}: {err}", path.display()))
+        })?;
+        Self::of_project_text(&text)
+            .map_err(|err| ProjectError::message(format!("{}: {err}", path.display())))
+    }
+
+    /// Refuse a table that names no crate, a crate twice, or an empty path.
+    fn check(&self) -> Result<(), ProjectError> {
+        if self.crates.is_empty() {
+            return Err(ProjectError::message(
+                "[catalog] crates is empty: name the project's catalog crates (crates = \
+                 [\"sim/catalog\"]), or take the table out to run on the catalogs embsim ships",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for path in &self.crates {
+            if path.trim().is_empty() {
+                return Err(ProjectError::message(
+                    "[catalog] crates names an empty path; each is a crate's directory, \
+                     relative to the project file",
+                ));
+            }
+            if !seen.insert(path.as_str()) {
+                return Err(ProjectError::message(format!(
+                    "[catalog] crates names {path:?} twice; a crate registers its kinds once"
+                )));
+            }
+        }
+        if self
+            .embsim
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(ProjectError::message(
+                "[catalog] embsim is empty: name an embsim checkout's root, relative to the \
+                 project file, or leave the key out to build against the one embsim was built \
+                 from",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The directory beside a project file where embsim keeps what it makes
+/// for the project and nobody edits — a `host-serial`'s PTY, the runner the
+/// `embsim` tool builds — made if it is missing, with a `.gitignore` that
+/// keeps all of it out of version control.
+pub fn state_dir(project_dir: &Path) -> std::io::Result<PathBuf> {
+    let dir = project_dir.join(".embsim");
+    std::fs::create_dir_all(&dir)?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(
+            &ignore,
+            "# Written by embsim: what it makes for the project beside this directory\n\
+             # (PTYs, the runner it builds). Nothing here is source.\n*\n",
+        )?;
+    }
+    Ok(dir)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectFile {
+    /// `[catalog]`: the project's own catalog crates.
+    #[serde(default)]
+    catalog: Option<CatalogTable>,
     #[serde(default)]
     board: Vec<BoardSpec>,
     #[serde(default)]
@@ -806,6 +917,9 @@ impl Project {
     pub fn parse(text: &str) -> Result<Self, ProjectError> {
         let file: ProjectFile = toml::from_str(text)
             .map_err(|err| ProjectError::message(format!("project does not parse: {err}")))?;
+        if let Some(catalog) = &file.catalog {
+            catalog.check()?;
+        }
         let project = Self {
             file,
             dir: PathBuf::from("."),
@@ -841,6 +955,13 @@ impl Project {
     /// The directory the project's paths are relative to.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The project's `[catalog]` table, when it names catalog crates of its
+    /// own. Building a system does not read it: the kinds those crates add
+    /// reach the project through the catalog it is built with.
+    pub fn catalog(&self) -> Option<&CatalogTable> {
+        self.file.catalog.as_ref()
     }
 
     /// The boards, in file order.

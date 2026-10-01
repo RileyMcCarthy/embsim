@@ -273,6 +273,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom-project-catalog"
+version = "0.1.0"
+dependencies = [
+ "embsim-board",
+ "embsim-boards",
+ "embsim-cli",
+ "embsim-core",
+ "rstest",
+ "vibes-behaviour",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,8 +342,11 @@ dependencies = [
  "embsim-p2-qemu",
  "libc",
  "rstest",
+ "serde_json",
  "toml",
+ "toml_edit 0.22.24",
  "vibes-behaviour",
+ "yourproject-catalog",
 ]
 
 [[package]]
@@ -1603,6 +1618,14 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "yourproject-catalog"
+version = "0.1.0"
+dependencies = [
+ "embsim-board",
+ "embsim-boards",
+]
 
 [[package]]
 name = "zerocopy"

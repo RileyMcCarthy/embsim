@@ -10,6 +10,11 @@ members = [
     "tools/trace",
     "cpu-oracle",
     "cli",
+    # The catalog crate `embsim new --catalog` starts, compiled here so the
+    # gates hold it to the API it is written against.
+    "cli/catalog-template",
+    # A project with kinds of its own (examples/custom-project/README.md).
+    "examples/custom-project/catalog",
 ]
 resolver = "2"
 
@@ -38,6 +43,7 @@ gimli = "0.34"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+toml_edit = "0.22"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 # The `embsim` command line (cli/): subcommands and their options, derived.

@@ -400,12 +400,12 @@ fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proj
     let path = match path {
         Some(path) => dir.join(path),
         None => {
-            // `.embsim/<name>.pty` beside the project file.
-            let embsim = dir.join(".embsim");
-            std::fs::create_dir_all(&embsim).map_err(|err| {
+            // `.embsim/<name>.pty` beside the project file, out of
+            // version control.
+            let embsim = embsim_board::state_dir(dir).map_err(|err| {
                 error(format!(
                     "cannot make {} for its PTY: {err}",
-                    embsim.display()
+                    dir.join(".embsim").display()
                 ))
             })?;
             embsim.join(format!("{}.pty", spec.name))

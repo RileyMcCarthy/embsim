@@ -290,8 +290,25 @@ cargo test -p embsim-boards --test scripted_source --test host_serial
 # host's PTY where it says and printing its path. And the command as a
 # library (`cli/tests/library.rs`, in process): a catalog the test defines
 # adds a board kind, a part kind, a P2 core and a bench component, and a
-# project naming all four checks and runs through `embsim_cli::run`.
+# project naming all four checks and runs through `embsim_cli::run`. A
+# project's own catalog crates (`cli/tests/runner.rs`): `new --catalog`
+# starting a crate and naming it in a project, the tool's refusals before
+# Cargo, the runner's files written when no Cargo starts, a runner refusing
+# a project naming other crates; and the crate `new --catalog` starts, its
+# four kinds run in process (`cli/tests/template.rs`).
 cargo test -p embsim-cli
+
+# The runner built with Cargo (`#[ignore]`d above; CI's project-runner job):
+# examples/custom-project checked and run through the real binary and the
+# runner it builds, a quiet second build and a --rebuild, a started crate
+# built outside any workspace, and a crate that does not compile shown with
+# rustc's errors. The first build of embsim in the release profile is the
+# slow part.
+cargo test -p embsim-cli --test runner -- --ignored
+
+# The worked example's own test: its project run as its runner runs it, in
+# process, every edge at its nanosecond (stepped, own binary).
+cargo test -p custom-project-catalog
 ```
 
 Per-crate iteration:

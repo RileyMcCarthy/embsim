@@ -517,3 +517,71 @@ fn the_three_board_machine_project_waits_on_the_two_parts_the_catalog_lacks() {
         .count();
     assert_eq!(listed, 2, "{message}");
 }
+
+#[rstest]
+#[case::no_crate("crates = []", "[catalog] crates is empty")]
+#[case::twice(
+    "crates = [\"sim/catalog\", \"sim/catalog\"]",
+    "[catalog] crates names \"sim/catalog\" twice"
+)]
+#[case::empty_path("crates = [\"\"]", "[catalog] crates names an empty path")]
+#[case::empty_checkout("crates = [\"c\"]\nembsim = \"\"", "[catalog] embsim is empty")]
+#[case::unknown_key(
+    "crates = [\"c\"]\ncolour = \"red\"",
+    "unknown field `colour`, expected `crates` or `embsim`"
+)]
+fn a_catalog_table_that_names_no_crate_clearly_is_refused(#[case] table: &str, #[case] says: &str) {
+    behaviour!(Test {
+        id: "project.refuses-bad-catalog-table",
+        covers: Some("board/src/project.rs#CatalogTable::of_project_text"),
+        given: "a project whose catalog-crates table names no crate, one crate twice, an empty \
+                path, an empty embsim checkout, or a key the table does not have",
+    });
+    expect!(
+        "refused-by-both",
+        "the project is refused when it is read, and so is the table when the `embsim` tool \
+         reads it alone, each refusal saying what the table needs",
+        "the tool builds a runner from this table before the project is read"
+    );
+    let text = format!("[catalog]\n{table}\n{}", header(""));
+    let message = Project::parse(&text)
+        .expect_err("the table is refused")
+        .to_string();
+    assert_says(&message, &[says]);
+    let alone = embsim_board::CatalogTable::of_project_text(&text)
+        .expect_err("the table alone is refused")
+        .to_string();
+    assert_says(&alone, &[says]);
+}
+
+#[rstest]
+fn the_catalog_table_is_read_without_the_rest_of_the_file() {
+    behaviour!(Test {
+        id: "project.catalog-table-alone",
+        covers: Some("board/src/project.rs#CatalogTable::of_project_text"),
+        given: "a project file with a catalog-crates table and a table this embsim does not \
+                know",
+    });
+    expect!(
+        "table-read",
+        "the catalog crates are read from it in the order the file gives them, while the \
+         project itself is refused for the table it does not know",
+        "the `embsim` tool reads only this table before it hands a project to its runner, so \
+         a project a newer embsim in the runner reads is never refused by an older tool"
+    );
+    let text = format!(
+        "[catalog]\ncrates = [\"sim/b\", \"sim/a\"]\nembsim = \"../embsim\"\n\n[later]\nkey = 1\n{}",
+        header("")
+    );
+    let catalog = embsim_board::CatalogTable::of_project_text(&text)
+        .expect("the table reads")
+        .expect("the file has one");
+    assert_eq!(catalog.crates, ["sim/b", "sim/a"]);
+    assert_eq!(catalog.embsim.as_deref(), Some("../embsim"));
+    assert_says(
+        &Project::parse(&text)
+            .expect_err("the project is refused")
+            .to_string(),
+        &["unknown field `later`"],
+    );
+}

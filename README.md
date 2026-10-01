@@ -21,10 +21,12 @@ file with `embsim_board::Project`. The guide is [`PROJECTS.md`](PROJECTS.md).
 It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD)
 and is designed to be reused: no generic crate depends on a project crate
 (below). A new project supplies its boards' netlists, and the models, boards,
-processor cores and bench parts it needs that embsim does not ship: a catalog
-of its own, which joins the shipped ones in a catalog set, and the `embsim`
-command over that set, a binary of ten lines on the command's library
-(`PROJECTS.md` sections 7 and 10).
+processor cores and bench parts it needs that embsim does not ship: a
+catalog crate of its own, named in the project file
+(`[catalog] crates = ["sim/catalog"]`), which the `embsim` tool builds into
+the command with Cargo and runs the project through (`PROJECTS.md`
+sections 7 and 10). [`examples/custom-project`](examples/custom-project/README.md)
+is one, worked end to end.
 
 ## What embsim is for, and what it is not
 
@@ -139,7 +141,9 @@ Project-specific wiring lives in the consumer's repo.
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets. Carries the `target/p2` sources |
 | `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
-| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked). The guide is [`PROJECTS.md`](PROJECTS.md) |
+| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked), and build a project's own catalog crates into the runner that runs it. The guide is [`PROJECTS.md`](PROJECTS.md) |
+| `yourproject-catalog` | [`cli/catalog-template/`](cli/catalog-template) | The catalog crate `embsim new --catalog` starts, compiled here so it stays true to the API |
+| `custom-project-catalog` | [`examples/custom-project/catalog/`](examples/custom-project/catalog) | A worked example: a project's own part model, board, P2 core and bench component ([`examples/custom-project`](examples/custom-project/README.md)) |
 | `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from an archive |
 | `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
 | `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer mounts into |
@@ -250,6 +254,18 @@ embsim run board.toml --for 20ms --net BOARD.VCC
   reports of itself, the nets asked for with `--net`, and each finding's net
   read again: the ones the run cleared (a rail that came up) apart from the
   ones still true. `--pty` says where a `host-serial` component's PTY goes.
+
+A project whose file names catalog crates of its own (`[catalog]`) is
+checked and run through a **runner**: `embsim` writes a small crate beside
+the project (`.embsim/runner-<id>/`, kept out of git), builds it with Cargo
+— the project's crates and embsim in one binary, reusing what the crates'
+workspace built, and with nothing changed only Cargo's no-op check — and
+hands the command line to it. `embsim new --catalog DIR` starts such a
+crate with one commented example of each sort of kind, and names it in the
+project (`--add-to PROJECT`, or the starter project `new` writes);
+`check --rebuild` builds the runner afresh. The tool takes embsim's crates
+from the checkout it was built from, or the project's `[catalog] embsim`
+(`PROJECTS.md` section 10, "The runner").
 
 The standard catalog's bench component kinds are `host-serial`, a host's
 serial port as a PTY on the host's own rail, and `scripted-source`, a pin

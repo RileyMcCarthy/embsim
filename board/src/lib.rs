@@ -95,9 +95,9 @@ pub use net::{
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use project::{
-    parse_duration, Assignment, BoardSpec, Catalog, CatalogBoard, ComponentRequest, ComponentSpec,
-    ContactState, JumperSpec, KeyField, MateSpec, ModelSpec, PartOptions, PinShortSpec, Project,
-    ProjectError, SwitchSpec, WireSpec,
+    parse_duration, state_dir, Assignment, BoardSpec, Catalog, CatalogBoard, CatalogTable,
+    ComponentRequest, ComponentSpec, ContactState, JumperSpec, KeyField, MateSpec, ModelSpec,
+    PartOptions, PinShortSpec, Project, ProjectError, SwitchSpec, WireSpec,
 };
 pub use registry::{
     reference_designator_class, Classification, Classified, JumperState, ModelFacade, PartRegistry,
