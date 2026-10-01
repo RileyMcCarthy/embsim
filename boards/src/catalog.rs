@@ -42,9 +42,20 @@
 //! one: what the model is, the part numbers it is for, the pin tables it can
 //! declare (the ones its `pins` option picks, read off the models it
 //! registers) and the options it cannot go without. [`KindGuide::fit`] says
-//! how a kind could be a part's model — by part number, by a table with
-//! exactly the part's pins, or by pin count — which is how `embsim survey`
-//! and `embsim new` name the kinds that could be a part the survey lists.
+//! how a kind is a part's model — by part number, or by the part family its
+//! keys name — which is how `embsim survey` and `embsim new` name the kind
+//! a part the survey lists is. Pins alone name no kind.
+//!
+//! # What a part is
+//!
+//! A kind says what a part is (`DESIGN.md` rule 1), so every kind checks
+//! the parts an entry reaches before it registers
+//! ([`StandardCatalog::check_parts_are_the_kind`], [`Named`]): a model's
+//! kind seats only on a part one of whose keys names its part family;
+//! `sd-card` and `boundary` only on a connector, by its reference designator
+//! or its symbol; `switch` only on a switch or jumper, by its designator, its
+//! symbol or its name; and `mechanical` only on a part whose pins sit on one
+//! net at most. A part none of them is needs a model.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -97,6 +108,9 @@ struct PartKind {
     name: &'static str,
     /// The model, in a phrase: the model column of `PROJECTS.md`'s table.
     summary: &'static str,
+    /// What a part has to be for the kind to seat there: checked for every
+    /// part an entry reaches before the kind registers ([`Named`]).
+    is: Named,
     /// Part numbers the kind is for that the base registry does not place
     /// by number (the processor): the guide names them beside the ones it
     /// does ([`known_parts`]).
@@ -109,114 +123,135 @@ const PART_KINDS: &[PartKind] = &[
     PartKind {
         name: "p2",
         summary: "the Propeller 2 package",
+        is: Named::Family(&["P2X8C4M64P"]),
         unplaced: &["P2X8C4M64P"],
         register: p2_kind,
     },
     PartKind {
         name: "tg2520smn",
         summary: "EPSON TCXO; frequency from the part's value or number",
+        is: Named::Family(&["TG2520SMN"]),
         unplaced: &[],
         register: tg2520smn_kind,
     },
     PartKind {
         name: "74lvc2g04",
         summary: "NXP dual inverter",
+        is: Named::Family(&["74LVC2G04"]),
         unplaced: &[],
         register: lvc2g04_kind,
     },
     PartKind {
         name: "sn74lvc1g14",
         summary: "TI Schmitt inverter",
+        is: Named::Family(&["74LVC1G14"]),
         unplaced: &[],
         register: lvc1g14_kind,
     },
     PartKind {
         name: "aps6404l",
         summary: "AP Memory PSRAM",
+        is: Named::Family(&["APS6404L"]),
         unplaced: &[],
         register: aps6404l_kind,
     },
     PartKind {
         name: "w25q128jv",
         summary: "Winbond serial NOR flash, blank or holding an image",
+        is: Named::Family(&["W25Q128JV"]),
         unplaced: &[],
         register: w25q128jv_kind,
     },
     PartKind {
         name: "sd-card",
         summary: "a card in an SD socket",
+        is: Named::Connector,
         unplaced: &[],
         register: sd_card_kind,
     },
     PartKind {
         name: "ap62301",
         summary: "Diodes buck; setpoint from its feedback divider",
+        is: Named::Family(&["AP62301"]),
         unplaced: &[],
         register: ap62301_kind,
     },
     PartKind {
         name: "ncp114",
         summary: "onsemi LDO; setpoint from the part's value or number",
+        is: Named::Family(&["NCP114"]),
         unplaced: &[],
         register: ncp114_kind,
     },
     PartKind {
         name: "xl1509",
         summary: "XLSEMI buck; version from the part's value or number",
+        is: Named::Family(&["XL1509"]),
         unplaced: &[],
         register: xl1509_kind,
     },
     PartKind {
         name: "ucc12040",
         summary: "TI isolated DC/DC; setpoint from its SEL strap",
+        is: Named::Family(&["UCC12040"]),
         unplaced: &[],
         register: ucc12040_kind,
     },
     PartKind {
         name: "stm1061",
         summary: "ST voltage detector, from its ordering code",
+        is: Named::Family(&["STM1061"]),
         unplaced: &[],
         register: stm1061_kind,
     },
     PartKind {
         name: "6n137",
         summary: "Lite-On optocoupler",
+        is: Named::Family(&["6N137"]),
         unplaced: &[],
         register: opto_6n137_kind,
     },
     PartKind {
         name: "vo2631",
         summary: "Vishay dual optocoupler",
+        is: Named::Family(&["VO2631"]),
         unplaced: &[],
         register: vo2631_kind,
     },
     PartKind {
         name: "iso67xx",
         summary: "TI digital isolator, the member the key names",
+        is: Named::Family(&[
+            "ISO6720", "ISO6721", "ISO6731", "ISO6740", "ISO6741", "ISO6742",
+        ]),
         unplaced: &[],
         register: iso67xx_kind,
     },
     PartKind {
         name: "ads122u04",
         summary: "TI 24-bit ADC, as it comes out of reset",
+        is: Named::Family(&["ADS122U04"]),
         unplaced: &[],
         register: ads122u04_kind,
     },
     PartKind {
         name: "switch",
         summary: "a switch whose poles pair the part's pins, each open",
+        is: Named::Switch,
         unplaced: &[],
         register: switch_kind,
     },
     PartKind {
         name: "mechanical",
         summary: "a part with pads and nothing electrical",
+        is: Named::OneNet,
         unplaced: &[],
         register: mechanical_kind,
     },
     PartKind {
         name: "boundary",
         summary: "a connector, by its symbol's part name",
+        is: Named::Connector,
         unplaced: &[],
         register: boundary_kind,
     },
@@ -263,6 +298,7 @@ impl Catalog for StandardCatalog {
             .iter()
             .find(|kind| kind.name == assignment.kind)
             .ok_or_else(|| assignment.error("not a part kind this catalog ships"))?;
+        StandardCatalog::check_parts_are_the_kind(assignment)?;
         (kind.register)(registry, assignment, options)
     }
 
@@ -300,7 +336,7 @@ impl StandardCatalog {
 
 /// A model ready to register: the facade every component it builds
 /// declares, and its constructor.
-struct Model {
+pub(crate) struct Model {
     facade: ModelFacade,
     ctor: ComponentCtor,
 }
@@ -332,7 +368,7 @@ impl Model {
         }
     }
 
-    fn register(self, registry: &mut PartRegistry, key: &str) {
+    pub(crate) fn register(self, registry: &mut PartRegistry, key: &str) {
         let Model { facade, ctor } = self;
         registry.register_model(key, facade, move |decl| ctor(decl));
     }
@@ -367,13 +403,16 @@ fn p2_model() -> Model {
     )
 }
 
-fn tcxo_model(config: oscillator::Config, table: (&'static str, &'static [PinDecl])) -> Model {
+pub(crate) fn tcxo_model(
+    config: oscillator::Config,
+    table: (&'static str, &'static [PinDecl]),
+) -> Model {
     Model::with_table(named("tg2520smn", table.0), table.1, move |_| {
         Box::new(Oscillator::new(config.clone()).with_pins(table.1))
     })
 }
 
-fn gate_model(
+pub(crate) fn gate_model(
     kind: &'static str,
     config: logic_gate::Config,
     table: (&'static str, &'static [GatePin]),
@@ -386,13 +425,16 @@ fn gate_model(
     })
 }
 
-fn psram_model(table: (&'static str, &'static [PinDecl])) -> Model {
+pub(crate) fn psram_model(table: (&'static str, &'static [PinDecl])) -> Model {
     Model::with_table(named("aps6404l", table.0), table.1, move |_| {
         Box::new(PsramComponent::new(Psram::new()).with_pins(table.1))
     })
 }
 
-fn flash_model(id: (&'static str, [u8; 3]), table: (&'static str, &'static [PinDecl])) -> Model {
+pub(crate) fn flash_model(
+    id: (&'static str, [u8; 3]),
+    table: (&'static str, &'static [PinDecl]),
+) -> Model {
     Model::with_table(
         format!("w25q128jv, pins = {:?}, id = {:?}", table.0, id.0),
         table.1,
@@ -407,7 +449,7 @@ fn flash_model(id: (&'static str, [u8; 3]), table: (&'static str, &'static [PinD
     )
 }
 
-fn rail_model(
+pub(crate) fn rail_model(
     kind: &'static str,
     config: rail::Config,
     table: (&'static str, &'static [RailPin]),
@@ -417,7 +459,7 @@ fn rail_model(
     })
 }
 
-fn detector_model(
+pub(crate) fn detector_model(
     config: supervisor::Config,
     table: (&'static str, &'static [DetectorPin]),
 ) -> Model {
@@ -450,45 +492,54 @@ fn adc_model() -> Model {
 // Pin tables
 // ============================================================
 
-const TCXO_TABLES: [(&str, &[PinDecl]); 2] = [
+pub(crate) const TCXO_TABLES: [(&str, &[PinDecl]); 2] = [
     ("numbered", &TCXO_PINS_NUMBERED),
     ("by-function", &TCXO_PINS_BY_FUNCTION),
 ];
-const LVC2G04_TABLES: [(&str, &[GatePin]); 2] = [
+pub(crate) const LVC2G04_TABLES: [(&str, &[GatePin]); 2] = [
     ("sot363", &LVC2G04_PINS_SOT363),
     ("by-function", &LVC2G04_PINS_BY_FUNCTION),
 ];
 const LVC1G14_TABLES: [(&str, &[GatePin]); 1] = [("sot23", &LVC1G14_PINS_SOT23)];
-const PSRAM_TABLES: [(&str, &[PinDecl]); 2] = [
+pub(crate) const PSRAM_TABLES: [(&str, &[PinDecl]); 2] = [
     ("sop8", &PSRAM_PINS_SOP8),
     ("by-function", &PSRAM_PINS_BY_FUNCTION),
 ];
-const FLASH_TABLES: [(&str, &[PinDecl]); 3] = [
+pub(crate) const FLASH_TABLES: [(&str, &[PinDecl]); 3] = [
     ("soic8", &SPI_FLASH_PINS_SOIC8),
     ("by-function", &SPI_FLASH_PINS_BY_FUNCTION),
     ("spi-only", &SPI_FLASH_PINS_SPI_ONLY),
 ];
-const FLASH_IDS: [(&str, [u8; 3]); 2] =
+pub(crate) const FLASH_IDS: [(&str, [u8; 3]); 2] =
     [("im", JEDEC_ID_W25Q128JV_IM), ("iq", JEDEC_ID_W25Q128JV_IQ)];
-const SD_TABLES: [(&str, &[PinDecl]); 3] = [
+pub(crate) const SD_TABLES: [(&str, &[PinDecl]); 3] = [
     ("microsd", &SD_CARD_PINS_MICROSD),
     ("by-function", &SD_CARD_PINS_BY_FUNCTION),
     ("spi-only", &SD_CARD_PINS_SPI_ONLY),
 ];
-const AP62301_TABLES: [(&str, &[RailPin]); 2] = [
+pub(crate) const AP62301_TABLES: [(&str, &[RailPin]); 2] = [
     ("sot563", &AP62301_PINS_SOT563),
     ("by-function", &AP62301_PINS_BY_FUNCTION),
 ];
-const NCP114_TABLES: [(&str, &[RailPin]); 2] = [
+pub(crate) const NCP114_TABLES: [(&str, &[RailPin]); 2] = [
     ("udfn4", &NCP114_PINS_UDFN4),
     ("by-function", &NCP114_PINS_BY_FUNCTION),
 ];
 const XL1509_TABLES: [(&str, &[RailPin]); 1] = [("sop8", &XL1509_PINS_SOP8)];
 const UCC12040_TABLES: [(&str, &[RailPin]); 1] = [("soic16", &UCC12040_PINS_SOIC16)];
-const STM1061_TABLES: [(&str, &[DetectorPin]); 2] = [
+pub(crate) const STM1061_TABLES: [(&str, &[DetectorPin]); 2] = [
     ("sot23", &STM1061_PINS_SOT23),
     ("by-function", &STM1061_PINS_BY_FUNCTION),
 ];
+
+/// The table named `by-function` among `tables`: the one a netlist
+/// transcribed from a schematic uses, as the P2-EC32MB's does.
+pub(crate) fn by_function<T: Copy>(tables: &[(&'static str, T)]) -> (&'static str, T) {
+    *tables
+        .iter()
+        .find(|(name, _)| *name == "by-function")
+        .expect("the model offers a by-function table")
+}
 
 /// Take option `name` as one of `tables`' names; the first is the default.
 fn choose<T: Copy>(
@@ -824,11 +875,15 @@ fn sd_card_kind(
     let blocks = read_image(&path).map_err(|err| {
         assignment.error(format!("cannot read card image {}: {err}", path.display()))
     })?;
+    sd_model(blocks, table).register(registry, assignment.key);
+    Ok(())
+}
+
+/// A card holding `blocks` in a socket whose pins are `table`.
+pub(crate) fn sd_model(blocks: Vec<u8>, table: (&'static str, &'static [PinDecl])) -> Model {
     Model::with_table(named("sd-card", table.0), table.1, move |_| {
         Box::new(SdCardComponent::new(SdCard::with_image(blocks.clone())).with_pins(table.1))
     })
-    .register(registry, assignment.key);
-    Ok(())
 }
 
 fn read_image(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -1040,6 +1095,276 @@ fn boundary_kind(
 }
 
 // ============================================================
+// What a part is
+// ============================================================
+
+/// What a part has to be for a kind to seat there: a kind says what the
+/// part is (`DESIGN.md` rule 1), so a kind never seats on a part that is
+/// something else, whatever its pins. A part none of them fits is a part
+/// that needs a model (`PROJECTS.md` §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Named {
+    /// One of the part's part name, manufacturer part number or value names
+    /// one of these part families, compared on letters and digits: the part
+    /// is a member of the family the model's datasheet describes.
+    Family(&'static [&'static str]),
+    /// A connector, by its reference designator or its symbol
+    /// ([`is_connector`]).
+    Connector,
+    /// A switch or a jumper, by its reference designator or its symbol
+    /// ([`is_switch`]).
+    Switch,
+    /// A part with nothing electrical: its pins sit on one net at most, so
+    /// it joins nothing. A part whose pins join two nets carries current
+    /// between them, and that is behaviour a model has to say.
+    OneNet,
+}
+
+/// The reference designators a connector is drawn with: `J` (a jack or a
+/// connector), `P` (a plug), `CN`.
+pub const CONNECTOR_DESIGNATORS: [&str; 3] = ["J", "P", "CN"];
+
+/// The reference designators a switch or jumper is drawn with: `S`, `SW`,
+/// `JP`, `SJ` (a solder jumper).
+pub const SWITCH_DESIGNATORS: [&str; 4] = ["S", "SW", "JP", "SJ"];
+
+/// Words a part's own name says it is a switch or jumper with, in any case:
+/// a netlist transcribed from a schematic has no symbol, and its value is
+/// the part's name (the P2-EC32MB's `J101`, "Solder Link Pads").
+pub const SWITCH_WORDS: [&str; 3] = ["switch", "jumper", "solder link"];
+
+/// A reference designator's class letters: the letters before its first
+/// digit, upper-cased (`"SW"` for `SW3`, `"U"` for `U24`).
+fn designator(reference: &str) -> String {
+    reference
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Whether a part is a connector by what the board says of it: a connector
+/// designator ([`CONNECTOR_DESIGNATORS`]) or a `Conn…` symbol.
+pub fn is_connector(reference: &str, part: &str) -> bool {
+    CONNECTOR_DESIGNATORS.contains(&designator(reference).as_str()) || part.starts_with("Conn")
+}
+
+/// Whether a part is a switch or jumper by what the board says of it: a
+/// switch designator ([`SWITCH_DESIGNATORS`]), a `SW_…` symbol, or a symbol
+/// name or value that says so ([`SWITCH_WORDS`]).
+pub fn is_switch(reference: &str, part: &str, value: &str) -> bool {
+    let says = |text: &str| {
+        let text = text.to_lowercase();
+        SWITCH_WORDS.iter().any(|word| text.contains(word))
+    };
+    SWITCH_DESIGNATORS.contains(&designator(reference).as_str())
+        || part.starts_with("SW_")
+        || says(part)
+        || says(value)
+}
+
+/// Whether one of `keys` names one of `families`: a key's letters and
+/// digits contain the family's ([`number_stem`]). A key shorter than
+/// [`MIN_NUMBER_STEM`] names no part.
+fn names_a_family(keys: &[&str], families: &[&'static str]) -> Option<&'static str> {
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| number_stem(key))
+        .filter(|key| key.len() >= MIN_NUMBER_STEM)
+        .collect();
+    families.iter().copied().find(|family| {
+        let family = number_stem(family);
+        keys.iter().any(|key| key.contains(family.as_str()))
+    })
+}
+
+impl Named {
+    /// What the kind is for, as the `PROJECTS.md` table and an error say
+    /// it.
+    pub fn describe(self) -> String {
+        match self {
+            Named::Family(families) => {
+                let names: Vec<&str> = families.to_vec();
+                let listed = match names.as_slice() {
+                    [one] => (*one).to_string(),
+                    [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+                    [] => String::new(),
+                };
+                format!("a part whose part name, mpn or value contains {listed}")
+            }
+            Named::Connector => "a connector: designator J, P or CN, or a Conn… symbol".to_string(),
+            Named::Switch => {
+                "a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that \
+                 says switch, jumper or solder link"
+                    .to_string()
+            }
+            Named::OneNet => "a part whose pads sit on one net at most".to_string(),
+        }
+    }
+}
+
+impl StandardCatalog {
+    /// Refuse the entry unless every part it reaches is what its kind
+    /// says ([`Named`]). [`Catalog::register_part`] checks this first; a
+    /// catalog that registers one of this catalog's kinds itself (the QEMU
+    /// catalog's `p2`) calls it too.
+    pub fn check_parts_are_the_kind(assignment: &Assignment<'_>) -> Result<(), ProjectError> {
+        let Some(kind) = PART_KINDS.iter().find(|kind| kind.name == assignment.kind) else {
+            return Ok(());
+        };
+        for decl in assignment.parts {
+            let part = embsim_board::registry::normalize_part(decl);
+            let why = match kind.is {
+                Named::Family(families) => {
+                    let keys = [
+                        part.as_str(),
+                        decl.mpn.as_deref().unwrap_or(""),
+                        &decl.value,
+                    ];
+                    if names_a_family(&keys, families).is_some() {
+                        continue;
+                    }
+                    format!(
+                        "kind {:?} is for {}, and {}'s {} do not",
+                        kind.name,
+                        kind.is.describe(),
+                        decl.reference,
+                        keys_phrase(&part, decl)
+                    )
+                }
+                Named::Connector => {
+                    if is_connector(&decl.reference, &part) {
+                        continue;
+                    }
+                    format!(
+                        "kind {:?} is for {}, and {} is neither",
+                        kind.name,
+                        Named::Connector.describe(),
+                        symbol_phrase(&part, decl)
+                    )
+                }
+                Named::Switch => {
+                    if is_switch(&decl.reference, &part, &decl.value) {
+                        continue;
+                    }
+                    format!(
+                        "kind {:?} is for {}, and {} is neither",
+                        kind.name,
+                        Named::Switch.describe(),
+                        symbol_phrase(&part, decl)
+                    )
+                }
+                Named::OneNet => {
+                    let nets = assignment.nets_of(&decl.reference);
+                    if nets.len() <= 1 {
+                        continue;
+                    }
+                    let mut listed: Vec<&str> = nets.into_iter().collect();
+                    let more = listed.len().saturating_sub(4);
+                    listed.truncate(4);
+                    format!(
+                        "kind {:?} is for {}, and {}'s pins join {} nets ({}{}): a part whose \
+                         pins join nets carries current between them",
+                        kind.name,
+                        Named::OneNet.describe(),
+                        decl.reference,
+                        listed.len() + more,
+                        listed.join(", "),
+                        if more > 0 {
+                            format!(" and {more} more")
+                        } else {
+                            String::new()
+                        }
+                    )
+                }
+            };
+            return Err(assignment.error(format!(
+                "{} is not the part this kind says it is: {why}. A kind says what a part is \
+                 (DESIGN.md rule 1); a part no kind is for needs a model (PROJECTS.md §7)",
+                decl.reference
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `part name "X", mpn "Y" and value "Z"`: the keys a part carries.
+fn keys_phrase(part: &str, decl: &ComponentDecl) -> String {
+    let mut keys = Vec::new();
+    if !part.is_empty() {
+        keys.push(format!("part name {part:?}"));
+    }
+    if let Some(mpn) = &decl.mpn {
+        keys.push(format!("mpn {mpn:?}"));
+    }
+    keys.push(format!("value {:?}", decl.value));
+    match keys.as_slice() {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// `U1 (designator U, symbol "ADS122U04")`: what the board says a part is.
+fn symbol_phrase(part: &str, decl: &ComponentDecl) -> String {
+    let designator = designator(&decl.reference);
+    if part.is_empty() {
+        format!(
+            "{} (designator {designator}, no symbol name)",
+            decl.reference
+        )
+    } else {
+        format!(
+            "{} (designator {designator}, symbol {part:?})",
+            decl.reference
+        )
+    }
+}
+
+/// The kinds that need no model a part may take, each with what makes it
+/// one: by its reference designator, its symbol's part name and the number
+/// of nets its pins sit on — the checks those kinds make when an entry
+/// names them ([`StandardCatalog::check_parts_are_the_kind`]).
+pub fn kinds_without_a_model(
+    reference: &str,
+    part: &str,
+    value: &str,
+    nets: usize,
+) -> Vec<(&'static str, String)> {
+    let mut kinds = Vec::new();
+    let designator = designator(reference);
+    if is_switch(reference, part, value) {
+        let why = if SWITCH_DESIGNATORS.contains(&designator.as_str()) {
+            format!("its designator {designator}")
+        } else if part.is_empty() {
+            format!("its value {value:?}")
+        } else {
+            format!("its symbol {part:?}")
+        };
+        kinds.push(("switch", why));
+    }
+    if is_connector(reference, part) {
+        let why = if CONNECTOR_DESIGNATORS.contains(&designator.as_str()) {
+            format!("its designator {designator}")
+        } else {
+            format!("its symbol {part:?}")
+        };
+        kinds.push(("boundary", why));
+    }
+    if nets <= 1 {
+        kinds.push((
+            "mechanical",
+            if nets == 0 {
+                "it has no pins on a net".to_string()
+            } else {
+                "its pins sit on one net".to_string()
+            },
+        ));
+    }
+    kinds
+}
+
+// ============================================================
 // The guide
 // ============================================================
 
@@ -1085,19 +1410,24 @@ pub struct KindGuide {
     pub tables: Vec<PinTable>,
     /// The options it cannot be registered without.
     pub required: Vec<RequiredOption>,
+    /// What a part has to be for the kind to seat there.
+    pub is: Named,
 }
 
-/// How a part kind could be a part's model, strongest first.
+/// How a part kind is a part's model, strongest first. Pins alone say
+/// nothing: an EDA export numbers every package's pins from 1, so two parts
+/// with as many pins share a table whatever they are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
     /// One of the part's keys and a number the kind is for name the same
     /// part: one is the other, or the other with an ordering suffix
     /// (`ADS122U04` and `ADS122U04IPW`), compared on letters and digits.
     Number(&'static str),
-    /// The pin table declares exactly the part's pins.
-    Pins(&'static str),
-    /// The pin table declares as many pins as the part has, by other names.
-    PinCount(&'static str),
+    /// One of the part's keys names the part family the kind's model is
+    /// for (`TG2520SMN 26.0000M-ECGNNM3` names `TG2520SMN`): the kind seats
+    /// there ([`Named::Family`]), and the model reads what it needs from the
+    /// part or refuses it.
+    Family(&'static str),
 }
 
 /// The fewest letters and digits a key must have to be compared with a
@@ -1114,31 +1444,28 @@ fn number_stem(text: &str) -> String {
 }
 
 impl KindGuide {
-    /// The strongest way this kind could be the model of a part whose
-    /// keys (part name, manufacturer part number, value) and pins are
-    /// these ([`Fit`]); `None` when it fits by none of them.
-    pub fn fit(&self, keys: &[&str], pins: &[&str]) -> Option<Fit> {
-        let keys: Vec<String> = keys
+    /// The strongest way this kind is the model of a part whose keys (part
+    /// name, manufacturer part number, value) are these ([`Fit`]); `None`
+    /// when it is not.
+    pub fn fit(&self, keys: &[&str]) -> Option<Fit> {
+        let stems: Vec<String> = keys
             .iter()
             .map(|key| number_stem(key))
             .filter(|key| key.len() >= MIN_NUMBER_STEM)
             .collect();
         for number in &self.numbers {
             let stem = number_stem(number);
-            if keys
+            if stems
                 .iter()
                 .any(|key| stem.starts_with(key.as_str()) || key.starts_with(stem.as_str()))
             {
                 return Some(Fit::Number(number));
             }
         }
-        if let Some(table) = self.table_with(pins) {
-            return Some(Fit::Pins(table.name));
+        match self.is {
+            Named::Family(families) => names_a_family(keys, families).map(Fit::Family),
+            _ => None,
         }
-        self.tables
-            .iter()
-            .find(|table| table.pins.len() == pins.len())
-            .map(|table| Fit::PinCount(table.name))
     }
 
     /// The table that declares exactly `pins`, compared as sets.
@@ -1174,6 +1501,7 @@ impl StandardCatalog {
                     numbers,
                     tables: kind_tables(kind.name, &known),
                     required: required_options(kind.name),
+                    is: kind.is,
                 }
             })
             .collect()
@@ -1283,6 +1611,7 @@ fn required_options(name: &str) -> Vec<RequiredOption> {
 
 #[cfg(test)]
 mod tests {
+    use embsim_board::ParsedNetlist;
     use rstest::rstest;
     use vibes_behaviour::{behaviour, expect, Test};
 
@@ -1318,6 +1647,29 @@ mod tests {
         }
     }
 
+    /// A part `kind` seats on, carrying `number`: a connector's or a
+    /// switch's designator for the kinds that check one.
+    fn part_for(kind: &KindGuide, number: &str) -> ComponentDecl {
+        let reference = match kind.is {
+            Named::Connector => "J1",
+            Named::Switch => "SW1",
+            Named::Family(_) | Named::OneNet => "U1",
+        };
+        ComponentDecl {
+            reference: reference.to_string(),
+            ..decl(number)
+        }
+    }
+
+    /// A netlist with no nets: what a part with no pins on a net sits in.
+    fn no_nets() -> ParsedNetlist {
+        ParsedNetlist {
+            version: "E".to_string(),
+            components: Vec::new(),
+            nets: Vec::new(),
+        }
+    }
+
     /// Register `kind` under `key` with `options`, for the part `decl`.
     fn register(
         registry: &mut PartRegistry,
@@ -1328,6 +1680,7 @@ mod tests {
         dir: &Path,
     ) -> Result<(), ProjectError> {
         let parts = [decl];
+        let netlist = no_nets();
         let assignment = Assignment {
             board: "B",
             by: KeyField::Mpn,
@@ -1335,6 +1688,7 @@ mod tests {
             kind,
             parts: &parts,
             dir,
+            netlist: &netlist,
         };
         let table: toml::Table = toml::from_str(options).expect("the options parse");
         StandardCatalog.register_part(
@@ -1378,7 +1732,7 @@ mod tests {
         let mut checked = 0;
         for kind in StandardCatalog::guide() {
             let key = kind.numbers.first().copied().unwrap_or("PART-1");
-            let part = decl(key);
+            let part = part_for(&kind, key);
             for table in kind.tables.iter().filter(|table| table.option) {
                 let mut options = format!("pins = {:?}\n", table.name);
                 if kind.name == "sd-card" {
@@ -1401,19 +1755,18 @@ mod tests {
         assert_eq!(checked, 22);
     }
 
-    /// The P2's 86 pins as the P2-EC32MB's netlist gives them.
-    fn p2_pins() -> Vec<String> {
-        p2x8c4m64p_pins()
-            .iter()
-            .map(|pin| pin.number.to_string())
-            .collect()
-    }
-
     #[rstest]
     #[case::ordering_suffix("ads122u04", &["ADS122U04"], Some(Fit::Number("ADS122U04IPW")))]
     #[case::reel_suffix("w25q128jv", &["W25Q128JVSIQ TR"], Some(Fit::Number("W25Q128JVSIQ")))]
     #[case::processor("p2", &["P2X8C4M64P"], Some(Fit::Number("P2X8C4M64P")))]
     #[case::too_short_to_name_a_part("ads122u04", &["ADS"], None)]
+    #[case::another_frequency(
+        "tg2520smn",
+        &["TG2520SMN 26.0000M-ECGNNM3"],
+        Some(Fit::Family("TG2520SMN"))
+    )]
+    #[case::vendor_prefix("sn74lvc1g14", &["74LVC1G14"], Some(Fit::Family("74LVC1G14")))]
+    #[case::another_part("ads122u04", &["AM26LS31CD"], None)]
     fn a_part_number_fits_the_kind_it_shares_a_stem_with(
         #[case] kind: &str,
         #[case] keys: &[&str],
@@ -1422,8 +1775,9 @@ mod tests {
         behaviour!(Test {
             id: "catalog.fit-by-number",
             covers: Some("boards/src/catalog.rs#KindGuide::fit"),
-            given: "a part whose part name, number or value is one of a kind's part numbers \
-                    with or without its ordering suffix, or a stem too short to name a part",
+            given: "a part whose keys are a kind's part number with or without its ordering \
+                    suffix, the kind's family under another ordering code, another part's number, \
+                    or too short a stem",
         });
         expect!(
             "stem-shared",
@@ -1431,51 +1785,77 @@ mod tests {
              and digits; a stem under five characters fits nothing",
             "an ordering code adds package, reel and temperature letters to the part's number"
         );
+        expect!(
+            "family-named",
+            "a key containing the family the kind's model is for fits the kind by that family, \
+             and a key naming another part fits nothing",
+            "an oscillator ordered at another frequency, or a logic gate under its vendor's \
+             prefix, is the same part family the datasheet describes"
+        );
         let guide = StandardCatalog::guide();
         let kind = guide
             .iter()
             .find(|guide| guide.name == kind)
             .expect("a kind the catalog ships");
-        assert_eq!(kind.fit(keys, &[]), fit);
+        assert_eq!(kind.fit(keys), fit);
     }
 
     #[rstest]
-    fn a_part_with_no_number_fits_by_its_pins_then_by_their_count() {
+    #[case::processor_under_another_name(&["Propeller", "MCU"])]
+    #[case::option_switch(&["DIP Switch 4 way", "218-4LPSTJR"])]
+    #[case::line_driver(&["AM26LS31CD"])]
+    fn a_part_named_as_no_family_the_catalog_models_fits_no_kind(#[case] keys: &[&str]) {
         behaviour!(Test {
-            id: "catalog.fit-by-pins",
+            id: "catalog.unnamed-part-fits-no-kind",
             covers: Some("boards/src/catalog.rs#KindGuide::fit"),
-            given: "parts whose keys name no part number: one with the processor package's 86 \
-                    pins, one with eight pins named as no table names them",
+            given: "a part whose part name, number and value name no part family the catalog \
+                    has a model for: a processor under a name of its own, an eight-pin option \
+                    switch, a line driver",
         });
         expect!(
-            "exact-pins",
-            "the processor's pins fit the P2 kind by its pin table"
+            "no-kind",
+            "no kind of the catalog fits the part, whatever pins it has",
+            "an EDA export numbers every package's pins from 1, so a pin table says how many \
+             pins a part has and nothing about what the part is"
         );
+        for kind in StandardCatalog::guide() {
+            assert_eq!(kind.fit(keys), None, "{} fits {keys:?}", kind.name);
+        }
+    }
+
+    #[rstest]
+    #[case::connector("J3", "P2_EDGE_MODULE_SOCKET", "P2_EDGE_MODULE_SOCKET", 40, &["boundary"])]
+    #[case::switch("S301", "", "DIP Switch 4 way", 8, &["switch"])]
+    #[case::solder_link("J101", "", "Solder Link Pads", 2, &["switch", "boundary"])]
+    #[case::mounting_hole("H1", "MountingHole_Pad", "MountingHole", 1, &["mechanical"])]
+    #[case::bom_line("PCB", "", "PCB for P2 EC Module", 0, &["mechanical"])]
+    #[case::integrated_circuit("U24", "AM26LS31CD", "AM26LS31CD", 12, &[])]
+    fn a_part_takes_a_kind_without_a_model_only_when_the_board_says_it_is_one(
+        #[case] reference: &str,
+        #[case] part: &str,
+        #[case] value: &str,
+        #[case] nets: usize,
+        #[case] kinds: &[&str],
+    ) {
+        behaviour!(Test {
+            id: "catalog.kinds-without-a-model",
+            covers: Some("boards/src/catalog.rs#kinds_without_a_model"),
+            given: "parts a project could make a switch, a connector or a mechanical part: a \
+                    socket, a switch, a solder link drawn with a J, a mounting hole, a parts-list \
+                    line, a twelve-net integrated circuit",
+        });
         expect!(
-            "pin-count",
-            "the eight pins fit the PSRAM kind only by count, through its eight-pin table"
+            "by-designator-symbol-and-nets",
+            "its designator, symbol or name allows a switch, its designator or symbol a \
+             connector, pins on one net a mechanical part; the integrated circuit takes none",
+            "these kinds say what a part is without a model, so the board itself has to say the \
+             part is one"
         );
-        let guide = StandardCatalog::guide();
-        let find = |name: &str| {
-            guide
-                .iter()
-                .find(|kind| kind.name == name)
-                .expect("a kind the catalog ships")
-        };
-        let pins = p2_pins();
-        let pins: Vec<&str> = pins.iter().map(String::as_str).collect();
-        assert_eq!(
-            find("p2").fit(&["Propeller"], &pins),
-            Some(Fit::Pins("P2X8C4M64P"))
-        );
-        let switch = [
-            "1_ON", "1_OFF", "2_ON", "2_OFF", "3_ON", "3_OFF", "4_ON", "4_OFF",
-        ];
-        assert_eq!(
-            find("aps6404l").fit(&["DIP Switch"], &switch),
-            Some(Fit::PinCount("sop8"))
-        );
-        assert_eq!(find("p2").fit(&["DIP Switch"], &switch), None);
+        let found: Vec<&str> = kinds_without_a_model(reference, part, value, nets)
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect();
+        assert_eq!(found, kinds);
     }
 
     // ============================================================
@@ -1521,7 +1901,7 @@ mod tests {
     /// number, and return the error, if any.
     fn register_error(kind: &KindGuide, options: &str, dir: &Path) -> Option<String> {
         let key = kind.numbers.first().copied().unwrap_or("PART-1");
-        let part = decl(key);
+        let part = part_for(kind, key);
         register(
             &mut PartRegistry::new(),
             kind.name,
@@ -1605,8 +1985,8 @@ mod tests {
     fn part_kinds_table(dir: &Path) -> String {
         let known = known_parts();
         let mut out = String::from(
-            "| kind | model | placed by part number | `pins` (the first is the default) | other \
-             options |\n|---|---|---|---|---|\n",
+            "| kind | model | seats on | placed by part number | `pins` (the first is the \
+             default) | other options |\n|---|---|---|---|---|---|\n",
         );
         for kind in StandardCatalog::guide() {
             let unplaced = PART_KINDS
@@ -1683,8 +2063,10 @@ mod tests {
                 options.join("; ")
             };
             out.push_str(&format!(
-                "| `{}` | {} | {placed} | {pins} | {options} |\n",
-                kind.name, kind.summary
+                "| `{}` | {} | {} | {placed} | {pins} | {options} |\n",
+                kind.name,
+                kind.summary,
+                kind.is.describe()
             ));
         }
         out

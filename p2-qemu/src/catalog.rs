@@ -98,6 +98,8 @@ impl QemuCatalog {
         assignment: &Assignment<'_>,
         mut options: PartOptions,
     ) -> Result<(), ProjectError> {
+        // The part has to be a P2, whatever runs in it.
+        StandardCatalog::check_parts_are_the_kind(assignment)?;
         let core = options.choice("core", &CORES)?.ok_or_else(|| {
             assignment.error(
                 "options.core says what runs inside the package: \"held-in-reset\", the chip \
@@ -228,7 +230,7 @@ impl Component for Unbooted {
 mod tests {
     use std::path::Path;
 
-    use embsim_board::{ComponentDecl, KeyField};
+    use embsim_board::{ComponentDecl, KeyField, ParsedNetlist};
 
     use super::*;
 
@@ -246,6 +248,11 @@ mod tests {
     }
 
     fn register(core: &str, extra: &str, parts: &[&ComponentDecl]) -> Result<(), ProjectError> {
+        let netlist = ParsedNetlist {
+            version: "E".to_string(),
+            components: Vec::new(),
+            nets: Vec::new(),
+        };
         let assignment = Assignment {
             board: "EC32",
             by: KeyField::Value,
@@ -253,6 +260,7 @@ mod tests {
             kind: "p2",
             parts,
             dir: Path::new("."),
+            netlist: &netlist,
         };
         let table: toml::Table =
             toml::from_str(&format!("core = {core:?}\n{extra}")).expect("the options parse");
@@ -281,6 +289,22 @@ mod tests {
                 .contains("it offers \"held-in-reset\", \"qemu\""),
             "{err}"
         );
+    }
+
+    /// A core is seated only in a part the board names a P2, whatever runs
+    /// inside it.
+    #[test]
+    fn a_core_in_a_part_that_is_not_a_p2_is_refused() {
+        let mut other = decl("U7");
+        other.value = "ATMEGA328P".to_string();
+        for core in CORES {
+            let err = register(core, "", &[&other]).expect_err("U7 is no P2");
+            assert!(
+                err.to_string()
+                    .contains("U7 is not the part this kind says it is"),
+                "{err}"
+            );
+        }
     }
 
     /// Without QEMU the entry is refused with the stub's own message; with

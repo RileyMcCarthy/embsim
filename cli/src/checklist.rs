@@ -6,14 +6,15 @@
 //! so what they list is what `embsim check` will refuse until it is
 //! answered.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Component as PathPart, Path, PathBuf};
 
 use embsim_board::{
-    BoardSurvey, Classification, ConnectorReport, KeyField, PassiveKind, Project, SurveyedPart,
-    UnmodelledPart,
+    BoardSurvey, Classification, ConnectorReport, KeyField, PassiveKind, PinSite, Project,
+    SurveyedPart, UnmodelledPart,
 };
-use embsim_boards::catalog::{Fit, KindGuide};
+use embsim_boards::catalog::{is_connector, kinds_without_a_model, Fit, KindGuide};
 use embsim_p2_qemu::catalog::QemuCatalog;
 
 /// The widest a line of references gets before it wraps.
@@ -118,28 +119,22 @@ fn stub_key(part: &UnmodelledPart) -> (KeyField, &str) {
     }
 }
 
-/// How strong a fit is: a part number names the part, a pin table only
-/// agrees with it, a pin count only counts.
+/// How strong a fit is: a part number names the part itself, a family
+/// name its family.
 fn strength(fit: Fit) -> u8 {
     match fit {
-        Fit::Number(_) => 3,
-        Fit::Pins(_) => 2,
-        Fit::PinCount(_) => 1,
+        Fit::Number(_) => 2,
+        Fit::Family(_) => 1,
     }
 }
 
-/// The kinds that could model a part with these keys and pins, one fit per
-/// kind, and only the strongest kind of fit any kind makes: the kinds whose
-/// part numbers name it; else the kinds with a table of exactly its pins;
-/// else the kinds with a table of as many.
-fn candidates<'g>(
-    guide: &'g [KindGuide],
-    keys: &[&str],
-    pins: &[&str],
-) -> Vec<(&'g KindGuide, Fit)> {
+/// The kinds a part with these keys is, one fit per kind, and only the
+/// strongest kind of fit any kind makes: the kinds whose part numbers name
+/// it, else the kinds whose part family its keys name. Pins name no kind.
+fn candidates<'g>(guide: &'g [KindGuide], keys: &[&str]) -> Vec<(&'g KindGuide, Fit)> {
     let fits: Vec<(&KindGuide, Fit)> = guide
         .iter()
-        .filter_map(|kind| kind.fit(keys, pins).map(|fit| (kind, fit)))
+        .filter_map(|kind| kind.fit(keys).map(|fit| (kind, fit)))
         .collect();
     let best = fits.iter().map(|(_, fit)| strength(*fit)).max();
     fits.into_iter()
@@ -151,34 +146,88 @@ fn candidates<'g>(
 fn fit_phrase(kind: &KindGuide, fit: Fit) -> String {
     match fit {
         Fit::Number(number) => format!("{} (part number {number})", kind.name),
-        Fit::Pins(table) => format!("{} (its pins are the {table:?} table's)", kind.name),
-        Fit::PinCount(table) => format!("{} (as many pins as its {table:?} table)", kind.name),
+        Fit::Family(family) => format!("{} (part family {family})", kind.name),
     }
 }
 
-/// The candidates as a sentence, or what to do when there are none.
-fn candidates_sentence(candidates: &[(&KindGuide, Fit)]) -> String {
-    if candidates.is_empty() {
-        return "no catalog kind fits by part number or pins; switch, mechanical and \
-                boundary take any pins"
-            .to_string();
+/// The distinct nets a part's pins sit on.
+fn net_count(pins: &[PinSite]) -> usize {
+    pins.iter()
+        .map(|site| site.net.as_str())
+        .filter(|net| !net.is_empty())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// What a part that needs a model could be, as a sentence: the kinds whose
+/// number or family it carries, else the kinds without a model its
+/// designator, symbol, name or nets allow, else that it needs a model.
+fn candidates_sentence(candidates: &[(&KindGuide, Fit)], part: &UnmodelledPart) -> String {
+    if !candidates.is_empty() {
+        return format!(
+            "could be: {}",
+            candidates
+                .iter()
+                .map(|(kind, fit)| fit_phrase(kind, *fit))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
-    let prefix = if candidates
-        .iter()
-        .all(|(_, fit)| matches!(fit, Fit::PinCount(_)))
-    {
-        "same pin count, pins named otherwise: "
-    } else {
-        "could be: "
-    };
+    let plain = kinds_without_a_model(
+        &part.reference,
+        &part.part,
+        &part.value,
+        net_count(&part.pins),
+    );
+    if plain.is_empty() {
+        return "no catalog kind is for this part: it needs a model (PROJECTS.md §7)".to_string();
+    }
     format!(
-        "{prefix}{}",
-        candidates
+        "no catalog model is for this part; it may be {}",
+        plain
             .iter()
-            .map(|(kind, fit)| fit_phrase(kind, *fit))
+            .map(|(kind, why)| format!("{kind} ({why})"))
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// Letters and digits, upper-cased, with a symbol name's lower-case `x` —
+/// a placeholder for any one character (`AM26LV32xD`) — kept as `None`.
+fn stem_with_placeholders(text: &str) -> Vec<Option<char>> {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| (c != 'x').then(|| c.to_ascii_uppercase()))
+        .collect()
+}
+
+/// The fewest leading letters and digits two part numbers share for one to
+/// be read as a variant of the other's family: a vendor prefix and a series.
+const SHARED_FAMILY_STEM: usize = 4;
+
+/// When a part's symbol names one part and its manufacturer part number
+/// another of the same family (`AM26LV32xD` and `AM26LS32CD`), the sentence
+/// that says so: a model belongs to one part, and the netlist does not say
+/// which the board carries.
+fn names_disagree(part: &UnmodelledPart) -> Option<String> {
+    let mpn = part.mpn.as_deref()?;
+    let (a, b) = (
+        stem_with_placeholders(&part.part),
+        stem_with_placeholders(mpn),
+    );
+    if a.len() < SHARED_FAMILY_STEM || b.len() < SHARED_FAMILY_STEM {
+        return None;
+    }
+    let same = |x: &Option<char>, y: &Option<char>| x.is_none() || y.is_none() || x == y;
+    let shared = a.iter().zip(&b).take_while(|(x, y)| same(x, y)).count();
+    if shared < SHARED_FAMILY_STEM || shared == a.len().min(b.len()) {
+        return None;
+    }
+    Some(format!(
+        "its symbol names {:?} and its mpn {mpn:?}: two parts; give it the model of the one \
+         the board carries",
+        part.part
+    ))
 }
 
 /// A part's pins, comma-separated.
@@ -302,6 +351,32 @@ pub fn survey(netlist: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `embsim survey --kind <board kind>`: a board the catalog ships, surveyed
+/// with the registry it builds with, as a project's `[[board]]` of that
+/// kind surveys it — every part it places, the ones it leaves to the
+/// project, and every connector pin with its name and net.
+pub fn survey_kind(kind: &str) -> Result<(), String> {
+    if kind == "netlist" {
+        return Err(
+            "--kind netlist is a board read from a file; give the file: embsim survey board.net"
+                .to_string(),
+        );
+    }
+    let text = format!(
+        "[[board]]\nname = \"BOARD\"\nkind = {}\n",
+        toml_string(kind)
+    );
+    let project = Project::parse(&text).map_err(|err| err.to_string())?;
+    let survey = project
+        .survey(&QemuCatalog::new(), "BOARD")
+        .map_err(|err| err.to_string())?;
+    print!(
+        "{}",
+        survey_report(&format!("kind {kind:?}"), &survey, &QemuCatalog::guide())
+    );
+    Ok(())
+}
+
 /// The checklist, as `embsim survey` prints it.
 fn survey_report(source: &str, survey: &BoardSurvey, guide: &[KindGuide]) -> String {
     let mut out = String::new();
@@ -388,17 +463,34 @@ fn survey_report(source: &str, survey: &BoardSurvey, guide: &[KindGuide]) -> Str
         );
         if pins.is_empty() {
             let _ = writeln!(out, "      no pins");
+        } else if is_connector(&part.reference, &part.part) {
+            // A connector once it is one: its pins are where a wire or a
+            // mate will land, so they are listed as a connector's are.
+            let _ = writeln!(out, "      {}:", count(pins.len(), "pin", "pins"));
+            let as_connector = ConnectorReport {
+                reference: part.reference.clone(),
+                value: part.value.clone(),
+                pins: part.pins.clone(),
+            };
+            let _ = write!(
+                out,
+                "{}",
+                pin_table(&as_connector, "        ", "pin", |pin| pin.to_string())
+            );
         } else {
             let lead = format!("      {}: ", count(pins.len(), "pin", "pins"));
             let _ = writeln!(out, "{}", wrapped(&lead, &pins, "        ", ", "));
+        }
+        if let Some(disagree) = names_disagree(part) {
+            let _ = writeln!(out, "      {disagree}");
         }
         let keys = [
             part.part.as_str(),
             part.mpn.as_deref().unwrap_or(""),
             part.value.as_str(),
         ];
-        let found = candidates(guide, &keys, &pins);
-        let _ = writeln!(out, "      {}", candidates_sentence(&found));
+        let found = candidates(guide, &keys);
+        let _ = writeln!(out, "      {}", candidates_sentence(&found, part));
     }
 
     let groups = pin_table_groups(survey);
@@ -757,29 +849,34 @@ fn starter_project(
             first.mpn.as_deref().unwrap_or(""),
             first.value.as_str(),
         ];
-        let found = candidates(guide, &keys, &pins);
+        let found = candidates(guide, &keys);
         let pins_clause = if pins.is_empty() {
             "no pins".to_string()
         } else {
             format!("{}: {}", count(pins.len(), "pin", "pins"), pin_list(&pins))
         };
+        let disagree = names_disagree(first)
+            .map(|text| format!("\n{}.", capitalized(&text)))
+            .unwrap_or_default();
         comment(
             &mut out,
             &format!(
-                "{}: {}; {pins_clause}.\n{}.",
+                "{}: {}; {pins_clause}.{disagree}\n{}.",
                 references.join(", "),
                 keys_clause(&first.part, &first.value, first.mpn.as_deref(), ", "),
-                capitalized(&candidates_sentence(&found))
+                capitalized(&candidates_sentence(&found, first))
             ),
         );
-        let mut kinds: Vec<&KindGuide> = Vec::new();
-        for (kind, fit) in &found {
-            if !matches!(fit, Fit::PinCount(_)) && !kinds.iter().any(|k| k.name == kind.name) {
-                kinds.push(kind);
-            }
-        }
-        let chosen = match kinds.as_slice() {
-            [only] => Some(*only),
+        // The kind is written in only where a part number names it: a
+        // family says the model is for the part's series, and the part's
+        // own number is for the author to check against it.
+        let numbered: Vec<&KindGuide> = found
+            .iter()
+            .filter(|(_, fit)| matches!(fit, Fit::Number(_)))
+            .map(|(kind, _)| *kind)
+            .collect();
+        let chosen = match numbered.as_slice() {
+            [only] if disagree.is_empty() => Some(*only),
             _ => None,
         };
         let _ = writeln!(out, "# [[board.model]]");

@@ -8,7 +8,8 @@
 //!
 //! - `embsim survey <netlist>` — the checklist: what the catalog populates
 //!   by itself, what needs a model and which catalog kinds could be it, and
-//!   every connector pin a wire may use.
+//!   every connector pin a wire may use. `embsim survey --kind p2-ec32mb`
+//!   surveys a board the catalog ships the same way.
 //! - `embsim new <netlist>` — a starter project answering that checklist as
 //!   far as the catalog can, with a commented stub for every part left.
 //! - `embsim check <project>` — loads, surveys and builds the system with
@@ -27,7 +28,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 mod checklist;
 mod live;
@@ -43,12 +44,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// The checklist for a netlist: the parts the catalog populates, the
-    /// parts that need a model and the kinds that could be it, and every
-    /// connector pin with its name and net.
+    /// The checklist for a netlist, or for a board kind the catalog ships:
+    /// the parts the catalog populates, the parts that need a model and the
+    /// kinds that could be them, and every connector pin with its name and
+    /// net.
+    #[command(group(ArgGroup::new("board").required(true).args(["netlist", "kind"])))]
     Survey {
         /// A KiCad netlist export (`kicad-cli sch export netlist`).
-        netlist: PathBuf,
+        netlist: Option<PathBuf>,
+        /// A board kind the catalog ships (`p2-ec32mb`), surveyed with the
+        /// registry a project builds it with.
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Write a starter project for a netlist: the board, the pin tables the
     /// catalog can choose, a commented stub for every part that needs a
@@ -95,7 +102,11 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match cli.command {
-        Command::Survey { netlist } => checklist::survey(&netlist),
+        Command::Survey { netlist, kind } => match (netlist, kind) {
+            (Some(netlist), None) => checklist::survey(&netlist),
+            (None, Some(kind)) => checklist::survey_kind(&kind),
+            _ => unreachable!("clap requires exactly one of the netlist and --kind"),
+        },
         Command::New {
             netlist,
             name,
