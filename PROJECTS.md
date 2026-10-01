@@ -7,8 +7,9 @@ one: `survey` says what the netlist asks for, `new` writes a starter project,
 `check` builds it, `run` runs it. Rust code loads the same file with
 `embsim_board::Project`. This document is the guide to both: what a project
 is, the workflow, the kinds the standard catalog ships, wiring boards to each
-other, adding kinds of your own, and the rules a project cannot break
-([`DESIGN.md`](DESIGN.md) holds the rules for the whole of embsim).
+other, adding kinds of your own, the rules a project cannot break
+([`DESIGN.md`](DESIGN.md) holds the rules for the whole of embsim), and how a
+project's own crates extend the command (section 10).
 
 ## 1. What a project is
 
@@ -1048,6 +1049,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 A catalog of your own runs from Rust. The `embsim` binary's catalog is
 `QemuCatalog`, fixed when the binary is built, and the binary loads no other.
+Section 10 is the design that changes this: a project names its own catalog
+crates in its file, and the command builds them in.
 
 ## 8. The rules a project cannot break
 
@@ -1109,7 +1112,8 @@ catalog of the test tree's own (`machine_parts::EdgeCatalog`).
 ### The rest
 
 - The standard catalog has no bench component kinds. `[[component]]` parses,
-  and every kind it names is refused.
+  and every kind it names is refused. Section 10 designs the first two,
+  `host-serial` and `scripted-source`.
 - The standard catalog has no part kind for a diode, LED, FET or transistor.
   One the element library does not know by part number has no way into a
   project yet.
@@ -1119,16 +1123,747 @@ catalog of the test tree's own (`machine_parts::EdgeCatalog`).
   a scenario set from Rust has to carry the project's lines too.
 - A project has no host serial port. `embsim_board::HostPty`, a PTY whose
   bytes are levels on two pins, is a bench component added from Rust with
-  `System::component`.
+  `System::component`. Section 10 makes it the `host-serial` kind.
 - The `sd-card` kind needs a card image. There is no blank card.
 - There is no command that makes a P2 flash image (section 5).
 - `run` prints findings in their Rust form (`FloatingSense { … }`).
-  Interrupted, it prints no summary. At the end it reads again only the
-  findings about a net (a floating sense, an unsourced power net, a down
-  rail, a fight, a domain with no reference); every other finding is listed
-  as about the board, and the engine itself never withdraws a finding.
+  Interrupted, it prints no summary (section 10 adds the handler that
+  does). At the end it reads again only the findings about a net (a
+  floating sense, an unsourced power net, a down rail, a fight, a domain
+  with no reference); every other finding is listed as about the board,
+  and the engine itself never withdraws a finding.
 - The mates of a module and its carrier, or of a cable, are written by
   hand from the two surveys: nothing in the netlists says which connectors
   mate.
 - `check` names the parts whose pin table does not fit but not the table
   that would. `survey` and `new` do name it.
+
+## 10. Extending embsim from a project
+
+*Status: designed 2026-10-01 on `feat/embsim-catalogs`; the decision record,
+with the alternatives and the code that changes, is
+[`NODES.md`](NODES.md) §13. This section is the contract that branch builds
+to. Until it lands, sections 1 to 9 describe the command as it is, and the
+Rust below is marked `ignore` instead of running as a doc test.*
+
+A project whose boards need something embsim does not ship (a model, a
+board, a processor core, a bench part) writes it in Rust, in a crate of its
+own, and names that crate in the project file. The `embsim` command then
+builds the crate in and runs the same four subcommands, with the project's
+kinds beside the shipped ones. There is one command and no plugin
+interface: Cargo compiles the project's crate and embsim into one binary,
+against one copy of embsim.
+
+### What a project can add
+
+Everything a project file names is a **kind**, and a catalog provides each
+kind. A project's catalog crate can add five sorts of thing:
+
+| It adds | What it is | Rust | The file names it as |
+|---|---|---|---|
+| a board kind | a named board: a netlist the crate bundles, and the models its parts take | `Catalog::board_kinds`, `Catalog::board` | `[[board]] kind = "mad-edge"` |
+| a part kind | a model, registered into a board's part registry for every part a key reaches | `Catalog::part_kinds`, `Catalog::register_part` | `[[board.model]] kind = "mad-sd-card"` |
+| base registrations | models a netlist board places by the part number it carries | `Catalog::register_base` | nothing: every `kind = "netlist"` board starts from them |
+| a P2 core | what runs inside the `p2` package | `embsim_boards::p2::CoreCatalog` | `[board.model.options] core = "p2iss"` |
+| a bench component | a part with pins and no board: a host port, a stimulus, a plant | `Catalog::component_kinds`, `Catalog::component` | `[[component]] kind = "mad-machine"` |
+
+A mechanical link is not a sixth sort. A plant is one bench component. Its
+mechanism (a motor's shaft, a carriage, a sample, a load cell) is inside it,
+in Rust. Its outside is electrical pins: a drive's step and direction
+inputs, an encoder's outputs, a switch's contacts, a bridge's terminals. The
+project wires those pins like any other ([`DESIGN.md`](DESIGN.md) rule 2:
+one interface, no second channel).
+
+### The catalog crate
+
+A catalog crate is an ordinary library crate. It depends on the embsim
+crates it builds on from the same source the runner builds embsim from
+(below), and it exports one function at its root, the **registration
+function**:
+
+```rust,ignore
+// SIL/catalog/src/lib.rs
+use embsim_board::ProjectError;
+use embsim_boards::catalog::CatalogSet;
+
+/// Called once, after the catalogs embsim ships are in the set and before
+/// the project is read.
+pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError> {
+    // Board, part and component kinds: one `embsim_board::Catalog`.
+    set.add(MadCatalog::new(set.reports()))?;
+    // A P2 core: one `embsim_boards::p2::CoreCatalog`.
+    set.add_cores(IssCores::new(set.reports()))?;
+    Ok(())
+}
+```
+
+```toml
+# SIL/catalog/Cargo.toml
+[package]
+name = "mad-sim-catalog"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embsim-board = { path = "../embsim/board" }
+embsim-boards = { path = "../embsim/boards" }
+embsim-models = { path = "../embsim/models" }
+p2iss = { path = "../p2iss" }
+models = { path = "../models" }
+```
+
+The registration function:
+
+- is `pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError>`,
+  at the crate root, under that name;
+- adds catalogs with `CatalogSet::add` and P2 cores with
+  `CatalogSet::add_cores`, and hands each one the set's report sink
+  (`CatalogSet::reports`, see "What a run prints" below) when what it builds
+  has something to say;
+- starts nothing: no thread, no file opened, no chip booted. `survey` and
+  `new` run it and build nothing. A thread starts, or a chip boots, in a
+  constructor, when a board or the bench is built (section 7, "What a kind
+  may not do");
+- returns an error that says what to fix. The command prints it and exits 1.
+
+### How kinds are named
+
+- **One name, one kind.** In a set, board, part, component and core kinds
+  share one namespace. A catalog that provides a name another catalog in
+  the set already provides is refused when it is added, before any project
+  is read, and the error names the kind and both catalogs:
+
+  ```text
+  error: catalog mad-sim-catalog: kind "sd-card" is already a part kind of embsim-boards; a kind has one catalog, so give this one a name of its own
+  ```
+
+- **No catalog replaces another's kind.** A kind means the same thing in
+  every project that names it, so section 5's tables stay true. A project
+  that wants another model of a part embsim models gives it a name of its
+  own.
+- **Base registrations collide the same way.** Two catalogs that place
+  parts by one key are refused, naming the key and both catalogs.
+- **Spelling.** A kind name uses lowercase letters, digits and hyphens.
+  `netlist` is the board kind every project has, and no catalog provides it.
+- **Choosing a name.** Name a part kind for the part family it is
+  (`ads122u04`, `am26ls31`), as the standard catalog does. Name a kind only
+  your project has after your project (`mad-machine`, `mad-edge`).
+
+An unknown kind is refused as today, listing every kind the set holds.
+`check` and `run` print the set's catalogs under the project line:
+
+```text
+project mad.toml
+  catalogs: embsim-boards, embsim-p2-qemu, mad-sim-catalog
+```
+
+### The `[catalog]` table
+
+| Key | What it says |
+|---|---|
+| `crates` | the project's catalog crates: each a directory holding a `Cargo.toml`, relative to the project file. Their registration functions run in this order, after the catalogs embsim ships |
+| `embsim` | optional: the embsim checkout (its workspace root, relative to the project file) that the runner builds embsim from. By default it is the checkout `embsim` itself was built from |
+
+A key the table does not have is refused, as everywhere in the file. A
+project without `[catalog]` runs on the catalogs embsim ships, in the
+`embsim` binary itself, exactly as sections 1 to 9 describe.
+
+### The runner
+
+A project with `[catalog]` runs in a **runner**: a small crate that `embsim`
+writes, builds with Cargo, and hands the command line to.
+
+- **What it is.** A binary crate whose dependencies are `embsim-cli`, from
+  the embsim checkout the runner builds against, and each crate `[catalog]`
+  names, by path. Its `main` is one call into the command's library:
+
+  ```rust,ignore
+  // generated by embsim from mad.toml's [catalog]; rewritten when that changes
+  fn main() -> std::process::ExitCode {
+      embsim_cli::main_with(&[embsim_cli::Registration {
+          name: "mad-sim-catalog",
+          dir: "/home/me/MaD/SIL/catalog",
+          register: mad_sim_catalog::register,
+      }])
+  }
+  ```
+
+  The `embsim` binary is the same call with no registrations,
+  `embsim_cli::main_with(&[])`. `main_with` starts from the catalogs embsim
+  ships (`embsim_cli::shipped()`: the standard catalog, and QEMU as a P2
+  core), runs each registration in order, and then runs the subcommand.
+- **Where it lives.** In `.embsim/runner-<id>/` beside the project file:
+  `Cargo.toml`, `main.rs` and a `build.rs` that links QEMU the way the
+  `embsim` binary's own does. `<id>` is a hash of the crates' canonical
+  directories and the embsim checkout, so two projects that name the same
+  crates share a runner. The manifest declares an empty `[workspace]`, so
+  the runner is never taken for a member of a workspace it sits inside.
+  Keep `.embsim/` out of version control.
+- **Who runs a project.** A binary runs a project itself when its
+  registrations are exactly the crates `[catalog]` names (by canonical
+  directory). Otherwise it writes the project's runner, builds it and hands
+  over. The `embsim` binary has no registrations, so it always hands a
+  project with `[catalog]` to its runner, and the runner always runs it
+  itself. Before it hands over, `embsim` reads only the `[catalog]` table,
+  so a project that the runner's embsim reads is never refused by an older
+  `embsim`.
+- **When it builds.** On every subcommand, `embsim` rewrites the runner's
+  three files only if their content would change, then runs `cargo build`
+  on the runner. The first build compiles embsim and the catalog crates.
+  After that Cargo rebuilds only what changed, and with nothing changed the
+  build is Cargo's own no-op check. Cargo's progress goes to standard error,
+  with one line before it:
+
+  ```text
+  embsim: building the runner for mad.toml (mad-sim-catalog, embsim at /home/me/MaD/SIL/embsim) in .embsim/runner-3f9a2c1e
+  ```
+
+  The profile is `release`, unless `EMBSIM_RUNNER_PROFILE` names another.
+  The target directory is `CARGO_TARGET_DIR` when it is set. Otherwise it
+  is the target directory of the workspace the first catalog crate belongs
+  to (MaD's `SIL/target`), so the crates that workspace has already built
+  are reused, and failing that `.embsim/target`. The runner's `Cargo.lock`
+  starts as a copy of that workspace's lock file (else embsim's), so shared
+  dependencies keep the versions they were tested at. Cargo resolves only
+  what neither file names.
+- **How it hands over.** `embsim` takes the runner's path from Cargo's build
+  report and `exec`s it with the same arguments. The runner is then the
+  process: its output, its exit status and Ctrl-C are its own. embsim is a
+  Unix program (its PTYs are), so there is no other path.
+- **When the build fails.** The command exits 1 with Cargo's errors above
+  one line saying which runner did not build, from which crates, against
+  which embsim.
+
+#### Which embsim the runner builds against
+
+The runner's `embsim-cli` and every catalog crate's embsim dependencies must
+be one copy of embsim. Two copies would compile, if at all, into two
+`Catalog` traits and two process-global virtual clocks. `embsim` picks the
+checkout in this order:
+
+1. `[catalog] embsim`, when the project gives it;
+2. the checkout `embsim` was built from. Its `build.rs` records the
+   workspace root at build time (`EMBSIM_SOURCE_DIR`).
+
+Then it checks the choice. It runs `cargo metadata` on the runner (offline
+and quick) and refuses the runner if any embsim crate appears from two
+places, naming both:
+
+```text
+error: mad.toml: the runner would build two embsims: mad-sim-catalog depends on embsim-board at /home/me/MaD/SIL/embsim/board, and embsim-cli comes from /home/me/src/embsim; set [catalog] embsim to the checkout the catalog crates depend on ("embsim")
+```
+
+So an installed `embsim` finds its sources as follows:
+
+- **`cargo install --path cli`** from a checkout records that checkout.
+  Projects whose crates depend on it need no `embsim` key. A project whose
+  crates depend on another checkout (MaD's crates depend on its submodule)
+  names that checkout, and the runner builds embsim from it.
+- **`cargo install --git …`** records Cargo's own copy of the repository,
+  which Cargo may clean away. A project run by such an install names its
+  checkout with `[catalog] embsim`. When the recorded directory is gone and
+  the project names none, the error says to name one.
+- **`cargo run -p embsim-cli`** inside a checkout uses that checkout.
+
+QEMU is linked into a runner when it was linked into `embsim`.
+`EMBSIM_QEMU_P2_BUILD` is passed through when it is set in the environment,
+and otherwise the tree `embsim` was built with is used (recorded the same
+way). Without either, the runner refuses `core = "qemu"` with the message
+section 5 shows.
+
+### Adding a P2 core
+
+The `p2` part kind is the package: its 86 pins, the START gate (the reset,
+`VDD` and the datasheet's 3 ms restart delay), the bank supplies, the
+brownout hold (`embsim_boards::p2`). What runs inside it is a **core
+kind**. The package takes `core` from the entry's options and asks the set
+for that kind. It then passes the rest of the options to the core, so each
+core takes its own options: `rom` is the `qemu` core's, and
+`held-in-reset` takes none.
+
+```rust,ignore
+// embsim_boards::p2
+pub trait CoreCatalog {
+    /// The catalog's name, as an error naming two catalogs prints it.
+    fn name(&self) -> &str;
+    /// The core kinds it provides ("qemu", "p2iss").
+    fn core_kinds(&self) -> Vec<String>;
+    /// Check `options` for the core `core` in the parts `assignment` reaches,
+    /// and return the constructor the board build calls once per part.
+    /// Starts nothing: a survey calls this too.
+    fn seat(
+        &self,
+        core: &str,
+        assignment: &Assignment<'_>,
+        options: PartOptions,
+    ) -> Result<CoreCtor, ProjectError>;
+}
+
+/// Builds the core for one part, at board build. An `Err` is a part that
+/// refuses to attach, with the message, so the system does not start.
+pub type CoreCtor =
+    Box<dyn Fn(&ComponentDecl) -> Result<Box<dyn P2Core>, String> + Send + Sync>;
+```
+
+The package is the same for every core. The `p2` kind wraps whatever the
+constructor returns in `P2Package::new`, so no core can skip the START gate.
+A core implements `P2Core` (`attach(P2Pads)`, `start`, `reset`) and drives
+its pads through `P2Pads::bank_supplies().pad_drive(..)`, as QEMU's does.
+The standard catalog's core is `held-in-reset`. QEMU's is `qemu`, added by
+`embsim_p2_qemu::catalog::register` like any project's, and it refuses a key
+that reaches two parts, since QEMU is one machine per process. The `p2`
+kind adds a report for every package it seats (its start, or why it is
+held), and a core adds its own (QEMU's console, per pad).
+
+### Adding a board
+
+`Catalog::board` returns a `CatalogBoard`: the parsed netlist the crate
+bundles (`include_str!` of an EDA export), the registry it builds with, and
+`models`, the board's own `[[board.model]]` entries. The registry is either
+a registry the catalog builds itself (`p2-ec32mb`'s, which places every part
+of the module but the processor) or `None`, meaning start from the set's
+base registry, as a `kind = "netlist"` board does. The project registers the
+board's `models` through the set's kinds before the project's own entries,
+with every check an entry in the file gets. An entry in the project with the
+same key replaces the board's, as a project's flash image replaces the
+P2-EC32MB's blank flash today.
+
+```rust,ignore
+fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
+    match spec.kind.as_str() {
+        "mad-edge" => Ok(CatalogBoard {
+            netlist: netlist::parse(MAD_EDGE_NET)
+                .map_err(|err| ProjectError::message(format!("board {}: {err}", spec.name)))?,
+            registry: None, // the set's base registry, as a netlist board
+            // J3, the module socket, is a project-library symbol: a connector.
+            models: vec![ModelSpec::by_part("P2_EDGE_MODULE_SOCKET", "boundary")],
+        }),
+        other => Err(ProjectError::message(format!("board {}: no kind {other:?} here", spec.name))),
+    }
+}
+```
+
+### Adding a part model
+
+`Catalog::part_kinds` returns a `KindGuide` for each kind. This is the same
+guide the standard catalog's kinds have, and `survey` and `new` read it to
+name a kind for a part. Its `is` says what a part must be for the kind to
+seat there (`Named::Family`, `Connector`, `Switch`, `OneNet`). The project
+checks `is` for every part an entry reaches before it calls the catalog's
+`register_part`, whichever catalog the kind comes from, and refuses a part
+the kind is not, as section 8 says. A project's kinds are held to rule 1 by
+the pipeline, not by each author remembering the check (today a catalog
+calls `StandardCatalog::check_parts_are_the_kind` itself). `register_part`
+then does what section 7 describes: it takes its options through
+`PartOptions` and registers the model under `assignment.key` with its
+`ModelFacade`. The model's numbers carry their citations ([`DESIGN.md`](DESIGN.md)
+rules 6 and 9 bind a project's models as they bind embsim's).
+
+### Adding a bench component
+
+```toml
+[[component]]
+name = "MACHINE"
+kind = "mad-machine"
+[component.options]
+sample = "sil-linear-reference"
+```
+
+`[component.options]` is new. It is taken and refused like
+`[board.model.options]`. `Catalog::component` receives a
+`ComponentRequest`: the entry, its options as `PartOptions`, and the
+project file's directory. It returns the `Box<dyn Component>`. A component's
+pins are its endpoints, `Name.Pin`. `PartOptions` gains `number`, `integer`
+and `duration` (a time, written as `--for` takes it: `"1.5ms"`), and
+`value`, for a shape the kind reads itself.
+
+A component that is made of models embsim already has builds them into an
+**`embsim_board::Assembly`**: one component that hosts several, each part's
+pins renamed onto the assembly's (`Assembly::new().part(motor, &[("STEP",
+"STEP"), …])`). Every part reaches the engine through the one interface, its
+pins through the assembly's handle table (`ComponentNetIo::renamed`), and
+its wakes through a `WakeGate` the assembly holds. A package hosts its core
+the same way. At a shared instant the assembly wakes its parts in the order
+they were added. The links between the parts (a shaft turning an encoder,
+a carriage closing a switch) are Rust inside the assembly. The engine sees
+one node with pins, and no node sees another (rule 4).
+
+### The bench components embsim ships
+
+**`host-serial`**: the host's end of a serial link, a PTY
+(`embsim_board::HostPty`). Pins `TX` (what the host sends, driven onto the
+wire) and `RX` (what it receives), named from the host's side, so a wire
+reads `HOST.TX` to the board's receive pin.
+
+| Option | What it says |
+|---|---|
+| `baud` | required: the link's rate, framed 8N1. A host names its rate, and the kind invents none |
+| `path` | the path the PTY is reached at (a symlink to it), relative to the project file; by default `.embsim/<name>.pty` |
+
+`run --pty PATH` sets `path` for the project's one `host-serial` component.
+`--pty NAME=PATH` sets it for the component named `NAME`, and is needed when
+there are several. The run prints each PTY's path at its first look, at 0,
+before virtual time moves, so a host can open it:
+
+```text
+[   0.000000 ms] HOST: host serial at /tmp/tty.rpi, 2000000 baud 8N1
+```
+
+The pins are `HostPty`'s: a 3.3 V LVCMOS output and a JESD8C.01 receiver,
+the stated stand-in for a bench adapter no datasheet describes. A host's
+bytes arrive when the host writes them, in wall time, so they land at
+whatever virtual instant the run has reached. A run whose host wrote
+anything says so at the end, and is reproducible in what the host sent but
+not in when (`NODES.md` §9 lists deterministic host-PTY runs as a
+non-goal).
+
+**`scripted-source`**: one pin, `OUT`, driven through a list of steps. This
+is the smallest stimulus that lets a project do something over time: press
+a button, brown out a rail, sweep a sensor's output.
+
+| Option | What it says |
+|---|---|
+| `ohms` | required: the source's output impedance, more than 0 Ω. A scenario line names it (rule 6). An ideal constant supply is a `[[wire]]` with `volts` |
+| `steps` | required: `[["0ms", 0.0], ["5ms", 3.3], …]`, each an instant and the volts the pin drives from then on, behind `ohms`. Instants count from the instant the system starts (the run's 0) and increase strictly. Volts are in the engine's frame, as a wire's `volts` are |
+
+Before its first instant the pin is released. After its last, it holds.
+Each step is one drive published at its instant, on a wake the source
+arms for it.
+
+**Ending a run.** `run` without `--for` runs until SIGINT (Ctrl-C) or
+SIGTERM. With `--for`, it runs until that time or the signal, whichever
+comes first. Either way, the first signal ends the run at the next look
+(every 100 µs of virtual time). The run prints `interrupted at <instant> of
+virtual time` and then the summary that section 3 describes for a run that
+reaches its `--for`. A second signal ends the process at once.
+
+### What a run prints about what a catalog built
+
+A core's console, a PTY's path and a carriage's travel are not findings,
+and no net carries them. Anything a catalog builds can hand the run a
+**report**:
+
+```rust,ignore
+// embsim_board
+pub trait Report: Send {
+    /// What the lines are about, as the run prints it: "EC32.U100", "HOST".
+    fn subject(&self) -> String;
+    /// What is new since the last look, at `now_ns` of the run's virtual time.
+    fn look(&mut self, now_ns: u64) -> Vec<String>;
+    /// The state at the end of the run.
+    fn summary(&self) -> Vec<String>;
+}
+```
+
+A constructor adds its report to the sink it was given
+(`Reports::add`, a clone of `CatalogSet::reports`). The run takes them after
+the system is built and asks each at every look and at the end. The run
+prints what they return under their subject, stamped like a finding. A look
+reads state the engine's thread wrote while the run's thread was parked, so
+on the stepped clock two runs print the same report, as section 3 says.
+
+### MaD, end to end
+
+The MaD tensile tester (`RileyMcCarthy/MaD`, `SIL/`) is the consumer this
+design is checked against. Today its SIL is `mad-emulator`
+(`SIL/MaDSim/src/main.rs`), a program that assembles the system by hand:
+
+- the P2 instruction-set simulator as a component on no board, declaring
+  only the pins its lists name;
+- the DS2 add-on board;
+- a PTY;
+- bench pull-ups;
+- a stepper, an encoder and two end switches, coupled by callbacks;
+- the gantry, sample and strain-gauge chain;
+- an SD card node.
+
+As a project it is one crate and one file. `NODES.md` §13 maps each of
+`mad-emulator`'s pieces to a kind and lists what MaD has to change first.
+
+**The crate**, `SIL/catalog` (`mad-sim-catalog`), adds:
+
+| Kind | Sort | What it is |
+|---|---|---|
+| `p2iss` | P2 core | `p2iss::P2Iss` as a `P2Core`, booting the chip's ROM off the board's flash as `qemu` does. Option `rom` (a file; by default the boot ROM `p2iss/rom/rom_booter_v33k.bin`) |
+| `mad-edge` | board | the MaD Edge carrier, from a netlist exported from `Hardware/EdgeBoard`; its socket `J3` a `boundary` |
+| `mad-sd-card` | part | a FAT16 card holding a directory (`p2iss::sdimage::mad_card`), embsim's SD card model in a connector. Option `dir` (required) |
+| `mad-machine` | component | the machine: servo drive, carriage, encoder, two end switches, gantry, sample and load cell, one `Assembly` |
+
+`mad-machine`'s pins and its one option:
+
+| Pins | What they are |
+|---|---|
+| `STEP`, `DIR`, `ENA` | the servo drive's inputs (`embsim_models::machine::StepperMotor`, `DIR` low forward, enable active low) |
+| `ENC_A`, `ENC_B`, `ENC_Z` | the encoder's outputs (`QuadratureEncoder`, as many counts per millimetre as steps) |
+| `UPPER_COM`, `UPPER_NO`, `LOWER_COM`, `LOWER_NO` | the two end switches' contacts (`EndSwitch`, at 100 mm and 0 mm of travel) |
+| `E+`, `E-` | the load cell's excitation, sensed: the bridge reads its excitation off the board instead of assuming 3.3 V |
+| `S+`, `S-` | the bridge's outputs, each behind the cell's 350 Ω, at the excitation's midpoint ± half the strain gauge's output |
+| `sample` (option) | the sample in the grips, one of the samples the crate carries with their provenance: `sil-linear-reference` |
+
+The rest of its numbers (8192 steps a millimetre, 100 mm of travel, the
+gantry's 15 mm of slack, the cell's sensitivity) are the machine's. They
+stay in the crate with their citations, as they are in `MaDSim` and `models`
+today.
+
+**The file**, `SIL/mad.toml`:
+
+```toml
+# The MaD tensile tester: the Edge carrier, the P2-EC32MB module in its
+# socket running the firmware on MaD's instruction-set simulator, the DS2
+# force-gauge add-on on the force cable, the machine on the carrier's
+# connectors, and the Raspberry Pi's serial port as a PTY.
+
+[catalog]
+crates = ["catalog"]     # SIL/catalog, the crate mad-sim-catalog
+embsim = "embsim"        # SIL/embsim, the submodule that crate depends on
+
+[[board]]
+name = "EDGE"
+kind = "mad-edge"
+
+[[board]]
+name = "EC32"
+kind = "p2-ec32mb"
+
+[[board.model]]
+value = "P2X8C4M64P"
+kind = "p2"
+[board.model.options]
+core = "p2iss"
+
+# Stage-1 and the propeller2_debug program, laid out by `make flash-image`
+# (p2iss::flashimage): the ROM boots the firmware off the module's flash.
+[[board.model]]
+value = "SPI Flash 16MB (128Mb)"
+kind = "w25q128jv"
+[board.model.options]
+pins = "by-function"
+image = "build/flash.bin"
+
+[[board.model]]
+value = "MicroSD Socket"
+kind = "mad-sd-card"
+[board.model.options]
+dir = "sd"
+
+[[board]]
+name = "DS2"
+kind = "netlist"
+netlist = "boards/ds2_addon.net"
+
+[[board.model]]
+part = "ADS122U04"
+kind = "ads122u04"
+
+[[component]]
+name = "MACHINE"
+kind = "mad-machine"
+[component.options]
+sample = "sil-linear-reference"
+
+[[component]]
+name = "HOST"
+kind = "host-serial"
+[component.options]
+baud = 2000000
+
+# ---- The module in its socket, and the force cable (edge-ec32-ds2.toml) ----
+
+[[mate]]
+a = "EC32.J203"
+b = "EDGE.J3"
+
+[[mate]]
+a = "EDGE.J9"
+b = "DS2.J1"
+map = [["1", "1"], ["5", "2"], ["4", "3"], ["2", "4"], ["3", "5"]]
+
+# ---- Supplies: the bench's, and the Pi's side of the isolator IC2 ----------
+
+[[wire]]
+from = "BENCH.12V"
+to = "EDGE.J2.1"
+volts = 12.0
+
+[[wire]]
+from = "BENCH.GND"
+to = "EDGE.J2.2"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.SERVO5V"
+to = "EDGE.J21.1"
+volts = 5.0
+
+[[wire]]
+from = "BENCH.SERVOGND"
+to = "EDGE.J21.8"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.IFGGND"
+to = "DS2.J1.2"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.VDDA"
+to = "DS2.J2.1"
+volts = 3.3
+
+[[wire]]
+from = "BENCH.AGND"
+to = "DS2.J2.2"
+volts = 0.0
+
+[[wire]]                 # GND_IO, the isolated I/O domain's return
+from = "BENCH.IOGND"
+to = "EDGE.J10.2"
+volts = 0.0
+
+[[wire]]                 # RPI_5V
+from = "PI.5V"
+to = "EDGE.J4.1"
+volts = 5.0
+
+[[wire]]                 # RPI_GND
+from = "PI.GND"
+to = "EDGE.J4.6"
+volts = 0.0
+
+# ---- The host on the Pi's connector ----------------------------------------
+
+[[wire]]                 # RPI_TX, into IC2
+from = "HOST.TX"
+to = "EDGE.J4.2"
+
+[[wire]]                 # RPI_RX, out of IC2
+from = "EDGE.J4.3"
+to = "HOST.RX"
+
+# ---- The machine on the carrier's connectors -------------------------------
+
+[[wire]]                 # SC_PUL+, from the line driver U24
+from = "EDGE.J21.2"
+to = "MACHINE.STEP"
+
+[[wire]]                 # SC_DIR+
+from = "EDGE.J21.5"
+to = "MACHINE.DIR"
+
+[[wire]]                 # SC_ENA
+from = "EDGE.J21.7"
+to = "MACHINE.ENA"
+
+[[wire]]                 # A+, into the line receiver U25
+from = "MACHINE.ENC_A"
+to = "EDGE.J20.1"
+
+[[wire]]                 # B+
+from = "MACHINE.ENC_B"
+to = "EDGE.J20.3"
+
+[[wire]]                 # Z+
+from = "MACHINE.ENC_Z"
+to = "EDGE.J20.7"
+
+# The end switches follow the nets: IEND_U is on J16 and IEND_L on J15,
+# whatever the silkscreen says (board/tests/machine_parts, machine_harness).
+[[wire]]
+from = "EDGE.J16.2"
+to = "MACHINE.UPPER_COM"
+
+[[wire]]
+from = "MACHINE.UPPER_NO"
+to = "EDGE.J16.1"
+
+[[wire]]
+from = "EDGE.J15.2"
+to = "MACHINE.LOWER_COM"
+
+[[wire]]
+from = "MACHINE.LOWER_NO"
+to = "EDGE.J15.1"
+
+[[wire]]                 # the bridge's excitation: VDDA and its return
+from = "MACHINE.E+"
+to = "DS2.J2.1"
+
+[[wire]]
+from = "MACHINE.E-"
+to = "DS2.J2.2"
+
+[[wire]]                 # A0
+from = "MACHINE.S+"
+to = "DS2.J2.3"
+
+[[wire]]                 # A1
+from = "MACHINE.S-"
+to = "DS2.J2.4"
+
+# The E-stop loops on J11 to J13, as the machine's switches stand at rest:
+# a closed contact is a wire across its loop.
+[[wire]]
+from = "EDGE.J11.2"
+to = "EDGE.J11.1"
+
+[[wire]]
+from = "EDGE.J12.2"
+to = "EDGE.J12.1"
+
+[[wire]]
+from = "EDGE.J13.2"
+to = "EDGE.J13.1"
+
+# ---- Scenario ---------------------------------------------------------------
+
+[[switch]]               # FLASH: P61 is the flash's chip select
+part = "EC32.S301"
+pole = 1
+state = "closed"
+
+[[switch]]               # R303 holds P59 down: boot the program in flash
+part = "EC32.S301"
+pole = 3
+state = "closed"
+
+[[jumper]]               # A-, B- and Z- to the encoder ground: a
+part = "EDGE.JP2"        # single-ended encoder on the RS-422 receiver
+state = "closed"
+
+[[jumper]]
+part = "EDGE.JP3"
+state = "closed"
+
+[[jumper]]
+part = "EDGE.JP4"
+state = "closed"
+
+[[jumper]]               # A0 and A1 to the converter (R6 and R7 are DNP)
+part = "DS2.JP1"
+state = "closed"
+
+[[jumper]]
+part = "DS2.JP2"
+state = "closed"
+
+[[pin_short]]            # the bench's ~RESET strap: the stock board leaves
+a = "DS2.U1.3"           # U1's reset on a net of its own
+b = "DS2.U1.13"
+```
+
+**The commands** that replace `mad-emulator` (`SIL/makefile`):
+
+```bash
+cd SIL
+embsim check mad.toml                        # every board, wire and kind checked; time held
+embsim run mad.toml --pty /tmp/tty.rpi       # make playground / e2e-emulator: until Ctrl-C
+embsim run mad.toml --for 2s --net EDGE.+3.3V
+```
+
+The first `check` builds the runner, which compiles embsim and MaD's crates
+once. Later commands reuse it. Until embsim ships kinds for the Edge
+board's RS-422 pair (`U24`, `U25`; section 9), `check` refuses `EDGE` and
+names those two parts, as it refuses `edge-ec32-ds2.toml` today.
+`make playground-rom`'s serial boot is a second file: the same boards with
+`S301` set for serial boot, an erased flash, and the host on the carrier's
+`Debug` header (`J1`: `P62`, `P63`, `RESn`).

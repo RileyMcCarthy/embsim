@@ -253,7 +253,7 @@ The crossing is Δ = τ·ln((v∞ − v0)/(v∞ − v_th)), defined only when v_
 
 ## 9. Non-goals, and the answer
 
-Non-goals: transient/timestep SPICE or ngspice; inductor dynamics; multi-pole RC beyond the symmetric pair (one pole per block, with the finding); Newton or exponential device laws (PWL regions only); regulator current limit; pad Schmitt/hysteresis and ADC modes beyond the ROM seed; P2 current-source pull modes; isolator/receiver propagation delay; thermal and parasitics; STEP as edges; membership changes at runtime; a native `bridge_i2c`; deterministic host-PTY runs; migrating MaD's hand-wired GPIO/encoder/pulse seams (unified-drive first).
+Non-goals: transient/timestep SPICE or ngspice; inductor dynamics; multi-pole RC beyond the symmetric pair (one pole per block, with the finding); Newton or exponential device laws (PWL regions only); regulator current limit; pad Schmitt/hysteresis and ADC modes beyond the ROM seed; P2 current-source pull modes; isolator/receiver propagation delay; thermal and parasitics; STEP as edges; membership changes at runtime; a native `bridge_i2c`; deterministic host-PTY runs; migrating MaD's hand-wired GPIO/encoder/pulse seams (unified-drive first) — retired as a non-goal 2026-10-01: the unified drive landed in phase 5, and §13 is the migration's design.
 
 **SPI output timing (decision, 2026-09-27).** `ByteShifter` — the NOR flash and the PSRAM — presents the next output bit on the rising clock edge, and a master reads that bit after the edge. The P2 core reads a pad with no model of the silicon's registered input, so a falling-edge bit arrives one clock late to the boot ROM. Owner: the P2 pad model. Retire the rising-edge presentation when that model delays a pad read by the datasheet's input-register clocks and `rom_boot_ec32mb` still matches. Until then the SD card adapter keeps the card specification's falling-edge presentation on its own shifter.
 
@@ -446,3 +446,194 @@ impl ComponentNetIo {
 6. **Capacitors** (§8 phase 5). 7. **I2C bench** (§8 phase 6). 8. **Plant-driven edges** (§8 phase 7).
 
 Each phase is one pull request, gated by its proof list and by the goldens passing without re-blessing; `DESIGN.md` §5 is the review checklist for every one of them.
+
+## 13. Decision record: extending embsim from a project (2026-10-01)
+
+*Decided 2026-10-01 on `feat/embsim-catalogs`, stacked on `feat/embsim-projects` (draft PR 94). The user-facing contract is `PROJECTS.md` §10. This record holds what was chosen, the alternatives and why each was or was not taken, the code that changes, the §5 test, the proof that will say it is done, and MaD mapped onto it. Line references are against the tree at d4adf05 and, for MaD, against its working tree on 2026-10-01 (branch `feat/iss-rom-serial-flash`).*
+
+**The ask**, in the user's words: "the CLI should be a tool and a project like MaD should be able to add its own models, ISS, boards etc." PR 94 left these pieces:
+
+- the project file and the `Catalog` trait (`board/src/project.rs:114`);
+- `StandardCatalog` (`boards/src/catalog.rs`);
+- `QemuCatalog` (`p2-qemu/src/catalog.rs:67`), a full `Catalog` that wraps the standard one to add `core = "qemu"`;
+- an `embsim` binary with `QemuCatalog` wired in at seven call sites (`cli/src/live.rs:186`, `:327`; `cli/src/checklist.rs:72`, `:348`, `:371`, `:375`, `:623`). `PROJECTS.md` §7 says "the binary loads no other".
+
+The reference consumer, MaD, assembles its SIL by hand in `SIL/MaDSim` (`mad-emulator`, 1 078 lines in `main.rs`, `iss_description.rs` and `system_description.rs`). That code re-implements what the command already does: clock set-up with a time-authority workaround (`main.rs:225`), signal handling (`:59`), a telemetry thread (`:360`) and a PTY default. It runs none of the command's checks: no survey, and no findings report.
+
+### What was chosen
+
+1. **The command is a library and a binary.** `embsim-cli` gains `src/lib.rs`, which exports:
+   - `main_with(&[Registration]) -> ExitCode`, the four subcommands over a catalog set;
+   - `shipped() -> Result<CatalogSet, ProjectError>`, the standard catalog plus `embsim_p2_qemu::catalog::register`;
+   - `Registration { name, dir, register }`, one catalog crate as a runner names it.
+
+   `src/main.rs` becomes `embsim_cli::main_with(&[])`. `live.rs` and `checklist.rs` take the set in place of `QemuCatalog::new()` and `QemuCatalog::guide()`.
+2. **Catalogs compose in a `CatalogSet`** (`embsim_boards::catalog`), which implements `Catalog` by dispatch.
+   - `CatalogSet::add(impl Catalog)` and `CatalogSet::add_cores(impl CoreCatalog)` refuse a kind name the set already holds. The error names the kind and both catalogs. The same holds for a base-registry key two catalogs place.
+   - `CatalogSet::reports()` hands out the set's report sink, and `CatalogSet::guide()` returns every part kind's `KindGuide`.
+   - Every extension point a project needs goes through the set: board kinds, part kinds, base registrations, P2 cores (`embsim_boards::p2::CoreCatalog`) and bench components.
+   - The `p2` kind asks the set for its core. It is the standard catalog's, registered through `p2::register_p2(registry, assignment, options, cores)` with the cores of whatever calls it. Called alone, that is `held-in-reset`. Called through a set, it is every core the set holds.
+3. **A project names its catalog crates** (`[catalog] crates = [...]`, and optionally `embsim = "..."`, both relative to the project file). `embsim` writes a runner crate into `.embsim/runner-<id>/` beside the project. The runner's dependencies are `embsim-cli` and the declared crates, by path, and its `main` calls `main_with` with each crate's `register`. `embsim` builds the runner with Cargo, which reuses it when nothing changed, and `exec`s it with the same arguments. A project with no `[catalog]` runs in the `embsim` binary. There is one tool and no plugin ABI.
+4. **Mechanical links stay inside a component.** A plant is one bench component that presents electrical pins. A plant made of models embsim already has hosts them in an `embsim_board::Assembly`. Each hosted part gets its renamed pins (`ComponentNetIo::renamed`) and a `WakeGate` of the assembly's, as the `P2Package` already hosts its core (§12 item 5).
+5. **Two standard bench components.**
+   - `host-serial`: `HostPty` as a kind. `baud` is required and `path` is optional; `run --pty` overrides `path`.
+   - `scripted-source`: a pin driven through `(instant, volts)` steps behind a named `ohms`.
+
+   `run` gains a SIGINT/SIGTERM handler. A run without `--for` lasts until the signal and then prints its summary.
+
+Two generalisations come with these, because the five need them:
+
+- **What a run prints about what a catalog built is a `Report`** (`embsim_board`: `subject`, `look(now_ns)`, `summary`), collected through `Reports`. This replaces `QemuSeat`/`QemuCatalog::seats()` (`p2-qemu/src/catalog.rs:43`, `:78`) and the CLI's QEMU-specific `Reporter` (`cli/src/live.rs:207`).
+- **The check that a part kind seats only on a part it is moves into the pipeline.** `Project::prepare` checks every reached part against the kind's `KindGuide::is` before `register_part`, for every catalog. Today each catalog has to call `StandardCatalog::check_parts_are_the_kind` itself (`boards/src/catalog.rs:1211`; `QemuCatalog` does).
+
+### Decisions the ask left open
+
+- **(a) Kinds are not namespaced. A duplicate is an error naming both catalogs, raised when the second catalog is added.** A kind says what a part is, and a reader of a project file should not need to know which crate ships a model. Collisions are rare. They are caught before any project is read, and the fix is to rename the project's kind. Namespacing (`mad/plant`, `std/p2`) would put a second spelling on every kind, or need a rule for which namespace a bare name means. It would also let a project replace a standard kind, so `PROJECTS.md` §5's tables would stop being true of every project. Board, part, component and core kinds share one namespace. `netlist` is reserved. Names are lowercase letters, digits and hyphens.
+- **(b) The set lives in `embsim-boards`, so cores stay typed.** A core's interface is the package's (`P2Core::attach(P2Pads)`, `boards/src/p2.rs:1135`). `P2Pads` and `BankSupplies` live in `embsim-boards`. A set in `embsim-board` could only carry a core as `Box<dyn Any>`, downcast at the seam: a runtime type contract between crates. Cost of the choice: when a second processor package with cores ships, it gets a `CoreCatalog` of its own, beside the P2's.
+- **(c) The runner builds against one embsim, named or recorded, and the choice is checked.** Precedence: `[catalog] embsim` first, then the checkout `embsim` was built from (`cli/build.rs` records it as `EMBSIM_SOURCE_DIR`). After writing the manifest, `embsim` runs `cargo metadata` on the runner. It refuses any embsim crate that appears from two places, naming both and the key that fixes it. Two copies would be two `Catalog` traits and two process-global virtual clocks (`embsim_core::virtual_clock`). Not taken:
+  - `[patch]`: Cargo cannot patch a path dependency;
+  - inferring the checkout from a catalog crate's own `embsim-board` path: that guesses a checkout layout from a crate directory, and a crate may name several embsim crates. The check gives the same safety, with an error that names the fix. Inference can be added later if that error turns out common.
+
+  A `cargo install --path` build records its checkout. A `cargo install --git` build records Cargo's cached copy, which Cargo may clean away. Such a project names its checkout, and a recorded directory that is gone is an error saying so.
+- **(d) Where the runner lives and how it builds.** It is written to `.embsim/runner-<id>/`, where `<id>` is a hash of the canonical crate directories and the embsim root, so projects that name the same crates share one runner. Its manifest declares an empty `[workspace]`, so it is never taken for a member of an enclosing workspace (MaD's `SIL/Cargo.toml`). Its files are rewritten only when their content changes, so Cargo's fingerprints hold. `cargo build` runs on every subcommand: Cargo decides freshness, because a hash `embsim` kept would miss an edit inside a catalog crate.
+  - **Profile:** `release`, unless `EMBSIM_RUNNER_PROFILE` names another. The CLI tests use `dev` with the workspace's target directory, so the embsim crates are compiled once.
+  - **Target directory:** `CARGO_TARGET_DIR` if set. Otherwise the target directory of the first catalog crate's workspace (from `cargo metadata`; MaD's `SIL/target`), so what that workspace has built is reused. Failing both, `.embsim/target`.
+  - **Lock file:** `Cargo.lock` starts as a copy of that workspace's lock file, else embsim's, so shared dependencies stay at tested versions (rule 7: same inputs, same binary).
+  - **QEMU:** the runner gets the `build.rs` the `embsim` binary has (`cli/build.rs` becomes the template both use). The runner depends on `embsim-p2-qemu` directly, because a `links` crate hands its metadata to direct dependents only. `EMBSIM_QEMU_P2_BUILD` is passed through, and otherwise the tree `embsim` was built with is used.
+- **(e) Who runs a project.** A binary runs a project itself when its registrations equal the crates `[catalog]` names, by canonical directory. Otherwise it builds the project's runner and hands over. There is no environment variable and no recursion: the `embsim` binary has no registrations, and a runner always matches its own project. Before it hands over, `embsim` parses only the `[catalog]` table, so an older `embsim` never refuses a project file that the runner's embsim reads.
+- **(f) Handing over is `exec`.** The runner becomes the process: its output, its exit status, and Ctrl-C reach it directly. embsim's PTYs already make it a Unix program, so there is no spawn-and-forward path. Cargo's progress goes to standard error, so `check`'s and `run`'s standard output is the runner's own.
+- **(g) `survey` and `new` take `--project FILE`** to use that project's catalogs, so a project's own kinds appear among a part's candidates. Without it they use the shipped catalogs, as today.
+- **(h) A board kind may bring `models`** (`CatalogBoard::models`, its own `[[board.model]]` entries) and may start from the set's base registry (`registry: None`). Without this, a board kind from a project crate could not seat a standard kind on its parts except by reaching into `StandardCatalog`'s private registration functions. The board's entries go through the set's kinds with every check a file entry gets. A project entry with the same key replaces the board's, as a project's flash image already replaces the P2-EC32MB's blank flash. `prepare` turns on the reference-designator fallback for every board that starts from the base registry. Today the standard base registry sets the flag itself (`boards/src/catalog.rs:324`), which made it a property of one catalog rather than of a netlist board.
+- **(i) `host-serial`.** Its pins are `HostPty`'s (`board/src/host_pty.rs:118`): a 3.3 V LVCMOS output and a JESD8C.01 receiver, the stated stand-in for a bench adapter no datasheet describes.
+  - `baud` is required: a link's rate is the project's to name (rule 6).
+  - `path` defaults to `.embsim/<name>.pty` beside the project file. `run --pty PATH`, or `--pty NAME=PATH` when there are several, sets it through `Project::set_component_option` before the system is built.
+  - The run prints the path at its first look. A run whose host wrote anything says at the end that its timing depended on when the host wrote: §9 already lists deterministic host-PTY runs as a non-goal, and this does not change that.
+  - A 5 V adapter is a kind for later.
+- **(j) `scripted-source`.** One pin, `OUT`, declared `PinDecl::analog_source`: it drives, so it is a source and not a reader (the phase-5 review's correction for bench parts that drive).
+  - `ohms`, more than 0, is required, because a source's impedance is a scenario line. An ideal constant supply is a `[[wire]]` with `volts`.
+  - `steps` is `[["0ms", 0.0], …]`: instants as `--for` writes them, strictly increasing and counted from the system's start; volts in the engine's frame, as a wire's are.
+  - Before the first step the pin is released, and after the last it holds. Each step is one Thevenin publish on a wake armed at its instant.
+  - A released step, a ramp and a repeat are for later.
+- **(k) Ending a run.** The first SIGINT or SIGTERM ends the run at the next look (100 µs of virtual time). The run prints `interrupted at …`, then the same summary as a run that reaches `--for`. The handler only stores an atomic, as `MaDSim/src/main.rs:59` does, and it restores the default handler, so a second signal ends the process at once.
+- **(l) Every core gets a report from the package, and a core may add its own.** The `p2` kind adds one report per seated package: its START instant at the look that sees it, and at the end its `StartState` and core kind. QEMU's core adds its console per pad, its yields and whether it halted. MaD's ISS adds its console, running cogs, each async smart pin's derived baud and framing errors, and dropped edges. Today's output keeps its content, split over the two subjects' lines. `run_boots_the_p2_off_the_modules_flash` (`cli/tests/cli.rs`) is updated to match.
+- **(m) The `p2iss` core boots the ROM off the board's flash, as `qemu` does.** It has no fast-load option that puts the program straight into hub RAM (`P2Iss::new(&image, ..)`, which `mad-emulator` uses today). A fast load skips the board's boot chain (the flash, `S301`, the `P59`–`P61` straps), and checking that chain is what a board simulation exists for. The cost has not been measured: MaD measures the ISS at about 0.03× real time, and nobody has timed it reading MaD's image off a bit-banged flash. That is MaD's first measurement under this design. If the boot is too slow, a `program` option is a §5 "no" to record here first, with the measurement.
+
+### The code that changes
+
+| Where | Today | After |
+|---|---|---|
+| `board/src/project.rs:114` `Catalog` | seven required methods; `base_registry(&self) -> PartRegistry`; `part_kinds() -> Vec<String>`; `component(&ComponentSpec)` | `name(&self) -> &str` required; every other method has an empty default, so a catalog writes only what it provides; `register_base(&self, &mut PartRegistry)` in place of `base_registry`; `part_kinds() -> Vec<KindGuide>`; `component(ComponentRequest<'_>)` |
+| `:105` `CatalogBoard` | `{ netlist, registry }` | `{ netlist, registry: Option<PartRegistry>, models: Vec<ModelSpec> }`: `None` starts from the set's base registry |
+| `:395` `ModelSpec` | built only by serde | plus `by_part`, `by_mpn`, `by_value(key, kind)` and `option(name, value)`, for a board kind's `models` |
+| `:427` `ComponentSpec` | `{ name, kind }` | plus `options: toml::Table` (`[component.options]`) |
+| new `ComponentRequest<'a>` | none | `{ spec, options: PartOptions, dir }` |
+| `:237` `PartOptions` | `string`, `choice`, `pairs`, `finish` | plus `number`, `integer`, `duration` (a time as `--for` writes it) and `value` (a shape the kind reads itself) |
+| `:518` `ProjectFile` | seven tables | plus `catalog: Option<CatalogSpec { crates, embsim }>`, `deny_unknown_fields`; `Project::catalog()`; `Project::set_component_option(name, key, value)` for `--pty` |
+| `:864` `prepare` | base registry with the fallback as the catalog set it; each catalog checks what a part is | turns the fallback on for a board that starts from the base; registers a board kind's `models` before the project's entries; checks every reached part against the kind's `KindGuide::is` before `register_part` |
+| `boards/src/catalog.rs:1106`, `:1373`, `:1386`, `:1399`, `:1421` | `Named`, `PinTable`, `RequiredOption`, `KindGuide`, `Fit` in `embsim-boards` | moved to `embsim_board::project` and re-exported from `embsim_boards::catalog`, so nothing that names them breaks; `check_parts_are_the_kind` becomes `KindGuide::check(&Assignment)` |
+| new in `embsim_board` | none | `Report`, `Reports`; `Assembly`; `ScriptedSource` beside `HostPty`; `ComponentNetIo::renamed(&self, &[(&str, &str)])` beside `with_wake_gate` (`board/src/component.rs:1824`) |
+| `board/src/registry.rs:357` `PartRegistry` | a later registration silently replaces an earlier one under the same key | plus `keys()`, sorted, which the set reads to refuse two catalogs placing one key |
+| `boards/src/catalog.rs` `StandardCatalog` | `component_kinds()` empty (`:305`); `p2_kind` (`:739`) refuses every core but `held-in-reset` | `component_kinds()` = `host-serial`, `scripted-source`; `p2` registers through `p2::register_p2` with the caller's cores; new `CatalogSet` |
+| `boards/src/p2.rs` | `P2Core` (`:1135`), `HeldInReset` (`:1165`), `P2Package::new(core)` (`:1293`) | plus `CoreCatalog`, `CoreCtor`, `impl P2Core for Box<dyn P2Core>`, `register_p2`, and the package's `Report`; `Unbooted` moves here from `p2-qemu/src/catalog.rs:212`, so a core that cannot boot refuses to attach whichever core it is |
+| `p2-qemu/src/catalog.rs` | `QemuCatalog` (a whole `Catalog`), `QemuSeat`, `seats()`, `guide()` | `QemuCores`, a `CoreCatalog` of one kind, `qemu`; `register(set)`; its console and yields as a `Report` |
+| `cli/` | a binary; `QemuCatalog` wired in; a `Reporter` (`live.rs:207`) that reads `QemuSeat` | a library and a binary; the set passed in; the `Reporter` reads `Reports`; `runner.rs` (new); the signal handler; `run --pty`; `survey`/`new --project`; `build.rs` records `EMBSIM_SOURCE_DIR` and the QEMU tree and is the runner's template |
+
+### Alternatives
+
+- **A project-specific binary: taken, in generated form.** This is what MaD has now: `mad-emulator` re-implements the command, and it drifts from it. It has its own flags, clock set-up, signal handling, telemetry, and PTY default, and none of the survey or the findings report. The runner is exactly a project-specific binary, but generated, and the only project code in it is `register`. `main_with` is public, so a project that needs a binary of its own (one that also serves something) can still write one. It runs the same command with the same checks.
+- **Dynamic-library plugins over a C ABI or a stable Rust ABI: not taken.** Rust has no stable ABI. `Box<dyn Component>`, the registry's boxed constructors, the `Arc`s inside `PinHandle`, and `P2Core`'s trait objects are sound across a `cdylib` boundary only when both sides come from the same compiler, with the same dependency versions and flags. Cargo already guarantees that for one binary, without the `unsafe`. A C ABI, or `abi_stable`, means re-declaring the whole extension surface as FFI-safe mirrors: `Component`, `PinDecl`, `Drive`, `Sense`, wakes, `P2Core`, `P2Pads`. That is a second interface beside the one interface (rule 2), kept in step by hand. Every sense and wake would pass through a shim against a per-edge budget of 0.61 µs (rule 8). The decisive fact is that a plugin links its own copy of `embsim-core`. `embsim_core::virtual_clock` is process-global state, so a plugin's components would wait on a second clock. A plugin-safe virtual clock would be an engine redesign, bought only to avoid `cargo build`.
+- **Data-only part libraries: not taken.** The file stays data and models stay code. Every model's numbers carry a citation and a proving test (rules 6 and 9), and behaviour written as data is a modelling language with its own semantics: a second pipeline (rule 1). An ISS, a QEMU core, a PTY and a plant cannot be data. The one kind of part that already is pure data is a piecewise-linear element (`PwlSpec`, `PartRegistry::register_pwl`). Exposing it as a project table would close `PROJECTS.md` §9's gap of diodes the element library does not know. That is a separate, smaller change, recorded there.
+- **Also considered and not taken:**
+  - namespaced kinds (decision (a));
+  - a set in `embsim-board` with type-erased cores (decision (b));
+  - inferring the embsim checkout (decision (c));
+  - WASM components: an ISS or QEMU core needs threads and file descriptors, and a sandbox crossing on every callback breaks rule 8;
+  - **the plant as several components joined by a mechanical link in the file.** That is a second channel (rule 2), and it would make a node see another (rule 4). Today `mad-emulator` couples four engine components through callbacks outside the engine (`iss_description.rs:343`, the shaft fanning out to the encoder, both switches and `CarriageTravel`; `main.rs:306` onward, the gantry, sample and strain-gauge chain). Decision 4 puts that coupling inside one node.
+
+### DESIGN.md §5
+
+1. **Projection or closed form?** Yes. The set, the runner and the `[catalog]` table are build-time composition and change no resolution. `scripted-source` publishes a Thevenin drive at an instant it armed. `host-serial` is the existing `SerialLevelBridge`, publishing levels at bit instants. The assembly routes wakes and integrates nothing.
+2. **Every number named?** Yes. The set adds no number. `host-serial` takes its `baud` from the file and its levels from `HostPty`'s cited stand-in. `scripted-source` takes `ohms`, volts and instants from the file and has no default impedance. A project's own models bind to rules 6 and 9 as embsim's do. The set cannot check a citation, so review in the project does, as it does here.
+3. **One interface?** Yes. Every kind builds an ordinary `Component` or `P2Core`. An assembly's parts use the same declarations, `Drive`, `Sense` and wakes through a `WakeGate`, which is how the package already hosts its core. No new message reaches the engine, and mechanical links stay inside a component.
+4. **Fast path free?** Yes. A project with no `[catalog]` runs in the `embsim` binary as today. Kind dispatch is one map lookup per entry at build. The runner costs wall time when it builds, never virtual time or per-edge time. Only an assembly's own parts pay for the wake multiplexer. The engine does not change.
+5. **One pipeline?** Yes, and stronger. Every board is still surveyed and built through `Board::from_netlist`. A board kind's `models` go through the same entry path as the file's. Rule 1's "a kind seats only on a part it is" moves out of each catalog's discipline into `prepare`, for every catalog's kinds. Nothing adds a stub tier, a facade or an allow-list.
+6. **Observable, goldens unchanged?** Yes. Each piece has a stepped proof (below). Nothing on the resolution path moves, so the four goldens stay byte-identical, the census stays 87/6/0/3, 176/29/0/33, 22/2/0/0, and the ROM boot's edge, yield and solve counts are unchanged.
+
+### Proof
+
+The tests that make each piece done are stepped (`TESTING.md` rule 9) and declare their behaviours as their neighbours do.
+
+- `boards/tests/catalog_set.rs`:
+  - two catalogs providing one kind are refused, naming both;
+  - two catalogs placing one base key are refused, naming both;
+  - a part kind from an added catalog builds on the EC32 carrier project through the one pipeline;
+  - an added kind's entry on a part it is not is refused by `prepare`, without the catalog checking;
+  - a board kind's `models` seat a standard kind, and a project entry replaces one;
+  - a core from an added `CoreCatalog`, recording its `start`, starts at the package's START instant: 5.5 ms on the P2-EC32MB from its fingers, as QEMU's does.
+- `board/tests/assembly.rs`:
+  - two parts each arming wakes are woken at exactly the instants each asked for, in part order at a shared instant;
+  - a stepper and an encoder coupled by a shaft inside one assembly, driven by a periodic `STEP`, count the encoder's edges equal to the steps folded.
+- `board/tests/scripted_source.rs`: across a 10 kΩ divider, the net reads the old step 1 ns before each instant and the new one at it; it reads nothing before the first step.
+- `board/tests/host_serial.rs`: a `host-serial` with `TX` wired to its own `RX` returns what the host wrote to its PTY.
+- `cli/tests/runner.rs`, with a fixture catalog crate under `cli/tests/fixtures/` providing a component kind:
+  - `check` through the runner lists the fixture's catalog and builds its component;
+  - a second `check` does not recompile, because the runner binary is unchanged;
+  - `cargo metadata` output naming embsim twice is refused, with the fix.
+- `cli/tests/cli.rs`: `run` without `--for`, sent SIGINT after it says it is running, prints `interrupted at` and the summary's three parts, and exits 0. Its run of the module's flash boot keeps its facts under the two report subjects.
+
+### MaD mapped onto it
+
+Every piece of `mad-emulator` becomes a kind, a line of `SIL/mad.toml` (`PROJECTS.md` §10 has the file whole), or nothing because the board does the job:
+
+| `mad-emulator` today | Becomes | Kind |
+|---|---|---|
+| `P2Iss` (`p2iss/src/lib.rs:869`), a `Component` (`:1069`) named `P2` with no board, whose pins are only the ones its lists name (`SerialLink`, `with_level_pins`, `with_input_pins`, `with_pulse_pins`) | the P2-EC32MB's `U100`, a `p2` with `core = "p2iss"`: all 64 pads on the package's pins, each pad's role read from its mode word as QEMU's pads are, so the lists go | `p2iss` (MaD's core) |
+| the image loaded straight into hub RAM (`P2Iss::new(&image, ..)`, `main.rs:194`) | stage-1 and the program in the module's flash, booted by the ROM | `w25q128jv` `image` (standard), written by `make flash-image` with `p2iss::flashimage` |
+| `run_iss_rom` (`main.rs:99`), its `P59` strap `Pull`, the host on `P62`/`P63` | a second file: `S301` set for serial boot, the host on the carrier's `Debug` header `J1` | `[[switch]]`, `host-serial` |
+| `HostPty` on `P2.P55`/`P2.P53` | the host on the carrier's Pi connector `J4.2`/`J4.3`, through the isolator `IC2` (ISO6742), with the Pi's side supplied on `J4.1`/`J4.6` | `host-serial` (standard) |
+| `BenchPulls`/`IDLE_PULLS` (`iss_description.rs:90`, `:121`) | nothing: the carrier's isolators, optos and their resistors set those lines, and a line the board leaves open is a finding, not a bench pull | none |
+| `BenchSd` with `SdCardNode` on four bare pins, and `MisoPullUp` (`:464`, `:503`) | the module's own socket `J301`, sharing `P58`–`P61` with the flash as `ec32mb.rs` documents. The 15 kΩ pull the firmware asks for is its own pad mode (`P_HIGH_15K`), published through `pad_drive` | `mad-sd-card` (MaD), seating embsim's `SdCardComponent` |
+| `sdimage::mad_card` mirroring `--sd-path` | the kind's `dir` option | `mad-sd-card` |
+| `BenchForcePath` (`:184`): the DS2 from `DS2_NETLIST`, the converter registered pre-configured (`vref_mv`, gain 128), `JP1`/`JP2` closed, the `~RESET` `pin_short`, straps on `J1`/`J2`, and the force-gauge UART wired straight to `P2.P2`/`P2.P0` | the DS2 as a `netlist` board with `ads122u04` as it comes out of reset (the firmware's `WREG` writes configure it), the same scenario lines, on the carrier's force cable through its isolator `IC5` | `netlist`, `ads122u04`, `[[jumper]]`, `[[pin_short]]`, `[[mate]]` |
+| the `PROTO` and `FORCE_GAUGE` `SerialLink`s | nothing: the ISS reads each async smart pin's rate from the guest's mode word | none |
+| `LoadCellBridge`/`BridgeDrive` (`system_description.rs:46`, `:86`), its excitation the constant `BRIDGE_EXCITATION_V` (`:30`) | inside `mad-machine`: `S±` behind 350 Ω as today, centred on the excitation it senses on `E±` instead of on a constant | `mad-machine` |
+| `BenchMachine` (`iss_description.rs:290`): the stepper, the encoder, two end switches, the shaft callback, `CarriageTravel` | one `Assembly` inside `mad-machine`; `CarriageTravel` becomes the machine's report | `mad-machine` |
+| the gantry, sample and strain-gauge chain (`main.rs:306` onward; the `models` crate) | inside `mad-machine`; the sample is its `sample` option | `mad-machine` |
+| harness wires to bare `P2.Pnn` | wires to the carrier's connectors (`J21`, `J20`, `J15`, `J16`, `J4`) and the add-on's `J2` | `[[wire]]` |
+| the telemetry thread (`main.rs:360`) | the `p2iss` core's report and the machine's report | `Report` |
+| `--speed`, `virtual_clock::init`, `take_time_authority` (`main.rs:225`) | the run's stepped clock: unpaced, as `make e2e-emulator`'s `--speed 0` is | none |
+| `install_shutdown_signals`, `park_until_shutdown` | `run`'s handler (decision (k)) | none |
+
+**What MaD changes, in order:**
+
+1. **The open items of §12 item 5's MaD list.** The interface rewrite is done in MaD's working tree: no `PinKind`, `StreamRole` or `level_of` remains in `p2iss/src`, and `HostPty` is embsim's. What is still open:
+   - `P2Iss` becomes a `P2Core`. It takes `P2Pads` with all 64 pads and their senses through `P2Pads::on_pad_sense`. Its pads drive through `bank_supplies().pad_drive(pin, WRPIN, dir, out)`. `start()` anchors its clock at the package's START instant, on the engine thread, and `reset()` holds it. Any MaD assertion on a boot instant moves by the 3 ms restart.
+   - The pin lists (`SerialLink`, `with_level_pins`, `with_input_pins`, `with_pulse_pins`) are replaced by each pad's mode word.
+   - `p2core/src/board.rs:482` `sensed()` takes the strong-mask rule.
+   - The `P59` fiat goes (`p2iss/src/lib.rs:939`).
+2. **The catalog crate**, `SIL/catalog` (`mad-sim-catalog`), a member of MaD's SIL workspace, with `pub fn register(&mut CatalogSet)`:
+   - `IssCores` (core kind `p2iss`: `rom`, by default `p2iss/rom/rom_booter_v33k.bin`), with the ISS's report;
+   - board kind `mad-edge` (a netlist of `Hardware/EdgeBoard` exported with `kicad-cli` to `SIL/boards/mad_edge.net`, carrying a provenance header as `ds2_addon.net` does; `models` = `J3` a `boundary`);
+   - part kind `mad-sd-card` (`is` = a connector; `dir`);
+   - component kind `mad-machine` (an `Assembly` of `StepperMotor`, `QuadratureEncoder` and two `EndSwitch`es, with the bridge and the `models` chain inside; `sample`), with its report.
+3. **The files**:
+   - `SIL/mad.toml`, and a second file for the serial boot;
+   - `SIL/boards/` holding both exports (`MaDSim/boards/ds2_addon.net` moves there);
+   - a `flash-image` make target;
+   - `SIL/.embsim/` in `.gitignore`.
+4. **The callers**: `make playground`, `playground-iss`, `playground-rom` and `e2e-emulator` become `embsim run … --pty …`. `MaDSim/tests/pty_protocol.rs` moves to a test of the project. CI runs `embsim check SIL/mad.toml`, which builds the runner. `mad-emulator` retires.
+
+**What embsim owes before MaD's file checks:**
+
+- this record's code;
+- kinds for the Edge carrier's RS-422 pair, `U24` (AM26LS31) and `U25` (AM26LV32). These are `PROJECTS.md` §9's two parts, with their provenance and the `U25` part-number disagreement settled. They are generic TI parts, so they are embsim's to ship: a project crate should not fork a model. Until they land, `embsim check SIL/mad.toml` refuses `EDGE` and names the two parts, as it refuses `edge-ec32-ds2.toml` today.
+
+### Open
+
+- **Pacing a host by the board's clock.** A host the board's clock must meter, as MaD's co-simulated browser is (Chrome in a QEMU VM that stops when the board's clock does), needs the run to drive the host's clock. `host-serial` delivers the host's bytes in wall time and does not do that.
+- **The ISS's boot time off flash**, measured on MaD's image (decision (m)).
+- **A git source** for `[catalog] embsim`.
+- **A generated `component-kinds` table** in `PROJECTS.md` §5, beside the two tables `projects_md_tabulates_every_kind_the_catalog_ships` generates, once the kinds land. §10's hand-written tables then move there.
+- **More bench parts:** a 5 V `host-serial`, a released step, ramps and repeats in `scripted-source`.
+- **A flash-image command:** `PROJECTS.md` §9 notes no command makes a P2 flash image.
+- **The load cell's legs.** Phase 7's plant-driven edges, where the bridge's legs become mutable conductances (§8, the first `SetEdge` consumer), will turn `mad-machine`'s `S±` from a two-source Thevenin equivalent into the bridge itself. That needs no change to the project file.
