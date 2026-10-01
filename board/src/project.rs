@@ -152,7 +152,7 @@ impl CatalogBoard {
 /// answers each kind from whichever catalog provides it.
 pub trait Catalog {
     /// The catalog's name, as an error that names two catalogs prints it:
-    /// its crate's name (`"embsim-boards"`, `"mad-sim-catalog"`).
+    /// its crate's name (`"embsim-boards"`, `"custom-project-catalog"`).
     fn name(&self) -> &str;
 
     /// The board kinds this catalog provides, besides `"netlist"`, which

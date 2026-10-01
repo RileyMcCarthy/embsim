@@ -1252,17 +1252,17 @@ catalog of the test tree's own beside the standard one
 
 ## 10. Extending embsim from a project
 
-*Status, 2026-10-01 on `feat/embsim-catalogs`. Landed, and described here as
-it is: the catalog set and every extension point (board, part, base, core
-and bench component kinds), the rule for a name two catalogs provide, the
-check that a kind seats only on a part it is, made by the project for every
-catalog, the reports a run prints, the command as a library
-(`embsim_cli`), the two bench component kinds of section 5, and `run`'s
-interrupt; then the `[catalog]` table, the runner the `embsim` tool builds
-for a project's own crates, `embsim new --catalog`, and the worked example,
-[`examples/custom-project`](examples/custom-project/README.md). Still the
-design, its Rust marked `ignore`: a plant's `Assembly`. The decision record,
-with the alternatives and what is open, is [`NODES.md`](NODES.md) §13.*
+*Status, 2026-10-01 on `feat/embsim-catalogs`. Everything this section
+describes is built, except a plant's `Assembly` ("Adding a bench
+component"), which is still a design, and `survey`/`new` over a project's
+own kinds. The Rust below either runs as a doc test of `embsim-boards` or
+is quoted from the worked example,
+[`examples/custom-project`](examples/custom-project/README.md), whose crate
+every gate compiles; `boards/tests/guide_quotes.rs` fails when a quotation
+and its file differ. Every command was run as shown. MaD's move onto a
+project of its own is [`MIGRATING-MAD.md`](MIGRATING-MAD.md); the decision
+record, with the alternatives and what is open, is [`NODES.md`](NODES.md)
+§13.*
 
 A project whose boards need something embsim does not ship (a model, a
 board, a processor core, a bench part) writes it in Rust, in a crate of its
@@ -1281,6 +1281,25 @@ embsim check rig.toml                                # build the runner, then ch
 embsim run rig.toml --for 10ms
 ```
 
+```text
+$ embsim new --catalog sim/catalog --add-to rig.toml
+wrote sim/catalog/Cargo.toml and sim/catalog/src/lib.rs: catalog crate sim-catalog
+  kinds sim-board (a board), sim-sensor (a part), sim-core (a P2 core), sim-source (a bench component): one commented example of each to keep, rename or replace
+added "sim/catalog" to the [catalog] crates of rig.toml; `embsim check rig.toml` builds the runner that holds it
+$ embsim check rig.toml
+embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim) in ./.embsim/runner-c03c22d2
+…
+project rig.toml
+  catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
+…
+```
+
+Here `rig.toml` was a copy of `boards/projects/ec32-carrier.toml`; any
+project takes a crate the same way. The first `check` compiles embsim, its
+dependencies and the crate: 54 crates in 19 s from an empty target directory on the eight-core machine
+these were run on. A second `check` or `run` with nothing changed is
+Cargo's no-op check and then the run: 0.3 s for `run rig.toml --for 10ms`.
+
 [`examples/custom-project`](examples/custom-project/README.md) is a
 project with a catalog crate of its own adding one kind of each sort: a
 part model with a stand-in datasheet, a board that needs it, a P2 core
@@ -1289,15 +1308,16 @@ that toggles a pad on a schedule, and a bench instrument.
 ### What a project can add
 
 Everything a project file names is a **kind**, and a catalog provides each
-kind. A project's catalog crate can add five sorts of thing:
+kind. A project's catalog crate can add five sorts of thing (the last
+column names the worked example's kinds):
 
 | It adds | What it is | Rust | The file names it as |
 |---|---|---|---|
-| a board kind | a named board: a netlist the crate bundles, and the models its parts take | `Catalog::board_kinds`, `Catalog::board` | `[[board]] kind = "mad-edge"` |
-| a part kind | a model, registered into a board's part registry for every part a key reaches | `Catalog::part_kinds`, `Catalog::register_part` | `[[board.model]] kind = "mad-sd-card"` |
+| a board kind | a named board: a netlist the crate bundles, and the models its parts take | `Catalog::board_kinds`, `Catalog::board` | `[[board]] kind = "example-buffer-board"` |
+| a part kind | a model, registered into a board's part registry for every part a key reaches | `Catalog::part_kinds`, `Catalog::register_part` | `[[board.model]] kind = "example-ex-buf1"` |
 | base registrations | models a netlist board places by the part number it carries | `Catalog::register_base` | nothing: every `kind = "netlist"` board starts from them |
-| a P2 core | what runs inside the `p2` package | `embsim_boards::p2::CoreCatalog` | `[board.model.options] core = "mad-p2iss"` |
-| a bench component | a part with pins and no board: a host port, a stimulus, a plant | `Catalog::component_kinds`, `Catalog::component` | `[[component]] kind = "mad-machine"` |
+| a P2 core | what runs inside the `p2` package | `embsim_boards::p2::CoreCatalog` | `[board.model.options] core = "example-blinker"` |
+| a bench component | a part with pins and no board: a host port, a stimulus, a plant | `Catalog::component_kinds`, `Catalog::component` | `[[component]] kind = "example-edge-counter"` |
 
 A mechanical link is not a sixth sort. A plant is one bench component. Its
 mechanism (a motor's shaft, a carriage, a sample, a load cell) is inside it,
@@ -1323,18 +1343,18 @@ project with the crate in its `[catalog]`; with `--add-to PROJECT`, the
 crate joins that file's `[catalog] crates`, the file edited in place with
 its comments kept.
 
-```rust,ignore
-// SIL/catalog/src/lib.rs
-use embsim_board::ProjectError;
-use embsim_boards::catalog::CatalogSet;
+The worked example's registration function, at the root of its crate
+(`use embsim_board::ProjectError; use embsim_boards::catalog::CatalogSet;`
+above it):
 
-/// Called once, after the catalogs embsim ships are in the set and before
-/// the project is read.
+<!-- quoted from examples/custom-project/catalog/src/lib.rs -->
+```rust,ignore
+/// Add the example's kinds to `set`: the board, part and bench component
+/// kinds as one catalog ([`board::ExampleCatalog`]), the core as a core
+/// catalog ([`blinker::BlinkerCores`]). Starts nothing.
 pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError> {
-    // Board, part and component kinds: one `embsim_board::Catalog`.
-    set.add(MadCatalog)?;
-    // A P2 core: one `embsim_boards::p2::CoreCatalog`.
-    set.add_cores(IssCores)?;
+    set.add(board::ExampleCatalog)?;
+    set.add_cores(blinker::BlinkerCores)?;
     Ok(())
 }
 ```
@@ -1353,16 +1373,17 @@ The registration function:
 - returns an error that says what to fix.
 
 The runner the tool builds calls it. A project that owns its binary calls
-it too, the command over the shipped set with the project's catalogs in it
-(`embsim_cli`'s crate docs):
+it too, the command over the shipped set with the project's catalogs in it.
+The example has one, `cargo run -p custom-project-catalog --example
+own_binary -- run project.toml --for 10ms` from `examples/custom-project`:
 
+<!-- quoted from examples/custom-project/catalog/examples/own_binary.rs -->
 ```rust,ignore
-// SIL/sim/src/main.rs
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut set = embsim_cli::shipped();
-    match mad_sim_catalog::register(&mut set) {
+    match custom_project_catalog::register(&mut set) {
         Ok(()) => embsim_cli::main_with(set),
         Err(err) => {
             eprintln!("error: {err}");
@@ -1371,6 +1392,15 @@ fn main() -> ExitCode {
     }
 }
 ```
+
+The example's crate takes `embsim-cli` as a dev-dependency, which its
+examples and tests use; a project's own binary crate depends on
+`embsim-cli` and on its catalog crate. A binary like it that links QEMU (`embsim-cli` built with
+`EMBSIM_QEMU_P2_BUILD` set) needs QEMU's link arguments, which
+`embsim-p2-qemu` hands only to a crate that depends on it directly: the
+binary's crate then depends on `embsim-p2-qemu` and has a `build.rs` like
+the one the tool writes for a runner (`BUILD_RS` in `cli/src/runner.rs`).
+Without a QEMU tree, as for the example, nothing more is needed.
 
 `embsim_cli::shipped()` is the standard catalog with QEMU's core;
 `embsim_cli::main_with(set)` reads the process's arguments and runs the
@@ -1425,8 +1455,8 @@ An unknown kind is refused as before, listing every kind the set holds.
 `check` and `run` print the set's catalogs under the project line:
 
 ```text
-project mad.toml
-  catalogs: embsim-boards, embsim-p2-qemu, mad-sim-catalog
+project project.toml
+  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
 ```
 
 ### The `[catalog]` table
@@ -1665,13 +1695,74 @@ an entry in the file gets. An entry in the project with the same key
 replaces the board's, as a project's flash image replaces the P2-EC32MB's
 blank flash.
 
-```rust,ignore
-fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
-    let netlist = netlist::parse(MAD_EDGE_NET)
-        .map_err(|err| ProjectError::message(format!("board {}: {err}", spec.name)))?;
-    // J3, the module socket, is a project-library symbol: a connector.
-    Ok(CatalogBoard::from_base(netlist)
-        .with_model(ModelSpec::by_part("P2_EDGE_MODULE_SOCKET", "boundary")))
+A board kind is where a project's own hardware goes: the netlist exported
+from its EDA files, bundled with the crate, and the entries every project
+that names the board would otherwise repeat. The example below, a doc test
+of `embsim-boards`, is a carrier whose module socket is a symbol from the
+project's own library, which no tier knows is a connector: the board kind
+says so once, so a project names the board and nothing else. MaD's Edge
+carrier is this shape ([`MIGRATING-MAD.md`](MIGRATING-MAD.md)).
+
+```rust
+use embsim_board::{netlist, BoardSpec, Catalog, CatalogBoard, ModelSpec, Project, ProjectError};
+use embsim_boards::catalog::CatalogSet;
+
+/// The carrier's netlist, as a crate bundles its board's EDA export
+/// (`include_str!("../boards/carrier.net")`): the module socket `J1`, a
+/// project-library symbol, and a pull-down on its signal pin.
+const CARRIER: &str = r#"(export (version "E")
+  (components
+    (comp (ref "J1") (value "MODULE_SOCKET")
+      (libsource (lib "my-project") (part "MODULE_SOCKET")))
+    (comp (ref "R1") (value "10k")
+      (libsource (lib "Device") (part "R"))))
+  (nets
+    (net (code "1") (name "SIG")
+      (node (ref "J1") (pin "1"))
+      (node (ref "R1") (pin "1")))
+    (net (code "2") (name "GND")
+      (node (ref "J1") (pin "2"))
+      (node (ref "R1") (pin "2")))))"#;
+
+/// One board kind, `my-carrier`.
+struct MyBoards;
+
+impl Catalog for MyBoards {
+    fn name(&self) -> &str {
+        "my-catalog"
+    }
+
+    fn board_kinds(&self) -> Vec<String> {
+        vec!["my-carrier".to_string()]
+    }
+
+    fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
+        let netlist = netlist::parse(CARRIER)
+            .map_err(|err| ProjectError::message(format!("board {}: {err}", spec.name)))?;
+        // The resistor takes the base registrations; the socket is a
+        // connector because the board says so, with every check a file's
+        // entry gets.
+        Ok(CatalogBoard::from_base(netlist)
+            .with_model(ModelSpec::by_part("MODULE_SOCKET", "boundary")))
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut set = CatalogSet::new();
+    set.add(MyBoards)?;
+    let project = Project::parse(
+        r#"
+        [[board]]
+        name = "CARRIER"
+        kind = "my-carrier"
+        "#,
+    )?;
+    let survey = project.survey(&set, "CARRIER")?;
+    assert!(survey.compliant());
+    // The socket is the board's one connector: where a wire or a mate lands.
+    let connectors: Vec<&str> = survey.connectors.iter().map(|c| c.reference.as_str()).collect();
+    assert_eq!(connectors, ["J1"]);
+    Ok(())
 }
 ```
 
@@ -1693,13 +1784,25 @@ model's numbers carry their citations ([`DESIGN.md`](DESIGN.md) rules 6 and
 
 ### Adding a bench component
 
+The example's edge counter, as its project names it and wires it:
+
+<!-- quoted from examples/custom-project/project.toml -->
 ```toml
+# Its trigger levels are the bench's choice: the buffer's own V_T- and V_T+.
 [[component]]
-name = "MACHINE"
-kind = "mad-machine"
+name = "COUNTER"
+kind = "example-edge-counter"
 [component.options]
-sample = "sil-linear-reference"
-loop_volts = 24.0
+low = 0.9
+high = 2.0
+
+[[wire]]
+from = "BUF.J1.2"
+to = "COUNTER.IN"
+
+[[wire]]
+from = "COUNTER.REF"
+to = "BUF.J1.4"
 ```
 
 `Catalog::component` receives a `ComponentRequest`: the entry
@@ -1709,7 +1812,9 @@ returns the `Box<dyn Component>`, whose pins are its endpoints, `Name.Pin`.
 `PartOptions` takes `number`, `integer`, `duration` (a time, written as
 `--for` takes it: `"1.5ms"`) and `value` (a shape the kind reads itself)
 beside `string`, `choice` and `pairs`. The two kinds of section 5 are built
-this way (`boards/src/catalog.rs`).
+this way (`boards/src/catalog.rs`), and so is the example's counter
+(`examples/custom-project/catalog/src/counter.rs`): two required trigger
+levels, its pins declared from them, and a report of the edges it saw.
 
 *Design; not built:* a component made of models embsim already has would
 build them into an **`embsim_board::Assembly`**: one component that hosts
@@ -1721,22 +1826,66 @@ parts in the order they were added. The links between the parts (a shaft
 turning an encoder, a carriage opening a switch) are Rust inside the
 assembly; the engine sees one node with pins, and no node sees another
 (rule 4). `NODES.md` §13 records what such a plant samples, and how often.
+MaD's machine, a servo drive, an encoder, switches and a load cell on one
+carriage, is the plant it is for ([`MIGRATING-MAD.md`](MIGRATING-MAD.md)).
 
 ### What a run prints about what a catalog built
 
 A core's console, a PTY's path and a carriage's travel are not findings,
 and no net carries them. Anything a catalog builds can hand the run a
-**report** (`embsim_board::Report`):
+**report** (`embsim_board::Report`): its `subject` (what the lines are
+about, `"EC32.U100"` or `"HOST"`), a `look(now_ns)` that returns what is
+new since the last look, and a `summary` of the state at the end. The
+example below, a doc test of `embsim-boards`, is a counter's report, and
+what the build and the run do with it:
 
-```rust,ignore
-// embsim_board::report
-pub trait Report: Send {
-    /// What the lines are about, as the run prints it: "EC32.U100", "HOST".
-    fn subject(&self) -> String;
-    /// What is new since the last look, at `now_ns` of the run's virtual time.
-    fn look(&mut self, now_ns: u64) -> Vec<String>;
-    /// The state at the end of the run.
-    fn summary(&self) -> Vec<String>;
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use embsim_board::report::instant;
+use embsim_board::{Report, Reports};
+
+/// What a bench counter says: its count when a look finds it changed, and
+/// the total at the end.
+struct CountReport {
+    count: Arc<AtomicU64>,
+    said: u64,
+}
+
+impl Report for CountReport {
+    fn subject(&self) -> String {
+        "COUNTER".to_string()
+    }
+
+    fn look(&mut self, now_ns: u64) -> Vec<String> {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == self.said {
+            return Vec::new();
+        }
+        self.said = count;
+        vec![format!("{count} edges by {}", instant(now_ns))]
+    }
+
+    fn summary(&self) -> Vec<String> {
+        vec![format!("{} edges", self.count.load(Ordering::Relaxed))]
+    }
+}
+
+fn main() {
+    // The sink a build hands a constructor (`request.reports`,
+    // `assignment.reports`): the constructor adds its report, keeping the
+    // other end of what the report reads.
+    let reports = Reports::new();
+    let count = Arc::new(AtomicU64::new(0));
+    reports.add(CountReport { count: Arc::clone(&count), said: 0 });
+
+    // The run takes the reports once the system is built, and looks.
+    let mut taken = reports.take();
+    count.store(2, Ordering::Relaxed);
+    assert_eq!(taken[0].look(1_500_000), ["2 edges by 1.500000 ms"]);
+    assert!(taken[0].look(1_600_000).is_empty());
+    assert_eq!(taken[0].summary(), ["2 edges"]);
 }
 ```
 
@@ -1749,368 +1898,23 @@ what they return under their subject, stamped like a finding. A look reads
 state the engine's thread wrote while the run's thread was parked, so on
 the stepped clock two runs print the same report, as section 3 says.
 
-### MaD, end to end
-
-*Design. The kinds MaD's catalog adds are not written, the Edge carrier's
-RS-422 pair has no kind yet (section 9), and the file below has not been
-built: its harness was checked against the Edge netlist
-(`board/tests/fixtures/mad_edge.net`) by reading it, not by a test.*
+### MaD, the first project to extend embsim
 
 The MaD tensile tester (`RileyMcCarthy/MaD`, `SIL/`) is the consumer this
-design is checked against. Today its SIL is `mad-emulator`
-(`SIL/MaDSim/src/main.rs`), a program that assembles the system by hand:
-
-- the P2 instruction-set simulator as a component on no board, declaring
-  only the pins its lists name;
-- the DS2 add-on board;
-- a PTY;
-- bench pull-ups;
-- a stepper, an encoder and two end switches, coupled by callbacks;
-- the gantry, sample and strain-gauge chain;
-- an SD card node.
-
-As a project it is one crate, one binary and one file. `NODES.md` §13 maps
-each of `mad-emulator`'s pieces to a kind and lists what MaD has to change
-first.
-
-**The crate**, `SIL/catalog` (`mad-sim-catalog`), adds:
+section was designed against. Its SIL today is `mad-emulator`, a program
+that assembles the system by hand. As a project it is one catalog crate,
+`SIL/mad-catalog`, adding four kinds, and one file, `SIL/mad.toml`:
 
 | Kind | Sort | What it is |
 |---|---|---|
-| `mad-p2iss` | P2 core | `p2iss::P2Iss` as a `P2Core`, booting the chip's ROM off the board's flash as `qemu` does. Option `rom` (a file; by default the boot ROM `p2iss/rom/rom_booter_v33k.bin`) |
-| `mad-edge` | board | the MaD Edge carrier, from a netlist exported from `Hardware/EdgeBoard`; its socket `J3` a `boundary` |
-| `mad-sd-card` | part | a FAT16 card holding a directory (`p2iss::sdimage::mad_card`), embsim's SD card model in a connector. Option `dir` (required) |
-| `mad-machine` | component | the machine: servo drive, carriage, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant |
-
-`mad-machine`'s pins and its options:
-
-| Pins | What they are |
-|---|---|
-| `STEP`, `DIR`, `ENA` | the servo drive's inputs (`embsim_models::machine::StepperMotor`, `DIR` low forward, enable active low), read against `DRIVE_GND` |
-| `DRIVE_GND` | the drive's input return, on the carrier's `EN_GND` (`J21.8`) |
-| `ENC_A`, `ENC_B`, `ENC_Z` | the encoder's outputs (`QuadratureEncoder`, as many counts per millimetre as steps), against `ENC_GND` |
-| `ENC_GND` | the encoder's return, on `EN_GND` (`J20.5`) |
-| `UPPER+`, `UPPER-`, `LOWER+`, `LOWER-`, `DOOR+`, `DOOR-`, `ESD_U+`, `ESD_U-`, `ESD_L+`, `ESD_L-`, `ESD_A+`, `ESD_A-` | each switch as the sourced loop the carrier reads: `+` the machine's loop supply behind its normally-closed contact while the contact is closed, released while it is open; `-` that supply's return. The carrier's loops are a current regulator and an opto LED between `+` and `-` (`IC9` and `U6` for the upper end switch), and power nothing themselves |
-| `E+`, `E-` | the load cell's excitation, sensed: the bridge reads its excitation off the board instead of assuming 3.3 V |
-| `S+`, `S-` | the bridge's outputs, each behind the cell's 350 Ω, at the excitation's midpoint ± half the strain gauge's output |
-| `sample` (option) | the sample in the grips, one of the samples the crate carries with their provenance: `sil-linear-reference` |
-| `loop_volts` (option) | required: the machine's switch-loop supply. A scenario line names it (rule 6); the isolation test's bench uses 24 V |
-
-The rest of its numbers (8192 steps a millimetre, 100 mm of travel, the
-gantry's 15 mm of slack, the cell's sensitivity) are the machine's. They
-stay in the crate with their citations, as they are in `MaDSim` and `models`
-today.
-
-**The file**, `SIL/mad.toml`:
-
-```toml
-# The MaD tensile tester: the Edge carrier, the P2-EC32MB module in its
-# socket running the firmware on MaD's instruction-set simulator, the DS2
-# force-gauge add-on on the force cable, the machine on the carrier's
-# connectors, and the Raspberry Pi's serial port as a PTY.
-
-[catalog]
-crates = ["catalog"]     # SIL/catalog, the crate mad-sim-catalog
-
-[[board]]
-name = "EDGE"
-kind = "mad-edge"
-
-[[board]]
-name = "EC32"
-kind = "p2-ec32mb"
-
-[[board.model]]
-value = "P2X8C4M64P"
-kind = "p2"
-[board.model.options]
-core = "mad-p2iss"
-
-# Stage-1 and the propeller2_debug program, laid out by `make flash-image`
-# (p2iss::flashimage): the ROM boots the firmware off the module's flash.
-[[board.model]]
-value = "SPI Flash 16MB (128Mb)"
-kind = "w25q128jv"
-[board.model.options]
-pins = "by-function"
-image = "build/flash.bin"
-
-[[board.model]]
-value = "MicroSD Socket"
-kind = "mad-sd-card"
-[board.model.options]
-dir = "sd"
-
-[[board]]
-name = "DS2"
-kind = "netlist"
-netlist = "boards/ds2_addon.net"
-
-[[board.model]]
-part = "ADS122U04"
-kind = "ads122u04"
-
-[[component]]
-name = "MACHINE"
-kind = "mad-machine"
-[component.options]
-sample = "sil-linear-reference"
-loop_volts = 24.0
-
-[[component]]
-name = "HOST"
-kind = "host-serial"
-[component.options]
-baud = 2000000
-
-# ---- The module in its socket, and the force cable (edge-ec32-ds2.toml) ----
-
-[[mate]]
-a = "EC32.J203"
-b = "EDGE.J3"
-
-[[mate]]
-a = "EDGE.J9"
-b = "DS2.J1"
-map = [["1", "1"], ["5", "2"], ["4", "3"], ["2", "4"], ["3", "5"]]
-
-# ---- Supplies: the bench's, and the Pi's side of the isolator IC2 ----------
-
-[[wire]]
-from = "BENCH.12V"
-to = "EDGE.J2.1"
-volts = 12.0
-
-[[wire]]
-from = "BENCH.GND"
-to = "EDGE.J2.2"
-volts = 0.0
-
-[[wire]]
-from = "BENCH.SERVO5V"
-to = "EDGE.J21.1"
-volts = 5.0
-
-[[wire]]
-from = "BENCH.SERVOGND"
-to = "EDGE.J21.8"
-volts = 0.0
-
-[[wire]]
-from = "BENCH.IFGGND"
-to = "DS2.J1.2"
-volts = 0.0
-
-[[wire]]
-from = "BENCH.VDDA"
-to = "DS2.J2.1"
-volts = 3.3
-
-[[wire]]
-from = "BENCH.AGND"
-to = "DS2.J2.2"
-volts = 0.0
-
-[[wire]]                 # GND_IO, the isolated I/O domain's return
-from = "BENCH.IOGND"
-to = "EDGE.J10.2"
-volts = 0.0
-
-[[wire]]                 # RPI_5V: IC2's Pi-side supply
-from = "PI.5V"
-to = "EDGE.J4.1"
-volts = 5.0
-
-[[wire]]                 # RPI_GND
-from = "PI.GND"
-to = "EDGE.J4.6"
-volts = 0.0
-
-# ---- The host on the Pi's connector ----------------------------------------
-
-[[wire]]                 # the Pi's I/O rail: its GPIO are 3.3 V
-from = "PI.3V3"
-to = "HOST.VIO"
-volts = 3.3
-
-[[wire]]
-from = "PI.GND"
-to = "HOST.GND"
-
-[[wire]]                 # RPI_RX: IC2's input INC, what the Pi sends
-from = "HOST.TX"
-to = "EDGE.J4.3"
-
-[[wire]]                 # RPI_TX: IC2's output OUTA, what the Pi receives
-from = "EDGE.J4.2"
-to = "HOST.RX"
-
-# ---- The machine on the carrier's connectors -------------------------------
-
-[[wire]]                 # SC_PUL+, from the line driver U24
-from = "EDGE.J21.2"
-to = "MACHINE.STEP"
-
-[[wire]]                 # SC_DIR+
-from = "EDGE.J21.5"
-to = "MACHINE.DIR"
-
-[[wire]]                 # SC_ENA, from JP1's common pad
-from = "EDGE.J21.7"
-to = "MACHINE.ENA"
-
-[[wire]]                 # EN_GND, the drive's input return
-from = "EDGE.J21.9"
-to = "MACHINE.DRIVE_GND"
-
-[[wire]]                 # A+, into the line receiver U25
-from = "MACHINE.ENC_A"
-to = "EDGE.J20.1"
-
-[[wire]]                 # B+
-from = "MACHINE.ENC_B"
-to = "EDGE.J20.3"
-
-[[wire]]                 # ZI+, U25's third channel (J20.7 and .8 are its enables)
-from = "MACHINE.ENC_Z"
-to = "EDGE.J20.9"
-
-[[wire]]                 # EN_GND, the encoder's return
-from = "MACHINE.ENC_GND"
-to = "EDGE.J20.5"
-
-# The switch loops follow the nets: IEND_U is on J16, IEND_L on J15 and
-# IDOOR on J14, whatever the silkscreen says (board/tests/machine_parts,
-# machine_harness). Pin 2 of each is the loop's + (the current regulator's
-# anode), pin 1 its - (the opto LED's cathode).
-[[wire]]
-from = "MACHINE.UPPER+"
-to = "EDGE.J16.2"
-
-[[wire]]
-from = "EDGE.J16.1"
-to = "MACHINE.UPPER-"
-
-[[wire]]
-from = "MACHINE.LOWER+"
-to = "EDGE.J15.2"
-
-[[wire]]
-from = "EDGE.J15.1"
-to = "MACHINE.LOWER-"
-
-[[wire]]
-from = "MACHINE.DOOR+"
-to = "EDGE.J14.2"
-
-[[wire]]
-from = "EDGE.J14.1"
-to = "MACHINE.DOOR-"
-
-[[wire]]                 # IESD_U, J11
-from = "MACHINE.ESD_U+"
-to = "EDGE.J11.2"
-
-[[wire]]
-from = "EDGE.J11.1"
-to = "MACHINE.ESD_U-"
-
-[[wire]]                 # IESD_L, J12
-from = "MACHINE.ESD_L+"
-to = "EDGE.J12.2"
-
-[[wire]]
-from = "EDGE.J12.1"
-to = "MACHINE.ESD_L-"
-
-[[wire]]                 # IESD_A, J13
-from = "MACHINE.ESD_A+"
-to = "EDGE.J13.2"
-
-[[wire]]
-from = "EDGE.J13.1"
-to = "MACHINE.ESD_A-"
-
-[[wire]]                 # the bridge's excitation: VDDA and its return
-from = "MACHINE.E+"
-to = "DS2.J2.1"
-
-[[wire]]
-from = "MACHINE.E-"
-to = "DS2.J2.2"
-
-[[wire]]                 # A0
-from = "MACHINE.S+"
-to = "DS2.J2.3"
-
-[[wire]]                 # A1
-from = "MACHINE.S-"
-to = "DS2.J2.4"
-
-# ---- Scenario ---------------------------------------------------------------
-
-[[switch]]               # FLASH: P61 is the flash's chip select
-part = "EC32.S301"
-pole = 1
-state = "closed"
-
-[[switch]]               # R303 holds P59 down: boot the program in flash
-part = "EC32.S301"
-pole = 3
-state = "closed"
-
-[[switch]]               # JP1, TTL-SINK: SC_ENA from IC14's TTL output
-part = "EDGE.JP1"        # through R24 (pads A and C)
-pole = 0
-state = "closed"
-
-[[jumper]]               # A-, B- and ZI- to the encoder ground: a
-part = "EDGE.JP2"        # single-ended encoder on the RS-422 receiver
-state = "closed"
-
-[[jumper]]
-part = "EDGE.JP3"
-state = "closed"
-
-[[jumper]]               # Z_GND: Z-, U25's active-low enable, to EN_GND
-part = "EDGE.JP4"
-state = "closed"
-
-[[jumper]]               # ZI_GND
-part = "EDGE.JP5"
-state = "closed"
-
-[[jumper]]               # A0 and A1 to the converter (R6 and R7 are DNP)
-part = "DS2.JP1"
-state = "closed"
-
-[[jumper]]
-part = "DS2.JP2"
-state = "closed"
-
-[[pin_short]]            # the bench's ~RESET strap: the stock board leaves
-a = "DS2.U1.3"           # U1's reset on a net of its own
-b = "DS2.U1.13"
-```
-
-Which of `JP1`'s two positions the machine's drive takes (pads A and C, the
-TTL output; pads B and C, `Q1`'s open collector) is the machine's, and so is
-`loop_volts`; the file states the first and the isolation test's 24 V, and
-both are for MaD to confirm (`NODES.md` §13, "Open").
-
-**The commands** that replace `mad-emulator` (`SIL/makefile`), through
-`embsim` itself, which builds the runner for `SIL/catalog` (or through a
-binary of MaD's own, `cargo run -p mad-sim --`, if MaD prefers to own it):
-
-```bash
-cd SIL
-embsim check mad.toml                        # every board, wire and kind checked; time held
-embsim run mad.toml --pty /tmp/tty.rpi       # make playground / e2e-emulator: until Ctrl-C
-embsim run mad.toml --for 2s --net EDGE.+3.3V
-```
-
-Until embsim ships kinds for the Edge board's RS-422 pair (`U24`, `U25`;
-section 9), `check` refuses `EDGE` and names those two parts, as it refuses
-`edge-ec32-ds2.toml` today. `make playground-rom`'s serial boot is a second
-file: the same boards with `S301` set for serial boot, an erased flash, and
-the host on the carrier's `Debug` header (`J1`: `P62`, `P63`, `RESn`).
+| `mad-edge` | board | the MaD Edge carrier, from its KiCad export; its module socket `J3` a `boundary` |
+| `mad-ds2` | board | the DS2 force-gauge add-on, from its KiCad export; its converter `U1` an `ads122u04` |
+| `mad-p2iss` | P2 core | MaD's instruction-set simulator, `p2iss::P2Iss`, once it implements `P2Core`, booting the ROM off the module's flash |
+| `mad-machine` | bench component | the machine: servo drive, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant |
+
+[`MIGRATING-MAD.md`](MIGRATING-MAD.md) holds the file as it would read,
+the crate's contents, and the ordered changes on both sides, each with the
+files it touches and the test that says it is done. `NODES.md` §13 maps
+each of `mad-emulator`'s pieces to a kind, and lists what embsim owes
+first: kinds for the Edge carrier's RS-422 pair (section 9), the ADS122U04
+applying the firmware's register writes, and the `Assembly`.

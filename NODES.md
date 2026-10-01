@@ -249,7 +249,7 @@ The crossing is Δ = τ·ln((v∞ − v0)/(v∞ − v_th)), defined only when v_
    - **What MaD will need** (unedited): `Component::references()` has a default and `PartClass::Registered` patterns with `..` are unaffected (`SIL/MaDSim`/`p2iss` match none as far as this repository shows); `embsim_boards::stub` and `ec32mb::{BUCK_PINS, BROWNOUT_PINS, LDO_PINS}` are gone (nothing in MaD imported them); `Ec32mb` now registers `BUCK_PART`/`LDO_PART`/`BROWNOUT_DETECTOR_PART`, and a MaD system that powers the module from `J203` sees every module rail 2.5 ms after the 5 V arrives — a build snapshot has them down with `RailDown`, and a live system steps to `t_SS`; the module's `Common_VDD` on a bench with no 5 V finger reads `Floating`, not `Pulled(Low, 23 800)`.
 5. **Capacitors.** Proof: `cluster_handchecks` RC step reads 63.2 % at t0 + τ to 1 µV and the digital sense fires at exactly `round(τ·ln(3.3/1.8))` ns; a second drive before the crossing cancels it (one `Crossing` record); 25 Ω into 10 pF schedules nothing and the bit-grid test passes with that pad cap declared; 100 pF on TX: the byte decodes, edges at +2/+2 ns; DS2 populated filter settles by 5τ_diff with the pair decomposition; `MultiPoleBlock` on an asymmetric two-cap fixture and on a cap-plus-PWL node; a released TX with 100 pF holds `Analog(v0)`; `Harness::leak` reproduces the permanent-start-bit symptom; incremental == full for Settling; `ln_q` matches libm to 1e-9 on 10⁶ points; the macOS determinism leg green; four goldens unchanged.
 6. **I2C bench.** `i2c_bus.rs`: 100 kHz round trip, slave stretches and the master waits, two masters arbitrate, rise at 910 ns with 100 pF; a strength change at the same level re-publishes.
-7. **Plant-driven edges; caching only if earned.** `MaDSim/src/wiring.rs` BridgeDrive → four `SetEdge` legs (hand-computed differential to 1 µV), the first mutable conductance; an LU cache per (topology, impedance signature) only if the phase-0 bench shows an escalated cluster on a hot path.
+7. **Plant-driven edges; caching only if earned.** MaD's `BridgeDrive` (`MaDSim/src/wiring.rs` when this was written, `system_description.rs` in MaD's tree of 2026-10-01, and `mad-machine`'s bridge after `MIGRATING-MAD.md`) → four `SetEdge` legs (hand-computed differential to 1 µV), the first mutable conductance; an LU cache per (topology, impedance signature) only if the phase-0 bench shows an escalated cluster on a hot path.
 
 ## 9. Non-goals, and the answer
 
@@ -449,7 +449,7 @@ Each phase is one pull request, gated by its proof list and by the goldens passi
 
 ## 13. Decision record: extending embsim from a project (2026-10-01)
 
-*Decided 2026-10-01 on `feat/embsim-catalogs`, stacked on `feat/embsim-projects` (draft PR 94). The user-facing contract is `PROJECTS.md` §10. This record holds what was chosen, the alternatives and why each was or was not taken, the code that changes, the §5 test, the proof that says it is done, MaD mapped onto it, and the review the design had before code. Line references marked "at d4adf05" are against that tree and, for MaD, against its working tree on 2026-10-01 (branch `feat/iss-rom-serial-flash`).*
+*Decided 2026-10-01 on `feat/embsim-catalogs`, stacked on `feat/embsim-projects` (draft PR 94). The user-facing contract is `PROJECTS.md` §10; MaD's plan is `MIGRATING-MAD.md`. This record holds what was chosen, the alternatives and why each was or was not taken, the code that changes, the §5 test, the proof that says it is done, MaD mapped onto it, and the review the design had before code. Line references marked "at d4adf05" are against that tree and, for MaD, against its working tree on 2026-10-01 (branch `feat/iss-rom-serial-flash`).*
 
 **The ask**, in the user's words: "the CLI should be a tool and a project like MaD should be able to add its own models, ISS, boards etc." PR 94 left these pieces:
 
@@ -467,7 +467,7 @@ The reference consumer, MaD, assembles its SIL by hand in `SIL/MaDSim` (`mad-emu
    - `main_with(CatalogSet) -> ExitCode`: the same with the process's arguments and standard output;
    - `shipped() -> CatalogSet`: the standard catalog plus `embsim_p2_qemu::catalog::register`.
 
-   `src/main.rs` is `embsim_cli::main_with(embsim_cli::shipped())`. `live.rs` and `checklist.rs` take the set and a writer. A project's binary is ten lines: `shipped()`, its registration function, `main_with` (the crate docs show it). The record had `main_with(&[Registration { name, dir, register }])`; the directory exists only for the runner's "who runs a project" rule, which is not built, so the entry point takes the set and leaves that rule to the runner (see "Open").
+   `src/main.rs` is `embsim_cli::main_with(embsim_cli::shipped())`. `live.rs` and `checklist.rs` take the set and a writer. A project's binary is ten lines: `shipped()`, its registration function, `main_with` (the crate docs show it, and the worked example has one, `examples/custom-project/catalog/examples/own_binary.rs`). The record had `main_with(&[Registration { name, dir, register }])`; the directory exists only for the runner's "who runs a project" rule, which is not built, so the entry point takes the set and leaves that rule to the runner (see "Open").
 2. **Catalogs compose in a `CatalogSet`** (`embsim_boards::catalog`, `boards/src/set.rs`), which implements `Catalog` by dispatch. *Built.*
    - `CatalogSet::new()` holds the standard catalog and its `held-in-reset` core; `add(impl Catalog)` and `add_cores(impl CoreCatalog)` add the rest. Each catalog's kinds are read once when it joins.
    - A name two catalogs provide is held, and refused where a project names it (decision (a), revised below).
@@ -528,6 +528,20 @@ Two generalisations came with these, because the five need them. Both are built:
 4. **Fast path free?** Yes: a project without `[catalog]` runs in the tool as before, the tool reading one table first; a runner with nothing changed costs Cargo's no-op check before the run, and nothing during it.
 5. **One pipeline?** Yes: every board of a runner's project is surveyed and built by `Board::from_netlist` through the same `Project`; no plugin interface, no second build path.
 6. **Observable, goldens unchanged?** Yes: the tests below; nothing on the resolution path moved, so the determinism goldens are byte-identical.
+
+### The guides and the MaD plan, as written (2026-10-01)
+
+*The documentation pass on `feat/embsim-catalogs`, after the runner. No library code moved: one example binary, one build-only test, one doc comment.*
+
+- **The guide is the code.** Every Rust block in `PROJECTS.md` §10 is now a doc test of `embsim-boards` (the core catalog, a board kind bringing its own `boundary` entry for a socket of its own symbol library, a `Report` as the run takes and reads it) or a quotation of the worked example, whose crate every gate compiles. A quotation carries `<!-- quoted from PATH -->` above its fence, and `boards/tests/guide_quotes.rs` fails when a quoted block is not its file's text, line for line, across `README.md`, `PROJECTS.md`, `TESTING.md`, `MIGRATING-MAD.md` and the example's README. Left `ignore`, and said so beside each: the runner's `main` (generated; `cli/tests/runner.rs` asserts its parts) and the MaD crate's sketches in `MIGRATING-MAD.md` (MaD's code, not written).
+- **The project's own binary is in the example.** `examples/custom-project/catalog/examples/own_binary.rs`, the ten lines over `main_with`, is what §10 quotes for a project that owns its binary; `cargo run -p custom-project-catalog --example own_binary -- run project.toml --for 10ms` prints what `embsim run` prints. Found writing it: a binary over `embsim_cli` that links QEMU needs QEMU's link arguments, which `embsim-p2-qemu` hands only to a direct dependent's build script, so such a binary's crate depends on `embsim-p2-qemu` and carries a `build.rs` like the runner's (`BUILD_RS`, `cli/src/runner.rs`). §10 says so; a helper that spares the copy is open.
+- **Every command was run.** `new --catalog --add-to`, `check` and `run` of a scratch project, and the example's `check` and `run`, with the output §10 and the example's README show. Measured: the first runner build from an empty target directory compiled 54 crates in 19 s on an eight-core machine; a `run … --for 10ms` with nothing changed took 0.3 s, Cargo's check included.
+- **(n) MaD's boards are board kinds of MaD's catalog**: `mad-edge` (the Edge carrier, its `J3` socket a `boundary`) and `mad-ds2` (the DS2, its converter an `ads122u04`), each netlist exported from `Hardware/` and bundled. This revises the record's "the Edge carrier is a `kind = \"netlist\"` board" (review item 11 and the first MaD list). The user's ask names boards among what a project adds; MaD has two files (the flash boot and the serial boot) that would each repeat the netlist path and the board's entries; and a hardware revision is then one re-export in one crate. Review item 11's point stands: nothing generic goes in MaD's crate.
+- **(o) The crate is `SIL/mad-catalog`, package `mad-catalog`**, not `SIL/catalog` (`mad-sim-catalog`): `embsim new --catalog mad-catalog`, run in `SIL/`, gives that name and `mad-…` kinds. The tool reads the name off the path it is given, so `--catalog catalog` in `SIL/` would give `project-catalog`, and `--catalog SIL/catalog` from the repository root `sil-catalog`.
+- **(p) The images, until embsim's options ship.** MaD writes `SIL/build/flash.bin` (`p2iss::flashimage::boot_flash`) and `SIL/build/sd.img` (`p2iss::sdimage::mad_card`) with two make targets, and the file names them with the kinds embsim ships (`w25q128jv` `image`; `sd-card` `image`, with `pins = \"by-function\"`, which `J301`'s pin names need). An EC32 project naming both, with stand-in images, passes `check` today. The flash-layout and `dir` options stay owed (E5 in `MIGRATING-MAD.md`) and retire the targets.
+- **(q) MaD runs the tool from its pinned submodule** (`cargo run --release --manifest-path embsim/Cargo.toml -p embsim-cli --` in `SIL/makefile`), so the runner and `mad-catalog`'s path dependencies are one checkout without an install step; an installed `embsim` built from that checkout does the same.
+- **(r) `P2Iss` keeps its `Component` beside the new core** until `mad-emulator` retires: a `P2IssCore` sharing its machine implements `P2Core`, so nothing MaD runs today stops while the project is built. The pin lists, the `P59` fiat and the bare component go at retirement (`MIGRATING-MAD.md` step 11).
+- **Found reading MaD's tree for the plan:** the machine has no pin for the drive's ready output (`SC_SRDY`, `J21.6`; the firmware's `SERVO_RDY` on `P5`), which `mad-emulator` holds inactive with a bench pull. It joins MaD's questions.
 
 ### The code that changed
 
@@ -599,56 +613,44 @@ The built pieces' tests are stepped where they run a system (`TESTING.md` rule 9
 - `cli/tests/runner.rs`, the binary as a user runs it: `new --catalog --add-to` writes the crate (its dependencies on the tool's checkout, its library the template under the project's name) and adds it to the project, comments kept; `new NETLIST -o P --catalog DIR` writes both, and refuses a crate directory that is not empty before writing anything; a crate that is not there is refused before Cargo; with no Cargo the runner's files are written (one binary on `embsim-cli` from the checkout and the crate by path, a workspace of its own, a main over the crate's registration function, `.embsim/` ignored) and the error says how to get Cargo; a runner refuses a project naming other crates. Three cases build runners and are `#[ignore]`d, run by CI's `project-runner` job: `examples/custom-project` checked and run through the real binary and its runner (every edge at its nanosecond, the second build quiet, `--rebuild` recompiling the crate), a started crate built and run outside any workspace, and a crate that does not compile shown with rustc's error and the tool's line. They declare no behaviour, as the QEMU boot does not: the ledger's suite builds no runner.
 - `cli/tests/template.rs`: the started crate's four kinds checked and run in one project, as its runner runs them.
 - `examples/custom-project/catalog/tests/project.rs`: the example run as its runner runs it: the first edge at the START instant plus the buffer's 12 ns, one a millisecond after, five in 10 ms, the pad flipped eight times.
+- `boards/tests/guide_quotes.rs` (build only): every block a guide quotes from a file is that file's text, and `PROJECTS.md` quotes the example's registration function and its own binary; `PROJECTS.md`'s doc tests (`cargo test -p embsim-boards --doc`) run the board kind with its own entry and the report.
 - Not built, so not proved: `board/tests/assembly.rs` (the `Assembly`).
 
 ### MaD mapped onto it
 
-Every piece of `mad-emulator` becomes a kind, a line of `SIL/mad.toml` (`PROJECTS.md` §10 has the file whole), or nothing because the board does the job:
+Every piece of `mad-emulator` becomes a kind, a line of `SIL/mad.toml` (`MIGRATING-MAD.md` §4 has the file whole), or nothing because the board does the job. *Revised by the docs pass* ("The guides and the MaD plan, as written", below): MaD's two boards are board kinds of its catalog, and the images come from make targets until embsim's options ship.
 
 | `mad-emulator` today | Becomes | Kind |
 |---|---|---|
 | `P2Iss` (`p2iss/src/lib.rs:869`), a `Component` (`:1069`) named `P2` with no board, whose pins are only the ones its lists name (`SerialLink`, `with_level_pins`, `with_input_pins`, `with_pulse_pins`) | the P2-EC32MB's `U100`, a `p2` with `core = "mad-p2iss"`: all 64 pads on the package's pins, each pad's role read from its mode word as QEMU's pads are, so the lists go | `mad-p2iss` (MaD's core) |
-| the image loaded straight into hub RAM (`P2Iss::new(&image, ..)`, `main.rs:194`) | stage-1 and the program in the module's flash, booted by the ROM | `w25q128jv` with a P2 flash-boot layout option (embsim's to ship, "What embsim owes") |
+| the image loaded straight into hub RAM (`P2Iss::new(&image, ..)`, `main.rs:258`) | stage-1 and the program in the module's flash, booted by the ROM | `w25q128jv` with `image`, written by `make flash-image` until a P2 flash-layout option ships ("What embsim owes") |
 | `run_iss_rom` (`main.rs:99`), its `P59` strap `Pull`, the host on `P62`/`P63` | a second file: `S301` set for serial boot, the host on the carrier's `Debug` header `J1` | `[[switch]]`, `host-serial` |
 | `HostPty` on `P2.P55`/`P2.P53` | the host on the carrier's Pi connector, `TX` into `J4.3` (`RPI_RX`, `IC2`'s input `INC`) and `RX` from `J4.2` (`RPI_TX`, `IC2`'s output `OUTA`), its `VIO` the Pi's 3.3 V and its `GND` the Pi's, with the Pi's side of the isolator supplied on `J4.1`/`J4.6` | `host-serial` (standard) |
 | `BenchPulls`/`IDLE_PULLS` (`iss_description.rs:90`, `:121`) | nothing: the carrier's isolators, optos and their resistors set those lines, and a line the board leaves open is a finding, not a bench pull | none |
-| `BenchSd` with `SdCardNode` on four bare pins, and `MisoPullUp` (`:464`, `:503`) | the module's own socket `J301`, sharing `P58`–`P61` with the flash as `ec32mb.rs` documents. The 15 kΩ pull the firmware asks for is its own pad mode (`P_HIGH_15K`), published through `pad_drive` | `sd-card` with a `dir` option (embsim's to ship, "What embsim owes") |
-| `sdimage::mad_card` mirroring `--sd-path` | the `sd-card` kind's `dir` option | `sd-card` |
-| `BenchForcePath` (`:184`): the DS2 from `DS2_NETLIST`, the converter registered pre-configured (`vref_mv`, gain 128), `JP1`/`JP2` closed, the `~RESET` `pin_short`, straps on `J1`/`J2`, and the force-gauge UART wired straight to `P2.P2`/`P2.P0` | the DS2 as a `netlist` board with `ads122u04`, configured by the firmware's `WREG` writes once the model applies them ("What embsim owes"), the same scenario lines, on the carrier's force cable through its isolator `IC5` | `netlist`, `ads122u04`, `[[jumper]]`, `[[pin_short]]`, `[[mate]]` |
+| `BenchSd` with `SdCardNode` on four bare pins, and `MisoPullUp` (`:464`, `:503`) | the module's own socket `J301`, sharing `P58`–`P61` with the flash as `ec32mb.rs` documents. The 15 kΩ pull the firmware asks for is its own pad mode (`P_HIGH_15K`), published through `pad_drive` | `sd-card` with `pins = "by-function"` (`J301`'s pins are named by function) |
+| `sdimage::mad_card` mirroring `--sd-path` | the card's `image`, written by `make sd-image` until the `sd-card` kind's `dir` option ships | `sd-card` |
+| `BenchForcePath` (`:184`): the DS2 from `DS2_NETLIST`, the converter registered pre-configured (`vref_mv`, gain 128), `JP1`/`JP2` closed, the `~RESET` `pin_short`, straps on `J1`/`J2`, and the force-gauge UART wired straight to `P2.P2`/`P2.P0` | the DS2 as the `mad-ds2` board kind, its netlist bundled and its converter an `ads122u04` configured by the firmware's `WREG` writes once the model applies them ("What embsim owes"), the same scenario lines, on the carrier's force cable through its isolator `IC5` | `mad-ds2` (MaD's board), `[[jumper]]`, `[[pin_short]]`, `[[mate]]` |
 | the `PROTO` and `FORCE_GAUGE` `SerialLink`s | nothing: the ISS reads each async smart pin's rate from the guest's mode word | none |
 | `LoadCellBridge`/`BridgeDrive` (`system_description.rs:46`, `:86`), its excitation the constant `BRIDGE_EXCITATION_V` (`:30`) | inside `mad-machine`: `S±` behind 350 Ω as today, centred on the excitation it senses on `E±` instead of on a constant | `mad-machine` |
 | `BenchMachine` (`iss_description.rs:290`): the stepper, the encoder, two end switches, the shaft callback, `CarriageTravel` | inside `mad-machine`, its switches presented as the sourced loops the carrier reads (`UPPER±`, `LOWER±`, `DOOR±`, `ESD_U±`, `ESD_L±`, `ESD_A±`, behind the required `loop_volts`), its drive inputs and encoder outputs against their own returns (`DRIVE_GND`, `ENC_GND` on `EN_GND`); `CarriageTravel` becomes the machine's report | `mad-machine` |
-| the gantry, sample and strain-gauge chain (`main.rs:306` onward; the `models` crate) | inside `mad-machine`; the sample is its `sample` option | `mad-machine` |
+| the gantry, sample and strain-gauge chain (`main.rs:305`–`345`; the `models` crate) | inside `mad-machine`; the sample is its `sample` option | `mad-machine` |
+| the Edge carrier, not modelled | the `mad-edge` board kind, its netlist exported from `Hardware/EdgeBoard` and bundled, its socket `J3` a `boundary`, in the module's socket by a `[[mate]]` | `mad-edge` (MaD's board) |
 | harness wires to bare `P2.Pnn` | wires to the carrier's connectors (`J21`, `J20`, `J11`–`J16`, `J4`) and the add-on's `J2` | `[[wire]]` |
 | the telemetry thread (`main.rs:360`) | the `mad-p2iss` core's report and the machine's report | `Report` |
 | `--speed`, `virtual_clock::init`, `take_time_authority` (`main.rs:225`) | the run's stepped clock: unpaced, as `make e2e-emulator`'s `--speed 0` is. Not yet a home for the ISS with a host that must keep wall time ("Open", item 5) | none |
 | `install_shutdown_signals`, `park_until_shutdown` | `run`'s handler (decision (k)) | none |
 
-**What MaD changes, in order:**
-
-1. **The open items of §12 item 5's MaD list.** The interface rewrite is done in MaD's working tree: no `PinKind`, `StreamRole` or `level_of` remains in `p2iss/src`, and `HostPty` is embsim's. What is still open:
-   - `P2Iss` becomes a `P2Core`. It takes `P2Pads` with all 64 pads and their senses through `P2Pads::on_pad_sense`. Its pads drive through `bank_supplies().pad_drive(pin, WRPIN, dir, out)`. `start()` anchors its clock at the package's START instant, on the engine thread, and `reset()` holds it. Any MaD assertion on a boot instant moves by the 3 ms restart.
-   - The pin lists (`SerialLink`, `with_level_pins`, `with_input_pins`, `with_pulse_pins`) are replaced by each pad's mode word.
-   - `p2core/src/board.rs:482` `sensed()` takes the strong-mask rule.
-   - The `P59` fiat goes (`p2iss/src/lib.rs:939`).
-2. **The catalog crate**, `SIL/catalog` (`mad-sim-catalog`), a member of MaD's SIL workspace, with `pub fn register(&mut CatalogSet)`:
-   - `IssCores` (core kind `mad-p2iss`: `rom`, by default `p2iss/rom/rom_booter_v33k.bin`), with the ISS's report;
-   - component kind `mad-machine` (the plant, `sample`, `loop_volts`), with its report.
-
-   The Edge carrier is a `kind = "netlist"` board (a netlist of `Hardware/EdgeBoard` exported with `kicad-cli` to `SIL/boards/mad_edge.net`, with a provenance header as `ds2_addon.net` has, and `[[board.model]] part = "P2_EDGE_MODULE_SOCKET" kind = "boundary"` in the file), and the card is embsim's `sd-card` with `dir`, so the crate holds MaD's two kinds and no generic one.
-3. **The binary**: none of MaD's own. `SIL/mad.toml` names `[catalog] crates = ["catalog"]`, and `embsim` (installed from the `SIL/embsim` submodule, so its checkout is the one the crate's path dependencies reach) builds the runner in MaD's `SIL/target`. A `SIL/sim` (`mad-sim`) over `embsim_cli::main_with` stays an option for a MaD that prefers to own its binary.
-4. **The files**:
-   - `SIL/mad.toml`, and a second file for the serial boot;
-   - `SIL/boards/` holding both exports (`MaDSim/boards/ds2_addon.net` moves there);
-   - nothing in `.gitignore`: `SIL/.embsim/` carries its own.
-5. **The callers**: `make playground`, `playground-iss`, `playground-rom` and `e2e-emulator` become `mad-sim run … --pty …`. `MaDSim/tests/pty_protocol.rs` moves to a test of the project. CI runs `mad-sim check SIL/mad.toml`. `mad-emulator` retires only once "Open" items 5 and 10 are answered.
+**What MaD changes, in order** is `MIGRATING-MAD.md` §5: eleven steps, each with the files it touches and the test that says it is done. The record's first list (the open items of §12 item 5's MaD list, the crate, the binary, the files, the callers) is folded into it; what changed in folding is "The guides and the MaD plan, as written", below.
 
 **What embsim owes before MaD's file checks:**
 
 - kinds for the Edge carrier's RS-422 pair, `U24` (AM26LS31) and `U25` (AM26LV32). These are `PROJECTS.md` §9's two parts, with their provenance and the `U25` part-number disagreement settled. They are generic TI parts, so they are embsim's to ship: a project crate should not fork a model. Until they land, `check` refuses `EDGE` and names the two parts, as it refuses `edge-ec32-ds2.toml` today;
 - the ADS122U04 model applying `GAIN` and `VREF` from the firmware's register writes, with `VREF = AVDD` taken as the sensed `AVDD − AVSS` (the firmware's write names the reference, rule 6), proved by a stepped test: 1 mV of differential input at gain 128 on a 3.3 V `AVDD` reads the code the datasheet's transfer function gives. Without it the force path reads about 79 times low, and MaD must not fork an `mad-ads122u04` kind to work around it;
 - a P2 flash-boot layout option on `w25q128jv` (a `p2_program` file, laid out behind embsim's stage-1 when the board is built), and a `dir` option on `sd-card` (a FAT16 card holding a directory): both are generic P2 and FlexC needs;
-- the `Assembly`, for a plant made of embsim's models.
+- the `Assembly`, for a plant made of embsim's models;
+- a pace for `run`, or a host the board's clock meters, before `make playground` (real time, for a person watching) moves, and review item 5's answer before `make e2e-emulator` does.
+
+`MIGRATING-MAD.md` §2 numbers these E1–E5 and says which MaD step waits on each.
 
 ### Review, 2026-10-01
 
@@ -664,7 +666,7 @@ A review of the record before code raised twelve points. Each is resolved below,
 8. **No Rust toolchain, or a prebuilt `embsim`** (medium). *Answered with the runner* ("The runner, as built"), all but the QEMU line at hand-over. As raised: the errors it asks for ("names catalog crates, which need Cargo"), the embsim version and source printed under the project line, and saying at handover that the runner cannot link QEMU.
 9. **Refusing a doubled kind when a catalog joins breaks working projects on an upgrade** (medium). *Accepted and built:* decision (a), option (b) of the review, with the naming advice changed and `p2iss` renamed `mad-p2iss`.
 10. **Two performance costs are unmeasured: MaD's image booting off flash, and all 64 pads on nets** (medium). *Open; MaD's measurements.* `rom_boot_net.rs` pointed at stage-1 and the real program, and an `iss_speed` run with every pad on a net, recorded here before `mad-emulator` retires; a `program` fast-load is a §5 "no" to record first if the numbers call for it.
-11. **The flash image and the SD card are generic needs** (medium). *Accepted;* owed by embsim ("What embsim owes"). MaD's catalog holds only `mad-p2iss` and `mad-machine`, and MaD's file names the Edge carrier as a `netlist` board. `CatalogBoard::models` is proved with a fixture board kind (`boards/tests/catalog_set.rs`, `cli/tests/library.rs`), not with MaD.
+11. **The flash image and the SD card are generic needs** (medium). *Accepted;* owed by embsim ("What embsim owes"). *Revised by the docs pass (decision (n)):* MaD's catalog also holds its two boards as board kinds; no generic kind. As first recorded: MaD's catalog holds only `mad-p2iss` and `mad-machine`, and MaD's file names the Edge carrier as a `netlist` board. `CatalogBoard::models` is proved with a fixture board kind (`boards/tests/catalog_set.rs`, `cli/tests/library.rs`), not with MaD.
 12. **The plant's sampled cadence and an invented common ground** (medium). *Accepted in part.* The plant's pins now carry their own references (`DRIVE_GND`, `ENC_GND`, each loop's `-`), so no ground is common inside it that the board does not join. The cadence is the `Assembly`'s to record as a §5 "no" with its bound when it is designed — a switch trips within one observation of the carriage, and the encoder's count equals the steps folded — or to avoid by publishing the encoder as a periodic drive at the shaft's rate.
 
 ### Open
@@ -673,7 +675,9 @@ A review of the record before code raised twelve points. Each is resolved below,
 - **The ISS with a host that keeps wall time** (review item 5): a metered host kind, or the user's answer on the ISS + PTY run; and with either, whether `run` gets a pace.
 - **MaD's measurements** (review item 10): the ISS's boot off flash, and every pad on a net.
 - **MaD's answers**: the machine's loop supply (`loop_volts`, or the carrier's `5V_IO`), `JP1`'s position, and the board's `IC2` rail against a Pi's 3.3 V (review items 2 and 4).
-- **The stepped test of MaD's file** (review item 1), with MaD's catalog.
+- **The stepped test of MaD's file** (review item 1), with MaD's catalog: `MIGRATING-MAD.md` step 9.
+- **QEMU's link arguments for a project's own binary**: today a copy of the runner's `build.rs` and a direct dependency on `embsim-p2-qemu`; a helper (a function the build script calls, or the arguments carried another way) would spare the copy.
+- **The drive's ready output** on `mad-machine` (`SC_SRDY`), with MaD's answers.
 - **A git source** for `[catalog] embsim`, if the runner keeps that key.
 - **A generated `component-kinds` table** in `PROJECTS.md` §5, beside the two tables `projects_md_tabulates_every_kind_the_catalog_ships` generates; §5's two hand-written bench tables move there.
 - **More bench parts:** a host on a 1.8 V rail, a released step, ramps and repeats in `scripted-source`.

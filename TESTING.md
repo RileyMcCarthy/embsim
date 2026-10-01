@@ -259,9 +259,17 @@ cargo test -p embsim-board --test edge_project --test edge_project_live
 cargo test -p embsim-boards --lib catalog
 # PROJECTS.md's Rust examples, run as doc tests of embsim-boards from its
 # directory: a project loaded, surveyed and built, a catalog of one's own
-# adding a board kind and a part kind to a catalog set, and a core catalog
-# adding a P2 core.
+# adding a board kind and a part kind to a catalog set, a core catalog
+# adding a P2 core, a board kind that brings its own entry for a socket of
+# its own symbol library, and a report as a run takes and reads it.
 cargo test -p embsim-boards --doc
+# The guides' quotations (build only): every code block README.md,
+# PROJECTS.md, TESTING.md, MIGRATING-MAD.md or the example's README marks
+# `<!-- quoted from PATH -->` is that file's text, line for line, and
+# PROJECTS.md quotes the worked example's registration function and its own
+# binary. The quoted files are the example's, which every gate compiles, so
+# the guide's code that is not a doc test is still code that builds.
+cargo test -p embsim-boards --test guide_quotes
 # Catalogs composed into one (`boards/src/set.rs`), build only: a kind two
 # catalogs provide refused where a project names it, naming both, and a
 # project that does not name it surveyed; a core and a base part number
@@ -307,9 +315,36 @@ cargo test -p embsim-cli
 cargo test -p embsim-cli --test runner -- --ignored
 
 # The worked example's own test: its project run as its runner runs it, in
-# process, every edge at its nanosecond (stepped, own binary).
+# process, every edge at its nanosecond (stepped, own binary). The crate is
+# a workspace member, so `cargo test --workspace` (CI's test job) runs this
+# and compiles its own binary (`examples/own_binary.rs`); clippy and doc
+# take it too. Run it as a user would, from examples/custom-project:
+#   cargo run -p custom-project-catalog --example own_binary -- run project.toml --for 10ms
 cargo test -p custom-project-catalog
 ```
+
+How CI runs the project pieces: the `test` job's `cargo test --workspace
+--all-targets` and `--doc` run everything above but the `#[ignore]`d runner
+builds, among them the example's test, the started crate's test
+(`cli/tests/template.rs`), the guide's doc tests and `guide_quotes`; the
+`project-runner` job runs `cargo test -p embsim-cli --test runner --
+--ignored`, which builds real runners with Cargo; the `p2-qemu-boot` job
+runs `cargo test -p embsim-cli` with QEMU linked, where `run` boots the P2
+off the module's flash. The behaviour ledger's suite (`vibes.suite.json`)
+runs `embsim-board`, `embsim-boards`, `embsim-cli` and
+`custom-project-catalog`, so the runner builds and the QEMU boot declare no
+behaviours: the ledger's run builds neither.
+
+**A project's own catalog** is tested the way the example's is, in the
+project's repository: a test that runs the project file through
+`embsim_cli::run_with_crates` with the crate's registration function, in
+process and stepped inside the command, asserting on what the run prints
+(`examples/custom-project/catalog/tests/project.rs`); and, for a property
+the printout does not carry (a byte crossing a PTY, a net's level at an
+instant), a test that loads the file with `embsim_board::Project`, builds
+it with the shipped set and the crate's kinds, and runs the system on the
+stepped clock as `board/tests/edge_project_live.rs` does (rule 9). Neither
+builds a runner. `MIGRATING-MAD.md` lists MaD's.
 
 Per-crate iteration:
 
@@ -448,5 +483,8 @@ When these land, each needs a dedicated integration binary:
 
 Consumer repos (e.g. MaD) should re-run this suite against the **pinned**
 submodule commit on SIL-related PRs (`cd vendor/embsim && cargo test
---workspace --all-targets`), mirroring how ProtoEmb is gated. Upstream CI on
-this repo remains the primary gate for commits that land here.
+--workspace --all-targets`), mirroring how ProtoEmb is gated, and check
+their own project files with the `embsim` built from that commit, which
+builds their catalog crates against it (`MIGRATING-MAD.md`, step 9).
+Upstream CI on this repo remains the primary gate for commits that land
+here.

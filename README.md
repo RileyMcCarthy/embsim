@@ -3,30 +3,48 @@
 [![CI](https://github.com/RileyMcCarthy/embsim/actions/workflows/ci.yml/badge.svg)](https://github.com/RileyMcCarthy/embsim/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A generic **software-in-the-loop (SIL) emulator framework** for embedded firmware.
+A **software-in-the-loop (SIL) simulator** for embedded firmware and the
+boards it runs on, used as a tool: the `embsim` command.
 
 embsim runs a system of boards with **no physical hardware**: each board built
 from its vendor netlist with every part a node, the real firmware on an
 instruction-set simulator in the processor's package, and the nets between
 them resolved as circuits at the instants things happen.
 
-embsim is run as a **project**: a TOML file that names the boards (a KiCad
-netlist each, or a module the catalog ships), the model each part takes, the
-wires between the boards' connectors, and the scenario. The `embsim` command
-takes a netlist to a running system through one. `embsim survey` lists what
-the netlist asks for, `embsim new` writes a starter project, `embsim check`
-builds it, and `embsim run` runs it in virtual time. Rust code loads the same
-file with `embsim_board::Project`. The guide is [`PROJECTS.md`](PROJECTS.md).
+You use it by writing a **project**: a TOML file that names the boards (a
+KiCad netlist each, or a board a catalog ships), the model each part takes,
+the bench components, the wires between the boards' connectors, and the
+scenario. The `embsim` command takes a netlist to a running system through
+one:
 
-It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD)
-and is designed to be reused: no generic crate depends on a project crate
-(below). A new project supplies its boards' netlists, and the models, boards,
-processor cores and bench parts it needs that embsim does not ship: a
-catalog crate of its own, named in the project file
-(`[catalog] crates = ["sim/catalog"]`), which the `embsim` tool builds into
-the command with Cargo and runs the project through (`PROJECTS.md`
-sections 7 and 10). [`examples/custom-project`](examples/custom-project/README.md)
-is one, worked end to end.
+```bash
+cargo install --path cli                    # from this checkout: the `embsim` tool
+embsim survey board.net                     # what the netlist asks for
+embsim new board.net -o board.toml          # a starter project answering it
+embsim check board.toml                     # build it, time held; say what is left
+embsim run board.toml --for 20ms            # run it in virtual time
+```
+
+**A project extends the tool.** When its boards need what embsim does not
+ship (a part model, a board of its own, a processor core such as an
+instruction-set simulator, a bench part such as a machine's mechanism), the
+project writes them in Rust, in a **catalog crate** of its own, and names
+the crate in its file (`[catalog] crates = ["sim/catalog"]`). The `embsim`
+tool then builds the crate and embsim into one binary with Cargo, a
+**runner** kept beside the project, and runs the project through it: the
+same command, with the project's kinds beside embsim's. There is no plugin
+interface; Cargo compiles one binary against one copy of embsim.
+`embsim new --catalog DIR` starts such a crate.
+[`examples/custom-project`](examples/custom-project/README.md) is one,
+worked end to end, and [`PROJECTS.md`](PROJECTS.md) is the guide (section
+10 for extending embsim).
+
+It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD),
+and MaD's own move onto a project with a catalog crate is
+[`MIGRATING-MAD.md`](MIGRATING-MAD.md). No generic crate depends on a
+project crate (below). Rust code can also use the crates directly: a
+project file loads with `embsim_board::Project`, and the command itself is
+a library, `embsim_cli`.
 
 ## What embsim is for, and what it is not
 
@@ -117,8 +135,10 @@ and refused.
 ## Crate layering
 
 ```
-   consumer      your board, your CPU core, your host on the PTY
-   command       embsim-cli        embsim survey / new / check / run
+   project       your project file, and your catalog crate: your boards,
+                 models, CPU cores and bench parts
+                      │
+   command       embsim-cli        embsim survey / new / check / run; the runner
                       │
    boards        embsim-boards     off-the-shelf modules (P2-EC32MB) and the P2 package
    cpu           embsim-p2-qemu    QEMU Propeller 2, pads on nets
@@ -130,7 +150,9 @@ and refused.
 ```
 
 The dependency graph is acyclic: **no generic crate depends on a project crate.**
-Project-specific wiring lives in the consumer's repo.
+A project's kinds live in its own repository, in a catalog crate that
+depends on embsim's crates; the runner the `embsim` tool builds is the one
+place the two meet.
 
 ## Repository layout
 
@@ -153,17 +175,28 @@ The plan for making every netlist part a node in one pipeline — switches, capa
 
 ## What a new project provides
 
-A board from its netlist, a core in the processor slot, and a host on the PTY.
-The core drives and senses pads. The host is [`HostPty`](board/src/host_pty.rs):
-bytes on `TX`/`RX` become levels on the nets. The P2-EC32MB and the QEMU P2
-core are the reference:
+A project's netlists, its project file, and, for what embsim does not ship,
+a catalog crate. The crate is an ordinary library whose root exports one
+function the runner calls. The worked example's:
 
+<!-- quoted from examples/custom-project/catalog/src/lib.rs -->
 ```rust
-let p2 = embsim_p2_qemu::P2Qemu::with_boot_rom(&rom, &[])?;
-let board = embsim_boards::ec32mb::Ec32mb::new()
-    .with_p2(|_decl| Box::new(embsim_boards::p2::P2Package::new(p2)))
-    .build()?;
+/// Add the example's kinds to `set`: the board, part and bench component
+/// kinds as one catalog ([`board::ExampleCatalog`]), the core as a core
+/// catalog ([`blinker::BlinkerCores`]). Starts nothing.
+pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError> {
+    set.add(board::ExampleCatalog)?;
+    set.add_cores(blinker::BlinkerCores)?;
+    Ok(())
+}
 ```
+
+Each kind it adds is built through the one interface every embsim part
+uses (a `Component`, a model in a board's part registry, or a `P2Core` in
+the P2's package) and goes through the same survey and checks as embsim's
+own. A kind's numbers carry their citations ([`DESIGN.md`](DESIGN.md)).
+`embsim new --catalog DIR` starts a crate with one commented example of
+each sort of kind; [`PROJECTS.md`](PROJECTS.md) §10 is the contract.
 
 ## Projects: a system in a file
 
@@ -283,29 +316,40 @@ boot as a project file is in `cli/tests/cli.rs`
 
 ## Using embsim in your project
 
-embsim is a Cargo workspace of path crates (not yet on crates.io). Consume it
-as a **git submodule** and point path dependencies at the crates you need:
+embsim is a Cargo workspace of path crates (not yet on crates.io). A project
+keeps it as a **git submodule**, so its catalog crate and the `embsim` tool
+come from one pinned checkout:
 
 ```bash
 git submodule add https://github.com/RileyMcCarthy/embsim.git vendor/embsim
+cargo install --path vendor/embsim/cli      # or run it in place:
+cargo run --release --manifest-path vendor/embsim/Cargo.toml -p embsim-cli -- check sim.toml
 ```
+
+The catalog crate depends on embsim's crates by path, into that checkout:
 
 ```toml
-# your-emulator/Cargo.toml
+# sim/catalog/Cargo.toml
 [dependencies]
-embsim-core   = { path = "../vendor/embsim/core" }
-embsim-board  = { path = "../vendor/embsim/board" }
-embsim-models = { path = "../vendor/embsim/models" }
-embsim-boards = { path = "../vendor/embsim/boards" }
+embsim-board  = { path = "../../vendor/embsim/board" }
+embsim-boards = { path = "../../vendor/embsim/boards" }
 ```
 
-Your workspace should `exclude` the submodule directory (embsim is its own
-workspace root) — path dependencies across the boundary work fine:
+The runner takes embsim from the checkout the tool was built from, or from
+the project's `[catalog] embsim`, and refuses a build that links two copies
+(`PROJECTS.md` §10, "Which embsim the runner builds against"). A project
+workspace should `exclude` the submodule directory (embsim is its own
+workspace root); path dependencies across the boundary work fine:
 
 ```toml
 [workspace]
 exclude = ["vendor/embsim"]
 ```
+
+A project that would rather own its binary than have the tool build a
+runner writes ten lines over the command's library (`embsim_cli::shipped`,
+its registration function, `embsim_cli::main_with`); the example's is
+`examples/custom-project/catalog/examples/own_binary.rs`.
 
 ## One QEMU P2 per OS process
 
@@ -331,6 +375,9 @@ cargo test -p embsim-boards         # the P2-EC32MB board against its netlist
 cargo test -p embsim-memory-inspect # DWARF parser (compiles a tiny C fixture at test time)
 cargo test -p embsim-trace          # trace recorder
 cargo test -p embsim-ui             # web shell render + handlers
+cargo test -p embsim-cli            # the command as a user runs it, and as a library
+cargo test -p custom-project-catalog                # the worked example's project, in process
+cargo test -p embsim-cli --test runner -- --ignored # the tool building runners with Cargo (CI: project-runner)
 ```
 
 Release-mode smoke:

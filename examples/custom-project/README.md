@@ -81,6 +81,12 @@ buffer's 12 ns propagation delay after the pad flips.
   process, as the runner runs it (`embsim_cli::run_with_crates`), and
   asserts the instant of every edge: how a project tests its own catalog
   without building a runner.
+- [`examples/own_binary.rs`](catalog/examples/own_binary.rs) is the same
+  command as a binary of the project's own, for a project that would
+  rather own it than have the tool build a runner: `embsim_cli::shipped()`,
+  the registration function, `embsim_cli::main_with`. From this directory,
+  `cargo run -p custom-project-catalog --example own_binary -- run
+  project.toml --for 10ms` prints what `embsim run` does.
 
 `embsim new --catalog DIR` starts a crate of this shape for a project of
 your own, with one commented example of each sort of kind to keep, rename
