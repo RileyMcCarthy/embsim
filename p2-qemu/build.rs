@@ -63,20 +63,34 @@ fn main() {
     }
     cc.compile("p2hostdrive");
 
-    for obj in &link.objects {
-        println!("cargo:rustc-link-arg={}", obj.display());
-    }
-    for archive in &link.archives {
-        println!("cargo:rustc-link-arg={}", archive.display());
-    }
-    for lib in &link.libs {
-        println!("cargo:rustc-link-arg={lib}");
-    }
+    let mut args: Vec<String> = Vec::new();
+    args.extend(link.objects.iter().map(|obj| obj.display().to_string()));
+    args.extend(
+        link.archives
+            .iter()
+            .map(|archive| archive.display().to_string()),
+    );
+    args.extend(link.libs.iter().cloned());
     for framework in &link.frameworks {
-        println!("cargo:rustc-link-arg=-framework");
-        println!("cargo:rustc-link-arg={framework}");
+        args.push("-framework".to_string());
+        args.push(framework.clone());
+    }
+    for arg in &args {
+        println!("cargo:rustc-link-arg={arg}");
     }
     println!("cargo:rustc-cfg=qemu_linked");
+
+    // A link argument reaches this package's own binaries only. A crate
+    // that links this one into a binary of its own — the `embsim` command —
+    // replays the same arguments from its build script: `links =
+    // "qemu-p2"` hands it this file as `DEP_QEMU_P2_LINK_ARGS_FILE`, one
+    // argument a line, and `DEP_QEMU_P2_LINKED`.
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let args_file = out_dir.join("qemu-link-args.txt");
+    fs::write(&args_file, args.join("\n"))
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", args_file.display()));
+    println!("cargo::metadata=link_args_file={}", args_file.display());
+    println!("cargo::metadata=linked=true");
 }
 
 /// The tree must hold the target this crate carries, and QEMU must carry

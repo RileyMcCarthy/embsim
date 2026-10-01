@@ -5,17 +5,24 @@
 
 A generic **software-in-the-loop (SIL) emulator framework** for embedded firmware.
 
-embsim links your real firmware C code against Rust implementations of its
-hardware-access (HAL) layer, plus emulated peripherals and physical models, so
-the firmware runs unmodified on a host with **no physical hardware**. Host
-software (a desktop app, a test harness) talks to the emulated serial port
-through a `/dev` PTY symlink, exactly as it would to a real board.
+embsim runs a system of boards with **no physical hardware**: each board built
+from its vendor netlist with every part a node, the real firmware on an
+instruction-set simulator in the processor's package, and the nets between
+them resolved as circuits at the instants things happen.
+
+embsim is run as a **project**: a TOML file that names the boards (a KiCad
+netlist each, or a module the catalog ships), the model each part takes, the
+wires between the boards' connectors, and the scenario. The `embsim` command
+takes a netlist to a running system through one. `embsim survey` lists what
+the netlist asks for, `embsim new` writes a starter project, `embsim check`
+builds it, and `embsim run` runs it in virtual time. Rust code loads the same
+file with `embsim_board::Project`. The guide is [`PROJECTS.md`](PROJECTS.md).
 
 It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD)
-and is designed to be reused: the `core`, `peripherals`, `models`, `runtime`,
-and `tools` crates carry no project- or Propeller-2-specific assumptions. A new
-project supplies a *platform crate* and a *machine*, and gets a runnable
-emulator.
+and is designed to be reused: no generic crate depends on a project crate
+(below). A new project supplies its boards' netlists, the models its parts
+need (a catalog of its own, `PROJECTS.md` section 7), and a core in the
+processor's slot.
 
 ## What embsim is for, and what it is not
 
@@ -107,6 +114,7 @@ and refused.
 
 ```
    consumer      your board, your CPU core, your host on the PTY
+   command       embsim-cli        embsim survey / new / check / run
                       │
    boards        embsim-boards     off-the-shelf modules (P2-EC32MB) and the P2 package
    cpu           embsim-p2-qemu    QEMU Propeller 2, pads on nets
@@ -125,10 +133,11 @@ Project-specific wiring lives in the consumer's repo.
 | Crate | Path | What it is |
 |-------|------|------------|
 | `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
-| `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface |
+| `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface, projects and the netlist survey |
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets. Carries the `target/p2` sources |
-| `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, and the P2 package a core sits in |
+| `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
+| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked). The guide is [`PROJECTS.md`](PROJECTS.md) |
 | `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from an archive |
 | `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
 | `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer mounts into |
@@ -149,6 +158,104 @@ let board = embsim_boards::ec32mb::Ec32mb::new()
     .with_p2(|_decl| Box::new(embsim_boards::p2::P2Package::new(p2)))
     .build()?;
 ```
+
+## Projects: a system in a file
+
+A project is the system written down: the boards, the model each part takes,
+the wires between connectors, and the scenario. The file names **kinds**; a
+catalog (`embsim_boards::catalog::StandardCatalog`) turns each into a netlist
+and registry, a part model, or a bench component. The file holds no
+behaviour: every number stays in its model, with its citation.
+
+```toml
+[[board]]
+name = "DS2Addon"
+kind = "netlist"                       # any KiCad netlist export
+netlist = "ds2_addon.net"              # relative to this file
+
+[[board.model]]                        # a part the survey named
+part = "ADS122U04"                     # exactly one of part, mpn, value
+kind = "ads122u04"
+
+[[wire]]                               # a supply of its own on a connector pin
+from = "BENCH.3V3"
+to = "DS2Addon.J1.1"
+volts = 3.3
+```
+
+```rust
+let project = embsim_board::Project::load("ds2-addon.toml")?;
+let system = project.instantiate(&embsim_boards::catalog::StandardCatalog)?.start()?;
+```
+
+Every board is built by `Board::from_netlist` with a part registry: a
+`kind = "netlist"` board from the catalog's base registry, which places every
+model it knows by its manufacturer part number, and a catalog board kind
+(`p2-ec32mb`) from its own. Before it builds, each board is **surveyed** with
+the registry it will build with (`Project::survey`): the parts with no model,
+named by the part name, number and value a `[[board.model]]` can key on; the
+parts whose model declares other pins than the netlist gives them (a numbered
+datasheet table against a netlist that names pins by function —
+`options.pins` picks the other table); and the connectors, with their pins. A
+board whose survey is not clean is refused with the survey as the error. A
+wire's board end is a connector pin (`Board.Connector.Pin`); its other end is
+another board's connector, a bench component's pin, or, with `volts`, a supply.
+A `[[mate]]` joins two connectors at once, pin for pin by number or by a
+cable's `map`: a module in its socket, a cable between two boards. A kind
+seats only on a part that is what it says (a model's kind on a part whose
+keys name its part family; `switch`, `boundary` and `mechanical` where the
+board says so), so a part no kind is for needs a model.
+The part kinds, their options and pin tables, the workflow from a netlist to
+a running system, wiring boards to each other, and adding kinds of your own
+are in [`PROJECTS.md`](PROJECTS.md); the example projects are in
+`boards/projects/`.
+
+### The `embsim` command
+
+`cargo install --path cli` (or `cargo run -p embsim-cli --`) gives the
+command that takes a netlist to a running system. Every step goes through the
+same project, catalog and survey as the Rust above.
+
+```bash
+embsim survey board.net                 # the checklist
+embsim new board.net -o board.toml      # a starter project
+embsim check board.toml                 # build it, time held; say what is left
+embsim run board.toml --for 20ms --net BOARD.VCC
+```
+
+- **`survey`** lists what the catalog populates (by class, and by part
+  number), each part that needs a model with the kinds that could be it (by
+  part number, else by part family; else the kinds without a model its
+  designator, symbol or nets allow; else that it needs a model), each part
+  placed with a pin table the netlist does not use with the table that fits,
+  and every connector pin with its name and net. `embsim survey --kind
+  p2-ec32mb` surveys a board kind the catalog ships the same way.
+- **`new`** writes the project that answers the checklist as far as the
+  catalog can: the board, a `[[board.model]]` choosing the pin table that
+  fits for each part the catalog placed with another, a commented stub for
+  each part that needs a model (the kind filled in when exactly one part
+  number names it),
+  and every connector's pins as the endpoints a `[[wire]]` names. Uncomment
+  the stubs, choose the kinds, wire the connectors.
+- **`check`** loads, surveys and builds the system and starts it with virtual
+  time held: every part attached, nothing yet run. It prints each board's
+  survey line and what the build found, and exits non-zero with the reason —
+  the survey, for a board with a part still unmodelled — on any refusal.
+- **`run`** starts the system on a stepped clock and runs it for `--for` of
+  virtual time (or until interrupted), printing the build's findings, then
+  findings and a P2's console as the run reaches them, then the nets asked
+  for with `--net`, and at the end each finding's net read again: the ones
+  the run cleared (a rail that came up) apart from the ones still true.
+
+`embsim` knows one more value for the `p2` kind's `core` than the standard
+catalog: `core = "qemu"` seats the QEMU P2 in the package, which boots its
+ROM (`rom = "file"` for another) off whatever the board gives it — on the
+P2-EC32MB, the flash, which `image = "boot.bin"` on the `w25q128jv` kind
+fills (`embsim_p2_qemu::flashimage` lays out stage-1 and a program). QEMU
+has to be linked when `embsim` is built (`EMBSIM_QEMU_P2_BUILD`, see
+`p2-qemu/README.md`); a build without it refuses the entry saying so. The
+boot as a project file is in `cli/tests/cli.rs`
+(`run_boots_the_p2_off_the_modules_flash`).
 
 ## Using embsim in your project
 

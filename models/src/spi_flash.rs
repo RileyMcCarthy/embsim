@@ -89,6 +89,10 @@ pub const JEDEC_ID_W25Q128JV_IM: [u8; 3] = [0xEF, 0x70, 0x18];
 /// byte — the P2 boot ROM among them — cannot tell them apart at all.
 pub const JEDEC_ID_W25Q128JV_IQ: [u8; 3] = [0xEF, 0x40, 0x18];
 
+/// A W25Q128JV's array, 16 MiB: the part is 128M-bit, "organized into
+/// 65,536 programmable pages of 256-bytes each" (§2 General Descriptions).
+pub const W25Q128JV_CAPACITY_BYTES: usize = 65_536 * 256;
+
 /// Bytes in a page program before it wraps (§8.2.13, p.36: "if more than 256
 /// bytes are sent ... the addressing will wrap to the beginning of the page").
 pub const DEFAULT_PAGE_SIZE: u32 = 256;

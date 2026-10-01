@@ -2,6 +2,6 @@
   "v": 1,
   "name": "board",
   "lang": "rust",
-  "cmd": "cargo test -p embsim-board",
+  "cmd": "cargo test -p embsim-board -p embsim-boards -p embsim-cli",
   "results": "cargo-stdout"
 }

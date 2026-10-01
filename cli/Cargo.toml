@@ -1,0 +1,31 @@
+[package]
+name = "embsim-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The embsim command: survey a netlist, start a project, check it, run it"
+keywords = ["embedded", "emulator", "simulation", "sil", "cli"]
+categories = ["command-line-utilities", "simulation"]
+
+# Links QEMU into the binary when embsim-p2-qemu linked it (EMBSIM_QEMU_P2_BUILD
+# named a QEMU tree), and sets `cfg(qemu_linked)` so the tests that boot the P2
+# are built only then.
+build = "build.rs"
+
+[[bin]]
+name = "embsim"
+path = "src/main.rs"
+
+[dependencies]
+embsim-board = { path = "../board" }
+embsim-boards = { path = "../boards" }
+embsim-core = { path = "../core" }
+embsim-p2-qemu = { path = "../p2-qemu" }
+clap.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

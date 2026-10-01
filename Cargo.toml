@@ -9,6 +9,7 @@ members = [
     "tools/ui",
     "tools/trace",
     "cpu-oracle",
+    "cli",
 ]
 resolver = "2"
 
@@ -35,9 +36,12 @@ libc = "0.2"
 object = "0.40"
 gimli = "0.34"
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 serde_json = "1"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+# The `embsim` command line (cli/): subcommands and their options, derived.
+clap = { version = "4.5", features = ["derive"] }
 # Test harness: discrete case matrices (`#[rstest]`, `#[case]`, `#[values]`).
 # See TESTING.md. All workspace crates that ship tests take this as a
 # dev-dependency so failure names and filters stay consistent.

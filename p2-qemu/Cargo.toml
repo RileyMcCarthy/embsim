@@ -16,6 +16,9 @@ categories = ["embedded", "simulation"]
 # build time. When the variable is unset the crate still compiles, to a stub
 # that says so, because a workspace must build on a machine with no QEMU.
 build = "build.rs"
+# Names the QEMU link so a dependent's build script is handed it
+# (`DEP_QEMU_P2_LINK_ARGS_FILE`, `DEP_QEMU_P2_LINKED`; build.rs).
+links = "qemu-p2"
 
 [dependencies]
 embsim-core = { path = "../core" }
@@ -23,6 +26,9 @@ embsim-board = { path = "../board" }
 # The node is the core inside `embsim_boards::p2::P2Package`, and the pad
 # strengths are decoded there (boards never depends back on this crate).
 embsim-boards = { path = "../boards" }
+# The `p2` kind's options, handed on to the standard catalog
+# (`catalog::QemuCatalog`).
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

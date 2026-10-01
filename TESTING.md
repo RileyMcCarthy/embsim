@@ -227,6 +227,52 @@ cargo test -p embsim-board --lib rebasing_trails_the_original_by_at_most_one_pul
 # Or all schedule-arithmetic cases together:
 # cargo test -p embsim-board --lib
 cargo test -p embsim-models --lib stepper_motor
+# Projects (`board/src/project.rs`, `boards/src/catalog.rs`): a system written
+# down as a TOML file of boards, part models, wires and a scenario. Build
+# only: the P2-EC32MB from its netlist through the catalog equals the module
+# `Ec32mb` builds, part for part, net for net and cluster for cluster; the
+# checklist its netlist asks for with nothing assigned; the carrier file's
+# switch positions; connectors mated pin for pin and by a cable's map; and
+# every refusal, with the text that says what to fix — a kind on a part it is
+# not, one key twice, one supply name twice, a mate that does not fit, and
+# the MaD machine's three-board project waiting on its two unmodelled parts.
+cargo test -p embsim-boards --test ec32_project --test project_refusals --test mates
+# Live, stepped, each its own binary: the EC32 netlist project's power tree
+# from the carrier's fingers (every rail equal to the library module's); the
+# DS2 add-on project on its bench supplies (its ADC's protocol thread lives
+# for the process, rule 5); two boards joined connector to connector, a pad
+# on one read through the other's resistor.
+cargo test -p embsim-boards --test ec32_project_power --test ds2_project --test board_to_board
+# The MaD machine's three boards as a project (`boards/projects/edge-ec32-ds2.toml`),
+# with the Edge board's RS-422 pair given the board tests' models: its mates
+# join what the machine tests' hand-written harnesses join (build only), and
+# live, stepped, the module and the add-on run from the carrier's rails.
+cargo test -p embsim-board --test edge_project --test edge_project_live
+# The catalog's guide (`boards/src/catalog.rs`): every pin table it lists is
+# the one its kind registers; how a part fits a kind — by part number, by
+# part family, never by pins — and which kinds without a model a part may
+# take by its designator, symbol and nets; and PROJECTS.md's tables of
+# board and part kinds,
+# which are generated from the catalog (each option read off the kind's own
+# registration) and must match the document character for character — the
+# failure prints the tables to paste.
+cargo test -p embsim-boards --lib catalog
+# PROJECTS.md's Rust examples, run as doc tests of embsim-boards from its
+# directory: a project loaded, surveyed and built, and a catalog of one's
+# own adding a board kind and a part kind.
+cargo test -p embsim-boards --doc
+# The `embsim` command (`cli/`), run as a user runs it, a process a case:
+# survey the EC32's netlist (every connector pin, what needs a model and what
+# could be it, the pin table that fits), the Edge board's (the two parts no
+# kind is for, the socket offered as a connector, a symbol and a part number
+# that name two parts) and the p2-ec32mb kind; `new` then `check` for the header
+# board, the DS2 add-on (refused with its survey until its stub is filled)
+# and the EC32 (the pin tables the hand-written project chooses); `run` of
+# the EC32 project for 10 ms, its rails up, the build's findings apart and
+# the ones the run cleared listed at the end, the report the same twice. With
+# EMBSIM_QEMU_P2_BUILD set, `run` also boots the P2 off the module's flash
+# (`core = "qemu"`); without it, the refusal that says how.
+cargo test -p embsim-cli
 ```
 
 Per-crate iteration:
@@ -359,7 +405,6 @@ cargo llvm-cov --workspace --summary-only
 
 When these land, each needs a dedicated integration binary:
 
-- `Harness::from_toml`
 - Live topology mutation after `System::start`
 - Dual-MCU firmware entry inversion (one image per process still applies)
 

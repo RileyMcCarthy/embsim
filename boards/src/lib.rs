@@ -14,10 +14,21 @@
 //! - [`p2`] — the Propeller 2 package as a node: the 86-pin facade around
 //!   a core (QEMU, an instruction-set simulator, the native firmware) or
 //!   around no core at all, held in reset
+//! - [`catalog`] — [`catalog::StandardCatalog`], the board kinds and part
+//!   kinds a project file names ([`embsim_board::Project`]), and the base
+//!   registry that places every model here by its manufacturer part number
 //!
 //! There is no stub tier (`DESIGN.md` rule 1): every part on a board here
 //! is a node whose class has behaviour, and a part nobody has modelled is
 //! a build error naming it.
 
+pub mod catalog;
 pub mod ec32mb;
 pub mod p2;
+
+/// `PROJECTS.md` at the workspace root: every Rust example in it runs as a
+/// doc test of this crate, from this crate's directory, so the guide's code
+/// is the code that builds.
+#[cfg(doctest)]
+#[doc = include_str!("../../PROJECTS.md")]
+pub struct ProjectsGuide;

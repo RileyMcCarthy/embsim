@@ -1,0 +1,109 @@
+# The MaD machine's electronics as three boards: the MaD Edge carrier, the
+# Parallax P2-EC32MB module seated in its socket, and the DS2 force-gauge
+# add-on on the Edge board's force cable, on the bench supplies a bring-up
+# rig gives the carrier.
+#
+# `embsim check` refuses this project until the catalog models two of the
+# Edge board's parts: U24, the AM26LS31 RS-422 line driver, and U25, the
+# AM26LV32 line receiver (PROJECTS.md §9, the parts the catalog does not
+# model yet). Everything else is placed, and every mate and wire here is
+# checked against the boards' connectors. `board/tests/edge_project.rs`
+# builds and runs this file with those two parts given the models the
+# board tests use, and holds its mates to the hand-written harnesses.
+
+[[board]]
+name = "EDGE"
+kind = "netlist"
+netlist = "../../board/tests/fixtures/mad_edge.net"
+
+# J3, the module socket: a project-library symbol the first tier does not
+# know, a connector by its J.
+[[board.model]]
+part = "P2_EDGE_MODULE_SOCKET"
+kind = "boundary"
+
+[[board]]
+name = "EC32"
+kind = "p2-ec32mb"
+
+# The processor: the P2 package with nothing running inside it.
+[[board.model]]
+value = "P2X8C4M64P"
+kind = "p2"
+[board.model.options]
+core = "held-in-reset"
+
+[[board]]
+name = "DS2"
+kind = "netlist"
+netlist = "../../board/tests/fixtures/ds2_addon.net"
+
+[[board.model]]
+part = "ADS122U04"
+kind = "ads122u04"
+
+# The module in its socket. Both netlists number the 80-way card edge by
+# finger, so each of the 60 fingers the module's netlist declares lands on
+# the socket contact of its number. The other 20 contacts (55, 56, 59-67,
+# 69-77: P40-P57 and the V40/V48 bank supplies, which the module keeps for
+# its PSRAMs) have no finger behind them and stay open.
+[[mate]]
+a = "EC32.J203"
+b = "EDGE.J3"
+
+# The force cable, the Edge board's six-way J9 to the add-on's five-way J1.
+# It crosses: the Edge board's TX reaches the converter's RX on J1.3, and
+# the converter's TX comes back on J1.4. J9.6, on the Edge board's SHIELD
+# net, has no pin on the add-on to land on.
+#
+#   J9 pin  Edge net   J1 pin  add-on net
+#   1       IFG_5V     1       +3V3
+#   5       IFG_GND    2       GND
+#   4       IFG_TX     3       to the converter's RX, through R3
+#   2       IFG_RX     4       from the converter's TX, through R4
+#   3       IFG_INT    5       the converter's ~DRDY, through R5
+[[mate]]
+a = "EDGE.J9"
+b = "DS2.J1"
+map = [["1", "1"], ["5", "2"], ["4", "3"], ["2", "4"], ["3", "5"]]
+
+# The bench: 12 V and its return on the main input, 5 V and its return on
+# the isolated servo connector. The Edge board makes its own +5V and +3.3V
+# from the 12 V, and the module takes its 5 V from the socket.
+[[wire]]
+from = "BENCH.12V"
+to = "EDGE.J2.1"
+volts = 12.0
+
+[[wire]]
+from = "BENCH.GND"
+to = "EDGE.J2.2"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.SERVO5V"
+to = "EDGE.J21.1"
+volts = 5.0
+
+[[wire]]
+from = "BENCH.SERVOGND"
+to = "EDGE.J21.8"
+volts = 0.0
+
+# The isolated force domain: its 5 V is the Edge board's IC4, over the
+# cable; its return, and the add-on's analog supply and return, nothing on
+# either board generates.
+[[wire]]
+from = "BENCH.IFGGND"
+to = "DS2.J1.2"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.VDDA"
+to = "DS2.J2.1"
+volts = 3.3
+
+[[wire]]
+from = "BENCH.AGND"
+to = "DS2.J2.2"
+volts = 0.0
