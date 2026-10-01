@@ -223,6 +223,13 @@ impl SerialLevelBridge {
     /// Re-drive the idle level when no frame is on the line, so a new high
     /// voltage reaches the net; a frame in flight picks it up at its next
     /// bit.
+    /// The owner's ports changed (the supply it drives from moved): a quiet
+    /// line re-drives its idle level through them, and a frame in flight
+    /// takes them at its next bit.
+    pub fn ports_changed(&self) {
+        self.idle_if_quiet();
+    }
+
     fn idle_if_quiet(&self) {
         let quiet = self.tx.lock().expect("tx state never poisoned").is_idle();
         if quiet {

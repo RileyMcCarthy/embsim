@@ -1,11 +1,21 @@
-//! The standard catalog, with QEMU as a core the P2 package can hold.
+//! QEMU as a core the P2 package can hold, for a project.
 //!
-//! [`QemuCatalog`] is [`StandardCatalog`] with one more value for the `p2`
-//! part kind's `core` option. `core = "qemu"` seats a [`P2Qemu`] inside the
-//! [`P2Package`]: the chip boots its ROM — [`BOOT_ROM`], or the file its
-//! `rom` option names, relative to the project file — the way
-//! `tests/rom_boot_ec32mb.rs` boots it, off whatever the board's nets give
-//! it. Every other kind, option and board is the standard catalog's.
+//! [`QemuCores`] is a [`CoreCatalog`] of one core kind, `qemu`: the `p2`
+//! part kind seats a [`P2Qemu`] inside its [`P2Package`] (the package and
+//! its START gate are the standard catalog's, `embsim_boards::p2`), and
+//! the chip boots its ROM — [`BOOT_ROM`], or the file its `rom` option
+//! names, relative to the project file — the way `tests/rom_boot_ec32mb.rs`
+//! boots it, off whatever the board's nets give it. [`register`] adds it to
+//! a set, as a project's own catalog crate adds its kinds:
+//!
+//! ```
+//! use embsim_boards::catalog::CatalogSet;
+//!
+//! let mut set = CatalogSet::new();
+//! embsim_p2_qemu::catalog::register(&mut set).expect("one core, spelled as a kind is");
+//! let cores: Vec<&str> = set.core_kinds().iter().map(|kind| kind.name).collect();
+//! assert_eq!(cores, ["held-in-reset", "qemu"]);
+//! ```
 //!
 //! ```toml
 //! [[board.model]]
@@ -19,103 +29,52 @@
 //! QEMU is one machine per process, so a `core = "qemu"` key may reach one
 //! part, and a build with no QEMU linked ([`crate::linked`]) refuses the
 //! entry with [`P2QemuError::Unavailable`]'s message. The chip boots when
-//! the board is built — the registration only checks — so a survey of the
-//! project boots nothing. [`QemuCatalog::seats`] hands out a view of each
-//! core it seated, and of its package, for a program to report from.
+//! the board is built — seating only checks — so a survey of the project
+//! boots nothing. The core reports its console, per pad, and its yields to
+//! the run ([`Report`]).
 
-use std::sync::{Arc, Mutex};
+use embsim_board::{Assignment, PartOptions, ProjectError, Report};
+use embsim_boards::catalog::CatalogSet;
+use embsim_boards::p2::{CoreCatalog, CoreCtor, CoreKind, P2Core};
 
-use embsim_board::{
-    Assignment, AttachError, BoardSpec, Catalog, CatalogBoard, Component, ComponentNetIo,
-    ComponentSpec, ModelFacade, PartOptions, PartRegistry, PinDecl, ProjectError,
-};
-use embsim_boards::catalog::{KindGuide, StandardCatalog};
-use embsim_boards::p2::{P2Package, P2PackageHandle};
+use crate::{P2Qemu, P2QemuError, P2QemuHandle, BOOT_ROM};
 
-use crate::{p2x8c4m64p_pins, P2Qemu, P2QemuError, P2QemuHandle, BOOT_ROM};
+#[cfg(doc)]
+use embsim_boards::p2::P2Package;
 
-/// The values the `p2` kind's `core` option takes here.
-const CORES: [&str; 2] = ["held-in-reset", "qemu"];
+/// The catalog's name, as an error naming two catalogs prints it.
+pub const NAME: &str = "embsim-p2-qemu";
 
-/// A QEMU core the catalog seated, with the views of it that outlive the
-/// system it runs in.
-#[derive(Clone)]
-pub struct QemuSeat {
-    /// The board it sits on, as the project names it.
-    pub board: String,
-    /// The part it is (`"U100"`).
-    pub reference: String,
-    /// The core: its console, its yields, whether it halted.
-    pub core: P2QemuHandle,
-    /// The package around it: when the START gate opened, the crystal, the
-    /// reset inputs.
-    pub package: P2PackageHandle,
+/// The P2's smart pins, the ones a console can be on.
+const P2_PADS: u8 = 64;
+
+/// Add QEMU's core to `set`.
+pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError> {
+    set.add_cores(QemuCores)
 }
 
-impl std::fmt::Debug for QemuSeat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QemuSeat")
-            .field("board", &self.board)
-            .field("reference", &self.reference)
-            .field("package", &self.package)
-            .finish()
-    }
-}
+/// The `qemu` core kind (module docs).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QemuCores;
 
-/// [`StandardCatalog`], with `core = "qemu"` for the `p2` kind (module docs).
-#[derive(Debug, Default, Clone)]
-pub struct QemuCatalog {
-    seats: Arc<Mutex<Vec<QemuSeat>>>,
-}
-
-impl QemuCatalog {
-    /// A catalog that has seated nothing yet.
-    pub fn new() -> Self {
-        Self::default()
+impl CoreCatalog for QemuCores {
+    fn name(&self) -> &str {
+        NAME
     }
 
-    /// Every QEMU core seated so far, in the order the boards were built.
-    pub fn seats(&self) -> Vec<QemuSeat> {
-        self.seats.lock().expect("seats never poisoned").clone()
+    fn core_kinds(&self) -> Vec<CoreKind> {
+        vec![CoreKind {
+            name: "qemu",
+            summary: "the chip booting its ROM on QEMU",
+        }]
     }
 
-    /// The standard catalog's guide, with the `p2` kind's `core` saying
-    /// what this catalog seats.
-    pub fn guide() -> Vec<KindGuide> {
-        let mut guide = StandardCatalog::guide();
-        for kind in guide.iter_mut().filter(|kind| kind.name == "p2") {
-            for option in kind.required.iter_mut().filter(|o| o.name == "core") {
-                option.means = "what runs inside the package: \"held-in-reset\", the chip before \
-                                it runs, or \"qemu\", the chip booting its ROM";
-            }
-        }
-        guide
-    }
-
-    fn register_p2(
+    fn seat(
         &self,
-        registry: &mut PartRegistry,
+        _core: &str,
         assignment: &Assignment<'_>,
         mut options: PartOptions,
-    ) -> Result<(), ProjectError> {
-        // The part has to be a P2, whatever runs in it.
-        StandardCatalog::check_parts_are_the_kind(assignment)?;
-        let core = options.choice("core", &CORES)?.ok_or_else(|| {
-            assignment.error(
-                "options.core says what runs inside the package: \"held-in-reset\", the chip \
-                 before it runs, or \"qemu\", the chip booting its ROM on QEMU",
-            )
-        })?;
-        if core == "held-in-reset" {
-            options.finish()?;
-            let mut table = toml::Table::new();
-            table.insert("core".to_string(), toml::Value::String(core.to_string()));
-            return StandardCatalog.register_part(
-                registry,
-                assignment,
-                PartOptions::new(assignment.context(), table),
-            );
-        }
+    ) -> Result<CoreCtor, ProjectError> {
         let rom = options.string("rom")?;
         options.finish()?;
         if !crate::linked() {
@@ -137,92 +96,80 @@ impl QemuCatalog {
                 })?
             }
         };
-        let seats = Arc::clone(&self.seats);
+        let reports = assignment.reports.clone();
         let board = assignment.board.to_string();
-        registry.register_model(
-            assignment.key,
-            ModelFacade::of("p2, core = \"qemu\"", &p2x8c4m64p_pins()),
-            move |decl| -> Box<dyn Component> {
-                // The chip boots here, when the board is built: a survey
-                // never builds, so it never boots one.
-                match P2Qemu::with_boot_rom(&rom, &[]) {
-                    Ok(p2) => {
-                        let core = p2.handle();
-                        let package = P2Package::new(p2);
-                        seats.lock().expect("seats never poisoned").push(QemuSeat {
-                            board: board.clone(),
-                            reference: decl.reference.clone(),
-                            core,
-                            package: package.handle(),
-                        });
-                        Box::new(package)
-                    }
-                    Err(err) => Box::new(Unbooted {
-                        pins: p2x8c4m64p_pins(),
-                        message: format!("{}: QEMU did not boot: {err}", decl.reference),
-                    }),
-                }
-            },
-        );
-        Ok(())
+        Ok(Box::new(move |decl| {
+            // The chip boots here, when the board is built: a survey never
+            // builds, so it never boots one.
+            let p2 = P2Qemu::with_boot_rom(&rom, &[])
+                .map_err(|err| format!("QEMU did not boot: {err}"))?;
+            reports.add(QemuReport {
+                subject: format!("{board}.{}", decl.reference),
+                core: p2.handle(),
+                printed: vec![0; usize::from(P2_PADS)],
+                halted: false,
+            });
+            Ok(Box::new(p2) as Box<dyn P2Core>)
+        }))
     }
 }
 
-impl Catalog for QemuCatalog {
-    fn board_kinds(&self) -> Vec<String> {
-        StandardCatalog.board_kinds()
+/// What a QEMU core says in a run: what its guest wrote to each pad's
+/// console as it writes it, when every cog stops, and at the end its yields,
+/// whether it runs, and every console.
+struct QemuReport {
+    subject: String,
+    core: P2QemuHandle,
+    /// Console characters printed so far, per pad.
+    printed: Vec<usize>,
+    halted: bool,
+}
+
+impl Report for QemuReport {
+    fn subject(&self) -> String {
+        self.subject.clone()
     }
 
-    fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
-        StandardCatalog.board(spec)
-    }
-
-    fn base_registry(&self) -> PartRegistry {
-        StandardCatalog::base_registry()
-    }
-
-    fn part_kinds(&self) -> Vec<String> {
-        StandardCatalog.part_kinds()
-    }
-
-    fn register_part(
-        &self,
-        registry: &mut PartRegistry,
-        assignment: &Assignment<'_>,
-        options: PartOptions,
-    ) -> Result<(), ProjectError> {
-        if assignment.kind == "p2" {
-            self.register_p2(registry, assignment, options)
-        } else {
-            StandardCatalog.register_part(registry, assignment, options)
+    fn look(&mut self, _now_ns: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for pad in 0..P2_PADS {
+            let text = self.core.console(pad);
+            let printed = &mut self.printed[usize::from(pad)];
+            let count = text.chars().count();
+            if count > *printed {
+                let new: String = text.chars().skip(*printed).collect();
+                lines.push(format!("P{pad} {new:?}"));
+                *printed = count;
+            }
         }
+        if !self.halted && self.core.halted() {
+            self.halted = true;
+            lines.push("every cog has stopped".to_string());
+        }
+        lines
     }
 
-    fn component_kinds(&self) -> Vec<String> {
-        StandardCatalog.component_kinds()
-    }
-
-    fn component(&self, spec: &ComponentSpec) -> Result<Box<dyn Component>, ProjectError> {
-        StandardCatalog.component(spec)
-    }
-}
-
-/// The package's pins around a core QEMU could not boot: it refuses to
-/// attach with the reason, so the system does not start.
-struct Unbooted {
-    pins: Vec<PinDecl>,
-    message: String,
-}
-
-impl Component for Unbooted {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
-        Err(AttachError::Failed {
-            message: self.message.clone(),
-        })
+    fn summary(&self) -> Vec<String> {
+        let consoles: Vec<String> = (0..P2_PADS)
+            .filter_map(|pad| {
+                let text = self.core.console(pad);
+                (!text.is_empty()).then(|| format!("P{pad} {text:?}"))
+            })
+            .collect();
+        vec![format!(
+            "QEMU: {} pad yields; {}; console {}",
+            self.core.yields(),
+            if self.core.halted() {
+                "halted"
+            } else {
+                "running"
+            },
+            if consoles.is_empty() {
+                "empty".to_string()
+            } else {
+                consoles.join(", ")
+            }
+        )]
     }
 }
 
@@ -230,7 +177,7 @@ impl Component for Unbooted {
 mod tests {
     use std::path::Path;
 
-    use embsim_board::{ComponentDecl, KeyField, ParsedNetlist};
+    use embsim_board::{Catalog, ComponentDecl, KeyField, ParsedNetlist, PartRegistry, Reports};
 
     use super::*;
 
@@ -247,12 +194,15 @@ mod tests {
         }
     }
 
+    /// The `p2` kind through a set holding QEMU's core, as a project
+    /// registers it.
     fn register(core: &str, extra: &str, parts: &[&ComponentDecl]) -> Result<(), ProjectError> {
         let netlist = ParsedNetlist {
             version: "E".to_string(),
             components: Vec::new(),
             nets: Vec::new(),
         };
+        let reports = Reports::new();
         let assignment = Assignment {
             board: "EC32",
             by: KeyField::Value,
@@ -261,10 +211,13 @@ mod tests {
             parts,
             dir: Path::new("."),
             netlist: &netlist,
+            reports: &reports,
         };
         let table: toml::Table =
             toml::from_str(&format!("core = {core:?}\n{extra}")).expect("the options parse");
-        QemuCatalog::new().register_part(
+        let mut set = CatalogSet::new();
+        super::register(&mut set).expect("QEMU's core joins the set");
+        set.register_part(
             &mut PartRegistry::new(),
             &assignment,
             PartOptions::new(assignment.context(), table),
@@ -281,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_core_names_both_this_catalog_seats() {
+    fn an_unknown_core_names_both_the_set_seats() {
         let u100 = decl("U100");
         let err = register("p2core", "", &[&u100]).expect_err("not a core here");
         assert!(
@@ -292,16 +245,26 @@ mod tests {
     }
 
     /// A core is seated only in a part the board names a P2, whatever runs
-    /// inside it.
+    /// inside it: the project checks the part before the set seats a core.
     #[test]
     fn a_core_in_a_part_that_is_not_a_p2_is_refused() {
-        let mut other = decl("U7");
-        other.value = "ATMEGA328P".to_string();
-        for core in CORES {
-            let err = register(core, "", &[&other]).expect_err("U7 is no P2");
+        let mut set = CatalogSet::new();
+        super::register(&mut set).expect("QEMU's core joins the set");
+        for core in ["held-in-reset", "qemu"] {
+            let project = embsim_board::Project::parse(&format!(
+                "[[board]]\nname = \"EC32\"\nkind = \"netlist\"\n\
+                 netlist = \"../boards/netlists/p2_ec32mb.net\"\n[[board.model]]\n\
+                 mpn = \"218-4LPSTJR\"\nkind = \"p2\"\n[board.model.options]\n\
+                 core = {core:?}\n"
+            ))
+            .expect("the text is a project")
+            .relative_to(env!("CARGO_MANIFEST_DIR"));
+            let err = project
+                .survey(&set, "EC32")
+                .expect_err("the option switch is no P2");
             assert!(
                 err.to_string()
-                    .contains("U7 is not the part this kind says it is"),
+                    .contains("S301 is not the part this kind says it is"),
                 "{err}"
             );
         }

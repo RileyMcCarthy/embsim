@@ -72,7 +72,6 @@ use embsim_board::{
     EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PeriodicSchedule,
     PinDecl, PinHandle, Scenario, Sense, SwitchPole, TheveninDrive, Thresholds, Volts,
 };
-use embsim_boards::catalog::StandardCatalog;
 use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
 use embsim_models::isolation::{iso67xx, Iso67xx};
@@ -1471,57 +1470,32 @@ pub fn force_domain_ground(ds2: &str) -> Harness {
 // The standard catalog, with the Edge board's RS-422 pair
 // ============================================================
 
-/// The standard project catalog (`embsim_boards::catalog::StandardCatalog`)
-/// with its base registry given the Edge board's RS-422 pair, `U24` and
-/// `U25`, as these tests model them and keyed as [`edge_registry`] keys
-/// them: the two Edge parts the standard catalog has no kind for yet
-/// (`PROJECTS.md` §9). Everything else is the standard catalog's.
+/// The Edge board's RS-422 pair, `U24` and `U25`, as these tests model them
+/// and keyed as [`edge_registry`] keys them, as base registrations: the two
+/// Edge parts the standard catalog has no kind for yet (`PROJECTS.md` §9).
+/// A project builds with them through [`edge_catalogs`].
 pub struct EdgeCatalog;
 
 impl embsim_board::Catalog for EdgeCatalog {
-    fn board_kinds(&self) -> Vec<String> {
-        StandardCatalog.board_kinds()
+    fn name(&self) -> &str {
+        "embsim-board-tests"
     }
 
-    fn board(
-        &self,
-        spec: &embsim_board::BoardSpec,
-    ) -> Result<embsim_board::CatalogBoard, embsim_board::ProjectError> {
-        StandardCatalog.board(spec)
-    }
-
-    fn base_registry(&self) -> PartRegistry {
-        let mut registry = StandardCatalog::base_registry();
+    fn register_base(&self, registry: &mut PartRegistry) {
         registry.register("AM26LS31CD", |_decl| {
             Box::new(Rs422Driver::new(SERVO_RAIL_VOLTS))
         });
         registry.register("AM26LV32xD", |_decl| {
             Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
         });
-        registry
     }
+}
 
-    fn part_kinds(&self) -> Vec<String> {
-        StandardCatalog.part_kinds()
-    }
-
-    fn register_part(
-        &self,
-        registry: &mut PartRegistry,
-        assignment: &embsim_board::Assignment<'_>,
-        options: embsim_board::PartOptions,
-    ) -> Result<(), embsim_board::ProjectError> {
-        StandardCatalog.register_part(registry, assignment, options)
-    }
-
-    fn component_kinds(&self) -> Vec<String> {
-        StandardCatalog.component_kinds()
-    }
-
-    fn component(
-        &self,
-        spec: &embsim_board::ComponentSpec,
-    ) -> Result<Box<dyn Component>, embsim_board::ProjectError> {
-        StandardCatalog.component(spec)
-    }
+/// The standard catalog with [`EdgeCatalog`] beside it: everything else is
+/// the standard catalog's.
+pub fn edge_catalogs() -> embsim_boards::catalog::CatalogSet {
+    let mut set = embsim_boards::catalog::CatalogSet::new();
+    set.add(EdgeCatalog)
+        .expect("the test catalog provides no kind, only two part numbers");
+    set
 }

@@ -51,10 +51,13 @@
 //! Every board is built by [`Board::from_netlist`] with a [`PartRegistry`] —
 //! the constructor every board in embsim goes through. A `kind = "netlist"`
 //! board reads its netlist from the path, relative to the project file, and
-//! starts from the catalog's base registry ([`Catalog::base_registry`]); a
-//! catalog board kind brings its own netlist and registry
-//! ([`Catalog::board`]). Each `[[board.model]]` then registers a part kind
-//! into that registry ([`Catalog::register_part`]), under the part name, the
+//! starts from the catalog's base registrations ([`Catalog::register_base`]);
+//! a catalog board kind brings its own netlist, and its own registry or the
+//! base one, and may bring entries for its own parts ([`Catalog::board`]).
+//! Each `[[board.model]]` is checked against what its kind says a part is
+//! ([`KindGuide::check`], `DESIGN.md` rule 1, for every catalog's kinds),
+//! then registers a part kind into that registry
+//! ([`Catalog::register_part`]), under the part name, the
 //! manufacturer part number or the value it names — the registry's own
 //! keys, looked up in the registry's order: part name, then manufacturer
 //! part number, then value. A reference designator is not a key: a model
@@ -90,8 +93,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::kind::KindGuide;
 use crate::netlist::{self, ComponentDecl, ParsedNetlist};
 use crate::registry::{normalize_part, Classification};
+use crate::report::Reports;
 use crate::survey::{BoardSurvey, ConnectorReport};
 use crate::{Board, Component, EndpointRef, Harness, JumperState, PartRegistry, Scenario, System};
 
@@ -99,55 +104,143 @@ use crate::{Board, Component, EndpointRef, Harness, JumperState, PartRegistry, S
 // The catalog
 // ============================================================
 
-/// A catalog board kind's source: its netlist and the registry it builds
-/// with, before the project's `[[board.model]]` entries are registered.
+/// A catalog board kind's source: its netlist, the registry it builds with,
+/// and the `[[board.model]]` entries it brings for its own parts.
 #[derive(Debug)]
 pub struct CatalogBoard {
     /// The netlist.
     pub netlist: ParsedNetlist,
-    /// The registry the board builds with.
-    pub registry: PartRegistry,
+    /// The registry the board builds with, before any `[[board.model]]` is
+    /// registered: one the catalog builds itself (the P2-EC32MB's, which
+    /// places every part of the module but the processor), or `None` to
+    /// start from the catalog's base registrations
+    /// ([`Catalog::register_base`]) as a `kind = "netlist"` board does.
+    pub registry: Option<PartRegistry>,
+    /// The board's own `[[board.model]]` entries, registered through the
+    /// catalog's part kinds before the project's, with every check an entry
+    /// in a project file gets. A project entry with the same key replaces
+    /// the board's.
+    pub models: Vec<ModelSpec>,
+}
+
+impl CatalogBoard {
+    /// A board from `netlist` that starts from the catalog's base
+    /// registrations and brings no entries of its own.
+    pub fn from_base(netlist: ParsedNetlist) -> Self {
+        Self {
+            netlist,
+            registry: None,
+            models: Vec::new(),
+        }
+    }
+
+    /// The same board with `model` among its own entries.
+    #[must_use]
+    pub fn with_model(mut self, model: ModelSpec) -> Self {
+        self.models.push(model);
+        self
+    }
 }
 
 /// Turns a kind named in a project into what it is: a board's netlist and
 /// registry, a part model registered into a registry, a bench component.
+///
+/// A catalog provides only what it says: every method but [`Self::name`]
+/// has a default that provides nothing, so a catalog writes the methods for
+/// the kinds it has. Catalogs compose in a set
+/// (`embsim_boards::catalog::CatalogSet`), which is itself a catalog: it
+/// answers each kind from whichever catalog provides it.
 pub trait Catalog {
-    /// The board kinds this catalog ships, besides `"netlist"`, which every
-    /// project can name.
-    fn board_kinds(&self) -> Vec<String>;
+    /// The catalog's name, as an error that names two catalogs prints it:
+    /// its crate's name (`"embsim-boards"`, `"mad-sim-catalog"`).
+    fn name(&self) -> &str;
 
-    /// The netlist and registry of the catalog board `spec` names (a kind
-    /// in [`Self::board_kinds`]).
-    fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError>;
+    /// The board kinds this catalog provides, besides `"netlist"`, which
+    /// every project can name and no catalog provides.
+    fn board_kinds(&self) -> Vec<String> {
+        Vec::new()
+    }
 
-    /// The registry a `kind = "netlist"` board starts from: every model the
-    /// catalog can place by a key a netlist carries by itself — a
-    /// manufacturer part number — so the survey names only the parts the
-    /// catalog cannot place.
-    fn base_registry(&self) -> PartRegistry;
+    /// The netlist, registry and own entries of the catalog board `spec`
+    /// names (a kind in [`Self::board_kinds`]).
+    fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
+        Err(ProjectError::message(format!(
+            "board {}: catalog {} has no board kind {:?}",
+            spec.name,
+            self.name(),
+            spec.kind
+        )))
+    }
 
-    /// The part kinds a `[[board.model]]` may name.
-    fn part_kinds(&self) -> Vec<String>;
+    /// Register every model the catalog places by a key a netlist carries
+    /// by itself — a manufacturer part number — into `registry`, so a
+    /// `kind = "netlist"` board's survey names only the parts no catalog
+    /// can place. The project turns the registry's reference-designator
+    /// fallback on for every board that starts from these registrations.
+    fn register_base(&self, _registry: &mut PartRegistry) {}
+
+    /// The part kinds a `[[board.model]]` may name, each as someone
+    /// choosing one reads it ([`KindGuide`]). The project checks every part
+    /// an entry reaches against the kind's [`KindGuide::is`] before it calls
+    /// [`Self::register_part`].
+    fn part_kinds(&self) -> Vec<KindGuide> {
+        Vec::new()
+    }
 
     /// Register the part kind `assignment` names into `registry` under its
     /// key, taking its options from `options` and refusing any it does not
-    /// know ([`PartOptions::finish`]). A kind whose model reads board data
-    /// from a part (a frequency in its value, a divider at attach) may check
-    /// [`Assignment::parts`] here, so a part it cannot configure is an
-    /// error naming the part, before anything is built.
+    /// know ([`PartOptions::finish`]). Every part the key reaches is what
+    /// the kind says it is: the project checked. A kind whose model reads
+    /// board data from a part (a frequency in its value, a divider at
+    /// attach) may check [`Assignment::parts`] here, so a part it cannot
+    /// configure is an error naming the part, before anything is built.
+    /// Starts nothing: a survey registers every entry and builds nothing.
     fn register_part(
         &self,
-        registry: &mut PartRegistry,
+        _registry: &mut PartRegistry,
         assignment: &Assignment<'_>,
-        options: PartOptions,
-    ) -> Result<(), ProjectError>;
+        _options: PartOptions,
+    ) -> Result<(), ProjectError> {
+        Err(assignment.error(format!(
+            "catalog {} has no part kind {:?}",
+            self.name(),
+            assignment.kind
+        )))
+    }
 
     /// The bench component kinds a `[[component]]` may name.
-    fn component_kinds(&self) -> Vec<String>;
+    fn component_kinds(&self) -> Vec<String> {
+        Vec::new()
+    }
 
-    /// Build the bench component `spec` names (a kind in
-    /// [`Self::component_kinds`]).
-    fn component(&self, spec: &ComponentSpec) -> Result<Box<dyn Component>, ProjectError>;
+    /// Build the bench component `request` names (a kind in
+    /// [`Self::component_kinds`]), taking its options from
+    /// [`ComponentRequest::options`].
+    fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
+        Err(ProjectError::message(format!(
+            "component {}: catalog {} has no component kind {:?}",
+            request.spec.name,
+            self.name(),
+            request.spec.kind
+        )))
+    }
+
+    /// The catalogs that each provide the kind `kind` — a board, part,
+    /// component or core kind — when two or more do; empty otherwise. A
+    /// single catalog provides each of its kinds once; a set that holds two
+    /// catalogs naming one kind answers with both, and a project that names
+    /// that kind is refused, naming them.
+    fn kind_clash(&self, _kind: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The catalogs whose base registrations each place parts by `key`,
+    /// when two or more do; empty otherwise. A board that starts from the
+    /// base registrations and carries a part the key reaches is refused,
+    /// naming them, unless an entry assigns that key a kind itself.
+    fn base_key_clash(&self, _key: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Which of a part's registry keys a `[[board.model]]` names.
@@ -203,6 +296,10 @@ pub struct Assignment<'a> {
     /// The board's netlist, for a kind that checks what a part is by the
     /// nets its pins join ([`Self::nets_of`]).
     pub netlist: &'a ParsedNetlist,
+    /// Where what the kind's constructor builds reports to the run
+    /// ([`Report`](crate::Report)): a constructor clones it and adds its
+    /// report when it builds the part, never when the kind registers.
+    pub reports: &'a Reports,
 }
 
 impl Assignment<'_> {
@@ -250,8 +347,54 @@ impl PartOptions {
         }
     }
 
-    fn error(&self, message: impl fmt::Display) -> ProjectError {
+    /// An error about these options, with the entry in front of it.
+    pub fn error(&self, message: impl fmt::Display) -> ProjectError {
         ProjectError::message(format!("{}: {message}", self.context))
+    }
+
+    /// Take the option `name` as it is written, if it is given: for a
+    /// shape no other `take` reads, which the kind reads itself (and names
+    /// in its errors through [`Self::error`]).
+    pub fn value(&mut self, name: &'static str) -> Option<toml::Value> {
+        self.accepted.push(name);
+        self.table.remove(name)
+    }
+
+    /// Take the number option `name` (`3.3`, or a whole number), if it is
+    /// given.
+    pub fn number(&mut self, name: &'static str) -> Result<Option<f64>, ProjectError> {
+        match self.value(name) {
+            None => Ok(None),
+            Some(toml::Value::Float(number)) => Ok(Some(number)),
+            Some(toml::Value::Integer(number)) => Ok(Some(number as f64)),
+            Some(other) => Err(self.error(format!(
+                "options.{name} is a number; {other} is a {}",
+                other.type_str()
+            ))),
+        }
+    }
+
+    /// Take the whole-number option `name`, if it is given.
+    pub fn integer(&mut self, name: &'static str) -> Result<Option<i64>, ProjectError> {
+        match self.value(name) {
+            None => Ok(None),
+            Some(toml::Value::Integer(number)) => Ok(Some(number)),
+            Some(other) => Err(self.error(format!(
+                "options.{name} is a whole number; {other} is a {}",
+                other.type_str()
+            ))),
+        }
+    }
+
+    /// Take the option `name`, a time written as `embsim run --for` takes
+    /// it (`"1.5ms"`, [`parse_duration`]), in nanoseconds, if it is given.
+    pub fn duration(&mut self, name: &'static str) -> Result<Option<u64>, ProjectError> {
+        let Some(text) = self.string(name)? else {
+            return Ok(None);
+        };
+        parse_duration(&text)
+            .map(Some)
+            .map_err(|why| self.error(format!("options.{name}: {why}")))
     }
 
     /// Take the string option `name`, if it is given.
@@ -344,6 +487,41 @@ impl PartOptions {
     }
 }
 
+/// Parse a duration of virtual time: a number and a unit, `ns`, `us` (or
+/// `µs`), `ms` or `s` (`20ms`, `1.5 s`, `250us`), to whole nanoseconds —
+/// how `embsim run --for` and every option that is a time write one.
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .ok_or_else(|| format!("{text:?} has no unit; give one of ns, us, ms, s (20ms)"))?;
+    let (number, unit) = text.split_at(split);
+    if number.is_empty() {
+        return Err(format!(
+            "{text:?} does not start with a number; give a number and a unit (20ms)"
+        ));
+    }
+    let per_unit: f64 = match unit.trim() {
+        "ns" => 1.0,
+        "us" | "µs" => 1e3,
+        "ms" => 1e6,
+        "s" => 1e9,
+        other => {
+            return Err(format!(
+                "{other:?} is not a unit of time; give one of ns, us, ms, s (20ms)"
+            ))
+        }
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("{number:?} is not a number of {}", unit.trim()))?;
+    let ns = (value * per_unit).round();
+    if !ns.is_finite() || ns > u64::MAX as f64 {
+        return Err(format!("{text:?} is longer than a run can be"));
+    }
+    Ok(ns as u64)
+}
+
 // ============================================================
 // The file
 // ============================================================
@@ -410,6 +588,40 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
+    fn keyed(by: KeyField, key: &str, kind: &str) -> Self {
+        let key = Some(key.to_string());
+        Self {
+            part: key.clone().filter(|_| by == KeyField::Part),
+            mpn: key.clone().filter(|_| by == KeyField::Mpn),
+            value: key.filter(|_| by == KeyField::Value),
+            kind: kind.to_string(),
+            options: toml::Table::new(),
+        }
+    }
+
+    /// An entry giving every part whose symbol's part name is `key` the
+    /// kind `kind`: a board kind's own entry ([`CatalogBoard::models`]).
+    pub fn by_part(key: &str, kind: &str) -> Self {
+        Self::keyed(KeyField::Part, key, kind)
+    }
+
+    /// An entry by manufacturer part number.
+    pub fn by_mpn(key: &str, kind: &str) -> Self {
+        Self::keyed(KeyField::Mpn, key, kind)
+    }
+
+    /// An entry by value.
+    pub fn by_value(key: &str, kind: &str) -> Self {
+        Self::keyed(KeyField::Value, key, kind)
+    }
+
+    /// The same entry with the option `name` set to `value`.
+    #[must_use]
+    pub fn option(mut self, name: &str, value: impl Into<toml::Value>) -> Self {
+        self.options.insert(name.to_string(), value.into());
+        self
+    }
+
     /// The one field this entry matches by, and its key.
     pub fn key(&self) -> Option<(KeyField, &str)> {
         match (&self.part, &self.mpn, &self.value) {
@@ -421,7 +633,8 @@ impl ModelSpec {
     }
 }
 
-/// One bench component: a name in the system and a catalog kind.
+/// One bench component: a name in the system, a catalog kind and its
+/// options.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentSpec {
@@ -429,6 +642,41 @@ pub struct ComponentSpec {
     pub name: String,
     /// Catalog kind.
     pub kind: String,
+    /// The kind's options, `[component.options]`.
+    #[serde(default)]
+    pub options: toml::Table,
+}
+
+/// One `[[component]]` as a catalog builds it.
+#[derive(Debug)]
+pub struct ComponentRequest<'a> {
+    /// The entry: its name and kind.
+    pub spec: &'a ComponentSpec,
+    /// Its options, taken one by one; [`PartOptions::finish`] refuses the
+    /// rest.
+    pub options: PartOptions,
+    /// The project file's directory: a path an option names is relative to
+    /// it.
+    pub dir: &'a Path,
+    /// Where what the component has to say goes ([`Report`](crate::Report)).
+    pub reports: &'a Reports,
+}
+
+impl ComponentRequest<'_> {
+    /// The entry, as an error names it: `component HOST (kind
+    /// "host-serial")`.
+    pub fn context(&self) -> String {
+        component_context(self.spec)
+    }
+
+    /// An error about this entry.
+    pub fn error(&self, message: impl fmt::Display) -> ProjectError {
+        ProjectError::message(format!("{}: {message}", self.context()))
+    }
+}
+
+fn component_context(spec: &ComponentSpec) -> String {
+    format!("component {} (kind {:?})", spec.name, spec.kind)
 }
 
 /// One harness wire. `volts` makes it a supply on `from`.
@@ -615,12 +863,67 @@ impl Project {
         &self.file.mate
     }
 
+    /// The bench component named `name`, as the file gives it.
+    pub fn component_spec(&self, name: &str) -> Option<&ComponentSpec> {
+        self.file.component.iter().find(|spec| spec.name == name)
+    }
+
+    /// Set the option `key` of the bench component `name` to `value`, as if
+    /// the file had said it: what `embsim run --pty` does to a
+    /// `host-serial`'s `path`. The kind still checks it when the system is
+    /// built.
+    pub fn set_component_option(
+        &mut self,
+        name: &str,
+        key: &str,
+        value: impl Into<toml::Value>,
+    ) -> Result<(), ProjectError> {
+        let names: Vec<&str> = self
+            .file
+            .component
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        let none = || {
+            ProjectError::message(format!(
+                "no component {name:?} in this project; its components: {}",
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                }
+            ))
+        };
+        let index = self
+            .file
+            .component
+            .iter()
+            .position(|spec| spec.name == name)
+            .ok_or_else(none)?;
+        self.file.component[index]
+            .options
+            .insert(key.to_string(), value.into());
+        Ok(())
+    }
+
     /// Build the [`System`] this project describes, its paths relative to
     /// [`Self::dir`]. The caller starts it; a test that wants the
     /// attach-time circuit and no later wake calls [`System::hold_time`]
-    /// before [`System::start`].
+    /// before [`System::start`]. What the build's constructors report goes
+    /// nowhere; [`Self::instantiate_with`] keeps it.
     pub fn instantiate(&self, catalog: &dyn Catalog) -> Result<System, ProjectError> {
-        self.instantiate_in(catalog, &self.dir)
+        self.instantiate_with(catalog, &Reports::new())
+    }
+
+    /// [`Self::instantiate`], every report the build's constructors make
+    /// added to `reports` ([`crate::Report`]): what a run prints about what
+    /// a catalog built.
+    pub fn instantiate_with(
+        &self,
+        catalog: &dyn Catalog,
+        reports: &Reports,
+    ) -> Result<System, ProjectError> {
+        self.build_system(catalog, &self.dir, reports)
     }
 
     /// [`Self::instantiate`] with `base` as the directory the project's
@@ -631,10 +934,19 @@ impl Project {
         catalog: &dyn Catalog,
         base: &Path,
     ) -> Result<System, ProjectError> {
+        self.build_system(catalog, base, &Reports::new())
+    }
+
+    fn build_system(
+        &self,
+        catalog: &dyn Catalog,
+        base: &Path,
+        reports: &Reports,
+    ) -> Result<System, ProjectError> {
         let mut system = System::new();
         let mut surveys: BTreeMap<String, BoardSurvey> = BTreeMap::new();
         for spec in &self.file.board {
-            let (board, survey) = build(spec, catalog, base)?;
+            let (board, survey) = build(spec, catalog, base, reports)?;
             surveys.insert(spec.name.clone(), survey);
             system = system.board(&spec.name, board);
         }
@@ -650,7 +962,13 @@ impl Project {
                     kinds_sentence("component", &known_components)
                 )));
             }
-            let component = catalog.component(spec)?;
+            refuse_clash(catalog, &spec.kind, &component_context(spec))?;
+            let component = catalog.component(ComponentRequest {
+                spec,
+                options: PartOptions::new(component_context(spec), spec.options.clone()),
+                dir: base,
+                reports,
+            })?;
             let pins = component
                 .pins()
                 .iter()
@@ -754,13 +1072,13 @@ impl Project {
     /// whether or not it is ready to build: the checklist of what is left.
     pub fn survey(&self, catalog: &dyn Catalog, name: &str) -> Result<BoardSurvey, ProjectError> {
         let spec = self.board_spec(name)?;
-        prepare(spec, catalog, &self.dir).map(|prepared| prepared.survey)
+        prepare(spec, catalog, &self.dir, &Reports::new()).map(|prepared| prepared.survey)
     }
 
     /// The board `name`, built as [`Self::instantiate`] builds it.
     pub fn build_board(&self, catalog: &dyn Catalog, name: &str) -> Result<Board, ProjectError> {
         let spec = self.board_spec(name)?;
-        build(spec, catalog, &self.dir).map(|(board, _)| board)
+        build(spec, catalog, &self.dir, &Reports::new()).map(|(board, _)| board)
     }
 
     fn board_spec(&self, name: &str) -> Result<&BoardSpec, ProjectError> {
@@ -818,12 +1136,13 @@ fn build(
     spec: &BoardSpec,
     catalog: &dyn Catalog,
     base: &Path,
+    reports: &Reports,
 ) -> Result<(Board, BoardSurvey), ProjectError> {
     let Prepared {
         netlist,
         registry,
         survey,
-    } = prepare(spec, catalog, base)?;
+    } = prepare(spec, catalog, base, reports)?;
     if !survey.compliant() {
         return Err(ProjectError::message(format!(
             "board {} is not ready to build:\n{survey}{}",
@@ -845,10 +1164,12 @@ fn not_ready_hint(survey: &BoardSurvey, catalog: &dyn Catalog) -> String {
              and the kind it is; a kind seats only on a part that is what the kind says, and a \
              part no kind is for needs a model written for it (PROJECTS.md §7)",
         );
-        hint.push_str(&format!(
-            "; {}\n",
-            kinds_sentence("part", &catalog.part_kinds())
-        ));
+        let kinds: Vec<String> = catalog
+            .part_kinds()
+            .iter()
+            .map(|kind| kind.name.to_string())
+            .collect();
+        hint.push_str(&format!("; {}\n", kinds_sentence("part", &kinds)));
     }
     if !survey.mismatched.is_empty() {
         hint.push_str(
@@ -860,9 +1181,59 @@ fn not_ready_hint(survey: &BoardSurvey, catalog: &dyn Catalog) -> String {
     hint
 }
 
+/// `"a and b"`, `"a, b and c"`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Refuse the kind `kind` when two or more of the catalogs behind
+/// `catalog` provide it ([`Catalog::kind_clash`]), naming them.
+fn refuse_clash(catalog: &dyn Catalog, kind: &str, what: &str) -> Result<(), ProjectError> {
+    let providers = catalog.kind_clash(kind);
+    if providers.len() < 2 {
+        return Ok(());
+    }
+    Err(ProjectError::message(format!(
+        "{what}: kind {kind:?} is provided by {} catalogs, {}; a kind means one thing, so a \
+         catalog a project adds gives each of its kinds a name no other catalog has, its \
+         project's prefix in front (PROJECTS.md §10)",
+        providers.len(),
+        and_list(&providers)
+    )))
+}
+
+/// A registry that starts from the catalog's base registrations, the
+/// reference-designator fallback on: what a `kind = "netlist"` board, and a
+/// board kind that names no registry of its own, build with.
+fn base_registry(catalog: &dyn Catalog) -> PartRegistry {
+    let mut registry = PartRegistry::new();
+    // A netlist transcribed from a schematic carries no libsource; its
+    // passives and connectors classify by their reference designator.
+    registry.classify_unnamed_by_reference(true);
+    catalog.register_base(&mut registry);
+    registry
+}
+
+/// Where a `[[board.model]]` entry comes from: the project file, or the
+/// board kind's own ([`CatalogBoard::models`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Project,
+    BoardKind,
+}
+
 /// Read the board's netlist, register its models, and survey it.
-fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepared, ProjectError> {
-    let (netlist, mut registry) = if spec.kind == "netlist" {
+fn prepare(
+    spec: &BoardSpec,
+    catalog: &dyn Catalog,
+    base: &Path,
+    reports: &Reports,
+) -> Result<Prepared, ProjectError> {
+    let (netlist, mut registry, from_base, board_models) = if spec.kind == "netlist" {
         let relative = spec.netlist.as_deref().ok_or_else(|| {
             ProjectError::message(format!(
                 "board {}: kind \"netlist\" reads a netlist file; give its path, netlist = \
@@ -885,7 +1256,7 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
                 path.display()
             ))
         })?;
-        (parsed, catalog.base_registry())
+        (parsed, base_registry(catalog), true, Vec::new())
     } else {
         let kinds = catalog.board_kinds();
         if !kinds.contains(&spec.kind) {
@@ -898,6 +1269,7 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
                 kinds_sentence("board", &all)
             )));
         }
+        refuse_clash(catalog, &spec.kind, &format!("board {}", spec.name))?;
         if spec.netlist.is_some() {
             return Err(ProjectError::message(format!(
                 "board {}: kind {:?} brings its own netlist; netlist = … is for kind = \
@@ -905,8 +1277,40 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
                 spec.name, spec.kind
             )));
         }
-        let CatalogBoard { netlist, registry } = catalog.board(spec)?;
-        (netlist, registry)
+        let CatalogBoard {
+            netlist,
+            registry,
+            models,
+        } = catalog.board(spec)?;
+        match registry {
+            Some(registry) => (netlist, registry, false, models),
+            None => (netlist, base_registry(catalog), true, models),
+        }
+    };
+
+    // The board kind's own entries first, each one a project entry with the
+    // same key does not replace; then the project's.
+    let project_keys: BTreeSet<&str> = spec
+        .model
+        .iter()
+        .filter_map(|model| model.key().map(|(_, key)| key))
+        .collect();
+    let entries: Vec<(&ModelSpec, Origin)> = board_models
+        .iter()
+        .filter(|model| {
+            model
+                .key()
+                .is_none_or(|(_, key)| !project_keys.contains(key))
+        })
+        .map(|model| (model, Origin::BoardKind))
+        .chain(spec.model.iter().map(|model| (model, Origin::Project)))
+        .collect();
+    let from_kind = |origin: Origin, err: ProjectError| match origin {
+        Origin::Project => err,
+        Origin::BoardKind => ProjectError::message(format!(
+            "{err} (an entry board kind {:?} brings for its own parts)",
+            spec.kind
+        )),
     };
 
     let part_kinds = catalog.part_kinds();
@@ -914,13 +1318,16 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
     // a second entry under the same string would replace the first.
     let mut assigned: BTreeMap<String, KeyField> = BTreeMap::new();
     let mut checks: Vec<(KeyField, String, Vec<usize>)> = Vec::new();
-    for model in &spec.model {
+    for (model, origin) in entries {
         let (by, key) = model.key().ok_or_else(|| {
-            ProjectError::message(format!(
-                "board {}: a [[board.model]] (kind {:?}) matches parts by exactly one of part, \
-                 mpn or value",
-                spec.name, model.kind
-            ))
+            from_kind(
+                origin,
+                ProjectError::message(format!(
+                    "board {}: a [[board.model]] (kind {:?}) matches parts by exactly one of \
+                     part, mpn or value",
+                    spec.name, model.kind
+                )),
+            )
         })?;
         if let Some(first) = assigned.get(key) {
             let clash = if *first == by {
@@ -928,10 +1335,13 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
             } else {
                 format!("[[board.model]] {first} = {key:?} and {by} = {key:?} are one registry key")
             };
-            return Err(ProjectError::message(format!(
-                "board {}: {clash}, and a key takes one model; keep one",
-                spec.name
-            )));
+            return Err(from_kind(
+                origin,
+                ProjectError::message(format!(
+                    "board {}: {clash}, and a key takes one model; keep one",
+                    spec.name
+                )),
+            ));
         }
         assigned.insert(key.to_string(), by);
         let matched: Vec<usize> = netlist
@@ -942,20 +1352,30 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
             .map(|(index, _)| index)
             .collect();
         if matched.is_empty() {
-            return Err(ProjectError::message(format!(
-                "board {}: [[board.model]] {by} = {key:?} matches no part on the board{}",
-                spec.name,
-                no_match_hint(&netlist, by, key)
-            )));
+            return Err(from_kind(
+                origin,
+                ProjectError::message(format!(
+                    "board {}: [[board.model]] {by} = {key:?} matches no part on the board{}",
+                    spec.name,
+                    no_match_hint(&netlist, by, key)
+                )),
+            ));
         }
-        if !part_kinds.contains(&model.kind) {
-            return Err(ProjectError::message(format!(
-                "board {}: [[board.model]] {by} = {key:?}: unknown kind {:?}; {}",
-                spec.name,
-                model.kind,
-                kinds_sentence("part", &part_kinds)
-            )));
-        }
+        let Some(guide) = part_kinds.iter().find(|kind| kind.name == model.kind) else {
+            let names: Vec<String> = part_kinds
+                .iter()
+                .map(|kind| kind.name.to_string())
+                .collect();
+            return Err(from_kind(
+                origin,
+                ProjectError::message(format!(
+                    "board {}: [[board.model]] {by} = {key:?}: unknown kind {:?}; {}",
+                    spec.name,
+                    model.kind,
+                    kinds_sentence("part", &names)
+                )),
+            ));
+        };
         let reached: Vec<&ComponentDecl> = netlist
             .components
             .iter()
@@ -973,9 +1393,19 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
             parts: &reached,
             dir: base,
             netlist: &netlist,
+            reports,
         };
+        refuse_clash(catalog, &model.kind, &assignment.context())
+            .map_err(|err| from_kind(origin, err))?;
+        // A kind says what a part is (DESIGN.md rule 1): checked here, for
+        // every catalog's kinds, before the catalog registers anything.
+        guide
+            .check(&assignment)
+            .map_err(|err| from_kind(origin, err))?;
         let options = PartOptions::new(assignment.context(), model.options.clone());
-        catalog.register_part(&mut registry, &assignment, options)?;
+        catalog
+            .register_part(&mut registry, &assignment, options)
+            .map_err(|err| from_kind(origin, err))?;
         checks.push((by, key.to_string(), matched));
     }
 
@@ -1016,6 +1446,38 @@ fn prepare(spec: &BoardSpec, catalog: &dyn Catalog, base: &Path) -> Result<Prepa
                 "board {}: [[board.model]] {by} = {key:?} does not reach {}: {why}",
                 spec.name, decl.reference
             )));
+        }
+    }
+
+    // A part the base registrations place by a key two catalogs place is
+    // ambiguous, unless an entry gave that key a kind itself.
+    if from_base {
+        for decl in &netlist.components {
+            let pins = pin_counts
+                .get(decl.reference.as_str())
+                .copied()
+                .unwrap_or(0);
+            let Ok(classified) = registry.classify_with_key(decl, pins) else {
+                continue;
+            };
+            let Some(key) = classified.key else {
+                continue;
+            };
+            if assigned.contains_key(&key) {
+                continue;
+            }
+            let providers = catalog.base_key_clash(&key);
+            if providers.len() >= 2 {
+                return Err(ProjectError::message(format!(
+                    "board {}: {} is placed by {key:?}, and {} catalogs place parts by that key, \
+                     {}; give the key one kind with a [[board.model]] of its own, or leave one \
+                     catalog out",
+                    spec.name,
+                    decl.reference,
+                    providers.len(),
+                    and_list(&providers)
+                )));
+            }
         }
     }
 

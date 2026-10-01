@@ -67,13 +67,14 @@ replays them (`cli/build.rs` does, for the `embsim` binary and its tests).
 
 ## In a project
 
-`catalog::QemuCatalog` is the standard catalog with `core = "qemu"` for the
-`p2` part kind: the package holds a `P2Qemu` that boots `BOOT_ROM` (or the
-file the kind's `rom` option names) when the board is built, never when it
-is only surveyed. A build without QEMU refuses the entry with
-`P2QemuError::Unavailable`'s message; a key that reaches two parts is refused,
-QEMU being one machine per process. `QemuCatalog::seats` hands out the core's
-and the package's handles. The `embsim` command uses it: `embsim run` on a
+`catalog::QemuCores` is a core catalog of one kind, `qemu`, for the `p2`
+part kind, and `catalog::register` adds it to a catalog set: the package
+holds a `P2Qemu` that boots `BOOT_ROM` (or the file the core's `rom` option
+names) when the board is built, never when it is only surveyed. A build
+without QEMU refuses the entry with `P2QemuError::Unavailable`'s message; a
+key that reaches two parts is refused, QEMU being one machine per process.
+The core reports its console, per pad, and its yields to a run. The
+`embsim` command's set (`embsim_cli::shipped`) holds it: `embsim run` on a
 project whose P2 is `core = "qemu"` boots the ROM off the board's flash, as
 `tests/rom_boot_ec32mb.rs` does.
 

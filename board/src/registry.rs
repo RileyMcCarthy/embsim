@@ -515,6 +515,15 @@ impl PartRegistry {
         self.reference_fallback = enabled;
     }
 
+    /// Every key the registry places parts by — each entry's key and each
+    /// declared boundary's part name — sorted, each once: what a set of
+    /// catalogs compares to find two that place parts by one key.
+    pub fn keys(&self) -> Vec<String> {
+        let keys: std::collections::BTreeSet<&String> =
+            self.entries.keys().chain(self.boundaries.iter()).collect();
+        keys.into_iter().cloned().collect()
+    }
+
     /// True when a registry entry of any kind exists for the (already
     /// normalized) part name or value.
     pub fn has_part(&self, part: &str) -> bool {

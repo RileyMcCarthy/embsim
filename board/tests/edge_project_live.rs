@@ -1,8 +1,8 @@
 //! The MaD machine's three boards as a project, live:
 //! `boards/projects/edge-ec32-ds2.toml` run from the bench supplies it
 //! wires, past every soft-start, with the Edge board's RS-422 pair given
-//! the board tests' models (`machine_parts::EdgeCatalog`: the catalog does
-//! not ship them yet).
+//! the board tests' models (`machine_parts::edge_catalogs`: the standard
+//! catalog does not ship them yet).
 //!
 //! Stepped (`TESTING.md` rule 9), its own binary: the clock stepped before
 //! the project builds the converter (its protocol thread joins the clock as
@@ -25,7 +25,7 @@ use embsim_models::rail::{
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
-use machine_parts::EdgeCatalog;
+use machine_parts::edge_catalogs;
 
 /// The virtual time the run is handed before it reads: 10.1 ms, past the
 /// longest chain the boards arm from their supplies — the module's bucks'
@@ -85,7 +85,7 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
     let system = Project::load(&path)
         .expect("the project loads")
-        .instantiate(&EdgeCatalog)
+        .instantiate(&edge_catalogs())
         .expect("the project builds with the two line parts modelled")
         .hold_time()
         .start()

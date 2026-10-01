@@ -27,43 +27,49 @@
 //!
 //! # The base registry
 //!
-//! A `kind = "netlist"` board starts from [`StandardCatalog::base_registry`]:
-//! the reference-designator fallback for a netlist with no libsource, the
-//! element library ([`embsim_models::pwl_library`]), and every part kind's
-//! model under the manufacturer part numbers its datasheet and provenance
-//! name, with its default pin table. Two kinds are never placed by number: the
-//! processor, whose core is the thing under test, and a card socket, whose
-//! card is. A board kind's own registrations (the P2-EC32MB's, keyed on its
-//! netlist's values) stay with that board.
+//! A `kind = "netlist"` board starts from the base registrations
+//! ([`StandardCatalog::base_registry`]): the element library
+//! ([`embsim_models::pwl_library`]), and every part kind's model under the
+//! manufacturer part numbers its datasheet and provenance name, with its
+//! default pin table. Two kinds are never placed by number: the processor,
+//! whose core is the thing under test, and a card socket, whose card is. A
+//! board kind's own registrations (the P2-EC32MB's, keyed on its netlist's
+//! values) stay with that board.
 //!
 //! # The guide
 //!
 //! [`StandardCatalog::guide`] describes every part kind for someone choosing
-//! one: what the model is, the part numbers it is for, the pin tables it can
-//! declare (the ones its `pins` option picks, read off the models it
-//! registers) and the options it cannot go without. [`KindGuide::fit`] says
-//! how a kind is a part's model — by part number, or by the part family its
-//! keys name — which is how `embsim survey` and `embsim new` name the kind
-//! a part the survey lists is. Pins alone name no kind.
+//! one ([`KindGuide`]): what the model is, the part numbers it is for, the
+//! pin tables it can declare (the ones its `pins` option picks, read off the
+//! models it registers), the options it cannot go without, and what a part
+//! has to be for the kind to seat there ([`Named`]). The project checks the
+//! last for every part an entry reaches, for this catalog's kinds as for
+//! every other's ([`KindGuide::check`]).
 //!
-//! # What a part is
+//! # Bench components
 //!
-//! A kind says what a part is (`DESIGN.md` rule 1), so every kind checks
-//! the parts an entry reaches before it registers
-//! ([`StandardCatalog::check_parts_are_the_kind`], [`Named`]): a model's
-//! kind seats only on a part one of whose keys names its part family;
-//! `sd-card` and `boundary` only on a connector, by its reference designator
-//! or its symbol; `switch` only on a switch or jumper, by its designator, its
-//! symbol or its name; and `mechanical` only on a part whose pins sit on one
-//! net at most. A part none of them is needs a model.
+//! Two component kinds: `host-serial`, the host's end of a serial link as a
+//! PTY ([`embsim_board::HostPty::open_on_rail`]), and `scripted-source`, a
+//! pin driven through a list of steps ([`embsim_board::ScriptedSource`]).
+//!
+//! # Sets
+//!
+//! [`CatalogSet`] composes this catalog with others — the QEMU core, a
+//! project's own kinds — into one catalog a project is built with.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use embsim_board::registry::ComponentCtor;
 use embsim_board::{
-    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, Component, ComponentDecl, ComponentSpec,
-    KeyField, ModelFacade, PartOptions, PartRegistry, PinDecl, ProjectError, SwitchPole,
+    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, Component, ComponentDecl,
+    ComponentRequest, HostPty, KeyField, ModelFacade, PartOptions, PartRegistry, PinDecl,
+    ProjectError, Report, ScriptedSource, Step, SwitchPole,
+};
+
+pub use crate::set::CatalogSet;
+pub use embsim_board::kind::{
+    is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, Named, PinTable,
+    RequiredOption, CONNECTOR_DESIGNATORS, SWITCH_DESIGNATORS, SWITCH_WORDS,
 };
 use embsim_models::ads122u04::Config as AdcConfig;
 use embsim_models::ads122u04_component::{Ads122u04Component, ADS122U04_PINS};
@@ -94,7 +100,7 @@ use embsim_models::supervisor::{
 };
 
 use crate::ec32mb::{self, Ec32mb};
-use crate::p2::{p2x8c4m64p_pins, P2Package};
+use crate::p2::{self, p2x8c4m64p_pins, HeldInResetCores, P2Package};
 
 /// The board kinds, part kinds and base registry this crate ships.
 #[derive(Debug, Default, Clone, Copy)]
@@ -257,7 +263,17 @@ const PART_KINDS: &[PartKind] = &[
     },
 ];
 
+/// The catalog's name, as an error naming two catalogs prints it.
+pub const NAME: &str = "embsim-boards";
+
+/// The bench component kinds.
+const COMPONENT_KINDS: [&str; 2] = ["host-serial", "scripted-source"];
+
 impl Catalog for StandardCatalog {
+    fn name(&self) -> &str {
+        NAME
+    }
+
     fn board_kinds(&self) -> Vec<String> {
         BOARD_KINDS.iter().map(|kind| (*kind).to_string()).collect()
     }
@@ -268,7 +284,8 @@ impl Catalog for StandardCatalog {
                 netlist: netlist::parse(ec32mb::NETLIST).expect("the bundled EC32 netlist parses"),
                 // The module as `Ec32mb` builds it, the processor slot left
                 // for the project: `U100` is the part its survey names.
-                registry: Ec32mb::new().registry(),
+                registry: Some(Ec32mb::new().registry()),
+                models: Vec::new(),
             }),
             other => Err(ProjectError::message(format!(
                 "board {}: unknown kind {other:?}",
@@ -277,15 +294,12 @@ impl Catalog for StandardCatalog {
         }
     }
 
-    fn base_registry(&self) -> PartRegistry {
-        StandardCatalog::base_registry()
+    fn register_base(&self, registry: &mut PartRegistry) {
+        StandardCatalog::register_base_into(registry);
     }
 
-    fn part_kinds(&self) -> Vec<String> {
-        PART_KINDS
-            .iter()
-            .map(|kind| kind.name.to_string())
-            .collect()
+    fn part_kinds(&self) -> Vec<KindGuide> {
+        StandardCatalog::guide()
     }
 
     fn register_part(
@@ -298,36 +312,210 @@ impl Catalog for StandardCatalog {
             .iter()
             .find(|kind| kind.name == assignment.kind)
             .ok_or_else(|| assignment.error("not a part kind this catalog ships"))?;
-        StandardCatalog::check_parts_are_the_kind(assignment)?;
         (kind.register)(registry, assignment, options)
     }
 
     fn component_kinds(&self) -> Vec<String> {
-        Vec::new()
+        COMPONENT_KINDS
+            .iter()
+            .map(|kind| (*kind).to_string())
+            .collect()
     }
 
-    fn component(&self, spec: &ComponentSpec) -> Result<Box<dyn Component>, ProjectError> {
-        Err(ProjectError::message(format!(
-            "component {}: unknown kind {:?}; this catalog has no component kinds",
-            spec.name, spec.kind
-        )))
+    fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
+        match request.spec.kind.as_str() {
+            "host-serial" => host_serial(request),
+            "scripted-source" => scripted_source(request),
+            other => Err(ProjectError::message(format!(
+                "component {}: unknown kind {other:?}; the component kinds are \"host-serial\", \
+                 \"scripted-source\"",
+                request.spec.name
+            ))),
+        }
     }
 }
 
 impl StandardCatalog {
     /// The registry a `kind = "netlist"` board starts from (module docs,
-    /// "The base registry").
+    /// "The base registry"), the reference-designator fallback on as the
+    /// project turns it on.
     pub fn base_registry() -> PartRegistry {
         let mut registry = PartRegistry::new();
         // A netlist transcribed from a schematic carries no libsource; its
         // passives and connectors classify by their reference designator.
         registry.classify_unnamed_by_reference(true);
-        pwl_library::register(&mut registry);
-        for KnownPart { number, model, .. } in known_parts() {
-            model.register(&mut registry, number);
-        }
+        StandardCatalog::register_base_into(&mut registry);
         registry
     }
+
+    fn register_base_into(registry: &mut PartRegistry) {
+        pwl_library::register(registry);
+        for KnownPart { number, model, .. } in known_parts() {
+            model.register(registry, number);
+        }
+    }
+
+    /// Refuse the entry unless every part it reaches is what its kind
+    /// says: the project's own check ([`KindGuide::check`]) with this
+    /// catalog's guide, for a caller that registers one of this catalog's
+    /// kinds outside a project. A kind this catalog does not ship passes.
+    pub fn check_parts_are_the_kind(assignment: &Assignment<'_>) -> Result<(), ProjectError> {
+        match StandardCatalog::guide()
+            .iter()
+            .find(|kind| kind.name == assignment.kind)
+        {
+            Some(kind) => kind.check(assignment),
+            None => Ok(()),
+        }
+    }
+}
+
+// ============================================================
+// Bench components
+// ============================================================
+
+/// `host-serial`: the host's end of a serial link, a PTY whose bytes are
+/// levels on `TX` and `RX` at the host's own rail (`VIO` above `GND`).
+fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
+    let ComponentRequest {
+        spec,
+        mut options,
+        dir,
+        reports,
+    } = request;
+    let error = |message: String| options_error(spec, message);
+    let baud = options.integer("baud")?.ok_or_else(|| {
+        error(
+            "options.baud is the link's rate, framed 8N1; a host names its rate, and the kind \
+             invents none (baud = 115200)"
+                .to_string(),
+        )
+    })?;
+    let baud = u32::try_from(baud)
+        .ok()
+        .filter(|baud| *baud > 0)
+        .ok_or_else(|| error(format!("options.baud = {baud} is not a rate")))?;
+    let path = options.string("path")?;
+    options.finish()?;
+    let path = match path {
+        Some(path) => dir.join(path),
+        None => {
+            // `.embsim/<name>.pty` beside the project file.
+            let embsim = dir.join(".embsim");
+            std::fs::create_dir_all(&embsim).map_err(|err| {
+                error(format!(
+                    "cannot make {} for its PTY: {err}",
+                    embsim.display()
+                ))
+            })?;
+            embsim.join(format!("{}.pty", spec.name))
+        }
+    };
+    let text = path.to_string_lossy().into_owned();
+    let pty = HostPty::open_on_rail(&text, baud)
+        .map_err(|err| error(format!("cannot open a PTY at {text}: {err}")))?;
+    reports.add(HostSerialReport {
+        subject: spec.name.clone(),
+        path: text,
+        baud,
+        counters: pty.counters(),
+        said: false,
+    });
+    Ok(Box::new(pty))
+}
+
+/// An error about a bench component's entry.
+fn options_error(spec: &embsim_board::ComponentSpec, message: String) -> ProjectError {
+    ProjectError::message(format!(
+        "component {} (kind {:?}): {message}",
+        spec.name, spec.kind
+    ))
+}
+
+/// What a `host-serial` says in a run: its path at the first look, so a
+/// host can open it, and the bytes each way at the end.
+struct HostSerialReport {
+    subject: String,
+    path: String,
+    baud: u32,
+    counters: std::sync::Arc<embsim_board::HostPtyCounters>,
+    said: bool,
+}
+
+impl Report for HostSerialReport {
+    fn subject(&self) -> String {
+        self.subject.clone()
+    }
+
+    fn look(&mut self, _now_ns: u64) -> Vec<String> {
+        if std::mem::replace(&mut self.said, true) {
+            return Vec::new();
+        }
+        vec![format!(
+            "host serial at {}, {} baud 8N1",
+            self.path, self.baud
+        )]
+    }
+
+    fn summary(&self) -> Vec<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let from_host = self.counters.from_host.load(Relaxed);
+        let mut lines = vec![format!(
+            "host serial at {}: {from_host} bytes from the host, {} to it, {} framing errors",
+            self.path,
+            self.counters.to_host.load(Relaxed),
+            self.counters.framing_errors.load(Relaxed)
+        )];
+        if from_host > 0 {
+            lines.push(
+                "the host wrote during the run: its bytes landed when it wrote them, so this run \
+                 is reproducible in what the host sent, not in when"
+                    .to_string(),
+            );
+        }
+        lines
+    }
+}
+
+/// `scripted-source`: one pin, `OUT`, driven through `steps` behind `ohms`.
+fn scripted_source(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
+    let ComponentRequest {
+        spec, mut options, ..
+    } = request;
+    let ohms = options.number("ohms")?.ok_or_else(|| {
+        options_error(
+            spec,
+            "options.ohms is the source's output impedance, more than 0 Ω; a scenario names it \
+             (an ideal constant supply is a [[wire]] with volts)"
+                .to_string(),
+        )
+    })?;
+    let shape = "options.steps is a list of [\"instant\", volts] pairs, such as [[\"0ms\", \
+                 0.0], [\"5ms\", 3.3]]";
+    let Some(value) = options.value("steps") else {
+        return Err(options_error(spec, format!("{shape}, and it is required")));
+    };
+    let toml::Value::Array(items) = value else {
+        return Err(options.error(shape));
+    };
+    let mut steps = Vec::with_capacity(items.len());
+    for item in items {
+        let toml::Value::Array(pair) = item else {
+            return Err(options.error(shape));
+        };
+        let (at, volts) = match pair.as_slice() {
+            [toml::Value::String(at), toml::Value::Float(volts)] => (at.clone(), *volts),
+            [toml::Value::String(at), toml::Value::Integer(volts)] => (at.clone(), *volts as f64),
+            _ => return Err(options.error(shape)),
+        };
+        let at_ns = embsim_board::parse_duration(&at)
+            .map_err(|why| options.error(format!("options.steps: {why}")))?;
+        steps.push(Step { at_ns, volts });
+    }
+    options.finish()?;
+    ScriptedSource::new(ohms, steps)
+        .map(|source| Box::new(source) as Box<dyn Component>)
+        .map_err(|why| options_error(spec, why))
 }
 
 // ============================================================
@@ -739,18 +927,13 @@ fn value_then_mpn<C>(decl: &ComponentDecl, parse: impl Fn(&str) -> Option<C>) ->
 fn p2_kind(
     registry: &mut PartRegistry,
     assignment: &Assignment<'_>,
-    mut options: PartOptions,
+    options: PartOptions,
 ) -> Result<(), ProjectError> {
-    options.choice("core", &["held-in-reset"])?.ok_or_else(|| {
-        assignment.error(
-            "options.core says what runs inside the package; this catalog seats \
-                 \"held-in-reset\", the chip before it runs (a core under test, QEMU or an \
-                 instruction-set simulator, is seated by the program that owns it)",
-        )
-    })?;
-    options.finish()?;
-    p2_model().register(registry, assignment.key);
-    Ok(())
+    // Alone, the catalog seats the one core it has; a set seats every core
+    // it holds through the same function (`CatalogSet`).
+    p2::register_p2(registry, assignment, options, &[&HeldInResetCores], &|_| {
+        Vec::new()
+    })
 }
 
 fn tg2520smn_kind(
@@ -1095,388 +1278,8 @@ fn boundary_kind(
 }
 
 // ============================================================
-// What a part is
-// ============================================================
-
-/// What a part has to be for a kind to seat there: a kind says what the
-/// part is (`DESIGN.md` rule 1), so a kind never seats on a part that is
-/// something else, whatever its pins. A part none of them fits is a part
-/// that needs a model (`PROJECTS.md` §7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Named {
-    /// One of the part's part name, manufacturer part number or value names
-    /// one of these part families, compared on letters and digits: the part
-    /// is a member of the family the model's datasheet describes.
-    Family(&'static [&'static str]),
-    /// A connector, by its reference designator or its symbol
-    /// ([`is_connector`]).
-    Connector,
-    /// A switch or a jumper, by its reference designator or its symbol
-    /// ([`is_switch`]).
-    Switch,
-    /// A part with nothing electrical: its pins sit on one net at most, so
-    /// it joins nothing. A part whose pins join two nets carries current
-    /// between them, and that is behaviour a model has to say.
-    OneNet,
-}
-
-/// The reference designators a connector is drawn with: `J` (a jack or a
-/// connector), `P` (a plug), `CN`.
-pub const CONNECTOR_DESIGNATORS: [&str; 3] = ["J", "P", "CN"];
-
-/// The reference designators a switch or jumper is drawn with: `S`, `SW`,
-/// `JP`, `SJ` (a solder jumper).
-pub const SWITCH_DESIGNATORS: [&str; 4] = ["S", "SW", "JP", "SJ"];
-
-/// Words a part's own name says it is a switch or jumper with, in any case:
-/// a netlist transcribed from a schematic has no symbol, and its value is
-/// the part's name (the P2-EC32MB's `J101`, "Solder Link Pads").
-pub const SWITCH_WORDS: [&str; 3] = ["switch", "jumper", "solder link"];
-
-/// A reference designator's class letters: the letters before its first
-/// digit, upper-cased (`"SW"` for `SW3`, `"U"` for `U24`).
-fn designator(reference: &str) -> String {
-    reference
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
-}
-
-/// Whether a part is a connector by what the board says of it: a connector
-/// designator ([`CONNECTOR_DESIGNATORS`]) or a `Conn…` symbol.
-pub fn is_connector(reference: &str, part: &str) -> bool {
-    CONNECTOR_DESIGNATORS.contains(&designator(reference).as_str()) || part.starts_with("Conn")
-}
-
-/// Whether a part is a switch or jumper by what the board says of it: a
-/// switch designator ([`SWITCH_DESIGNATORS`]), a `SW_…` symbol, or a symbol
-/// name or value that says so ([`SWITCH_WORDS`]).
-pub fn is_switch(reference: &str, part: &str, value: &str) -> bool {
-    let says = |text: &str| {
-        let text = text.to_lowercase();
-        SWITCH_WORDS.iter().any(|word| text.contains(word))
-    };
-    SWITCH_DESIGNATORS.contains(&designator(reference).as_str())
-        || part.starts_with("SW_")
-        || says(part)
-        || says(value)
-}
-
-/// Whether one of `keys` names one of `families`: a key's letters and
-/// digits contain the family's ([`number_stem`]). A key shorter than
-/// [`MIN_NUMBER_STEM`] names no part.
-fn names_a_family(keys: &[&str], families: &[&'static str]) -> Option<&'static str> {
-    let keys: Vec<String> = keys
-        .iter()
-        .map(|key| number_stem(key))
-        .filter(|key| key.len() >= MIN_NUMBER_STEM)
-        .collect();
-    families.iter().copied().find(|family| {
-        let family = number_stem(family);
-        keys.iter().any(|key| key.contains(family.as_str()))
-    })
-}
-
-impl Named {
-    /// What the kind is for, as the `PROJECTS.md` table and an error say
-    /// it.
-    pub fn describe(self) -> String {
-        match self {
-            Named::Family(families) => {
-                let names: Vec<&str> = families.to_vec();
-                let listed = match names.as_slice() {
-                    [one] => (*one).to_string(),
-                    [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
-                    [] => String::new(),
-                };
-                format!("a part whose part name, mpn or value contains {listed}")
-            }
-            Named::Connector => "a connector: designator J, P or CN, or a Conn… symbol".to_string(),
-            Named::Switch => {
-                "a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that \
-                 says switch, jumper or solder link"
-                    .to_string()
-            }
-            Named::OneNet => "a part whose pads sit on one net at most".to_string(),
-        }
-    }
-}
-
-impl StandardCatalog {
-    /// Refuse the entry unless every part it reaches is what its kind
-    /// says ([`Named`]). [`Catalog::register_part`] checks this first; a
-    /// catalog that registers one of this catalog's kinds itself (the QEMU
-    /// catalog's `p2`) calls it too.
-    pub fn check_parts_are_the_kind(assignment: &Assignment<'_>) -> Result<(), ProjectError> {
-        let Some(kind) = PART_KINDS.iter().find(|kind| kind.name == assignment.kind) else {
-            return Ok(());
-        };
-        for decl in assignment.parts {
-            let part = embsim_board::registry::normalize_part(decl);
-            let why = match kind.is {
-                Named::Family(families) => {
-                    let keys = [
-                        part.as_str(),
-                        decl.mpn.as_deref().unwrap_or(""),
-                        &decl.value,
-                    ];
-                    if names_a_family(&keys, families).is_some() {
-                        continue;
-                    }
-                    format!(
-                        "kind {:?} is for {}, and {}'s {} do not",
-                        kind.name,
-                        kind.is.describe(),
-                        decl.reference,
-                        keys_phrase(&part, decl)
-                    )
-                }
-                Named::Connector => {
-                    if is_connector(&decl.reference, &part) {
-                        continue;
-                    }
-                    format!(
-                        "kind {:?} is for {}, and {} is neither",
-                        kind.name,
-                        Named::Connector.describe(),
-                        symbol_phrase(&part, decl)
-                    )
-                }
-                Named::Switch => {
-                    if is_switch(&decl.reference, &part, &decl.value) {
-                        continue;
-                    }
-                    format!(
-                        "kind {:?} is for {}, and {} is neither",
-                        kind.name,
-                        Named::Switch.describe(),
-                        symbol_phrase(&part, decl)
-                    )
-                }
-                Named::OneNet => {
-                    let nets = assignment.nets_of(&decl.reference);
-                    if nets.len() <= 1 {
-                        continue;
-                    }
-                    let mut listed: Vec<&str> = nets.into_iter().collect();
-                    let more = listed.len().saturating_sub(4);
-                    listed.truncate(4);
-                    format!(
-                        "kind {:?} is for {}, and {}'s pins join {} nets ({}{}): a part whose \
-                         pins join nets carries current between them",
-                        kind.name,
-                        Named::OneNet.describe(),
-                        decl.reference,
-                        listed.len() + more,
-                        listed.join(", "),
-                        if more > 0 {
-                            format!(" and {more} more")
-                        } else {
-                            String::new()
-                        }
-                    )
-                }
-            };
-            return Err(assignment.error(format!(
-                "{} is not the part this kind says it is: {why}. A kind says what a part is \
-                 (DESIGN.md rule 1); a part no kind is for needs a model (PROJECTS.md §7)",
-                decl.reference
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// `part name "X", mpn "Y" and value "Z"`: the keys a part carries.
-fn keys_phrase(part: &str, decl: &ComponentDecl) -> String {
-    let mut keys = Vec::new();
-    if !part.is_empty() {
-        keys.push(format!("part name {part:?}"));
-    }
-    if let Some(mpn) = &decl.mpn {
-        keys.push(format!("mpn {mpn:?}"));
-    }
-    keys.push(format!("value {:?}", decl.value));
-    match keys.as_slice() {
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-        [] => String::new(),
-    }
-}
-
-/// `U1 (designator U, symbol "ADS122U04")`: what the board says a part is.
-fn symbol_phrase(part: &str, decl: &ComponentDecl) -> String {
-    let designator = designator(&decl.reference);
-    if part.is_empty() {
-        format!(
-            "{} (designator {designator}, no symbol name)",
-            decl.reference
-        )
-    } else {
-        format!(
-            "{} (designator {designator}, symbol {part:?})",
-            decl.reference
-        )
-    }
-}
-
-/// The kinds that need no model a part may take, each with what makes it
-/// one: by its reference designator, its symbol's part name and the number
-/// of nets its pins sit on — the checks those kinds make when an entry
-/// names them ([`StandardCatalog::check_parts_are_the_kind`]).
-pub fn kinds_without_a_model(
-    reference: &str,
-    part: &str,
-    value: &str,
-    nets: usize,
-) -> Vec<(&'static str, String)> {
-    let mut kinds = Vec::new();
-    let designator = designator(reference);
-    if is_switch(reference, part, value) {
-        let why = if SWITCH_DESIGNATORS.contains(&designator.as_str()) {
-            format!("its designator {designator}")
-        } else if part.is_empty() {
-            format!("its value {value:?}")
-        } else {
-            format!("its symbol {part:?}")
-        };
-        kinds.push(("switch", why));
-    }
-    if is_connector(reference, part) {
-        let why = if CONNECTOR_DESIGNATORS.contains(&designator.as_str()) {
-            format!("its designator {designator}")
-        } else {
-            format!("its symbol {part:?}")
-        };
-        kinds.push(("boundary", why));
-    }
-    if nets <= 1 {
-        kinds.push((
-            "mechanical",
-            if nets == 0 {
-                "it has no pins on a net".to_string()
-            } else {
-                "its pins sit on one net".to_string()
-            },
-        ));
-    }
-    kinds
-}
-
-// ============================================================
 // The guide
 // ============================================================
-
-/// A pin table a part kind's model can declare.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PinTable {
-    /// What names the table: its `pins` option value (`"soic8"`) when
-    /// [`Self::option`] is set, otherwise the part number whose model
-    /// declares it (`"ISO6741DWR"`, `"P2X8C4M64P"`).
-    pub name: &'static str,
-    /// Whether `pins = name` among the kind's options picks this table.
-    pub option: bool,
-    /// The pin identities the table declares, in declaration order.
-    pub pins: Vec<String>,
-}
-
-/// An option a part kind cannot be registered without.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequiredOption {
-    /// The option's name (`"core"`).
-    pub name: &'static str,
-    /// A value of the shape the option takes, as TOML (`"\"held-in-reset\""`).
-    pub example: &'static str,
-    /// What the option says, in a phrase.
-    pub means: &'static str,
-}
-
-/// A part kind as someone choosing one reads it: what the model is, the
-/// part numbers it is for, the pin tables it can declare, and the options
-/// it needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KindGuide {
-    /// The kind's name, as a `[[board.model]]` gives it.
-    pub name: &'static str,
-    /// The model, in a phrase.
-    pub summary: &'static str,
-    /// The part numbers the kind is for: every one the base registry
-    /// places it by, and the processor's, which it never places.
-    pub numbers: Vec<&'static str>,
-    /// The pin tables its model can declare. Empty for a kind that takes
-    /// the part's own pins, whatever they are (`switch`, `mechanical`,
-    /// `boundary`).
-    pub tables: Vec<PinTable>,
-    /// The options it cannot be registered without.
-    pub required: Vec<RequiredOption>,
-    /// What a part has to be for the kind to seat there.
-    pub is: Named,
-}
-
-/// How a part kind is a part's model, strongest first. Pins alone say
-/// nothing: an EDA export numbers every package's pins from 1, so two parts
-/// with as many pins share a table whatever they are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fit {
-    /// One of the part's keys and a number the kind is for name the same
-    /// part: one is the other, or the other with an ordering suffix
-    /// (`ADS122U04` and `ADS122U04IPW`), compared on letters and digits.
-    Number(&'static str),
-    /// One of the part's keys names the part family the kind's model is
-    /// for (`TG2520SMN 26.0000M-ECGNNM3` names `TG2520SMN`): the kind seats
-    /// there ([`Named::Family`]), and the model reads what it needs from the
-    /// part or refuses it.
-    Family(&'static str),
-}
-
-/// The fewest letters and digits a key must have to be compared with a
-/// part number: short enough for `6N137`, long enough that a value such
-/// as `10k` or `P2` names no part.
-const MIN_NUMBER_STEM: usize = 5;
-
-/// Letters and digits, upper-cased: `"W25Q128JVSIM TR"` is `"W25Q128JVSIMTR"`.
-fn number_stem(text: &str) -> String {
-    text.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
-}
-
-impl KindGuide {
-    /// The strongest way this kind is the model of a part whose keys (part
-    /// name, manufacturer part number, value) are these ([`Fit`]); `None`
-    /// when it is not.
-    pub fn fit(&self, keys: &[&str]) -> Option<Fit> {
-        let stems: Vec<String> = keys
-            .iter()
-            .map(|key| number_stem(key))
-            .filter(|key| key.len() >= MIN_NUMBER_STEM)
-            .collect();
-        for number in &self.numbers {
-            let stem = number_stem(number);
-            if stems
-                .iter()
-                .any(|key| stem.starts_with(key.as_str()) || key.starts_with(stem.as_str()))
-            {
-                return Some(Fit::Number(number));
-            }
-        }
-        match self.is {
-            Named::Family(families) => names_a_family(keys, families).map(Fit::Family),
-            _ => None,
-        }
-    }
-
-    /// The table that declares exactly `pins`, compared as sets.
-    pub fn table_with(&self, pins: &[&str]) -> Option<&PinTable> {
-        let wanted: BTreeSet<&str> = pins.iter().copied().collect();
-        self.tables.iter().find(|table| {
-            table.pins.len() == wanted.len()
-                && table.pins.iter().all(|pin| wanted.contains(pin.as_str()))
-        })
-    }
-}
 
 impl StandardCatalog {
     /// Every part kind, in `PROJECTS.md`'s order, as someone choosing one
@@ -1593,17 +1396,20 @@ fn required_options(name: &str) -> Vec<RequiredOption> {
         "p2" => vec![RequiredOption {
             name: "core",
             example: "\"held-in-reset\"",
-            means: "what runs inside the package; \"held-in-reset\" is the chip before it runs",
+            means: "what runs inside the package; \"held-in-reset\" is the chip before it runs"
+                .to_string(),
         }],
         "sd-card" => vec![RequiredOption {
             name: "image",
             example: "\"card.img\"",
-            means: "the card in the socket: a card image file, relative to the project file",
+            means: "the card in the socket: a card image file, relative to the project file"
+                .to_string(),
         }],
         "switch" => vec![RequiredOption {
             name: "poles",
             example: "[[\"1\", \"2\"]]",
-            means: "the part's pins paired into poles, each open until a [[switch]] closes it",
+            means: "the part's pins paired into poles, each open until a [[switch]] closes it"
+                .to_string(),
         }],
         _ => Vec::new(),
     }
@@ -1681,6 +1487,7 @@ mod tests {
     ) -> Result<(), ProjectError> {
         let parts = [decl];
         let netlist = no_nets();
+        let reports = embsim_board::Reports::new();
         let assignment = Assignment {
             board: "B",
             by: KeyField::Mpn,
@@ -1689,8 +1496,11 @@ mod tests {
             parts: &parts,
             dir,
             netlist: &netlist,
+            reports: &reports,
         };
         let table: toml::Table = toml::from_str(options).expect("the options parse");
+        // What a project checks before it registers any kind.
+        StandardCatalog::check_parts_are_the_kind(&assignment)?;
         StandardCatalog.register_part(
             registry,
             &assignment,

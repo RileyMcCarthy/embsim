@@ -5,9 +5,9 @@
 //! The standard catalog does not model two of the Edge board's parts yet,
 //! the AM26LS31 line driver `U24` and the AM26LV32 line receiver `U25`
 //! (`PROJECTS.md` §9), so the file builds here with a catalog of the test
-//! tree's own, `machine_parts::EdgeCatalog`: the standard catalog, its base
-//! registry given the two models the board tests run the Edge board with.
-//! Everything else the project names is the standard catalog's.
+//! tree's own beside the standard one (`machine_parts::edge_catalogs`): its
+//! base registrations are the two models the board tests run the Edge board
+//! with. Everything else the project names is the standard catalog's.
 //!
 //! What it holds the file to is the hand-written harnesses the machine
 //! tests assemble the three boards with (`machine_parts`): the socket's
@@ -26,7 +26,7 @@ use embsim_core::virtual_clock::{self, ClockMode};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
-use machine_parts::{edge_fingers, force_gauge_harness, module_socket_harness, EdgeCatalog};
+use machine_parts::{edge_catalogs, edge_fingers, force_gauge_harness, module_socket_harness};
 
 fn project() -> Project {
     let path: PathBuf = [
@@ -97,7 +97,7 @@ fn the_three_board_projects_mates_join_what_the_machines_harnesses_join() {
     // Building attaches the converter, whose protocol thread joins the clock.
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
     let built = project()
-        .instantiate(&EdgeCatalog)
+        .instantiate(&edge_catalogs())
         .expect("the project builds with the two line parts modelled")
         .build()
         .expect("the system builds");

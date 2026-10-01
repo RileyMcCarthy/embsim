@@ -20,9 +20,11 @@ file with `embsim_board::Project`. The guide is [`PROJECTS.md`](PROJECTS.md).
 
 It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD)
 and is designed to be reused: no generic crate depends on a project crate
-(below). A new project supplies its boards' netlists, the models its parts
-need (a catalog of its own, `PROJECTS.md` section 7), and a core in the
-processor's slot.
+(below). A new project supplies its boards' netlists, and the models, boards,
+processor cores and bench parts it needs that embsim does not ship: a catalog
+of its own, which joins the shipped ones in a catalog set, and the `embsim`
+command over that set, a binary of ten lines on the command's library
+(`PROJECTS.md` sections 7 and 10).
 
 ## What embsim is for, and what it is not
 
@@ -242,13 +244,19 @@ embsim run board.toml --for 20ms --net BOARD.VCC
   survey line and what the build found, and exits non-zero with the reason —
   the survey, for a board with a part still unmodelled — on any refusal.
 - **`run`** starts the system on a stepped clock and runs it for `--for` of
-  virtual time (or until interrupted), printing the build's findings, then
-  findings and a P2's console as the run reaches them, then the nets asked
-  for with `--net`, and at the end each finding's net read again: the ones
-  the run cleared (a rail that came up) apart from the ones still true.
+  virtual time, or until interrupted (Ctrl-C), printing the build's
+  findings, then findings and what the parts report (a P2's start and
+  console, a host port's path) as the run reaches them, then what each part
+  reports of itself, the nets asked for with `--net`, and each finding's net
+  read again: the ones the run cleared (a rail that came up) apart from the
+  ones still true. `--pty` says where a `host-serial` component's PTY goes.
 
-`embsim` knows one more value for the `p2` kind's `core` than the standard
-catalog: `core = "qemu"` seats the QEMU P2 in the package, which boots its
+The standard catalog's bench component kinds are `host-serial`, a host's
+serial port as a PTY on the host's own rail, and `scripted-source`, a pin
+driven through a list of steps (`PROJECTS.md` section 5).
+
+The `embsim` command's set adds one core for the `p2` kind to the standard
+catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its
 ROM (`rom = "file"` for another) off whatever the board gives it — on the
 P2-EC32MB, the flash, which `image = "boot.bin"` on the `w25q128jv` kind
 fills (`embsim_p2_qemu::flashimage` lays out stage-1 and a program). QEMU

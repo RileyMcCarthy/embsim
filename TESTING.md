@@ -258,9 +258,23 @@ cargo test -p embsim-board --test edge_project --test edge_project_live
 # failure prints the tables to paste.
 cargo test -p embsim-boards --lib catalog
 # PROJECTS.md's Rust examples, run as doc tests of embsim-boards from its
-# directory: a project loaded, surveyed and built, and a catalog of one's
-# own adding a board kind and a part kind.
+# directory: a project loaded, surveyed and built, a catalog of one's own
+# adding a board kind and a part kind to a catalog set, and a core catalog
+# adding a P2 core.
 cargo test -p embsim-boards --doc
+# Catalogs composed into one (`boards/src/set.rs`), build only: a kind two
+# catalogs provide refused where a project names it, naming both, and a
+# project that does not name it surveyed; a core and a base part number
+# the same; what a set refuses when a catalog joins; an added kind refused
+# on a part it is not before its catalog is asked; a board kind's own
+# entries, and a project entry replacing one.
+cargo test -p embsim-boards --test catalog_set
+# The standard bench component kinds, stepped, each its own binary: a
+# scripted source's steps landing at their instants across a divider (read a
+# nanosecond either side of each, and by a reader handed each at its
+# instant), and two host serial ports as a null-modem cable carrying bytes
+# between their PTYs both ways; and what each kind refuses.
+cargo test -p embsim-boards --test scripted_source --test host_serial
 # The `embsim` command (`cli/`), run as a user runs it, a process a case:
 # survey the EC32's netlist (every connector pin, what needs a model and what
 # could be it, the pin table that fits), the Edge board's (the two parts no
@@ -271,7 +285,12 @@ cargo test -p embsim-boards --doc
 # the EC32 project for 10 ms, its rails up, the build's findings apart and
 # the ones the run cleared listed at the end, the report the same twice. With
 # EMBSIM_QEMU_P2_BUILD set, `run` also boots the P2 off the module's flash
-# (`core = "qemu"`); without it, the refusal that says how.
+# (`core = "qemu"`); without it, the refusal that says how. `run` with no
+# duration interrupted by SIGINT, its summary printed; `run --pty` putting a
+# host's PTY where it says and printing its path. And the command as a
+# library (`cli/tests/library.rs`, in process): a catalog the test defines
+# adds a board kind, a part kind, a P2 core and a bench component, and a
+# project naming all four checks and runs through `embsim_cli::run`.
 cargo test -p embsim-cli
 ```
 

@@ -8,14 +8,14 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io::Write as IoWrite;
 use std::path::{Component as PathPart, Path, PathBuf};
 
 use embsim_board::{
-    BoardSurvey, Classification, ConnectorReport, KeyField, PassiveKind, PinSite, Project,
-    SurveyedPart, UnmodelledPart,
+    is_connector, kinds_without_a_model, BoardSurvey, Classification, ConnectorReport, Fit,
+    KeyField, KindGuide, PassiveKind, PinSite, Project, SurveyedPart, UnmodelledPart,
 };
-use embsim_boards::catalog::{is_connector, kinds_without_a_model, Fit, KindGuide};
-use embsim_p2_qemu::catalog::QemuCatalog;
+use embsim_boards::catalog::CatalogSet;
 
 /// The widest a line of references gets before it wraps.
 const LINE_WIDTH: usize = 100;
@@ -51,8 +51,8 @@ fn default_name(netlist: &Path) -> String {
 }
 
 /// Survey `netlist` as the board `name` of a project whose one board is
-/// that netlist, with the catalog's base registry.
-fn survey_netlist(netlist: &Path, name: &str) -> Result<BoardSurvey, String> {
+/// that netlist, with the set's base registrations.
+fn survey_netlist(set: &CatalogSet, netlist: &Path, name: &str) -> Result<BoardSurvey, String> {
     let file = netlist
         .file_name()
         .ok_or_else(|| format!("{} names no netlist file", netlist.display()))?;
@@ -68,9 +68,7 @@ fn survey_netlist(netlist: &Path, name: &str) -> Result<BoardSurvey, String> {
     let project = Project::parse(&text)
         .map_err(|err| err.to_string())?
         .relative_to(dir);
-    project
-        .survey(&QemuCatalog::new(), name)
-        .map_err(|err| err.to_string())
+    project.survey(set, name).map_err(|err| err.to_string())
 }
 
 // ============================================================
@@ -337,25 +335,22 @@ fn option_table_for<'g>(kind: &'g KindGuide, pins: &[&str]) -> Option<&'g str> {
 // ============================================================
 
 /// `embsim survey <netlist>`.
-pub fn survey(netlist: &Path) -> Result<(), String> {
+pub fn survey(set: &CatalogSet, netlist: &Path, out: &mut dyn IoWrite) -> Result<(), String> {
     let name = default_name(netlist);
-    let survey = survey_netlist(netlist, &name)?;
-    print!(
+    let survey = survey_netlist(set, netlist, &name)?;
+    let _ = write!(
+        out,
         "{}",
-        survey_report(
-            &netlist.display().to_string(),
-            &survey,
-            &QemuCatalog::guide()
-        )
+        survey_report(&netlist.display().to_string(), &survey, &set.guide())
     );
     Ok(())
 }
 
-/// `embsim survey --kind <board kind>`: a board the catalog ships, surveyed
+/// `embsim survey --kind <board kind>`: a board a catalog ships, surveyed
 /// with the registry it builds with, as a project's `[[board]]` of that
 /// kind surveys it — every part it places, the ones it leaves to the
 /// project, and every connector pin with its name and net.
-pub fn survey_kind(kind: &str) -> Result<(), String> {
+pub fn survey_kind(set: &CatalogSet, kind: &str, out: &mut dyn IoWrite) -> Result<(), String> {
     if kind == "netlist" {
         return Err(
             "--kind netlist is a board read from a file; give the file: embsim survey board.net"
@@ -368,11 +363,12 @@ pub fn survey_kind(kind: &str) -> Result<(), String> {
     );
     let project = Project::parse(&text).map_err(|err| err.to_string())?;
     let survey = project
-        .survey(&QemuCatalog::new(), "BOARD")
+        .survey(set, "BOARD")
         .map_err(|err| err.to_string())?;
-    print!(
+    let _ = write!(
+        out,
         "{}",
-        survey_report(&format!("kind {kind:?}"), &survey, &QemuCatalog::guide())
+        survey_report(&format!("kind {kind:?}"), &survey, &set.guide())
     );
     Ok(())
 }
@@ -594,13 +590,15 @@ fn pin_table(
 
 /// `embsim new <netlist> [--name N] [-o project.toml] [--force]`.
 pub fn new_project(
+    set: &CatalogSet,
     netlist: &Path,
     name: Option<&str>,
     output: Option<&Path>,
     force: bool,
+    out: &mut dyn IoWrite,
 ) -> Result<(), String> {
     let name = name.map_or_else(|| default_name(netlist), str::to_string);
-    let survey = survey_netlist(netlist, &name)?;
+    let survey = survey_netlist(set, netlist, &name)?;
 
     // The netlist, relative to where the project will live.
     let project_dir = match output {
@@ -620,7 +618,7 @@ pub fn new_project(
         &name,
         &relative.to_string_lossy(),
         &survey,
-        &QemuCatalog::guide(),
+        &set.guide(),
     );
     // What `new` writes is a project; a text that is not one is this
     // command's own error.
@@ -628,7 +626,7 @@ pub fn new_project(
         .map_err(|err| format!("the starter project does not parse (embsim's error): {err}"))?;
 
     let Some(path) = output else {
-        print!("{text}");
+        let _ = write!(out, "{text}");
         return Ok(());
     };
     if path.exists() && !force {
@@ -639,8 +637,9 @@ pub fn new_project(
     }
     std::fs::write(path, &text).map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     let stubs = stub_groups(&survey).len();
-    println!("wrote {}", path.display());
-    println!(
+    let _ = writeln!(out, "wrote {}", path.display());
+    let _ = writeln!(
+        out,
         "  board {name}: {} parts, {} populated by the catalog, {} pin table{} chosen",
         survey.part_count,
         survey.modelled - survey.mismatched.len(),
@@ -652,7 +651,8 @@ pub fn new_project(
         }
     );
     if stubs > 0 {
-        println!(
+        let _ = writeln!(
+            out,
             "  {stubs} model stub{} to fill in, for {} part{} that need a model",
             if stubs == 1 { "" } else { "s" },
             survey.needs_model.len(),
@@ -663,7 +663,8 @@ pub fn new_project(
             }
         );
     }
-    println!(
+    let _ = writeln!(
+        out,
         "  {} connector{} to wire; then `embsim check {}`",
         survey.connectors.len(),
         if survey.connectors.len() == 1 {

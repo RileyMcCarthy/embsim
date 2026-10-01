@@ -273,7 +273,7 @@ fn edge(rest: &str) -> String {
 fn a_kind_the_board_says_a_part_is_not_is_refused(#[case] text: String, #[case] says: &[&str]) {
     behaviour!(Test {
         id: "project.refuses-kind-the-part-is-not",
-        covers: Some("boards/src/catalog.rs#StandardCatalog::check_parts_are_the_kind"),
+        covers: Some("board/src/kind.rs#KindGuide::check"),
         given: "an integrated circuit given a kind its board says it is not: the force-gauge \
                 converter as mechanical, a connector, a switch or a supply, and the Edge line \
                 driver as the converter",

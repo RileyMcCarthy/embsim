@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::net::{Level, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::uart::{FramingError, UartFraming};
 use crate::{
     jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, PinDecl,
@@ -89,9 +90,51 @@ impl std::fmt::Debug for HostPtyCounters {
     }
 }
 
+/// The pins of a host whose I/O rail is its own `VIO` pin, against its own
+/// `GND` ([`HostPty::open_on_rail`]).
+const ON_RAIL_PINS: [PinDecl; 4] = [
+    // Driven at the sensed `VIO` above `GND`, through the bridge's ports;
+    // released while `VIO` reads no voltage.
+    PinDecl::digital_out("TX")
+        .with_idle(None)
+        .with_reference("GND"),
+    // The host's receiver: JESD8C.01's LVCMOS/LVTTL pair, against the
+    // host's own ground.
+    PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)).with_reference("GND"),
+    PinDecl::power_in("VIO").with_reference("GND"),
+    PinDecl::power_in("GND"),
+];
+
+/// What the host's rail pins last read: `VIO` against `GND`, and `GND` in
+/// the engine's frame.
+#[derive(Debug, Default, Clone, Copy)]
+struct Rail {
+    vio: Option<Volts>,
+    gnd: Option<Volts>,
+}
+
+impl Rail {
+    /// The port the TX pin presents for `level`: `GND`, or `VIO` above it,
+    /// behind the push-pull default; `None` (released) while either reads
+    /// no voltage.
+    fn port(self, level: Level) -> Option<TheveninDrive> {
+        let (vio, gnd) = (self.vio?, self.gnd?);
+        Some(TheveninDrive {
+            volts: match level {
+                Level::High => gnd + vio,
+                Level::Low => gnd,
+            },
+            impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
+        })
+    }
+}
+
 /// A serial link whose far end is a PTY the host can open.
 pub struct HostPty {
-    pins: [PinDecl; 2],
+    pins: Vec<PinDecl>,
+    /// Whether TX drives at the sensed `VIO` above `GND`
+    /// ([`Self::open_on_rail`]) or at the crate's logic rail.
+    on_rail: bool,
     framing: UartFraming,
     /// Kept alive for the component's life: dropping it closes the PTY and
     /// removes the symlink.
@@ -119,14 +162,42 @@ impl HostPty {
     /// and `"RX"` (what the host receives), from the *host's* point of view —
     /// so a harness reads `HOST.TX → MCU.RX` the way a cable does.
     pub fn open(symlink_path: &str, baud_hz: u32) -> std::io::Result<Self> {
-        Ok(Self {
-            pins: [
+        Self::opened(
+            symlink_path,
+            baud_hz,
+            vec![
                 PinDecl::digital_out("TX"),
                 // The host's end is a bench adapter no datasheet here
                 // describes: its receiver reads at the 3.3 V LVCMOS pair
                 // the link signals at.
                 PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)),
             ],
+            false,
+        )
+    }
+
+    /// Open a PTY at `symlink_path`, framed at `baud_hz`, for a host whose
+    /// I/O rail and ground are pins of its own: `TX`, `RX`, `VIO` and `GND`.
+    ///
+    /// `TX` drives a high at `VIO` above `GND` and a low at `GND`, behind
+    /// the push-pull default, and is released while `VIO` reads no voltage;
+    /// `RX` reads JESD8C.01's 0.8 V / 2.0 V pair against `GND` — the pair a
+    /// 3.3 V LVCMOS input and a 5 V TTL input both take. A project wires
+    /// the host's real rail to `VIO` (a Raspberry Pi's 3.3 V), so a board
+    /// that expects another sees the margin it really has.
+    pub fn open_on_rail(symlink_path: &str, baud_hz: u32) -> std::io::Result<Self> {
+        Self::opened(symlink_path, baud_hz, ON_RAIL_PINS.to_vec(), true)
+    }
+
+    fn opened(
+        symlink_path: &str,
+        baud_hz: u32,
+        pins: Vec<PinDecl>,
+        on_rail: bool,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            pins,
+            on_rail,
             framing: UartFraming::new_8n1(baud_hz),
             pty: Pty::new(symlink_path)?,
             counters: Arc::new(HostPtyCounters {
@@ -151,6 +222,11 @@ impl HostPty {
     pub fn counters(&self) -> Arc<HostPtyCounters> {
         Arc::clone(&self.counters)
     }
+
+    /// The framing the link is clocked at.
+    pub fn framing(&self) -> UartFraming {
+        self.framing
+    }
 }
 
 impl Component for HostPty {
@@ -159,12 +235,43 @@ impl Component for HostPty {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        let bridge = Arc::new(SerialLevelBridge::new(
+        let rail = Arc::new(Mutex::new(Rail::default()));
+        let mut bridge = SerialLevelBridge::new(
             self.framing,
             io.pin("TX")?,
             io.clone(),
             Arc::clone(&self.shutdown),
-        ));
+        );
+        if self.on_rail {
+            let rail = Arc::clone(&rail);
+            bridge = bridge.with_ports(move |level| {
+                rail.lock()
+                    .expect("the rail reading is never poisoned")
+                    .port(level)
+            });
+        }
+        let bridge = Arc::new(bridge);
+        if self.on_rail {
+            // Unpowered until `VIO` reads a voltage: a host with no rail
+            // drives nothing.
+            bridge.set_output_enabled(false);
+            for pin in ["VIO", "GND"] {
+                let (rail, bridge) = (Arc::clone(&rail), Arc::clone(&bridge));
+                io.on_sense(pin, move |sense| {
+                    let powered = {
+                        let mut rail = rail.lock().expect("the rail reading is never poisoned");
+                        if pin == "VIO" {
+                            rail.vio = sense.volts;
+                        } else {
+                            rail.gnd = sense.volts;
+                        }
+                        rail.vio.is_some()
+                    };
+                    bridge.set_output_enabled(powered);
+                    bridge.ports_changed();
+                })?;
+            }
+        }
         // An idle asynchronous line still drives: without it the far end has no
         // reference against which the first start bit is a falling edge.
         bridge.idle();

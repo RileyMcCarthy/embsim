@@ -767,6 +767,151 @@ fn a_duration_without_a_unit_of_time_is_a_usage_error(#[case] duration: &str) {
     assert_says(&stderr(&output), &["give one of ns, us, ms, s"]);
 }
 
+#[rstest]
+fn an_interrupted_run_says_when_and_prints_its_summary() {
+    behaviour!(Test {
+        id: "cli.run-interrupted",
+        covers: Some("cli/src/live.rs#run"),
+        given: "the header board's project run from the command line with no duration, sent \
+                an interrupt once it says it is running",
+    });
+    expect!(
+        "says-when",
+        "the run says it was interrupted and at which instant of virtual time"
+    );
+    expect!(
+        "summary",
+        "it then prints the summary a run that reaches its duration prints: the time it ran \
+         and its findings read again"
+    );
+    expect!("exits-ok", "the command's exit status is zero");
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+    let project = workspace().join("boards/projects/header.toml");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_embsim"))
+        .args(["run", path(&project)])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the embsim binary runs");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        let read = stdout.read_line(&mut line).expect("stdout reads");
+        assert!(
+            read > 0,
+            "the run ended before it said it was running:\n{head}"
+        );
+        head.push_str(&line);
+        if line.starts_with("running until interrupted") {
+            break;
+        }
+    }
+    // SAFETY: signalling a child this test spawned and has not reaped.
+    let sent = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    assert_eq!(sent, 0, "SIGINT reaches the run");
+    let mut rest = String::new();
+    stdout
+        .read_to_string(&mut rest)
+        .expect("the rest of stdout reads");
+    let status = child.wait().expect("the run ends");
+    let text = format!("{head}{rest}");
+    assert!(status.success(), "{status:?}\n{text}");
+    assert_says(
+        &text,
+        &[
+            "running until interrupted",
+            "interrupted at ",
+            "ms of virtual time\nran ",
+            "findings: ",
+        ],
+    );
+}
+
+/// A project of one host on its own rail, and nothing else.
+const HOST_PROJECT: &str = r#"
+[[component]]
+name = "HOST"
+kind = "host-serial"
+[component.options]
+baud = 115200
+
+[[wire]]
+from = "RAIL.3V3"
+to = "HOST.VIO"
+volts = 3.3
+
+[[wire]]
+from = "RAIL.GND"
+to = "HOST.GND"
+volts = 0.0
+"#;
+
+#[rstest]
+fn a_run_puts_the_hosts_pty_where_pty_says_and_prints_its_path() {
+    behaviour!(Test {
+        id: "cli.run-pty",
+        covers: Some("cli/src/live.rs#apply_ptys"),
+        given: "a project with one host serial port, run for a millisecond with --pty naming \
+                a path",
+    });
+    expect!(
+        "path-printed",
+        "the run prints the port's path, its baud rate and its framing at its first look, \
+         before virtual time moves",
+        "a host opens the path while the run goes on"
+    );
+    expect!(
+        "summary-counts",
+        "the summary says how many bytes crossed each way"
+    );
+    let dir = scratch("pty");
+    let project = dir.join("host.toml");
+    std::fs::write(&project, HOST_PROJECT).expect("the project is writable");
+    let pty = dir.join("tty.host");
+    let output = embsim(&["run", path(&project), "--for", "1ms", "--pty", path(&pty)]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert_says(
+        &text,
+        &[
+            &format!(
+                "0.000000 ms] HOST: host serial at {}, 115200 baud 8N1",
+                pty.display()
+            ),
+            &format!(
+                "HOST: host serial at {}: 0 bytes from the host, 0 to it, 0 framing errors",
+                pty.display()
+            ),
+        ],
+    );
+}
+
+#[rstest]
+fn a_pty_without_a_name_is_refused_when_the_project_has_two_hosts() {
+    let dir = scratch("pty_two");
+    let project = dir.join("hosts.toml");
+    let two = format!(
+        "{HOST_PROJECT}\n[[component]]\nname = \"HOST2\"\nkind = \"host-serial\"\n\
+         [component.options]\nbaud = 9600\n"
+    );
+    std::fs::write(&project, two).expect("the project is writable");
+    let output = embsim(&[
+        "run",
+        path(&project),
+        "--for",
+        "1ms",
+        "--pty",
+        path(&dir.join("tty")),
+    ]);
+    assert!(!output.status.success());
+    assert_says(
+        &stderr(&output),
+        &["has 2 host-serial components, HOST, HOST2; say which with --pty NAME=PATH"],
+    );
+}
+
 // ============================================================
 // embsim run, with QEMU as the P2's core
 // ============================================================
@@ -879,11 +1024,12 @@ fn run_boots_the_p2_off_the_modules_flash() {
         "{text}"
     );
     // The program the flash served reached the debug pin.
-    assert!(text.contains("EC32.U100 P62: \"B\""), "{text}");
+    assert!(text.contains("EC32.U100: P62 \"B\""), "{text}");
     assert!(
-        text.contains("EC32.U100 (core \"qemu\"): started at 5.500000 ms;"),
+        text.contains("EC32.U100: core \"qemu\": started at 5.500000 ms"),
         "{text}"
     );
+    assert!(text.contains("EC32.U100: QEMU: "), "{text}");
     assert!(text.contains("console P62 \"B\""), "{text}");
     assert!(text.contains("ran 20.000000 ms of virtual time"), "{text}");
 }

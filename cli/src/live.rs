@@ -1,8 +1,8 @@
 //! A project built and started: `embsim check` and `embsim run`.
 //!
 //! Both load the project, survey each board with the registry it builds
-//! with, and build the system through the catalog. `check` starts it with
-//! virtual time held — every part attached, every attach-time drive
+//! with, and build the system through the catalog set. `check` starts it
+//! with virtual time held — every part attached, every attach-time drive
 //! resolved, no wake fired: the state `System::build` analyzes — reads what
 //! the build found, and stops. `run` releases time and runs.
 //!
@@ -12,82 +12,127 @@
 //! instant and reads the system at rest there, the same on every machine.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use embsim_board::{Finding, NetState, Project, System, SystemHandle};
-use embsim_boards::p2::StartState;
+use embsim_board::report::instant as ms;
+use embsim_board::{Finding, NetState, Project, Report, Reports, System, SystemHandle};
+use embsim_boards::catalog::CatalogSet;
 use embsim_core::virtual_clock::{self, ClockMode};
-use embsim_p2_qemu::catalog::{QemuCatalog, QemuSeat};
+
+use crate::signals::Watch;
 
 /// The virtual clock's cycle rate. Nothing on a board reads it — the engine
 /// keeps nanoseconds, and a P2 core its own clock from the mode it set —
 /// so it is the 1 MHz the board tests use, a cycle a microsecond.
 const CYCLE_HZ: u32 = 1_000_000;
 
-/// How far the run goes between looks at the system: findings and console
-/// output are printed when a look finds them, stamped with the instant of
-/// that look, at most this long after they happened.
+/// How far the run goes between looks at the system: findings and what its
+/// parts report are printed when a look finds them, stamped with the
+/// instant of that look, at most this long after they happened; an
+/// interrupt ends the run at the next look.
 const LOOK_NS: u64 = 100_000;
 
-/// The P2's smart pins, the ones a console can be on.
-const P2_PADS: u8 = 64;
+/// The component kind whose path `--pty` sets.
+const HOST_SERIAL: &str = "host-serial";
 
-/// Parse a duration of virtual time: a number and a unit, `ns`, `us`,
-/// `ms` or `s` (`20ms`, `1.5 s`, `250us`), to whole nanoseconds.
-pub fn parse_duration(text: &str) -> Result<u64, String> {
-    let text = text.trim();
-    let split = text
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .ok_or_else(|| format!("{text:?} has no unit; give one of ns, us, ms, s (20ms)"))?;
-    let (number, unit) = text.split_at(split);
-    if number.is_empty() {
-        return Err(format!(
-            "{text:?} does not start with a number; give a number and a unit (20ms)"
-        ));
-    }
-    let per_unit: f64 = match unit.trim() {
-        "ns" => 1.0,
-        "us" | "µs" => 1e3,
-        "ms" => 1e6,
-        "s" => 1e9,
-        other => {
-            return Err(format!(
-                "{other:?} is not a unit of time; give one of ns, us, ms, s (20ms)"
-            ))
-        }
-    };
-    let value: f64 = number
-        .parse()
-        .map_err(|_| format!("{number:?} is not a number of {}", unit.trim()))?;
-    let ns = (value * per_unit).round();
-    if !ns.is_finite() || ns > u64::MAX as f64 {
-        return Err(format!("{text:?} is longer than a run can be"));
-    }
-    Ok(ns as u64)
+/// Write a line to the run's output. A write that fails (a closed pipe)
+/// loses the line and nothing else: the run's outcome is its exit status.
+macro_rules! say {
+    ($out:expr) => {{
+        let _ = writeln!($out);
+    }};
+    ($out:expr, $($arg:tt)*) => {{
+        let _ = writeln!($out, $($arg)*);
+    }};
 }
 
-/// A virtual instant as milliseconds, exactly: `5.500000 ms`.
-fn ms(ns: u64) -> String {
-    format!("{}.{:06} ms", ns / 1_000_000, ns % 1_000_000)
+/// What `embsim run` was asked for besides the project.
+#[derive(Debug, Default)]
+pub struct RunOptions {
+    /// How long to run, in virtual nanoseconds; `None` until interrupted.
+    pub duration: Option<u64>,
+    /// The nets to read at the end, `Board.Net`.
+    pub nets: Vec<String>,
+    /// `--pty`: `PATH`, or `NAME=PATH`.
+    pub ptys: Vec<String>,
 }
 
 /// The net each board pin sits on: `Board.Ref.Pin` to `Board.Net`, from
 /// the boards' surveys — for a finding that names a pin.
 type PinNets = BTreeMap<String, String>;
 
-/// Load `path`, print each board's survey line, and build the system.
-fn build(path: &Path, catalog: &QemuCatalog) -> Result<(System, PinNets), String> {
-    let project = Project::load(path).map_err(|err| err.to_string())?;
-    println!("project {}", path.display());
+/// Apply each `--pty` to the project's `host-serial` components: `PATH` to
+/// its one host, `NAME=PATH` to the one named. A relative path is the
+/// current directory's.
+fn apply_ptys(project: &mut Project, ptys: &[String]) -> Result<(), String> {
+    let hosts: Vec<String> = project
+        .components()
+        .iter()
+        .filter(|spec| spec.kind == HOST_SERIAL)
+        .map(|spec| spec.name.clone())
+        .collect();
+    for pty in ptys {
+        let named = pty
+            .split_once('=')
+            .filter(|(name, _)| hosts.iter().any(|host| host == name));
+        let (name, path) = match named {
+            Some((name, path)) => (name.to_string(), path),
+            None => match hosts.as_slice() {
+                [only] => (only.clone(), pty.as_str()),
+                [] => {
+                    return Err(format!(
+                        "--pty {pty}: the project has no {HOST_SERIAL} component for a PTY to \
+                         belong to"
+                    ))
+                }
+                several => {
+                    return Err(format!(
+                        "--pty {pty}: the project has {} {HOST_SERIAL} components, {}; say \
+                         which with --pty NAME=PATH",
+                        several.len(),
+                        several.join(", ")
+                    ))
+                }
+            },
+        };
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map_err(|err| format!("--pty {pty}: no current directory: {err}"))?
+                .join(path)
+        };
+        project
+            .set_component_option(&name, "path", path.to_string_lossy().into_owned())
+            .map_err(|err| format!("--pty {pty}: {err}"))?;
+    }
+    Ok(())
+}
+
+/// Load `path`, apply `ptys`, print each board's survey line, and build the
+/// system, its constructors reporting to `reports`.
+fn build(
+    set: &CatalogSet,
+    path: &Path,
+    ptys: &[String],
+    reports: &Reports,
+    out: &mut dyn Write,
+) -> Result<(System, PinNets), String> {
+    let mut project = Project::load(path).map_err(|err| err.to_string())?;
+    apply_ptys(&mut project, ptys)?;
+    say!(out, "project {}", path.display());
+    say!(out, "  catalogs: {}", set.catalogs().join(", "));
     let mut pin_nets = PinNets::new();
     for spec in project.boards() {
         let survey = project
-            .survey(catalog, &spec.name)
+            .survey(set, &spec.name)
             .map_err(|err| err.to_string())?;
         let text = survey.to_string();
         let line = text.lines().next().unwrap_or_default();
-        println!("  board {} ({}): {line}", spec.name, spec.kind);
+        say!(out, "  board {} ({}): {line}", spec.name, spec.kind);
         for part in survey.parts() {
             for site in &part.pins {
                 pin_nets.insert(
@@ -98,9 +143,10 @@ fn build(path: &Path, catalog: &QemuCatalog) -> Result<(System, PinNets), String
         }
     }
     let system = project
-        .instantiate(catalog)
+        .instantiate_with(set, reports)
         .map_err(|err| err.to_string())?;
-    println!(
+    say!(
+        out,
         "  {} board{}, {} bench component{}, {} wire{}, {} mate{}",
         project.boards().len(),
         plural(project.boards().len()),
@@ -181,174 +227,138 @@ fn start_held(path: &Path, system: System) -> Result<SystemHandle, String> {
 }
 
 /// `embsim check <project>`.
-pub fn check(path: &Path) -> Result<(), String> {
+pub fn check(set: &CatalogSet, path: &Path, out: &mut dyn Write) -> Result<(), String> {
     start_clock();
-    let catalog = QemuCatalog::new();
-    let (system, _) = build(path, &catalog)?;
+    let reports = Reports::new();
+    let (system, _) = build(set, path, &[], &reports, out)?;
     let handle = start_held(path, system)?;
     let findings = handle.findings();
     if findings.is_empty() {
-        println!("build findings: none");
+        say!(out, "build findings: none");
     } else {
-        println!(
+        say!(
+            out,
             "build findings ({}), the system before its first wake:",
             findings.len()
         );
         for finding in &findings {
-            println!("  {finding:?}");
+            say!(out, "  {finding:?}");
         }
     }
     handle.shutdown();
-    println!("ok: {} builds", path.display());
+    say!(out, "ok: {} builds", path.display());
     Ok(())
 }
 
 /// What a run has printed so far, so each look prints only what is new.
 struct Reporter {
-    seats: Vec<QemuSeat>,
+    reports: Vec<Box<dyn Report>>,
     findings: usize,
     /// How many of the findings the build made.
     at_build: usize,
-    started: Vec<bool>,
-    halted: Vec<bool>,
-    /// Console characters printed, per seat and pad.
-    console: Vec<Vec<usize>>,
 }
 
 impl Reporter {
-    fn new(seats: Vec<QemuSeat>) -> Self {
-        let count = seats.len();
+    fn new(reports: Vec<Box<dyn Report>>) -> Self {
         Self {
-            seats,
+            reports,
             findings: 0,
             at_build: 0,
-            started: vec![false; count],
-            halted: vec![false; count],
-            console: vec![vec![0; usize::from(P2_PADS)]; count],
         }
     }
 
     /// Print the findings the build made, the system before its first
     /// wake: every one is about that instant, and the run may clear it.
-    fn build_snapshot(&mut self, system: &SystemHandle) {
+    fn build_snapshot(&mut self, system: &SystemHandle, out: &mut dyn Write) {
         let findings = system.findings();
         if findings.is_empty() {
-            println!("findings at build, before any wake: none");
+            say!(out, "findings at build, before any wake: none");
         } else {
-            println!("findings at build, before any wake ({}):", findings.len());
+            say!(
+                out,
+                "findings at build, before any wake ({}):",
+                findings.len()
+            );
         }
         for finding in &findings {
-            println!("  {finding:?}");
+            say!(out, "  {finding:?}");
         }
         self.findings = findings.len();
         self.at_build = findings.len();
     }
 
     /// Print what appeared since the last look, stamped `now`.
-    fn look(&mut self, system: &SystemHandle, now: u64) {
+    fn look(&mut self, system: &SystemHandle, now: u64, out: &mut dyn Write) {
         let stamp = format!("[{:>14}]", ms(now));
         let findings = system.findings();
         for finding in findings.iter().skip(self.findings) {
-            println!("{stamp} {finding:?}");
+            say!(out, "{stamp} {finding:?}");
         }
         self.findings = findings.len();
-        for (index, seat) in self.seats.iter().enumerate() {
-            let name = format!("{}.{}", seat.board, seat.reference);
-            if !self.started[index] {
-                if let Some(at) = seat.package.started_at_ns() {
-                    self.started[index] = true;
-                    println!("{stamp} {name}: the core started at {}", ms(at));
-                }
-            }
-            for pad in 0..P2_PADS {
-                let text = seat.core.console(pad);
-                let printed = &mut self.console[index][usize::from(pad)];
-                let count = text.chars().count();
-                if count > *printed {
-                    let new: String = text.chars().skip(*printed).collect();
-                    println!("{stamp} {name} P{pad}: {new:?}");
-                    *printed = count;
-                }
-            }
-            if !self.halted[index] && seat.core.halted() {
-                self.halted[index] = true;
-                println!("{stamp} {name}: every cog has stopped");
+        for report in &mut self.reports {
+            let subject = report.subject();
+            for line in report.look(now) {
+                say!(out, "{stamp} {subject}: {line}");
             }
         }
     }
 
-    /// The summary of every core at the end of a run.
-    fn summary(&self) {
-        for seat in &self.seats {
-            let name = format!("{}.{}", seat.board, seat.reference);
-            let state = match seat.package.start_state() {
-                StartState::Started { at_ns } => format!("started at {}", ms(at_ns)),
-                StartState::BrownoutWithoutReset {
-                    started_at_ns,
-                    at_ns,
-                    ..
-                } => format!(
-                    "started at {}, held by a brownout without a reset at {}",
-                    ms(started_at_ns),
-                    ms(at_ns)
-                ),
-                StartState::Restarting { starts_at_ns, .. } => {
-                    format!("reset released, starting at {}", ms(starts_at_ns))
-                }
-                StartState::Held { reset } => format!("held in reset ({reset:?})"),
-            };
-            let consoles: Vec<String> = (0..P2_PADS)
-                .filter_map(|pad| {
-                    let text = seat.core.console(pad);
-                    (!text.is_empty()).then(|| format!("P{pad} {text:?}"))
-                })
-                .collect();
-            println!(
-                "{name} (core \"qemu\"): {state}; {} pad yields; {}; console {}",
-                seat.core.yields(),
-                if seat.core.halted() {
-                    "halted"
-                } else {
-                    "running"
-                },
-                if consoles.is_empty() {
-                    "empty".to_string()
-                } else {
-                    consoles.join(", ")
-                }
-            );
+    /// What every report says at the end of a run.
+    fn summary(&self, out: &mut dyn Write) {
+        for report in &self.reports {
+            let subject = report.subject();
+            for line in report.summary() {
+                say!(out, "{subject}: {line}");
+            }
         }
     }
 }
 
-/// `embsim run <project> [--for DURATION] [--net BOARD.NET]...`.
-pub fn run(path: &Path, duration: Option<u64>, nets: &[String]) -> Result<(), String> {
+/// `embsim run <project> [--for DURATION] [--net BOARD.NET]... [--pty
+/// [NAME=]PATH]...`.
+pub fn run(
+    set: &CatalogSet,
+    path: &Path,
+    options: &RunOptions,
+    out: &mut dyn Write,
+) -> Result<(), String> {
     start_clock();
-    let catalog = QemuCatalog::new();
-    let (system, pin_nets) = build(path, &catalog)?;
+    let reports = Reports::new();
+    let (system, pin_nets) = build(set, path, &options.ptys, &reports, out)?;
     let handle = start_held(path, system)?;
-    for net in nets {
+    for net in &options.nets {
         if handle.net_state(net).is_none() {
+            handle.shutdown();
             return Err(format!(
                 "--net {net}: no such net; a net is Board.Net, as its board's netlist names it"
             ));
         }
     }
-    let mut reporter = Reporter::new(catalog.seats());
-    match duration {
-        Some(ns) => println!("running for {} of virtual time", ms(ns)),
-        None => println!("running until interrupted"),
+    let mut reporter = Reporter::new(reports.take());
+    // Before the line that says the run is running: a signal sent once it
+    // says so ends the run with its summary.
+    let watch = Watch::install();
+    match options.duration {
+        Some(ns) => say!(out, "running for {} of virtual time", ms(ns)),
+        None => say!(out, "running until interrupted"),
     }
+    let _ = out.flush();
 
     let actor = virtual_clock::register_actor("embsim run");
-    reporter.build_snapshot(&handle);
+    reporter.build_snapshot(&handle, out);
     let wall = Instant::now();
     handle.release_time();
     let origin = virtual_clock::virtual_ns();
-    reporter.look(&handle, 0);
+    reporter.look(&handle, 0, out);
+    let mut interrupted = false;
     loop {
+        let _ = out.flush();
+        if watch.interrupted() {
+            interrupted = true;
+            break;
+        }
         let elapsed = virtual_clock::virtual_ns() - origin;
-        let step = match duration {
+        let step = match options.duration {
             Some(total) => LOOK_NS.min(total - elapsed.min(total)),
             None => LOOK_NS,
         };
@@ -356,30 +366,36 @@ pub fn run(path: &Path, duration: Option<u64>, nets: &[String]) -> Result<(), St
             break;
         }
         virtual_clock::wait_virtual_ns(step);
-        reporter.look(&handle, virtual_clock::virtual_ns() - origin);
+        reporter.look(&handle, virtual_clock::virtual_ns() - origin, out);
         if !handle.engine_is_alive() {
             drop(actor);
+            drop(watch);
             return Err("the engine stopped: a component's model failed".to_string());
         }
     }
     let elapsed = virtual_clock::virtual_ns() - origin;
-    println!(
+    if interrupted {
+        say!(out, "interrupted at {} of virtual time", ms(elapsed));
+    }
+    say!(
+        out,
         "ran {} of virtual time in {:.3} s",
         ms(elapsed),
         wall.elapsed().as_secs_f64()
     );
-    reporter.summary();
-    for net in nets {
+    reporter.summary(out);
+    for net in &options.nets {
         let state = handle
             .net_state(net)
             .expect("every named net was checked before the run");
-        println!("net {net}: {state:?}");
+        say!(out, "net {net}: {state:?}");
     }
     let findings = handle.findings();
     let stalled = findings
         .iter()
         .any(|finding| matches!(finding, Finding::QuiescenceTimeout { .. }));
-    println!(
+    say!(
+        out,
         "findings: {} ({} at build, {} while running)",
         findings.len(),
         reporter.at_build,
@@ -398,31 +414,34 @@ pub fn run(path: &Path, duration: Option<u64>, nets: &[String]) -> Result<(), St
                 Now::Standing => standing.push(format!("{finding:?}")),
             }
         }
-        println!("at {}, each finding's net read again:", ms(elapsed));
+        say!(out, "at {}, each finding's net read again:", ms(elapsed));
         for (title, lines) in [
             ("no longer true", &cleared),
             ("still true", &holds),
             ("about the board as built and wired", &standing),
         ] {
-            println!("  {title} ({}):", lines.len());
+            say!(out, "  {title} ({}):", lines.len());
             for line in lines {
-                println!("    {line}");
+                say!(out, "    {line}");
             }
         }
     }
     if stalled {
-        println!(
+        say!(
+            out,
             "the engine advanced without waiting for a part (QuiescenceTimeout): this run is \
              not reproducible"
         );
     }
     drop(actor);
+    drop(watch);
     handle.shutdown();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use embsim_board::parse_duration;
     use rstest::rstest;
 
     use super::*;
