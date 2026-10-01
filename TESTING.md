@@ -242,8 +242,15 @@ cargo test -p embsim-boards --test ec32_project --test project_refusals
 cargo test -p embsim-boards --test ec32_project_power --test ds2_project --test board_to_board
 # The catalog's guide (`boards/src/catalog.rs`): every pin table it lists is
 # the one its kind registers, and how a part fits a kind — by part number,
-# by pins, by pin count.
+# by pins, by pin count; and PROJECTS.md's tables of board and part kinds,
+# which are generated from the catalog (each option read off the kind's own
+# registration) and must match the document character for character — the
+# failure prints the tables to paste.
 cargo test -p embsim-boards --lib catalog
+# PROJECTS.md's Rust examples, run as doc tests of embsim-boards from its
+# directory: a project loaded, surveyed and built, and a catalog of one's
+# own adding a board kind and a part kind.
+cargo test -p embsim-boards --doc
 # The `embsim` command (`cli/`), run as a user runs it, a process a case:
 # survey the EC32's netlist (every connector pin, what needs a model and what
 # could be it, the pin table that fits); `new` then `check` for the header

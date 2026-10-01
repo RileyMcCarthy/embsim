@@ -1,42 +1,25 @@
 //! The kinds embsim ships, as a [`Catalog`] a project file can name.
 //!
-//! # Board kinds
+//! # Kinds
 //!
-//! | kind | what it is |
-//! |---|---|
-//! | `netlist` | any board, from its KiCad netlist export (`netlist = "board.net"`) |
-//! | `p2-ec32mb` | the Parallax P2-EC32MB module ([`crate::ec32mb`]), its processor slot `U100` left for a `[[board.model]]` |
+//! The board kinds are `netlist`, any board from its KiCad netlist export
+//! (`netlist = "board.net"`), and `p2-ec32mb`, the Parallax P2-EC32MB module
+//! ([`crate::ec32mb`]) with its processor slot `U100` left for a
+//! `[[board.model]]`.
 //!
-//! # Part kinds
-//!
-//! A `[[board.model]]` names one of these for every part its key reaches.
-//! Each kind is one model in `embsim-models` (or this crate) with the
+//! A `[[board.model]]` names a part kind for every part its key reaches.
+//! Each part kind is one model in `embsim-models` (or this crate) with the
 //! numbers its datasheet gives; the options choose between what the model
 //! already offers — a pin table, a device ID — and nothing else. Where a
 //! model reads data from the board (a feedback divider, a select strap),
 //! it reads it from the netlist at attach, as it does on any board.
 //!
-//! | kind | model | options |
-//! |---|---|---|
-//! | `p2` | the Propeller 2 package ([`crate::p2::P2Package`]) | `core` = `"held-in-reset"` (required) |
-//! | `tg2520smn` | EPSON TCXO; frequency from the part's value or number | `pins` = `"numbered"`, `"by-function"` |
-//! | `74lvc2g04` | NXP dual inverter | `pins` = `"sot363"`, `"by-function"` |
-//! | `sn74lvc1g14` | TI Schmitt inverter | `pins` = `"sot23"` |
-//! | `aps6404l` | AP Memory PSRAM | `pins` = `"sop8"`, `"by-function"` |
-//! | `w25q128jv` | Winbond serial NOR flash, blank or holding an image | `pins` = `"soic8"`, `"by-function"`, `"spi-only"`; `id` = `"im"`, `"iq"`; `image` = a file the part holds from address 0, relative to the project file, the rest erased |
-//! | `sd-card` | a card in an SD socket | `image` = card image path (required); `pins` = `"microsd"`, `"by-function"`, `"spi-only"` |
-//! | `ap62301` | Diodes buck; setpoint from its feedback divider | `pins` = `"sot563"`, `"by-function"` |
-//! | `ncp114` | onsemi LDO; setpoint from the part's value or number | `pins` = `"udfn4"`, `"by-function"` |
-//! | `xl1509` | XLSEMI buck; version from the part's value or number | `pins` = `"sop8"` |
-//! | `ucc12040` | TI isolated DC/DC; setpoint from its `SEL` strap | `pins` = `"soic16"` |
-//! | `stm1061` | ST voltage detector, from its ordering code | `pins` = `"sot23"`, `"by-function"` |
-//! | `6n137` | Lite-On optocoupler | — |
-//! | `vo2631` | Vishay dual optocoupler | — |
-//! | `iso67xx` | TI digital isolator, the member the key names | — |
-//! | `ads122u04` | TI 24-bit ADC, as it comes out of reset | `pins` = `"tssop16"` |
-//! | `switch` | a switch whose poles pair the part's pins, each open | `poles` = `[["1", "2"], …]` (required) |
-//! | `mechanical` | a part with pads and nothing electrical | — |
-//! | `boundary` | a connector, by its symbol's part name | — |
+//! Every kind, with its model, the part numbers the base registry places it
+//! by, its pin tables and every option it takes, is tabulated in
+//! `PROJECTS.md` at the workspace root (§5). The tables there are generated
+//! from this module by `projects_md_tabulates_every_kind_the_catalog_ships`,
+//! which reads each option off the kind's own registration and fails when
+//! the document and the catalog differ.
 //!
 //! The first `pins` value is the default: the datasheet's numbered table,
 //! which is how an EDA export names pins. `by-function` is the table a
@@ -46,9 +29,9 @@
 //!
 //! A `kind = "netlist"` board starts from [`StandardCatalog::base_registry`]:
 //! the reference-designator fallback for a netlist with no libsource, the
-//! element library ([`embsim_models::pwl_library`]), and every model above
-//! under the manufacturer part numbers its datasheet and provenance name,
-//! with its default pin table. Two kinds are never placed by number: the
+//! element library ([`embsim_models::pwl_library`]), and every part kind's
+//! model under the manufacturer part numbers its datasheet and provenance
+//! name, with its default pin table. Two kinds are never placed by number: the
 //! processor, whose core is the thing under test, and a card socket, whose
 //! card is. A board kind's own registrations (the P2-EC32MB's, keyed on its
 //! netlist's values) stay with that board.
@@ -112,7 +95,7 @@ const BOARD_KINDS: [&str; 1] = ["p2-ec32mb"];
 /// One part kind: its name, what it is, and how it registers.
 struct PartKind {
     name: &'static str,
-    /// The model, in the module docs' words.
+    /// The model, in a phrase: the model column of `PROJECTS.md`'s table.
     summary: &'static str,
     /// Part numbers the kind is for that the base registry does not place
     /// by number (the processor): the guide names them beside the ones it
@@ -121,7 +104,7 @@ struct PartKind {
     register: fn(&mut PartRegistry, &Assignment<'_>, PartOptions) -> Result<(), ProjectError>,
 }
 
-/// Every part kind, in the order the module docs list them.
+/// Every part kind, in the order `PROJECTS.md`'s table lists them.
 const PART_KINDS: &[PartKind] = &[
     PartKind {
         name: "p2",
@@ -1169,7 +1152,7 @@ impl KindGuide {
 }
 
 impl StandardCatalog {
-    /// Every part kind, in the module docs' order, as someone choosing one
+    /// Every part kind, in `PROJECTS.md`'s order, as someone choosing one
     /// reads it ([`KindGuide`]). The tables are the ones each kind's
     /// `register` offers; `every_option_table_is_the_one_its_kind_registers`
     /// holds the two together.
@@ -1493,6 +1476,272 @@ mod tests {
             Some(Fit::PinCount("sop8"))
         );
         assert_eq!(find("p2").fit(&["DIP Switch"], &switch), None);
+    }
+
+    // ============================================================
+    // PROJECTS.md's tables, generated from the catalog
+    // ============================================================
+
+    /// The workspace's project guide, whose tables of kinds this module
+    /// generates.
+    const PROJECTS_MD: &str = include_str!("../../PROJECTS.md");
+
+    /// What each board kind is, for its row: the catalog carries no
+    /// sentence for a board kind, so a new one fails the doc test until it
+    /// has one here.
+    fn board_kind_summary(kind: &str) -> Option<&'static str> {
+        match kind {
+            "netlist" => Some(
+                "any board, from its KiCad netlist export: `netlist = \"board.net\"`, relative to \
+                 the project file; it starts from the base registry",
+            ),
+            "p2-ec32mb" => Some(
+                "the Parallax P2-EC32MB module from its bundled netlist, every part placed but the \
+                 processor, `U100`",
+            ),
+            _ => None,
+        }
+    }
+
+    /// An option that is not a choice, not required, and so not in the
+    /// guide: a value of its shape and what it says, for its cell. A new one
+    /// fails the doc test until it has one here.
+    fn free_option(kind: &str, option: &str) -> Option<(&'static str, &'static str)> {
+        match (kind, option) {
+            ("w25q128jv", "image") => Some((
+                "\"boot.bin\"",
+                "a file the part holds from address 0, the rest erased, relative to the project \
+                 file",
+            )),
+            _ => None,
+        }
+    }
+
+    /// Register `kind` with `options` (TOML) for a part keyed by its first
+    /// number, and return the error, if any.
+    fn register_error(kind: &KindGuide, options: &str, dir: &Path) -> Option<String> {
+        let key = kind.numbers.first().copied().unwrap_or("PART-1");
+        let part = decl(key);
+        register(
+            &mut PartRegistry::new(),
+            kind.name,
+            key,
+            &part,
+            options,
+            dir,
+        )
+        .err()
+        .map(|err| err.to_string())
+    }
+
+    /// `"a", "b"` after `lead` in `message`, unquoted.
+    fn quoted_after(message: &str, lead: &str) -> Option<Vec<String>> {
+        let (_, rest) = message.split_once(lead)?;
+        Some(
+            rest.split(", ")
+                .map(|item| item.trim().trim_matches('"').to_string())
+                .collect(),
+        )
+    }
+
+    /// Every option `kind` takes, in the order its registration takes them,
+    /// read off the registration itself: the kind is registered with its
+    /// required options at the guide's examples and one option it cannot
+    /// know, and names what it takes in refusing it; each option is then
+    /// given a value no choice has, and a choice names what it offers.
+    fn options_of(kind: &KindGuide, dir: &Path) -> Vec<(String, Option<Vec<String>>)> {
+        let required: String = kind
+            .required
+            .iter()
+            .map(|option| format!("{} = {}\n", option.name, option.example))
+            .collect();
+        let err = register_error(kind, &format!("{required}zz_probe = 1\n"), dir)
+            .unwrap_or_else(|| panic!("{} takes an option it cannot know", kind.name));
+        let taken = if err.ends_with("this kind takes no options") {
+            Vec::new()
+        } else {
+            quoted_after(&err, "this kind takes ").unwrap_or_else(|| panic!("{}: {err}", kind.name))
+        };
+        taken
+            .into_iter()
+            .map(|option| {
+                let others: String = kind
+                    .required
+                    .iter()
+                    .filter(|required| required.name != option)
+                    .map(|required| format!("{} = {}\n", required.name, required.example))
+                    .collect();
+                let probe = format!("{others}{option} = \"zz-probe\"\n");
+                let offers = register_error(kind, &probe, dir)
+                    .and_then(|err| quoted_after(&err, "it offers "));
+                (option, offers)
+            })
+            .collect()
+    }
+
+    /// `"a"`, `"b"`: choices as a cell spells them.
+    fn choices(values: &[&str]) -> String {
+        values
+            .iter()
+            .map(|value| format!("`\"{value}\"`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The board kinds table.
+    fn board_kinds_table() -> String {
+        let mut kinds = vec!["netlist".to_string()];
+        kinds.extend(StandardCatalog.board_kinds());
+        let mut out = String::from("| kind | what it is |\n|---|---|\n");
+        for kind in kinds {
+            let summary = board_kind_summary(&kind)
+                .unwrap_or_else(|| panic!("board kind {kind:?} has no summary for PROJECTS.md"));
+            out.push_str(&format!("| `{kind}` | {summary} |\n"));
+        }
+        out
+    }
+
+    /// The part kinds table.
+    fn part_kinds_table(dir: &Path) -> String {
+        let known = known_parts();
+        let mut out = String::from(
+            "| kind | model | placed by part number | `pins` (the first is the default) | other \
+             options |\n|---|---|---|---|---|\n",
+        );
+        for kind in StandardCatalog::guide() {
+            let unplaced = PART_KINDS
+                .iter()
+                .find(|entry| entry.name == kind.name)
+                .expect("the guide lists the catalog's kinds")
+                .unplaced;
+            let placed: Vec<String> = known
+                .iter()
+                .filter(|part| part.kind == kind.name)
+                .map(|part| format!("`{}`", part.number))
+                .collect();
+            let placed = match (placed.is_empty(), unplaced.is_empty()) {
+                (false, _) => placed.join(", "),
+                (true, false) => format!(
+                    "never (it is for {})",
+                    unplaced
+                        .iter()
+                        .map(|number| format!("`{number}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                (true, true) => "—".to_string(),
+            };
+            let option_tables: Vec<String> = kind
+                .tables
+                .iter()
+                .filter(|table| table.option)
+                .map(|table| format!("`\"{}\"` ({} pins)", table.name, table.pins.len()))
+                .collect();
+            let fixed: Vec<String> = kind
+                .tables
+                .iter()
+                .filter(|table| !table.option)
+                .map(|table| format!("`{}` ({} pins)", table.name, table.pins.len()))
+                .collect();
+            let pins = match (option_tables.is_empty(), fixed.as_slice()) {
+                (false, _) => option_tables.join(", "),
+                (true, []) => "the part's own".to_string(),
+                (true, [one]) => format!("fixed: {one}"),
+                (true, many) => format!("fixed, the member's: {}", many.join(", ")),
+            };
+            let options: Vec<String> = options_of(&kind, dir)
+                .into_iter()
+                .filter(|(name, _)| name != "pins")
+                .map(|(name, offers)| {
+                    let required = kind.required.iter().find(|option| option.name == name);
+                    let cell = match (&offers, required) {
+                        (Some(values), _) => {
+                            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+                            format!("`{name}` = {}", choices(&values))
+                        }
+                        (None, Some(option)) => {
+                            format!("`{name} = {}` — {}", option.example, option.means)
+                        }
+                        (None, None) => {
+                            let (example, means) =
+                                free_option(kind.name, &name).unwrap_or_else(|| {
+                                    panic!("{} option {name:?} has no phrase", kind.name)
+                                });
+                            format!("`{name} = {example}` — {means}")
+                        }
+                    };
+                    if required.is_some() {
+                        format!("{cell} (required)")
+                    } else {
+                        cell
+                    }
+                })
+                .collect();
+            let options = if options.is_empty() {
+                "—".to_string()
+            } else {
+                options.join("; ")
+            };
+            out.push_str(&format!(
+                "| `{}` | {} | {placed} | {pins} | {options} |\n",
+                kind.name, kind.summary
+            ));
+        }
+        out
+    }
+
+    /// The text between the lines `<!-- {name}:begin -->` and
+    /// `<!-- {name}:end -->` of PROJECTS.md.
+    fn doc_block(name: &str) -> &'static str {
+        let begin = format!("<!-- {name}:begin -->\n");
+        let end = format!("<!-- {name}:end -->");
+        let start = PROJECTS_MD
+            .find(&begin)
+            .unwrap_or_else(|| panic!("PROJECTS.md has no {begin:?}"))
+            + begin.len();
+        let stop = PROJECTS_MD[start..]
+            .find(&end)
+            .unwrap_or_else(|| panic!("PROJECTS.md has no {end:?}"));
+        &PROJECTS_MD[start..start + stop]
+    }
+
+    #[rstest]
+    fn projects_md_tabulates_every_kind_the_catalog_ships() {
+        behaviour!(Test {
+            id: "catalog.projects-md-tables",
+            covers: Some("boards/src/catalog.rs#StandardCatalog::guide"),
+            given: "the projects guide's tables of the board kinds and part kinds a project \
+                    file can name, beside the same tables generated from the catalog's own \
+                    registrations",
+        });
+        expect!(
+            "board-kinds",
+            "the guide's board-kind table is the generated one, word for word",
+            "a board kind the catalog gains or loses changes the generated table, so the \
+             guide cannot fall behind the code"
+        );
+        expect!(
+            "part-kinds",
+            "the guide's part-kind table is the generated one, word for word",
+            "each option, and each value a choice offers, is read off the kind's own \
+             registration, which names them when it refuses one it does not know"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("embsim-catalog-projects-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the temp dir is writable");
+        // The card the `sd-card` kind's required `image` example names.
+        std::fs::write(dir.join("card.img"), vec![0u8; 512]).expect("the temp dir is writable");
+        let boards = board_kinds_table();
+        let parts = part_kinds_table(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            doc_block("board-kinds") == boards,
+            "PROJECTS.md's board kinds are not the catalog's; replace the block with:\n{boards}"
+        );
+        assert!(
+            doc_block("part-kinds") == parts,
+            "PROJECTS.md's part kinds are not the catalog's; replace the block with:\n{parts}"
+        );
     }
 
     #[rstest]

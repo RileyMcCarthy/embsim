@@ -5,17 +5,24 @@
 
 A generic **software-in-the-loop (SIL) emulator framework** for embedded firmware.
 
-embsim links your real firmware C code against Rust implementations of its
-hardware-access (HAL) layer, plus emulated peripherals and physical models, so
-the firmware runs unmodified on a host with **no physical hardware**. Host
-software (a desktop app, a test harness) talks to the emulated serial port
-through a `/dev` PTY symlink, exactly as it would to a real board.
+embsim runs a system of boards with **no physical hardware**: each board built
+from its vendor netlist with every part a node, the real firmware on an
+instruction-set simulator in the processor's package, and the nets between
+them resolved as circuits at the instants things happen.
+
+embsim is run as a **project**: a TOML file that names the boards (a KiCad
+netlist each, or a module the catalog ships), the model each part takes, the
+wires between the boards' connectors, and the scenario. The `embsim` command
+takes a netlist to a running system through one. `embsim survey` lists what
+the netlist asks for, `embsim new` writes a starter project, `embsim check`
+builds it, and `embsim run` runs it in virtual time. Rust code loads the same
+file with `embsim_board::Project`. The guide is [`PROJECTS.md`](PROJECTS.md).
 
 It was extracted from the [MaD tensile tester](https://github.com/RileyMcCarthy/MaD)
-and is designed to be reused: the `core`, `peripherals`, `models`, `runtime`,
-and `tools` crates carry no project- or Propeller-2-specific assumptions. A new
-project supplies a *platform crate* and a *machine*, and gets a runnable
-emulator.
+and is designed to be reused: no generic crate depends on a project crate
+(below). A new project supplies its boards' netlists, the models its parts
+need (a catalog of its own, `PROJECTS.md` section 7), and a core in the
+processor's slot.
 
 ## What embsim is for, and what it is not
 
@@ -130,7 +137,7 @@ Project-specific wiring lives in the consumer's repo.
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets. Carries the `target/p2` sources |
 | `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
-| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked) |
+| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked). The guide is [`PROJECTS.md`](PROJECTS.md) |
 | `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from an archive |
 | `embsim-trace` | [`tools/trace/`](tools/trace) | Time-series trace recorder + live web viewer (feature `web`) |
 | `embsim-ui` | [`tools/ui/`](tools/ui) | Pluggable web shell the trace viewer mounts into |
@@ -193,8 +200,10 @@ datasheet table against a netlist that names pins by function —
 board whose survey is not clean is refused with the survey as the error. A
 wire's board end is a connector pin (`Board.Connector.Pin`); its other end is
 another board's connector, a bench component's pin, or, with `volts`, a supply.
-The part kinds and their options are listed in `boards/src/catalog.rs`; the
-example projects are in `boards/projects/`.
+The part kinds, their options and pin tables, the workflow from a netlist to
+a running system, wiring boards to each other, and adding kinds of your own
+are in [`PROJECTS.md`](PROJECTS.md); the example projects are in
+`boards/projects/`.
 
 ### The `embsim` command
 
