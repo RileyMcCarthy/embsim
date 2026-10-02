@@ -35,12 +35,12 @@ use std::sync::{Arc, Mutex};
 use embsim_board::report::instant;
 use embsim_board::{
     netlist, Assignment, AttachError, BoardSpec, Catalog, CatalogBoard, Component, ComponentNetIo,
-    ComponentRequest, Drive, KindGuide, ModelFacade, Named, PartOptions, PartRegistry, PinDecl,
-    PinHandle, ProjectError, Report, TheveninDrive,
+    ComponentRequest, Drive, KindGuide, KindInfo, ModelFacade, Named, PartOptions, PartRegistry,
+    PinDecl, PinHandle, ProjectError, Report, TheveninDrive,
 };
 use embsim_boards::catalog::CatalogSet;
 use embsim_boards::p2::{
-    CoreCatalog, CoreCtor, CoreKind, P2Core, P2Pads, PadDrive, NATIVE_PAD_MODE, NUM_PADS,
+    CoreCatalog, CoreCtor, P2Core, P2Pads, PadDrive, NATIVE_PAD_MODE, NUM_PADS,
 };
 use embsim_core::virtual_clock;
 
@@ -95,8 +95,13 @@ impl Catalog for Kinds {
         CATALOG
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        vec![BOARD.to_string()]
+    // Every sort of kind describes itself the same way: its name, what it
+    // is, and the options it cannot be built without.
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            BOARD,
+            "a two-pin header and the sensor U1 across it, from the netlist this crate bundles",
+        )]
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
@@ -117,7 +122,7 @@ impl Catalog for Kinds {
         vec![KindGuide::new(
             SENSOR,
             "a sensor that reads the voltage across its two pins",
-            Named::Family(&["YOURPROJECT-SENSOR"]),
+            Named::family(["YOURPROJECT-SENSOR"]),
         )]
     }
 
@@ -151,8 +156,18 @@ impl Catalog for Kinds {
         Ok(())
     }
 
-    fn component_kinds(&self) -> Vec<String> {
-        vec![SOURCE.to_string()]
+    fn component_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            SOURCE,
+            "one pin, OUT, released until a while after the start, then driven",
+        )
+        .requires("volts", "3.3", "what the pin drives")
+        .requires("ohms", "100.0", "the source's impedance, more than 0")
+        .requires(
+            "at",
+            "\"1ms\"",
+            "when, after the system starts, the pin is driven",
+        )]
     }
 
     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
@@ -235,11 +250,12 @@ impl CoreCatalog for Cores {
         CATALOG
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind {
-            name: CORE,
-            summary: "a core that drives one pad high from the moment it starts",
-        }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            CORE,
+            "a core that drives one pad high from the moment it starts",
+        )
+        .requires("pin", "0", "the pad the core drives, 0 to 63")]
     }
 
     fn seat(

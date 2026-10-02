@@ -13,7 +13,7 @@
 //!
 //! let mut set = CatalogSet::new();
 //! embsim_p2_qemu::catalog::register(&mut set).expect("one core, spelled as a kind is");
-//! let cores: Vec<&str> = set.core_kinds().iter().map(|kind| kind.name).collect();
+//! let cores: Vec<String> = set.core_kinds().into_iter().map(|kind| kind.name.into_owned()).collect();
 //! assert_eq!(cores, ["held-in-reset", "qemu"]);
 //! ```
 //!
@@ -30,14 +30,15 @@
 //! refuses the entry, saying how to install one, when there is none. The
 //! chip boots when the board is built — seating only checks — so a survey
 //! of the project boots nothing; each part the key reaches boots a program
-//! of its own. The core reports its console, per pad, its yields, and why
-//! it stopped if its program died ([`Report`]).
+//! of its own. The core reports which program it runs (where it was found,
+//! its protocol, target and QEMU), its console, per pad, its yields, and
+//! why it stopped if its program died ([`Report`]).
 
-use embsim_board::{Assignment, PartOptions, ProjectError, Report};
+use embsim_board::{Assignment, KindInfo, PartOptions, ProjectError, Report};
 use embsim_boards::catalog::CatalogSet;
-use embsim_boards::p2::{CoreCatalog, CoreCtor, CoreKind, P2Core};
+use embsim_boards::p2::{CoreCatalog, CoreCtor, P2Core};
 
-use crate::{P2Qemu, P2QemuHandle, QemuSystemP2, Transport, BOOT_ROM};
+use crate::{Identity, P2Qemu, P2QemuHandle, QemuSystemP2, Transport, BOOT_ROM};
 
 #[cfg(doc)]
 use embsim_boards::p2::P2Package;
@@ -75,11 +76,8 @@ impl CoreCatalog for QemuCores {
         NAME
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind {
-            name: "qemu",
-            summary: "the chip booting its ROM on QEMU",
-        }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("qemu", "the chip booting its ROM on QEMU")]
     }
 
     fn seat(
@@ -113,6 +111,13 @@ impl CoreCatalog for QemuCores {
                 .map_err(|err| format!("QEMU did not boot: {err}"))?;
             reports.add(QemuReport {
                 subject: format!("{board}.{}", decl.reference),
+                // Started, so its hello was what this embsim needs.
+                program: Some(format!(
+                    "qemu-system-p2 {} ({}): {}",
+                    program.path().display(),
+                    program.found().describe(),
+                    Identity::needed()
+                )),
                 core: p2.handle(),
                 printed: vec![0; usize::from(P2_PADS)],
                 halted: false,
@@ -128,6 +133,9 @@ impl CoreCatalog for QemuCores {
 /// whether it runs, and every console.
 struct QemuReport {
     subject: String,
+    /// Which program runs the core, said at the first look and then
+    /// taken: what a run was made with.
+    program: Option<String>,
     core: P2QemuHandle,
     /// Console characters printed so far, per pad.
     printed: Vec<usize>,
@@ -142,7 +150,7 @@ impl Report for QemuReport {
     }
 
     fn look(&mut self, _now_ns: u64) -> Vec<String> {
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = self.program.take().into_iter().collect();
         for pad in 0..P2_PADS {
             let text = self.core.console(pad);
             let printed = &mut self.printed[usize::from(pad)];
@@ -195,8 +203,6 @@ impl Report for QemuReport {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use embsim_board::{Catalog, ComponentDecl, KeyField, ParsedNetlist, PartRegistry, Reports};
 
     use super::*;
@@ -238,16 +244,16 @@ mod tests {
             nets: Vec::new(),
         };
         let reports = Reports::new();
-        let assignment = Assignment {
-            board: "EC32",
-            by: KeyField::Value,
-            key: "P2X8C4M64P",
-            kind: "p2",
+        let assignment = Assignment::new(
+            "EC32",
+            KeyField::Value,
+            "P2X8C4M64P",
+            "p2",
             parts,
-            dir: Path::new("."),
-            netlist: &netlist,
-            reports: &reports,
-        };
+            &netlist,
+            &reports,
+            set,
+        );
         let table: toml::Table =
             toml::from_str(&format!("core = {core:?}\n{extra}")).expect("the options parse");
         set.register_part(

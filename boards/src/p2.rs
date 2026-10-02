@@ -193,9 +193,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use embsim_board::report::instant;
 use embsim_board::{
     jesd8c01_lvcmos_thresholds, Amps, Assignment, AttachError, Component, ComponentDecl,
-    ComponentNetIo, DeadBand, DigitalReceiver, Level, ModelFacade, Ohms, PartOptions, PartRegistry,
-    PinDecl, PinHandle, ProjectError, Report, Sense, TheveninDrive, Thresholds, Volts, WakeGate,
-    WakeHandler,
+    ComponentNetIo, DeadBand, DigitalReceiver, KindInfo, Level, ModelFacade, Ohms, PartOptions,
+    PartRegistry, PinDecl, PinHandle, ProjectError, Report, Sense, TheveninDrive, Thresholds,
+    Volts, WakeGate, WakeHandler,
 };
 use embsim_core::virtual_clock;
 
@@ -1192,16 +1192,6 @@ impl P2Core for Box<dyn P2Core> {
 // Core kinds: what a project's `core` option names
 // ============================================================
 
-/// One core kind a [`CoreCatalog`] provides: the name a project's `core`
-/// option gives, and what it is, in a phrase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CoreKind {
-    /// The name (`"qemu"`).
-    pub name: &'static str,
-    /// What runs, in a phrase (`"the chip booting its ROM on QEMU"`).
-    pub summary: &'static str,
-}
-
 /// Builds the core for one part when its board is built. An `Err` is a
 /// core that could not be made, with the reason: the package refuses to
 /// attach with it, so the system does not start.
@@ -1220,8 +1210,11 @@ pub trait CoreCatalog {
     /// The catalog's name, as an error naming two catalogs prints it.
     fn name(&self) -> &str;
 
-    /// The core kinds it provides.
-    fn core_kinds(&self) -> Vec<CoreKind>;
+    /// The core kinds it provides, each described as every sort of kind
+    /// is ([`KindInfo`]): the name a project's `core` option gives
+    /// (`"qemu"`), what runs in a phrase (`"the chip booting its ROM on
+    /// QEMU"`), and the options it cannot be seated without.
+    fn core_kinds(&self) -> Vec<KindInfo>;
 
     /// Check `options` — every option of the entry but `core` — for the
     /// core `core` in the parts `assignment` reaches, refusing any it does
@@ -1247,11 +1240,8 @@ impl CoreCatalog for HeldInResetCores {
         crate::catalog::NAME
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind {
-            name: "held-in-reset",
-            summary: "the chip before it runs",
-        }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("held-in-reset", "the chip before it runs")]
     }
 
     fn seat(
@@ -1265,20 +1255,31 @@ impl CoreCatalog for HeldInResetCores {
     }
 }
 
-/// The `core` option's meaning, naming every core `cores` provide: what
-/// the `p2` kind's guide says of it.
-pub fn core_option_means(cores: &[&dyn CoreCatalog]) -> String {
+/// The core kinds `cores` provide, as an option taking one says them:
+/// `"held-in-reset", the chip before it runs; or "qemu", …`.
+pub fn core_kinds_listed(cores: &[KindInfo]) -> String {
     let kinds: Vec<String> = cores
         .iter()
-        .flat_map(|catalog| catalog.core_kinds())
         .map(|kind| format!("{:?}, {}", kind.name, kind.summary))
         .collect();
-    let listed = match kinds.as_slice() {
+    match kinds.as_slice() {
         [] => String::new(),
         [one] => one.clone(),
         [rest @ .., last] => format!("{}, or {last}", rest.join("; ")),
-    };
-    format!("what runs inside the package: {listed}")
+    }
+}
+
+/// The `core` option's meaning, naming every core `cores` provide: what
+/// the `p2` kind's refusal of a missing `core` says.
+pub fn core_option_means(cores: &[&dyn CoreCatalog]) -> String {
+    let kinds: Vec<KindInfo> = cores
+        .iter()
+        .flat_map(|catalog| catalog.core_kinds())
+        .collect();
+    format!(
+        "what runs inside the package: {}",
+        core_kinds_listed(&kinds)
+    )
 }
 
 /// Register the `p2` part kind under `assignment`'s key: the package around
@@ -1297,12 +1298,13 @@ pub fn register_p2(
     cores: &[&dyn CoreCatalog],
     clash: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), ProjectError> {
-    let mut names: Vec<&'static str> = Vec::new();
+    let mut owned: Vec<String> = Vec::new();
     for kind in cores.iter().flat_map(|catalog| catalog.core_kinds()) {
-        if !names.contains(&kind.name) {
-            names.push(kind.name);
+        if !owned.iter().any(|name| *name == kind.name) {
+            owned.push(kind.name.into_owned());
         }
     }
+    let names: Vec<&str> = owned.iter().map(String::as_str).collect();
     let core = options.choice("core", &names)?.ok_or_else(|| {
         assignment.error(format!("options.core says {}", core_option_means(cores)))
     })?;

@@ -23,10 +23,11 @@
 use std::sync::{Arc, Mutex};
 
 use embsim_board::report::instant;
-use embsim_board::{Assignment, AttachError, Drive, PartOptions, PinHandle, ProjectError, Report};
+use embsim_board::{
+    Assignment, AttachError, Drive, KindInfo, PartOptions, PinHandle, ProjectError, Report,
+};
 use embsim_boards::p2::{
-    BankSupplies, CoreCatalog, CoreCtor, CoreKind, P2Core, P2Pads, PadDrive, NATIVE_PAD_MODE,
-    NUM_PADS,
+    BankSupplies, CoreCatalog, CoreCtor, P2Core, P2Pads, PadDrive, NATIVE_PAD_MODE, NUM_PADS,
 };
 use embsim_core::virtual_clock;
 
@@ -42,11 +43,13 @@ impl CoreCatalog for BlinkerCores {
         crate::NAME
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind {
-            name: BLINKER,
-            summary: "a core that toggles one pad every half period from its start",
-        }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            BLINKER,
+            "a core that toggles one pad every half period from its start",
+        )
+        .requires("pin", "0", "the pad the core toggles, 0 to 63")
+        .requires("period", "\"1ms\"", "the time between two rising edges")]
     }
 
     fn seat(

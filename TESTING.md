@@ -322,24 +322,33 @@ cargo test -p embsim-boards --test scripted_source --test host_serial
 # adds a board kind, a part kind, a P2 core and a bench component, and a
 # project naming all four checks and runs through `embsim_cli::run`. A
 # project's own catalog crates (`cli/tests/runner.rs`): `new --catalog`
-# starting a crate and naming it in a project, the tool's refusals before
-# Cargo, the runner's files written when no Cargo starts, a runner refusing
-# a project naming other crates, `survey` and `new` with `--project` through
-# a runner; and, with a stand-in `$CARGO` that reads manifests and builds
-# nothing, a lone crate's runner built under `.embsim/target`, a crate on
-# another embsim checkout refused before any build, a crate's dependency on
-# another checkout named as two copies when the build fails, and a
-# symlinked checkout spelled as the crate spells it. The crate `new --catalog` starts,
+# starting a crate (its embsim by path inside the project, else by git
+# revision, else the project's crates' own) and its own runner, naming them
+# in a project, the tool's refusals before Cargo, the runner's files written
+# when no Cargo starts, a runner refusing a project naming other crates,
+# `survey` and `new` with `--project` through a runner, a command line the
+# tool cannot parse handed over; and, with a stand-in `$CARGO` that reads
+# manifests and builds nothing, a lone crate's runner built under
+# `.embsim/target`, the runner's embsim taken from the crates' git source,
+# a crate on another embsim refused before any build, a crate's dependency
+# on another checkout named as two copies when Cargo refuses the second
+# `links = "embsim-core"`, two copies refused by Cargo's resolver, a
+# symlinked checkout spelled as the crate spells it, `embsim.lock` copied in
+# and built `--locked`, and a project's own runner built in its workspace.
+# What a binary is made of, on every check and in `--version`
+# (`cli/tests/cli.rs`). The crate `new --catalog` starts,
 # its four kinds run in process, its source driving at its instant
 # (`cli/tests/template.rs`).
 cargo test -p embsim-cli
 
 # The runner built with Cargo (`#[ignore]`d above; CI's project-runner job):
 # examples/custom-project checked and run through the real binary and the
-# runner it builds, a quiet second build and a --rebuild, a started crate
-# built outside any workspace, and a crate that does not compile shown with
-# rustc's errors. The first build of embsim in the release profile is the
-# slow part.
+# runner it builds, --locked against its committed embsim.lock, a quiet
+# second build and a --rebuild that keeps the lock, a started crate built
+# outside any workspace whose first run writes embsim.lock, a project's own
+# runner built in its workspace and run, and a crate that does not compile
+# shown with rustc's errors. The first build of embsim in the release
+# profile is the slow part.
 cargo test -p embsim-cli --test runner -- --ignored
 
 # The worked example's own test: its project run as its runner runs it, in

@@ -90,11 +90,11 @@ fn project_file() -> PathBuf {
 /// The command as the template crate's runner, with `args`: its exit
 /// status, what it printed and its errors.
 fn runner(args: &[&str]) -> (ExitCode, String, String) {
-    let crates = [CatalogCrate {
-        name: "yourproject-catalog",
-        dir: TEMPLATE_DIR,
-        register: yourproject_catalog::register,
-    }];
+    let crates = [CatalogCrate::new(
+        "yourproject-catalog",
+        TEMPLATE_DIR,
+        yourproject_catalog::register,
+    )];
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = embsim_cli::run_with_crates(
         &crates,

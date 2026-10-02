@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use embsim_board::{
-    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, Classification, KindGuide, ModelSpec,
-    Named, PartOptions, PartRegistry, Project, ProjectError,
+    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, Classification, KindGuide, KindInfo,
+    ModelSpec, Named, PartOptions, PartRegistry, Project, ProjectError, RequiredOption,
 };
 use embsim_boards::catalog::CatalogSet;
 use embsim_boards::ec32mb::dip_switch_poles;
-use embsim_boards::p2::{CoreCatalog, CoreCtor, CoreKind, HeldInReset, P2Core};
+use embsim_boards::p2::{CoreCatalog, CoreCtor, HeldInReset, P2Core};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
@@ -37,9 +37,9 @@ fn ec32(rest: &str) -> Project {
 /// asked to register.
 struct Kinds {
     name: &'static str,
-    boards: Vec<String>,
+    boards: Vec<KindInfo>,
     parts: Vec<KindGuide>,
-    components: Vec<String>,
+    components: Vec<KindInfo>,
     /// Keys its base registrations place as mechanical parts.
     base: Vec<&'static str>,
     registered: Arc<AtomicUsize>,
@@ -68,7 +68,7 @@ impl Catalog for Kinds {
         self.name
     }
 
-    fn board_kinds(&self) -> Vec<String> {
+    fn board_kinds(&self) -> Vec<KindInfo> {
         self.boards.clone()
     }
 
@@ -95,7 +95,7 @@ impl Catalog for Kinds {
         Ok(())
     }
 
-    fn component_kinds(&self) -> Vec<String> {
+    fn component_kinds(&self) -> Vec<KindInfo> {
         self.components.clone()
     }
 }
@@ -116,11 +116,8 @@ impl CoreCatalog for Cores {
         self.name
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind {
-            name: self.core,
-            summary: "the chip held in reset",
-        }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(self.core, "the chip held in reset")]
     }
 
     fn seat(
@@ -276,9 +273,9 @@ fn a_part_number_two_catalogs_place_is_refused_on_a_board_that_carries_it() {
 }
 
 #[rstest]
-#[case::netlist(Kinds { boards: vec!["netlist".to_string()], ..Kinds::named("bad-catalog") }, "\"netlist\" is the board kind every project has")]
+#[case::netlist(Kinds { boards: vec![KindInfo::new("netlist", "a board")], ..Kinds::named("bad-catalog") }, "\"netlist\" is the board kind every project has")]
 #[case::spelling(Kinds::named("bad-catalog").part(switch_kind("Big_Switch")), "a kind is lowercase letters, digits and hyphens")]
-#[case::two_sorts(Kinds { components: vec!["thing".to_string()], ..Kinds::named("bad-catalog").part(switch_kind("thing")) }, "both a part kind and a component kind of this catalog")]
+#[case::two_sorts(Kinds { components: vec![KindInfo::new("thing", "a thing")], ..Kinds::named("bad-catalog").part(switch_kind("thing")) }, "both a part kind and a component kind of this catalog")]
 #[case::same_name(
     Kinds::named("embsim-boards"),
     "the set already holds a catalog named \"embsim-boards\""
@@ -327,7 +324,7 @@ fn an_added_kind_seats_only_on_a_part_it_is_whichever_catalog_it_is_from() {
     let catalog = Kinds::named("project-catalog").part(KindGuide::new(
         "my-flash",
         "a serial flash",
-        Named::Family(&["W25Q128JV"]),
+        Named::family(["W25Q128JV"]),
     ));
     let registered = Arc::clone(&catalog.registered);
     let mut set = CatalogSet::new();
@@ -376,8 +373,8 @@ impl Catalog for StripCatalog {
         "strip-catalog"
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        vec!["strip".to_string()]
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("strip", "a strip of two connectors")]
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
@@ -428,4 +425,61 @@ fn a_board_kinds_own_entries_seat_standard_kinds_and_a_project_entry_replaces_on
         .expect("the project's entry replaces the board's");
     assert!(replaced.compliant(), "{replaced}");
     assert_eq!(replaced.class_of("J2"), Some(&Classification::Boundary));
+}
+
+#[rstest]
+fn an_option_taking_a_core_kind_is_described_with_every_core_the_set_holds() {
+    behaviour!(Test {
+        id: "catalogs.core-kind-option",
+        covers: Some("boards/src/set.rs#CatalogSet::part_kinds"),
+        given: "a set holding a project's catalog whose part kind declares a required option \
+                taking one of the set's core kinds, and a core catalog adding one core",
+    });
+    expect!(
+        "lists-every-core",
+        "the set describes that option with what the kind says it means, then every core kind \
+         the set holds, the standard catalog's first, each with what it is",
+        "the set treats every catalog's kinds alike: any kind may take a core, and none is \
+         named in the set"
+    );
+    expect!(
+        "p2-alike",
+        "the standard catalog's P2 package describes its core option the same way"
+    );
+    let package = KindGuide::new(
+        "my-package",
+        "a processor package of the project's",
+        Named::family(["MY-PACKAGE"]),
+    )
+    .requires_option(
+        RequiredOption::new("core", "\"held-in-reset\"", "what runs inside it")
+            .one_of_the_core_kinds(),
+    );
+    let mut set = CatalogSet::new();
+    set.add(Kinds::named("project-catalog").part(package))
+        .expect("the catalog joins");
+    set.add_cores(Cores {
+        name: "project-cores",
+        core: "my-core",
+    })
+    .expect("the core catalog joins");
+    let guides = set.part_kinds();
+    let means = |kind: &str| {
+        guides
+            .iter()
+            .find(|guide| guide.name() == kind)
+            .and_then(|guide| guide.info.required.iter().find(|o| o.name == "core"))
+            .map(|option| option.means.to_string())
+            .unwrap_or_else(|| panic!("{kind} has a core option"))
+    };
+    let listed = "\"held-in-reset\", the chip before it runs, or \"my-core\", the chip held in \
+                  reset";
+    assert_eq!(
+        means("my-package"),
+        format!("what runs inside it: {listed}")
+    );
+    assert_eq!(
+        means("p2"),
+        format!("what runs inside the package: {listed}")
+    );
 }

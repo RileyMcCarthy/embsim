@@ -38,11 +38,12 @@ fn workspace() -> PathBuf {
 /// The template crate `new --catalog` copies (`cli/catalog-template`).
 const TEMPLATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/catalog-template");
 
-/// A directory of the test's own, emptied.
+/// A directory of the test's own inside the embsim checkout, emptied: the
+/// checkout is then inside the crate's git repository, as embsim is in a
+/// project that keeps it as a submodule, whichever target directory the
+/// tests build in.
 fn scratch(test: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("runner")
-        .join(test);
+    let dir = workspace().join("target").join("runner-tests").join(test);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the scratch directory can be made");
     dir
@@ -105,10 +106,15 @@ fn new_catalog_starts_a_crate_and_names_it_in_the_project() {
     });
     expect!(
         "crate-written",
-        "the directory gets a Cargo package named rig-catalog whose embsim dependencies are \
-         the checkout the command was built from, and a library that is the started catalog \
-         with every kind named rig-board, rig-sensor, rig-core and rig-source",
+        "the directory gets a Cargo package named rig-catalog, and a library that is the \
+         started catalog with every kind named rig-board, rig-sensor, rig-core and rig-source",
         "a kind starts with its project's name, so no kind embsim ships ever meets it"
+    );
+    expect!(
+        "embsim-by-path",
+        "the package's embsim dependencies reach, by paths relative to it, the embsim checkout \
+         the command was built from, which sits in the same repository as the crate",
+        "embsim inside a project, as a submodule is, is the project's embsim"
     );
     expect!(
         "project-names-it",
@@ -235,6 +241,169 @@ fn new_with_a_netlist_and_a_catalog_writes_a_project_that_names_the_crate() {
     assert!(!dir.join("other.toml").exists());
 }
 
+#[rstest]
+fn a_crate_started_outside_any_repository_takes_embsim_from_its_repository() {
+    behaviour!(Test {
+        id: "cli.new-catalog-git",
+        covers: Some("cli/src/scaffold.rs#embsim_for"),
+        given: "`embsim new --catalog` asked for a crate in a directory outside every git \
+                repository, the embsim checkout the command was built from elsewhere",
+    });
+    expect!(
+        "git-and-release",
+        "each embsim dependency of the crate is embsim's repository at the revision the \
+         command was built from, or at its release tag, with the command's release as the \
+         version Cargo checks",
+        "a crate's embsim dependency is the embsim the project builds against, the same on \
+         every machine; a path into one machine's checkout would not be"
+    );
+    let dir = outside("new_git");
+    let output = embsim_in(&dir, &["new", "--catalog", "rig/catalog"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let table: toml::Table =
+        toml::from_str(&read(&dir.join("rig/catalog/Cargo.toml"))).expect("the manifest parses");
+    for dependency in ["embsim-board", "embsim-boards", "embsim-core"] {
+        let dep = &table["dependencies"][dependency];
+        assert_eq!(
+            dep["git"].as_str(),
+            Some("https://github.com/RileyMcCarthy/embsim"),
+            "{dependency}"
+        );
+        assert_eq!(dep["version"].as_str(), Some(release().as_str()));
+        let pinned = dep.get("rev").or_else(|| dep.get("tag"));
+        assert!(
+            pinned
+                .and_then(toml::Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "{dependency}: {dep}"
+        );
+    }
+    assert_says(
+        &stdout(&output),
+        &["its embsim, and so the runner's: from git https://github.com/RileyMcCarthy/embsim"],
+    );
+}
+
+#[rstest]
+fn a_crate_that_joins_a_project_takes_the_embsim_its_crates_take() {
+    behaviour!(Test {
+        id: "cli.new-catalog-joins",
+        covers: Some("cli/src/scaffold.rs#new_catalog"),
+        given: "`embsim new --catalog --add-to` for a project whose catalog crate takes embsim \
+                from a git repository at a revision",
+    });
+    expect!(
+        "same-embsim",
+        "the new crate's embsim dependencies are that repository at that revision",
+        "a runner holds one copy of embsim, so every catalog crate of a project takes the same"
+    );
+    let dir = outside("new_joins");
+    git_crate(&dir.join("first"), "rig-first", "0123abcd");
+    std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"first\"]\n").expect("writable");
+    let output = embsim_in(
+        &dir,
+        &["new", "--catalog", "second", "--add-to", "p.toml"],
+        &[],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let table: toml::Table =
+        toml::from_str(&read(&dir.join("second/Cargo.toml"))).expect("the manifest parses");
+    let dep = &table["dependencies"]["embsim-boards"];
+    assert_eq!(dep["git"].as_str(), Some(OTHER_REPOSITORY));
+    assert_eq!(dep["rev"].as_str(), Some("0123abcd"));
+    let catalog = embsim_board::CatalogTable::of_project(&dir.join("p.toml"))
+        .expect("the project reads")
+        .expect("it has a [catalog]");
+    assert_eq!(catalog.crates, ["first", "second"]);
+}
+
+#[rstest]
+fn new_catalog_with_its_own_runner_starts_both_crates() {
+    behaviour!(Test {
+        id: "cli.new-own-runner",
+        covers: Some("cli/src/scaffold.rs#write_runner_crate"),
+        given: "`embsim new --catalog sim/catalog --own-runner --add-to` a project, in a \
+                directory of a Cargo workspace",
+    });
+    expect!(
+        "runner-crate",
+        "a binary crate is written beside the catalog crate, in sim/runner: it depends on the \
+         embsim command from the catalog crate's embsim and on the catalog crate by path, and \
+         its main runs the command over the catalog crate, found from the runner's own \
+         directory",
+        "the project's own runner is the same command a runner the tool writes is"
+    );
+    expect!(
+        "named-as-runner",
+        "the project names the catalog crate among its crates and the binary crate as its \
+         runner, both relative to the file"
+    );
+    expect!(
+        "workspace-note",
+        "the command says the two crates sit inside the workspace and are to be added to its \
+         members"
+    );
+    let dir = scratch("own_runner_new");
+    std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("writable");
+    std::fs::write(dir.join("rig.toml"), "# The rig.\n").expect("writable");
+    let output = embsim_in(
+        &dir,
+        &[
+            "new",
+            "--catalog",
+            "sim/catalog",
+            "--own-runner",
+            "--add-to",
+            "rig.toml",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let runner = dir.join("sim/runner");
+    let table: toml::Table =
+        toml::from_str(&read(&runner.join("Cargo.toml"))).expect("the manifest parses");
+    assert_eq!(table["package"]["name"].as_str(), Some("sim-runner"));
+    assert_eq!(table["bin"][0]["name"].as_str(), Some("sim-runner"));
+    assert!(
+        !table.contains_key("workspace"),
+        "a member of the workspace above it"
+    );
+    let cli = table["dependencies"]["embsim-cli"]["path"]
+        .as_str()
+        .expect("embsim by path");
+    assert_eq!(
+        runner.join(cli).canonicalize().unwrap(),
+        workspace().join("cli").canonicalize().unwrap()
+    );
+    assert_eq!(
+        table["dependencies"]["sim-catalog"]["path"].as_str(),
+        Some("../catalog")
+    );
+    let main = read(&runner.join("src/main.rs"));
+    assert_says(
+        &main,
+        &[
+            "embsim_cli::runner_main(&[embsim_cli::CatalogCrate::new(",
+            "\"sim-catalog\"",
+            "concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../catalog\")",
+            "sim_catalog::register",
+        ],
+    );
+    let catalog = embsim_board::CatalogTable::of_project(&dir.join("rig.toml"))
+        .expect("the project reads")
+        .expect("it has a [catalog]");
+    assert_eq!(catalog.crates, ["sim/catalog"]);
+    assert_eq!(catalog.runner.as_deref(), Some("sim/runner"));
+    assert_says(
+        &stdout(&output),
+        &[
+            "the project's runner sim-runner",
+            "sim/catalog and sim/runner sit inside the Cargo workspace",
+            "add them to that workspace's members",
+        ],
+    );
+}
+
 // ============================================================
 // The tool, before Cargo
 // ============================================================
@@ -281,8 +450,8 @@ fn without_cargo_the_runner_is_written_and_the_error_says_how_to_get_cargo() {
     expect!(
         "runner-written",
         "the runner's manifest is written beside the project, in a directory of its own: \
-         one binary depending on the embsim command from the checkout the tool was built \
-         from and on the crate by its path, as a workspace of its own",
+         one binary depending on the embsim command from the embsim checkout the crate's own \
+         embsim dependency names, and on the crate by its path, as a workspace of its own",
         "Cargo compiles the project's crates and embsim into one binary, against one copy of \
          embsim"
     );
@@ -351,8 +520,9 @@ fn without_cargo_the_runner_is_written_and_the_error_says_how_to_get_cargo() {
         &main,
         &[
             "embsim_cli::runner_main(&[",
-            "name: \"yourproject-catalog\"",
-            "register: yourproject_catalog::register",
+            "embsim_cli::CatalogCrate::new(",
+            "\"yourproject-catalog\"",
+            "yourproject_catalog::register",
         ],
     );
     assert_eq!(
@@ -380,11 +550,11 @@ fn a_runner_refuses_a_project_that_names_other_catalog_crates() {
     std::fs::create_dir_all(&other).expect("the directory can be made");
     let project = dir.join("p.toml");
     std::fs::write(&project, "[catalog]\ncrates = [\"other\"]\n").expect("writable");
-    let crates = [CatalogCrate {
-        name: "yourproject-catalog",
-        dir: TEMPLATE_DIR,
-        register: yourproject_catalog::register,
-    }];
+    let crates = [CatalogCrate::new(
+        "yourproject-catalog",
+        TEMPLATE_DIR,
+        yourproject_catalog::register,
+    )];
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = embsim_cli::run_with_crates(
         &crates,
@@ -432,11 +602,11 @@ const SENSOR_BOARD: &str = r#"(export (version "E")
 
 /// The command as the started crate's runner, with `args`.
 fn template_runner(args: &[&str]) -> (ExitCode, String, String) {
-    let crates = [CatalogCrate {
-        name: "yourproject-catalog",
-        dir: TEMPLATE_DIR,
-        register: yourproject_catalog::register,
-    }];
+    let crates = [CatalogCrate::new(
+        "yourproject-catalog",
+        TEMPLATE_DIR,
+        yourproject_catalog::register,
+    )];
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = embsim_cli::run_with_crates(
         &crates,
@@ -625,12 +795,14 @@ fn new_with_a_project_offers_its_kinds_and_carries_its_catalog() {
 // log and hands `cargo metadata` (a read of the manifests and the lock file,
 // no build) to the real Cargo; anything else, a build included, it fails.
 // So these cases see every decision the tool makes before it builds — the
-// target directory, the checkout the runner's manifest spells, the
-// refusals — and what it says of a build that failed, without paying for a
-// build of embsim.
+// target directory, the embsim the runner's manifest names, the lock file,
+// the refusals — and what it says of a build that failed, without paying
+// for a build of embsim. A case whose crates take embsim from git hands on
+// only `cargo metadata --no-deps`, which reads manifests and fetches
+// nothing.
 
-/// A directory of the test's own outside every Cargo workspace (embsim's
-/// target directory is inside embsim's), emptied.
+/// A directory of the test's own outside every Cargo workspace and git
+/// repository (embsim's target directory is inside both), emptied.
 fn outside(test: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join(format!("embsim-runner-{}", std::process::id()))
@@ -640,15 +812,22 @@ fn outside(test: &str) -> PathBuf {
     dir.canonicalize().expect("the directory is there")
 }
 
-/// The stand-in Cargo in `dir`, and the log it writes.
-fn logging_cargo(dir: &Path) -> (PathBuf, PathBuf) {
+/// The stand-in Cargo in `dir`, and the log it writes: `cargo metadata`
+/// goes to the real Cargo, all of it, or only `--no-deps` when `resolve`
+/// is false.
+fn logging_cargo_with(dir: &Path, resolve: bool) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("cargo-log.sh");
     let log = dir.join("cargo.log");
+    let pattern = if resolve {
+        "metadata*"
+    } else {
+        "metadata\\ --no-deps*"
+    };
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$1\" in\n  metadata) exec \
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  {pattern}) exec \
              {cargo:?} \"$@\" ;;\nesac\nexit 101\n",
             cargo = env!("CARGO"),
         ),
@@ -657,6 +836,11 @@ fn logging_cargo(dir: &Path) -> (PathBuf, PathBuf) {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
         .expect("the script is executable");
     (script, log)
+}
+
+/// [`logging_cargo_with`], every `cargo metadata` to the real Cargo.
+fn logging_cargo(dir: &Path) -> (PathBuf, PathBuf) {
+    logging_cargo_with(dir, true)
 }
 
 /// `embsim` with `args` in `dir`, Cargo the stand-in `cargo`, and no
@@ -672,35 +856,58 @@ fn embsim_logged(dir: &Path, cargo: &Path, args: &[&str]) -> Output {
         .expect("the embsim binary runs")
 }
 
-/// The `--target-dir` the build in `log` was given.
-fn build_target(log: &Path) -> PathBuf {
+/// The build line in `log`, split into words.
+fn build_line(log: &Path) -> Vec<String> {
     let text = read(log);
     let build = text
         .lines()
         .find(|line| line.starts_with("build "))
         .unwrap_or_else(|| panic!("no build in:\n{text}"));
-    let words: Vec<&str> = build.split(' ').collect();
-    let at = words
-        .iter()
-        .position(|word| *word == "--target-dir")
-        .expect("the build names a target directory");
-    PathBuf::from(words[at + 1])
+    build.split(' ').map(str::to_string).collect()
 }
 
-/// A stand-in embsim checkout in `dir`: what the tool reads to know a
-/// checkout (`cli` is `embsim-cli`, `p2-qemu` is there), and an
-/// `embsim-board` package a crate can depend on.
+/// The `--target-dir` the build in `log` was given.
+fn build_target(log: &Path) -> PathBuf {
+    let words = build_line(log);
+    let at = words
+        .iter()
+        .position(|word| word == "--target-dir")
+        .expect("the build names a target directory");
+    PathBuf::from(&words[at + 1])
+}
+
+/// A stand-in embsim checkout in `dir`: its `embsim-cli`, and `embsim-board`
+/// and `embsim-boards` over its own `embsim-core`, which claims `links =
+/// "embsim-core"` as embsim's does — a second copy as Cargo sees one.
 fn other_checkout(dir: &Path) -> PathBuf {
-    for (crate_dir, package) in [
-        ("cli", "embsim-cli"),
-        ("p2-qemu", "embsim-p2-qemu"),
-        ("board", "embsim-board"),
+    for (crate_dir, package, deps) in [
+        ("cli", "embsim-cli", ""),
+        ("core", "embsim-core", ""),
+        (
+            "board",
+            "embsim-board",
+            "embsim-core = { path = \"../core\" }\n",
+        ),
+        (
+            "boards",
+            "embsim-boards",
+            "embsim-board = { path = \"../board\" }\n",
+        ),
     ] {
         let at = dir.join(crate_dir);
         std::fs::create_dir_all(at.join("src")).expect("the directory can be made");
+        let links = if package == "embsim-core" {
+            std::fs::write(at.join("build.rs"), "fn main() {}\n").expect("writable");
+            "links = \"embsim-core\"\n"
+        } else {
+            ""
+        };
         std::fs::write(
             at.join("Cargo.toml"),
-            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            format!(
+                "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \
+                 \"2021\"\n{links}\n[dependencies]\n{deps}"
+            ),
         )
         .expect("the manifest is writable");
         std::fs::write(at.join("src/lib.rs"), "").expect("the library is writable");
@@ -708,34 +915,74 @@ fn other_checkout(dir: &Path) -> PathBuf {
     dir.to_path_buf()
 }
 
-/// A catalog crate `rig-catalog` in `dir` whose one embsim dependency,
-/// `embsim-board`, is at `board`.
-fn crate_on(dir: &Path, board: &Path) {
-    library_on(dir, "rig-catalog", board);
+/// A catalog crate `rig-catalog` in `dir` whose embsim dependency,
+/// `embsim-boards`, is in the checkout `root`.
+fn crate_on(dir: &Path, root: &Path) {
+    library_on(
+        dir,
+        "rig-catalog",
+        &[("embsim-boards", &root.join("boards"))],
+    );
 }
 
-/// A library package `name` in `dir` depending on `embsim-board` at `board`.
-fn library_on(dir: &Path, name: &str, board: &Path) {
+/// A library package `name` in `dir` depending on each `(package, path)`.
+fn library_on(dir: &Path, name: &str, deps: &[(&str, &Path)]) {
     std::fs::create_dir_all(dir.join("src")).expect("the directory can be made");
+    let deps: String = deps
+        .iter()
+        .map(|(package, path)| {
+            format!(
+                "{package} = {{ path = {:?} }}\n",
+                path.display().to_string()
+            )
+        })
+        .collect();
     std::fs::write(
         dir.join("Cargo.toml"),
         format!(
             "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\nembsim-board = {{ path = {:?} }}\n",
-            board.display().to_string()
+             [dependencies]\n{deps}"
         ),
     )
     .expect("the manifest is writable");
     std::fs::write(dir.join("src/lib.rs"), "").expect("the library is writable");
 }
 
+/// A repository the git-sourced crates name; nothing fetches it.
+const OTHER_REPOSITORY: &str = "https://example.invalid/embsim.git";
+
+/// A catalog crate `name` in `dir` whose embsim dependencies are
+/// [`OTHER_REPOSITORY`] at the revision `rev`.
+fn git_crate(dir: &Path, name: &str, rev: &str) {
+    std::fs::create_dir_all(dir.join("src")).expect("the directory can be made");
+    let dep =
+        |package: &str| format!("{package} = {{ git = {OTHER_REPOSITORY:?}, rev = {rev:?} }}\n");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n{}{}",
+            dep("embsim-boards"),
+            dep("embsim-core")
+        ),
+    )
+    .expect("the manifest is writable");
+    std::fs::write(dir.join("src/lib.rs"), "").expect("the library is writable");
+}
+
+/// This embsim's release, `major.minor`.
+fn release() -> String {
+    let parts: Vec<&str> = env!("CARGO_PKG_VERSION").split('.').collect();
+    format!("{}.{}", parts[0], parts[1])
+}
+
 #[rstest]
-fn a_started_crate_in_no_workspace_builds_its_runner_beside_the_project() {
+fn a_crate_in_no_workspace_builds_its_runner_beside_the_project() {
     behaviour!(Test {
         id: "cli.runner-lone-crate-target",
         covers: Some("cli/src/runner.rs#workspace_of"),
-        given: "a project and the catalog crate `embsim new --catalog` started beside it, in a \
-                directory no Cargo workspace covers, checked with the `embsim` tool and no \
+        given: "a project and a catalog crate beside it that is a Cargo package of its own, in \
+                a directory no Cargo workspace covers, checked with the `embsim` tool and no \
                 target directory set in the environment",
     });
     expect!(
@@ -747,13 +994,15 @@ fn a_started_crate_in_no_workspace_builds_its_runner_beside_the_project() {
     );
     let dir = outside("lone_crate");
     let (cargo, log) = logging_cargo(&dir);
-    std::fs::write(dir.join("rig.toml"), "# The rig.\n").expect("writable");
-    let new = embsim_logged(
-        &dir,
-        &cargo,
-        &["new", "--catalog", "sim/catalog", "--add-to", "rig.toml"],
+    crate_on(
+        &dir.join("sim/catalog"),
+        &workspace().canonicalize().unwrap(),
     );
-    assert!(new.status.success(), "{}", stderr(&new));
+    std::fs::write(
+        dir.join("rig.toml"),
+        "[catalog]\ncrates = [\"sim/catalog\"]\n",
+    )
+    .expect("writable");
     // What made the runner build inside the crate: Cargo reads a lone
     // package as a workspace of its own, rooted at its directory.
     let metadata = Command::new(env!("CARGO"))
@@ -776,67 +1025,109 @@ fn a_started_crate_in_no_workspace_builds_its_runner_beside_the_project() {
 }
 
 #[rstest]
-#[case::the_tools_own(false)]
-#[case::named_in_the_project(true)]
-fn a_crate_on_another_embsim_checkout_is_refused_before_any_build(#[case] named: bool) {
+fn a_runner_takes_embsim_from_where_its_crates_do() {
+    behaviour!(Test {
+        id: "cli.runner-embsim-from-crates",
+        covers: Some("cli/src/runner.rs#one_embsim"),
+        given: "a project whose one catalog crate takes embsim from a git repository at a \
+                revision, checked with the `embsim` tool",
+    });
+    expect!(
+        "same-source",
+        "the runner's manifest takes the embsim command from that repository at that revision",
+        "the project's own Cargo files say which embsim it builds against, wherever the tool \
+         itself was installed from"
+    );
+    expect!(
+        "said",
+        "the line the tool prints before it builds names that repository and revision"
+    );
+    let dir = outside("git_source");
+    let (cargo, _) = logging_cargo_with(&dir, false);
+    git_crate(&dir.join("rig"), "rig-catalog", "0123abcd");
+    std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"rig\"]\n").expect("writable");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success(), "the stand-in Cargo builds nothing");
+    let table: toml::Table =
+        toml::from_str(&read(&runner_dir(&dir).join("Cargo.toml"))).expect("the manifest parses");
+    let cli = &table["dependencies"]["embsim-cli"];
+    assert_eq!(cli["git"].as_str(), Some(OTHER_REPOSITORY));
+    assert_eq!(cli["rev"].as_str(), Some("0123abcd"));
+    assert_says(
+        &stderr(&check),
+        &[&format!(
+            "(rig-catalog, embsim from git {OTHER_REPOSITORY} rev 0123abcd)"
+        )],
+    );
+}
+
+#[rstest]
+#[case::two_crates(false)]
+#[case::one_crate_two_checkouts(true)]
+fn a_crate_on_another_embsim_is_refused_before_any_build(#[case] one_crate: bool) {
     behaviour!(Test {
         id: "cli.runner-two-copies",
         covers: Some("cli/src/runner.rs#one_embsim"),
-        given: "a project whose catalog crate depends on embsim-board from one embsim \
-                checkout while the runner would build against another: the checkout the tool \
-                was built from, or one the project names with [catalog] embsim",
+        given: "a project whose catalog crates take embsim from two checkouts: a second crate's \
+                from another checkout than the first's, or the first crate's own embsim-core \
+                from another checkout than its embsim-boards",
     });
     expect!(
         "refused-naming-both",
         "the tool refuses the project before it builds anything, naming the crate, the \
-         directory its embsim dependency is in, and the checkout the runner builds against",
+         embsim crate it takes from the other checkout and that checkout, and the checkout \
+         the first crate's embsim-boards is in",
         "two copies of embsim in one runner would be two virtual clocks"
     );
     expect!(
         "says-the-fix",
-        "the refusal says to point the crate's embsim dependencies at the runner's checkout, \
-         or, when the crate's is a checkout, to name it with [catalog] embsim"
+        "the refusal says to point every catalog crate's embsim dependencies at one embsim"
     );
-    let dir = outside(if named { "copies_named" } else { "copies_own" });
+    let dir = outside(if one_crate {
+        "copies_one"
+    } else {
+        "copies_two"
+    });
     let (cargo, log) = logging_cargo(&dir);
     let copy = other_checkout(&dir.join("embsim-copy"));
     let real = workspace().canonicalize().unwrap();
-    let (board, embsim_line, fix) = if named {
-        (
-            real.join("board"),
-            "embsim = \"embsim-copy\"\n",
-            format!(
-                "Point the crate's embsim dependencies at {}",
-                copy.display()
-            ),
-        )
+    let (crates, culprit, name) = if one_crate {
+        library_on(
+            &dir.join("rig"),
+            "rig-catalog",
+            &[
+                ("embsim-boards", &real.join("boards")),
+                ("embsim-core", &copy.join("core")),
+            ],
+        );
+        ("\"rig\"", "rig-catalog", "embsim-core")
     } else {
-        (
-            copy.join("board"),
-            "",
-            "[catalog] embsim = \"embsim-copy\"".to_string(),
-        )
+        crate_on(&dir.join("rig"), &real);
+        library_on(
+            &dir.join("more"),
+            "more-catalog",
+            &[("embsim-boards", &copy.join("boards"))],
+        );
+        ("\"rig\", \"more\"", "more-catalog", "embsim-boards")
     };
-    crate_on(&dir.join("rig"), &board);
     std::fs::write(
         dir.join("p.toml"),
-        format!("[catalog]\ncrates = [\"rig\"]\n{embsim_line}"),
+        format!("[catalog]\ncrates = [{crates}]\n"),
     )
     .expect("writable");
     let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
     assert!(!check.status.success());
-    let runner_checkout = if named { &copy } else { &real };
     assert_says(
         &stderr(&check),
         &[
             &format!(
-                "catalog crate rig-catalog takes embsim-board from {}, which is not in the \
-                 embsim checkout the runner builds against, {}",
-                board.display(),
-                runner_checkout.display()
+                "catalog crate {culprit} takes {name} at {}, and the runner builds against \
+                 the embsim rig-catalog takes embsim-boards at {}",
+                copy.display(),
+                real.display()
             ),
             "two would be two virtual clocks",
-            &fix,
+            "Point every catalog crate's embsim dependencies at one embsim",
         ],
     );
     assert!(
@@ -850,16 +1141,16 @@ fn a_dependency_on_another_embsim_checkout_is_named_as_two_copies() {
     behaviour!(Test {
         id: "cli.runner-collision",
         covers: Some("cli/src/runner.rs#Cargo::collision"),
-        given: "a catalog crate whose own embsim dependency is in the checkout the tool was \
-                built from, and which depends on a crate of the project's taking embsim-board \
-                from another checkout, checked with the `embsim` tool, the build failing",
+        given: "a catalog crate whose own embsim dependency is embsim's checkout, and which \
+                depends on a crate of the project's taking embsim from another checkout, \
+                checked with the `embsim` tool, the build failing",
     });
     expect!(
         "named-two-copies",
         "the error gives two copies of embsim as the one reason the build failed, quotes \
-         Cargo's package collision naming both embsim-board directories, and says to point \
-         every crate's embsim dependencies, the catalog crates' and those they depend on, at \
-         the checkout",
+         Cargo's refusal of a second package claiming embsim-core's links name and the first \
+         one's directory, and says to point every crate's embsim dependencies, the catalog \
+         crates' and those they depend on, at the runner's embsim",
         "a second copy reached through a crate the catalog crate depends on is refused by \
          Cargo's resolver before anything compiles, and the tool names it"
     );
@@ -867,8 +1158,12 @@ fn a_dependency_on_another_embsim_checkout_is_named_as_two_copies() {
     let (cargo, log) = logging_cargo(&dir);
     let copy = other_checkout(&dir.join("embsim-copy"));
     let real = workspace().canonicalize().unwrap();
-    library_on(&dir.join("helper"), "rig-helper", &copy.join("board"));
-    crate_on(&dir.join("rig"), &real.join("board"));
+    library_on(
+        &dir.join("helper"),
+        "rig-helper",
+        &[("embsim-board", &copy.join("board"))],
+    );
+    crate_on(&dir.join("rig"), &real);
     let manifest = dir.join("rig/Cargo.toml");
     let text = read(&manifest) + &format!("rig-helper = {{ path = {:?} }}\n", "../helper");
     std::fs::write(&manifest, text).expect("the manifest is writable");
@@ -885,12 +1180,11 @@ fn a_dependency_on_another_embsim_checkout_is_named_as_two_copies() {
         &said,
         &[
             "the runner for p.toml did not build: it met two copies of embsim (package \
-             collision in the lockfile: packages embsim-board v0.1.0 (",
-            &format!("{})", real.join("board").display()),
-            &format!("{})", copy.join("board").display()),
+             `embsim-core` links to the native library `embsim-core`",
+            "the first is package `embsim-core v",
             &format!(
                 "Point the embsim dependencies of every catalog crate, and of the crates they \
-                 depend on, at {}",
+                 depend on, at embsim at {}",
                 real.display()
             ),
         ],
@@ -899,12 +1193,65 @@ fn a_dependency_on_another_embsim_checkout_is_named_as_two_copies() {
 }
 
 #[rstest]
+fn two_copies_of_embsim_do_not_resolve() {
+    behaviour!(Test {
+        id: "cli.one-embsim-links",
+        covers: Some("core/Cargo.toml"),
+        given: "a Cargo workspace whose one package depends on embsim's virtual-clock crate \
+                and whose other depends on a second package of that name claiming the same \
+                links name, at another version and directory",
+    });
+    expect!(
+        "refused-at-resolution",
+        "Cargo refuses the graph when it resolves it, before anything compiles, naming the \
+         links name embsim-core that only one package may claim",
+        "the virtual clock is process-global: a second copy of embsim would be a second clock"
+    );
+    let dir = outside("links");
+    let core_manifest = read(&workspace().join("core/Cargo.toml"));
+    let core: toml::Table = toml::from_str(&core_manifest).expect("the manifest parses");
+    let links = core["package"]["links"]
+        .as_str()
+        .expect("embsim-core claims a links name");
+    let copy = dir.join("copy");
+    std::fs::create_dir_all(copy.join("src")).expect("the directory can be made");
+    std::fs::write(
+        copy.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"embsim-core\"\nversion = \"0.0.1\"\nedition = \"2021\"\n\
+             links = {links:?}\n"
+        ),
+    )
+    .expect("writable");
+    std::fs::write(copy.join("build.rs"), "fn main() {}\n").expect("writable");
+    std::fs::write(copy.join("src/lib.rs"), "").expect("writable");
+    let real = workspace().canonicalize().unwrap();
+    library_on(&dir.join("a"), "a", &[("embsim-core", &real.join("core"))]);
+    library_on(&dir.join("b"), "b", &[("embsim-core", &copy)]);
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+    )
+    .expect("writable");
+    let resolved = Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--offline"])
+        .current_dir(&dir)
+        .output()
+        .expect("cargo runs");
+    assert!(!resolved.status.success(), "two copies resolved");
+    assert_says(
+        &stderr(&resolved),
+        &["links to the native library `embsim-core`"],
+    );
+}
+
+#[rstest]
 fn a_runner_spells_the_checkout_as_its_crates_do() {
     behaviour!(Test {
         id: "cli.runner-spelling",
         covers: Some("cli/src/runner.rs#one_embsim"),
-        given: "a catalog crate whose embsim dependency reaches the checkout the tool was \
-                built from through a symlink, checked with the `embsim` tool",
+        given: "a catalog crate whose embsim dependency reaches an embsim checkout through a \
+                symlink, checked with the `embsim` tool",
     });
     expect!(
         "spelled-alike",
@@ -917,7 +1264,7 @@ fn a_runner_spells_the_checkout_as_its_crates_do() {
     let link = dir.join("embsim-link");
     std::os::unix::fs::symlink(workspace().canonicalize().unwrap(), &link)
         .expect("the link can be made");
-    crate_on(&dir.join("rig"), &link.join("board"));
+    crate_on(&dir.join("rig"), &link);
     std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"rig\"]\n").expect("writable");
     let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
     assert!(!check.status.success(), "the stand-in Cargo builds nothing");
@@ -931,6 +1278,276 @@ fn a_runner_spells_the_checkout_as_its_crates_do() {
     assert_says(
         &stderr(&check),
         &[&format!("embsim at {})", link.display())],
+    );
+}
+
+#[rstest]
+#[case::kept(true)]
+#[case::first(false)]
+fn a_runners_lock_file_is_kept_beside_the_project(#[case] kept: bool) {
+    behaviour!(Test {
+        id: "cli.runner-lock",
+        covers: Some("cli/src/runner.rs#lock"),
+        given: "a project naming one catalog crate, checked with the `embsim` tool, with or \
+                without the runner's embsim.lock beside it",
+    });
+    expect!(
+        "locked-when-kept",
+        "with embsim.lock there, the runner's lock is that file and the build is --locked; \
+         without it, the build may lock afresh",
+        "a lock kept beside the project, which can be committed, builds the same runner on \
+         every machine"
+    );
+    let dir = outside(if kept { "lock_kept" } else { "lock_first" });
+    let (cargo, log) = logging_cargo_with(&dir, false);
+    crate_on(&dir.join("rig"), &workspace().canonicalize().unwrap());
+    std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"rig\"]\n").expect("writable");
+    // The runner is named after its crates alone, so the lock names the
+    // same runner on every machine: one built here says which.
+    let first = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!first.status.success(), "the stand-in Cargo builds nothing");
+    let package = runner_dir(&dir)
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .replace("runner-", "embsim-runner-");
+    let saved =
+        format!("version = 4\n\n[[package]]\nname = \"{package}\"\nversion = \"0.0.0\"\n# kept\n");
+    if kept {
+        std::fs::write(dir.join("embsim.lock"), &saved).expect("writable");
+    }
+    std::fs::remove_file(&log).expect("the log is there");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success(), "the stand-in Cargo builds nothing");
+    let locked = build_line(&log).iter().any(|word| word == "--locked");
+    assert_eq!(locked, kept, "{}", read(&log));
+    if kept {
+        assert_eq!(read(&runner_dir(&dir).join("Cargo.lock")), saved);
+    }
+}
+
+#[rstest]
+fn another_runners_lock_file_is_refused() {
+    behaviour!(Test {
+        id: "cli.runner-lock-other",
+        covers: Some("cli/src/runner.rs#lock"),
+        given: "a project beside an embsim.lock that locks the runner of other catalog crates",
+    });
+    expect!(
+        "refused",
+        "the tool refuses the project before it builds, naming the file and the runner it \
+         locks, and saying the projects in one directory share it"
+    );
+    let dir = outside("lock_other");
+    let (cargo, log) = logging_cargo_with(&dir, false);
+    crate_on(&dir.join("rig"), &workspace().canonicalize().unwrap());
+    std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"rig\"]\n").expect("writable");
+    std::fs::write(
+        dir.join("embsim.lock"),
+        "version = 4\n\n[[package]]\nname = \"embsim-runner-00000000\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("writable");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success());
+    assert_says(
+        &stderr(&check),
+        &[
+            "embsim.lock is the lock of another runner (embsim-runner-00000000",
+            "the projects in one directory that name catalog crates share its embsim.lock",
+        ],
+    );
+    assert!(
+        !read(&log).lines().any(|line| line.starts_with("build ")),
+        "nothing is built"
+    );
+}
+
+/// The project's own runner crate `name` in `dir`: a binary over the
+/// catalog crate at `catalog`, the embsim command from the checkout `root`.
+fn runner_on(dir: &Path, name: &str, catalog: (&str, &Path), root: &Path) {
+    std::fs::create_dir_all(dir.join("src")).expect("the directory can be made");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nembsim-cli = {{ path = {:?} }}\n{} = {{ path = {:?} }}\n",
+            root.join("cli").display().to_string(),
+            catalog.0,
+            catalog.1.display().to_string()
+        ),
+    )
+    .expect("the manifest is writable");
+    std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").expect("writable");
+}
+
+#[rstest]
+#[case::locked(true)]
+#[case::no_lock_yet(false)]
+fn the_projects_own_runner_is_built_in_its_workspace(#[case] lock: bool) {
+    behaviour!(Test {
+        id: "cli.own-runner-build",
+        covers: Some("cli/src/runner.rs#hand_over_own"),
+        given: "a project whose catalog table names its own runner crate, a member of the \
+                project's Cargo workspace with its catalog crate, checked with the `embsim` \
+                tool, with or without the workspace's Cargo.lock",
+    });
+    expect!(
+        "builds-the-crate",
+        "the tool builds the runner crate's one binary by its own manifest, in the target \
+         directory the workspace's Cargo settles, and writes no runner of its own",
+        "a project that owns its runner owns its lock file, target directory and profiles"
+    );
+    expect!(
+        "locked-with-the-workspace-lock",
+        "the build is --locked when the workspace has a Cargo.lock, and may lock afresh when \
+         it has none"
+    );
+    let dir = outside(if lock { "own_locked" } else { "own_unlocked" });
+    let (cargo, log) = logging_cargo_with(&dir, false);
+    let real = workspace().canonicalize().unwrap();
+    crate_on(&dir.join("sim/catalog"), &real);
+    runner_on(
+        &dir.join("sim/runner"),
+        "sim-runner",
+        ("rig-catalog", &dir.join("sim/catalog")),
+        &real,
+    );
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"sim/catalog\", \"sim/runner\"]\nresolver = \"2\"\n",
+    )
+    .expect("writable");
+    if lock {
+        std::fs::copy(real.join("Cargo.lock"), dir.join("Cargo.lock")).expect("the lock copies");
+    }
+    std::fs::write(
+        dir.join("p.toml"),
+        "[catalog]\ncrates = [\"sim/catalog\"]\nrunner = \"sim/runner\"\n",
+    )
+    .expect("writable");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success(), "the stand-in Cargo builds nothing");
+    assert_says(
+        &stderr(&check),
+        &["embsim: building the project's runner sim-runner for p.toml (rig-catalog)"],
+    );
+    let words = build_line(&log);
+    let manifest = dir.join("sim/runner/Cargo.toml");
+    assert!(
+        words.windows(2).any(|pair| pair[0] == "--manifest-path"
+            && Path::new(&pair[1]).canonicalize().ok() == manifest.canonicalize().ok()),
+        "{words:?}"
+    );
+    assert!(
+        words.windows(2).any(|pair| pair == ["--bin", "sim-runner"]),
+        "{words:?}"
+    );
+    assert!(
+        !words.iter().any(|word| word == "--target-dir"),
+        "{words:?}"
+    );
+    assert_eq!(
+        words.iter().any(|word| word == "--locked"),
+        lock,
+        "{words:?}"
+    );
+    assert!(
+        !dir.join(".embsim").exists(),
+        "the tool writes no runner of its own"
+    );
+}
+
+#[rstest]
+#[case::not_there("runner = \"sim/nowhere\"", "[catalog] runner = \"sim/nowhere\"")]
+#[case::no_binary("runner = \"sim/catalog\"", "the package rig-catalog has no binary")]
+fn a_runner_that_is_not_one_is_refused_saying_what_it_is(#[case] line: &str, #[case] says: &str) {
+    behaviour!(Test {
+        id: "cli.own-runner-refused",
+        covers: Some("cli/src/runner.rs#Cargo::own_runner"),
+        given: "a project whose catalog table names as its runner a directory that is not \
+                there, or a crate with no binary",
+    });
+    expect!(
+        "refused",
+        "the tool refuses it before any build, naming the runner as the file gives it and \
+         saying a runner is a binary crate over the catalog crates"
+    );
+    let dir = outside(&format!("own_refused_{}", line.len()));
+    let (cargo, log) = logging_cargo_with(&dir, false);
+    crate_on(
+        &dir.join("sim/catalog"),
+        &workspace().canonicalize().unwrap(),
+    );
+    std::fs::write(
+        dir.join("p.toml"),
+        format!("[catalog]\ncrates = [\"sim/catalog\"]\n{line}\n"),
+    )
+    .expect("writable");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success());
+    assert_says(&stderr(&check), &[says, "runner"]);
+    assert!(
+        !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("build ")),
+        "nothing is built"
+    );
+}
+
+#[rstest]
+#[case::check(&["check", "p.toml", "--a-flag-only-a-newer-embsim-has"])]
+#[case::survey(&["survey", "--project", "p.toml", "--a-flag-only-a-newer-embsim-has"])]
+fn a_command_line_this_tool_cannot_parse_is_handed_to_the_projects_runner(#[case] args: &[&str]) {
+    behaviour!(Test {
+        id: "cli.hand-over-unparsed",
+        covers: Some("cli/src/lib.rs#tool_main"),
+        given: "the `embsim` tool given a flag it does not know, for a project with catalog \
+                crates named after `check` or with --project",
+    });
+    expect!(
+        "handed-over",
+        "the tool goes on to the project's runner, which here refuses the missing crate the \
+         project names",
+        "a newer flag is the runner's embsim's to read: a project written for a newer embsim \
+         reaches its runner through an older tool"
+    );
+    let dir = outside(&format!("unparsed_{}", args[0]));
+    std::fs::write(
+        dir.join("p.toml"),
+        "[catalog]\ncrates = [\"sim/nowhere\"]\n",
+    )
+    .expect("writable");
+    let output = embsim_in(&dir, args, &[]);
+    assert!(!output.status.success());
+    let said = stderr(&output);
+    assert_says(&said, &["[catalog] crates: \"sim/nowhere\""]);
+    assert!(!said.contains("unexpected argument"), "{said}");
+}
+
+#[rstest]
+fn a_project_for_a_newer_embsim_says_so_when_its_line_does_not_parse() {
+    behaviour!(Test {
+        id: "cli.unparsed-newer-project",
+        covers: Some("cli/src/lib.rs#tool_main"),
+        given: "the `embsim` tool given a flag it does not know, for a project without catalog \
+                crates written for a later embsim release",
+    });
+    expect!(
+        "says-the-release",
+        "the tool refuses it saying the project is written for that release and this is \
+         another"
+    );
+    let dir = outside("unparsed_newer");
+    std::fs::write(dir.join("p.toml"), "requires-embsim = \"99.0\"\n").expect("writable");
+    let output = embsim_in(&dir, &["check", "p.toml", "--new-flag"], &[]);
+    assert!(!output.status.success());
+    assert_says(
+        &stderr(&output),
+        &[
+            "this project is written for embsim 99.0",
+            &format!("this is embsim {}", env!("CARGO_PKG_VERSION")),
+        ],
     );
 }
 
@@ -979,12 +1596,16 @@ fn example() -> (PathBuf, PathBuf) {
 fn the_example_project_checks_and_runs_through_the_tool_and_its_runner() {
     // examples/custom-project names its catalog crate in [catalog]. The real
     // `embsim` binary writes the runner beside it, builds it in the
-    // workspace's target directory (the crate is a workspace member) and
-    // execs it for `check` and for `run`: the run prints what the crate's
-    // core, part and instrument did. A second build with nothing changed
-    // is quiet; `--rebuild` compiles the crate again.
+    // workspace's target directory (the crate is a workspace member),
+    // --locked against the embsim.lock the example commits, and execs it
+    // for `check` and for `run`: the run prints what the crate's core, part
+    // and instrument did, and what the runner is made of. A second build
+    // with nothing changed is quiet; `--rebuild` compiles the crate again
+    // and keeps the lock.
     let (project, dir) = example();
     let project = project.to_str().expect("text");
+    let lock = dir.join("embsim.lock");
+    let committed = std::fs::read_to_string(&lock).ok();
     let check = embsim_in(&dir, &["check", project], &[]);
     assert!(
         check.status.success(),
@@ -999,7 +1620,20 @@ fn the_example_project_checks_and_runs_through_the_tool_and_its_runner() {
             "(custom-project-catalog, embsim at",
         ],
     );
-    assert_says(&stdout(&check), &[EXAMPLE_RUN[0], "ok: "]);
+    assert_says(
+        &stdout(&check),
+        &[
+            EXAMPLE_RUN[0],
+            "catalog crate custom-project-catalog 0.1.0: ",
+            ", git rev ",
+            "ok: ",
+        ],
+    );
+    match &committed {
+        // Built --locked against it: the file is as it was.
+        Some(text) => assert_eq!(&read(&lock), text),
+        None => assert_says(&stderr(&check), &["embsim: wrote", "embsim.lock"]),
+    }
     assert_eq!(
         read(&dir.join(".embsim/.gitignore")).lines().last(),
         Some("*")
@@ -1018,9 +1652,11 @@ fn the_example_project_checks_and_runs_through_the_tool_and_its_runner() {
         stderr(&run)
     );
 
+    let kept = read(&lock);
     let rebuilt = embsim_in(&dir, &["check", "--rebuild", project], &[]);
     assert!(rebuilt.status.success(), "{}", stderr(&rebuilt));
     assert_says(&stderr(&rebuilt), &["Compiling custom-project-catalog"]);
+    assert_eq!(read(&lock), kept, "--rebuild keeps the lock");
 }
 
 #[rstest]
@@ -1094,6 +1730,124 @@ volts = 0.0
             "SRC: drove OUT at 2.5 V behind 100 Ω from 0.500000 ms",
         ],
     );
+    // The first build kept its lock beside the project; the next builds
+    // --locked against it, and says nothing of it.
+    assert_says(&stderr(&run), &["embsim: wrote", "embsim.lock"]);
+    let lock = read(&dir.join("embsim.lock"));
+    let again = embsim_in(
+        &dir,
+        &["check", "rig.toml"],
+        &[("CARGO_TARGET_DIR", target)],
+    );
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert!(
+        !stderr(&again).contains("embsim: wrote"),
+        "{}",
+        stderr(&again)
+    );
+    assert_eq!(read(&dir.join("embsim.lock")), lock);
+}
+
+#[rstest]
+#[ignore = "builds a runner with Cargo; CI's project-runner job runs it (--ignored)"]
+fn the_projects_own_runner_builds_in_its_workspace_and_runs() {
+    // A Cargo workspace of the project's own, as MaD's SIL is: `embsim new
+    // <netlist> --catalog sim/catalog --own-runner` writes the catalog crate
+    // and the runner crate, members of it, and names the runner in the
+    // project. The tool builds the runner by its own manifest, writes the
+    // workspace's Cargo.lock the first time and says to commit it, runs
+    // the project's kinds through it, and says what the runner is made of.
+    let dir = scratch("own_runner_built");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"sim/catalog\", \"sim/runner\"]\nresolver = \"2\"\n",
+    )
+    .expect("writable");
+    std::fs::copy(
+        workspace().join("boards/projects/header.net"),
+        dir.join("header.net"),
+    )
+    .expect("the netlist copies");
+    let new = embsim_in(
+        &dir,
+        &[
+            "new",
+            "header.net",
+            "-o",
+            "rig.toml",
+            "--catalog",
+            "sim/catalog",
+            "--own-runner",
+        ],
+        &[],
+    );
+    assert!(new.status.success(), "{}", stderr(&new));
+    let mut text = read(&dir.join("rig.toml"));
+    text.push_str(
+        r#"
+[[board]]
+name = "BRD"
+kind = "sim-board"
+
+[[board.model]]
+value = "SIM-SENSOR"
+kind = "sim-sensor"
+
+[[component]]
+name = "SRC"
+kind = "sim-source"
+[component.options]
+volts = 2.5
+ohms = 100.0
+at = "0.5ms"
+
+[[wire]]
+from = "SRC.OUT"
+to = "BRD.J1.1"
+
+[[wire]]
+from = "BENCH.GND"
+to = "BRD.J1.2"
+volts = 0.0
+"#,
+    );
+    std::fs::write(dir.join("rig.toml"), text).expect("writable");
+    let target = target_dir();
+    let target = target.to_str().expect("text");
+    let run = embsim_in(
+        &dir,
+        &["run", "rig.toml", "--for", "1ms"],
+        &[("CARGO_TARGET_DIR", target)],
+    );
+    assert!(run.status.success(), "{}\n{}", stderr(&run), stdout(&run));
+    assert_says(
+        &stderr(&run),
+        &[
+            "embsim: building the project's runner sim-runner for rig.toml (sim-catalog)",
+            "Cargo.lock: commit it",
+        ],
+    );
+    assert_says(
+        &stdout(&run),
+        &[
+            "catalogs: embsim-boards, embsim-p2-qemu, sim-catalog",
+            "runner crate sim-runner 0.1.0: ",
+            "catalog crate sim-catalog 0.1.0: ",
+            "BRD.U1: pin 1 read 2.5 V from 0.500000 ms",
+        ],
+    );
+    assert!(dir.join("Cargo.lock").exists());
+    assert!(
+        !dir.join(".embsim").exists(),
+        "the tool writes no runner of its own"
+    );
+    let again = embsim_in(
+        &dir,
+        &["check", "rig.toml"],
+        &[("CARGO_TARGET_DIR", target)],
+    );
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert!(!stderr(&again).contains("commit it"), "{}", stderr(&again));
 }
 
 #[rstest]

@@ -9,7 +9,9 @@ node. This document is the plan for replacing it with what every embsim
 project has: a catalog crate of MaD's own kinds, a project file, and the
 `embsim` command ([`PROJECTS.md`](PROJECTS.md) §10).
 
-*Status, 2026-10-01. A plan: nothing in MaD has changed. It was checked
+*Status, 2026-10-02, against embsim 0.2.0 (the runner MaD owns, and the
+embsim it holds through the submodule, are 2026-10-02's; `NODES.md` §13,
+"Packaging for the release"). A plan: nothing in MaD has changed. It was checked
 against embsim's `feat/embsim-catalogs` and against MaD's working tree on
 2026-10-01: branch `feat/iss-rom-serial-flash` at `a2b20efe2` with changes
 no commit holds yet (`SIL/MaDSim/src/main.rs`, `iss_description.rs` and
@@ -31,7 +33,8 @@ its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
 
 | Today (`mad-emulator`) | After |
 |---|---|
-| `SIL/MaDSim`, 1 078 lines of assembly, flags, clock set-up, signals and telemetry (`main.rs`, `iss_description.rs` and `system_description.rs`, as step 0 lands them) | `SIL/mad-catalog`: four kinds and their tests. The command, its checks and its report are embsim's |
+| `SIL/MaDSim`, 1 078 lines of assembly, flags, clock set-up, signals and telemetry (`main.rs`, `iss_description.rs` and `system_description.rs`, as step 0 lands them) | `SIL/mad-catalog`: four kinds and their tests; `SIL/mad-runner`: ten lines, the embsim command over them. The command, its checks and its report are embsim's |
+| `mad-emulator` built against whatever `SIL/embsim` holds | the runner a member of MaD's SIL workspace, built `--locked` against the committed `SIL/Cargo.lock`, embsim a path dependency through the `SIL/embsim` submodule: the pinned commit is the embsim every machine builds |
 | `P2Iss` on no board, declaring the pins its lists name | `p2iss`'s core in the P2-EC32MB's package (`core = "mad-p2iss"`), all 64 pads on the module's nets |
 | the firmware image put straight into hub RAM | the ROM booting stage-1 and the firmware off the module's flash, as the chip does |
 | the DS2 built from `MaDSim/boards/ds2_addon.net`, its converter pre-configured | the `mad-ds2` board, its converter configured by the firmware's own register writes |
@@ -65,10 +68,13 @@ project crate does not fork a model.
 
 ## 3. The catalog crate, `SIL/mad-catalog`
 
-A member of MaD's SIL workspace. `embsim new --catalog mad-catalog`, run in
-`SIL/`, starts it with the name `mad-catalog` and every example kind named
-`mad-…`; its embsim dependencies reach `SIL/embsim`, the checkout the tool
-is built from.
+A member of MaD's SIL workspace. `embsim new --catalog mad-catalog
+--own-runner`, run in `SIL/` with the tool built from the submodule (step
+5), starts it with the name `mad-catalog` and every example kind named
+`mad-…`, and starts the runner beside it (below). Its embsim dependencies
+are paths into `SIL/embsim`: the tool's own checkout sits inside MaD's
+repository, so `new` writes paths, not a git source (`PROJECTS.md` §10,
+"The catalog crate").
 
 ```text
 SIL/mad-catalog/
@@ -98,7 +104,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-# One copy of embsim: the checkout the `embsim` tool is built from.
+# One copy of embsim: the pinned submodule, by path. The runner takes
+# embsim-cli from the same checkout, and SIL/Cargo.lock locks the rest.
 embsim-board = { path = "../embsim/board" }
 embsim-boards = { path = "../embsim/boards" }
 embsim-core = { path = "../embsim/core" }
@@ -112,6 +119,44 @@ p2iss = { path = "../p2iss" }
 embsim-cli = { path = "../embsim/cli" }
 rstest.workspace = true
 vibes-behaviour = { path = "../../Vibes/bindings/rust" }
+```
+
+### The runner, `SIL/mad-runner`
+
+MaD owns its runner: a binary crate in the SIL workspace, which `embsim
+new --catalog mad-catalog --own-runner` writes and names in the project's
+`[catalog] runner` (`PROJECTS.md` §10, "A runner the project owns"). The
+`embsim` tool builds it with Cargo against `SIL/Cargo.lock`, `--locked`, in
+`SIL/target`, and runs the project through it; `cargo run -p mad-runner --
+check mad.toml` is the same without the tool.
+
+```toml
+[package]
+name = "mad-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mad-runner"
+path = "src/main.rs"
+
+[dependencies]
+# The same embsim as the catalog crate's: one copy of embsim in the runner.
+embsim-cli = { path = "../embsim/cli" }
+mad-catalog = { path = "../mad-catalog" }
+```
+
+```rust,ignore
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    embsim_cli::runner_main(&[embsim_cli::CatalogCrate::new(
+        "mad-catalog",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../mad-catalog"),
+        mad_catalog::register,
+    )])
+}
 ```
 
 ### `src/lib.rs`
@@ -267,8 +312,11 @@ harness was checked against `mad_edge.net` (the nets of `J4`, `J9`–`J16`,
 # force-gauge add-on on the force cable, the machine on the carrier's
 # connectors, and the Raspberry Pi's serial port as a PTY.
 
+requires-embsim = "0.2"
+
 [catalog]
 crates = ["mad-catalog"]
+runner = "mad-runner"
 
 [[board]]
 name = "EDGE"
@@ -572,10 +620,11 @@ Commit them, or merge the branch, before step 1, and record that commit
 here. *Files:* the ones the status note lists. *Done when:* MaD's CI is
 green on the commit, and each symbol this plan cites is in it.
 
-**1. Pin the submodule.** Bump `SIL/embsim` to a commit with
-`feat/embsim-catalogs` merged (MaD's CI gates embsim pin bumps).
-*Files:* the `SIL/embsim` gitlink. *Done when:* MaD's CI is green on the
-bump, with `mad-emulator` unchanged.
+**1. Pin the submodule.** Bump `SIL/embsim` to embsim 0.2.0, the release
+with `feat/embsim-catalogs` merged (MaD's CI gates embsim pin bumps).
+*Files:* the `SIL/embsim` gitlink, `SIL/Cargo.lock` (embsim's crates at
+0.2.0). *Done when:* MaD's CI is green on the bump, with `mad-emulator`
+unchanged.
 
 **2. `p2iss` gets a core.** A `P2IssCore` beside today's `P2Iss`, sharing
 its machine, implementing `embsim_boards::p2::P2Core`:
@@ -628,29 +677,37 @@ its fingers, the two image entries of `mad.toml`) passes `embsim check`;
 the card entry was checked this way with a stand-in image. E5 retires both
 targets.
 
-**5. The tool.** The makefile runs `embsim` from the pinned submodule, so
-the runner it builds takes embsim from the same checkout as
-`mad-catalog`'s path dependencies:
+**5. The tool.** The makefile runs `embsim` from the pinned submodule.
+Which embsim the project runs on is the runner's, `mad-runner`, whose
+`embsim-cli` is the submodule by path and whose lock is `SIL/Cargo.lock`,
+whatever tool starts it; running the tool from the same commit keeps its
+own checks (the head it reads first, the hand-over) that commit's too:
 
 ```make
-# The embsim tool, built from the pinned submodule (PROJECTS.md §10, "Which
-# embsim the runner builds against"). EMBSIM=embsim uses an installed one.
+# The embsim tool, built from the pinned submodule; it builds and runs
+# mad-runner, which holds MaD's kinds (PROJECTS.md §10, "A runner the
+# project owns"). EMBSIM=embsim uses an installed one.
 EMBSIM ?= cargo run --release --quiet --manifest-path embsim/Cargo.toml -p embsim-cli --
 ```
 
-A developer may `cargo install --path SIL/embsim/cli` instead; it records
-that checkout too. *Files:* `SIL/makefile`. *Done when:* `make check` (step
-9) runs through it.
+A developer may `cargo install --locked --path SIL/embsim/cli` instead, or
+use any installed embsim 0.2: either hands MaD's projects to
+`mad-runner`. *Files:* `SIL/makefile`. *Done when:* `make check` (step 9)
+runs through it.
 
-**6. Start the crate.** In `SIL/`: `embsim new --catalog mad-catalog`
-writes `mad-catalog/Cargo.toml` and `src/lib.rs` with one example of each
-sort of kind, named `mad-board`, `mad-sensor`, `mad-core` and
-`mad-source`. Keep the registration function; replace the four examples
-with section 3's kinds as the steps below write them. *Files:*
-`SIL/mad-catalog/` (new), `SIL/Cargo.toml` (`members` gains
-`"mad-catalog"`), `.github/workflows/ci.yml` (the `rustfmt (gating)`
-step's `cargo fmt -p mad-emulator -p models` gains `-p mad-catalog`). *Done when:* `cargo test -p mad-catalog` passes in MaD's
-workspace.
+**6. Start the crates.** In `SIL/`: `embsim new --catalog mad-catalog
+--own-runner` writes `mad-catalog/Cargo.toml` and `src/lib.rs` with one
+example of each sort of kind, named `mad-board`, `mad-sensor`, `mad-core`
+and `mad-source`, and `mad-runner/` (section 3), and says to add both to
+the workspace's members. Keep the registration function; replace the four
+examples with section 3's kinds as the steps below write them. *Files:*
+`SIL/mad-catalog/` and `SIL/mad-runner/` (new), `SIL/Cargo.toml`
+(`members` gains `"mad-catalog"` and `"mad-runner"`), `SIL/Cargo.lock`
+(the two crates locked; commit it), `.github/workflows/ci.yml` (the
+`rustfmt (gating)` step's `cargo fmt -p mad-emulator -p models` gains `-p
+mad-catalog -p mad-runner`). *Done when:* `cargo test -p mad-catalog`
+passes in MaD's workspace, and `cargo build --locked -p mad-runner`
+builds.
 
 **7. The boards.** `mad-edge` and `mad-ds2` (section 3). Export
 `mad_edge.net` with `kicad-cli sch export netlist` and give it the

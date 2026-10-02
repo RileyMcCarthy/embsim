@@ -7,7 +7,7 @@
 //! answers each kind from the catalog that provides it.
 //!
 //! ```
-//! use embsim_board::{Catalog, ComponentRequest, Component, ProjectError};
+//! use embsim_board::{Catalog, ComponentRequest, Component, KindInfo, ProjectError};
 //! use embsim_boards::catalog::CatalogSet;
 //!
 //! /// A catalog of one bench component kind.
@@ -17,8 +17,8 @@
 //!     fn name(&self) -> &str {
 //!         "bench-catalog"
 //!     }
-//!     fn component_kinds(&self) -> Vec<String> {
-//!         vec!["bench-lamp".to_string()]
+//!     fn component_kinds(&self) -> Vec<KindInfo> {
+//!         vec![KindInfo::new("bench-lamp", "a lamp on the bench")]
 //!     }
 //!     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
 //!         Err(request.error("this example builds no lamp"))
@@ -28,7 +28,7 @@
 //! let mut set = CatalogSet::new();
 //! set.add(Bench).expect("its kind is spelled as a kind is");
 //! assert_eq!(set.catalogs(), ["embsim-boards", "bench-catalog"]);
-//! assert!(set.component_kinds().contains(&"bench-lamp".to_string()));
+//! assert!(set.component_kinds().iter().any(|kind| kind.name == "bench-lamp"));
 //! ```
 //!
 //! # Names
@@ -51,23 +51,38 @@
 //! digits and hyphens), `netlist` (the board kind every project has), a
 //! name one catalog provides twice, and a second catalog under a name the
 //! set already holds.
+//!
+//! # What a set adds to a kind's description
+//!
+//! The set treats every catalog's kinds alike; no kind is special to it.
+//! An option a kind declares as one of the set's core kinds
+//! ([`embsim_board::OptionValues::CoreKind`], the `p2` package's `core`)
+//! is described with every core the set holds, and a kind that needs the
+//! set itself reads it through the assignment it is registered with
+//! (`Assignment::catalog`, [`Catalog::as_any`]): that is how the `p2`
+//! package finds the cores ([`CatalogSet::core_catalogs`]).
 
 use std::collections::BTreeMap;
 
 use embsim_board::{
-    Assignment, BoardSpec, Catalog, CatalogBoard, Component, ComponentRequest, KindGuide,
-    PartOptions, PartRegistry, ProjectError,
+    Assignment, BoardSpec, Catalog, CatalogBoard, Component, ComponentRequest, KindGuide, KindInfo,
+    OptionValues, PartOptions, PartRegistry, ProjectError,
 };
 
 use crate::catalog::StandardCatalog;
-use crate::p2::{self, core_option_means, CoreCatalog, CoreKind, HeldInResetCores};
+use crate::p2::{core_kinds_listed, CoreCatalog, HeldInResetCores};
 
-/// One catalog's kinds, by sort.
+/// One catalog's kinds, by sort, as it described them when it joined.
 #[derive(Debug, Default)]
 struct Kinds {
-    boards: Vec<String>,
+    boards: Vec<KindInfo>,
     parts: Vec<String>,
-    components: Vec<String>,
+    components: Vec<KindInfo>,
+}
+
+/// The names of `kinds`.
+fn names(kinds: &[KindInfo]) -> impl Iterator<Item = &str> {
+    kinds.iter().map(|kind| kind.name.as_ref())
 }
 
 /// Catalogs composed into one (module docs).
@@ -130,20 +145,15 @@ impl CatalogSet {
             boards: catalog.board_kinds(),
             parts: catalog
                 .part_kinds()
-                .into_iter()
-                .map(|kind| kind.name.to_string())
+                .iter()
+                .map(|kind| kind.name().to_string())
                 .collect(),
             components: catalog.component_kinds(),
         };
         let mut kinds: Vec<(&'static str, String)> = Vec::new();
-        kinds.extend(found.boards.iter().map(|kind| ("board", kind.clone())));
+        kinds.extend(names(&found.boards).map(|kind| ("board", kind.to_string())));
         kinds.extend(found.parts.iter().map(|kind| ("part", kind.clone())));
-        kinds.extend(
-            found
-                .components
-                .iter()
-                .map(|kind| ("component", kind.clone())),
-        );
+        kinds.extend(names(&found.components).map(|kind| ("component", kind.to_string())));
         self.admit(&name, &kinds)?;
         let mut scratch = PartRegistry::new();
         catalog.register_base(&mut scratch);
@@ -162,7 +172,7 @@ impl CatalogSet {
         let kinds: Vec<(&'static str, String)> = cores
             .core_kinds()
             .into_iter()
-            .map(|kind| ("core", kind.name.to_string()))
+            .map(|kind| ("core", kind.name.into_owned()))
             .collect();
         // A core catalog may share its name with the catalog it ships beside
         // (the standard catalog and its `held-in-reset`): one crate, one name.
@@ -252,11 +262,18 @@ impl CatalogSet {
     }
 
     /// Every P2 core kind the set holds, in the order they were added.
-    pub fn core_kinds(&self) -> Vec<CoreKind> {
+    pub fn core_kinds(&self) -> Vec<KindInfo> {
         self.cores
             .iter()
             .flat_map(|catalog| catalog.core_kinds())
             .collect()
+    }
+
+    /// The P2 core catalogs the set holds, in the order they were added
+    /// (the standard catalog's `held-in-reset` first): what a package kind
+    /// seats its core from (`embsim_boards::p2::register_p2`).
+    pub fn core_catalogs(&self) -> Vec<&dyn CoreCatalog> {
+        self.cores.iter().map(|catalog| catalog.as_ref()).collect()
     }
 
     /// Every part kind, as someone choosing one reads it: the guides of
@@ -266,33 +283,38 @@ impl CatalogSet {
         self.part_kinds()
     }
 
-    fn cores(&self) -> Vec<&dyn CoreCatalog> {
-        self.cores.iter().map(|catalog| catalog.as_ref()).collect()
-    }
-
-    /// The first catalog whose kinds `of` picks `kind` from, and its index
-    /// (0 is the standard catalog).
-    fn provider(
-        &self,
-        kind: &str,
-        of: impl Fn(&Kinds) -> &Vec<String>,
-    ) -> Option<(usize, &dyn Catalog)> {
+    /// The first catalog whose kinds `has` says provide `kind`.
+    fn provider(&self, has: impl Fn(&Kinds) -> bool) -> Option<&dyn Catalog> {
         self.kinds
             .iter()
-            .position(|kinds| of(kinds).iter().any(|name| name == kind))
-            .map(|index| (index, self.catalogs[index].as_ref()))
+            .position(has)
+            .map(|index| self.catalogs[index].as_ref())
+    }
+
+    /// `option` as the set describes it: an option taking one of the set's
+    /// core kinds names each of them after what it means.
+    fn described(&self, mut option: embsim_board::RequiredOption) -> embsim_board::RequiredOption {
+        if option.values == OptionValues::CoreKind {
+            option.means = format!(
+                "{}: {}",
+                option.means,
+                core_kinds_listed(&self.core_kinds())
+            )
+            .into();
+        }
+        option
     }
 }
 
-/// The names in `lists`, each once, in the order they first appear.
-fn union(lists: impl Iterator<Item = Vec<String>>) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for name in lists.flatten() {
-        if !names.contains(&name) {
-            names.push(name);
+/// The kinds in `lists`, each name once, in the order they first appear.
+fn union(lists: impl Iterator<Item = Vec<KindInfo>>) -> Vec<KindInfo> {
+    let mut kinds: Vec<KindInfo> = Vec::new();
+    for kind in lists.flatten() {
+        if !kinds.iter().any(|known| known.name == kind.name) {
+            kinds.push(kind);
         }
     }
-    names
+    kinds
 }
 
 impl Catalog for CatalogSet {
@@ -300,13 +322,13 @@ impl Catalog for CatalogSet {
         "the catalog set"
     }
 
-    fn board_kinds(&self) -> Vec<String> {
+    fn board_kinds(&self) -> Vec<KindInfo> {
         union(self.kinds.iter().map(|kinds| kinds.boards.clone()))
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
-        match self.provider(&spec.kind, |kinds| &kinds.boards) {
-            Some((_, catalog)) => catalog.board(spec),
+        match self.provider(|kinds| names(&kinds.boards).any(|name| name == spec.kind)) {
+            Some(catalog) => catalog.board(spec),
             None => Err(ProjectError::message(format!(
                 "board {}: no catalog in the set has board kind {:?}",
                 spec.name, spec.kind
@@ -321,20 +343,17 @@ impl Catalog for CatalogSet {
     }
 
     fn part_kinds(&self) -> Vec<KindGuide> {
-        let means = core_option_means(&self.cores());
-        let mut guides: Vec<KindGuide> = Vec::new();
-        for (index, catalog) in self.catalogs.iter().enumerate() {
-            for mut guide in catalog.part_kinds() {
-                // The package's core is every core the set holds.
-                if index == 0 && guide.name == "p2" {
-                    for option in guide.required.iter_mut().filter(|o| o.name == "core") {
-                        option.means.clone_from(&means);
-                    }
-                }
-                guides.push(guide);
-            }
-        }
-        guides
+        self.catalogs
+            .iter()
+            .flat_map(|catalog| catalog.part_kinds())
+            .map(|mut guide| {
+                guide.info.required = std::mem::take(&mut guide.info.required)
+                    .into_iter()
+                    .map(|option| self.described(option))
+                    .collect();
+                guide
+            })
+            .collect()
     }
 
     fn register_part(
@@ -343,26 +362,20 @@ impl Catalog for CatalogSet {
         assignment: &Assignment<'_>,
         options: PartOptions,
     ) -> Result<(), ProjectError> {
-        match self.provider(assignment.kind, |kinds| &kinds.parts) {
-            // The standard catalog's package, around every core the set
-            // holds.
-            Some((0, _)) if assignment.kind == "p2" => {
-                p2::register_p2(registry, assignment, options, &self.cores(), &|name| {
-                    self.kind_clash(name)
-                })
-            }
-            Some((_, catalog)) => catalog.register_part(registry, assignment, options),
+        match self.provider(|kinds| kinds.parts.iter().any(|name| name == assignment.kind)) {
+            Some(catalog) => catalog.register_part(registry, assignment, options),
             None => Err(assignment.error("no catalog in the set has this part kind")),
         }
     }
 
-    fn component_kinds(&self) -> Vec<String> {
+    fn component_kinds(&self) -> Vec<KindInfo> {
         union(self.kinds.iter().map(|kinds| kinds.components.clone()))
     }
 
     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
-        match self.provider(&request.spec.kind, |kinds| &kinds.components) {
-            Some((_, catalog)) => catalog.component(request),
+        match self.provider(|kinds| names(&kinds.components).any(|name| name == request.spec.kind))
+        {
+            Some(catalog) => catalog.component(request),
             None => Err(request.error("no catalog in the set has this component kind")),
         }
     }
@@ -379,5 +392,9 @@ impl Catalog for CatalogSet {
             Some(providers) if providers.len() >= 2 => providers.clone(),
             _ => Vec::new(),
         }
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }

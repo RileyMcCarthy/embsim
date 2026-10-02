@@ -93,7 +93,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::kind::KindGuide;
+use crate::kind::{KindGuide, KindInfo};
 use crate::netlist::{self, ComponentDecl, ParsedNetlist};
 use crate::registry::{normalize_part, Classification};
 use crate::report::Reports;
@@ -106,7 +106,12 @@ use crate::{Board, Component, EndpointRef, Harness, JumperState, PartRegistry, S
 
 /// A catalog board kind's source: its netlist, the registry it builds with,
 /// and the `[[board.model]]` entries it brings for its own parts.
+///
+/// Non-exhaustive, as every struct a catalog fills in: build one with
+/// [`Self::from_base`] or [`Self::with_registry`], so a field added later
+/// breaks no catalog.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CatalogBoard {
     /// The netlist.
     pub netlist: ParsedNetlist,
@@ -134,6 +139,16 @@ impl CatalogBoard {
         }
     }
 
+    /// A board from `netlist` that builds with `registry`, a registry the
+    /// catalog built itself, and brings no entries of its own.
+    pub fn with_registry(netlist: ParsedNetlist, registry: PartRegistry) -> Self {
+        Self {
+            netlist,
+            registry: Some(registry),
+            models: Vec::new(),
+        }
+    }
+
     /// The same board with `model` among its own entries.
     #[must_use]
     pub fn with_model(mut self, model: ModelSpec) -> Self {
@@ -147,9 +162,12 @@ impl CatalogBoard {
 ///
 /// A catalog provides only what it says: every method but [`Self::name`]
 /// has a default that provides nothing, so a catalog writes the methods for
-/// the kinds it has. Catalogs compose in a set
+/// the kinds it has, and a method added later breaks no catalog. Every
+/// sort of kind describes itself the same way ([`KindInfo`]; a part kind's
+/// [`KindGuide`] holds one). Catalogs compose in a set
 /// (`embsim_boards::catalog::CatalogSet`), which is itself a catalog: it
-/// answers each kind from whichever catalog provides it.
+/// answers each kind from whichever catalog provides it, and a kind reads
+/// the set it is registered through as [`Assignment::catalog`].
 pub trait Catalog {
     /// The catalog's name, as an error that names two catalogs prints it:
     /// its crate's name (`"embsim-boards"`, `"custom-project-catalog"`).
@@ -157,7 +175,7 @@ pub trait Catalog {
 
     /// The board kinds this catalog provides, besides `"netlist"`, which
     /// every project can name and no catalog provides.
-    fn board_kinds(&self) -> Vec<String> {
+    fn board_kinds(&self) -> Vec<KindInfo> {
         Vec::new()
     }
 
@@ -209,7 +227,7 @@ pub trait Catalog {
     }
 
     /// The bench component kinds a `[[component]]` may name.
-    fn component_kinds(&self) -> Vec<String> {
+    fn component_kinds(&self) -> Vec<KindInfo> {
         Vec::new()
     }
 
@@ -240,6 +258,14 @@ pub trait Catalog {
     /// naming them, unless an entry assigns that key a kind itself.
     fn base_key_clash(&self, _key: &str) -> Vec<String> {
         Vec::new()
+    }
+
+    /// This catalog as [`std::any::Any`], for a kind that reads a catalog
+    /// it knows the type of through [`Assignment::catalog`]: a set answers
+    /// with itself, so the `p2` kind finds the set's P2 cores. `None` by
+    /// default.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
     }
 }
 
@@ -276,7 +302,10 @@ impl fmt::Display for KeyField {
 }
 
 /// One `[[board.model]]` as a catalog registers it.
-#[derive(Debug)]
+///
+/// Non-exhaustive: a project makes one ([`Self::new`] for a test of a kind
+/// outside a project), so a field added later breaks no catalog.
+#[non_exhaustive]
 pub struct Assignment<'a> {
     /// The board's name in the project.
     pub board: &'a str,
@@ -300,6 +329,63 @@ pub struct Assignment<'a> {
     /// ([`Report`](crate::Report)): a constructor clones it and adds its
     /// report when it builds the part, never when the kind registers.
     pub reports: &'a Reports,
+    /// The catalog the project is built with — for a set of catalogs, the
+    /// whole set — whichever catalog provides this kind: what a kind reads
+    /// beyond its own ([`Catalog::kind_clash`], or the set itself through
+    /// [`Catalog::as_any`]).
+    pub catalog: &'a dyn Catalog,
+}
+
+impl fmt::Debug for Assignment<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Assignment")
+            .field("board", &self.board)
+            .field("by", &self.by)
+            .field("key", &self.key)
+            .field("kind", &self.kind)
+            .field("parts", &self.parts.len())
+            .field("dir", &self.dir)
+            .field("catalog", &self.catalog.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> Assignment<'a> {
+    /// The entry `by = key` naming the kind `kind` on the board `board`,
+    /// reaching `parts` of `netlist`, as a project makes one: its paths
+    /// relative to the current directory ([`Self::in_dir`] for another),
+    /// reports to `reports`, through `catalog`. For a test of a kind outside
+    /// a project.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        board: &'a str,
+        by: KeyField,
+        key: &'a str,
+        kind: &'a str,
+        parts: &'a [&'a ComponentDecl],
+        netlist: &'a ParsedNetlist,
+        reports: &'a Reports,
+        catalog: &'a dyn Catalog,
+    ) -> Self {
+        Self {
+            board,
+            by,
+            key,
+            kind,
+            parts,
+            dir: Path::new("."),
+            netlist,
+            reports,
+            catalog,
+        }
+    }
+
+    /// The same entry, its paths relative to `dir`.
+    #[must_use]
+    pub fn in_dir(mut self, dir: &'a Path) -> Self {
+        self.dir = dir;
+        self
+    }
 }
 
 impl Assignment<'_> {
@@ -412,11 +498,11 @@ impl PartOptions {
 
     /// Take the option `name`, which must be one of `choices`; `None` when
     /// it is not given.
-    pub fn choice(
+    pub fn choice<'c>(
         &mut self,
         name: &'static str,
-        choices: &[&'static str],
-    ) -> Result<Option<&'static str>, ProjectError> {
+        choices: &[&'c str],
+    ) -> Result<Option<&'c str>, ProjectError> {
         let Some(text) = self.string(name)? else {
             return Ok(None);
         };
@@ -568,8 +654,11 @@ pub struct BoardSpec {
 
 /// One `[[board.model]]`: the part kind for every part whose part name,
 /// manufacturer part number or value — exactly one of them — is the key.
+/// Non-exhaustive: a board kind builds its own with [`Self::by_part`],
+/// [`Self::by_mpn`] or [`Self::by_value`] and [`Self::option`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ModelSpec {
     /// Match by the libsource part name.
     #[serde(default)]
@@ -647,8 +736,10 @@ pub struct ComponentSpec {
     pub options: toml::Table,
 }
 
-/// One `[[component]]` as a catalog builds it.
+/// One `[[component]]` as a catalog builds it. Non-exhaustive: a project
+/// makes one, so a field added later breaks no catalog.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ComponentRequest<'a> {
     /// The entry: its name and kind.
     pub spec: &'a ComponentSpec,
@@ -761,61 +852,112 @@ pub struct PinShortSpec {
     pub b: String,
 }
 
+/// The embsim release this crate is part of (`Cargo.toml`'s version): what
+/// a project's `requires-embsim` is held to.
+pub const EMBSIM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// `[catalog]`: the project's own catalog crates, which the `embsim` tool
 /// builds into a runner and runs the project through (`PROJECTS.md` §10,
 /// "The runner"). A project without it runs on the catalogs embsim ships.
 ///
-/// The table says where the crates are, and nothing about what they hold:
-/// the kinds they add are named in the rest of the file like any other.
+/// The table says where the crates are, and which runner holds them,
+/// nothing about what they hold: the kinds they add are named in the rest
+/// of the file like any other. Which embsim the runner builds against is
+/// not here: it is the catalog crates' own embsim dependency, in the
+/// project's own Cargo files. Non-exhaustive: a key may be added.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CatalogTable {
     /// The catalog crates, each a directory holding a `Cargo.toml`,
     /// relative to the project file. Their registration functions run in
     /// this order, after the catalogs embsim ships.
     pub crates: Vec<String>,
-    /// The embsim checkout (its workspace root, relative to the project
-    /// file) the runner builds embsim from; by default the checkout the
-    /// `embsim` tool was built from.
+    /// The project's own runner: a binary crate in the project's own Cargo
+    /// workspace, relative to the project file, whose `main` is
+    /// `embsim_cli::runner_main` over the crates. The tool builds it with
+    /// the workspace's lock file and runs it. Without it, the tool writes a
+    /// runner of its own beside the project.
     #[serde(default)]
-    pub embsim: Option<String>,
+    pub runner: Option<String>,
+    /// Whether the file gives the retired `embsim` key: read by the lenient
+    /// pass every parse starts with, which says what replaced it.
+    #[serde(skip)]
+    retired_embsim: bool,
+}
+
+/// `true` for a key the file gives, whatever its value.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+}
+
+/// The `[catalog]` table as a tool reads it before it reads the rest of a
+/// project: the keys this embsim knows, every other passed over, so a
+/// project written for a newer embsim still reaches its runner.
+#[derive(Deserialize)]
+struct LenientCatalog {
+    #[serde(default)]
+    crates: Vec<String>,
+    #[serde(default)]
+    runner: Option<String>,
+    /// An older key, refused with what replaced it.
+    #[serde(default, rename = "embsim", deserialize_with = "present")]
+    retired_embsim: bool,
+}
+
+/// What every embsim reads of a project before anything else, leniently: a
+/// key it does not know is passed over unread.
+#[derive(Deserialize)]
+struct LenientHead {
+    #[serde(default, rename = "requires-embsim")]
+    requires_embsim: Option<String>,
+    #[serde(default)]
+    catalog: Option<LenientCatalog>,
 }
 
 impl CatalogTable {
+    /// A table naming `crates`, held by a runner the tool writes.
+    pub fn new(crates: Vec<String>) -> Self {
+        Self {
+            crates,
+            runner: None,
+            retired_embsim: false,
+        }
+    }
+
+    /// The same table, its crates held by the project's own runner crate
+    /// at `runner`.
+    #[must_use]
+    pub fn with_runner(mut self, runner: impl Into<String>) -> Self {
+        self.runner = Some(runner.into());
+        self
+    }
+
     /// The `[catalog]` table of the project text `text`, reading nothing
-    /// else of it: what the `embsim` tool reads before it hands a project
-    /// to its runner, so a project the runner's embsim reads is never
-    /// refused by an older tool. `None` when the file has no `[catalog]`.
+    /// else of it and passing over any key this embsim does not know: what
+    /// the `embsim` tool reads before it hands a project to its runner, so
+    /// a project the runner's embsim reads is never refused by an older
+    /// tool. `None` when the file has no `[catalog]`.
     pub fn of_project_text(text: &str) -> Result<Option<Self>, ProjectError> {
-        /// The file, every table but `[catalog]` passed over unread.
-        #[derive(Deserialize)]
-        struct CatalogOnly {
-            #[serde(default)]
-            catalog: Option<CatalogTable>,
-        }
-        let file: CatalogOnly = toml::from_str(text)
-            .map_err(|err| ProjectError::message(format!("project does not parse: {err}")))?;
-        match file.catalog {
-            Some(catalog) => {
-                catalog.check()?;
-                Ok(Some(catalog))
-            }
-            None => Ok(None),
-        }
+        Ok(ProjectHead::of_project_text(text)?.catalog)
     }
 
     /// The `[catalog]` table of the project file at `path`
     /// ([`Self::of_project_text`]).
     pub fn of_project(path: &Path) -> Result<Option<Self>, ProjectError> {
-        let text = std::fs::read_to_string(path).map_err(|err| {
-            ProjectError::message(format!("cannot read project {}: {err}", path.display()))
-        })?;
-        Self::of_project_text(&text)
-            .map_err(|err| ProjectError::message(format!("{}: {err}", path.display())))
+        Ok(ProjectHead::of_project(path)?.catalog)
     }
 
     /// Refuse a table that names no crate, a crate twice, or an empty path.
     fn check(&self) -> Result<(), ProjectError> {
+        if self.retired_embsim {
+            return Err(ProjectError::message(
+                "[catalog] embsim is retired: the runner builds against the embsim the catalog \
+                 crates depend on, by path, git or version, in their own Cargo.toml. Take the \
+                 key out, and point the crates' embsim dependencies where it pointed \
+                 (PROJECTS.md §10, \"Which embsim the runner builds against\")",
+            ));
+        }
         if self.crates.is_empty() {
             return Err(ProjectError::message(
                 "[catalog] crates is empty: name the project's catalog crates (crates = \
@@ -837,18 +979,126 @@ impl CatalogTable {
             }
         }
         if self
-            .embsim
+            .runner
             .as_deref()
             .is_some_and(|path| path.trim().is_empty())
         {
             return Err(ProjectError::message(
-                "[catalog] embsim is empty: name an embsim checkout's root, relative to the \
-                 project file, or leave the key out to build against the one embsim was built \
-                 from",
+                "[catalog] runner is empty: name the project's runner crate, relative to the \
+                 project file, or take the key out for a runner the `embsim` tool writes",
             ));
         }
         Ok(())
     }
+}
+
+/// What every embsim reads of a project before it reads the rest
+/// (`PROJECTS.md` §2): the embsim release it requires (`requires-embsim`)
+/// and its `[catalog]`, any other key passed over. The `embsim` tool reads
+/// this to decide who runs the project — itself, or the project's runner —
+/// so a newer project still reaches the runner whose embsim reads it, and
+/// an embsim it was not written for says so instead of refusing a key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProjectHead {
+    /// `requires-embsim`: the embsim release the project is written for
+    /// (`"0.2"`), as a caret requirement: `0.2` is any `0.2.x`.
+    pub requires_embsim: Option<String>,
+    /// `[catalog]`.
+    pub catalog: Option<CatalogTable>,
+}
+
+impl ProjectHead {
+    /// The head of the project text `text`.
+    pub fn of_project_text(text: &str) -> Result<Self, ProjectError> {
+        let head: LenientHead = toml::from_str(text)
+            .map_err(|err| ProjectError::message(format!("project does not parse: {err}")))?;
+        let catalog = head.catalog.map(|catalog| CatalogTable {
+            crates: catalog.crates,
+            runner: catalog.runner,
+            retired_embsim: catalog.retired_embsim,
+        });
+        if let Some(catalog) = &catalog {
+            catalog.check()?;
+        }
+        Ok(Self {
+            requires_embsim: head.requires_embsim,
+            catalog,
+        })
+    }
+
+    /// The head of the project file at `path`.
+    pub fn of_project(path: &Path) -> Result<Self, ProjectError> {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            ProjectError::message(format!("cannot read project {}: {err}", path.display()))
+        })?;
+        Self::of_project_text(&text)
+            .map_err(|err| ProjectError::message(format!("{}: {err}", path.display())))
+    }
+
+    /// Refuse a project that requires an embsim release this one is not
+    /// ([`EMBSIM_VERSION`]), saying both.
+    pub fn check_version(&self) -> Result<(), ProjectError> {
+        check_requires_embsim(self.requires_embsim.as_deref())
+    }
+}
+
+/// Refuse `requires`, a project's `requires-embsim`, unless this embsim
+/// ([`EMBSIM_VERSION`]) meets it.
+fn check_requires_embsim(requires: Option<&str>) -> Result<(), ProjectError> {
+    let Some(requires) = requires else {
+        return Ok(());
+    };
+    match version_meets(EMBSIM_VERSION, requires) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ProjectError::message(format!(
+            "this project is written for embsim {requires} (requires-embsim = {requires:?}), and \
+             this is embsim {EMBSIM_VERSION}: run it with an embsim {requires}, or, if it is \
+             written for this one, say so with requires-embsim = {:?} (PROJECTS.md §2)",
+            caret_of(EMBSIM_VERSION)
+        ))),
+        Err(why) => Err(ProjectError::message(format!(
+            "requires-embsim = {requires:?} {why}: write the embsim release the project is \
+             written for, as \"{}\"",
+            caret_of(EMBSIM_VERSION)
+        ))),
+    }
+}
+
+/// `major.minor`, the requirement a project written for `version` gives.
+fn caret_of(version: &str) -> String {
+    version.splitn(3, '.').take(2).collect::<Vec<_>>().join(".")
+}
+
+/// Whether `version` (`0.2.0`) meets the caret requirement `requires`
+/// (`0.2`, `0.2.1`, `1`), as Cargo reads one: at least `requires`, and
+/// below the next release that may break it — the next major version, or
+/// for a `0.x` the next minor. An error says why `requires` is not one.
+pub fn version_meets(version: &str, requires: &str) -> Result<bool, String> {
+    let parse = |text: &str| -> Option<Vec<u64>> {
+        let parts: Vec<u64> = text
+            .trim()
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect::<Option<_>>()?;
+        (1..=3).contains(&parts.len()).then_some(parts)
+    };
+    let wanted = parse(requires.trim_start_matches('^'))
+        .ok_or_else(|| "is not a version: one to three numbers with dots".to_string())?;
+    let have = parse(version.split(['-', '+']).next().unwrap_or(version))
+        .ok_or_else(|| format!("cannot be compared with this embsim's version {version}"))?;
+    let at = |parts: &[u64], index: usize| parts.get(index).copied().unwrap_or(0);
+    let floor = [at(&wanted, 0), at(&wanted, 1), at(&wanted, 2)];
+    let have = [at(&have, 0), at(&have, 1), at(&have, 2)];
+    if have < floor {
+        return Ok(false);
+    }
+    // The first number the requirement gives that is not zero (or its
+    // last) is the one a release that may break it changes.
+    let fixed = (0..wanted.len())
+        .find(|&index| wanted[index] != 0)
+        .unwrap_or(wanted.len() - 1);
+    Ok(have[..=fixed] == floor[..=fixed])
 }
 
 /// The directory beside a project file where embsim keeps what it makes
@@ -872,6 +1122,9 @@ pub fn state_dir(project_dir: &Path) -> std::io::Result<PathBuf> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectFile {
+    /// `requires-embsim`: the embsim release the project is written for.
+    #[serde(default, rename = "requires-embsim")]
+    requires_embsim: Option<String>,
     /// `[catalog]`: the project's own catalog crates.
     #[serde(default)]
     catalog: Option<CatalogTable>,
@@ -915,6 +1168,9 @@ impl Project {
     /// Parse `text` as a project whose paths are relative to the current
     /// directory. Kinds are not resolved yet.
     pub fn parse(text: &str) -> Result<Self, ProjectError> {
+        // The release first: a project written for another embsim says so,
+        // whatever else in it this one would refuse.
+        ProjectHead::of_project_text(text)?.check_version()?;
         let file: ProjectFile = toml::from_str(text)
             .map_err(|err| ProjectError::message(format!("project does not parse: {err}")))?;
         if let Some(catalog) = &file.catalog {
@@ -955,6 +1211,12 @@ impl Project {
     /// The directory the project's paths are relative to.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The embsim release the project is written for (`requires-embsim`),
+    /// when it says: parsing refused it already unless this embsim meets it.
+    pub fn requires_embsim(&self) -> Option<&str> {
+        self.file.requires_embsim.as_deref()
     }
 
     /// The project's `[catalog]` table, when it names catalog crates of its
@@ -1072,7 +1334,11 @@ impl Project {
             system = system.board(&spec.name, board);
         }
 
-        let known_components = catalog.component_kinds();
+        let known_components: Vec<String> = catalog
+            .component_kinds()
+            .into_iter()
+            .map(|kind| kind.name.into_owned())
+            .collect();
         let mut bench_pins: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for spec in &self.file.component {
             if !known_components.contains(&spec.kind) {
@@ -1288,7 +1554,7 @@ fn not_ready_hint(survey: &BoardSurvey, catalog: &dyn Catalog) -> String {
         let kinds: Vec<String> = catalog
             .part_kinds()
             .iter()
-            .map(|kind| kind.name.to_string())
+            .map(|kind| kind.name().to_string())
             .collect();
         hint.push_str(&format!("; {}\n", kinds_sentence("part", &kinds)));
     }
@@ -1379,7 +1645,11 @@ fn prepare(
         })?;
         (parsed, base_registry(catalog), true, Vec::new())
     } else {
-        let kinds = catalog.board_kinds();
+        let kinds: Vec<String> = catalog
+            .board_kinds()
+            .into_iter()
+            .map(|kind| kind.name.into_owned())
+            .collect();
         if !kinds.contains(&spec.kind) {
             let mut all = vec!["netlist".to_string()];
             all.extend(kinds);
@@ -1482,10 +1752,10 @@ fn prepare(
                 )),
             ));
         }
-        let Some(guide) = part_kinds.iter().find(|kind| kind.name == model.kind) else {
+        let Some(guide) = part_kinds.iter().find(|kind| kind.name() == model.kind) else {
             let names: Vec<String> = part_kinds
                 .iter()
-                .map(|kind| kind.name.to_string())
+                .map(|kind| kind.name().to_string())
                 .collect();
             return Err(from_kind(
                 origin,
@@ -1515,6 +1785,7 @@ fn prepare(
             dir: base,
             netlist: &netlist,
             reports,
+            catalog,
         };
         refuse_clash(catalog, &model.kind, &assignment.context())
             .map_err(|err| from_kind(origin, err))?;

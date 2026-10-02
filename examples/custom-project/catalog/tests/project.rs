@@ -31,11 +31,11 @@ const PERIOD_NS: u64 = 1_000_000;
 
 /// The command as this crate's runner, with `args`.
 fn runner(args: &[&str]) -> (ExitCode, String, String) {
-    let crates = [CatalogCrate {
-        name: custom_project_catalog::NAME,
-        dir: env!("CARGO_MANIFEST_DIR"),
-        register: custom_project_catalog::register,
-    }];
+    let crates = [CatalogCrate::new(
+        custom_project_catalog::NAME,
+        env!("CARGO_MANIFEST_DIR"),
+        custom_project_catalog::register,
+    )];
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = embsim_cli::run_with_crates(
         &crates,

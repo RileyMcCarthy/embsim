@@ -525,17 +525,18 @@ fn the_three_board_machine_project_waits_on_the_two_parts_the_catalog_lacks() {
     "[catalog] crates names \"sim/catalog\" twice"
 )]
 #[case::empty_path("crates = [\"\"]", "[catalog] crates names an empty path")]
-#[case::empty_checkout("crates = [\"c\"]\nembsim = \"\"", "[catalog] embsim is empty")]
-#[case::unknown_key(
-    "crates = [\"c\"]\ncolour = \"red\"",
-    "unknown field `colour`, expected `crates` or `embsim`"
+#[case::empty_runner("crates = [\"c\"]\nrunner = \"\"", "[catalog] runner is empty")]
+#[case::retired_checkout(
+    "crates = [\"c\"]\nembsim = \"../embsim\"",
+    "[catalog] embsim is retired: the runner builds against the embsim the catalog crates \
+     depend on"
 )]
 fn a_catalog_table_that_names_no_crate_clearly_is_refused(#[case] table: &str, #[case] says: &str) {
     behaviour!(Test {
         id: "project.refuses-bad-catalog-table",
         covers: Some("board/src/project.rs#CatalogTable::of_project_text"),
         given: "a project whose catalog-crates table names no crate, one crate twice, an empty \
-                path, an empty embsim checkout, or a key the table does not have",
+                path or an empty runner, or gives the retired key that named an embsim checkout",
     });
     expect!(
         "refused-by-both",
@@ -559,29 +560,167 @@ fn the_catalog_table_is_read_without_the_rest_of_the_file() {
     behaviour!(Test {
         id: "project.catalog-table-alone",
         covers: Some("board/src/project.rs#CatalogTable::of_project_text"),
-        given: "a project file with a catalog-crates table and a table this embsim does not \
-                know",
+        given: "a project file with a catalog-crates table naming the project's own runner and \
+                a key this embsim does not know, and a table this embsim does not know",
     });
     expect!(
         "table-read",
-        "the catalog crates are read from it in the order the file gives them, while the \
-         project itself is refused for the table it does not know",
+        "the catalog crates and the runner are read from it in the order the file gives them, \
+         the keys and table this embsim does not know passed over",
         "the `embsim` tool reads only this table before it hands a project to its runner, so \
          a project a newer embsim in the runner reads is never refused by an older tool"
     );
+    expect!(
+        "project-refuses",
+        "the project itself, read whole, is refused for the key and the table it does not know"
+    );
     let text = format!(
-        "[catalog]\ncrates = [\"sim/b\", \"sim/a\"]\nembsim = \"../embsim\"\n\n[later]\nkey = 1\n{}",
+        "[catalog]\ncrates = [\"sim/b\", \"sim/a\"]\nrunner = \"sim/runner\"\nlater = 1\n\n\
+         [later]\nkey = 1\n{}",
         header("")
     );
     let catalog = embsim_board::CatalogTable::of_project_text(&text)
         .expect("the table reads")
         .expect("the file has one");
     assert_eq!(catalog.crates, ["sim/b", "sim/a"]);
-    assert_eq!(catalog.embsim.as_deref(), Some("../embsim"));
+    assert_eq!(catalog.runner.as_deref(), Some("sim/runner"));
     assert_says(
         &Project::parse(&text)
             .expect_err("the project is refused")
             .to_string(),
         &["unknown field `later`"],
+    );
+}
+
+#[rstest]
+#[case::this_release(&format!("requires-embsim = {:?}\n", release()))]
+#[case::this_release_and_patch(&format!("requires-embsim = \"{}.0\"\n", release()))]
+#[case::no_key("")]
+fn a_project_written_for_this_release_is_read(#[case] key: &str) {
+    behaviour!(Test {
+        id: "project.requires-embsim",
+        covers: Some("board/src/project.rs#ProjectHead::check_version"),
+        given: "a project that names this embsim's release as the one it is written for, with \
+                or without a patch number, or names no release",
+    });
+    expect!(
+        "this-release-reads",
+        "the project is read, and the head a tool reads first accepts it too",
+        "a release is any version with the same release number and no lower patch, as Cargo \
+         reads a 0.x version"
+    );
+    let text = format!("{key}{}", header(""));
+    Project::parse(&text).expect("the project is read");
+    embsim_board::ProjectHead::of_project_text(&text)
+        .expect("the head reads")
+        .check_version()
+        .expect("the release is this one");
+}
+
+#[rstest]
+#[case::the_next_release(&format!("requires-embsim = {:?}\n", next_release()))]
+#[case::the_last_release("requires-embsim = \"0.1\"\n")]
+fn a_project_written_for_another_release_is_refused(#[case] key: &str) {
+    behaviour!(Test {
+        id: "project.requires-another-embsim",
+        covers: Some("board/src/project.rs#ProjectHead::check_version"),
+        given: "a project that names the embsim release after this one, or the one before it, \
+                as the one it is written for",
+    });
+    expect!(
+        "refused",
+        "the project is refused, the error naming the release it asks for, this embsim's \
+         version, and how to say a file suits this one"
+    );
+    expect!(
+        "head-says",
+        "the head a tool reads before the rest of the file is refused the same way"
+    );
+    let text = format!("{key}{}", header(""));
+    let head = embsim_board::ProjectHead::of_project_text(&text).expect("the head reads");
+    let asked = head.requires_embsim.clone().expect("it asks for one");
+    let message = Project::parse(&text)
+        .expect_err("the project is refused")
+        .to_string();
+    assert_says(
+        &message,
+        &[
+            &format!("this project is written for embsim {asked}"),
+            &format!("this is embsim {}", embsim_board::EMBSIM_VERSION),
+            &format!("requires-embsim = {:?}", release()),
+        ],
+    );
+    let said = head
+        .check_version()
+        .expect_err("the head refuses it")
+        .to_string();
+    assert_says(&said, &[&format!("embsim {asked}")]);
+}
+
+/// This embsim's release, `major.minor`.
+fn release() -> String {
+    let parts: Vec<&str> = embsim_board::EMBSIM_VERSION.split('.').collect();
+    format!("{}.{}", parts[0], parts[1])
+}
+
+/// The release after this one, as a 0.x release counts: the next minor.
+fn next_release() -> String {
+    let parts: Vec<u64> = embsim_board::EMBSIM_VERSION
+        .split('.')
+        .map(|part| part.parse().expect("a number"))
+        .collect();
+    format!("{}.{}", parts[0], parts[1] + 1)
+}
+
+#[rstest]
+#[case::same_minor("0.2.0", "0.2", true)]
+#[case::later_patch("0.2.5", "0.2.1", true)]
+#[case::earlier_patch("0.2.0", "0.2.1", false)]
+#[case::next_minor("0.3.0", "0.2", false)]
+#[case::earlier_minor("0.1.9", "0.2", false)]
+#[case::major_compatible("1.4.0", "1.2", true)]
+#[case::next_major("2.0.0", "1.2", false)]
+#[case::exact_zero_zero("0.0.3", "0.0.3", true)]
+#[case::zero_zero_next("0.0.4", "0.0.3", false)]
+#[case::caret_written("0.2.3", "^0.2", true)]
+fn a_release_meets_a_requirement_as_cargo_reads_a_caret(
+    #[case] version: &str,
+    #[case] requires: &str,
+    #[case] meets: bool,
+) {
+    behaviour!(Test {
+        id: "project.release-requirement",
+        covers: Some("board/src/project.rs#version_meets"),
+        given: "an embsim version and the release a project asks for, written as one to three \
+                numbers",
+    });
+    expect!(
+        "caret",
+        "the version meets the release when it is at least the release and keeps its first \
+         non-zero number, as Cargo's caret requirement does"
+    );
+    assert_eq!(embsim_board::version_meets(version, requires), Ok(meets));
+}
+
+#[rstest]
+fn a_release_that_is_not_one_says_what_to_write() {
+    behaviour!(Test {
+        id: "project.release-not-a-version",
+        covers: Some("board/src/project.rs#ProjectHead::check_version"),
+        given: "a project whose required embsim release is written as a word",
+    });
+    expect!(
+        "says-what-to-write",
+        "the project is refused, saying the release is not a version and giving this embsim's \
+         release as the shape to write"
+    );
+    let text = format!("requires-embsim = \"latest\"\n{}", header(""));
+    let message = Project::parse(&text).expect_err("refused").to_string();
+    assert_says(
+        &message,
+        &[
+            "requires-embsim = \"latest\" is not a version",
+            &format!("as \"{}\"", release()),
+        ],
     );
 }

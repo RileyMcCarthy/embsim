@@ -11,7 +11,7 @@
 
 use embsim_board::{
     netlist, Assignment, BoardSpec, Catalog, CatalogBoard, Component, ComponentRequest, KindGuide,
-    ModelFacade, Named, PartOptions, PartRegistry, ProjectError,
+    KindInfo, ModelFacade, Named, PartOptions, PartRegistry, ProjectError,
 };
 
 use crate::buffer::{Buffer, BUFFER_PINS};
@@ -37,8 +37,11 @@ impl Catalog for ExampleCatalog {
         crate::NAME
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        vec![BOARD.to_string()]
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            BOARD,
+            "a small board carrying one EX-BUF1, its input, output, supply and ground on J1",
+        )]
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
@@ -52,7 +55,7 @@ impl Catalog for ExampleCatalog {
             BUFFER,
             "the EX-BUF1 single Schmitt-trigger buffer (an example part, from its stand-in \
              datasheet)",
-            Named::Family(&["EX-BUF1"]),
+            Named::family(["EX-BUF1"]),
         )]
     }
 
@@ -73,8 +76,21 @@ impl Catalog for ExampleCatalog {
         Ok(())
     }
 
-    fn component_kinds(&self) -> Vec<String> {
-        vec![COUNTER.to_string()]
+    fn component_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            COUNTER,
+            "a bench instrument counting the rising edges on its IN, against its REF",
+        )
+        .requires(
+            "low",
+            "0.9",
+            "the level IN falls below to read low, in volts",
+        )
+        .requires(
+            "high",
+            "2.0",
+            "the level IN rises above to read high, in volts",
+        )]
     }
 
     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {

@@ -86,8 +86,9 @@ unknown field `colour`, expected one of `name`, `kind`, `netlist`, `model`
 
 | Table | Key | What it says |
 |---|---|---|
+| (top level) | `requires-embsim` | optional: the embsim release the project is written for, `"0.2"`, read as Cargo reads a caret requirement (`0.2` is any `0.2.x`). An embsim of another release refuses the project, naming both, before it reads the rest; `embsim new` writes it |
 | `[catalog]` | `crates` | optional table: the project's own catalog crates, each a directory relative to the project file; the `embsim` tool builds them into the runner that runs the project (section 10) |
-| | `embsim` | optional: the embsim checkout the runner builds against, relative to the project file; by default the one the `embsim` tool was built from |
+| | `runner` | optional: the project's own runner crate, relative to the project file, which the tool builds and runs instead of writing a runner of its own (section 10) |
 | `[[board]]` | `name` | the board's name in the system: the first word of every endpoint and net on it (`EC32.J203.41`, `EC32.Common_VDD`) |
 | | `kind` | `"netlist"`, or a board kind the catalog ships (section 5) |
 | | `netlist` | for `kind = "netlist"` only: the KiCad netlist export, relative to the project file |
@@ -103,6 +104,16 @@ unknown field `colour`, expected one of `name`, `kind`, `netlist`, `model`
 | `[[switch]]` | `part`, `pole`, `state` | a switch pole: `part = "EC32.S301"`, the pole numbered from 0 in the order the part declares its poles, `state = "open"` or `"closed"` |
 | `[[jumper]]` | `part`, `state` | a two-pad jumper (a `Jumper*` or `SolderJumper*` symbol), open or closed; a three-pad one is two switch poles (pads 1–2 and 2–3) |
 | `[[pin_short]]` | `a`, `b` | two part pins, `Board.Ref.Pin`, joined as one net: a scenario fault or a bodge wire |
+
+Every embsim reads two things of a project before the rest, and passes
+over any key it does not know while it does: `requires-embsim` and
+`[catalog]` (`embsim_board::ProjectHead`). So the `embsim` tool hands a
+project written for a newer embsim to the runner whose embsim reads it,
+and a project written for another release says so:
+
+```text
+error: p.toml: this project is written for embsim 0.3 (requires-embsim = "0.3"), and this is embsim 0.2.0: run it with an embsim 0.3, or, if it is written for this one, say so with requires-embsim = "0.2" (PROJECTS.md §2)
+```
 
 A board or component name is not empty and has no dot or space, and no two
 are the same. No two `[[board.model]]` entries on a board have the same key,
@@ -236,6 +247,8 @@ wrote ds2.toml
 
 The file answers the checklist as far as the catalog can:
 
+- **The release.** `requires-embsim` names this embsim's release, so an
+  embsim of another one says so instead of misreading the file (section 2).
 - **The board.** It is `kind = "netlist"`, with the netlist relative to the
   project file. When the two share nothing but the filesystem root, the path
   is written whole.
@@ -993,14 +1006,21 @@ that catalog to a **set**, `embsim_boards::catalog::CatalogSet`. A set starts
 with the standard catalog, answers each kind from the catalog that provides
 it, and is itself a catalog: a project is built with the set. Every method
 of `Catalog` but `name` has a default that provides nothing, so a catalog
-writes only the methods for the kinds it has:
+writes only the methods for the kinds it has. Every sort of kind
+describes itself the same way, as an `embsim_board::KindInfo`: its name,
+what it is in a phrase, and the options it cannot be built without
+(`KindInfo::new(name, summary).requires(option, example, means)`). The
+structs a catalog fills in or is handed are `#[non_exhaustive]` and built
+with their constructors, so a field embsim adds later breaks no catalog;
+names are `Cow<'static, str>`, so a catalog may make kinds as it runs.
 
-- **A board kind.** `board_kinds()` names it. `board()` returns a
+- **A board kind.** `board_kinds()` describes it. `board()` returns a
   `CatalogBoard`: the parsed netlist the crate bundles; the registry it
   builds with, either `Some` registry the catalog builds itself (as
   `Ec32mb::new().registry()` places every part of the module but `U100`) or
   `None`, the set's base registrations, as a `kind = "netlist"` board starts
-  from (`CatalogBoard::from_base`); and `models`, the board's own
+  from (`CatalogBoard::from_base`, or `CatalogBoard::with_registry` for the
+  first); and `models`, the board's own
   `[[board.model]]` entries (`ModelSpec::by_part`, `by_mpn`, `by_value`,
   with `option`). The project registers the board's entries through the
   set's kinds, with every check an entry in the file gets, before the
@@ -1008,10 +1028,16 @@ writes only the methods for the kinds it has:
   board's. The project then builds the board with `Board::from_netlist`,
   like every other board.
 - **A part kind.** `part_kinds()` returns a `KindGuide` for each
-  (`embsim_board::kind`, `KindGuide::new(name, summary, is)`): what the
-  model is, the part numbers it is for, its pin tables, the options it
-  cannot go without, and `is`, what a part must be for the kind to seat
-  there (`Named::Family`, `Connector`, `Switch`, `OneNet`). The project
+  (`embsim_board::kind`, `KindGuide::new(name, summary, is)`): its
+  `KindInfo`, the part numbers it is for (`number`), its pin tables
+  (`table`, with `PinTable::option` or `PinTable::fixed`), the options it
+  cannot go without (`requires`), and `is`, what a part must be for the
+  kind to seat there (`Named::family([…])`, `Connector`, `Switch`,
+  `OneNet`). An option may take one of the set's P2 core kinds
+  (`RequiredOption::new(…).one_of_the_core_kinds()`, as the `p2` package's
+  `core` does): the set describes it with every core it holds, and the
+  kind finds the cores through the set it is registered through
+  (`assignment.catalog`, `CatalogSet::core_catalogs`). The project
   checks every part an entry reaches against `is` before it calls the
   catalog (`KindGuide::check`), so no kind, whichever catalog it is from,
   seats on a part it is not (section 8). `register_part()` takes the options
@@ -1030,7 +1056,7 @@ writes only the methods for the kinds it has:
   front of a message.
 - **Base registrations.** `register_base()` registers the models a
   `kind = "netlist"` board places by the part number it carries.
-- **A bench component kind.** `component_kinds()` names it. `component()`
+- **A bench component kind.** `component_kinds()` describes it. `component()`
   takes a `ComponentRequest`: the entry, its `[component.options]` as
   `PartOptions`, the project file's directory and the report sink. It
   returns the `Box<dyn Component>`, whose pins are the endpoints `Name.Pin`.
@@ -1058,8 +1084,8 @@ with the pole pairing the module's netlist gives it
 
 ```rust
 use embsim_board::{
-    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, KindGuide, Named, PartOptions,
-    PartRegistry, Project, ProjectError,
+    netlist, Assignment, BoardSpec, Catalog, CatalogBoard, KindGuide, KindInfo, Named,
+    PartOptions, PartRegistry, Project, ProjectError,
 };
 use embsim_boards::catalog::CatalogSet;
 use embsim_boards::ec32mb::dip_switch_poles;
@@ -1087,8 +1113,8 @@ impl Catalog for MyCatalog {
         "my-catalog"
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        vec!["my-header".to_string()]
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("my-header", "a two-pin header and its pull-down")]
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
@@ -1274,30 +1300,33 @@ catalog of the test tree's own beside the standard one
 
 ## 10. Extending embsim from a project
 
-*Status, 2026-10-01 on `feat/embsim-catalogs`. Everything this section
-describes is built, except a plant's `Assembly` ("Adding a bench
-component"), which is still a design. The Rust below either runs as a doc test of `embsim-boards` or
+*Status, 2026-10-02 on `feat/embsim-catalogs`, for embsim 0.2.0.
+Everything this section describes is built, except a plant's `Assembly`
+("Adding a bench component"), which is still a design. The Rust below either runs as a doc test of `embsim-boards` or
 is quoted from the worked example,
 [`examples/custom-project`](examples/custom-project/README.md), whose crate
 every gate compiles; `boards/tests/guide_quotes.rs` fails when a quotation
 and its file differ. Every command was run as shown. MaD's move onto a
 project of its own is [`MIGRATING-MAD.md`](MIGRATING-MAD.md); the decision
 record, with the alternatives and what is open, is [`NODES.md`](NODES.md)
-§13.*
+§13 (its "Packaging for the release" for how a runner is pinned and
+owned).*
 
 A project whose boards need something embsim does not ship (a model, a
 board, a processor core, a bench part) writes it in Rust, in a crate of its
 own: a catalog crate. The project file names the crate
 (`[catalog] crates = ["sim/catalog"]`), and the `embsim` tool builds it
 into a **runner**, the same command over a set the crate's catalogs
-joined, and runs the project through it ("The runner", below). A project
-that would rather own its binary writes the same thing by hand: ten lines
-over the command's library. Either way there is one command and no plugin
-interface: Cargo compiles the project's crate and embsim into one binary,
-against one copy of embsim.
+joined, and runs the project through it ("The runner", below). The runner
+is a crate of the project's own when the file names one (`[catalog]
+runner`), else one the tool writes beside the project. Either way there
+is one command and no plugin interface: Cargo compiles the project's crate
+and embsim into one binary, against one copy of embsim — the embsim the
+project's own Cargo files depend on, whichever `embsim` tool started it.
 
 ```bash
 embsim new --catalog sim/catalog --add-to rig.toml   # start a crate, name it in the project
+                                                     # (--own-runner: and a runner crate beside it)
 embsim check rig.toml                                # build the runner, then check through it
 embsim run rig.toml --for 10ms
 embsim survey --project rig.toml board.net           # the checklist, the crate's kinds among the candidates
@@ -1307,17 +1336,26 @@ embsim survey --project rig.toml board.net           # the checklist, the crate'
 $ embsim new --catalog sim/catalog --add-to rig.toml
 wrote sim/catalog/Cargo.toml and sim/catalog/src/lib.rs: catalog crate sim-catalog
   kinds sim-board (a board), sim-sensor (a part), sim-core (a P2 core), sim-source (a bench component): one commented example of each to keep, rename or replace
+  its embsim, and so the runner's: at /home/me/embsim
 added "sim/catalog" to the [catalog] crates of rig.toml; `embsim check rig.toml` builds the runner that holds it
+note: sim/catalog sits inside the Cargo workspace /home/me/embsim/Cargo.toml; add it to that workspace's members to build and test it there (the runner builds it either way)
 $ embsim check rig.toml
-embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim) in ./.embsim/runner-c03c22d2
+embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim) in ./.embsim/runner-ec5fe81f
 …
+embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
 project rig.toml
   catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
+  embsim 0.2.0, git rev a47bf442f5a5, from /home/me/embsim
+  built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
+  catalog crate sim-catalog 0.1.0: /home/me/embsim/rig/sim/catalog, in the git repository at rev a47bf442f5a5, but no commit holds its files
 …
 ```
 
-Here `rig.toml` was a copy of `boards/projects/ec32-carrier.toml`; any
-project takes a crate the same way. The first `check` compiles embsim, its
+Here `rig.toml` was a copy of `boards/projects/ec32-carrier.toml` in a
+directory of the embsim checkout, so the crate takes embsim by path; any
+project takes a crate the same way, and one outside a checkout takes
+embsim from its repository at the tool's revision ("The catalog crate",
+below). The first `check` compiles embsim, its
 dependencies and the crate: 54 crates in 19 s from an empty target directory on the eight-core machine
 these were run on. A second `check` or `run` with nothing changed is
 Cargo's no-op check and then the run: 0.3 s for `run rig.toml --for 10ms`.
@@ -1353,12 +1391,25 @@ second channel).
 
 A catalog crate is an ordinary library crate. It depends on the embsim
 crates it builds on, and it exports one function at its root, the
-**registration function**. `embsim new --catalog DIR` starts one: a
-`Cargo.toml` whose embsim dependencies (`embsim-board`, `embsim-boards`,
-and `embsim-core` for the virtual clock) reach the checkout the tool was
-built from, and a `src/lib.rs` with the registration function and one
-commented example of each sort of kind, named after the project
-(`sim/catalog` gives `sim-board`, `sim-sensor`, `sim-core`, `sim-source`).
+**registration function**. Its embsim dependency is the embsim the
+project builds against ("Which embsim the runner builds against", below).
+`embsim new --catalog DIR` starts one: a `Cargo.toml` whose embsim
+dependencies (`embsim-board`, `embsim-boards`, and `embsim-core` for the
+virtual clock) are that embsim, and a `src/lib.rs` with the registration
+function and one commented example of each sort of kind, named after the
+project (`sim/catalog` gives `sim-board`, `sim-sensor`, `sim-core`,
+`sim-source`). Which embsim it writes, in order:
+
+1. for a crate that joins a project (`--add-to`) whose first catalog crate
+   names one, the same;
+2. the checkout the tool was built from, by a path relative to the crate,
+   when that checkout sits inside the crate's git repository (embsim as a
+   submodule, as in MaD);
+3. embsim's repository at the revision the tool was built from, with its
+   release as the version Cargo checks: `{ git =
+   "https://github.com/RileyMcCarthy/embsim", rev = "…", version = "0.2"
+   }` (at the release tag, `v0.2.0`, when the tool knows no revision).
+
 That library is `cli/catalog-template`, a crate of embsim's workspace that
 every gate compiles and `cli/tests/template.rs` runs, with `yourproject`
 where the project's name goes. With a netlist, `new` writes the starter
@@ -1395,8 +1446,11 @@ The registration function:
   its report then ("What a run prints", below);
 - returns an error that says what to fix.
 
-The runner the tool builds calls it. A project that owns its binary calls
-it too, the command over the shipped set with the project's catalogs in it.
+The runner the tool builds calls it, and so does a runner crate the project
+owns ("A runner the project owns", below), which the tool builds and runs
+as it builds its own. A binary of the project's own that the tool does not
+run calls it too, the command over the shipped set with the project's
+catalogs in it.
 The example has one, `cargo run -p custom-project-catalog --example
 own_binary -- run project.toml --for 10ms` from `examples/custom-project`:
 
@@ -1428,8 +1482,8 @@ four subcommands over `set`; `embsim_cli::run(&set, args, out, err)` is the
 same with the arguments and the output handed in, which is how
 `cli/tests/library.rs` checks and runs a project naming a board kind, a
 part kind, a core and a bench component of a catalog the test defines.
-`embsim_cli::runner_main(&[CatalogCrate { name, dir, register }])` is what
-a runner's `main` is, and `embsim_cli::run_with_crates` the same with the
+`embsim_cli::runner_main(&[CatalogCrate::new(name, dir, register)])` is
+what a runner's `main` is, and `embsim_cli::run_with_crates` the same with the
 arguments and output handed in: how a project tests its own catalog in
 process, as the runner runs it
 (`examples/custom-project/catalog/tests/project.rs`). The `embsim` binary
@@ -1484,72 +1538,109 @@ project project.toml
 | Key | What it says |
 |---|---|
 | `crates` | the project's catalog crates: each a directory holding a `Cargo.toml`, relative to the project file. Their registration functions run in this order, after the catalogs embsim ships |
-| `embsim` | optional: the embsim checkout (its workspace root, relative to the project file) that the runner builds embsim from. By default it is the checkout `embsim` itself was built from |
+| `runner` | optional: the project's own runner crate, a directory relative to the project file ("A runner the project owns", below). Without it the tool writes the runner |
 
 A key the table does not have is refused, as everywhere in the file, and
-so are an empty `crates`, a crate named twice and an empty path. A
-project without `[catalog]` runs on the catalogs embsim ships, in the
-`embsim` binary itself, exactly as sections 1 to 9 describe. Building a
-system does not read the table (`Project::catalog` gives it to a caller
-that wants it): the kinds the crates add reach the project through the set
-it is built with, so a binary of the project's own builds the same file.
+so are an empty `crates`, a crate named twice, and an empty path or runner.
+`embsim`, which named an embsim checkout before 0.2, is refused, saying
+that the crates' own dependency replaced it. A project without `[catalog]`
+runs on the catalogs embsim ships, in the `embsim` binary itself, exactly
+as sections 1 to 9 describe. Building a system does not read the table
+(`Project::catalog` gives it to a caller that wants it): the kinds the
+crates add reach the project through the set it is built with, so a binary
+of the project's own builds the same file.
 
 ### The runner
 
 A `check` or `run` of a project with `[catalog]`, and a `survey` or `new`
-whose `--project` names one, runs in a **runner**: a small crate the
-`embsim` tool writes, builds with Cargo, and hands the command line to
-(`cli/src/runner.rs`).
+whose `--project` names one, runs in a **runner**: the embsim command over
+the catalogs embsim ships and the project's crates
+(`embsim_cli::runner_main`), which the `embsim` tool builds with Cargo and
+hands the command line to (`cli/src/runner.rs`). It has one of two owners.
 
-- **What it is.** A binary crate whose dependencies are `embsim-cli` from
-  the embsim checkout the runner builds against, and each crate `[catalog]`
-  names, by path. Its `main` is
-  `embsim_cli::runner_main` over the crates, one registration function each:
+- **Who runs a project.** The `embsim` tool hands a `check` or `run` of a
+  project with `[catalog]` to its runner, and a `survey` or `new` given
+  `--project` naming one ("Surveying with a project's kinds", below); it
+  runs everything else itself. Before it hands over it reads only the
+  project's head, leniently (section 2): `[catalog]` and
+  `requires-embsim`. A command line the tool cannot parse — a flag only a
+  newer embsim has — is still handed over when it names a project with
+  `[catalog]` (the first argument naming a file after `check` or `run`, or
+  `--project`'s value), so the runner's embsim parses it. A runner runs a
+  project only when the project's `[catalog]` names exactly the crates it
+  holds, in its order; another is refused, naming both and saying to run
+  it with `embsim`.
+- **How it hands over.** `embsim` takes the runner's path from Cargo's build
+  report and `exec`s it with the same arguments (its `argv[0]` `embsim`, so
+  usage reads as the tool's), and with what it measured of the crates it
+  built ("What a run prints about what a catalog built", below). The runner
+  is then the process: its output, its exit status and Ctrl-C are its own.
+  embsim is a Unix program (its PTYs are), so there is no other path.
+
+#### A runner the tool writes
+
+- **What it is.** A binary crate whose dependencies are `embsim-cli`, from
+  where the catalog crates take embsim ("Which embsim the runner builds
+  against", below), and each crate `[catalog]` names, by path. Its `main`
+  is `embsim_cli::runner_main` over the crates, one registration function
+  each:
 
   ```rust,ignore
   fn main() -> std::process::ExitCode {
-      embsim_cli::runner_main(&[embsim_cli::CatalogCrate {
-          name: "custom-project-catalog",
-          dir: "/home/me/embsim/examples/custom-project/catalog",
-          register: custom_project_catalog::register,
-      }])
+      embsim_cli::runner_main(&[
+          embsim_cli::CatalogCrate::new(
+              "custom-project-catalog",
+              "/home/me/embsim/examples/custom-project/catalog",
+              custom_project_catalog::register,
+          ),
+      ])
   }
   ```
 
 - **Where it lives.** In `.embsim/runner-<id>/` beside the project file:
   `Cargo.toml` and `main.rs`. `<id>` is eight hex digits of a hash of the
-  crates' canonical directories and the embsim checkout's, so two projects
-  that name the same crates share a runner. The manifest declares an empty
-  `[workspace]`, so the runner is never taken for a member of a workspace
-  it sits inside. `.embsim/` holds a `.gitignore` of `*`, written with the
-  directory, so nothing in it reaches version control.
-- **Who runs a project.** The `embsim` tool hands a `check` or `run` of a
-  project with `[catalog]` to its runner, and a `survey` or `new` given
-  `--project` naming one ("Surveying with a project's kinds", below); it
-  runs everything else itself. Before it hands over it reads only the
-  `[catalog]` table (`CatalogTable::of_project`), so a project that the
-  runner's embsim reads is never refused by an older `embsim`. A runner
-  runs a project only when the project's `[catalog]` names exactly the
-  crates it holds, in its order, and, when the project names a checkout,
-  the one it was built from; another is refused, naming both and saying to
-  run it with `embsim`. The runner's binary is the whole command, all four
-  subcommands, over the project's set, and the tool passes it the command
-  line unchanged. It can be run directly too: it is
+  crates' package names, which is all the lock file says of the runner, so
+  its lock fits on any machine, wherever the project sits. The manifest
+  declares an empty `[workspace]`, so the runner is never taken for a
+  member of a workspace it sits inside. `.embsim/` holds a `.gitignore` of
+  `*`, written with the directory, so nothing in it reaches version
+  control. The runner's binary can be run directly: it is
   `<target>/release/embsim-runner-<id>` in the target directory "When it
   builds" names (another profile's directory under
-  `EMBSIM_RUNNER_PROFILE`). A binary of the project's own over `main_with`
-  is the same command over a set it builds itself: it runs every project
-  with that set and reads no `[catalog]`, so it is for a project that
-  would rather own its binary than have the tool build one.
-- **When it builds.** On every command it hands over, `embsim` rewrites the
-  runner's three files only if their content would change, then runs
-  `cargo build` on the runner. The first build compiles embsim and the
-  catalog crates. After that Cargo rebuilds only what changed, and with
-  nothing changed the build is Cargo's own no-op check, a fraction of a
-  second. One line goes to standard error first:
+  `EMBSIM_RUNNER_PROFILE`).
+- **Its lock file is the project's.** The runner's `Cargo.lock` is kept
+  beside the project as `embsim.lock`, a file to commit. When it is there,
+  the tool copies it in and builds `--locked`, so every machine builds the
+  same runner. The first build, with none there, starts from a seed: the
+  lock file of the workspace the first catalog crate is a member of, with
+  every package of embsim's own lock file (for an embsim checkout) whose
+  name the workspace's does not lock. A dependency the workspace locks
+  keeps the version the workspace builds it at (in MaD, `clap` 4.5.57
+  where embsim was tested at 4.6.7); one only embsim locks takes the
+  version embsim was tested at. Cargo resolves the rest at the newest
+  version that fits, and the tool keeps what it settled as `embsim.lock`:
 
   ```text
-  embsim: building the runner for project.toml (custom-project-catalog, embsim at /home/me/embsim) in ./.embsim/runner-403071fb
+  embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
+  ```
+
+  A name the workspace locks is never given a second version from
+  embsim's file: two versions of one name make the workspace's own entries
+  ambiguous. When the crates' dependencies change so that `embsim.lock` no
+  longer locks them, the `--locked` build fails and the tool says to remove
+  the file and run again: Cargo locks what changed, and the new lock is
+  kept there. Projects in one directory that name catalog crates share its
+  `embsim.lock`, so they name the same crates; an `embsim.lock` that locks
+  another runner is refused, naming it.
+- **When it builds.** On every command it hands over, `embsim` rewrites the
+  runner's two files only if their content would change, then runs `cargo
+  build` on the runner. The first build compiles embsim and the catalog
+  crates. After that Cargo rebuilds only what changed, and with nothing
+  changed the build is Cargo's own no-op check, a fraction of a second. One
+  line goes to standard error first:
+
+  ```text
+  embsim: building the runner for project.toml (custom-project-catalog, embsim at /home/me/embsim) in ./.embsim/runner-8c3b66a6
   ```
 
   The first build, and a `--rebuild`, show Cargo's progress. A runner built
@@ -1558,45 +1649,18 @@ whose `--project` names one, runs in a **runner**: a small crate the
 
   The profile is `release`, unless `EMBSIM_RUNNER_PROFILE` names another.
   The target directory is the one Cargo gives the workspace the first
-  catalog crate is a member of (`CARGO_TARGET_DIR` when it is set; MaD's
-  `SIL/target`), so the crates that workspace has already built are reused.
-  A crate in no workspace builds in `.embsim/target` beside the project
-  (or `CARGO_TARGET_DIR`), never in a `target/` inside the crate: that is a
+  catalog crate is a member of (`CARGO_TARGET_DIR` when it is set), so the
+  crates that workspace has already built are reused. A crate in no
+  workspace builds in `.embsim/target` beside the project (or
+  `CARGO_TARGET_DIR`), never in a `target/` inside the crate: that is a
   package that is its own root with no `[workspace]` table, as `embsim new
   --catalog` starts one outside any workspace, or a crate in a directory a
   workspace covers without listing it.
-
-  The runner's `Cargo.lock` is seeded from that workspace's lock file, with
-  every package of embsim's own lock file whose name the workspace's does
-  not lock added to it. A dependency the workspace locks keeps the version
-  the workspace builds it at (in MaD, `clap` 4.5.57 where embsim was tested
-  at 4.6.7); one only embsim locks takes the version embsim was tested at
-  (in MaD, `serde`, `serde_json`, `toml`). Cargo resolves afresh, at the
-  newest version that fits, a name neither file locks and one locked at a
-  version the runner's graph does not take: in MaD, `toml_edit`, locked at
-  0.25 where embsim takes 0.22, and `serde_core`, locked at 1.0.228 where
-  embsim's `serde` 1.0.229 takes 1.0.229 exactly. Those versions are the
-  newest on the day the runner is first built (or seeded again), so they
-  can differ from one machine to the next, and nothing holds them to
-  embsim's MSRV; the runner's `Cargo.lock` keeps what Cargo chose until the
-  seed changes. A name the workspace locks is never given a second version
-  from embsim's file: two versions of one name make the workspace's own
-  entries ambiguous, and MaD's lock file and embsim's, merged that way
-  (by name, version and source), did not resolve: `serde_core` 1.0.228 and
-  1.0.229 both locked, and one graph can hold only one. Without a workspace
-  the seed is embsim's lock file alone. The seed is kept beside the lock
-  (`Cargo.lock.seed`); when a later command computes a different one,
-  because either lock file changed, the runner's lock is seeded again.
-  Between seeds the lock is Cargo's, as it resolved it.
 - **`--rebuild`.** `check --rebuild` and `run --rebuild` remove the
   runner's directory, write it afresh, and `cargo clean` the runner and the
-  catalog crates before the build: for a change Cargo cannot see. A project
-  without `[catalog]` has nothing to rebuild.
-- **How it hands over.** `embsim` takes the runner's path from Cargo's build
-  report and `exec`s it with the same arguments (its `argv[0]` `embsim`, so
-  usage reads as the tool's). The runner is then the process: its output,
-  its exit status and Ctrl-C are its own. embsim is a Unix program (its
-  PTYs are), so there is no other path.
+  catalog crates before the build: for a change Cargo cannot see. The lock,
+  `embsim.lock`, stays. A project without `[catalog]` has nothing to
+  rebuild.
 - **When the build fails.** The command exits 1 with Cargo's errors above
   one line saying which runner did not build, from which crates, against
   which embsim, and what a catalog crate exports:
@@ -1605,82 +1669,125 @@ whose `--project` names one, runs in a **runner**: a small crate the
   error: the runner for p.toml did not build (catalog crates broken-catalog; embsim at /home/me/embsim); Cargo's errors are above. A catalog crate is a library with `pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError>` at its root (PROJECTS.md §10)
   ```
 
-  A build that failed because its graph holds two packages of one embsim
-  name (Cargo's "package collision in the lockfile", read off a `cargo
-  metadata` of the runner after the failure) says that instead: two copies
-  of embsim, the collision Cargo named, and where every crate's embsim
-  dependencies, the catalog crates' and the crates they depend on, should
-  point.
-
+  A build that failed because its graph holds two copies of embsim says
+  that instead ("Which embsim the runner builds against", below).
 - **When there is no Cargo.** The tool builds with `$CARGO` (what Cargo
   sets for a program it runs), else `cargo` on the `PATH`. When neither
   starts, the command exits 1 saying the project's catalog crates need
   Cargo, which one did not start, where Rust's toolchain comes from, and
   that a binary of the project's own over `main_with` needs no runner. The
-  runner's files are written by then, so they can be built by hand.
+  runner's files are written by then, from what the first crate's manifest
+  says of its embsim, so they can be built by hand.
 - **Before Cargo builds**, the tool refuses what it can see: a crate path
   that is not there, a directory without a `Cargo.toml`, a manifest with no
   `[package]` name (a workspace's), a package with no library, an embsim
   crate named as a catalog crate, and two crates with one package name.
   Each refusal names the path as the file gives it and where it reached.
   Then it reads each crate's embsim dependencies (`cargo metadata
-  --no-deps`, no build) and refuses a crate whose embsim dependency is in
-  another checkout ("Which embsim the runner builds against", below).
+  --no-deps`, no build, nothing fetched) and refuses a crate whose embsim is
+  not the first crate's (below).
+
+#### A runner the project owns
+
+A project in a Cargo workspace of its own — MaD's `SIL/` — owns its runner:
+a binary crate, a member of that workspace, named in the file:
+
+```toml
+[catalog]
+crates = ["sim/catalog"]
+runner = "sim/runner"
+```
+
+Its `main` is the same as a written runner's, each catalog crate's
+directory reached from the runner's own (`concat!(env!("CARGO_MANIFEST_DIR"),
+"/../catalog")`). `embsim new --catalog sim/catalog --own-runner` starts it
+beside the catalog crate (`sim/runner`; `--own-runner DIR` puts it
+elsewhere) and names it, with `embsim-cli` from the catalog crate's embsim
+and the catalog crate by path:
+
+```rust,ignore
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    embsim_cli::runner_main(&[embsim_cli::CatalogCrate::new(
+        "sim-catalog",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../catalog"),
+        sim_catalog::register,
+    )])
+}
+```
+
+The tool reads the crate (`cargo metadata --no-deps`; it is refused unless
+it is a package with one binary, or one named as the package), builds that
+binary by the crate's own manifest — in the target directory and with the
+profile settings the workspace's Cargo settles, `--locked` against the
+workspace's `Cargo.lock` once there is one — and `exec`s it. The first
+build of a workspace with no lock file says to commit the one Cargo wrote.
+A lock that no longer fits is refused, saying to update it with Cargo and
+commit it. `--rebuild` cleans the runner and its catalog crates; the lock
+stays. The tool writes nothing beside the project. Which embsim the runner
+holds is its own `embsim-cli` dependency, in the project's lock file; the
+crates' embsim and it are one copy, or Cargo refuses the graph (below). A
+catalog crate the project adds joins the runner's dependencies and the
+list its `main` hands `runner_main`, as it joins `[catalog] crates`.
 
 #### Which embsim the runner builds against
 
-The runner's `embsim-cli` and every catalog crate's embsim dependencies must
-be one copy of embsim. `embsim` picks the checkout in this order:
+A runner holds one copy of embsim: the one the project's own Cargo files
+name. For a runner the tool writes, that is where the first catalog
+crate's `embsim-boards` comes from — every catalog crate depends on it,
+for the `CatalogSet` its registration function takes:
 
-1. `[catalog] embsim`, when the project gives it (an embsim workspace
-   root: its `cli/Cargo.toml` is `embsim-cli`, and `p2-qemu` is there);
-2. the checkout `embsim` was built from (`embsim_cli::source_dir()`, the
-   workspace root of the `embsim-cli` it was compiled from).
+| The crate's `embsim-boards` | The runner's `embsim-cli` |
+|---|---|
+| `{ path = "../embsim/boards" }`, a checkout | `{ path = "<the checkout>/cli" }`, spelled as the crate spells it |
+| `{ git = "…", rev = "…" }` (or `branch`, `tag`, or neither) | the same repository at the same revision |
+| `"0.2"`, a crates.io release | `"0.2"` |
 
-How an installed `embsim` finds that checkout: `cargo install --path cli`
-records the checkout it was run in, which stays where it is.
-`cargo install --git https://github.com/RileyMcCarthy/embsim embsim-cli`
-records the checkout Cargo keeps under `$CARGO_HOME/git/checkouts/`, which
-lasts until Cargo's cache is cleaned; a catalog crate whose embsim
-dependencies are that git source resolves to the same files only when
-it pins the same revision, so such a project names its own checkout with
-`[catalog] embsim` and points its crate's paths there. When the recorded
-checkout is gone, the tool says so and asks for `[catalog] embsim`. The
-crate `embsim new --catalog` starts depends on the checkout the project
-names, or on the recorded one, by path, so the two agree from the start.
+So the embsim a project builds against is its choice, written in its
+crate's manifest and locked in its lock file, and the same on every
+machine; which `embsim` tool started the build does not change it. The
+tool's own version and the runner's may differ: each run prints both
+("What a run prints about what a catalog built", below). A project that
+must run on embsim of one release says so with `requires-embsim` (section
+2), and the runner's embsim checks it.
 
-The tool checks this before it builds. `cargo metadata --no-deps` on each
-catalog crate gives its `embsim-*` dependencies (the normal and build ones,
-which the runner links), at the paths Cargo resolved. Each must be inside
-the checkout, links followed, or the project is refused with nothing
-built, naming the crate, the directory it takes embsim from and the
-checkout the runner builds against, and saying to point the crate there
-or, when the crate's own is a checkout, to name it:
+The tool checks one copy before it builds. `cargo metadata --no-deps` on
+each catalog crate gives its embsim dependencies — the normal and build
+ones, which the runner links — and every one must come from where the
+first crate's `embsim-boards` does: one checkout (links followed), one
+repository at one revision, or crates.io. Otherwise the project is
+refused with nothing built, naming the crate, the embsim crate it takes
+from elsewhere and where, and where the first crate's comes from:
 
 ```text
-error: p.toml: catalog crate rig-catalog takes embsim-board from /home/me/embsim-copy/board, which is not in the embsim checkout the runner builds against, /home/me/embsim (the checkout this embsim was built from). A runner holds one copy of embsim: two would be two virtual clocks, and a part on one would wait on time nobody advances. Point the crate's embsim dependencies at /home/me/embsim, or build against the checkout it uses: [catalog] embsim = "../embsim-copy" (PROJECTS.md §10)
+error: p.toml: catalog crate more-catalog takes embsim-boards at /home/me/embsim-copy, and the runner builds against the embsim rig-catalog takes embsim-boards at /home/me/embsim. A runner holds one copy of embsim: two would be two virtual clocks, and a part on one would wait on time nobody advances. Point every catalog crate's embsim dependencies at one embsim (PROJECTS.md §10)
 ```
 
-The runner then reaches the checkout by the path the crates use. Cargo
-tells packages apart by path as written, so a checkout the crates reach
-through a symlink (MaD's `SIL/embsim`, in a copy where it is a link) would
-be two packages of every name if the runner spelled it resolved; the
-runner spells it as they do, and the build line says `embsim at` that
-path. Crates that spell one checkout two ways are refused, naming both.
+The runner reaches a checkout by the path the crates use. Cargo tells
+packages apart by path as written, so a checkout the crates reach through
+a symlink (MaD's `SIL/embsim`, in a copy where it is a link) would be two
+packages of every name if the runner spelled it resolved; the runner
+spells it as they do, and the build line says `embsim at` that path.
+Crates that spell one checkout two ways are refused, naming both.
 
-Past that, Cargo refuses most of the ways two copies could meet: a type
-from one copy is not the other's, so a registration function taking
-another copy's `CatalogSet` does not compile, and two packages of one name and
-version at two paths are Cargo's "package collision in the lockfile",
-which the tool names as two copies ("When the build fails", above). That
-covers a crate the catalog crate depends on (MaD's `p2iss`) taking embsim
-from elsewhere, which the check before the build does not read. What
-compiles anyway — a catalog crate reading the virtual clock of an
-`embsim-core` of its own — the tool reads off Cargo's build report: every
-`embsim_*` library the build reports must come from one directory, and a
-runner whose build reports two is refused, naming the library and both
-places, before it runs. Each copy would have its own virtual clock, and a
-part on one would wait on time nobody advances.
+Past that, Cargo refuses every other way two copies could meet, before
+anything compiles: `embsim-core` claims `links = "embsim-core"`, and Cargo
+lets one package in a graph claim a links name. That covers a crate the
+catalog crate depends on (MaD's `p2iss`) taking embsim from elsewhere,
+which the check before the build does not read, and a project's own runner
+whose `embsim-cli` is not its crates' embsim. The tool names Cargo's
+refusal as two copies:
+
+```text
+error: the runner for p.toml did not build: it met two copies of embsim (package `embsim-core` links to the native library `embsim-core`, but it conflicts with a previous package which links to `embsim-core` as well; the first is package `embsim-core v0.2.0 (/home/me/embsim/core)`; the second required by package `rig-helper v0.1.0 (/home/me/rig/helper)`); Cargo's errors are above. Each copy would have its own virtual clock. Point the embsim dependencies of every catalog crate, and of the crates they depend on, at embsim at /home/me/embsim, each spelled the same way (PROJECTS.md §10)
+```
+
+What could still compile — two `embsim_*` libraries from two directories —
+the tool reads off Cargo's build report, and a runner whose build reports
+one library from two places is refused before it runs. Each copy would
+have its own virtual clock, and a part on one would wait on time nobody
+advances.
 
 A runner links no QEMU, as the tool links none: its P2 QEMU core starts the
 `qemu-system-p2` it finds when a board is built, exactly as the tool's does,
@@ -1702,9 +1809,10 @@ embsim new --project rig.toml board.net -o boards/b.toml   # a starter project n
 ```
 
 `new --project` writes the project's `[catalog]` into the starter project,
-its paths rewritten to reach the crates from where the starter is written
-(relative, unless the two share only the root), so `embsim check
-boards/b.toml` runs through a runner holding the same crates; it does not
+its crates and its own runner, when it names one, with their paths
+rewritten to reach them from where the starter is written (relative,
+unless the two share only the root), so `embsim check boards/b.toml` runs
+through a runner holding the same crates; it does not
 start a crate (`--catalog`) or add to a project (`--add-to`). Without
 `--project`, a board kind no shipped catalog has is refused with the way
 to it:
@@ -1740,9 +1848,9 @@ The example below, a doc test of `embsim-boards`, adds a core that holds
 the chip in reset and records nothing, and seats it in the P2-EC32MB:
 
 ```rust
-use embsim_board::{Assignment, PartOptions, Project, ProjectError};
+use embsim_board::{Assignment, KindInfo, PartOptions, Project, ProjectError};
 use embsim_boards::catalog::CatalogSet;
-use embsim_boards::p2::{CoreCatalog, CoreCtor, CoreKind, HeldInReset, P2Core};
+use embsim_boards::p2::{CoreCatalog, CoreCtor, HeldInReset, P2Core};
 
 /// One core kind, `my-core`.
 struct MyCores;
@@ -1752,8 +1860,8 @@ impl CoreCatalog for MyCores {
         "my-catalog"
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind { name: "my-core", summary: "a core that runs nothing" }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("my-core", "a core that runs nothing")]
     }
 
     fn seat(
@@ -1819,7 +1927,9 @@ says so once, so a project names the board and nothing else. MaD's Edge
 carrier is this shape ([`MIGRATING-MAD.md`](MIGRATING-MAD.md)).
 
 ```rust
-use embsim_board::{netlist, BoardSpec, Catalog, CatalogBoard, ModelSpec, Project, ProjectError};
+use embsim_board::{
+    netlist, BoardSpec, Catalog, CatalogBoard, KindInfo, ModelSpec, Project, ProjectError,
+};
 use embsim_boards::catalog::CatalogSet;
 
 /// The carrier's netlist, as a crate bundles its board's EDA export
@@ -1847,8 +1957,8 @@ impl Catalog for MyBoards {
         "my-catalog"
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        vec!["my-carrier".to_string()]
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("my-carrier", "a carrier whose module socket is J1")]
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
@@ -2060,12 +2170,42 @@ what they return under their subject, stamped like a finding. A look reads
 state the engine's thread wrote while the run's thread was parked, so on
 the stepped clock two runs print the same report, as section 3 says.
 
+A run also says what its binary is made of, under the project line, so a
+result can be traced to what produced it (`DESIGN.md` rule 9):
+
+```text
+project project.toml
+  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  embsim 0.2.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
+  built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
+  catalog crate custom-project-catalog 0.1.0: /home/me/embsim/examples/custom-project/catalog, git rev 4f0c2a1b3d5e
+```
+
+The first two lines are compiled into the binary (`embsim-cli`'s
+`build.rs`): embsim's release, the git revision its sources were at —
+`+changes` when the embsim crates had changes no commit holds — and where
+they were, then the compiler, the target and the profile. `embsim -V` says
+the release and the revision, and `embsim --version` all of it. The
+catalog crates' lines — and a project's own runner crate's — are what the
+tool measured right after it built the runner, handed to it in
+`EMBSIM_PROVENANCE`; a runner started by hand names its crates and says
+their revisions come from the tool. A P2 QEMU core says at its first look
+which program runs it, where that was found, and its protocol, target and
+QEMU:
+
+```text
+[   0.000000 ms] EC32.U100: qemu-system-p2 /home/me/.embsim/qemu/fb2a01e4049c2979/qemu-system-p2 (installed by `embsim qemu install`): protocol 1, P2 target fb2a01e4049c2979, QEMU 10.1.0
+```
+
 ### MaD, the first project to extend embsim
 
 The MaD tensile tester (`RileyMcCarthy/MaD`, `SIL/`) is the consumer this
 section was designed against. Its SIL today is `mad-emulator`, a program
 that assembles the system by hand. As a project it is one catalog crate,
-`SIL/mad-catalog`, adding four kinds, and one file, `SIL/mad.toml`:
+`SIL/mad-catalog`, adding four kinds; its own runner, `SIL/mad-runner`,
+both members of MaD's `SIL` workspace and built against its committed
+`SIL/Cargo.lock`, with embsim a path dependency through the `SIL/embsim`
+submodule; and one file, `SIL/mad.toml`:
 
 | Kind | Sort | What it is |
 |---|---|---|

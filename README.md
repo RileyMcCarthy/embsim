@@ -31,9 +31,11 @@ instruction-set simulator, a bench part such as a machine's mechanism), the
 project writes them in Rust, in a **catalog crate** of its own, and names
 the crate in its file (`[catalog] crates = ["sim/catalog"]`). The `embsim`
 tool then builds the crate and embsim into one binary with Cargo, a
-**runner** kept beside the project, and runs the project through it: the
-same command, with the project's kinds beside embsim's. There is no plugin
-interface; Cargo compiles one binary against one copy of embsim.
+**runner** — the project's own crate, or one the tool keeps beside the
+project — and runs the project through it: the same command, with the
+project's kinds beside embsim's, against the embsim the catalog crate
+itself depends on. There is no plugin interface; Cargo compiles one binary
+against one copy of embsim.
 `embsim new --catalog DIR` starts such a crate.
 [`examples/custom-project`](examples/custom-project/README.md) is one,
 worked end to end, and [`PROJECTS.md`](PROJECTS.md) is the guide (section
@@ -251,8 +253,12 @@ are in [`PROJECTS.md`](PROJECTS.md); the example projects are in
 
 ### The `embsim` command
 
-`cargo install --path cli` (or `cargo run -p embsim-cli --`) gives the
-command that takes a netlist to a running system. Every step goes through the
+`cargo install --locked --git https://github.com/RileyMcCarthy/embsim
+--tag v0.2.0 embsim-cli` (or, in a checkout, `cargo install --locked --path
+cli`, or `cargo run -p embsim-cli --`) gives the command that takes a
+netlist to a running system. `embsim --version` says which release, git
+revision, compiler, target and profile it is, and every `check` and `run`
+prints the same under its project line. Every step goes through the
 same project, catalog and survey as the Rust above.
 
 ```bash
@@ -289,18 +295,24 @@ embsim run board.toml --for 20ms --net BOARD.VCC
   ones still true. `--pty` says where a `host-serial` component's PTY goes.
 
 A project whose file names catalog crates of its own (`[catalog]`) is
-checked and run through a **runner**: `embsim` writes a small crate beside
-the project (`.embsim/runner-<id>/`, kept out of git), builds it with Cargo
-— the project's crates and embsim in one binary, reusing what the crates'
-workspace built, and with nothing changed only Cargo's no-op check — and
-hands the command line to it. `embsim new --catalog DIR` starts such a
-crate with one commented example of each sort of kind, and names it in the
-project (`--add-to PROJECT`, or the starter project `new` writes);
-`check --rebuild` builds the runner afresh. `survey` and `new` take
-`--project FILE` to run in that project's runner, so the checklist offers
-the project's own kinds. The tool takes embsim's crates from the checkout
-it was built from, or the project's `[catalog] embsim` (`PROJECTS.md`
-section 10, "The runner").
+checked and run through a **runner**: the project's crates and embsim in
+one binary, which `embsim` builds with Cargo — with nothing changed only
+Cargo's no-op check — and hands the command line to. The runner is the
+project's own crate when the file names one (`[catalog] runner`, built in
+the project's Cargo workspace against its lock file), else a small crate
+the tool writes beside the project (`.embsim/runner-<id>/`, kept out of
+git) whose lock it keeps as `embsim.lock`, for the project to commit.
+Either way the runner's embsim is the one the catalog crates depend on, by
+path, git revision or release, whichever `embsim` tool started it.
+`embsim new --catalog DIR` starts such a crate with one commented example
+of each sort of kind, and names it in the project (`--add-to PROJECT`, or
+the starter project `new` writes); `--own-runner` starts the runner crate
+beside it. `check --rebuild` builds the runner afresh. `survey` and `new`
+take `--project FILE` to run in that project's runner, so the checklist
+offers the project's own kinds (`PROJECTS.md` section 10, "The runner").
+A project names the embsim release it is written for with
+`requires-embsim = "0.2"`, which every embsim reads first (`PROJECTS.md`
+section 2).
 
 The standard catalog's bench component kinds are `host-serial`, a host's
 serial port as a PTY on the host's own rail, and `scripted-source`, a pin
@@ -320,17 +332,28 @@ saying how to install it. The boot as a project file is in
 
 ## Using embsim in your project
 
-embsim is a Cargo workspace of path crates (not yet on crates.io). A project
-keeps it as a **git submodule**, so its catalog crate and the `embsim` tool
-come from one pinned checkout:
+embsim is a Cargo workspace (not yet on crates.io), released by git tag.
+A project's catalog crate names the embsim it builds against in its own
+`Cargo.toml`, and that is the embsim its runner holds, whichever `embsim`
+tool starts it (`PROJECTS.md` §10, "Which embsim the runner builds
+against"). Either from embsim's repository at a release:
+
+```toml
+# sim/catalog/Cargo.toml
+[dependencies]
+embsim-board  = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }
+embsim-boards = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }
+embsim-core   = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }   # the virtual clock
+```
+
+or, with embsim kept as a **git submodule** of the project, by path into
+that checkout, so the catalog crate and the tool come from one pinned
+commit:
 
 ```bash
 git submodule add https://github.com/RileyMcCarthy/embsim.git vendor/embsim
-cargo install --path vendor/embsim/cli      # or run it in place:
 cargo run --release --manifest-path vendor/embsim/Cargo.toml -p embsim-cli -- check sim.toml
 ```
-
-The catalog crate depends on embsim's crates by path, into that checkout:
 
 ```toml
 # sim/catalog/Cargo.toml
@@ -340,18 +363,24 @@ embsim-boards = { path = "../../vendor/embsim/boards" }
 embsim-core   = { path = "../../vendor/embsim/core" }   # the virtual clock
 ```
 
-The runner takes embsim from the checkout the tool was built from, or from
-the project's `[catalog] embsim`, refuses a catalog crate whose embsim
-dependencies are another copy before it builds, and spells the checkout as
-the crates do (`PROJECTS.md` §10, "Which embsim the runner builds
-against"). A project
-workspace should `exclude` the submodule directory (embsim is its own
-workspace root); path dependencies across the boundary work fine:
+`embsim new --catalog DIR` writes whichever fits: the path when the tool's
+own checkout sits inside the project's repository, else the repository at
+the tool's revision. Every catalog crate's embsim must be the same one;
+the tool refuses another before it builds, and Cargo refuses a second copy
+anywhere in the graph (`embsim-core` claims `links = "embsim-core"`). A
+project workspace with embsim as a submodule should `exclude` the
+submodule directory (embsim is its own workspace root); path dependencies
+across the boundary work fine:
 
 ```toml
 [workspace]
 exclude = ["vendor/embsim"]
 ```
+
+A project in a workspace of its own owns its runner: a member crate whose
+`main` is `embsim_cli::runner_main` over its catalog crates, named in
+`[catalog] runner` and built against the workspace's committed
+`Cargo.lock` (`embsim new --catalog DIR --own-runner` starts it).
 
 A project that would rather own its binary than have the tool build a
 runner writes ten lines over the command's library (`embsim_cli::shipped`,

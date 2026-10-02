@@ -21,7 +21,7 @@ resolver = "2"
 # Shared package metadata. A crate opts in with `version.workspace = true`,
 # `license.workspace = true`, etc.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Minimum supported Rust version. Determined empirically: gimli 0.34 (pulled in
 # by tools/memory-inspect) requires rustc 1.88, and 1.88 builds the whole
@@ -47,7 +47,7 @@ toml_edit = "0.22"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 # The `embsim` command line (cli/): subcommands and their options, derived.
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "string"] }
 # Test harness: discrete case matrices (`#[rstest]`, `#[case]`, `#[values]`).
 # See TESTING.md. All workspace crates that ship tests take this as a
 # dev-dependency so failure names and filters stay consistent.

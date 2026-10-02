@@ -11,9 +11,9 @@ publish = false
 description = "An example catalog crate: a part model, a board, a P2 core and a bench component a project adds to embsim"
 
 [dependencies]
-# The embsim checkout the runner builds against: the same directory the
-# project's [catalog] embsim names, or the one the `embsim` tool was built
-# from (here, the checkout this example lives in).
+# The embsim this project builds against: the runner takes embsim-cli from
+# where embsim-boards comes from here (the checkout this example lives in, by
+# path), and embsim.lock beside the project locks the rest.
 embsim-board = { path = "../../../board" }
 embsim-boards = { path = "../../../boards" }
 embsim-core = { path = "../../../core" }

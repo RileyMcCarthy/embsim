@@ -3,7 +3,9 @@
 # `cli/tests/template.rs` checks and runs a project naming its kinds.
 # `embsim new --catalog DIR` copies `src/lib.rs` with the project's name in
 # place of "yourproject", and writes a manifest of its own like this one
-# whose paths reach the embsim checkout (cli/src/scaffold.rs).
+# whose embsim dependencies are the embsim the project builds against: a
+# path into a checkout inside the project, or embsim's repository at a
+# revision (cli/src/scaffold.rs).
 [package]
 name = "yourproject-catalog"
 version = "0.1.0"

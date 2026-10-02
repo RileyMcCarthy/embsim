@@ -25,11 +25,11 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::{
     netlist, Assignment, AttachError, BoardSpec, Catalog, CatalogBoard, Component, ComponentNetIo,
-    ComponentRequest, KindGuide, ModelFacade, ModelSpec, Named, PartOptions, PartRegistry, PinDecl,
-    ProjectError, Report, TheveninDrive,
+    ComponentRequest, KindGuide, KindInfo, ModelFacade, ModelSpec, Named, PartOptions,
+    PartRegistry, PinDecl, ProjectError, Report, TheveninDrive,
 };
 use embsim_boards::catalog::CatalogSet;
-use embsim_boards::p2::{CoreCatalog, CoreCtor, CoreKind, P2Core, P2Pads};
+use embsim_boards::p2::{CoreCatalog, CoreCtor, P2Core, P2Pads};
 use embsim_core::virtual_clock;
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
@@ -156,8 +156,11 @@ impl Catalog for LibCatalog {
         "lib-test-catalog"
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        vec!["lib-test-strip".to_string()]
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            "lib-test-strip",
+            "a strip whose header is a connector",
+        )]
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
@@ -171,7 +174,7 @@ impl Catalog for LibCatalog {
         vec![KindGuide::new(
             "lib-test-lamp",
             "a lamp that reads the voltage across it",
-            Named::Family(&["LIBTEST-LAMP"]),
+            Named::family(["LIBTEST-LAMP"]),
         )]
     }
 
@@ -195,8 +198,14 @@ impl Catalog for LibCatalog {
         Ok(())
     }
 
-    fn component_kinds(&self) -> Vec<String> {
-        vec!["lib-test-source".to_string()]
+    fn component_kinds(&self) -> Vec<KindInfo> {
+        vec![
+            KindInfo::new("lib-test-source", "one pin driving a voltage").requires(
+                "volts",
+                "3.3",
+                "what the source drives",
+            ),
+        ]
     }
 
     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
@@ -234,11 +243,11 @@ impl CoreCatalog for LibCores {
         "lib-test-catalog"
     }
 
-    fn core_kinds(&self) -> Vec<CoreKind> {
-        vec![CoreKind {
-            name: "lib-test-core",
-            summary: "a core that records when it starts",
-        }]
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new(
+            "lib-test-core",
+            "a core that records when it starts",
+        )]
     }
 
     fn seat(

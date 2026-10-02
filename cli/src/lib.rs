@@ -32,13 +32,28 @@
 //! its file (`[catalog] crates = ["sim/catalog"]`). The `embsim` binary is
 //! [`tool_main`]: a project without `[catalog]` runs in it, over
 //! [`shipped`] (the standard catalog, and QEMU as a P2 core); a project
-//! with `[catalog]` is handed to a **runner**, a crate the tool writes
-//! beside the project, builds with Cargo and `exec`s — the same command
-//! over a set the project's catalogs joined ([`runner_main`];
-//! `PROJECTS.md` §10, "The runner"). `embsim new --catalog DIR` starts a
-//! catalog crate. `survey` and `new` take `--project FILE` to run in that
-//! project's runner the same way, so a part's candidates, `--kind`, and the
-//! starter project's `[catalog]` are the project's.
+//! with `[catalog]` is handed to a **runner** — the same command over a set
+//! the project's catalogs joined ([`runner_main`]) — which the tool builds
+//! with Cargo and `exec`s: the project's own runner crate when the file
+//! names one (`[catalog] runner`), else one the tool writes beside the
+//! project, against the embsim the catalog crates themselves depend on
+//! (`PROJECTS.md` §10, "The runner"). `embsim new --catalog DIR` starts a
+//! catalog crate, and `--own-runner` a runner crate beside it. `survey` and
+//! `new` take `--project FILE` to run in that project's runner the same
+//! way, so a part's candidates, `--kind`, and the starter project's
+//! `[catalog]` are the project's.
+//!
+//! The tool reads two things of a project before anything else, and
+//! nothing else before it chooses who runs it: its `[catalog]` and the
+//! embsim release it is written for, `requires-embsim` (`ProjectHead`),
+//! each read leniently. So a project written for a newer embsim, even one
+//! whose command line this tool cannot parse, still reaches its runner,
+//! and a project without catalog crates that a newer embsim wrote says so.
+//!
+//! Every `check` and `run` prints what its binary is made of under the
+//! project line — embsim's version and git revision and where its sources
+//! were, the compiler, target and profile, each catalog crate's version and
+//! revision — and `--version` says the same.
 //!
 //! A project's own binary is the same command over a set its catalogs
 //! joined, in ten lines, for a project that would rather own its binary
@@ -78,22 +93,26 @@
 //! first with the same registry, and every kind — whichever catalog it
 //! comes from — seated only on a part that is what it says.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use embsim_board::{CatalogTable, ProjectError};
+use embsim_board::{CatalogTable, ProjectError, ProjectHead};
 pub use embsim_boards::catalog::CatalogSet;
 
 mod checklist;
 mod live;
+mod provenance;
 mod qemu;
 mod runner;
 mod scaffold;
 mod signals;
+
+pub use provenance::PROVENANCE_ENV;
+pub use runner::LOCK_FILE;
 
 /// Simulate boards from their netlists: survey a netlist, start a project
 /// for it, check the project, run it.
@@ -151,6 +170,14 @@ enum Command {
         /// `[catalog]`: the starter project's, or `--add-to`'s.
         #[arg(long, value_name = "DIR")]
         catalog: Option<PathBuf>,
+        /// With `--catalog`: start the project's own runner as well, a
+        /// binary crate in `DIR` (by default beside the catalog crate,
+        /// `sim/catalog` → `sim/runner`) whose main is the command over the
+        /// crate, and name it in the project's `[catalog] runner`. The tool
+        /// then builds that crate, with the workspace's lock file, instead
+        /// of writing a runner of its own.
+        #[arg(long = "own-runner", value_name = "DIR", requires = "catalog", num_args = 0..=1)]
+        own_runner: Option<Option<PathBuf>>,
         /// With `--catalog` and no netlist: the existing project whose
         /// `[catalog] crates` the new crate joins (the file is edited in
         /// place, its comments kept).
@@ -293,46 +320,103 @@ pub fn shipped() -> CatalogSet {
     set
 }
 
-/// The embsim checkout this crate was built from: its workspace root. A
-/// runner the `embsim` tool builds takes embsim from here unless the
-/// project names another (`[catalog] embsim`). For `cargo install --path
-/// cli` it is that checkout; for `cargo install --git` it is the checkout
-/// Cargo keeps under `$CARGO_HOME/git/checkouts`, which lasts until Cargo's
-/// cache is cleaned. It may be gone when a runner is wanted, and the tool
-/// then says to name one.
-pub fn source_dir() -> PathBuf {
-    let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
-    cli.parent().unwrap_or(cli).to_path_buf()
-}
-
 /// The `embsim` binary's `main`: the command over [`shipped`], except that
 /// a `check` or `run` of a project with `[catalog]`, or a `survey` or `new`
-/// with `--project` naming one, is handed to the project's runner —
-/// written beside the project, built with Cargo and `exec`ed with the same
-/// arguments (`PROJECTS.md` §10, "The runner").
-/// Before it hands over it reads only the project's `[catalog]` table.
+/// with `--project` naming one, is handed to the project's runner — its
+/// own runner crate, or one the tool writes beside it — built with Cargo
+/// and `exec`ed with the same arguments (`PROJECTS.md` §10, "The runner").
+///
+/// Before it hands over it reads only the project's head, leniently
+/// (`ProjectHead`): its `[catalog]` and `requires-embsim`. A command line
+/// clap cannot parse — a flag only a newer embsim has — is still handed
+/// over when it names a project with `[catalog]` (the project after
+/// `check` or `run`, or `--project`), for the runner's embsim to parse; a
+/// project without one that requires another embsim says so.
 pub fn tool_main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
-    let cli = Cli::parse_from(&args);
+    let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    if let Some(project) = cli.command.project() {
-        match CatalogTable::of_project(project) {
-            Ok(Some(catalog)) => {
-                let rebuild = cli.command.rebuild();
-                let outcome = runner::hand_over(project, &catalog, rebuild, &args, &mut err);
-                // `hand_over` returns only when it could not hand over.
-                let Err(message) = outcome;
-                let _ = writeln!(err, "error: {message}");
-                return ExitCode::FAILURE;
+    let cli = match parse(&args, &[]) {
+        Ok(cli) => cli,
+        Err(usage) => {
+            if usage.use_stderr() {
+                if let Some((project, rebuild)) = scan_project(&args) {
+                    if let Ok(head) = ProjectHead::of_project(&project) {
+                        if let Some(catalog) = head.catalog {
+                            return hand_over(&project, &catalog, rebuild, &args, &mut err);
+                        }
+                        if let Err(message) = head.check_version() {
+                            let _ = writeln!(err, "error: {}: {message}", project.display());
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
             }
-            Ok(None) => {}
+            return usage_exit(&usage, &mut out, &mut err);
+        }
+    };
+    if let Some(project) = cli.command.project() {
+        let head = match ProjectHead::of_project(project) {
+            Ok(head) => head,
             Err(message) => {
                 let _ = writeln!(err, "error: {message}");
                 return ExitCode::FAILURE;
             }
+        };
+        if let Some(catalog) = head.catalog {
+            return hand_over(project, &catalog, cli.command.rebuild(), &args, &mut err);
+        }
+        if let Err(message) = head.check_version() {
+            let _ = writeln!(err, "error: {}: {message}", project.display());
+            return ExitCode::FAILURE;
         }
     }
-    execute(&shipped(), cli.command, &mut std::io::stdout(), &mut err)
+    execute(&shipped(), &[], cli.command, &mut out, &mut err)
+}
+
+/// Hand `project` to its runner; returns only when that failed.
+fn hand_over(
+    project: &Path,
+    catalog: &CatalogTable,
+    rebuild: bool,
+    args: &[OsString],
+    err: &mut dyn Write,
+) -> ExitCode {
+    let outcome = runner::hand_over(project, catalog, rebuild, args, err);
+    // `hand_over` returns only when it could not hand over.
+    let Err(message) = outcome;
+    let _ = writeln!(err, "error: {message}");
+    ExitCode::FAILURE
+}
+
+/// The project a command line names, read without clap: the first argument
+/// after `check` or `run` that names a file, or `--project`'s value after
+/// `survey` or `new`; and whether `--rebuild` is among the arguments. What
+/// the tool hands over on when clap refuses the line, for the runner's
+/// embsim to parse.
+fn scan_project(args: &[OsString]) -> Option<(PathBuf, bool)> {
+    let words: Vec<&OsStr> = args.iter().skip(1).map(OsString::as_os_str).collect();
+    let at = words
+        .iter()
+        .position(|word| matches!(word.to_str(), Some("check" | "run" | "survey" | "new")))?;
+    let rebuild = words[at..].iter().any(|word| *word == "--rebuild");
+    let rest = &words[at + 1..];
+    let project = match words[at].to_str() {
+        Some("check" | "run") => rest
+            .iter()
+            .filter(|word| !word.to_string_lossy().starts_with('-'))
+            .map(PathBuf::from)
+            .find(|path| path.is_file()),
+        _ => rest.iter().enumerate().find_map(|(index, word)| {
+            let word = word.to_string_lossy();
+            match word.strip_prefix("--project") {
+                Some("") => rest.get(index + 1).map(PathBuf::from),
+                Some(value) => value.strip_prefix('=').map(PathBuf::from),
+                None => None,
+            }
+        }),
+    }?;
+    Some((project, rebuild))
 }
 
 /// A project's catalog crate's registration function: it adds the crate's
@@ -340,9 +424,11 @@ pub fn tool_main() -> ExitCode {
 /// `CatalogSet::add_cores`), and starts nothing.
 pub type Register = fn(&mut CatalogSet) -> Result<(), ProjectError>;
 
-/// One catalog crate a runner was built with: what the runner main the
-/// `embsim` tool writes lists, one per crate in the project's `[catalog]`.
+/// One catalog crate a runner was built with: what a runner's main lists,
+/// one per crate in the project's `[catalog]`. Non-exhaustive: build one
+/// with [`Self::new`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CatalogCrate {
     /// The crate's package name, as an error names it.
     pub name: &'static str,
@@ -353,12 +439,26 @@ pub struct CatalogCrate {
     pub register: Register,
 }
 
+impl CatalogCrate {
+    /// The crate `name` in the directory `dir` (absolute, or reached from
+    /// the runner crate's own: `concat!(env!("CARGO_MANIFEST_DIR"),
+    /// "/../catalog")`), registering with `register`.
+    pub const fn new(name: &'static str, dir: &'static str, register: Register) -> Self {
+        Self {
+            name,
+            dir,
+            register,
+        }
+    }
+}
+
 /// A runner's `main`: the command over [`shipped`] and `crates`, each
 /// crate's registration function called in order, with the process's own
 /// arguments and output. A `check` or `run` of a project (or a `survey` or
-/// `new` with `--project`) whose `[catalog]` names other crates, or another
-/// embsim checkout, is refused, naming both: the `embsim` tool builds one
-/// runner per set of crates, and runs a project only through its own.
+/// `new` with `--project`) whose `[catalog]` names other crates is
+/// refused, naming both: a runner runs only the projects whose crates it
+/// holds. What it prints of what it is made of names the crates, and the
+/// `embsim` tool that started it adds each one's version and revision.
 pub fn runner_main(crates: &[CatalogCrate]) -> ExitCode {
     run_with_crates(
         crates,
@@ -390,9 +490,10 @@ where
             return ExitCode::FAILURE;
         }
     }
-    let cli = match parse(args, out, err) {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match parse(&args, crates) {
         Ok(cli) => cli,
-        Err(code) => return code,
+        Err(usage) => return usage_exit(&usage, out, err),
     };
     if let Some(project) = cli.command.project() {
         if let Err(message) = runner::check_runner_fits(crates, project) {
@@ -400,7 +501,7 @@ where
             return ExitCode::FAILURE;
         }
     }
-    execute(&set, cli.command, out, err)
+    execute(&set, crates, cli.command, out, err)
 }
 
 /// The `embsim` command over `set`, with the process's own arguments and
@@ -408,10 +509,9 @@ where
 /// `set`. It runs every project itself, whatever its `[catalog]` says. A
 /// usage error prints clap's message and exits 2.
 pub fn main_with(set: CatalogSet) -> ExitCode {
-    let cli = Cli::parse();
-    execute(
+    run(
         &set,
-        cli.command,
+        std::env::args_os(),
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )
@@ -426,32 +526,38 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match parse(args, out, err) {
-        Ok(cli) => execute(set, cli.command, out, err),
-        Err(code) => code,
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    match parse(&args, &[]) {
+        Ok(cli) => execute(set, &[], cli.command, out, err),
+        Err(usage) => usage_exit(&usage, out, err),
     }
 }
 
-/// The command line `args`, or clap's message written where clap would
-/// write it and its exit code.
-fn parse<I, T>(args: I, out: &mut dyn Write, err: &mut dyn Write) -> Result<Cli, ExitCode>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
-    Cli::try_parse_from(args).map_err(|usage| {
-        let text = usage.render().to_string();
-        let _ = if usage.use_stderr() {
-            write!(err, "{text}")
-        } else {
-            write!(out, "{text}")
-        };
-        ExitCode::from(u8::try_from(usage.exit_code()).unwrap_or(2))
-    })
+/// The command line `args` for a binary over `crates`, its `--version`
+/// saying what the binary is made of.
+fn parse(args: &[OsString], crates: &[CatalogCrate]) -> Result<Cli, clap::Error> {
+    Cli::command()
+        .version(provenance::short_version())
+        .long_version(provenance::long_version(crates))
+        .try_get_matches_from(args)
+        .and_then(|matches| Cli::from_arg_matches(&matches))
+}
+
+/// Write clap's message where clap would write it, and return its exit
+/// code: 0 for `--help` and `--version`, 2 for a usage error.
+fn usage_exit(usage: &clap::Error, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let text = usage.render().to_string();
+    let _ = if usage.use_stderr() {
+        write!(err, "{text}")
+    } else {
+        write!(out, "{text}")
+    };
+    ExitCode::from(u8::try_from(usage.exit_code()).unwrap_or(2))
 }
 
 fn execute(
     set: &CatalogSet,
+    crates: &[CatalogCrate],
     command: Command,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -474,25 +580,35 @@ fn execute(
             output,
             force,
             catalog,
+            own_runner,
             add_to,
             project,
-        } => match (netlist, catalog) {
-            (Some(netlist), catalog) => checklist::new_project(
-                set,
-                &netlist,
-                &checklist::NewOptions {
-                    name: name.as_deref(),
-                    output: output.as_deref(),
-                    force,
-                    catalog: catalog.as_deref(),
-                    project: project.as_deref(),
-                },
-                out,
-            ),
-            (None, Some(catalog)) => scaffold::new_catalog(&catalog, add_to.as_deref(), out),
-            (None, None) => unreachable!("clap requires the netlist unless --catalog is given"),
-        },
-        Command::Check { project, .. } => live::check(set, &project, out),
+        } => {
+            // An empty path is the default directory, beside the crate.
+            let own_runner = own_runner.map(Option::unwrap_or_default);
+            match (netlist, catalog) {
+                (Some(netlist), catalog) => checklist::new_project(
+                    set,
+                    &netlist,
+                    &checklist::NewOptions {
+                        name: name.as_deref(),
+                        output: output.as_deref(),
+                        force,
+                        catalog: catalog.as_deref(),
+                        own_runner: own_runner.as_deref(),
+                        project: project.as_deref(),
+                    },
+                    out,
+                ),
+                (None, Some(catalog)) => {
+                    scaffold::new_catalog(&catalog, own_runner.as_deref(), add_to.as_deref(), out)
+                }
+                (None, None) => unreachable!("clap requires the netlist unless --catalog is given"),
+            }
+        }
+        Command::Check { project, .. } => {
+            live::check(set, &project, &provenance::lines(crates), out)
+        }
         Command::Run {
             project,
             duration,
@@ -506,6 +622,7 @@ fn execute(
                 duration,
                 nets,
                 ptys,
+                provenance: provenance::lines(crates),
             },
             out,
         ),

@@ -68,8 +68,8 @@ use embsim_board::{
 
 pub use crate::set::CatalogSet;
 pub use embsim_board::kind::{
-    is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, Named, PinTable,
-    RequiredOption, CONNECTOR_DESIGNATORS, SWITCH_DESIGNATORS, SWITCH_WORDS,
+    is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, KindInfo, Named, OptionValues,
+    PinTable, RequiredOption, CONNECTOR_DESIGNATORS, SWITCH_DESIGNATORS, SWITCH_WORDS,
 };
 use embsim_models::ads122u04::Config as AdcConfig;
 use embsim_models::ads122u04_component::{Ads122u04Component, ADS122U04_PINS};
@@ -106,8 +106,14 @@ use crate::p2::{self, p2x8c4m64p_pins, HeldInResetCores, P2Package};
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StandardCatalog;
 
-/// The catalog board kinds.
-const BOARD_KINDS: [&str; 1] = ["p2-ec32mb"];
+/// The catalog board kinds, as someone choosing one reads them.
+fn board_kinds() -> Vec<KindInfo> {
+    vec![KindInfo::new(
+        "p2-ec32mb",
+        "the Parallax P2-EC32MB module from its bundled netlist, every part placed but the \
+         processor, `U100`",
+    )]
+}
 
 /// One part kind: its name, what it is, and how it registers.
 struct PartKind {
@@ -116,7 +122,7 @@ struct PartKind {
     summary: &'static str,
     /// What a part has to be for the kind to seat there: checked for every
     /// part an entry reaches before the kind registers ([`Named`]).
-    is: Named,
+    is: Seat,
     /// Part numbers the kind is for that the base registry does not place
     /// by number (the processor): the guide names them beside the ones it
     /// does ([`known_parts`]).
@@ -124,110 +130,131 @@ struct PartKind {
     register: fn(&mut PartRegistry, &Assignment<'_>, PartOptions) -> Result<(), ProjectError>,
 }
 
+/// What a part has to be for a kind to seat there, as [`PART_KINDS`]
+/// writes it: [`Named`], its families static.
+#[derive(Debug, Clone, Copy)]
+enum Seat {
+    Family(&'static [&'static str]),
+    Connector,
+    Switch,
+    OneNet,
+}
+
+impl Seat {
+    fn named(self) -> Named {
+        match self {
+            Seat::Family(families) => Named::family(families.iter().copied()),
+            Seat::Connector => Named::Connector,
+            Seat::Switch => Named::Switch,
+            Seat::OneNet => Named::OneNet,
+        }
+    }
+}
+
 /// Every part kind, in the order `PROJECTS.md`'s table lists them.
 const PART_KINDS: &[PartKind] = &[
     PartKind {
         name: "p2",
         summary: "the Propeller 2 package",
-        is: Named::Family(&["P2X8C4M64P"]),
+        is: Seat::Family(&["P2X8C4M64P"]),
         unplaced: &["P2X8C4M64P"],
         register: p2_kind,
     },
     PartKind {
         name: "tg2520smn",
         summary: "EPSON TCXO; frequency from the part's value or number",
-        is: Named::Family(&["TG2520SMN"]),
+        is: Seat::Family(&["TG2520SMN"]),
         unplaced: &[],
         register: tg2520smn_kind,
     },
     PartKind {
         name: "74lvc2g04",
         summary: "NXP dual inverter",
-        is: Named::Family(&["74LVC2G04"]),
+        is: Seat::Family(&["74LVC2G04"]),
         unplaced: &[],
         register: lvc2g04_kind,
     },
     PartKind {
         name: "sn74lvc1g14",
         summary: "TI Schmitt inverter",
-        is: Named::Family(&["74LVC1G14"]),
+        is: Seat::Family(&["74LVC1G14"]),
         unplaced: &[],
         register: lvc1g14_kind,
     },
     PartKind {
         name: "aps6404l",
         summary: "AP Memory PSRAM",
-        is: Named::Family(&["APS6404L"]),
+        is: Seat::Family(&["APS6404L"]),
         unplaced: &[],
         register: aps6404l_kind,
     },
     PartKind {
         name: "w25q128jv",
         summary: "Winbond serial NOR flash, blank or holding an image",
-        is: Named::Family(&["W25Q128JV"]),
+        is: Seat::Family(&["W25Q128JV"]),
         unplaced: &[],
         register: w25q128jv_kind,
     },
     PartKind {
         name: "sd-card",
         summary: "a card in an SD socket",
-        is: Named::Connector,
+        is: Seat::Connector,
         unplaced: &[],
         register: sd_card_kind,
     },
     PartKind {
         name: "ap62301",
         summary: "Diodes buck; setpoint from its feedback divider",
-        is: Named::Family(&["AP62301"]),
+        is: Seat::Family(&["AP62301"]),
         unplaced: &[],
         register: ap62301_kind,
     },
     PartKind {
         name: "ncp114",
         summary: "onsemi LDO; setpoint from the part's value or number",
-        is: Named::Family(&["NCP114"]),
+        is: Seat::Family(&["NCP114"]),
         unplaced: &[],
         register: ncp114_kind,
     },
     PartKind {
         name: "xl1509",
         summary: "XLSEMI buck; version from the part's value or number",
-        is: Named::Family(&["XL1509"]),
+        is: Seat::Family(&["XL1509"]),
         unplaced: &[],
         register: xl1509_kind,
     },
     PartKind {
         name: "ucc12040",
         summary: "TI isolated DC/DC; setpoint from its SEL strap",
-        is: Named::Family(&["UCC12040"]),
+        is: Seat::Family(&["UCC12040"]),
         unplaced: &[],
         register: ucc12040_kind,
     },
     PartKind {
         name: "stm1061",
         summary: "ST voltage detector, from its ordering code",
-        is: Named::Family(&["STM1061"]),
+        is: Seat::Family(&["STM1061"]),
         unplaced: &[],
         register: stm1061_kind,
     },
     PartKind {
         name: "6n137",
         summary: "Lite-On optocoupler",
-        is: Named::Family(&["6N137"]),
+        is: Seat::Family(&["6N137"]),
         unplaced: &[],
         register: opto_6n137_kind,
     },
     PartKind {
         name: "vo2631",
         summary: "Vishay dual optocoupler",
-        is: Named::Family(&["VO2631"]),
+        is: Seat::Family(&["VO2631"]),
         unplaced: &[],
         register: vo2631_kind,
     },
     PartKind {
         name: "iso67xx",
         summary: "TI digital isolator, the member the key names",
-        is: Named::Family(&[
+        is: Seat::Family(&[
             "ISO6720", "ISO6721", "ISO6731", "ISO6740", "ISO6741", "ISO6742",
         ]),
         unplaced: &[],
@@ -236,28 +263,28 @@ const PART_KINDS: &[PartKind] = &[
     PartKind {
         name: "ads122u04",
         summary: "TI 24-bit ADC, as it comes out of reset",
-        is: Named::Family(&["ADS122U04"]),
+        is: Seat::Family(&["ADS122U04"]),
         unplaced: &[],
         register: ads122u04_kind,
     },
     PartKind {
         name: "switch",
         summary: "a switch whose poles pair the part's pins, each open",
-        is: Named::Switch,
+        is: Seat::Switch,
         unplaced: &[],
         register: switch_kind,
     },
     PartKind {
         name: "mechanical",
         summary: "a part with pads and nothing electrical",
-        is: Named::OneNet,
+        is: Seat::OneNet,
         unplaced: &[],
         register: mechanical_kind,
     },
     PartKind {
         name: "boundary",
         summary: "a connector, by its symbol's part name",
-        is: Named::Connector,
+        is: Seat::Connector,
         unplaced: &[],
         register: boundary_kind,
     },
@@ -266,27 +293,48 @@ const PART_KINDS: &[PartKind] = &[
 /// The catalog's name, as an error naming two catalogs prints it.
 pub const NAME: &str = "embsim-boards";
 
-/// The bench component kinds.
-const COMPONENT_KINDS: [&str; 2] = ["host-serial", "scripted-source"];
+/// The bench component kinds, as someone choosing one reads them.
+fn component_kinds() -> Vec<KindInfo> {
+    vec![
+        KindInfo::new(
+            "host-serial",
+            "the host's end of a serial link: a PTY whose bytes are levels on the wire",
+        )
+        .requires("baud", "115200", "the link's rate, framed 8N1"),
+        KindInfo::new(
+            "scripted-source",
+            "one pin, OUT, driven through a list of steps",
+        )
+        .requires(
+            "ohms",
+            "100.0",
+            "the source's output impedance, more than 0 Ω",
+        )
+        .requires(
+            "steps",
+            "[[\"1ms\", 3.3]]",
+            "each an instant after the start and the volts the pin drives from then on",
+        ),
+    ]
+}
 
 impl Catalog for StandardCatalog {
     fn name(&self) -> &str {
         NAME
     }
 
-    fn board_kinds(&self) -> Vec<String> {
-        BOARD_KINDS.iter().map(|kind| (*kind).to_string()).collect()
+    fn board_kinds(&self) -> Vec<KindInfo> {
+        board_kinds()
     }
 
     fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
         match spec.kind.as_str() {
-            "p2-ec32mb" => Ok(CatalogBoard {
-                netlist: netlist::parse(ec32mb::NETLIST).expect("the bundled EC32 netlist parses"),
+            "p2-ec32mb" => Ok(CatalogBoard::with_registry(
+                netlist::parse(ec32mb::NETLIST).expect("the bundled EC32 netlist parses"),
                 // The module as `Ec32mb` builds it, the processor slot left
                 // for the project: `U100` is the part its survey names.
-                registry: Some(Ec32mb::new().registry()),
-                models: Vec::new(),
-            }),
+                Ec32mb::new().registry(),
+            )),
             other => Err(ProjectError::message(format!(
                 "board {}: unknown kind {other:?}",
                 spec.name
@@ -315,11 +363,8 @@ impl Catalog for StandardCatalog {
         (kind.register)(registry, assignment, options)
     }
 
-    fn component_kinds(&self) -> Vec<String> {
-        COMPONENT_KINDS
-            .iter()
-            .map(|kind| (*kind).to_string())
-            .collect()
+    fn component_kinds(&self) -> Vec<KindInfo> {
+        component_kinds()
     }
 
     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
@@ -362,7 +407,7 @@ impl StandardCatalog {
     pub fn check_parts_are_the_kind(assignment: &Assignment<'_>) -> Result<(), ProjectError> {
         match StandardCatalog::guide()
             .iter()
-            .find(|kind| kind.name == assignment.kind)
+            .find(|kind| kind.name() == assignment.kind)
         {
             Some(kind) => kind.check(assignment),
             None => Ok(()),
@@ -382,6 +427,7 @@ fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proj
         mut options,
         dir,
         reports,
+        ..
     } = request;
     let error = |message: String| options_error(spec, message);
     let baud = options.integer("baud")?.ok_or_else(|| {
@@ -945,11 +991,25 @@ fn p2_kind(
     assignment: &Assignment<'_>,
     options: PartOptions,
 ) -> Result<(), ProjectError> {
-    // Alone, the catalog seats the one core it has; a set seats every core
-    // it holds through the same function (`CatalogSet`).
-    p2::register_p2(registry, assignment, options, &[&HeldInResetCores], &|_| {
-        Vec::new()
-    })
+    // The package around a core of the set the project is built through
+    // (`Assignment::catalog`): every core a set holds, or, for the catalog
+    // alone, the one it has.
+    let set = assignment
+        .catalog
+        .as_any()
+        .and_then(|catalog| catalog.downcast_ref::<CatalogSet>());
+    match set {
+        Some(set) => p2::register_p2(
+            registry,
+            assignment,
+            options,
+            &set.core_catalogs(),
+            &|name| set.kind_clash(name),
+        ),
+        None => p2::register_p2(registry, assignment, options, &[&HeldInResetCores], &|_| {
+            Vec::new()
+        }),
+    }
 }
 
 fn tg2520smn_kind(
@@ -1307,21 +1367,21 @@ impl StandardCatalog {
         PART_KINDS
             .iter()
             .map(|kind| {
-                let mut numbers: Vec<&'static str> = kind.unplaced.to_vec();
-                numbers.extend(
-                    known
-                        .iter()
-                        .filter(|part| part.kind == kind.name)
-                        .map(|part| part.number),
-                );
-                KindGuide {
-                    name: kind.name,
-                    summary: kind.summary,
-                    numbers,
-                    tables: kind_tables(kind.name, &known),
-                    required: required_options(kind.name),
-                    is: kind.is,
+                let mut guide = KindGuide::new(kind.name, kind.summary, kind.is.named());
+                let placed = known
+                    .iter()
+                    .filter(|part| part.kind == kind.name)
+                    .map(|part| part.number);
+                for number in kind.unplaced.iter().copied().chain(placed) {
+                    guide = guide.number(number);
                 }
+                for table in kind_tables(kind.name, &known) {
+                    guide = guide.table(table);
+                }
+                for option in required_options(kind.name) {
+                    guide = guide.requires_option(option);
+                }
+                guide
             })
             .collect()
     }
@@ -1334,23 +1394,13 @@ fn option_tables<T: Copy>(
 ) -> Vec<PinTable> {
     tables
         .iter()
-        .map(|&table| PinTable {
-            name: table.0,
-            option: true,
-            pins: facade(table).pins,
-        })
+        .map(|&table| PinTable::option(table.0, facade(table).pins))
         .collect()
 }
 
 /// The tables of the kind `name`, as its `register` function builds them.
 fn kind_tables(name: &str, known: &[KnownPart]) -> Vec<PinTable> {
-    let fixed = |name: &'static str, model: Model| {
-        vec![PinTable {
-            name,
-            option: false,
-            pins: model.facade.pins,
-        }]
-    };
+    let fixed = |name: &'static str, model: Model| vec![PinTable::fixed(name, model.facade.pins)];
     let decls = |tables: &[(&'static str, &'static [PinDecl])]| {
         option_tables(tables, |(name, pins)| ModelFacade::of(name, pins))
     };
@@ -1391,17 +1441,12 @@ fn kind_tables(name: &str, known: &[KnownPart]) -> Vec<PinTable> {
         "iso67xx" => known
             .iter()
             .filter(|part| part.kind == "iso67xx")
-            .map(|part| PinTable {
-                name: part.number,
-                option: false,
-                pins: part.model.facade.pins.clone(),
-            })
+            .map(|part| PinTable::fixed(part.number, part.model.facade.pins.clone()))
             .collect(),
-        "ads122u04" => vec![PinTable {
-            name: "tssop16",
-            option: true,
-            pins: ModelFacade::of("", &ADS122U04_PINS).pins,
-        }],
+        "ads122u04" => vec![PinTable::option(
+            "tssop16",
+            ModelFacade::of("", &ADS122U04_PINS).pins,
+        )],
         _ => Vec::new(),
     }
 }
@@ -1409,24 +1454,24 @@ fn kind_tables(name: &str, known: &[KnownPart]) -> Vec<PinTable> {
 /// The options the kind `name` refuses to register without.
 fn required_options(name: &str) -> Vec<RequiredOption> {
     match name {
-        "p2" => vec![RequiredOption {
-            name: "core",
-            example: "\"held-in-reset\"",
-            means: "what runs inside the package; \"held-in-reset\" is the chip before it runs"
-                .to_string(),
-        }],
-        "sd-card" => vec![RequiredOption {
-            name: "image",
-            example: "\"card.img\"",
-            means: "the card in the socket: a card image file, relative to the project file"
-                .to_string(),
-        }],
-        "switch" => vec![RequiredOption {
-            name: "poles",
-            example: "[[\"1\", \"2\"]]",
-            means: "the part's pins paired into poles, each open until a [[switch]] closes it"
-                .to_string(),
-        }],
+        // What runs inside is one of the core kinds of the set the package
+        // is in: a set describing it names them.
+        "p2" => {
+            vec![
+                RequiredOption::new("core", "\"held-in-reset\"", "what runs inside the package")
+                    .one_of_the_core_kinds(),
+            ]
+        }
+        "sd-card" => vec![RequiredOption::new(
+            "image",
+            "\"card.img\"",
+            "the card in the socket: a card image file, relative to the project file",
+        )],
+        "switch" => vec![RequiredOption::new(
+            "poles",
+            "[[\"1\", \"2\"]]",
+            "the part's pins paired into poles, each open until a [[switch]] closes it",
+        )],
         _ => Vec::new(),
     }
 }
@@ -1475,7 +1520,7 @@ mod tests {
         let reference = match kind.is {
             Named::Connector => "J1",
             Named::Switch => "SW1",
-            Named::Family(_) | Named::OneNet => "U1",
+            _ => "U1",
         };
         ComponentDecl {
             reference: reference.to_string(),
@@ -1504,16 +1549,17 @@ mod tests {
         let parts = [decl];
         let netlist = no_nets();
         let reports = embsim_board::Reports::new();
-        let assignment = Assignment {
-            board: "B",
-            by: KeyField::Mpn,
+        let assignment = Assignment::new(
+            "B",
+            KeyField::Mpn,
             key,
             kind,
-            parts: &parts,
-            dir,
-            netlist: &netlist,
-            reports: &reports,
-        };
+            &parts,
+            &netlist,
+            &reports,
+            &StandardCatalog,
+        )
+        .in_dir(dir);
         let table: toml::Table = toml::from_str(options).expect("the options parse");
         // What a project checks before it registers any kind.
         StandardCatalog::check_parts_are_the_kind(&assignment)?;
@@ -1557,21 +1603,21 @@ mod tests {
             .to_path_buf();
         let mut checked = 0;
         for kind in StandardCatalog::guide() {
-            let key = kind.numbers.first().copied().unwrap_or("PART-1");
+            let key = kind.numbers.first().map(AsRef::as_ref).unwrap_or("PART-1");
             let part = part_for(&kind, key);
             for table in kind.tables.iter().filter(|table| table.option) {
                 let mut options = format!("pins = {:?}\n", table.name);
-                if kind.name == "sd-card" {
+                if kind.name() == "sd-card" {
                     let file = image.file_name().expect("a file").to_string_lossy();
                     options.push_str(&format!("image = {file:?}\n"));
                 }
                 let mut registry = PartRegistry::new();
-                register(&mut registry, kind.name, key, &part, &options, &dir)
-                    .unwrap_or_else(|err| panic!("{} {}: {err}", kind.name, table.name));
+                register(&mut registry, kind.name(), key, &part, &options, &dir)
+                    .unwrap_or_else(|err| panic!("{} {}: {err}", kind.name(), table.name));
                 let facade = registry
                     .facade(&part)
-                    .unwrap_or_else(|| panic!("{} states its pins", kind.name));
-                assert_eq!(facade.pins, table.pins, "{} {}", kind.name, table.name);
+                    .unwrap_or_else(|| panic!("{} states its pins", kind.name()));
+                assert_eq!(facade.pins, table.pins, "{} {}", kind.name(), table.name);
                 checked += 1;
             }
         }
@@ -1621,7 +1667,7 @@ mod tests {
         let guide = StandardCatalog::guide();
         let kind = guide
             .iter()
-            .find(|guide| guide.name == kind)
+            .find(|guide| guide.name() == kind)
             .expect("a kind the catalog ships");
         assert_eq!(kind.fit(keys), fit);
     }
@@ -1645,7 +1691,7 @@ mod tests {
              pins a part has and nothing about what the part is"
         );
         for kind in StandardCatalog::guide() {
-            assert_eq!(kind.fit(keys), None, "{} fits {keys:?}", kind.name);
+            assert_eq!(kind.fit(keys), None, "{} fits {keys:?}", kind.name());
         }
     }
 
@@ -1692,22 +1738,12 @@ mod tests {
     /// generates.
     const PROJECTS_MD: &str = include_str!("../../PROJECTS.md");
 
-    /// What each board kind is, for its row: the catalog carries no
-    /// sentence for a board kind, so a new one fails the doc test until it
-    /// has one here.
-    fn board_kind_summary(kind: &str) -> Option<&'static str> {
-        match kind {
-            "netlist" => Some(
-                "any board, from its KiCad netlist export: `netlist = \"board.net\"`, relative to \
-                 the project file; it starts from the base registry",
-            ),
-            "p2-ec32mb" => Some(
-                "the Parallax P2-EC32MB module from its bundled netlist, every part placed but the \
-                 processor, `U100`",
-            ),
-            _ => None,
-        }
-    }
+    /// What a `netlist` board is, for its row: no catalog provides the
+    /// kind, so none describes it; every other board kind's row is its
+    /// own description.
+    const NETLIST_SUMMARY: &str = "any board, from its KiCad netlist export: `netlist = \
+                                   \"board.net\"`, relative to the project file; it starts from \
+                                   the base registry";
 
     /// An option that is not a choice, not required, and so not in the
     /// guide: a value of its shape and what it says, for its cell. A new one
@@ -1726,11 +1762,11 @@ mod tests {
     /// Register `kind` with `options` (TOML) for a part keyed by its first
     /// number, and return the error, if any.
     fn register_error(kind: &KindGuide, options: &str, dir: &Path) -> Option<String> {
-        let key = kind.numbers.first().copied().unwrap_or("PART-1");
+        let key = kind.numbers.first().map(AsRef::as_ref).unwrap_or("PART-1");
         let part = part_for(kind, key);
         register(
             &mut PartRegistry::new(),
-            kind.name,
+            kind.name(),
             key,
             &part,
             options,
@@ -1757,21 +1793,24 @@ mod tests {
     /// given a value no choice has, and a choice names what it offers.
     fn options_of(kind: &KindGuide, dir: &Path) -> Vec<(String, Option<Vec<String>>)> {
         let required: String = kind
+            .info
             .required
             .iter()
             .map(|option| format!("{} = {}\n", option.name, option.example))
             .collect();
         let err = register_error(kind, &format!("{required}zz_probe = 1\n"), dir)
-            .unwrap_or_else(|| panic!("{} takes an option it cannot know", kind.name));
+            .unwrap_or_else(|| panic!("{} takes an option it cannot know", kind.name()));
         let taken = if err.ends_with("this kind takes no options") {
             Vec::new()
         } else {
-            quoted_after(&err, "this kind takes ").unwrap_or_else(|| panic!("{}: {err}", kind.name))
+            quoted_after(&err, "this kind takes ")
+                .unwrap_or_else(|| panic!("{}: {err}", kind.name()))
         };
         taken
             .into_iter()
             .map(|option| {
                 let others: String = kind
+                    .info
                     .required
                     .iter()
                     .filter(|required| required.name != option)
@@ -1796,13 +1835,10 @@ mod tests {
 
     /// The board kinds table.
     fn board_kinds_table() -> String {
-        let mut kinds = vec!["netlist".to_string()];
-        kinds.extend(StandardCatalog.board_kinds());
         let mut out = String::from("| kind | what it is |\n|---|---|\n");
-        for kind in kinds {
-            let summary = board_kind_summary(&kind)
-                .unwrap_or_else(|| panic!("board kind {kind:?} has no summary for PROJECTS.md"));
-            out.push_str(&format!("| `{kind}` | {summary} |\n"));
+        out.push_str(&format!("| `netlist` | {NETLIST_SUMMARY} |\n"));
+        for kind in StandardCatalog.board_kinds() {
+            out.push_str(&format!("| `{}` | {} |\n", kind.name, kind.summary));
         }
         out
     }
@@ -1817,12 +1853,12 @@ mod tests {
         for kind in StandardCatalog::guide() {
             let unplaced = PART_KINDS
                 .iter()
-                .find(|entry| entry.name == kind.name)
+                .find(|entry| entry.name == kind.name())
                 .expect("the guide lists the catalog's kinds")
                 .unplaced;
             let placed: Vec<String> = known
                 .iter()
-                .filter(|part| part.kind == kind.name)
+                .filter(|part| part.kind == kind.name())
                 .map(|part| format!("`{}`", part.number))
                 .collect();
             let placed = match (placed.is_empty(), unplaced.is_empty()) {
@@ -1859,7 +1895,7 @@ mod tests {
                 .into_iter()
                 .filter(|(name, _)| name != "pins")
                 .map(|(name, offers)| {
-                    let required = kind.required.iter().find(|option| option.name == name);
+                    let required = kind.info.required.iter().find(|option| option.name == name);
                     let cell = match (&offers, required) {
                         (Some(values), _) => {
                             let values: Vec<&str> = values.iter().map(String::as_str).collect();
@@ -1870,8 +1906,8 @@ mod tests {
                         }
                         (None, None) => {
                             let (example, means) =
-                                free_option(kind.name, &name).unwrap_or_else(|| {
-                                    panic!("{} option {name:?} has no phrase", kind.name)
+                                free_option(kind.name(), &name).unwrap_or_else(|| {
+                                    panic!("{} option {name:?} has no phrase", kind.name())
                                 });
                             format!("`{name} = {example}` — {means}")
                         }
@@ -1890,8 +1926,8 @@ mod tests {
             };
             out.push_str(&format!(
                 "| `{}` | {} | {} | {placed} | {pins} | {options} |\n",
-                kind.name,
-                kind.summary,
+                kind.name(),
+                kind.info.summary,
                 kind.is.describe()
             ));
         }

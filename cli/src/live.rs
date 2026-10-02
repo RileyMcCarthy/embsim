@@ -57,6 +57,9 @@ pub struct RunOptions {
     pub nets: Vec<String>,
     /// `--pty`: `PATH`, or `NAME=PATH`.
     pub ptys: Vec<String>,
+    /// What the binary is made of, a fact a line, printed under the
+    /// project line.
+    pub provenance: Vec<String>,
 }
 
 /// The net each board pin sits on: `Board.Ref.Pin` to `Board.Net`, from
@@ -112,12 +115,14 @@ fn apply_ptys(project: &mut Project, ptys: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Load `path`, apply `ptys`, print each board's survey line, and build the
-/// system, its constructors reporting to `reports`.
+/// Load `path`, apply `ptys`, print what the binary is made of and each
+/// board's survey line, and build the system, its constructors reporting to
+/// `reports`.
 fn build(
     set: &CatalogSet,
     path: &Path,
     ptys: &[String],
+    provenance: &[String],
     reports: &Reports,
     out: &mut dyn Write,
 ) -> Result<(System, PinNets), String> {
@@ -125,6 +130,9 @@ fn build(
     apply_ptys(&mut project, ptys)?;
     say!(out, "project {}", path.display());
     say!(out, "  catalogs: {}", set.catalogs().join(", "));
+    for line in provenance {
+        say!(out, "  {line}");
+    }
     let mut pin_nets = PinNets::new();
     for spec in project.boards() {
         let survey = project
@@ -226,11 +234,16 @@ fn start_held(path: &Path, system: System) -> Result<SystemHandle, String> {
         .map_err(|err| format!("{}: the system does not start: {err}", path.display()))
 }
 
-/// `embsim check <project>`.
-pub fn check(set: &CatalogSet, path: &Path, out: &mut dyn Write) -> Result<(), String> {
+/// `embsim check <project>`, by a binary made of what `provenance` says.
+pub fn check(
+    set: &CatalogSet,
+    path: &Path,
+    provenance: &[String],
+    out: &mut dyn Write,
+) -> Result<(), String> {
     start_clock();
     let reports = Reports::new();
-    let (system, _) = build(set, path, &[], &reports, out)?;
+    let (system, _) = build(set, path, &[], provenance, &reports, out)?;
     let handle = start_held(path, system)?;
     let findings = handle.findings();
     if findings.is_empty() {
@@ -324,7 +337,7 @@ pub fn run(
 ) -> Result<(), String> {
     start_clock();
     let reports = Reports::new();
-    let (system, pin_nets) = build(set, path, &options.ptys, &reports, out)?;
+    let (system, pin_nets) = build(set, path, &options.ptys, &options.provenance, &reports, out)?;
     let handle = start_held(path, system)?;
     for net in &options.nets {
         if handle.net_state(net).is_none() {

@@ -122,18 +122,20 @@ fn stub_key(part: &UnmodelledPart) -> (KeyField, &str) {
 
 /// How strong a fit is: a part number names the part itself, a family
 /// name its family.
-fn strength(fit: Fit) -> u8 {
+fn strength(fit: Fit<'_>) -> u8 {
     match fit {
         Fit::Number(_) => 2,
         Fit::Family(_) => 1,
+        // A way to fit added later is weaker than the two known.
+        _ => 0,
     }
 }
 
 /// The kinds a part with these keys is, one fit per kind, and only the
 /// strongest kind of fit any kind makes: the kinds whose part numbers name
 /// it, else the kinds whose part family its keys name. Pins name no kind.
-fn candidates<'g>(guide: &'g [KindGuide], keys: &[&str]) -> Vec<(&'g KindGuide, Fit)> {
-    let fits: Vec<(&KindGuide, Fit)> = guide
+fn candidates<'g>(guide: &'g [KindGuide], keys: &[&str]) -> Vec<(&'g KindGuide, Fit<'g>)> {
+    let fits: Vec<(&KindGuide, Fit<'g>)> = guide
         .iter()
         .filter_map(|kind| kind.fit(keys).map(|fit| (kind, fit)))
         .collect();
@@ -144,10 +146,11 @@ fn candidates<'g>(guide: &'g [KindGuide], keys: &[&str]) -> Vec<(&'g KindGuide, 
 }
 
 /// `kind (why)` for one candidate.
-fn fit_phrase(kind: &KindGuide, fit: Fit) -> String {
+fn fit_phrase(kind: &KindGuide, fit: Fit<'_>) -> String {
     match fit {
-        Fit::Number(number) => format!("{} (part number {number})", kind.name),
-        Fit::Family(family) => format!("{} (part family {family})", kind.name),
+        Fit::Number(number) => format!("{} (part number {number})", kind.name()),
+        Fit::Family(family) => format!("{} (part family {family})", kind.name()),
+        _ => kind.name().to_string(),
     }
 }
 
@@ -163,7 +166,7 @@ fn net_count(pins: &[PinSite]) -> usize {
 /// What a part that needs a model could be, as a sentence: the kinds whose
 /// number or family it carries, else the kinds without a model its
 /// designator, symbol, name or nets allow, else that it needs a model.
-fn candidates_sentence(candidates: &[(&KindGuide, Fit)], part: &UnmodelledPart) -> String {
+fn candidates_sentence(candidates: &[(&KindGuide, Fit<'_>)], part: &UnmodelledPart) -> String {
     if !candidates.is_empty() {
         return format!(
             "could be: {}",
@@ -323,14 +326,16 @@ fn pin_table_groups(survey: &BoardSurvey) -> Vec<PinTableGroup<'_>> {
 /// The catalog kind a key places parts as, when the key is one of the
 /// numbers the catalog places a kind by.
 fn kind_placed_by<'g>(guide: &'g [KindGuide], key: &str) -> Option<&'g KindGuide> {
-    guide.iter().find(|kind| kind.numbers.contains(&key))
+    guide
+        .iter()
+        .find(|kind| kind.numbers.iter().any(|number| number == key))
 }
 
 /// The option table of `kind` that declares exactly `pins`.
 fn option_table_for<'g>(kind: &'g KindGuide, pins: &[&str]) -> Option<&'g str> {
     kind.table_with(pins)
         .filter(|table| table.option)
-        .map(|table| table.name)
+        .map(|table| table.name.as_ref())
 }
 
 // ============================================================
@@ -374,7 +379,7 @@ pub fn survey_kind(
     );
     let project = Project::parse(&text).map_err(|err| err.to_string())?;
     let survey = project.survey(set, "BOARD").map_err(|err| {
-        let unknown = !set.board_kinds().iter().any(|known| known == kind);
+        let unknown = !set.board_kinds().iter().any(|known| known.name == kind);
         if unknown && !with_project {
             format!(
                 "{err}. A kind a project's catalog crate adds is surveyed with the project: \
@@ -619,6 +624,10 @@ pub struct NewOptions<'a> {
     /// `--catalog`: a catalog crate to start, named in the project's
     /// `[catalog]`.
     pub catalog: Option<&'a Path>,
+    /// `--own-runner`: the project's own runner crate to start beside it
+    /// (an empty path for the default directory), named in `[catalog]
+    /// runner`.
+    pub own_runner: Option<&'a Path>,
     /// `--project`: a project whose `[catalog]` the starter project names
     /// too.
     pub project: Option<&'a Path>,
@@ -637,6 +646,7 @@ pub fn new_project(
         output,
         force,
         catalog,
+        own_runner,
         project,
     } = *options;
     let name = name.map_or_else(|| default_name(netlist), str::to_string);
@@ -649,8 +659,18 @@ pub fn new_project(
             path.display()
         ));
     }
+    let runner_dir = own_runner.zip(catalog).map(|(path, catalog)| {
+        if path.as_os_str().is_empty() {
+            scaffold::default_runner_dir(catalog)
+        } else {
+            path.to_path_buf()
+        }
+    });
     if let Some(dir) = catalog {
-        scaffold::check_free(dir)?;
+        scaffold::check_free(dir).map_err(|why| format!("--catalog {why}"))?;
+    }
+    if let Some(dir) = &runner_dir {
+        scaffold::check_free(dir).map_err(|why| format!("--own-runner {why}"))?;
     }
 
     // The netlist, relative to where the project will live.
@@ -676,16 +696,33 @@ pub fn new_project(
     // `--project`'s catalog crates, reached from where this project lives.
     if let Some(project) = project {
         if let Some(carried) = carried_catalog(project, &project_dir)? {
-            text = scaffold::with_catalog(&text, &carried.crates, carried.embsim.as_deref());
+            text = scaffold::with_catalog(&text, &carried.crates, carried.runner.as_deref());
         }
     }
     // The crate first: the project names its directory as it is on disk.
     let scaffold = match catalog {
         Some(dir) => {
-            let scaffold = scaffold::write_crate(dir, &crate::source_dir())?;
+            let source = scaffold::embsim_for(dir, None);
+            let scaffold = scaffold::write_crate(dir, &source)?;
+            let runner = match &runner_dir {
+                Some(runner_dir) => Some(scaffold::write_runner_crate(runner_dir, &scaffold)?),
+                None => None,
+            };
             let from_project = relative_path(dir, &project_dir)?;
-            text = scaffold::with_catalog_table(&text, &from_project.to_string_lossy());
-            Some(scaffold)
+            let runner_path = match &runner_dir {
+                Some(runner_dir) => Some(
+                    relative_path(runner_dir, &project_dir)?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                None => None,
+            };
+            text = scaffold::with_catalog(
+                &text,
+                &[from_project.to_string_lossy().into_owned()],
+                runner_path.as_deref(),
+            );
+            Some((scaffold, runner))
         }
         None => None,
     };
@@ -737,8 +774,11 @@ pub fn new_project(
         },
         path.display()
     );
-    if let Some(scaffold) = scaffold {
+    if let Some((scaffold, runner)) = scaffold {
         scaffold.say(out);
+        if let Some(runner) = runner {
+            runner.say(out);
+        }
         let _ = writeln!(
             out,
             "  named in the project's [catalog]: `embsim check` builds the runner that holds it"
@@ -751,12 +791,12 @@ pub fn new_project(
 /// crates from where the starter goes.
 struct CarriedCatalog {
     crates: Vec<String>,
-    embsim: Option<String>,
+    runner: Option<String>,
 }
 
 /// The `[catalog]` of `project` with its paths reaching the crates from
 /// `project_dir`, where the starter project goes ([`relative_path`]): its
-/// crates, and its embsim checkout when it names one. `None` when the
+/// crates, and its own runner crate when it names one. `None` when the
 /// project has no `[catalog]`.
 fn carried_catalog(project: &Path, project_dir: &Path) -> Result<Option<CarriedCatalog>, String> {
     let catalog = CatalogTable::of_project(project).map_err(|err| err.to_string())?;
@@ -777,8 +817,8 @@ fn carried_catalog(project: &Path, project_dir: &Path) -> Result<Option<CarriedC
         .iter()
         .map(|path| reach(path))
         .collect::<Result<Vec<_>, _>>()?;
-    let embsim = catalog.embsim.as_deref().map(reach).transpose()?;
-    Ok(Some(CarriedCatalog { crates, embsim }))
+    let runner = catalog.runner.as_deref().map(reach).transpose()?;
+    Ok(Some(CarriedCatalog { crates, runner }))
 }
 
 /// `target` relative to the directory `base`, both resolved on disk.
@@ -836,6 +876,16 @@ fn comment(out: &mut String, text: &str) {
     }
 }
 
+/// The release a project this embsim starts is written for: its
+/// `major.minor`, which any `major.minor.patch` of it meets.
+fn requires_embsim() -> String {
+    embsim_board::EMBSIM_VERSION
+        .splitn(3, '.')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// The starter project `embsim new` writes.
 fn starter_project(
     source: &str,
@@ -862,6 +912,13 @@ fn starter_project(
             survey.connectors.len()
         ),
     );
+    let _ = writeln!(out);
+    comment(
+        &mut out,
+        "The embsim release this project is written for: an embsim of another release says so \
+         instead of reading it (PROJECTS.md §2).",
+    );
+    let _ = writeln!(out, "requires-embsim = {}", toml_string(&requires_embsim()));
     let _ = writeln!(out);
     let _ = writeln!(out, "[[board]]");
     let _ = writeln!(out, "name = {}", toml_string(name));
@@ -906,7 +963,7 @@ fn starter_project(
                 );
                 let _ = writeln!(out, "[[board.model]]");
                 let _ = writeln!(out, "{} = {}", group.field, toml_string(group.key));
-                let _ = writeln!(out, "kind = {}", toml_string(kind.name));
+                let _ = writeln!(out, "kind = {}", toml_string(kind.name()));
                 let _ = writeln!(out, "[board.model.options]");
                 let _ = writeln!(out, "pins = {}", toml_string(table));
             }
@@ -933,7 +990,7 @@ fn starter_project(
         section(&mut out, "Parts that need a model");
         let kinds: Vec<String> = guide
             .iter()
-            .map(|kind| format!("{:?}", kind.name))
+            .map(|kind| format!("{:?}", kind.name()))
             .collect();
         comment(
             &mut out,
@@ -990,11 +1047,11 @@ fn starter_project(
             let _ = writeln!(out, "# kind = \"\"");
             continue;
         };
-        let _ = writeln!(out, "# kind = {}", toml_string(kind.name));
+        let _ = writeln!(out, "# kind = {}", toml_string(kind.name()));
         // Each required option under a comment saying what it is, which
         // stays a comment when the stub is uncommented.
         let mut options = String::new();
-        for option in &kind.required {
+        for option in &kind.info.required {
             let mut said = String::new();
             comment(&mut said, &capitalized(&format!("{}.", option.means)));
             for line in said.lines() {
@@ -1003,7 +1060,7 @@ fn starter_project(
             let _ = writeln!(options, "# {} = {}", option.name, option.example);
         }
         if let Some(table) = option_table_for(kind, &pins) {
-            if kind.tables.first().map(|first| first.name) != Some(table) {
+            if kind.tables.first().map(|first| first.name.as_ref()) != Some(table) {
                 let _ = writeln!(options, "# pins = {}", toml_string(table));
             }
         }

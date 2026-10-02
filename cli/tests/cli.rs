@@ -378,14 +378,105 @@ fn the_header_boards_starter_project_lists_its_pins_and_checks_as_written() {
         "the file passes the check exactly as written",
         "every part of the board is populated by the catalog, so nothing is left to fill in"
     );
+    expect!(
+        "release-named",
+        "the file names the embsim release it is written for: this embsim's",
+        "an embsim of another release then refuses the file, naming the release it is \
+         written for"
+    );
     let (project, text) = header_starter("header_starter");
     assert_says(&text, &["# HDR.J1.1 Pin_1 SIG", "# HDR.J1.2 Pin_2 GND"]);
+    let release: Vec<&str> = env!("CARGO_PKG_VERSION").split('.').take(2).collect();
+    assert_says(
+        &text,
+        &[&format!("requires-embsim = \"{}\"", release.join("."))],
+    );
     assert!(!text.contains("# [[board.model]]"), "{text}");
     let checked = embsim(&["check", path(&project)]);
     assert!(checked.status.success(), "{}", stderr(&checked));
     assert_says(
         &stdout(&checked),
         &["board HDR (netlist): 2 parts: 2 classified", "ok:"],
+    );
+}
+
+#[rstest]
+fn a_check_says_what_its_binary_is_made_of() {
+    behaviour!(Test {
+        id: "cli.check-provenance",
+        covers: Some("cli/src/provenance.rs#lines"),
+        given: "the header board's starter project checked by the `embsim` binary, started \
+                with the facts a tool measured of a runner's crates in the environment",
+    });
+    expect!(
+        "embsim-and-build",
+        "under the project line the check names this embsim's version, the git revision of \
+         its sources and where they were, and the compiler, target and profile that built it",
+        "a run says what made it (DESIGN.md rule 9)"
+    );
+    expect!(
+        "measured-lines",
+        "the facts handed in the environment are printed beside them, as they were given"
+    );
+    let (project, _) = header_starter("check_provenance");
+    let checked = Command::new(env!("CARGO_BIN_EXE_embsim"))
+        .args(["check", path(&project)])
+        .env(
+            embsim_cli::PROVENANCE_ENV,
+            "catalog crate rig-catalog 0.1.0: /rig/catalog, git rev 0123456789ab",
+        )
+        .output()
+        .expect("the embsim binary runs");
+    assert!(checked.status.success(), "{}", stderr(&checked));
+    let text = stdout(&checked);
+    assert_says(
+        &text,
+        &[
+            &format!("embsim {}, ", env!("CARGO_PKG_VERSION")),
+            &format!(", from {}", workspace().display()),
+            "built by rustc ",
+            ", profile ",
+            "catalog crate rig-catalog 0.1.0: /rig/catalog, git rev 0123456789ab",
+        ],
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("project "))
+        .expect("the project line");
+    assert!(lines[at + 2].trim_start().starts_with("embsim "), "{text}");
+}
+
+#[rstest]
+fn version_says_what_the_binary_is_made_of() {
+    behaviour!(Test {
+        id: "cli.version-provenance",
+        covers: Some("cli/src/provenance.rs#long_version"),
+        given: "the `embsim` binary asked for its version, short and long",
+    });
+    expect!(
+        "short",
+        "the short form is the release and the first twelve digits of its git revision"
+    );
+    expect!(
+        "long",
+        "the long form adds where its sources were and the compiler, target and profile that \
+         built it"
+    );
+    let short = stdout(&embsim(&["-V"]));
+    assert!(
+        short.starts_with(&format!("embsim {}", env!("CARGO_PKG_VERSION"))),
+        "{short}"
+    );
+    let long = stdout(&embsim(&["--version"]));
+    assert_says(
+        &long,
+        &[
+            &format!("embsim {}, ", env!("CARGO_PKG_VERSION")),
+            "built by rustc ",
+            ", for ",
+            ", profile ",
+        ],
     );
 }
 
@@ -1078,6 +1169,8 @@ fn run_boots_the_p2_off_the_modules_flash() {
         "{text}"
     );
     assert!(text.contains("EC32.U100: QEMU: "), "{text}");
+    // Which program ran the core, said at the first look.
+    assert!(text.contains("EC32.U100: qemu-system-p2 "), "{text}");
     assert!(text.contains("console P62 \"B\""), "{text}");
     assert!(text.contains("ran 20.000000 ms of virtual time"), "{text}");
 }

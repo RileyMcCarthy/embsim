@@ -36,8 +36,9 @@ EC32.J203.45 (GND) ─► BUF.J1.4 (GND) ◄────────────
 
 ## Running it
 
-From this directory, with `embsim` installed (`cargo install --path cli`
-from the embsim checkout) or run in place (`cargo run -p embsim-cli --`):
+From this directory, with `embsim` installed (`cargo install --locked
+--path cli` from the embsim checkout) or run in place (`cargo run -p
+embsim-cli --`):
 
 ```bash
 embsim check project.toml
@@ -45,14 +46,23 @@ embsim run project.toml --for 10ms --net BUF.OUT
 ```
 
 The first `check` builds the runner: `embsim` writes a small crate into
-`.embsim/runner-<id>/` that depends on embsim and on `catalog/`, builds it
-with Cargo in the release profile, and runs the project through it. The
-crate is a member of embsim's workspace, so the runner builds in embsim's
-`target/` and reuses what the workspace built. After that a `check` or a
-`run` with nothing changed costs Cargo's no-op check; edit the crate and
-the next one rebuilds just it. `check --rebuild` starts the runner afresh.
+`.embsim/runner-<id>/` that depends on `catalog/` and on embsim — the
+embsim `catalog/` itself depends on, here the checkout it sits in, by path
+— builds it with Cargo in the release profile, and runs the project
+through it. The crate is a member of embsim's workspace, so the runner
+builds in embsim's `target/` and reuses what the workspace built. The
+runner's lock file is [`embsim.lock`](embsim.lock), committed beside the
+project as a project commits its own: every build is `--locked` against
+it, so every machine builds the same runner (when embsim's dependencies
+change, remove it and run again, and commit the lock the tool writes).
+After that a `check` or a `run` with nothing changed costs Cargo's no-op
+check; edit the crate and the next one rebuilds just it. `check
+--rebuild` starts the runner afresh and keeps the lock.
 
-The run prints, among the module's own findings and reports:
+The run prints, under the project line, what the runner is made of —
+embsim's release and git revision, the compiler, target and profile, and
+the catalog crate's version and revision — then, among the module's own
+findings and reports:
 
 ```text
 [   5.600000 ms] EC32.U100: blinker: P0 high at 5.500000 ms, flipping every 0.500000 ms

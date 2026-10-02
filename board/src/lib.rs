@@ -87,7 +87,8 @@ pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use host_pty::{HostPty, HostPtyCounters};
 pub use kind::{
-    is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, Named, PinTable, RequiredOption,
+    is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, KindInfo, Named, OptionValues,
+    PinTable, RequiredOption,
 };
 pub use net::{
     digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
@@ -95,9 +96,10 @@ pub use net::{
 };
 pub use netlist::{ComponentDecl, NetDecl, NetlistError, NodeDecl, ParsedNetlist};
 pub use project::{
-    parse_duration, state_dir, Assignment, BoardSpec, Catalog, CatalogBoard, CatalogTable,
-    ComponentRequest, ComponentSpec, ContactState, JumperSpec, KeyField, MateSpec, ModelSpec,
-    PartOptions, PinShortSpec, Project, ProjectError, SwitchSpec, WireSpec,
+    parse_duration, state_dir, version_meets, Assignment, BoardSpec, Catalog, CatalogBoard,
+    CatalogTable, ComponentRequest, ComponentSpec, ContactState, JumperSpec, KeyField, MateSpec,
+    ModelSpec, PartOptions, PinShortSpec, Project, ProjectError, ProjectHead, SwitchSpec, WireSpec,
+    EMBSIM_VERSION,
 };
 pub use registry::{
     reference_designator_class, Classification, Classified, JumperState, ModelFacade, PartRegistry,
