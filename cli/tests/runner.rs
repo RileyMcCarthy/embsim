@@ -141,7 +141,7 @@ fn new_catalog_starts_a_crate_and_names_it_in_the_project() {
     let table: toml::Table = toml::from_str(&manifest).expect("the manifest parses");
     assert_eq!(table["package"]["name"].as_str(), Some("rig-catalog"));
     let crate_dir = dir.join("rig/catalog");
-    for dependency in ["embsim-board", "embsim-boards"] {
+    for dependency in ["embsim-board", "embsim-boards", "embsim-core"] {
         let path = table["dependencies"][dependency]["path"]
             .as_str()
             .expect("a path dependency");
@@ -411,6 +411,530 @@ fn a_runner_refuses_a_project_that_names_other_catalog_crates() {
 }
 
 // ============================================================
+// survey and new with --project: a project's own kinds
+// ============================================================
+
+/// A board netlist naming the started crate's sensor: a two-pin header
+/// `J1` and `U1`, valued as the crate's sensor kind places it.
+const SENSOR_BOARD: &str = r#"(export (version "E")
+  (components
+    (comp (ref "J1") (value "Conn_01x02")
+      (libsource (lib "Connector") (part "Conn_01x02")))
+    (comp (ref "U1") (value "YOURPROJECT-SENSOR")
+      (libsource (lib "rig") (part "Sensor"))))
+  (nets
+    (net (code "1") (name "IN")
+      (node (ref "J1") (pin "1") (pinfunction "Pin_1"))
+      (node (ref "U1") (pin "1")))
+    (net (code "2") (name "GND")
+      (node (ref "J1") (pin "2") (pinfunction "Pin_2"))
+      (node (ref "U1") (pin "2")))))"#;
+
+/// The command as the started crate's runner, with `args`.
+fn template_runner(args: &[&str]) -> (ExitCode, String, String) {
+    let crates = [CatalogCrate {
+        name: "yourproject-catalog",
+        dir: TEMPLATE_DIR,
+        register: yourproject_catalog::register,
+    }];
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = embsim_cli::run_with_crates(
+        &crates,
+        std::iter::once("embsim").chain(args.iter().copied()),
+        &mut out,
+        &mut err,
+    );
+    (
+        code,
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    )
+}
+
+#[rstest]
+fn survey_with_a_project_names_the_projects_own_kinds() {
+    behaviour!(Test {
+        id: "cli.survey-with-project",
+        covers: Some("cli/src/lib.rs#Command::project"),
+        given: "a project naming the started catalog crate, and a board netlist whose sensor \
+                part only that crate has a kind for, each surveyed through the crate's runner \
+                with --project naming the project, as is the crate's own board kind",
+    });
+    expect!(
+        "candidates-include-the-crates",
+        "the netlist's checklist offers the crate's sensor kind for the sensor part",
+        "with --project a survey runs over the catalogs the project's runner holds"
+    );
+    expect!(
+        "kind-surveyed",
+        "the crate's board kind is surveyed, its sensor the one part left to the project"
+    );
+    let dir = scratch("survey_project");
+    std::fs::write(
+        dir.join("rig.toml"),
+        format!("[catalog]\ncrates = [{TEMPLATE_DIR:?}]\n"),
+    )
+    .expect("writable");
+    std::fs::write(dir.join("board.net"), SENSOR_BOARD).expect("writable");
+    let project = dir.join("rig.toml");
+    let project = project.to_str().expect("text");
+    let netlist = dir.join("board.net");
+
+    let (code, out, err) = template_runner(&[
+        "survey",
+        "--project",
+        project,
+        netlist.to_str().expect("text"),
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_says(&out, &["could be: yourproject-sensor"]);
+
+    let (code, out, err) = template_runner(&[
+        "survey",
+        "--project",
+        project,
+        "--kind",
+        "yourproject-board",
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_says(
+        &out,
+        &[
+            "kind \"yourproject-board\"",
+            "1 need a model",
+            "could be: yourproject-sensor",
+        ],
+    );
+}
+
+#[rstest]
+fn a_kind_only_a_project_adds_is_surveyed_through_the_project() {
+    behaviour!(Test {
+        id: "cli.survey-kind-hint",
+        covers: Some("cli/src/checklist.rs#survey_kind"),
+        given: "the `embsim` tool asked to survey a board kind that only a project's catalog \
+                crate adds, with no project named",
+    });
+    expect!(
+        "says-project",
+        "the survey is refused as an unknown kind, listing the kinds the tool ships and \
+         saying to survey the kind with --project naming the project"
+    );
+    let dir = scratch("survey_kind_hint");
+    let tool = embsim_in(&dir, &["survey", "--kind", "yourproject-board"], &[]);
+    assert!(!tool.status.success());
+    assert_says(
+        &stderr(&tool),
+        &[
+            "unknown kind \"yourproject-board\"; the board kinds are \"netlist\", \"p2-ec32mb\"",
+            "embsim survey --project FILE --kind yourproject-board",
+        ],
+    );
+}
+
+#[rstest]
+fn the_tool_hands_a_survey_with_a_project_to_its_runner() {
+    behaviour!(Test {
+        id: "cli.survey-project-hand-over",
+        covers: Some("cli/src/lib.rs#tool_main"),
+        given: "a survey given --project naming a project whose catalog crate is not there, \
+                run by the `embsim` tool",
+    });
+    expect!(
+        "refused-as-check-is",
+        "the tool refuses it before any build, naming the crate path, as it refuses a check \
+         of that project",
+        "a survey with --project runs in the project's runner, so the runner's crates must be \
+         there"
+    );
+    let dir = scratch("survey_hand_over");
+    std::fs::write(
+        dir.join("p.toml"),
+        "[catalog]\ncrates = [\"sim/nowhere\"]\n",
+    )
+    .expect("writable");
+    let output = embsim_in(
+        &dir,
+        &["survey", "--project", "p.toml", "--kind", "p2-ec32mb"],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert_says(
+        &stderr(&output),
+        &["p.toml: [catalog] crates: \"sim/nowhere\" (./sim/nowhere) is not there"],
+    );
+}
+
+#[rstest]
+fn new_with_a_project_offers_its_kinds_and_carries_its_catalog() {
+    behaviour!(Test {
+        id: "cli.new-with-project",
+        covers: Some("cli/src/checklist.rs#new_project"),
+        given: "`embsim new` for a board netlist whose sensor part only the started catalog \
+                crate has a kind for, through the crate's runner with --project naming a \
+                project that names the crate, writing the starter project into a directory \
+                below the project's",
+    });
+    expect!(
+        "stub-offers-the-kind",
+        "the sensor's stub in the starter project offers the crate's sensor kind"
+    );
+    expect!(
+        "catalog-carried",
+        "the starter project names the same catalog crate by a path that reaches it from the \
+         starter project's own directory",
+        "a starter project runs through the same runner as the project it was started from"
+    );
+    let dir = scratch("new_project");
+    // The project names its crate relative to itself, through a link in
+    // its own directory, so the path only reaches the crate from there.
+    std::os::unix::fs::symlink(TEMPLATE_DIR, dir.join("catalog")).expect("the link can be made");
+    std::fs::write(dir.join("rig.toml"), "[catalog]\ncrates = [\"catalog\"]\n").expect("writable");
+    std::fs::write(dir.join("board.net"), SENSOR_BOARD).expect("writable");
+    std::fs::create_dir_all(dir.join("boards")).expect("the directory can be made");
+    let starter = dir.join("boards/board.toml");
+    let (code, out, err) = template_runner(&[
+        "new",
+        "--project",
+        dir.join("rig.toml").to_str().expect("text"),
+        dir.join("board.net").to_str().expect("text"),
+        "-o",
+        starter.to_str().expect("text"),
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}\n{out}");
+    let text = read(&starter);
+    assert_says(&text, &["yourproject-sensor"]);
+    let catalog = embsim_board::CatalogTable::of_project_text(&text)
+        .expect("the project parses")
+        .expect("it has a [catalog]");
+    assert_eq!(catalog.crates.len(), 1, "{text}");
+    assert_eq!(
+        dir.join("boards")
+            .join(&catalog.crates[0])
+            .canonicalize()
+            .unwrap(),
+        Path::new(TEMPLATE_DIR).canonicalize().unwrap()
+    );
+}
+
+// ============================================================
+// The tool and Cargo, with a stand-in Cargo that builds nothing
+// ============================================================
+//
+// `$CARGO` names a script that writes each command line it is given to a
+// log and hands `cargo metadata` (a read of the manifests and the lock file,
+// no build) to the real Cargo; anything else, a build included, it fails.
+// So these cases see every decision the tool makes before it builds — the
+// target directory, the checkout the runner's manifest spells, the
+// refusals — and what it says of a build that failed, without paying for a
+// build of embsim.
+
+/// A directory of the test's own outside every Cargo workspace (embsim's
+/// target directory is inside embsim's), emptied.
+fn outside(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("embsim-runner-{}", std::process::id()))
+        .join(test);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the directory can be made");
+    dir.canonicalize().expect("the directory is there")
+}
+
+/// The stand-in Cargo in `dir`, and the log it writes.
+fn logging_cargo(dir: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("cargo-log.sh");
+    let log = dir.join("cargo.log");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$1\" in\n  metadata) exec \
+             {cargo:?} \"$@\" ;;\nesac\nexit 101\n",
+            cargo = env!("CARGO"),
+        ),
+    )
+    .expect("the script is writable");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("the script is executable");
+    (script, log)
+}
+
+/// `embsim` with `args` in `dir`, Cargo the stand-in `cargo`, and no
+/// `CARGO_TARGET_DIR`: what the tool decides on its own.
+fn embsim_logged(dir: &Path, cargo: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_embsim"))
+        .args(args)
+        .current_dir(dir)
+        .env("CARGO", cargo)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("EMBSIM_RUNNER_PROFILE")
+        .output()
+        .expect("the embsim binary runs")
+}
+
+/// The `--target-dir` the build in `log` was given.
+fn build_target(log: &Path) -> PathBuf {
+    let text = read(log);
+    let build = text
+        .lines()
+        .find(|line| line.starts_with("build "))
+        .unwrap_or_else(|| panic!("no build in:\n{text}"));
+    let words: Vec<&str> = build.split(' ').collect();
+    let at = words
+        .iter()
+        .position(|word| *word == "--target-dir")
+        .expect("the build names a target directory");
+    PathBuf::from(words[at + 1])
+}
+
+/// A stand-in embsim checkout in `dir`: what the tool reads to know a
+/// checkout (`cli` is `embsim-cli`, `p2-qemu` is there), and an
+/// `embsim-board` package a crate can depend on.
+fn other_checkout(dir: &Path) -> PathBuf {
+    for (crate_dir, package) in [
+        ("cli", "embsim-cli"),
+        ("p2-qemu", "embsim-p2-qemu"),
+        ("board", "embsim-board"),
+    ] {
+        let at = dir.join(crate_dir);
+        std::fs::create_dir_all(at.join("src")).expect("the directory can be made");
+        std::fs::write(
+            at.join("Cargo.toml"),
+            format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("the manifest is writable");
+        std::fs::write(at.join("src/lib.rs"), "").expect("the library is writable");
+    }
+    dir.to_path_buf()
+}
+
+/// A catalog crate `rig-catalog` in `dir` whose one embsim dependency,
+/// `embsim-board`, is at `board`.
+fn crate_on(dir: &Path, board: &Path) {
+    library_on(dir, "rig-catalog", board);
+}
+
+/// A library package `name` in `dir` depending on `embsim-board` at `board`.
+fn library_on(dir: &Path, name: &str, board: &Path) {
+    std::fs::create_dir_all(dir.join("src")).expect("the directory can be made");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nembsim-board = {{ path = {:?} }}\n",
+            board.display().to_string()
+        ),
+    )
+    .expect("the manifest is writable");
+    std::fs::write(dir.join("src/lib.rs"), "").expect("the library is writable");
+}
+
+#[rstest]
+fn a_started_crate_in_no_workspace_builds_its_runner_beside_the_project() {
+    behaviour!(Test {
+        id: "cli.runner-lone-crate-target",
+        covers: Some("cli/src/runner.rs#workspace_of"),
+        given: "a project and the catalog crate `embsim new --catalog` started beside it, in a \
+                directory no Cargo workspace covers, checked with the `embsim` tool and no \
+                target directory set in the environment",
+    });
+    expect!(
+        "builds-in-dot-embsim",
+        "the runner is built in the target directory under the project's .embsim directory, \
+         outside the catalog crate",
+        "a crate that is its own Cargo root is in no workspace, and builds stay out of the \
+         project's source tree"
+    );
+    let dir = outside("lone_crate");
+    let (cargo, log) = logging_cargo(&dir);
+    std::fs::write(dir.join("rig.toml"), "# The rig.\n").expect("writable");
+    let new = embsim_logged(
+        &dir,
+        &cargo,
+        &["new", "--catalog", "sim/catalog", "--add-to", "rig.toml"],
+    );
+    assert!(new.status.success(), "{}", stderr(&new));
+    // What made the runner build inside the crate: Cargo reads a lone
+    // package as a workspace of its own, rooted at its directory.
+    let metadata = Command::new(env!("CARGO"))
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(dir.join("sim/catalog"))
+        .output()
+        .expect("cargo runs");
+    assert!(metadata.status.success(), "{}", stderr(&metadata));
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).expect("cargo metadata is JSON");
+    assert_eq!(
+        metadata["workspace_root"].as_str().map(PathBuf::from),
+        Some(dir.join("sim/catalog"))
+    );
+    let check = embsim_logged(&dir, &cargo, &["check", "rig.toml"]);
+    assert!(!check.status.success(), "the stand-in Cargo builds nothing");
+    assert_says(&read(&log), &["metadata --no-deps"]);
+    assert_eq!(build_target(&log), dir.join(".embsim/target"));
+    assert!(!dir.join("sim/catalog/target").exists());
+}
+
+#[rstest]
+#[case::the_tools_own(false)]
+#[case::named_in_the_project(true)]
+fn a_crate_on_another_embsim_checkout_is_refused_before_any_build(#[case] named: bool) {
+    behaviour!(Test {
+        id: "cli.runner-two-copies",
+        covers: Some("cli/src/runner.rs#one_embsim"),
+        given: "a project whose catalog crate depends on embsim-board from one embsim \
+                checkout while the runner would build against another: the checkout the tool \
+                was built from, or one the project names with [catalog] embsim",
+    });
+    expect!(
+        "refused-naming-both",
+        "the tool refuses the project before it builds anything, naming the crate, the \
+         directory its embsim dependency is in, and the checkout the runner builds against",
+        "two copies of embsim in one runner would be two virtual clocks"
+    );
+    expect!(
+        "says-the-fix",
+        "the refusal says to point the crate's embsim dependencies at the runner's checkout, \
+         or, when the crate's is a checkout, to name it with [catalog] embsim"
+    );
+    let dir = outside(if named { "copies_named" } else { "copies_own" });
+    let (cargo, log) = logging_cargo(&dir);
+    let copy = other_checkout(&dir.join("embsim-copy"));
+    let real = workspace().canonicalize().unwrap();
+    let (board, embsim_line, fix) = if named {
+        (
+            real.join("board"),
+            "embsim = \"embsim-copy\"\n",
+            format!(
+                "Point the crate's embsim dependencies at {}",
+                copy.display()
+            ),
+        )
+    } else {
+        (
+            copy.join("board"),
+            "",
+            "[catalog] embsim = \"embsim-copy\"".to_string(),
+        )
+    };
+    crate_on(&dir.join("rig"), &board);
+    std::fs::write(
+        dir.join("p.toml"),
+        format!("[catalog]\ncrates = [\"rig\"]\n{embsim_line}"),
+    )
+    .expect("writable");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success());
+    let runner_checkout = if named { &copy } else { &real };
+    assert_says(
+        &stderr(&check),
+        &[
+            &format!(
+                "catalog crate rig-catalog takes embsim-board from {}, which is not in the \
+                 embsim checkout the runner builds against, {}",
+                board.display(),
+                runner_checkout.display()
+            ),
+            "two would be two virtual clocks",
+            &fix,
+        ],
+    );
+    assert!(
+        !read(&log).lines().any(|line| line.starts_with("build ")),
+        "nothing is built"
+    );
+}
+
+#[rstest]
+fn a_dependency_on_another_embsim_checkout_is_named_as_two_copies() {
+    behaviour!(Test {
+        id: "cli.runner-collision",
+        covers: Some("cli/src/runner.rs#Cargo::collision"),
+        given: "a catalog crate whose own embsim dependency is in the checkout the tool was \
+                built from, and which depends on a crate of the project's taking embsim-board \
+                from another checkout, checked with the `embsim` tool, the build failing",
+    });
+    expect!(
+        "named-two-copies",
+        "the error gives two copies of embsim as the one reason the build failed, quotes \
+         Cargo's package collision naming both embsim-board directories, and says to point \
+         every crate's embsim dependencies, the catalog crates' and those they depend on, at \
+         the checkout",
+        "a second copy reached through a crate the catalog crate depends on is refused by \
+         Cargo's resolver before anything compiles, and the tool names it"
+    );
+    let dir = outside("collision");
+    let (cargo, log) = logging_cargo(&dir);
+    let copy = other_checkout(&dir.join("embsim-copy"));
+    let real = workspace().canonicalize().unwrap();
+    library_on(&dir.join("helper"), "rig-helper", &copy.join("board"));
+    crate_on(&dir.join("rig"), &real.join("board"));
+    let manifest = dir.join("rig/Cargo.toml");
+    let text = read(&manifest) + &format!("rig-helper = {{ path = {:?} }}\n", "../helper");
+    std::fs::write(&manifest, text).expect("the manifest is writable");
+    std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"rig\"]\n").expect("writable");
+
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success());
+    assert!(
+        read(&log).lines().any(|line| line.starts_with("build ")),
+        "the check before the build reads only the catalog crate's own dependencies"
+    );
+    let said = stderr(&check);
+    assert_says(
+        &said,
+        &[
+            "the runner for p.toml did not build: it met two copies of embsim (package \
+             collision in the lockfile: packages embsim-board v0.1.0 (",
+            &format!("{})", real.join("board").display()),
+            &format!("{})", copy.join("board").display()),
+            &format!(
+                "Point the embsim dependencies of every catalog crate, and of the crates they \
+                 depend on, at {}",
+                real.display()
+            ),
+        ],
+    );
+    assert!(!said.contains("A catalog crate is a library"), "{said}");
+}
+
+#[rstest]
+fn a_runner_spells_the_checkout_as_its_crates_do() {
+    behaviour!(Test {
+        id: "cli.runner-spelling",
+        covers: Some("cli/src/runner.rs#one_embsim"),
+        given: "a catalog crate whose embsim dependency reaches the checkout the tool was \
+                built from through a symlink, checked with the `embsim` tool",
+    });
+    expect!(
+        "spelled-alike",
+        "the runner's manifest takes the embsim command from the checkout by the same \
+         symlinked path the crate uses",
+        "Cargo takes two spellings of one directory for two copies of a package"
+    );
+    let dir = outside("spelling");
+    let (cargo, _) = logging_cargo(&dir);
+    let link = dir.join("embsim-link");
+    std::os::unix::fs::symlink(workspace().canonicalize().unwrap(), &link)
+        .expect("the link can be made");
+    crate_on(&dir.join("rig"), &link.join("board"));
+    std::fs::write(dir.join("p.toml"), "[catalog]\ncrates = [\"rig\"]\n").expect("writable");
+    let check = embsim_logged(&dir, &cargo, &["check", "p.toml"]);
+    assert!(!check.status.success(), "the stand-in Cargo builds nothing");
+    let manifest = read(&runner_dir(&dir).join("Cargo.toml"));
+    let table: toml::Table = toml::from_str(&manifest).expect("the manifest parses");
+    assert_eq!(
+        table["dependencies"]["embsim-cli"]["path"].as_str(),
+        Some(link.join("cli").to_str().expect("text")),
+        "{manifest}"
+    );
+    assert_says(
+        &stderr(&check),
+        &[&format!("embsim at {})", link.display())],
+    );
+}
+
+// ============================================================
 // Built with Cargo: ignored here, run by CI's project-runner job
 // ============================================================
 
@@ -541,6 +1065,7 @@ kind = "sim-source"
 [component.options]
 volts = 2.5
 ohms = 100.0
+at = "0.5ms"
 
 [[wire]]
 from = "SRC.OUT"
@@ -565,8 +1090,8 @@ volts = 0.0
         &stdout(&run),
         &[
             "catalogs: embsim-boards, embsim-p2-qemu, sim-catalog",
-            "BRD.U1: pin 1 read 2.5 V",
-            "SRC: drove OUT at 2.5 V behind 100 Ω",
+            "BRD.U1: pin 1 read 2.5 V from 0.500000 ms",
+            "SRC: drove OUT at 2.5 V behind 100 Ω from 0.500000 ms",
         ],
     );
 }

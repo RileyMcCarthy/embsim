@@ -280,8 +280,13 @@ cargo test -p embsim-boards --test catalog_set
 # The standard bench component kinds, stepped, each its own binary: a
 # scripted source's steps landing at their instants across a divider (read a
 # nanosecond either side of each, and by a reader handed each at its
-# instant), and two host serial ports as a null-modem cable carrying bytes
-# between their PTYs both ways; and what each kind refuses.
+# instant), two host serial ports as a null-modem cable carrying bytes
+# between their PTYs both ways (written once running, and before the
+# system starts, none shed), a host's TX driving at whatever its VIO
+# reads (unsourced, 1.8 V, 3.3 V, each at its instant), and a PTY path
+# holding a file or a directory refused and left; and what each kind
+# refuses. (`cargo test -p embsim-core --test serial_pty` holds the PTY
+# link's own rule: it replaces only a link, and removes only its own.)
 cargo test -p embsim-boards --test scripted_source --test host_serial
 # The `embsim` command (`cli/`), run as a user runs it, a process a case:
 # survey the EC32's netlist (every connector pin, what needs a model and what
@@ -295,15 +300,22 @@ cargo test -p embsim-boards --test scripted_source --test host_serial
 # EMBSIM_QEMU_P2_BUILD set, `run` also boots the P2 off the module's flash
 # (`core = "qemu"`); without it, the refusal that says how. `run` with no
 # duration interrupted by SIGINT, its summary printed; `run --pty` putting a
-# host's PTY where it says and printing its path. And the command as a
+# host's PTY where it says and printing its path, and refusing a path that
+# holds a file. And the command as a
 # library (`cli/tests/library.rs`, in process): a catalog the test defines
 # adds a board kind, a part kind, a P2 core and a bench component, and a
 # project naming all four checks and runs through `embsim_cli::run`. A
 # project's own catalog crates (`cli/tests/runner.rs`): `new --catalog`
 # starting a crate and naming it in a project, the tool's refusals before
 # Cargo, the runner's files written when no Cargo starts, a runner refusing
-# a project naming other crates; and the crate `new --catalog` starts, its
-# four kinds run in process (`cli/tests/template.rs`).
+# a project naming other crates, `survey` and `new` with `--project` through
+# a runner; and, with a stand-in `$CARGO` that reads manifests and builds
+# nothing, a lone crate's runner built under `.embsim/target`, a crate on
+# another embsim checkout refused before any build, a crate's dependency on
+# another checkout named as two copies when the build fails, and a
+# symlinked checkout spelled as the crate spells it. The crate `new --catalog` starts,
+# its four kinds run in process, its source driving at its instant
+# (`cli/tests/template.rs`).
 cargo test -p embsim-cli
 
 # The runner built with Cargo (`#[ignore]`d above; CI's project-runner job):

@@ -14,3 +14,6 @@ description = "The catalog crate `embsim new --catalog` starts: one example of e
 [dependencies]
 embsim-board = { path = "../../board" }
 embsim-boards = { path = "../../boards" }
+# The virtual clock: the instant a component starts at, which its wakes
+# count from.
+embsim-core = { path = "../../core" }

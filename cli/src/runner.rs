@@ -21,19 +21,31 @@
 //!    the crates' canonical directories and the checkout's, so projects
 //!    naming the same crates share a runner. `.embsim/` carries a
 //!    `.gitignore` that keeps it out of version control.
-//! 4. **The files**: `Cargo.toml`, `main.rs`, `build.rs` (QEMU's link
+//! 4. **One embsim**: `cargo metadata --no-deps` on each crate gives its
+//!    embsim dependencies. Every one must be in the checkout, or the tool
+//!    refuses before it builds, naming both directories: two copies would be
+//!    two virtual clocks, and a part on one would wait on time nobody
+//!    advances. The runner reaches the checkout by the path the crates use
+//!    (a symlinked checkout is spelled as they spell it), since Cargo takes
+//!    two spellings of one directory for two packages.
+//! 5. **The files**: `Cargo.toml`, `main.rs`, `build.rs` (QEMU's link
 //!    arguments, as `cli/build.rs` passes them), each rewritten only when
 //!    its content would change, so Cargo sees nothing new.
-//! 5. **Where it builds**: the target directory of the Cargo workspace the
-//!    first crate belongs to (`CARGO_TARGET_DIR` included, as Cargo itself
-//!    reads it), so what that workspace built is reused; failing that,
-//!    `.embsim/target`. The runner's `Cargo.lock` starts as a copy of that
-//!    workspace's lock file, else embsim's, so shared dependencies keep the
-//!    versions they were tested at. The profile is `release`, unless
+//! 6. **Where it builds**: the target directory of the Cargo workspace the
+//!    first crate is a member of (`CARGO_TARGET_DIR` included, as Cargo
+//!    itself reads it), so what that workspace built is reused; for a crate
+//!    in no workspace — a package that is its own root, as `embsim new
+//!    --catalog` starts one — `.embsim/target` (or `CARGO_TARGET_DIR`), so
+//!    no build lands in the crate's source tree.
+//! 7. **The lock file**: the runner's `Cargo.lock` is seeded from the
+//!    workspace's lock file, with every package of embsim's own lock file
+//!    whose name the workspace's does not lock, and seeded again whenever
+//!    that seed changes. The profile is `release`, unless
 //!    `EMBSIM_RUNNER_PROFILE` names another.
-//! 6. **One embsim**: every `embsim_*` library the build reports must come
-//!    from one place. Two copies would be two virtual clocks, and a part on
-//!    one would wait on time nobody advances.
+//! 8. **After the build**: every `embsim_*` library the build reports must
+//!    come from one place; a build that fails on two copies of an embsim
+//!    package is said to, in place of the hint about what a catalog crate
+//!    exports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -85,6 +97,11 @@ struct Plan {
     crates: Vec<CrateDep>,
     /// The embsim checkout, canonical.
     embsim: PathBuf,
+    /// The same checkout as the runner's manifest spells it: the path the
+    /// catalog crates' embsim dependencies use, else [`Self::embsim`].
+    embsim_path: PathBuf,
+    /// `[catalog] embsim`, as the file gives it.
+    named_embsim: Option<String>,
     /// `.embsim/runner-<id>/`, absolute: Cargo runs in it.
     dir: PathBuf,
     /// The same directory as the project's path reaches it, for messages.
@@ -102,6 +119,22 @@ impl Plan {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// Where the checkout came from, for a message.
+    fn embsim_source(&self) -> String {
+        match &self.named_embsim {
+            Some(path) => format!("[catalog] embsim = {path:?}"),
+            None => "the checkout this embsim was built from".to_string(),
+        }
+    }
+
+    /// The project file's directory, as the command line reaches it.
+    fn project_dir(&self) -> &Path {
+        self.project
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    }
 }
 
 /// Write, build and `exec` the runner for `project`, whose `[catalog]` is
@@ -115,7 +148,7 @@ pub fn hand_over(
     args: &[OsString],
     err: &mut dyn Write,
 ) -> Result<Infallible, String> {
-    let plan = plan(project, catalog)?;
+    let mut plan = plan(project, catalog)?;
     if rebuild {
         match std::fs::remove_dir_all(&plan.dir) {
             Ok(()) => {}
@@ -128,9 +161,18 @@ pub fn hand_over(
             }
         }
     }
-    write_runner(&plan)?;
     let cargo = Cargo::find();
-    let workspace = cargo.workspace_of(&plan)?;
+    let metadata = match cargo.crate_metadata(&plan) {
+        Ok(metadata) => metadata,
+        Err(missing) => {
+            // Written either way, so the runner can be built by hand.
+            write_runner(&plan)?;
+            return Err(missing);
+        }
+    };
+    plan.embsim_path = one_embsim(&plan, &metadata)?;
+    write_runner(&plan)?;
+    let workspace = workspace_of(&plan, &metadata);
     seed_lock(&plan, workspace.as_ref())?;
     let target = workspace.as_ref().map_or_else(
         || {
@@ -150,7 +192,7 @@ pub fn hand_over(
         "embsim: building the runner for {} ({}, embsim at {}) in {}",
         plan.project.display(),
         plan.crate_names(),
-        plan.embsim.display(),
+        plan.embsim_path.display(),
         plan.shown.display()
     );
     let _ = err.flush();
@@ -175,29 +217,32 @@ pub fn hand_over(
                      every catalog crate's embsim dependencies at {}, or name the checkout they \
                      use with [catalog] embsim",
                     plan.project.display(),
-                    plan.embsim.display()
+                    plan.embsim_path.display()
                 ));
             }
             executable
         }
         Build::Failed { copies } => {
-            let mut message = format!(
+            let collision = two_copies(&copies).or_else(|| cargo.collision(&plan));
+            if let Some(copies) = collision {
+                return Err(format!(
+                    "the runner for {} did not build: it met two copies of embsim ({copies}); \
+                     Cargo's errors are above. Each copy would have its own virtual clock. \
+                     Point the embsim dependencies of every catalog crate, and of the crates \
+                     they depend on, at {}, each spelled by that path, or name the checkout \
+                     they use with [catalog] embsim (PROJECTS.md §10)",
+                    plan.project.display(),
+                    plan.embsim_path.display()
+                ));
+            }
+            return Err(format!(
                 "the runner for {} did not build (catalog crates {}; embsim at {}); Cargo's \
                  errors are above. A catalog crate is a library with `pub fn register(set: &mut \
                  CatalogSet) -> Result<(), ProjectError>` at its root (PROJECTS.md §10)",
                 plan.project.display(),
                 plan.crate_names(),
-                plan.embsim.display()
-            );
-            if let Some(copies) = two_copies(&copies) {
-                message.push_str(&format!(
-                    ". The build met two copies of embsim ({copies}): point every catalog \
-                     crate's embsim dependencies at {}, or name the checkout they use with \
-                     [catalog] embsim",
-                    plan.embsim.display()
-                ));
-            }
-            return Err(message);
+                plan.embsim_path.display()
+            ));
         }
     };
     let error = Command::new(&executable)
@@ -255,7 +300,9 @@ fn plan(project: &Path, catalog: &CatalogTable) -> Result<Plan, String> {
     Ok(Plan {
         project: project.to_path_buf(),
         crates,
+        embsim_path: embsim.clone(),
         embsim,
+        named_embsim: catalog.embsim.clone(),
         dir: state.join(&runner),
         shown: project_dir.join(".embsim").join(runner),
         package: format!("embsim-runner-{id}"),
@@ -434,8 +481,8 @@ fn manifest(plan: &Plan) -> String {
          # Named so build.rs is handed QEMU's link arguments when it links QEMU.\n\
          embsim-p2-qemu = {{ path = {qemu} }}\n",
         package = plan.package,
-        cli = toml_path(&plan.embsim.join("cli")),
-        qemu = toml_path(&plan.embsim.join("p2-qemu")),
+        cli = toml_path(&plan.embsim_path.join("cli")),
+        qemu = toml_path(&plan.embsim_path.join("p2-qemu")),
     );
     for dep in &plan.crates {
         text.push_str(&format!(
@@ -500,12 +547,13 @@ fn main() {
 "#;
 
 /// Write `content` to `path` unless it already holds exactly that, so an
-/// unchanged runner gives Cargo nothing new to look at.
-fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
+/// unchanged runner gives Cargo nothing new to look at. Whether it wrote.
+fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
     if std::fs::read_to_string(path).is_ok_and(|now| now == content) {
-        return Ok(());
+        return Ok(false);
     }
     std::fs::write(path, content)
+        .map(|()| true)
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
@@ -515,33 +563,93 @@ fn write_runner(plan: &Plan) -> Result<(), String> {
         .map_err(|error| format!("cannot make {}: {error}", plan.dir.display()))?;
     write_if_changed(&plan.dir.join("Cargo.toml"), &manifest(plan))?;
     write_if_changed(&plan.dir.join("main.rs"), &main_rs(plan))?;
-    write_if_changed(&plan.dir.join("build.rs"), BUILD_RS)
+    write_if_changed(&plan.dir.join("build.rs"), BUILD_RS)?;
+    Ok(())
 }
 
-/// Start the runner's `Cargo.lock` as a copy of the catalog workspace's,
-/// else embsim's, when it has none yet.
+/// The file beside the runner's `Cargo.lock` holding the seed it was last
+/// seeded from: a seed that differs from it seeds the lock again.
+const LOCK_SEED: &str = "Cargo.lock.seed";
+
+/// Seed the runner's `Cargo.lock` ([`lock_seed`]) when it has none, or when
+/// the seed changed since it was seeded: a lock file of the workspace or of
+/// embsim that moved. Between seeds the lock is Cargo's, as it resolved it.
 fn seed_lock(plan: &Plan, workspace: Option<&Workspace>) -> Result<(), String> {
-    let lock = plan.dir.join("Cargo.lock");
-    if lock.exists() {
+    let Some(seed) = lock_seed(plan, workspace)? else {
         return Ok(());
-    }
-    let seeds = workspace
-        .map(|workspace| workspace.root.join("Cargo.lock"))
-        .into_iter()
-        .chain(std::iter::once(plan.embsim.join("Cargo.lock")));
-    for seed in seeds {
-        if seed.exists() {
-            std::fs::copy(&seed, &lock).map_err(|error| {
-                format!(
-                    "cannot copy {} to {}: {error}",
-                    seed.display(),
-                    lock.display()
-                )
-            })?;
-            break;
-        }
+    };
+    let lock = plan.dir.join("Cargo.lock");
+    let changed = write_if_changed(&plan.dir.join(LOCK_SEED), &seed)?;
+    if changed || !lock.exists() {
+        std::fs::write(&lock, &seed)
+            .map_err(|error| format!("cannot write {}: {error}", lock.display()))?;
     }
     Ok(())
+}
+
+/// The lock file a runner starts from: the catalog workspace's
+/// `Cargo.lock`, and every package of embsim's own `Cargo.lock` whose name
+/// the workspace's does not lock. So a dependency the workspace builds
+/// keeps the version the workspace builds it at, one only embsim has takes
+/// the version embsim was tested at, and Cargo resolves afresh only what
+/// neither names (or a locked version embsim's requirement does not meet).
+/// A name the workspace locks is taken whole from it, never a second
+/// version beside it, so the workspace's own entries stay unambiguous.
+/// `None` when neither file is there.
+fn lock_seed(plan: &Plan, workspace: Option<&Workspace>) -> Result<Option<String>, String> {
+    let read = |path: PathBuf| -> Result<Option<(PathBuf, String)>, String> {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some((path, text))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+        }
+    };
+    let own = read(plan.embsim.join("Cargo.lock"))?;
+    let theirs = match workspace {
+        Some(workspace) => read(workspace.root.join("Cargo.lock"))?,
+        None => None,
+    };
+    match (theirs, own) {
+        (None, None) => Ok(None),
+        (Some((_, text)), None) | (None, Some((_, text))) => Ok(Some(text)),
+        (Some((base, text)), Some((extra, _))) if canonical(&base) == canonical(&extra) => {
+            Ok(Some(text))
+        }
+        (Some(base), Some(extra)) => merge_locks(&base, &extra).map(Some),
+    }
+}
+
+/// The lock file `base`, with every package of `extra` whose name `base`
+/// does not lock appended (each a path and its text).
+fn merge_locks(base: &(PathBuf, String), extra: &(PathBuf, String)) -> Result<String, String> {
+    let parse = |(path, text): &(PathBuf, String)| {
+        toml::from_str::<toml::Table>(text)
+            .map_err(|error| format!("{} does not parse: {error}", path.display()))
+    };
+    let mut merged = parse(base)?;
+    let added = parse(extra)?;
+    let name = |package: &toml::Value| {
+        package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+    let toml::Value::Array(packages) = merged
+        .entry("package")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+    else {
+        return Err(format!("{}: package is not a list", base.0.display()));
+    };
+    let locked: BTreeSet<String> = packages.iter().filter_map(name).collect();
+    if let Some(toml::Value::Array(more)) = added.get("package") {
+        packages.extend(
+            more.iter()
+                .filter(|package| name(package).is_some_and(|name| !locked.contains(&name)))
+                .cloned(),
+        );
+    }
+    toml::to_string(&merged)
+        .map_err(|error| format!("the runner's lock seed does not write: {error}"))
 }
 
 /// The Cargo workspace a catalog crate belongs to.
@@ -549,6 +657,162 @@ fn seed_lock(plan: &Plan, workspace: Option<&Workspace>) -> Result<(), String> {
 struct Workspace {
     root: PathBuf,
     target: PathBuf,
+}
+
+/// What Cargo says of one catalog crate (`cargo metadata --no-deps`).
+#[derive(Debug)]
+struct CrateMetadata {
+    /// The root of the workspace Cargo puts the crate in: its own
+    /// directory when it is in none.
+    workspace_root: PathBuf,
+    /// That workspace's target directory.
+    target: PathBuf,
+    /// The crate's embsim dependencies that are built into the runner
+    /// (normal and build), by package name, at the path Cargo resolved.
+    embsim_deps: Vec<(String, PathBuf)>,
+}
+
+impl CrateMetadata {
+    /// Read `metadata` for the package whose manifest is `manifest`.
+    fn read(metadata: &serde_json::Value, manifest: &Path) -> Option<Self> {
+        let path = |value: &serde_json::Value| value.as_str().map(PathBuf::from);
+        let workspace_root = path(metadata.get("workspace_root")?)?;
+        let target = path(metadata.get("target_directory")?)?;
+        let wanted = canonical(manifest);
+        let package = metadata
+            .get("packages")?
+            .as_array()?
+            .iter()
+            .find(|package| {
+                package
+                    .get("manifest_path")
+                    .and_then(path)
+                    .is_some_and(|found| canonical(&found) == wanted)
+            })?;
+        let embsim_deps = package
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .map(|deps| {
+                deps.iter()
+                    .filter(|dep| {
+                        // Dev-dependencies are not built into the runner.
+                        dep.get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|kind| kind == "build")
+                    })
+                    .filter_map(|dep| {
+                        let name = dep.get("name")?.as_str()?;
+                        let at = dep.get("path").and_then(path)?;
+                        name.starts_with("embsim-").then(|| (name.to_string(), at))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            workspace_root,
+            target,
+            embsim_deps,
+        })
+    }
+}
+
+/// The workspace the first catalog crate is a member of, if any. A package
+/// that is its own workspace root without a `[workspace]` table of its own
+/// — a crate `embsim new --catalog` starts outside any workspace — is in
+/// none: Cargo would name its own directory, and its `target/` there.
+fn workspace_of(plan: &Plan, metadata: &[Option<CrateMetadata>]) -> Option<Workspace> {
+    let (dep, metadata) = plan.crates.first().zip(metadata.first())?;
+    let metadata = metadata.as_ref()?;
+    if canonical(&metadata.workspace_root) == dep.dir && !declares_workspace(&dep.dir) {
+        return None;
+    }
+    Some(Workspace {
+        root: metadata.workspace_root.clone(),
+        target: metadata.target.clone(),
+    })
+}
+
+/// Whether the manifest in `dir` has a `[workspace]` table.
+fn declares_workspace(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+        .is_some_and(|table| table.contains_key("workspace"))
+}
+
+/// The embsim checkout as the runner's manifest spells it: the path the
+/// catalog crates' embsim dependencies reach it by, so Cargo, which takes
+/// two spellings of one directory (through a symlink) for two packages,
+/// sees one. Refused, naming both directories, when a crate's embsim
+/// dependency is not in the checkout, or when the crates spell it two
+/// ways. A crate Cargo could not read is left to the build's own check.
+fn one_embsim(plan: &Plan, metadata: &[Option<CrateMetadata>]) -> Result<PathBuf, String> {
+    let mut spellings: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for (dep, metadata) in plan.crates.iter().zip(metadata) {
+        let Some(metadata) = metadata else { continue };
+        for (name, at) in &metadata.embsim_deps {
+            let real = canonical(at);
+            let Ok(inside) = real.strip_prefix(&plan.embsim) else {
+                return Err(another_copy(plan, dep, name, &real));
+            };
+            let mut root = at.clone();
+            for _ in inside.components() {
+                root.pop();
+            }
+            if canonical(&root) != plan.embsim {
+                // A link inside the checkout: spell it canonically.
+                root.clone_from(&plan.embsim);
+            }
+            spellings.entry(root).or_insert_with(|| dep.package.clone());
+        }
+    }
+    if spellings.len() > 1 {
+        let ways: Vec<String> = spellings
+            .iter()
+            .map(|(root, package)| format!("{} ({package})", root.display()))
+            .collect();
+        return Err(format!(
+            "{}: the catalog crates reach the embsim checkout {} by {} paths, {}. Cargo takes \
+             each path for a copy of embsim of its own, and a runner holds one: spell every \
+             catalog crate's embsim dependencies by one of them",
+            plan.project.display(),
+            plan.embsim.display(),
+            spellings.len(),
+            ways.join(" and ")
+        ));
+    }
+    Ok(spellings
+        .into_keys()
+        .next()
+        .unwrap_or_else(|| plan.embsim.clone()))
+}
+
+/// The refusal for a catalog crate whose embsim dependency `name`, at
+/// `real` once links are followed, is outside the runner's checkout.
+fn another_copy(plan: &Plan, dep: &CrateDep, name: &str, real: &Path) -> String {
+    let mut message = format!(
+        "{}: catalog crate {} takes {name} from {}, which is not in the embsim checkout the \
+         runner builds against, {} ({}). A runner holds one copy of embsim: two would be two \
+         virtual clocks, and a part on one would wait on time nobody advances. Point the \
+         crate's embsim dependencies at {}",
+        plan.project.display(),
+        dep.package,
+        real.display(),
+        plan.embsim.display(),
+        plan.embsim_source(),
+        plan.embsim.display()
+    );
+    let other = real.ancestors().find(|dir| is_checkout(dir).is_ok());
+    if let Some(other) = other {
+        let path = crate::checklist::relative_path(other, plan.project_dir())
+            .unwrap_or_else(|_| other.to_path_buf());
+        message.push_str(&format!(
+            ", or build against the checkout it uses: [catalog] embsim = {}",
+            toml_string(&path.to_string_lossy())
+        ));
+    }
+    message.push_str(" (PROJECTS.md §10)");
+    message
 }
 
 /// What a runner build gave.
@@ -634,46 +898,68 @@ impl Cargo {
         )
     }
 
-    /// The workspace the first catalog crate belongs to, if Cargo names one.
-    fn workspace_of(&self, plan: &Plan) -> Result<Option<Workspace>, String> {
-        let Some(first) = plan.crates.first() else {
-            return Ok(None);
-        };
-        let manifest = first.dir.join("Cargo.toml");
+    /// What `cargo metadata --no-deps` says of each catalog crate, in
+    /// order: `None` for a crate Cargo cannot read on its own (one in a
+    /// directory a workspace covers without listing it). An error only when
+    /// Cargo does not start.
+    fn crate_metadata(&self, plan: &Plan) -> Result<Vec<Option<CrateMetadata>>, String> {
+        let mut all = Vec::with_capacity(plan.crates.len());
+        for dep in &plan.crates {
+            let manifest = dep.dir.join("Cargo.toml");
+            let output = self
+                .command(
+                    &dep.dir,
+                    &[
+                        OsStr::new("metadata"),
+                        OsStr::new("--no-deps"),
+                        OsStr::new("--format-version"),
+                        OsStr::new("1"),
+                        OsStr::new("--manifest-path"),
+                        manifest.as_os_str(),
+                    ],
+                )
+                .stderr(Stdio::null())
+                .output()
+                .map_err(|error| self.missing(plan, &error))?;
+            all.push(
+                output
+                    .status
+                    .success()
+                    .then(|| serde_json::from_slice(&output.stdout).ok())
+                    .flatten()
+                    .and_then(|metadata| CrateMetadata::read(&metadata, &manifest)),
+            );
+        }
+        Ok(all)
+    }
+
+    /// The line of Cargo's error that says the runner's dependency graph
+    /// holds two packages of one embsim name, when it does: read off a
+    /// `cargo metadata` of the runner (which resolves as the build did),
+    /// after a build failed.
+    fn collision(&self, plan: &Plan) -> Option<String> {
+        let manifest = plan.dir.join("Cargo.toml");
         let output = self
             .command(
-                &first.dir,
+                &plan.dir,
                 &[
                     OsStr::new("metadata"),
-                    OsStr::new("--no-deps"),
                     OsStr::new("--format-version"),
                     OsStr::new("1"),
                     OsStr::new("--manifest-path"),
                     manifest.as_os_str(),
                 ],
             )
-            .stderr(Stdio::null())
+            .stdout(Stdio::null())
             .output()
-            .map_err(|error| self.missing(plan, &error))?;
-        // A crate in no workspace, or in a directory a workspace it is not
-        // a member of covers, has no workspace to share: the runner builds
-        // in `.embsim/target`.
-        if !output.status.success() {
-            return Ok(None);
+            .ok()?;
+        if output.status.success() {
+            return None;
         }
-        let metadata: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-            Ok(metadata) => metadata,
-            Err(_) => return Ok(None),
-        };
-        let path = |key: &str| {
-            metadata
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-        };
-        Ok(path("workspace_root")
-            .zip(path("target_directory"))
-            .map(|(root, target)| Workspace { root, target }))
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .find(|line| line.contains("package collision") && line.contains("embsim-"))
+            .map(|line| line.trim().trim_start_matches("error: ").to_string())
     }
 
     /// `cargo clean` of the runner and the catalog crates, for `--rebuild`.
@@ -888,6 +1174,58 @@ mod tests {
         assert_ne!(
             runner_id(&[dep("/a"), dep("/b")], embsim),
             runner_id(&[dep("/b"), dep("/a")], embsim)
+        );
+    }
+
+    #[rstest]
+    fn a_lock_seed_keeps_the_workspaces_versions_and_adds_what_only_embsim_locks() {
+        let lock = |packages: &[(&str, &str)]| {
+            let mut text = String::from("version = 4\n");
+            for (name, version) in packages {
+                text.push_str(&format!(
+                    "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \
+                     \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+                ));
+            }
+            text
+        };
+        let base = (
+            PathBuf::from("/w/Cargo.lock"),
+            lock(&[("clap", "4.5.57"), ("libc", "0.2.170")]),
+        );
+        let extra = (
+            PathBuf::from("/e/Cargo.lock"),
+            lock(&[
+                ("clap", "4.6.7"),
+                ("serde_json", "1.0.140"),
+                ("toml", "0.8.23"),
+            ]),
+        );
+        let merged: toml::Table = toml::from_str(&merge_locks(&base, &extra).unwrap()).unwrap();
+        assert_eq!(merged["version"].as_integer(), Some(4));
+        let packages: Vec<(String, String)> = merged["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|package| {
+                (
+                    package["name"].as_str().unwrap().to_string(),
+                    package["version"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let packages: Vec<(&str, &str)> = packages
+            .iter()
+            .map(|(name, version)| (name.as_str(), version.as_str()))
+            .collect();
+        assert_eq!(
+            packages,
+            [
+                ("clap", "4.5.57"),
+                ("libc", "0.2.170"),
+                ("serde_json", "1.0.140"),
+                ("toml", "0.8.23")
+            ]
         );
     }
 

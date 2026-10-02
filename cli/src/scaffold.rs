@@ -145,6 +145,7 @@ pub fn write_crate(dir: &Path, embsim: &Path) -> Result<Scaffold, String> {
         .map_err(|error| format!("cannot make {}: {error}", src.display()))?;
     let board = reach(&embsim.join("board"), dir)?;
     let boards = reach(&embsim.join("boards"), dir)?;
+    let core = reach(&embsim.join("core"), dir)?;
     let manifest = format!(
         "# {package}: the kinds this project adds to embsim (PROJECTS.md §10). Started by\n\
          # `embsim new --catalog`; a project names it in its [catalog] crates, and the\n\
@@ -160,9 +161,13 @@ pub fn write_crate(dir: &Path, embsim: &Path) -> Result<Scaffold, String> {
          # runner, so these paths and the project's [catalog] embsim (or the checkout\n\
          # the `embsim` tool was built from) must be the same directory.\n\
          embsim-board = {{ path = {board} }}\n\
-         embsim-boards = {{ path = {boards} }}\n",
+         embsim-boards = {{ path = {boards} }}\n\
+         # The virtual clock: the instant a component starts at, which its wakes\n\
+         # count from.\n\
+         embsim-core = {{ path = {core} }}\n",
         board = toml_string(&board),
         boards = toml_string(&boards),
+        core = toml_string(&core),
     );
     let lib = TEMPLATE_LIB.replace(TEMPLATE_NAME, &prefix).replace(
         &TEMPLATE_NAME.to_ascii_uppercase(),
@@ -182,20 +187,32 @@ pub fn write_crate(dir: &Path, embsim: &Path) -> Result<Scaffold, String> {
     })
 }
 
-/// The `[catalog]` table naming one crate, as a project file writes it.
-fn catalog_table(path: &str) -> String {
-    format!(
+/// The `[catalog]` table naming `crates`, and the checkout `embsim` when
+/// given, as a project file writes it.
+fn catalog_table(crates: &[String], embsim: Option<&str>) -> String {
+    let crates: Vec<String> = crates.iter().map(|path| toml_string(path)).collect();
+    let mut table = format!(
         "# The project's own kinds: catalog crates the `embsim` tool builds into the\n\
          # runner that runs this project (PROJECTS.md §10).\n\
          [catalog]\n\
          crates = [{}]\n",
-        toml_string(path)
-    )
+        crates.join(", ")
+    );
+    if let Some(embsim) = embsim {
+        table.push_str(&format!("embsim = {}\n", toml_string(embsim)));
+    }
+    table
 }
 
 /// `text`, a project with no `[catalog]`, with one naming the crate `path`
 /// after its leading comment.
 pub fn with_catalog_table(text: &str, path: &str) -> String {
+    with_catalog(text, &[path.to_string()], None)
+}
+
+/// `text`, a project with no `[catalog]`, with one naming `crates` (and
+/// the checkout `embsim`) after its leading comment.
+pub fn with_catalog(text: &str, crates: &[String], embsim: Option<&str>) -> String {
     let mut head = 0;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
@@ -213,7 +230,7 @@ pub fn with_catalog_table(text: &str, path: &str) -> String {
         }
         out.push('\n');
     }
-    out.push_str(&catalog_table(path));
+    out.push_str(&catalog_table(crates, embsim));
     if !rest.is_empty() {
         out.push('\n');
         out.push_str(rest);

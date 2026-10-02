@@ -9,7 +9,8 @@
 //! - `embsim survey <netlist>` — the checklist: what the catalogs populate
 //!   by themselves, what needs a model and which kinds could be it, and
 //!   every connector pin a wire may use. `embsim survey --kind p2-ec32mb`
-//!   surveys a board a catalog ships the same way.
+//!   surveys a board a catalog ships the same way. With `--project FILE`
+//!   the project's own kinds are among them (below).
 //! - `embsim new <netlist>` — a starter project answering that checklist as
 //!   far as the catalogs can, with a commented stub for every part left.
 //! - `embsim check <project>` — loads, surveys and builds the system with
@@ -29,7 +30,9 @@
 //! beside the project, builds with Cargo and `exec`s — the same command
 //! over a set the project's catalogs joined ([`runner_main`];
 //! `PROJECTS.md` §10, "The runner"). `embsim new --catalog DIR` starts a
-//! catalog crate.
+//! catalog crate. `survey` and `new` take `--project FILE` to run in that
+//! project's runner the same way, so a part's candidates, `--kind`, and the
+//! starter project's `[catalog]` are the project's.
 //!
 //! A project's own binary is the same command over a set its catalogs
 //! joined, in ten lines, for a project that would rather own its binary
@@ -108,6 +111,11 @@ enum Command {
         /// registry a project builds it with.
         #[arg(long)]
         kind: Option<String>,
+        /// Survey with the kinds of this project's `[catalog]` crates among
+        /// the catalogs': the survey runs in the project's runner, as
+        /// `check` does.
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<PathBuf>,
     },
     /// Write a starter project for a netlist: the board, the pin tables the
     /// catalogs can choose, a commented stub for every part that needs a
@@ -146,6 +154,17 @@ enum Command {
             conflicts_with_all = ["netlist", "output", "name", "force"]
         )]
         add_to: Option<PathBuf>,
+        /// Start the project with the kinds of this project's `[catalog]`
+        /// crates among the catalogs': `new` runs in the project's runner,
+        /// and the starter project names the same `[catalog]`, its paths
+        /// rewritten to reach the crates from where it is written.
+        #[arg(
+            long,
+            value_name = "PROJECT",
+            requires = "netlist",
+            conflicts_with_all = ["catalog", "add_to"]
+        )]
+        project: Option<PathBuf>,
     },
     /// Load a project, survey its boards and build its system with time
     /// held; print what the build found. Exits non-zero, with the reason,
@@ -187,12 +206,13 @@ enum Command {
 }
 
 impl Command {
-    /// The project a `check` or `run` names: the file whose `[catalog]`
-    /// decides which binary runs it.
+    /// The project a `check` or `run` names, or a `survey` or `new` takes
+    /// with `--project`: the file whose `[catalog]` decides which binary
+    /// runs the command.
     fn project(&self) -> Option<&Path> {
         match self {
             Self::Check { project, .. } | Self::Run { project, .. } => Some(project),
-            Self::Survey { .. } | Self::New { .. } => None,
+            Self::Survey { project, .. } | Self::New { project, .. } => project.as_deref(),
         }
     }
 
@@ -230,9 +250,10 @@ pub fn source_dir() -> PathBuf {
 }
 
 /// The `embsim` binary's `main`: the command over [`shipped`], except that
-/// a `check` or `run` of a project with `[catalog]` is handed to the
-/// project's runner — written beside the project, built with Cargo and
-/// `exec`ed with the same arguments (`PROJECTS.md` §10, "The runner").
+/// a `check` or `run` of a project with `[catalog]`, or a `survey` or `new`
+/// with `--project` naming one, is handed to the project's runner —
+/// written beside the project, built with Cargo and `exec`ed with the same
+/// arguments (`PROJECTS.md` §10, "The runner").
 /// Before it hands over it reads only the project's `[catalog]` table.
 pub fn tool_main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -278,10 +299,10 @@ pub struct CatalogCrate {
 
 /// A runner's `main`: the command over [`shipped`] and `crates`, each
 /// crate's registration function called in order, with the process's own
-/// arguments and output. A `check` or `run` of a project whose `[catalog]`
-/// names other crates, or another embsim checkout, is refused, naming
-/// both: the `embsim` tool builds one runner per set of crates, and runs a
-/// project only through its own.
+/// arguments and output. A `check` or `run` of a project (or a `survey` or
+/// `new` with `--project`) whose `[catalog]` names other crates, or another
+/// embsim checkout, is refused, naming both: the `embsim` tool builds one
+/// runner per set of crates, and runs a project only through its own.
 pub fn runner_main(crates: &[CatalogCrate]) -> ExitCode {
     run_with_crates(
         crates,
@@ -380,9 +401,15 @@ fn execute(
     err: &mut dyn Write,
 ) -> ExitCode {
     let outcome = match command {
-        Command::Survey { netlist, kind } => match (netlist, kind) {
+        // `--project` chose the binary, and so the set; the survey reads
+        // nothing else of the file.
+        Command::Survey {
+            netlist,
+            kind,
+            project,
+        } => match (netlist, kind) {
             (Some(netlist), None) => checklist::survey(set, &netlist, out),
-            (None, Some(kind)) => checklist::survey_kind(set, &kind, out),
+            (None, Some(kind)) => checklist::survey_kind(set, &kind, project.is_some(), out),
             _ => unreachable!("clap requires exactly one of the netlist and --kind"),
         },
         Command::New {
@@ -392,6 +419,7 @@ fn execute(
             force,
             catalog,
             add_to,
+            project,
         } => match (netlist, catalog) {
             (Some(netlist), catalog) => checklist::new_project(
                 set,
@@ -401,6 +429,7 @@ fn execute(
                     output: output.as_deref(),
                     force,
                     catalog: catalog.as_deref(),
+                    project: project.as_deref(),
                 },
                 out,
             ),

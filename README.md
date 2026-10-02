@@ -296,9 +296,11 @@ workspace built, and with nothing changed only Cargo's no-op check — and
 hands the command line to it. `embsim new --catalog DIR` starts such a
 crate with one commented example of each sort of kind, and names it in the
 project (`--add-to PROJECT`, or the starter project `new` writes);
-`check --rebuild` builds the runner afresh. The tool takes embsim's crates
-from the checkout it was built from, or the project's `[catalog] embsim`
-(`PROJECTS.md` section 10, "The runner").
+`check --rebuild` builds the runner afresh. `survey` and `new` take
+`--project FILE` to run in that project's runner, so the checklist offers
+the project's own kinds. The tool takes embsim's crates from the checkout
+it was built from, or the project's `[catalog] embsim` (`PROJECTS.md`
+section 10, "The runner").
 
 The standard catalog's bench component kinds are `host-serial`, a host's
 serial port as a PTY on the host's own rail, and `scripted-source`, a pin
@@ -333,11 +335,14 @@ The catalog crate depends on embsim's crates by path, into that checkout:
 [dependencies]
 embsim-board  = { path = "../../vendor/embsim/board" }
 embsim-boards = { path = "../../vendor/embsim/boards" }
+embsim-core   = { path = "../../vendor/embsim/core" }   # the virtual clock
 ```
 
 The runner takes embsim from the checkout the tool was built from, or from
-the project's `[catalog] embsim`, and refuses a build that links two copies
-(`PROJECTS.md` §10, "Which embsim the runner builds against"). A project
+the project's `[catalog] embsim`, refuses a catalog crate whose embsim
+dependencies are another copy before it builds, and spells the checkout as
+the crates do (`PROJECTS.md` §10, "Which embsim the runner builds
+against"). A project
 workspace should `exclude` the submodule directory (embsim is its own
 workspace root); path dependencies across the boundary work fine:
 

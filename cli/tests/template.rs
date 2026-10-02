@@ -45,6 +45,7 @@ kind = "yourproject-source"
 [component.options]
 volts = 3.3
 ohms = 100.0
+at = "1ms"
 
 [[wire]]
 from = "SRC.OUT"
@@ -130,6 +131,12 @@ fn the_started_catalogs_four_kinds_check_and_run_in_one_project() {
          connector"
     );
     expect!(
+        "source-acts-at-its-instant",
+        "the bench source drives from the instant its options name, a millisecond after the \
+         system starts, and the sensor is first handed its volts at that instant",
+        "a bench component acts over time on a wake it arms when the system starts"
+    );
+    expect!(
         "core-drives-its-pad",
         "the core drives the pad its options name high from the processor's start, and the \
          pad's net reads driven high at the end",
@@ -148,10 +155,10 @@ fn the_started_catalogs_four_kinds_check_and_run_in_one_project() {
     let (code, out, err) = runner(&["run", project, "--for", "10ms", "--net", "EC32.P2_IO0"]);
     assert_eq!(code, ExitCode::SUCCESS, "{err}\n{out}");
     for line in [
-        "BRD.U1: pin 1 read 3.3 V",
+        "BRD.U1: pin 1 read 3.3 V from 1.000000 ms",
         "EC32.U100: core \"yourproject-core\": started at 5.500000 ms",
         "EC32.U100: drove P0 high",
-        "SRC: drove OUT at 3.3 V behind 100 Ω",
+        "SRC: drove OUT at 3.3 V behind 100 Ω from 1.000000 ms",
         "net EC32.P2_IO0: Driven(High)",
     ] {
         assert!(out.contains(line), "{line:?} missing from:\n{out}");

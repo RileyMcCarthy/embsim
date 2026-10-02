@@ -411,6 +411,15 @@ fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proj
             embsim.join(format!("{}.pty", spec.name))
         }
     };
+    // The PTY's link replaces a link an earlier run left there, and nothing
+    // else: a path holding a file (`--pty notes.txt`, the project file
+    // itself) is refused, and the file left as it is.
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.file_type().is_symlink()) {
+        return Err(error(format!(
+            "{} exists and is not a PTY link; name a free path",
+            path.display()
+        )));
+    }
     let text = path.to_string_lossy().into_owned();
     let pty = HostPty::open_on_rail(&text, baud)
         .map_err(|err| error(format!("cannot open a PTY at {text}: {err}")))?;
@@ -472,6 +481,13 @@ impl Report for HostSerialReport {
                  is reproducible in what the host sent, not in when"
                     .to_string(),
             );
+        }
+        let shed = self.counters.shed_inbound.load(Relaxed);
+        if shed > 0 {
+            lines.push(format!(
+                "{shed} bytes the host wrote were shed: its line was unpowered (VIO read no \
+                 voltage) or its queue was full"
+            ));
         }
         lines
     }

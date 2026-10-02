@@ -9,7 +9,7 @@
 //! | `yourproject-board` | a board: a netlist this crate bundles | `[[board]] kind = "yourproject-board"` |
 //! | `yourproject-sensor` | a part model | `[[board.model]] value = "YOURPROJECT-SENSOR"`, `kind = "yourproject-sensor"` |
 //! | `yourproject-core` | what runs inside the P2's package | `[board.model.options] core = "yourproject-core"`, `pin = 0` |
-//! | `yourproject-source` | a bench component | `[[component]] kind = "yourproject-source"`, `volts`, `ohms` |
+//! | `yourproject-source` | a bench component that acts over time | `[[component]] kind = "yourproject-source"`, `volts`, `ohms`, `at` |
 //!
 //! Keep the ones the project needs, rename them, and write the rest. Three
 //! rules bind them as they bind embsim's own (`DESIGN.md`):
@@ -32,15 +32,17 @@
 
 use std::sync::{Arc, Mutex};
 
+use embsim_board::report::instant;
 use embsim_board::{
     netlist, Assignment, AttachError, BoardSpec, Catalog, CatalogBoard, Component, ComponentNetIo,
     ComponentRequest, Drive, KindGuide, ModelFacade, Named, PartOptions, PartRegistry, PinDecl,
-    PinHandle, ProjectError, Report, Reports, TheveninDrive,
+    PinHandle, ProjectError, Report, TheveninDrive,
 };
 use embsim_boards::catalog::CatalogSet;
 use embsim_boards::p2::{
     CoreCatalog, CoreCtor, CoreKind, P2Core, P2Pads, PadDrive, NATIVE_PAD_MODE, NUM_PADS,
 };
+use embsim_core::virtual_clock;
 
 /// Add this crate's kinds to `set`: called once by the runner, after the
 /// catalogs embsim ships are in it and before the project is read. Starts
@@ -168,11 +170,14 @@ const SENSOR_PINS: [PinDecl; 2] = [
     PinDecl::power_in("2"),
 ];
 
+/// What pin 1 was last handed: its voltage (`None` while no source
+/// reaches it) and the instant it was handed it.
+type Reading = Arc<Mutex<Option<(Option<f64>, u64)>>>;
+
 /// The sensor: an analog reader across its pins. A real part's model
 /// declares its datasheet's thresholds, supply and outputs here.
 struct Sensor {
-    /// The voltage last handed to pin 1, `None` while no source reaches it.
-    reading: Arc<Mutex<Option<Option<f64>>>>,
+    reading: Reading,
 }
 
 impl Component for Sensor {
@@ -183,9 +188,10 @@ impl Component for Sensor {
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let reading = Arc::clone(&self.reading);
         // Delivered once at registration and on every change of the net,
-        // on the engine thread.
+        // on the engine thread, stamped with the virtual instant.
         io.on_sense("1", move |sense| {
-            *reading.lock().expect("the reading is never poisoned") = Some(sense.volts);
+            *reading.lock().expect("the reading is never poisoned") =
+                Some((sense.volts, sense.at_ns));
         })
     }
 }
@@ -193,7 +199,7 @@ impl Component for Sensor {
 /// What a sensor says at the end of a run.
 struct SensorReport {
     subject: String,
-    reading: Arc<Mutex<Option<Option<f64>>>>,
+    reading: Reading,
 }
 
 impl Report for SensorReport {
@@ -207,8 +213,8 @@ impl Report for SensorReport {
 
     fn summary(&self) -> Vec<String> {
         let line = match *self.reading.lock().expect("the reading is never poisoned") {
-            Some(Some(volts)) => format!("pin 1 read {volts} V"),
-            Some(None) => "pin 1 read no voltage: no source reaches it".to_string(),
+            Some((Some(volts), at_ns)) => format!("pin 1 read {volts} V from {}", instant(at_ns)),
+            Some((None, _)) => "pin 1 read no voltage: no source reaches it".to_string(),
             None => "pin 1 was never read".to_string(),
         };
         vec![line]
@@ -339,12 +345,12 @@ impl Report for CoreReport {
 }
 
 // ============================================================
-// A bench component kind
+// A bench component kind that acts over time
 // ============================================================
 
-/// `yourproject-source`: one pin, `OUT`, driving `volts` behind `ohms`
-/// from the moment the system starts. Both are the bench's to say, so both
-/// are required: the kind invents neither.
+/// `yourproject-source`: one pin, `OUT`, released until `at` after the
+/// system starts, then driving `volts` behind `ohms`. All three are the
+/// bench's to say, so all are required: the kind invents none.
 fn source(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
     let ComponentRequest {
         spec,
@@ -359,19 +365,39 @@ fn source(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectEr
         .number("ohms")?
         .filter(|ohms| *ohms > 0.0)
         .ok_or_else(|| options.error("options.ohms, more than 0, is the source's impedance"))?;
+    let at_ns = options.duration("at")?.ok_or_else(|| {
+        options.error("options.at is when, after the system starts, the source drives (\"1ms\")")
+    })?;
     options.finish()?;
-    add_source_report(reports, &spec.name, volts, ohms);
+    let driven_at = Arc::new(Mutex::new(None));
+    reports.add(SourceReport {
+        subject: spec.name.clone(),
+        volts,
+        ohms,
+        driven_at: Arc::clone(&driven_at),
+    });
     Ok(Box::new(Source {
-        pins: [PinDecl::analog_source("OUT").with_idle(Some(TheveninDrive {
+        pins: [PinDecl::analog_source("OUT")],
+        drive: TheveninDrive {
             volts,
             impedance: ohms,
-        }))],
+        },
+        at_ns,
+        io: None,
+        driven_at,
     }))
 }
 
-/// The source: its one pin idles at the drive the file named.
+/// The source: its one pin released until its instant, then driven.
 struct Source {
     pins: [PinDecl; 1],
+    drive: TheveninDrive,
+    /// When it drives, after the system starts.
+    at_ns: u64,
+    /// The handle `start` arms the wake on.
+    io: Option<ComponentNetIo>,
+    /// The virtual instant it drove, once it has.
+    driven_at: Arc<Mutex<Option<u64>>>,
 }
 
 impl Component for Source {
@@ -379,23 +405,39 @@ impl Component for Source {
         &self.pins
     }
 
-    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
+    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
+        let (pin, drive) = (io.pin("OUT")?, self.drive);
+        let driven_at = Arc::clone(&self.driven_at);
+        // Runs on the engine thread at each instant this component armed
+        // (`schedule_at_ns`), with that instant: virtual time, so a stepped
+        // run reaches it exactly, and two runs alike.
+        io.on_wake_ns(move |now_ns| {
+            let mut driven = driven_at.lock().expect("never poisoned");
+            if driven.is_none() {
+                pin.drive(Drive::Thevenin(drive));
+                *driven = Some(now_ns);
+            }
+        });
+        self.io = Some(io);
         Ok(())
+    }
+
+    /// The system started: time is held until every component has, so the
+    /// instant read here is the same on every run. Arm the one wake.
+    fn start(&mut self) {
+        let started_ns = virtual_clock::virtual_ns();
+        if let Some(io) = &self.io {
+            io.schedule_at_ns(started_ns.saturating_add(self.at_ns));
+        }
     }
 }
 
-/// Say what the source drives, once, at the end of the run.
-fn add_source_report(reports: &Reports, name: &str, volts: f64, ohms: f64) {
-    reports.add(SourceReport {
-        subject: name.to_string(),
-        line: format!("drove OUT at {volts} V behind {ohms} Ω"),
-    });
-}
-
-/// What the source says.
+/// What the source says at the end of a run.
 struct SourceReport {
     subject: String,
-    line: String,
+    volts: f64,
+    ohms: f64,
+    driven_at: Arc<Mutex<Option<u64>>>,
 }
 
 impl Report for SourceReport {
@@ -408,6 +450,13 @@ impl Report for SourceReport {
     }
 
     fn summary(&self) -> Vec<String> {
-        vec![self.line.clone()]
+        let (volts, ohms) = (self.volts, self.ohms);
+        vec![match *self.driven_at.lock().expect("never poisoned") {
+            Some(at_ns) => format!(
+                "drove OUT at {volts} V behind {ohms} Ω from {}",
+                instant(at_ns)
+            ),
+            None => "drove nothing: the run ended before its instant".to_string(),
+        }]
     }
 }

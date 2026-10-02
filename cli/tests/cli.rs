@@ -889,6 +889,53 @@ fn a_run_puts_the_hosts_pty_where_pty_says_and_prints_its_path() {
 }
 
 #[rstest]
+fn a_pty_naming_a_file_is_refused_and_the_file_kept() {
+    behaviour!(Test {
+        id: "cli.run-pty-guard",
+        covers: Some("boards/src/catalog.rs#host_serial"),
+        given: "a project with one host serial port, run for a millisecond with --pty naming \
+                a file of notes, and checked with its own path option naming the project file \
+                itself",
+    });
+    expect!(
+        "refused-and-kept",
+        "the run and the check each exit non-zero naming the component, the path and that \
+         it is not a PTY link, and the notes and the project file are unchanged",
+        "a run puts its PTY link only on a free path or over a link an earlier run left"
+    );
+    let dir = scratch("pty_file");
+    let project = dir.join("host.toml");
+    std::fs::write(&project, HOST_PROJECT).expect("the project is writable");
+    let notes = dir.join("notes.txt");
+    std::fs::write(&notes, "precious notes").expect("the notes are writable");
+    let run = embsim(&["run", path(&project), "--for", "1ms", "--pty", path(&notes)]);
+    assert!(!run.status.success(), "{}", stdout(&run));
+    assert_says(
+        &stderr(&run),
+        &[&format!(
+            "component HOST (kind \"host-serial\"): {} exists and is not a PTY link; name a \
+             free path",
+            notes.display()
+        )],
+    );
+    assert_eq!(
+        std::fs::read_to_string(&notes).expect("the notes are there"),
+        "precious notes"
+    );
+
+    let itself = dir.join("itself.toml");
+    let text = HOST_PROJECT.replace("baud = 115200", "baud = 115200\npath = \"itself.toml\"");
+    std::fs::write(&itself, &text).expect("the project is writable");
+    let check = embsim(&["check", path(&itself)]);
+    assert!(!check.status.success(), "{}", stdout(&check));
+    assert_says(&stderr(&check), &["exists and is not a PTY link"]);
+    assert_eq!(
+        std::fs::read_to_string(&itself).expect("the project is there"),
+        text
+    );
+}
+
+#[rstest]
 fn a_pty_without_a_name_is_refused_when_the_project_has_two_hosts() {
     let dir = scratch("pty_two");
     let project = dir.join("hosts.toml");

@@ -12,8 +12,9 @@ use std::io::Write as IoWrite;
 use std::path::{Component as PathPart, Path, PathBuf};
 
 use embsim_board::{
-    is_connector, kinds_without_a_model, BoardSurvey, Classification, ConnectorReport, Fit,
-    KeyField, KindGuide, PassiveKind, PinSite, Project, SurveyedPart, UnmodelledPart,
+    is_connector, kinds_without_a_model, BoardSurvey, Catalog, CatalogTable, Classification,
+    ConnectorReport, Fit, KeyField, KindGuide, PassiveKind, PinSite, Project, SurveyedPart,
+    UnmodelledPart,
 };
 use embsim_boards::catalog::CatalogSet;
 
@@ -352,7 +353,15 @@ pub fn survey(set: &CatalogSet, netlist: &Path, out: &mut dyn IoWrite) -> Result
 /// with the registry it builds with, as a project's `[[board]]` of that
 /// kind surveys it — every part it places, the ones it leaves to the
 /// project, and every connector pin with its name and net.
-pub fn survey_kind(set: &CatalogSet, kind: &str, out: &mut dyn IoWrite) -> Result<(), String> {
+///
+/// Without `with_project`, a kind no catalog of the set has is refused
+/// with the way to a project's own kinds: `--project FILE`.
+pub fn survey_kind(
+    set: &CatalogSet,
+    kind: &str,
+    with_project: bool,
+    out: &mut dyn IoWrite,
+) -> Result<(), String> {
     if kind == "netlist" {
         return Err(
             "--kind netlist is a board read from a file; give the file: embsim survey board.net"
@@ -364,9 +373,17 @@ pub fn survey_kind(set: &CatalogSet, kind: &str, out: &mut dyn IoWrite) -> Resul
         toml_string(kind)
     );
     let project = Project::parse(&text).map_err(|err| err.to_string())?;
-    let survey = project
-        .survey(set, "BOARD")
-        .map_err(|err| err.to_string())?;
+    let survey = project.survey(set, "BOARD").map_err(|err| {
+        let unknown = !set.board_kinds().iter().any(|known| known == kind);
+        if unknown && !with_project {
+            format!(
+                "{err}. A kind a project's catalog crate adds is surveyed with the project: \
+                 embsim survey --project FILE --kind {kind} (PROJECTS.md §10)"
+            )
+        } else {
+            err.to_string()
+        }
+    })?;
     let _ = write!(
         out,
         "{}",
@@ -602,6 +619,9 @@ pub struct NewOptions<'a> {
     /// `--catalog`: a catalog crate to start, named in the project's
     /// `[catalog]`.
     pub catalog: Option<&'a Path>,
+    /// `--project`: a project whose `[catalog]` the starter project names
+    /// too.
+    pub project: Option<&'a Path>,
 }
 
 /// `embsim new <netlist> [--name N] [-o project.toml] [--force] [--catalog
@@ -617,6 +637,7 @@ pub fn new_project(
         output,
         force,
         catalog,
+        project,
     } = *options;
     let name = name.map_or_else(|| default_name(netlist), str::to_string);
     let survey = survey_netlist(set, netlist, &name)?;
@@ -652,6 +673,12 @@ pub fn new_project(
         &survey,
         &set.guide(),
     );
+    // `--project`'s catalog crates, reached from where this project lives.
+    if let Some(project) = project {
+        if let Some(carried) = carried_catalog(project, &project_dir)? {
+            text = scaffold::with_catalog(&text, &carried.crates, carried.embsim.as_deref());
+        }
+    }
     // The crate first: the project names its directory as it is on disk.
     let scaffold = match catalog {
         Some(dir) => {
@@ -718,6 +745,40 @@ pub fn new_project(
         );
     }
     Ok(())
+}
+
+/// A `[catalog]` carried into a starter project, its paths reaching the
+/// crates from where the starter goes.
+struct CarriedCatalog {
+    crates: Vec<String>,
+    embsim: Option<String>,
+}
+
+/// The `[catalog]` of `project` with its paths reaching the crates from
+/// `project_dir`, where the starter project goes ([`relative_path`]): its
+/// crates, and its embsim checkout when it names one. `None` when the
+/// project has no `[catalog]`.
+fn carried_catalog(project: &Path, project_dir: &Path) -> Result<Option<CarriedCatalog>, String> {
+    let catalog = CatalogTable::of_project(project).map_err(|err| err.to_string())?;
+    let Some(catalog) = catalog else {
+        return Ok(None);
+    };
+    let from = project
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let reach = |path: &str| {
+        relative_path(&from.join(path), project_dir)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|err| format!("--project {}: [catalog]: {err}", project.display()))
+    };
+    let crates = catalog
+        .crates
+        .iter()
+        .map(|path| reach(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let embsim = catalog.embsim.as_deref().map(reach).transpose()?;
+    Ok(Some(CarriedCatalog { crates, embsim }))
 }
 
 /// `target` relative to the directory `base`, both resolved on disk.

@@ -10,9 +10,14 @@ project has: a catalog crate of MaD's own kinds, a project file, and the
 `embsim` command ([`PROJECTS.md`](PROJECTS.md) §10).
 
 *Status, 2026-10-01. A plan: nothing in MaD has changed. It was checked
-against MaD's working tree on 2026-10-01 (branch `feat/iss-rom-serial-flash`;
-line numbers below are that tree's) and against embsim's
-`feat/embsim-catalogs`. The project file was checked against the Edge
+against embsim's `feat/embsim-catalogs` and against MaD's working tree on
+2026-10-01: branch `feat/iss-rom-serial-flash` at `a2b20efe2` with changes
+no commit holds yet (`SIL/MaDSim/src/main.rs`, `iss_description.rs` and
+`system_description.rs` modified; `wiring.rs`, `machine_ui.rs`,
+`machine_view.rs`, `MaDSim/static/` and `p2iss/src/host_pty.rs` deleted).
+Step 0 lands them.
+MaD's code is cited by file and symbol, not by line, so each citation holds
+in the commit that lands them. The project file was checked against the Edge
 carrier's netlist by reading it, and its pieces embsim can already build
 were built: the module with a flash image and a card image (`embsim check`,
 for this plan) and the add-on (as `boards/projects/ds2-addon.toml` builds
@@ -26,7 +31,7 @@ its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
 
 | Today (`mad-emulator`) | After |
 |---|---|
-| `SIL/MaDSim`, 1 078 lines of assembly, flags, clock set-up, signals and telemetry | `SIL/mad-catalog`: four kinds and their tests. The command, its checks and its report are embsim's |
+| `SIL/MaDSim`, 1 078 lines of assembly, flags, clock set-up, signals and telemetry (`main.rs`, `iss_description.rs` and `system_description.rs`, as step 0 lands them) | `SIL/mad-catalog`: four kinds and their tests. The command, its checks and its report are embsim's |
 | `P2Iss` on no board, declaring the pins its lists name | `p2iss`'s core in the P2-EC32MB's package (`core = "mad-p2iss"`), all 64 pads on the module's nets |
 | the firmware image put straight into hub RAM | the ROM booting stage-1 and the firmware off the module's flash, as the chip does |
 | the DS2 built from `MaDSim/boards/ds2_addon.net`, its converter pre-configured | the `mad-ds2` board, its converter configured by the firmware's own register writes |
@@ -55,7 +60,7 @@ project crate does not fork a model.
 | E1 | kinds for the TI AM26LS31 line driver and the AM26LV32 line receiver (`PROJECTS.md` §9), with `U25`'s part-number disagreement settled | the Edge carrier's servo step and direction pairs (`U24`, `J21`) and encoder pairs (`U25`, `J20`); until they ship, `check` refuses `EDGE` and names the two parts | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS` | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
 | E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component") | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
-| E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open") | `make playground` runs at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5) | 10, 11 |
+| E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open") | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5) | 11 (step 10 moves only the unpaced e2e target) |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
 
 ## 3. The catalog crate, `SIL/mad-catalog`
@@ -208,7 +213,8 @@ fn seat(
 
 `P2IssCore` is step 2's type. Its report (`IssReport`, an
 `embsim_board::Report`) says what `mad-emulator`'s telemetry thread says
-(`MaDSim/src/main.rs:360`), the parts that do not depend on the wall clock:
+(the thread `run_iss` spawns, `MaDSim/src/main.rs`), the parts that do not
+depend on the wall clock:
 the guest's debug console (`P62`) line by line as a look finds it, and at
 the end the running cogs, the rate the guest programmed on each async smart
 pin it transmitted on, the framing errors and the dropped edges. The rate
@@ -233,16 +239,16 @@ the `Assembly` that hosts embsim's models.
 
 | Option | What it says |
 |---|---|
-| `sample` | the sample in the grips, one the crate carries with its provenance: `sil-linear-reference` (`MaDSim/src/main.rs:317`) |
+| `sample` | the sample in the grips, one the crate carries with its provenance: `sil-linear-reference` (the `MaterialProperties` named `SIL-Linear-Reference` in `run_iss`, `MaDSim/src/main.rs`) |
 | `loop_volts` | required: the machine's switch-loop supply. A bench figure, so the file names it (`DESIGN.md` rule 6) |
 
 What moves into it, and from where:
 
 | From | What |
 |---|---|
-| `MaDSim/src/iss_description.rs:272`–`438` | `STEPS_PER_MM` (8192), `TRAVEL_MM` (100, from the firmware's failsafe profile), `BenchMachine`'s drive conventions (`DIR` high reverse, enable active low, no load loss), the encoder, the two end switches, and `CarriageTravel`, which becomes the machine's report |
-| `MaDSim/src/main.rs:305`–`345` | the gantry (15 mm of slack), the sample, the strain gauge (100 N full scale, −4.868009 mV/V) and the callbacks that chain them, now inside one component |
-| `MaDSim/src/system_description.rs:26`–`105` | `LoadCellBridge` and `BridgeDrive`: `S±` behind 350 Ω, centred on the excitation sensed on `E±` instead of the constant `BRIDGE_EXCITATION_V` |
+| `MaDSim/src/iss_description.rs`, `STEPS_PER_MM` to `impl BenchMachine` | `STEPS_PER_MM` (8192), `TRAVEL_MM` (100, from the firmware's failsafe profile), `BenchMachine`'s drive conventions (`DIR` high reverse, enable active low, no load loss), the encoder, the two end switches, and `CarriageTravel`, which becomes the machine's report |
+| `MaDSim/src/main.rs`, in `run_iss`: `gantry_model`, `strain`, `sample` and what chains them | the gantry (15 mm of slack), the sample, the strain gauge (100 N full scale, −4.868009 mV/V) and the callbacks that chain them, now inside one component |
+| `MaDSim/src/system_description.rs`: `BRIDGE_EXCITATION_V`, `BridgeDrive`, `LoadCellBridge` | `LoadCellBridge` and `BridgeDrive`: `S±` behind 350 Ω, centred on the excitation sensed on `E±` instead of the constant `BRIDGE_EXCITATION_V` |
 
 Every figure keeps the citation it has today. The links between the parts
 (the shaft turning the encoder and opening the switches, the carriage
@@ -545,8 +551,8 @@ b = "DS2.U1.13"
 `SIL/mad-serial-boot.toml` is the same file with three differences:
 
 - `S301` pole 2 closed (the `P59` pull-up `R302`, the serial strap
-  `mad-emulator`'s `STRAP` stands in for today, `MaDSim/src/main.rs:111`
-  and `:164`)
+  `mad-emulator`'s `STRAP` stands in for today: the `Pull` that
+  `run_iss_rom` wires to `P2.P59`, `MaDSim/src/main.rs`)
   and pole 3 open;
 - the `w25q128jv` entry without `image`: the module's flash erased;
 - the host on the carrier's debug header instead of the Pi's connector:
@@ -557,8 +563,14 @@ b = "DS2.U1.13"
 ## 5. The ordered changes
 
 Each step says what changes, the files it touches, and what shows it is
-done. Steps 1 to 7 need nothing more from embsim than `feat/embsim-catalogs`;
-the rest wait on section 2's items, as marked.
+done. Steps 0 to 7 need nothing more from embsim than `feat/embsim-catalogs`;
+the rest wait on section 2's items and section 6's questions, as marked.
+
+**0. Land MaD's working tree.** This plan was read off changes on
+`feat/iss-rom-serial-flash` that no commit holds (the status note above).
+Commit them, or merge the branch, before step 1, and record that commit
+here. *Files:* the ones the status note lists. *Done when:* MaD's CI is
+green on the commit, and each symbol this plan cites is in it.
 
 **1. Pin the submodule.** Bump `SIL/embsim` to a commit with
 `feat/embsim-catalogs` merged (MaD's CI gates embsim pin bumps).
@@ -573,9 +585,8 @@ its machine, implementing `embsim_boards::p2::P2Core`:
 - a pad drives through `P2Pads::bank_supplies().pad_drive(pin, wrpin, dir,
   out)`, which reads the pad's mode word: the role a pin plays (a level, an
   async smart pin and its rate, a step train) comes from the guest, so the
-  pin lists (`SerialLink`, `with_level_pins`, `with_input_pins`,
-  `with_pulse_pins`, `p2iss/src/lib.rs:99`, `:966`–`:1050`) have no part
-  in it;
+  pin lists (`SerialLink`, and `P2Iss::with_level_pins`, `with_input_pins`
+  and `with_pulse_pins`, in `p2iss/src/lib.rs`) have no part in it;
 - `start()` anchors the guest's clock at the package's START instant, 3 ms
   after the reset releases, on the engine thread; any MaD assertion on a
   boot instant moves by that delay;
@@ -583,10 +594,11 @@ its machine, implementing `embsim_boards::p2::P2Core`:
 - the guest's `HUBSET` reports its clock word (`P2Pads::set_clock_mode`),
   and the crystal comes from `XI` (`P2Pads::on_crystal`);
 - the synchronous-serial smart pins run on the nets (today's
-  `with_sync_serial` path, `p2iss/src/lib.rs:1050`), so the module's flash
+  `P2Iss::with_sync_serial` path), so the module's flash
   and card share `P58`–`P61` as they do on the board;
-- `p2core/src/board.rs:482` `sensed()` takes the strong-mask rule, and
-  the `P59` fiat (`p2iss/src/lib.rs:939`) has no place in the core: the
+- `Board::sensed` (`p2core/src/board.rs`) takes the strong-mask rule, and
+  the `P59` fiat (`set_input_level(59, true)` in `P2Iss::with_boot_rom`,
+  `p2iss/src/lib.rs`) has no place in the core: the
   board's `S301` straps the pin.
 
 `P2Iss` keeps its `Component` impl and its pin lists until `mad-emulator`
@@ -636,14 +648,14 @@ sort of kind, named `mad-board`, `mad-sensor`, `mad-core` and
 `mad-source`. Keep the registration function; replace the four examples
 with section 3's kinds as the steps below write them. *Files:*
 `SIL/mad-catalog/` (new), `SIL/Cargo.toml` (`members` gains
-`"mad-catalog"`), `.github/workflows/ci.yml:714` (`cargo fmt -p
-mad-emulator -p models` gains `-p mad-catalog`). *Done when:* `cargo test -p mad-catalog` passes in MaD's
+`"mad-catalog"`), `.github/workflows/ci.yml` (the `rustfmt (gating)`
+step's `cargo fmt -p mad-emulator -p models` gains `-p mad-catalog`). *Done when:* `cargo test -p mad-catalog` passes in MaD's
 workspace.
 
 **7. The boards.** `mad-edge` and `mad-ds2` (section 3). Export
 `mad_edge.net` with `kicad-cli sch export netlist` and give it the
 provenance header embsim's fixture has; `git mv` the DS2 netlist and point
-`MaDSim/src/system_description.rs:20` at its new path, so `mad-emulator`
+`DS2_NETLIST` (`MaDSim/src/system_description.rs`) at its new path, so `mad-emulator`
 keeps building. *Files:* `SIL/mad-catalog/netlists/`,
 `SIL/mad-catalog/src/boards.rs`, `SIL/MaDSim/src/system_description.rs`.
 *Done when:* `SIL/mad-catalog/tests/boards.rs` builds `mad-ds2` on its
@@ -660,9 +672,22 @@ only at step 11. *Done when:* `tests/boot.rs` runs a project of the
 module, its flash image and a `host-serial` on `P62`, and the core's
 report carries the firmware's boot console (skipped, saying why, when the
 `propeller2_debug` image is absent, as `p2iss`'s tests are); and
-`tests/machine.rs`, stepped, drives `STEP` with a `scripted-source` and
-reads the encoder's quadrature on `ENC_A`/`ENC_B`, a count a step, and the
-upper loop released at 100 mm.
+`tests/machine.rs`, stepped, holds two cases:
+
+- **Steps as edges.** Two `scripted-source`s drive `STEP` through a few
+  steps and `DIR` between them (four rising edges with `DIR` low, then
+  four with it high), and the encoder's quadrature on `ENC_A`/`ENC_B`
+  counts one a step, up and then back down (the drive's convention, `DIR`
+  low forward).
+- **Travel as a rate.** A component of the test's own drives `STEP` with
+  `embsim_board::Drive::Periodic`, a `PeriodicSchedule` at a fixed rate,
+  the path `embsim_models::machine::StepperMotor` takes for a step train;
+  the case reads the upper loop released at 100 mm. That is 819 200 steps
+  (`STEPS_PER_MM` × `TRAVEL_MM`): a `scripted-source` would list about
+  1.6 million steps, each a wake of its own, and embsim carries a step
+  train as a rate, not edge by edge (`README.md`, "Why it stays fast").
+  A periodic stimulus kind would let a project file say the same; this
+  test does not need one, and adding one is an item for section 2 first.
 
 **9. The project files.** `SIL/mad.toml` and `SIL/mad-serial-boot.toml`
 (section 4), and a `make check` target running `$(EMBSIM) check` on both.
@@ -671,24 +696,32 @@ upper loop released at 100 mm.
 `SIL/mad-catalog/tests/mad.rs`, stepped, holds what `NODES.md` §13 review
 item 1 proposed: a byte from the host reaches `P53`, a byte the firmware
 sends on `P55` reaches `HOST.RX`, `P19`–`P21` read inactive at rest, the
-drive is enabled, and the encoder's edges reach `P9` and `P10`. That test
-builds the system from the file with `Project::load` and the set
+drive is enabled, and the encoder's edges reach `P9` and `P10`. The host's
+byte crosses `IC2` on the part's default state, not on a valid high
+(section 6): with `IC2`'s Pi side on `RPI_5V` its input thresholds are
+1.5 V and 3.5 V, so the host's 0 V low is a valid low and its 3.3 V high
+is an open input, for which an `ISO6742DWR`, without the `F` option,
+drives its default high (SLLSFJ6G's "INx open" row;
+`models/src/isolation/iso67xx.rs`, `an_undecidable_input_gets_the_default_output`).
+`IC2` alone on those rails, a `scripted-source` on `INC`, gave `P53`
+`Driven(High)` for 3.3 V and `Driven(Low)` for 0 V; the `ISO6742FDWR`
+gave `Driven(Low)` for both. That test builds the
+system from the file with `Project::load` and the set
 (`embsim_cli::shipped()` and `mad_catalog::register`), as
 `board/tests/edge_project_live.rs` builds its file.
 
-**10. The callers.** The make targets keep their names and run the tool:
+**10. The e2e target.** The make target keeps its name and runs the tool:
 
 | Target | Becomes |
 |---|---|
-| `e2e-emulator` | `$(EMBSIM) run mad.toml --pty /tmp/tty.rpi`: unpaced, until SIGTERM, then the summary |
-| `playground-iss` | `$(EMBSIM) run mad.toml --pty /tmp/tty.iss` |
-| `playground-rom` | `$(EMBSIM) run mad-serial-boot.toml --pty /tmp/tty.iss` |
-| `playground` | stays on `mad-emulator --speed 1.0` until E4 |
+| `e2e-emulator` | `$(EMBSIM) run mad.toml --pty /tmp/tty.rpi`: unpaced, as its `--speed 0` is today, until SIGTERM, then the summary |
+| `playground`, `playground-iss`, `playground-rom` | stay on `mad-emulator` until E4 (step 11). They run at real time today, for a person watching: none passes `--speed`, and `Args::speed` in `MaDSim/src/main.rs` defaults to 1.0. `embsim run` has no pace, so moving them now would let virtual time race ahead of whoever watches the playground or flashes through `playground-rom` |
 
 `MaDSim/tests/pty_protocol.rs` (one protocol round trip on the host's PTY)
 moves to `SIL/mad-catalog/tests/pty_protocol.rs`, spawning `embsim run`.
 *Needs:* the answer to section 6's first question, the ISS with a host
-that keeps wall time. *Files:* `SIL/makefile`,
+that keeps wall time. E4 is not needed: the target is unpaced today.
+*Files:* `SIL/makefile`,
 `SIL/mad-catalog/tests/pty_protocol.rs`, `.github/workflows/ci.yml` (the
 e2e job's `make e2e-emulator` is unchanged; a `make check` step joins it),
 `.github/workflows/e2e-nightly.yml`
@@ -700,9 +733,14 @@ the emulator: `docs/dev/sil-testing.md`, `docs/how-it-works/sil-emulator.md`,
 name the make targets and need no change. *Done when:* the e2e suite
 passes against `make e2e-emulator` on the project.
 
-**11. Retire `mad-emulator`.** *Needs:* E4, and step 3's numbers.
-*Files:* `SIL/MaDSim/` (removed), `SIL/Cargo.toml` (`members`),
-`.github/workflows/ci.yml:714` (`-p mad-emulator` dropped),
+**11. Retire `mad-emulator`.** The playground targets move onto the tool
+with E4's pace: `playground` and `playground-iss` to `$(EMBSIM) run
+mad.toml` (on `/tmp/tty.rpi` and `/tmp/tty.iss`), `playground-rom` to
+`$(EMBSIM) run mad-serial-boot.toml --pty /tmp/tty.iss`, each paced at
+real time. *Needs:* E4, and step 3's numbers. *Files:* `SIL/makefile`,
+`SIL/MaDSim/` (removed), `SIL/Cargo.toml` (`members`),
+`.github/workflows/ci.yml` (`-p mad-emulator` dropped from the `rustfmt
+(gating)` step),
 `p2iss/src/lib.rs` (the `Component` impl, `SerialLink` and the pin lists
 removed), the `p2iss` tests and examples that use them
 (`tests/level_pins.rs`, `protocol_on_levels.rs`, `rom_boot_net.rs`,
@@ -730,12 +768,18 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
 - **The Pi's TX against `IC2`.** `IC2`'s Pi side is supplied from `RPI_5V`
   (`J4.1`), so its `V_IH` is 3.5 V (0.7 × 5 V, SLLSFJ6G §7.3), above a
   Raspberry Pi's 3.3 V output. With the Pi's real rail on `HOST.VIO`,
-  embsim reads the host's TX as no valid level at `IC2`. That is a finding
-  about the board; supplying `IC2`'s Pi side from the Pi's 3.3 V would
-  clear it.
+  embsim reads the host's 3.3 V high as no valid level at `IC2`, an open
+  input, and the 0 V low as a valid low. `IC2` is an `ISO6742DWR`, whose
+  default output for an open input is high, so a byte from the host still
+  reaches `P53` (step 9): its highs ride the default state, not a
+  guaranteed level, and the same board with the `F` part would hold `P53`
+  low. On the same side, `OUTA` drives the Pi's receive line (`RPI_TX`) at
+  5 V, above a Pi's 3.3 V GPIO. Both are findings about the board;
+  supplying `IC2`'s Pi side from the Pi's 3.3 V would clear both.
 - **The drive's ready output.** `mad-machine` has no pin for the servo
   drive's ready line, `SC_SRDY` (`J21.6`, the firmware's `SERVO_RDY` on
   `P5`); `mad-emulator` holds `P5` at its inactive level with a bench pull
-  (`MaDSim/src/iss_description.rs:100`). Whether the machine presents it,
+  (`IDLE_PULLS`' `SERVO_RDY` entry, `MaDSim/src/iss_description.rs`).
+  Whether the machine presents it,
   and at what level the carrier reads it open, is to settle before
   step 8.
