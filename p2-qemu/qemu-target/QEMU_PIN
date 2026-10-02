@@ -1,0 +1,5 @@
+# The QEMU this target is staged into: the tag, and the commit the tag must
+# resolve to (a tag can be moved; a commit cannot). Read by `embsim qemu
+# install` and by CI; part of the target's identity.
+tag v10.1.0
+commit f8b2f64e2336a28bf0d50b6ef8a7d8c013e9bcf3

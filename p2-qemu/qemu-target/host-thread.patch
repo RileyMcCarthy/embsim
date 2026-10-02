@@ -2,14 +2,46 @@ SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 Copyright (c) 2026 Riley McCarthy
 
 host-thread.patch: embsim host-driven mode for round-robin TCG, against
-QEMU v10.1.0. With `rr_host_driven` set, QEMU's own vCPU thread parks at
-start-up and a host thread runs the cogs (../hostdrive.c). Each hunk
-carries the licence of the file it modifies: accel/tcg/tcg-accel-ops-rr.c
-is MIT (its own header), accel/tcg/tcg-accel-ops-rr.h is GPL-2.0-or-later
-(its own header). Applied by stage.sh; see README.md.
+QEMU v10.1.0. With `rr_host_driven` set (target/p2/hostipc.c sets it from
+the machine's `hostipc` property), QEMU's own vCPU thread parks at start-up,
+before it arms its kick timer, and a host thread runs the cogs; and the
+icount budget of a slice ignores real-time timers, so no wall-clock deadline
+can cut a slice short. Each hunk carries the licence of the file it
+modifies: accel/tcg/tcg-accel-ops-rr.c and accel/tcg/tcg-accel-ops-icount.c
+are MIT (their own headers), accel/tcg/tcg-accel-ops-rr.h is
+GPL-2.0-or-later (its own header). Applied by stage.sh; see README.md.
 
+diff --git a/accel/tcg/tcg-accel-ops-icount.c b/accel/tcg/tcg-accel-ops-icount.c
+index d0f7b41..5c1b527 100644
+--- a/accel/tcg/tcg-accel-ops-icount.c
++++ b/accel/tcg/tcg-accel-ops-icount.c
+@@ -45,10 +45,20 @@ static int64_t icount_get_limit(void)
+          */
+         deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                               QEMU_TIMER_ATTR_ALL);
+-        /* Check realtime timers, because they help with input processing */
+-        deadline = qemu_soonest_timeout(deadline,
+-                qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
+-                                           QEMU_TIMER_ATTR_ALL));
++        /*
++         * Check realtime timers, because they help with input processing.
++         *
++         * embsim host-driven mode: never. The host asks for a slice of an
++         * exact instruction count, and a real-time deadline would cut it
++         * short by the wall clock, making the cogs' interleaving depend on
++         * how fast the host ran. Virtual-clock deadlines are instruction
++         * counts under -icount, and stay.
++         */
++        if (!rr_host_driven) {
++            deadline = qemu_soonest_timeout(deadline,
++                    qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
++                                               QEMU_TIMER_ATTR_ALL));
++        }
+ 
+         /*
+          * Maintain prior (possibly buggy) behaviour where if no deadline
 diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
-index 6eec5c9..b3f0f44 100644
+index 6eec5c9..e550e0d 100644
 --- a/accel/tcg/tcg-accel-ops-rr.c
 +++ b/accel/tcg/tcg-accel-ops-rr.c
 @@ -37,6 +37,8 @@
@@ -35,8 +67,8 @@ index 6eec5c9..b3f0f44 100644
 +     * runs the cogs -- which is precisely the `g_assert(n < tcg_max_ctxs)`
 +     * in `tcg_register_thread`.
 +     *
-+     * Everything else it does still runs: RCU registration, the created-signal
-+     * `qemu_init` blocks on, and the kick timer.
++     * Everything else it does still runs: RCU registration and the
++     * created-signal `qemu_init` blocks on.
 +     */
 +    if (!rr_host_driven) {
 +        tcg_register_thread();
@@ -44,20 +76,27 @@ index 6eec5c9..b3f0f44 100644
  
      bql_lock();
      qemu_thread_get_self(cpu->thread);
-@@ -214,6 +230,31 @@ static void *rr_cpu_thread_fn(void *arg)
-     /* process any pending work */
-     cpu->exit_request = 1;
+@@ -207,6 +223,38 @@ static void *rr_cpu_thread_fn(void *arg)
+         }
+     }
  
 +    /*
 +     * embsim host-driven mode: hand the CPUs to the HOST thread and get out
 +     * of the way.
 +     *
-+     * embsim's engine calls cpu_exec on its own thread, one bounded slice at
-+     * a time, so every pin edge is a function call rather than a cross-thread
-+     * park/wake (measured at 10.9 us against a 0.25 us slice boundary --
-+     * spike 1d). This thread has already done everything the machine start
-+     * needs -- RCU registration, the created-signal qemu_init waits on, the
-+     * kick timer -- and the only thing left is which thread calls cpu_exec.
++     * The host thread (target/p2/hostipc.c) calls cpu_exec itself, one
++     * bounded slice at a time, as embsim asks over its channel, so a slice
++     * ends exactly where embsim needs it to and no other thread runs a cog.
++     * This thread has already done everything the machine start needs --
++     * RCU registration and the created-signal qemu_init waits on -- and the
++     * only thing left is which thread calls cpu_exec.
++     *
++     * It parks BEFORE it starts the kick timer. That timer only kicks this
++     * thread's loop, which never runs; and a virtual-clock deadline caps the
++     * budget of whichever slice reaches it, while the timer re-arms from
++     * whichever thread runs it first -- the main loop's among them, on the
++     * wall clock. No timer, no cap: a slice is exactly the instructions the
++     * host asked for.
 +     *
 +     * Parking rather than never creating the thread keeps the change to one
 +     * variable. A `TCGAccelOps.create_vcpu_thread` override is the tidier
@@ -73,9 +112,9 @@ index 6eec5c9..b3f0f44 100644
 +        }
 +    }
 +
-     while (1) {
-         /* Only used for icount_enabled() */
-         int64_t cpu_budget = 0;
+     rr_start_kick_timer();
+ 
+     cpu = first_cpu;
 diff --git a/accel/tcg/tcg-accel-ops-rr.h b/accel/tcg/tcg-accel-ops-rr.h
 index 2a76a29..78c6791 100644
 --- a/accel/tcg/tcg-accel-ops-rr.h

@@ -15,6 +15,7 @@
 #include "system/system.h"
 #include "target/p2/cpu.h"
 #include "target/p2/pinbus.h"
+#include "target/p2/hostipc.h"
 #include "qemu/timer.h"
 #include "exec/icount.h"
 #include "system/address-spaces.h"
@@ -149,9 +150,24 @@ static void p2_machine_init(MachineState *machine)
     }
 }
 
+/*
+ * `-M p2,hostipc=...`: embsim drives the cogs from another process
+ * (target/p2/hostipc.h). A machine property rather than an environment
+ * variable, so a qemu-system-p2 built without it refuses the option at once
+ * instead of booting a machine nobody drives.
+ */
+static void p2_set_hostipc(Object *obj, const char *value, Error **errp)
+{
+    p2_hostipc_configure(value, errp);
+}
+
 static void p2_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "hostipc", NULL, p2_set_hostipc);
+    object_class_property_set_description(oc, "hostipc",
+        "embsim's channel: <shm|sock>:<channel-fd>:<watch-fd>[:<spin-ns>]");
 
     mc->desc = "Parallax Propeller 2";
     mc->init = p2_machine_init;

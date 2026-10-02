@@ -26,18 +26,18 @@
 //! rom = "rom.bin"             # optional; the chip's own ROM otherwise
 //! ```
 //!
-//! QEMU is one machine per process, so a `core = "qemu"` key may reach one
-//! part, and a build with no QEMU linked ([`crate::linked`]) refuses the
-//! entry with [`P2QemuError::Unavailable`]'s message. The chip boots when
-//! the board is built — seating only checks — so a survey of the project
-//! boots nothing. The core reports its console, per pad, and its yields to
-//! the run ([`Report`]).
+//! Seating finds the `qemu-system-p2` to run ([`QemuSystemP2::find`]) and
+//! refuses the entry, saying how to install one, when there is none. The
+//! chip boots when the board is built — seating only checks — so a survey
+//! of the project boots nothing; each part the key reaches boots a program
+//! of its own. The core reports its console, per pad, its yields, and why
+//! it stopped if its program died ([`Report`]).
 
 use embsim_board::{Assignment, PartOptions, ProjectError, Report};
 use embsim_boards::catalog::CatalogSet;
 use embsim_boards::p2::{CoreCatalog, CoreCtor, CoreKind, P2Core};
 
-use crate::{P2Qemu, P2QemuError, P2QemuHandle, BOOT_ROM};
+use crate::{P2Qemu, P2QemuHandle, QemuSystemP2, Transport, BOOT_ROM};
 
 #[cfg(doc)]
 use embsim_boards::p2::P2Package;
@@ -50,12 +50,25 @@ const P2_PADS: u8 = 64;
 
 /// Add QEMU's core to `set`.
 pub fn register(set: &mut CatalogSet) -> Result<(), ProjectError> {
-    set.add_cores(QemuCores)
+    set.add_cores(QemuCores::default())
 }
 
 /// The `qemu` core kind (module docs).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct QemuCores;
+#[derive(Debug, Default, Clone)]
+pub struct QemuCores {
+    /// The program every seat runs; found when a part is seated if `None`.
+    program: Option<QemuSystemP2>,
+}
+
+impl QemuCores {
+    /// The kind, running `program` for every part it seats instead of the
+    /// one [`QemuSystemP2::find`] finds.
+    pub fn with_program(program: QemuSystemP2) -> Self {
+        Self {
+            program: Some(program),
+        }
+    }
+}
 
 impl CoreCatalog for QemuCores {
     fn name(&self) -> &str {
@@ -77,16 +90,11 @@ impl CoreCatalog for QemuCores {
     ) -> Result<CoreCtor, ProjectError> {
         let rom = options.string("rom")?;
         options.finish()?;
-        if !crate::linked() {
-            return Err(assignment.error(P2QemuError::Unavailable));
-        }
-        if let [first, second, ..] = assignment.parts {
-            return Err(assignment.error(format!(
-                "QEMU is one machine per process, and this key reaches {} and {}; give one \
-                 processor core = \"qemu\" by a key only it has",
-                first.reference, second.reference
-            )));
-        }
+        let program = match &self.program {
+            Some(program) => program.clone(),
+            None => QemuSystemP2::find().map_err(|err| assignment.error(err))?,
+        };
+        let transport = Transport::from_env().map_err(|err| assignment.error(err))?;
         let rom = match &rom {
             None => BOOT_ROM.to_vec(),
             Some(file) => {
@@ -101,13 +109,14 @@ impl CoreCatalog for QemuCores {
         Ok(Box::new(move |decl| {
             // The chip boots here, when the board is built: a survey never
             // builds, so it never boots one.
-            let p2 = P2Qemu::with_boot_rom(&rom, &[])
+            let p2 = P2Qemu::start(&program, &rom, &[], transport)
                 .map_err(|err| format!("QEMU did not boot: {err}"))?;
             reports.add(QemuReport {
                 subject: format!("{board}.{}", decl.reference),
                 core: p2.handle(),
                 printed: vec![0; usize::from(P2_PADS)],
                 halted: false,
+                failed: false,
             });
             Ok(Box::new(p2) as Box<dyn P2Core>)
         }))
@@ -123,6 +132,8 @@ struct QemuReport {
     /// Console characters printed so far, per pad.
     printed: Vec<usize>,
     halted: bool,
+    /// Whether the run has been told the program failed.
+    failed: bool,
 }
 
 impl Report for QemuReport {
@@ -142,6 +153,13 @@ impl Report for QemuReport {
                 *printed = count;
             }
         }
+        if !self.failed {
+            if let Some(failure) = self.core.failure() {
+                self.failed = true;
+                self.halted = true;
+                lines.push(format!("QEMU stopped: {failure}"));
+            }
+        }
         if !self.halted && self.core.halted() {
             self.halted = true;
             lines.push("every cog has stopped".to_string());
@@ -156,14 +174,16 @@ impl Report for QemuReport {
                 (!text.is_empty()).then(|| format!("P{pad} {text:?}"))
             })
             .collect();
+        let state = match self.core.failure() {
+            // The whole of it was printed when it happened; its first line
+            // says what.
+            Some(failure) => format!("stopped: {}", failure.lines().next().unwrap_or_default()),
+            None if self.core.halted() => "halted".to_string(),
+            None => "running".to_string(),
+        };
         vec![format!(
-            "QEMU: {} pad yields; {}; console {}",
+            "QEMU: {} pad yields; {state}; console {}",
             self.core.yields(),
-            if self.core.halted() {
-                "halted"
-            } else {
-                "running"
-            },
             if consoles.is_empty() {
                 "empty".to_string()
             } else {
@@ -195,8 +215,23 @@ mod tests {
     }
 
     /// The `p2` kind through a set holding QEMU's core, as a project
-    /// registers it.
+    /// registers it, the core running `program` (which seating never
+    /// starts).
     fn register(core: &str, extra: &str, parts: &[&ComponentDecl]) -> Result<(), ProjectError> {
+        let mut set = CatalogSet::new();
+        set.add_cores(QemuCores::with_program(QemuSystemP2::at(
+            "/nonexistent/qemu-system-p2",
+        )))
+        .expect("QEMU's core joins the set");
+        register_in(&set, core, extra, parts)
+    }
+
+    fn register_in(
+        set: &CatalogSet,
+        core: &str,
+        extra: &str,
+        parts: &[&ComponentDecl],
+    ) -> Result<(), ProjectError> {
         let netlist = ParsedNetlist {
             version: "E".to_string(),
             components: Vec::new(),
@@ -215,8 +250,6 @@ mod tests {
         };
         let table: toml::Table =
             toml::from_str(&format!("core = {core:?}\n{extra}")).expect("the options parse");
-        let mut set = CatalogSet::new();
-        super::register(&mut set).expect("QEMU's core joins the set");
         set.register_part(
             &mut PartRegistry::new(),
             &assignment,
@@ -270,24 +303,38 @@ mod tests {
         }
     }
 
-    /// Without QEMU the entry is refused with the stub's own message; with
-    /// it, a key reaching two parts is refused, since QEMU is one machine
-    /// per process. Neither boots anything.
+    /// Seating checks and starts nothing: a key may reach two P2s, each
+    /// booting a program of its own when the board is built, and a ROM
+    /// file that is not there is refused before anything is built.
     #[test]
-    fn a_qemu_core_is_refused_where_it_cannot_boot() {
+    fn a_qemu_core_seats_on_every_part_its_key_reaches_and_starts_nothing() {
         let u100 = decl("U100");
         let u200 = decl("U200");
-        if crate::linked() {
-            let err = register("qemu", "", &[&u100, &u200]).expect_err("two parts, one QEMU");
-            assert!(err.to_string().contains("reaches U100 and U200"), "{err}");
-            register("qemu", "", &[&u100]).expect("one part boots at build");
-        } else {
-            let err = register("qemu", "", &[&u100]).expect_err("no QEMU in this build");
-            assert!(
-                err.to_string()
-                    .contains(&P2QemuError::Unavailable.to_string()),
-                "{err}"
-            );
+        register("qemu", "", &[&u100, &u200]).expect("two parts, two programs at build");
+        let err = register("qemu", "rom = \"no-such-rom.bin\"", &[&u100])
+            .expect_err("a ROM that is not there");
+        assert!(err.to_string().contains("cannot read boot ROM"), "{err}");
+    }
+
+    /// The set's own `qemu` finds its program when a part is seated, and
+    /// with none to find refuses the entry saying how to install one.
+    #[test]
+    fn a_qemu_core_with_no_program_to_find_is_refused_saying_how_to_install_one() {
+        let set = {
+            let mut set = CatalogSet::new();
+            super::register(&mut set).expect("QEMU's core joins the set");
+            set
+        };
+        let u100 = decl("U100");
+        match (
+            QemuSystemP2::find(),
+            register_in(&set, "qemu", "", &[&u100]),
+        ) {
+            (Ok(_), outcome) => outcome.expect("a program was found"),
+            (Err(_), outcome) => {
+                let err = outcome.expect_err("nothing to run");
+                assert!(err.to_string().contains("`embsim qemu install`"), "{err}");
+            }
         }
     }
 }

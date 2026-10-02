@@ -28,9 +28,10 @@
 //!    advances. The runner reaches the checkout by the path the crates use
 //!    (a symlinked checkout is spelled as they spell it), since Cargo takes
 //!    two spellings of one directory for two packages.
-//! 5. **The files**: `Cargo.toml`, `main.rs`, `build.rs` (QEMU's link
-//!    arguments, as `cli/build.rs` passes them), each rewritten only when
-//!    its content would change, so Cargo sees nothing new.
+//! 5. **The files**: `Cargo.toml` and `main.rs`, each rewritten only when
+//!    its content would change, so Cargo sees nothing new. Nothing of QEMU
+//!    is linked: the P2's QEMU core starts the `qemu-system-p2` it finds
+//!    when a board is built, from a runner as from the tool.
 //! 6. **Where it builds**: the target directory of the Cargo workspace the
 //!    first crate is a member of (`CARGO_TARGET_DIR` included, as Cargo
 //!    itself reads it), so what that workspace built is reused; for a crate
@@ -470,19 +471,15 @@ fn manifest(plan: &Plan) -> String {
          version = \"0.0.0\"\n\
          edition = \"2021\"\n\
          publish = false\n\
-         build = \"build.rs\"\n\
          \n\
          [[bin]]\n\
          name = \"{package}\"\n\
          path = \"main.rs\"\n\
          \n\
          [dependencies]\n\
-         embsim-cli = {{ path = {cli} }}\n\
-         # Named so build.rs is handed QEMU's link arguments when it links QEMU.\n\
-         embsim-p2-qemu = {{ path = {qemu} }}\n",
+         embsim-cli = {{ path = {cli} }}\n",
         package = plan.package,
         cli = toml_path(&plan.embsim_path.join("cli")),
-        qemu = toml_path(&plan.embsim_path.join("p2-qemu")),
     );
     for dep in &plan.crates {
         text.push_str(&format!(
@@ -518,34 +515,6 @@ fn main_rs(plan: &Plan) -> String {
     text
 }
 
-/// The runner's `build.rs`: QEMU's link arguments for the runner's binary,
-/// as `cli/build.rs` passes them to the `embsim` binary's.
-const BUILD_RS: &str = r#"//! Link QEMU into the runner when embsim-p2-qemu linked it, as embsim's own
-//! `cli/build.rs` does for the `embsim` binary: embsim-p2-qemu hands a
-//! direct dependent its link arguments through its `links = "qemu-p2"`
-//! metadata. Written by `embsim`; edits are lost.
-
-use std::env;
-use std::fs;
-
-fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=DEP_QEMU_P2_LINKED");
-    println!("cargo:rerun-if-env-changed=DEP_QEMU_P2_LINK_ARGS_FILE");
-    if env::var_os("DEP_QEMU_P2_LINKED").is_none() {
-        return;
-    }
-    let file = env::var_os("DEP_QEMU_P2_LINK_ARGS_FILE")
-        .expect("embsim-p2-qemu says QEMU is linked and names its link arguments");
-    println!("cargo:rerun-if-changed={}", file.to_string_lossy());
-    let args = fs::read_to_string(&file)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.to_string_lossy()));
-    for arg in args.lines().filter(|arg| !arg.is_empty()) {
-        println!("cargo:rustc-link-arg-bins={arg}");
-    }
-}
-"#;
-
 /// Write `content` to `path` unless it already holds exactly that, so an
 /// unchanged runner gives Cargo nothing new to look at. Whether it wrote.
 fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
@@ -557,13 +526,18 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, String> {
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
-/// The runner's three files.
+/// The runner's two files. A `build.rs` an older embsim wrote (it linked
+/// QEMU) is removed: Cargo would run any `build.rs` beside the manifest.
 fn write_runner(plan: &Plan) -> Result<(), String> {
     std::fs::create_dir_all(&plan.dir)
         .map_err(|error| format!("cannot make {}: {error}", plan.dir.display()))?;
     write_if_changed(&plan.dir.join("Cargo.toml"), &manifest(plan))?;
     write_if_changed(&plan.dir.join("main.rs"), &main_rs(plan))?;
-    write_if_changed(&plan.dir.join("build.rs"), BUILD_RS)?;
+    let stale = plan.dir.join("build.rs");
+    if stale.exists() {
+        std::fs::remove_file(&stale)
+            .map_err(|error| format!("cannot remove {}: {error}", stale.display()))?;
+    }
     Ok(())
 }
 
@@ -869,13 +843,6 @@ impl Cargo {
     fn command(&self, dir: &Path, args: &[&OsStr]) -> Command {
         let mut command = Command::new(&self.program);
         command.args(args).current_dir(dir);
-        // The tool links QEMU into a runner when it was linked into the
-        // tool, unless the environment names a tree itself.
-        if std::env::var_os("EMBSIM_QEMU_P2_BUILD").is_none() {
-            if let Some(tree) = option_env!("EMBSIM_QEMU_TREE") {
-                command.env("EMBSIM_QEMU_P2_BUILD", tree);
-            }
-        }
         command
     }
 

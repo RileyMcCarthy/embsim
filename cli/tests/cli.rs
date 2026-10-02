@@ -1,6 +1,6 @@
 //! The `embsim` command, run as a user runs it: the built binary, on the
-//! netlists and projects the workspace ships, and — where QEMU is linked —
-//! booting the P2 off the P2-EC32MB's flash.
+//! netlists and projects the workspace ships, and — where a
+//! `qemu-system-p2` is installed — booting the P2 off the P2-EC32MB's flash.
 //!
 //! Each case starts the binary as its own process (the virtual clock and a
 //! P2 core are one per process), reads what it printed and how it exited,
@@ -969,11 +969,12 @@ fn a_pty_without_a_name_is_refused_when_the_project_has_two_hosts() {
 // closed, the boot flash holding stage-1 and a three-instruction program
 // that writes `B` to the debug pin — all said by a project file.
 //
-// Which case is built depends on whether QEMU is linked
-// (`EMBSIM_QEMU_P2_BUILD`, `cfg(qemu_linked)` from this crate's build
-// script), as with `rom_boot_ec32mb.rs`: with it, the boot; without it, the
-// refusal that says how to get it. Neither declares a behaviour: which one
-// runs is the build's choice, not the project's.
+// The boot needs a `qemu-system-p2` (`embsim qemu install`), so it is
+// `#[ignore]`d here and run by CI's `p2-qemu-boot` job, as
+// `rom_boot_ec32mb.rs` is, and declares no behaviour: the ledger's run
+// installs no QEMU. Without the program the entry is refused, saying how to
+// install it, which runs everywhere: the command is started with nothing to
+// find.
 
 /// The project, its flash image beside it.
 const PROJECT: &str = r#"
@@ -1046,8 +1047,8 @@ fn boot_project(test: &str) -> PathBuf {
     project
 }
 
-#[cfg(qemu_linked)]
 #[test]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
 fn run_boots_the_p2_off_the_modules_flash() {
     let project = boot_project("qemu_boot");
     let output = embsim(&[
@@ -1081,18 +1082,140 @@ fn run_boots_the_p2_off_the_modules_flash() {
     assert!(text.contains("ran 20.000000 ms of virtual time"), "{text}");
 }
 
-#[cfg(not(qemu_linked))]
-#[test]
-fn without_qemu_a_qemu_core_is_refused_saying_how_to_link_it() {
-    let project = boot_project("qemu_refused");
-    let output = embsim(&["check", project.to_str().expect("text")]);
+/// `embsim` with `args`, started where there is no `qemu-system-p2` to
+/// find: the variable unset, a `PATH` of an empty directory, and a home
+/// with nothing installed.
+fn embsim_without_qemu(test: &str, args: &[&str]) -> (Output, PathBuf) {
+    let home = scratch(test);
+    let empty = home.join("bin");
+    std::fs::create_dir_all(&empty).expect("an empty PATH");
+    let output = Command::new(env!("CARGO_BIN_EXE_embsim"))
+        .args(args)
+        .env_remove("EMBSIM_QEMU_SYSTEM_P2")
+        .env("PATH", &empty)
+        .env("HOME", &home)
+        .output()
+        .expect("the embsim binary runs");
+    (output, home)
+}
+
+#[rstest]
+fn without_qemu_system_p2_a_qemu_core_is_refused_saying_how_to_install_it() {
+    behaviour!(Test {
+        id: "cli.qemu-not-installed",
+        covers: Some("p2-qemu/src/catalog.rs#QemuCores::seat"),
+        given: "a project whose P2 runs on QEMU, checked where no qemu-system-p2 is installed, \
+                named or on the PATH",
+    });
+    expect!(
+        "where-it-looked",
+        "the check fails at the P2's entry, naming each place it looked for qemu-system-p2"
+    );
+    expect!(
+        "how-to-install",
+        "the error says `embsim qemu install` builds and installs it, and the directory it goes \
+         to",
+        "the program is built from the P2 target this embsim carries, so the install directory \
+         is named by that target"
+    );
+    let project = boot_project("qemu_refused_project");
+    let (output, home) =
+        embsim_without_qemu("qemu_refused", &["check", project.to_str().expect("text")]);
     assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        error.contains(
-            "board EC32: [[board.model]] value = \"P2X8C4M64P\" (kind \"p2\"): \
-             embsim-p2-qemu was built without a QEMU tree; set EMBSIM_QEMU_P2_BUILD"
-        ),
-        "{error}"
+    let error = stderr(&output);
+    let install_dir = home
+        .join(".embsim/qemu")
+        .join(embsim_p2_qemu::target::identity());
+    assert_says(
+        &error,
+        &[
+            "board EC32: [[board.model]] value = \"P2X8C4M64P\" (kind \"p2\"): no \
+             qemu-system-p2: EMBSIM_QEMU_SYSTEM_P2 is unset, none is on PATH, and none at",
+            &install_dir.join("qemu-system-p2").display().to_string(),
+            "`embsim qemu install` builds it",
+        ],
+    );
+}
+
+#[rstest]
+fn qemu_path_says_what_this_embsim_needs_and_where_it_looked() {
+    behaviour!(Test {
+        id: "cli.qemu-path-none",
+        covers: Some("cli/src/qemu.rs#path"),
+        given: "`embsim qemu path` where no qemu-system-p2 is installed, named or on the PATH",
+    });
+    expect!(
+        "needs",
+        "it prints the protocol, P2 target and QEMU release this embsim needs"
+    );
+    expect!(
+        "fails-saying-how",
+        "it exits non-zero, saying where it looked and how to install the program"
+    );
+    let (output, _) = embsim_without_qemu("qemu_path_none", &["qemu", "path"]);
+    assert!(!output.status.success());
+    let pin = embsim_p2_qemu::target::qemu_pin();
+    assert_says(
+        &stdout(&output),
+        &[&format!(
+            "this embsim needs: protocol {}, P2 target {}, QEMU {}",
+            embsim_p2_qemu::protocol::PROTOCOL,
+            embsim_p2_qemu::target::identity(),
+            pin.version()
+        )],
+    );
+    assert_says(
+        &stderr(&output),
+        &["error: no qemu-system-p2:", "`embsim qemu install`"],
+    );
+}
+
+#[rstest]
+fn qemu_install_dry_run_names_the_release_the_target_and_where_it_goes() {
+    behaviour!(Test {
+        id: "cli.qemu-install-plan",
+        covers: Some("p2-qemu/src/install.rs#Plan::describe"),
+        given: "`embsim qemu install --dry-run` with a directory to install into",
+    });
+    expect!(
+        "plan",
+        "it prints the P2 target it would build, the QEMU tag and commit it would fetch, the \
+         configure line, and the program's path in that directory, and builds nothing"
+    );
+    let dir = scratch("qemu_install_plan");
+    let prefix = dir.join("qemu");
+    let output = embsim(&[
+        "qemu",
+        "install",
+        "--dry-run",
+        "--prefix",
+        prefix.to_str().expect("text"),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let pin = embsim_p2_qemu::target::qemu_pin();
+    assert_says(
+        &stdout(&output),
+        &[
+            &format!("target {}", embsim_p2_qemu::target::identity()),
+            &format!(
+                "qemu {} {} from https://gitlab.com/qemu-project/qemu.git",
+                pin.tag, pin.commit
+            ),
+            "configure --target-list=p2-softmmu --without-default-features",
+            &format!("install {}", prefix.join("qemu-system-p2").display()),
+        ],
+    );
+    assert!(!prefix.exists(), "a dry run installs nothing");
+}
+
+#[test]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
+fn qemu_path_finds_the_installed_program_and_says_it_is_the_one() {
+    let output = embsim(&["qemu", "path"]);
+    let text = stdout(&output);
+    assert!(output.status.success(), "{}\n{text}", stderr(&output));
+    assert_says(
+        &text,
+        &["qemu-system-p2: ", "ok: the one this embsim needs"],
     );
 }

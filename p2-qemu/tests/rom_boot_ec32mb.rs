@@ -36,11 +36,11 @@
 //! real clock edges over the net, delivered one instant at a time, none
 //! before the START instant.
 
-// Built only when linked against a QEMU tree (`EMBSIM_QEMU_P2_BUILD` →
-// `cfg(qemu_linked)`). Stub workspace builds do not compile this binary,
-// so `cargo test -p embsim-p2-qemu` without QEMU cannot report a
-// false-green boot. Unit tests in `lib.rs` / `flashimage.rs` still run.
-#![cfg(qemu_linked)]
+//!
+//! The P2 runs in a `qemu-system-p2` of its own (`embsim qemu install`), so
+//! the test is `#[ignore]`d in the workspace's tests rather than reporting a
+//! boot it could not run; CI's `p2-qemu-boot` job runs it, over both
+//! channels (`EMBSIM_P2_QEMU_TRANSPORT`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -53,7 +53,7 @@ use embsim_board::{
 use embsim_boards::ec32mb::{Ec32mb, FLASH_SELECT_POLE, FLASH_SELECT_SWITCH, P59_PULL_DOWN_POLE};
 use embsim_boards::p2::{P2Package, P2_RESTART_DELAY_NS};
 use embsim_core::virtual_clock;
-use embsim_p2_qemu::{flashimage, P2Qemu, P2QemuError};
+use embsim_p2_qemu::{flashimage, P2Qemu};
 
 /// The P2's debug transmit pin, where the payload writes its byte.
 const DEBUG_TX: u8 = 62;
@@ -99,6 +99,18 @@ const TCXO_HZ: u64 = 20_000_000;
 /// edge: the boot's 16 901 edges are projections, as they were with the
 /// rails stuck from the bench (0 then, since nothing sourced the FET).
 const ESCALATED_SOLVES: u64 = 3;
+
+/// The pad changes the boot makes up to its byte: every one a yield of the
+/// guest and a publish of the node. Held exactly, as the budget it is: the
+/// same with QEMU linked into the node (2026-09-23 onward) and with it in a
+/// `qemu-system-p2` of its own, over the shared page and over the socket
+/// (2026-10-01 and 2026-10-02, `NODES.md` §14). The `jmp #$` the payload
+/// ends in changes no pad, so nothing after the byte adds to it.
+const BOOT_YIELDS: u64 = 16_953;
+
+/// The flash clock's edges on `P60` up to the byte, held exactly beside
+/// [`BOOT_YIELDS`].
+const BOOT_CLOCK_EDGES: usize = 16_901;
 
 fn ep(endpoint: &str) -> EndpointRef {
     EndpointRef::parse(endpoint).expect("endpoint parses")
@@ -171,6 +183,7 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 #[test]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
 fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     // mov pa,#"B" / wypin pa,#62 / jmp #$
     let payload: Vec<u8> = [0xF607EC42u32, 0xFC27EC3E, 0xFD9FFFFC]
@@ -191,7 +204,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         None => Vec::new(),
     };
     let p2 = P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &extra)
-        .expect("this test is built only when QEMU is linked");
+        .expect("qemu-system-p2 starts and is the one this embsim speaks to");
     let handle = p2.handle();
     // The core goes inside the package: the package is what the board sees.
     let package = P2Package::new(p2);
@@ -202,7 +215,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     let board = Ec32mb::new().with_flash_image(image);
     let flash = board.flash_view().expect("a programmed flash has a view");
     // The slot is filled once; a netlist with two U100s would be a different
-    // board, and QEMU is one machine per process anyway.
+    // board.
     let slot = std::sync::Mutex::new(Some(package));
     let board = board
         .with_p2(move |_decl| -> Box<dyn Component> {
@@ -290,7 +303,8 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     assert!(
         handle.console(DEBUG_TX).contains('B'),
         "the payload the flash served must reach the debug pin; console={:?} yields={} \
-         publishes={} slices={} reads={:?} commands={:?} halted={} start={:?} nets={nets:?}",
+         publishes={} slices={} reads={:?} commands={:?} halted={} failure={:?} start={:?} \
+         nets={nets:?}",
         handle.console(DEBUG_TX),
         handle.yields(),
         handle.publishes(),
@@ -298,6 +312,7 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         flash.reads(),
         flash.commands(),
         handle.halted(),
+        handle.failure(),
         package_handle.start_state(),
     );
 
@@ -325,10 +340,15 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         "the boot reads flash at 0 then $400; got {reads:?}"
     );
     // Every clock edge crossed the net as its own event.
-    assert!(
-        handle.yields() > 10_000,
-        "a kilobyte off the flash is thousands of edges, each a yield; saw {}",
-        handle.yields()
+    assert_eq!(
+        handle.yields(),
+        BOOT_YIELDS,
+        "a kilobyte off the flash is thousands of edges, each a yield"
+    );
+    assert_eq!(
+        handle.publishes(),
+        BOOT_YIELDS,
+        "each pad change published once, at its instant"
     );
 
     // And each at the guest's own instant. The scope saw every clock edge
@@ -355,10 +375,10 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
         handle.yields(),
         handle.publishes(),
     );
-    assert!(
-        instants.len() > 16_000,
-        "the scope must see every clock edge; saw {}",
-        instants.len()
+    assert_eq!(
+        instants.len(),
+        BOOT_CLOCK_EDGES,
+        "the scope must see every clock edge"
     );
     assert_eq!(
         ones,
@@ -389,25 +409,24 @@ fn the_rom_boots_off_the_modules_flash_over_the_nets() {
     // edge; the count is held exactly, as the budget it is. A phase that
     // changes it says so.
     let escalated = system.escalated_solves();
+    let (turn_ns, run_ns) = handle.turn_ns();
     eprintln!(
         "baseline: edges={} yields={} publishes={} escalated_solves={escalated} start_ns={:?} \
-         wall={:.3}s ({:.2} us/edge)",
+         wall={:.3}s ({:.2} us/edge) turns={} channel={:.2} us/turn (qemu {:.2} us/turn)",
         instants.len(),
         handle.yields(),
         handle.publishes(),
         package_handle.started_at_ns(),
         wall.as_secs_f64(),
         wall.as_secs_f64() * 1e6 / instants.len() as f64,
+        handle.turns(),
+        (turn_ns.saturating_sub(run_ns)) as f64 / 1e3 / handle.turns().max(1) as f64,
+        run_ns as f64 / 1e3 / handle.turns().max(1) as f64,
     );
     assert_eq!(
         escalated, ESCALATED_SOLVES,
         "the ROM boot is projections only: the power tree's solves before the first edge and \
          none per edge"
-    );
-    let second = P2Qemu::with_boot_rom(&rom("rom_booter_v33k.bin"), &[]);
-    assert!(
-        matches!(second, Err(P2QemuError::AlreadyBooted)),
-        "a second P2 in this process is refused, got {second:?}"
     );
 
     // The crystal is the rate the board delivers on XI, and on this module

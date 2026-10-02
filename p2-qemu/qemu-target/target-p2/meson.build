@@ -36,7 +36,8 @@ p2_system_ss = ss.source_set()
 p2_ss.add(gen)
 p2_ss.add(decode_interp)
 p2_ss.add(trans_stub, interp_stub)
-p2_ss.add(files('translate.c', 'op_helper.c', 'cpu.c', 'pinbus.c', 'interp.c'))
+p2_ss.add(files('translate.c', 'op_helper.c', 'cpu.c', 'pinbus.c', 'interp.c',
+                   'hostipc.c'))
 
 target_arch += {'p2': p2_ss}
 target_system_arch += {'p2': p2_system_ss}

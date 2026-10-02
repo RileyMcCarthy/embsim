@@ -280,21 +280,20 @@ jobs:
       - name: Propagate the verdict
         run: exit ${{ steps.report.outputs.code }}
 
-  # The P2 node boots the real Parallax ROM off the P2-EC32MB's flash, over
-  # nets, with QEMU as the CPU (p2-qemu/README.md). QEMU is built from a clean
-  # checkout with this repository's target sources and linked into the test
-  # binary as a library; the build is cached on everything that changes it.
-  # Without EMBSIM_QEMU_P2_BUILD the crate is a stub: the boot test is not
-  # built, and a unit test asserts the node is unavailable. This job is the
-  # one that links QEMU and runs the boot.
+  # The P2 core boots the real Parallax ROM off the P2-EC32MB's flash, over
+  # nets, with QEMU as the CPU in a qemu-system-p2 of its own
+  # (p2-qemu/README.md). The program is built and installed the way a user
+  # gets it, `embsim qemu install`, and cached on what decides it: the runner
+  # image (the program links its glib), the QEMU pin and the target's
+  # identity (a digest of p2-qemu/qemu-target's sources, QEMU_PIN among
+  # them), all three read from the plan the command would follow. Every test
+  # that needs the program is #[ignore]d in the other jobs, so this is the
+  # one job that needs QEMU. Linux: the shared page's futex path, on both
+  # sides; the socket fallback too.
   p2-qemu-boot:
     name: p2-qemu-boot
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      QEMU_TAG: v10.1.0
-      # What QEMU_TAG must resolve to. A tag can be moved; a commit cannot.
-      QEMU_COMMIT: f8b2f64e2336a28bf0d50b6ef8a7d8c013e9bcf3
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -307,71 +306,52 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libglib2.0-dev flex bison python3-venv
 
-      # build.ninja carries absolute paths to the runner image's system
-      # libraries, so the image is part of what a cached build was built
-      # against. (`env` holds only workflow-set variables, so ImageOS and
-      # ImageVersion are read from the shell.)
-      - name: Runner image
-        id: img
-        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Build the embsim command
+        run: cargo build -p embsim-cli
 
-      # The node links QEMU's OBJECTS, so the whole build directory is what a
-      # hit has to restore -- not just the binary. ~165 MB for one target.
-      # The SOURCE tree is not cached: the shim compiles against QEMU's
-      # headers, so the checkout and the staging below run on a hit too, and
-      # only configure + ninja are skipped. build.ninja carries absolute
-      # paths, which is why the tree goes to the same place every time.
-      #
-      # The key is the image, the QEMU pin and the target sources. The node's
-      # tree is `--with-devices-p2=node`. The flash the ROM reads is a board
-      # component, so this job does not link a flash device.
-      - name: Cache the QEMU build
-        id: qemu-cache
+      # `env` holds only workflow-set variables, so ImageOS and ImageVersion
+      # are read from the shell.
+      - name: What the install builds
+        id: plan
+        run: |
+          set -euo pipefail
+          plan=$(target/debug/embsim qemu install --dry-run)
+          echo "$plan"
+          echo "target=$(echo "$plan" | awk '$1 == "target" { print $2 }')" >> "$GITHUB_OUTPUT"
+          echo "qemu=$(echo "$plan" | awk '$1 == "qemu" { print $2 "-" $3 }')" >> "$GITHUB_OUTPUT"
+          echo "image=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+
+      # The installed program, not the ~150 MB build tree: the ~8 MB binary,
+      # its licences, NOTICE and source.
+      - name: Cache qemu-system-p2
         uses: actions/cache@v6
         with:
-          path: qemu-build/build-p2
-          key: qemu-p2-node-${{ runner.os }}-${{ steps.img.outputs.id }}-${{ env.QEMU_TAG }}-${{ hashFiles('p2-qemu/qemu-target/**') }}
+          path: ~/.embsim/qemu/${{ steps.plan.outputs.target }}
+          key: qemu-system-p2-${{ runner.os }}-${{ steps.plan.outputs.image }}-${{ steps.plan.outputs.qemu }}-${{ steps.plan.outputs.target }}
 
-      # Into a directory the cache may already have populated with build-p2,
-      # which `git clone` refuses; a fetch into an initialised repository
-      # does not mind what else is there.
-      - name: Check out QEMU
-        run: |
-          set -euo pipefail
-          mkdir -p qemu-build
-          git -C qemu-build init -q
-          git -C qemu-build fetch -q --depth 1 https://gitlab.com/qemu-project/qemu.git "refs/tags/$QEMU_TAG"
-          test "$(git -C qemu-build rev-parse 'FETCH_HEAD^{commit}')" = "$QEMU_COMMIT"
-          git -C qemu-build checkout -q FETCH_HEAD
+      # On a cache hit this starts the cached program, checks its handshake
+      # and builds nothing.
+      - name: embsim qemu install
+        run: target/debug/embsim qemu install --jobs 4
 
-      - name: Stage the P2 target into the QEMU tree
-        run: p2-qemu/qemu-target/stage.sh qemu-build
+      - name: Which qemu-system-p2 the tests start
+        run: target/debug/embsim qemu path
 
-      # --enable-pie: the objects have to link into a Rust test binary, which
-      # is position-independent. --disable-containers: configure otherwise
-      # probes docker. --with-devices-p2=node: the node's device set
-      # (p2-qemu/qemu-target/README.md).
-      - name: Build qemu-system-p2
-        if: steps.qemu-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          cd qemu-build
-          mkdir -p build-p2 && cd build-p2
-          ../configure --target-list=p2-softmmu --disable-containers --enable-pie \
-              --disable-docs --disable-werror --with-devices-p2=node
-          ninja qemu-system-p2
+      - name: Boot the ROM off the module's flash, over the nets (shared page)
+        run: cargo test -p embsim-p2-qemu -- --include-ignored --nocapture
 
-      - name: Boot the ROM off the module's flash, over the nets
+      - name: The same over the socket pair
         env:
-          EMBSIM_QEMU_P2_BUILD: ${{ github.workspace }}/qemu-build/build-p2
-        run: cargo test -p embsim-p2-qemu -- --nocapture
+          EMBSIM_P2_QEMU_TRANSPORT: socket
+        run: >-
+          cargo test -p embsim-p2-qemu --test rom_boot_ec32mb --test crystal_pll
+          --test pad_modes --test lifecycle -- --include-ignored --nocapture
 
       # The same boot said by a project file and run by the `embsim`
-      # command (`core = "qemu"`), QEMU linked into the binary.
+      # command (`core = "qemu"`), and `embsim qemu path` finding the
+      # installed program.
       - name: Boot the P2 from a project with embsim run
-        env:
-          EMBSIM_QEMU_P2_BUILD: ${{ github.workspace }}/qemu-build/build-p2
-        run: cargo test -p embsim-cli -- --nocapture
+        run: cargo test -p embsim-cli --test cli -- --include-ignored --nocapture
 
   # A project's own catalog crates (PROJECTS.md §10, "The runner"): the
   # `embsim` binary writes a runner beside examples/custom-project, builds

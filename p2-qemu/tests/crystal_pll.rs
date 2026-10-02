@@ -28,6 +28,9 @@
 //! package's reset releases at the build and the guest's clock counts from
 //! the START instant the restart delay later, 3 ms, and the `VIO_0_3` bank
 //! at 3.3 V for the pad it writes.
+//!
+//! Needs a `qemu-system-p2` (`embsim qemu install`), so it is `#[ignore]`d
+//! in the workspace's tests; CI's `p2-qemu-boot` job runs it.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +41,7 @@ use embsim_board::{
 };
 use embsim_boards::p2::{P2Package, P2_RESTART_DELAY_NS};
 use embsim_core::virtual_clock;
-use embsim_p2_qemu::{P2Qemu, P2QemuError};
+use embsim_p2_qemu::P2Qemu;
 
 /// The P2's debug transmit pin, where the guest writes its byte.
 const DEBUG_TX: u8 = 62;
@@ -212,16 +215,10 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 #[test]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
 fn hubset_multiplies_the_rate_delivered_on_xi_and_stalls_without_one() {
     let image: Vec<u8> = PROGRAM.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let p2 = match P2Qemu::with_boot_rom(&image, &[]) {
-        Ok(p2) => p2,
-        Err(P2QemuError::Unavailable) => {
-            eprintln!("\n*** SKIPPED: built without a QEMU tree (EMBSIM_QEMU_P2_BUILD). Asserted NOTHING.\n");
-            return;
-        }
-        Err(e) => panic!("{e}"),
-    };
+    let p2 = P2Qemu::with_boot_rom(&image, &[]).expect("qemu-system-p2 starts");
     let handle = p2.handle();
     let package = P2Package::new(p2);
     let package_handle = package.handle();
@@ -252,12 +249,13 @@ fn hubset_multiplies_the_rate_delivered_on_xi_and_stalls_without_one() {
         handle.console(DEBUG_TX),
         "K",
         "the guest ran to its byte after the clock arrived; edges={edges:?} stalled={} \
-         crystal={:?} halted={} yields={} slices={}",
+         crystal={:?} halted={} yields={} slices={} failure={:?}",
         handle.stalled(),
         handle.crystal_hz(),
         handle.halted(),
         handle.yields(),
         handle.slices(),
+        handle.failure(),
     );
 
     // The reset released at the build — the supplies were up before the

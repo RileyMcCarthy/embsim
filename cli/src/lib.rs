@@ -20,6 +20,12 @@
 //!   time, until `--for` elapses or the run is interrupted (Ctrl-C), then
 //!   prints its summary.
 //!
+//! And one for the P2's QEMU core, which runs in a program of its own:
+//! `embsim qemu install` builds that `qemu-system-p2` from the target this
+//! embsim carries and installs it where the core looks; `embsim qemu path`
+//! says which one a run would start and whether it is the right one
+//! (`embsim_p2_qemu`, "Where the CPU runs").
+//!
 //! Every kind a project names comes from a [`CatalogSet`]. A project with
 //! kinds of its own — a model, a board, an instruction-set simulator as the
 //! P2's core, a bench part — writes them in a catalog crate and names it in
@@ -84,6 +90,7 @@ pub use embsim_boards::catalog::CatalogSet;
 
 mod checklist;
 mod live;
+mod qemu;
 mod runner;
 mod scaffold;
 mod signals;
@@ -203,6 +210,54 @@ enum Command {
         #[arg(long)]
         rebuild: bool,
     },
+    /// The P2's QEMU core runs in a program of its own, `qemu-system-p2`:
+    /// install it, or say which one a run would start.
+    Qemu {
+        #[command(subcommand)]
+        command: QemuCommand,
+    },
+}
+
+/// `embsim qemu …`.
+#[derive(Debug, Subcommand)]
+enum QemuCommand {
+    /// Build `qemu-system-p2` from the P2 target this embsim carries —
+    /// fetching QEMU at its pinned release, staging the target, a minimal
+    /// configure, ninja — and install it into `~/.embsim/qemu/<target>/`,
+    /// where the core looks. Needs git, a C compiler, ninja, pkg-config,
+    /// glib and python3. The program is QEMU, GPL-2.0, installed with its
+    /// licence and source; embsim runs it and links none of it.
+    Install {
+        /// Install into this directory instead (then point
+        /// `EMBSIM_QEMU_SYSTEM_P2` at the program, or put it on `PATH`).
+        #[arg(long, value_name = "DIR")]
+        prefix: Option<PathBuf>,
+        /// Build here instead of under the system's temporary directory. An
+        /// install that stopped picks up where it was.
+        #[arg(long, value_name = "DIR")]
+        build_dir: Option<PathBuf>,
+        /// Keep the build directory afterwards.
+        #[arg(long)]
+        keep_build: bool,
+        /// Fetch QEMU from this repository (a mirror, a local clone); the
+        /// pinned commit is checked whatever the source.
+        #[arg(long, value_name = "URL")]
+        qemu_git: Option<String>,
+        /// Build jobs (ninja's default without it).
+        #[arg(long, short)]
+        jobs: Option<usize>,
+        /// Build and install even when the matching program is installed.
+        #[arg(long)]
+        force: bool,
+        /// Say what it would do — the target, the QEMU release, the build
+        /// and install directories, the configure line — and do nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Which `qemu-system-p2` a run would start (`EMBSIM_QEMU_SYSTEM_P2`,
+    /// then `PATH`, then the installed one), what it says it is, and
+    /// whether that is what this embsim needs.
+    Path,
 }
 
 impl Command {
@@ -213,6 +268,7 @@ impl Command {
         match self {
             Self::Check { project, .. } | Self::Run { project, .. } => Some(project),
             Self::Survey { project, .. } | Self::New { project, .. } => project.as_deref(),
+            Self::Qemu { .. } => None,
         }
     }
 
@@ -220,7 +276,7 @@ impl Command {
     fn rebuild(&self) -> bool {
         match self {
             Self::Check { rebuild, .. } | Self::Run { rebuild, .. } => *rebuild,
-            Self::Survey { .. } | Self::New { .. } => false,
+            Self::Survey { .. } | Self::New { .. } | Self::Qemu { .. } => false,
         }
     }
 }
@@ -453,6 +509,29 @@ fn execute(
             },
             out,
         ),
+        Command::Qemu { command } => match command {
+            QemuCommand::Install {
+                prefix,
+                build_dir,
+                keep_build,
+                qemu_git,
+                jobs,
+                force,
+                dry_run,
+            } => qemu::install(
+                &embsim_p2_qemu::install::InstallOptions {
+                    prefix,
+                    build_dir,
+                    qemu_git,
+                    jobs,
+                    keep_build,
+                    force,
+                    dry_run,
+                },
+                out,
+            ),
+            QemuCommand::Path => qemu::path(out),
+        },
     };
     let _ = out.flush();
     match outcome {
