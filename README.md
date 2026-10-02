@@ -161,9 +161,9 @@ place the two meet.
 | `embsim-core` | [`core/`](core) | Virtual clock, serial PTY, event observers |
 | `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface, projects and the netlist survey |
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
-| `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets. Carries the `target/p2` sources |
+| `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets, with QEMU in a `qemu-system-p2` of its own. Carries the `target/p2` sources that program is built from |
 | `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
-| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core where it is linked), and build a project's own catalog crates into the runner that runs it. The guide is [`PROJECTS.md`](PROJECTS.md) |
+| `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core, `embsim qemu install` installing the program it runs in), and build a project's own catalog crates into the runner that runs it. The guide is [`PROJECTS.md`](PROJECTS.md) |
 | `yourproject-catalog` | [`cli/catalog-template/`](cli/catalog-template) | The catalog crate `embsim new --catalog` starts, compiled here so it stays true to the API |
 | `custom-project-catalog` | [`examples/custom-project/catalog/`](examples/custom-project/catalog) | A worked example: a project's own part model, board, P2 core and bench component ([`examples/custom-project`](examples/custom-project/README.md)) |
 | `embsim-memory-inspect` | [`tools/memory-inspect/`](tools/memory-inspect) | DWARF reader — recover C enums/structs/variables from an archive |
@@ -311,10 +311,12 @@ catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its
 ROM (`rom = "file"` for another) off whatever the board gives it — on the
 P2-EC32MB, the flash, which `image = "boot.bin"` on the `w25q128jv` kind
 fills (`embsim_p2_qemu::flashimage` lays out stage-1 and a program). QEMU
-has to be linked when `embsim` is built (`EMBSIM_QEMU_P2_BUILD`, see
-`p2-qemu/README.md`); a build without it refuses the entry saying so. The
-boot as a project file is in `cli/tests/cli.rs`
-(`run_boots_the_p2_off_the_modules_flash`).
+is not linked into embsim: the P2 runs in `qemu-system-p2`, a program of its
+own that `embsim qemu install` builds from the target embsim carries and
+installs where the core looks (`embsim qemu path` says which one a run
+would start; see `p2-qemu/README.md`). Without it the entry is refused,
+saying how to install it. The boot as a project file is in
+`cli/tests/cli.rs` (`run_boots_the_p2_off_the_modules_flash`).
 
 ## Using embsim in your project
 
@@ -356,10 +358,14 @@ runner writes ten lines over the command's library (`embsim_cli::shipped`,
 its registration function, `embsim_cli::main_with`); the example's is
 `examples/custom-project/catalog/examples/own_binary.rs`.
 
-## One QEMU P2 per OS process
+## The QEMU P2 is a program of its own
 
-`P2Qemu::with_boot_rom` boots a process-global QEMU. A second call in the same
-process is refused. Run one machine per process.
+Each `P2Qemu` starts a `qemu-system-p2` of its own and takes turns with it
+over a shared page, so a board may carry several P2s and a process may run
+several systems' worth. The program dies with its node, and with the
+process that started it however that ends (`p2-qemu/README.md`, "Where the
+CPU runs, and why"). It is QEMU, a GPL-2.0 program, installed beside its
+licence and source; embsim links none of it.
 
 ## Building & testing
 
@@ -375,7 +381,7 @@ Per-crate, if you want to iterate on one area:
 ```bash
 cargo test -p embsim-core           # virtual clock, observers, serial PTY
 cargo test -p embsim-models         # ADS122U04, flash, SD, regulators, the plant
-cargo test -p embsim-p2-qemu        # P2 core: stub without a QEMU tree; EMBSIM_QEMU_P2_BUILD=<build> boots the ROM, the pad-mode and PLL benches
+cargo test -p embsim-p2-qemu        # P2 core; with `embsim qemu install` done, -- --include-ignored boots the ROM, the pad-mode and PLL benches
 cargo test -p embsim-boards         # the P2-EC32MB board against its netlist
 cargo test -p embsim-memory-inspect # DWARF parser (compiles a tiny C fixture at test time)
 cargo test -p embsim-trace          # trace recorder

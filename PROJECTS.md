@@ -667,7 +667,7 @@ image = "boot.bin"
 ```
 
 ```bash
-EMBSIM_QEMU_P2_BUILD=/path/to/qemu/build-p2 cargo install --path cli
+embsim qemu install      # once: builds and installs qemu-system-p2
 embsim run boot.toml --for 20ms --net EC32.Common_VDD
 ```
 
@@ -685,17 +685,22 @@ The package reports its start and, at the end, its gate; the QEMU core
 reports its console, per pad, and its yields. Both print under the part's
 name.
 
-QEMU is linked when the command is built (`EMBSIM_QEMU_P2_BUILD`; making the
-QEMU tree is [`p2-qemu/README.md`](p2-qemu/README.md)). A build without it
-refuses the entry and says how to link it:
+QEMU runs in a program of its own, `qemu-system-p2`, which `embsim qemu
+install` builds from the P2 target embsim carries and installs in
+`~/.embsim/qemu/<target>/` ([`p2-qemu/README.md`](p2-qemu/README.md));
+`embsim qemu path` says which one a run would start and whether it is the
+right one. The core looks for it when the entry is seated —
+`EMBSIM_QEMU_SYSTEM_P2`, then `PATH`, then the install directory — and
+refuses the entry without one, saying how to install it:
 
 ```text
-error: board EC32: [[board.model]] value = "P2X8C4M64P" (kind "p2"): embsim-p2-qemu was built without a QEMU tree; set EMBSIM_QEMU_P2_BUILD to a configured QEMU build with the p2 target and rebuild
+error: board EC32: [[board.model]] value = "P2X8C4M64P" (kind "p2"): no qemu-system-p2: EMBSIM_QEMU_SYSTEM_P2 is unset, none is on PATH, and none at /home/me/.embsim/qemu/<target>/qemu-system-p2. `embsim qemu install` builds it — QEMU v10.1.0 with the P2 target this embsim carries (identity <target>) — and installs it where this embsim looks (/home/me/.embsim/qemu/<target>); it needs git, a C compiler, ninja, pkg-config, glib and python3
 ```
 
-QEMU is one machine per process, so a `core = "qemu"` key may reach only one
-part. The chip boots when the board is built, which means `survey` never
-boots it and `check` does, with time held. No command makes a flash image
+A program built from another target, or speaking another protocol, is
+refused the same way, naming both. Each part a `core = "qemu"` key reaches
+boots a program of its own. The chip boots when the board is built, which
+means `survey` never boots it and `check` does, with time held. No command makes a flash image
 yet. `embsim_p2_qemu::flashimage::boot_flash(STAGE1, &program)` lays out
 stage-1 and a program, as the test that boots this project does
 (`run_boots_the_p2_off_the_modules_flash`, `cli/tests/cli.rs`).
@@ -1413,12 +1418,9 @@ fn main() -> ExitCode {
 
 The example's crate takes `embsim-cli` as a dev-dependency, which its
 examples and tests use; a project's own binary crate depends on
-`embsim-cli` and on its catalog crate. A binary like it that links QEMU (`embsim-cli` built with
-`EMBSIM_QEMU_P2_BUILD` set) needs QEMU's link arguments, which
-`embsim-p2-qemu` hands only to a crate that depends on it directly: the
-binary's crate then depends on `embsim-p2-qemu` and has a `build.rs` like
-the one the tool writes for a runner (`BUILD_RS` in `cli/src/runner.rs`).
-Without a QEMU tree, as for the example, nothing more is needed.
+`embsim-cli` and on its catalog crate, and needs nothing more: QEMU is not
+linked into any binary, and a project's binary runs the P2's QEMU core the
+way the tool does, starting the installed `qemu-system-p2`.
 
 `embsim_cli::shipped()` is the standard catalog with QEMU's core;
 `embsim_cli::main_with(set)` reads the process's arguments and runs the
@@ -1499,9 +1501,9 @@ whose `--project` names one, runs in a **runner**: a small crate the
 `embsim` tool writes, builds with Cargo, and hands the command line to
 (`cli/src/runner.rs`).
 
-- **What it is.** A binary crate whose dependencies are `embsim-cli` and
-  `embsim-p2-qemu` from the embsim checkout the runner builds against, and
-  each crate `[catalog]` names, by path. Its `main` is
+- **What it is.** A binary crate whose dependencies are `embsim-cli` from
+  the embsim checkout the runner builds against, and each crate `[catalog]`
+  names, by path. Its `main` is
   `embsim_cli::runner_main` over the crates, one registration function each:
 
   ```rust,ignore
@@ -1515,8 +1517,7 @@ whose `--project` names one, runs in a **runner**: a small crate the
   ```
 
 - **Where it lives.** In `.embsim/runner-<id>/` beside the project file:
-  `Cargo.toml`, `main.rs` and a `build.rs` that links QEMU the way the
-  `embsim` binary's own does. `<id>` is eight hex digits of a hash of the
+  `Cargo.toml` and `main.rs`. `<id>` is eight hex digits of a hash of the
   crates' canonical directories and the embsim checkout's, so two projects
   that name the same crates share a runner. The manifest declares an empty
   `[workspace]`, so the runner is never taken for a member of a workspace
@@ -1669,8 +1670,7 @@ path. Crates that spell one checkout two ways are refused, naming both.
 
 Past that, Cargo refuses most of the ways two copies could meet: a type
 from one copy is not the other's, so a registration function taking
-another copy's `CatalogSet` does not compile, two copies of `embsim-p2-qemu`
-(`links = "qemu-p2"`) do not resolve, and two packages of one name and
+another copy's `CatalogSet` does not compile, and two packages of one name and
 version at two paths are Cargo's "package collision in the lockfile",
 which the tool names as two copies ("When the build fails", above). That
 covers a crate the catalog crate depends on (MaD's `p2iss`) taking embsim
@@ -1682,11 +1682,9 @@ runner whose build reports two is refused, naming the library and both
 places, before it runs. Each copy would have its own virtual clock, and a
 part on one would wait on time nobody advances.
 
-QEMU is linked into a runner when it was linked into `embsim`.
-`EMBSIM_QEMU_P2_BUILD` is passed through when it is set in the environment,
-and otherwise the tree `embsim` was built with is used (`cli/build.rs`
-records it as `EMBSIM_QEMU_TREE`). Without either, the runner refuses
-`core = "qemu"` with the message section 5 shows.
+A runner links no QEMU, as the tool links none: its P2 QEMU core starts the
+`qemu-system-p2` it finds when a board is built, exactly as the tool's does,
+and refuses `core = "qemu"` without one with the message section 5 shows.
 
 ### Surveying with a project's kinds
 
@@ -1793,8 +1791,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The standard catalog's core is `held-in-reset`. QEMU's is `qemu`, added by
-`embsim_p2_qemu::catalog::register` like any project's, and it refuses a key
-that reaches two parts, since QEMU is one machine per process. The `p2`
+`embsim_p2_qemu::catalog::register` like any project's; each part its key
+reaches boots a `qemu-system-p2` of its own. The `p2`
 kind adds a report for every package it seats (its start, or why it is
 held), and a core adds its own (QEMU's console, per pad).
 

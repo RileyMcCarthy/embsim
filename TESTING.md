@@ -165,9 +165,11 @@ cargo test -p embsim-board --lib cluster::tests
 cargo test -p embsim-board --test ec32mb_module --test isolation_bridge
 # ns/solve of the MNA at m = 2, 4, 8, 11, 47 (not a test; run in release).
 cargo run -p embsim-board --release --example solve_bench
-# The QEMU core inside the package (needs a QEMU P2 tree): the ROM boot
-# prints its edges / yields / publishes / START instant / wall time and
-# holds its escalated-solve count exactly (since phase 4 the module is
+# The QEMU core inside the package (needs `embsim qemu install`'s
+# qemu-system-p2, so these are #[ignore]d without --include-ignored): the
+# ROM boot prints its edges / yields / publishes / START instant / wall time
+# / turns and the channel's cost per turn, holds its yields, publishes and
+# clock edges exactly, and its escalated-solve count (since phase 4 the module is
 # powered from its J203 fingers, nothing stuck: the reset releases at the
 # bucks' 2.5 ms soft-start and the core starts the datasheet's 3 ms later,
 # at 5.5 ms, the TCXO's 20 MHz reaches XI, and the count is the power
@@ -179,8 +181,19 @@ cargo run -p embsim-board --release --example solve_bench
 # the 20 MHz that arrives — the scope reads its pad writes 12–13 ns apart,
 # and one yield per pad write. Both benches supply VDD, RESN and the bank
 # the guest drives, as the START gate and the pads' bank rule need; their
-# guests start 3 ms in, the restart delay after the build.
-EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocapture
+# guests start 3 ms in, the restart delay after the build; `pad_modes` runs
+# two P2s, each its own program. `lifecycle`: a program killed mid-run stops
+# its core with the signal in the error, a dropped core takes its program
+# with it, and a program whose parent is killed ends itself.
+# EMBSIM_P2_QEMU_TRANSPORT=socket runs them over the fallback channel.
+cargo test -p embsim-p2-qemu -- --include-ignored --nocapture
+# Without QEMU (runs everywhere): `program` starts a stand-in that speaks
+# the protocol — a program of another protocol or target refused naming
+# both and saying how to install the right one, one that exits before its
+# handshake or dies mid-run reported with its status and standard error
+# within a second, one that will not quit killed when its node drops — and
+# checks that stage.sh and the crate compute one target identity.
+cargo test -p embsim-p2-qemu --test program
 # The interface phase's sense task (`NODES.md` §12 item 5; stepped, own
 # binary): what a pin is handed is a
 # voltage against its declared reference, and the level is the receiver's
@@ -296,9 +309,12 @@ cargo test -p embsim-boards --test scripted_source --test host_serial
 # board, the DS2 add-on (refused with its survey until its stub is filled)
 # and the EC32 (the pin tables the hand-written project chooses); `run` of
 # the EC32 project for 10 ms, its rails up, the build's findings apart and
-# the ones the run cleared listed at the end, the report the same twice. With
-# EMBSIM_QEMU_P2_BUILD set, `run` also boots the P2 off the module's flash
-# (`core = "qemu"`); without it, the refusal that says how. `run` with no
+# the ones the run cleared listed at the end, the report the same twice.
+# Where no qemu-system-p2 can be found, `check` of a `core = "qemu"` project
+# refused saying where it looked and how to install one, `qemu path` failing
+# the same way, and `qemu install --dry-run` naming the target, the QEMU
+# release and where it would go; with one installed (--include-ignored),
+# `run` boots the P2 off the module's flash and `qemu path` finds it. `run` with no
 # duration interrupted by SIGINT, its summary printed; `run --pty` putting a
 # host's PTY where it says and printing its path, and refusing a path that
 # holds a file. And the command as a
@@ -341,11 +357,14 @@ builds, among them the example's test, the started crate's test
 (`cli/tests/template.rs`), the guide's doc tests and `guide_quotes`; the
 `project-runner` job runs `cargo test -p embsim-cli --test runner --
 --ignored`, which builds real runners with Cargo; the `p2-qemu-boot` job
-runs `cargo test -p embsim-cli` with QEMU linked, where `run` boots the P2
-off the module's flash. The behaviour ledger's suite (`vibes.suite.json`)
-runs `embsim-board`, `embsim-boards`, `embsim-cli` and
-`custom-project-catalog`, so the runner builds and the QEMU boot declare no
-behaviours: the ledger's run builds neither.
+installs `qemu-system-p2` with `embsim qemu install` and runs `cargo test
+-p embsim-p2-qemu` and `cargo test -p embsim-cli --test cli` with
+`--include-ignored`, where `run` boots the P2 off the module's flash. The
+behaviour ledger's suite (`vibes.suite.json`) runs `embsim-board`,
+`embsim-boards`, `embsim-cli`, `embsim-p2-qemu` and `custom-project-catalog`,
+so the runner builds and the QEMU boots declare no behaviours: the ledger's
+run builds no runner and installs no QEMU. What runs without them (the
+stand-in program, the refusals) declares its behaviours.
 
 **A project's own catalog** is tested the way the example's is, in the
 project's repository: a test that runs the project file through
