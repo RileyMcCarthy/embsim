@@ -97,10 +97,10 @@ the target sources it was built from under `source/`, and a `NOTICE`
 saying how it was built — its corresponding source. embsim runs it as a
 separate program and talks to it over a small fixed protocol (a shared page
 or a socket pair, `src/protocol.rs`); it links none of QEMU, and nothing of
-embsim is in the program. The crate's own code is MIT; the package also
-carries the target's sources, as data (`Cargo.toml` says so in its licence
-expression). This is a statement of how the pieces are put together, not
-legal advice.
+embsim is in the program. The crate is MIT, as every embsim crate is; it
+also carries the target's sources, as data it never compiles, each file
+under its own licence (`qemu-target/README.md`, "License"). This is a
+statement of how the pieces are put together, not legal advice.
 
 ## In a project
 

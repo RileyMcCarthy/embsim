@@ -288,6 +288,7 @@ program it installs.
 program and talks to it over a small fixed protocol through a shared page or
 a socket pair (`../src/protocol.rs`); no QEMU code is compiled into
 `embsim-p2-qemu`, the `embsim` command or any runner, and nothing of embsim
-is compiled into the program. `embsim-p2-qemu` carries this directory as
-data, to build the program from. This describes how the pieces are put
-together; it is not legal advice.
+is compiled into the program. `embsim-p2-qemu`, MIT as every embsim crate
+is, carries this directory as data it never compiles, to write out and
+build the program from; every file here keeps the licence it states. This
+describes how the pieces are put together; it is not legal advice.

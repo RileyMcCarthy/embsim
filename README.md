@@ -459,4 +459,29 @@ gracefully** when no C toolchain is present.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+embsim's code, in every crate, is MIT: see [LICENSE](LICENSE). Two crates
+carry other people's material, under its own licence, beside that code:
+
+- `embsim-boards` compiles in `boards/netlists/p2_ec32mb.net`, a
+  transcription of Parallax's P2-EC32MB schematic, which Parallax
+  publishes under CC BY-SA 4.0; the transcription is CC BY-SA 4.0 too, so
+  that crate's licence is `MIT AND CC-BY-SA-4.0` (`boards/netlists/LICENSE`).
+- `embsim-p2-qemu` carries the QEMU Propeller 2 target in
+  `p2-qemu/qemu-target/`, as data: the target and board are
+  LGPL-2.1-or-later, its two QEMU patches carry the licences of the QEMU
+  files they modify (GPL-2.0-or-later and MIT), its decode table is MIT
+  (from PNut-TS); each file says which,
+  and the texts are in [`LICENSES/`](LICENSES) and
+  `p2-qemu/qemu-target/LICENSE-PNut-TS`. embsim compiles none of it: `embsim
+  qemu install` writes it out and builds it into QEMU. The crate's own
+  code is MIT, and so is its licence field.
+
+**`qemu-system-p2` is a separate program**, a GPL-2.0 work: QEMU is
+released as a whole under version 2 of the GPL, and the target becomes part
+of it. `embsim qemu install` builds it from QEMU at the pinned commit and
+those target sources, and installs it with QEMU's licence texts, the target
+sources it was built from and a `NOTICE` saying how — its corresponding
+source. embsim runs it as a separate process and talks to it over a small
+fixed protocol; it links none of QEMU, and nothing of embsim is in the
+program (`p2-qemu/qemu-target/README.md`, "License"). This says how the
+pieces are put together; it is not legal advice.
