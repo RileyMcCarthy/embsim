@@ -4,12 +4,14 @@ Copyright (c) 2026 Riley McCarthy
 host-thread.patch: embsim host-driven mode for round-robin TCG, against
 QEMU v10.1.0. With `rr_host_driven` set (target/p2/hostipc.c sets it from
 the machine's `hostipc` property), QEMU's own vCPU thread parks at start-up,
-before it arms its kick timer, and a host thread runs the cogs; and the
-icount budget of a slice ignores real-time timers, so no wall-clock deadline
-can cut a slice short. Each hunk carries the licence of the file it
-modifies: accel/tcg/tcg-accel-ops-rr.c and accel/tcg/tcg-accel-ops-icount.c
-are MIT (their own headers), accel/tcg/tcg-accel-ops-rr.h is
-GPL-2.0-or-later (its own header). Applied by stage.sh; see README.md.
+before it arms its kick timer, and a host thread runs the cogs; a kick from
+any thread that runs no cog does nothing, so only the host thread ends a
+slice; and the icount budget of a slice ignores real-time timers. No
+wall-clock instant can cut a slice short. Each hunk carries the licence of
+the file it modifies: accel/tcg/tcg-accel-ops-rr.c and
+accel/tcg/tcg-accel-ops-icount.c are MIT (their own headers),
+accel/tcg/tcg-accel-ops-rr.h is GPL-2.0-or-later (its own header). Applied
+by stage.sh; see README.md.
 
 diff --git a/accel/tcg/tcg-accel-ops-icount.c b/accel/tcg/tcg-accel-ops-icount.c
 index d0f7b41..5c1b527 100644
@@ -41,10 +43,10 @@ index d0f7b41..5c1b527 100644
          /*
           * Maintain prior (possibly buggy) behaviour where if no deadline
 diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
-index 6eec5c9..e550e0d 100644
+index 6eec5c9..5f617ea 100644
 --- a/accel/tcg/tcg-accel-ops-rr.c
 +++ b/accel/tcg/tcg-accel-ops-rr.c
-@@ -37,6 +37,8 @@
+@@ -37,11 +37,30 @@
  #include "tcg-accel-ops-rr.h"
  #include "tcg-accel-ops-icount.h"
  
@@ -53,7 +55,46 @@ index 6eec5c9..e550e0d 100644
  /* Kick all RR vCPUs */
  void rr_kick_vcpu_thread(CPUState *unused)
  {
-@@ -186,7 +188,21 @@ static void *rr_cpu_thread_fn(void *arg)
+     CPUState *cpu;
+ 
++    /*
++     * embsim host-driven mode: only the thread running the cogs ends a
++     * slice.
++     *
++     * A kick sets every cog's exit request, which ends the slice running
++     * at its next block -- an instant that, from any other thread, is
++     * wherever the wall clock found the host's slice: QEMU's main loop
++     * pausing the vCPUs for a shutdown, resume_all_vcpus at start-up, work
++     * queued for a vCPU. Those threads run no cog (current_cpu is the cog a
++     * thread is running, and only the host thread runs one), and their
++     * kicks do nothing. A kick from inside a slice -- COGINIT starting a
++     * cog -- ends the slice where it always did, at that instruction, the
++     * same on every run.
++     */
++    if (rr_host_driven && !current_cpu) {
++        return;
++    }
+     CPU_FOREACH(cpu) {
+         cpu_exit(cpu);
+     };
+@@ -71,6 +90,16 @@ static inline int64_t rr_next_kick_time(void)
+ static void rr_kick_next_cpu(void)
+ {
+     CPUState *cpu;
++
++    /*
++     * embsim host-driven mode: no thread but the host's ends a slice (see
++     * rr_kick_vcpu_thread). This one's callers -- the kick timer, which
++     * this mode never arms, and the RCU force-quiescent notifier -- kick
++     * whichever vCPU the parked thread would be running, and it runs none.
++     */
++    if (rr_host_driven) {
++        return;
++    }
+     do {
+         cpu = qatomic_read(&rr_current_cpu);
+         if (cpu) {
+@@ -186,7 +215,21 @@ static void *rr_cpu_thread_fn(void *arg)
      rcu_register_thread();
      force_rcu.notify = rr_force_rcu;
      rcu_add_force_rcu_notifier(&force_rcu);
@@ -76,7 +117,7 @@ index 6eec5c9..e550e0d 100644
  
      bql_lock();
      qemu_thread_get_self(cpu->thread);
-@@ -207,6 +223,38 @@ static void *rr_cpu_thread_fn(void *arg)
+@@ -207,6 +250,38 @@ static void *rr_cpu_thread_fn(void *arg)
          }
      }
  

@@ -97,10 +97,12 @@ the target sources it was built from under `source/`, and a `NOTICE`
 saying how it was built — its corresponding source. embsim runs it as a
 separate program and talks to it over a small fixed protocol (a shared page
 or a socket pair, `src/protocol.rs`); it links none of QEMU, and nothing of
-embsim is in the program. The crate is MIT, as every embsim crate is; it
-also carries the target's sources, as data it never compiles, each file
-under its own licence (`qemu-target/README.md`, "License"). This is a
-statement of how the pieces are put together, not legal advice.
+embsim is in the program. The crate's Rust is MIT, as every embsim
+crate's is; it also carries the target's sources, each file under its own
+licence (`qemu-target/README.md`, "License"), and embeds them verbatim in
+every binary that links it, as data it never compiles — so its licence is
+`MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later`. This is a statement of
+how the pieces are put together, not legal advice.
 
 ## In a project
 
@@ -161,14 +163,19 @@ a second. A program that dies is noticed within 100 ms (a blocked wait asks
 the kernel every 100 ms; the socket closes at once) and reported with its
 exit status and the last of its standard error, which the node also passes
 through to embsim's own; the core then runs no further
-(`P2QemuHandle::failure`). One that lives but has not answered a turn in
-30 s is killed and reported as unresponsive.
+(`P2QemuHandle::failure`), and `embsim run` stops there and exits
+non-zero. One that lives but has not answered a turn in 30 s is killed and
+reported as unresponsive. A program sent `SIGTERM`, `SIGINT` or `SIGHUP`
+ends at once: QEMU's own handler takes the signal, and the program exits
+from its main loop before QEMU's shutdown would pause the parked vCPUs
+(`qemu-target/README.md`, "Host-driven mode").
 
 No wall-clock input reaches the guest. A slice is exactly the instruction
 count asked for: the parked vCPU thread parks before it arms QEMU's kick
 timer, the board arms no quantum timer, and `host-thread.patch` keeps
 real-time timers out of the icount limit in host-driven mode, so no timer a
-main-loop option arms can cut a slice short.
+main-loop option arms can cut a slice short; and it makes a kick from any
+thread that runs no cog do nothing, so neither can QEMU's main loop.
 
 ## How an edge gets its instant
 
@@ -273,20 +280,12 @@ end because it is large and carries nothing the numbers do not.
 SIL=~/Documents/MaD/SIL              # the MaD checkout; p2core is not a dependency of embsim
 W=$(mktemp -d)
 
-# 1. The flash image the boot test builds (flashimage::boot_flash): stage-1
-#    in the first KB balanced to "Prop", the payload's length and image at
-#    $400 — the same bytes as romtest.sh's python.
-python3 - p2-qemu/rom/stage1.bin "$W/flash.bin" <<'PY'
-import sys, struct
-stage1 = open(sys.argv[1], 'rb').read()
-payload = b''.join(struct.pack('<I', w) for w in (0xF607EC42, 0xFC27EC3E, 0xFD9FFFFC))
-img = bytearray(0x404 + len(payload)); img[:len(stage1)] = stage1
-img[0x400:0x404] = struct.pack('<I', len(payload)); img[0x404:] = payload
-PROP = struct.unpack('<I', b'Prop')[0]
-s = sum(struct.unpack_from('<I', img, i)[0] for i in range(0, 0x400, 4)) & 0xFFFFFFFF
-img[0x3FC:0x400] = struct.pack('<I', (PROP - s) & 0xFFFFFFFF)
-open(sys.argv[2], 'wb').write(bytes(img))
-PY
+# 1. The flash image the boot test builds (`embsim flash-image`, over
+#    flashimage::boot_flash): stage-1 in the first KB balanced to "Prop",
+#    the payload's length and image at $400 — the same bytes as
+#    romtest.sh's python. The payload is mov pa,#"B" / wypin pa,#62 / jmp #$.
+printf '\102\354\007\366\076\354\047\374\374\377\237\375' > "$W/payload.binary"
+cargo run --quiet -p embsim-cli -- flash-image "$W/payload.binary" -o "$W/flash.bin"
 
 # 2. The reference: p2core's cog-0 state, one line per instruction, 60 000
 #    of them, booting the same ROM off the same image (P2CORE_NO_FF turns

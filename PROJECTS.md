@@ -505,6 +505,24 @@ Either way, the first interrupt ends the run at its next look: it prints
 `interrupted at` the instant it reached, then the summary a run that reaches
 its `--for` prints. A second interrupt ends the process at once.
 
+A part whose model fails ends the run too: a QEMU core whose
+`qemu-system-p2` died, or anything a catalog builds whose report says it
+failed (section 10, "What a run prints about what a catalog built"). The
+look that finds it prints why, under the part's name; the run stops there,
+prints `stopped at` that instant and which part failed, then the summary,
+and exits non-zero with the reason, so a script or CI job that runs a
+project sees it:
+
+```text
+[  56.500000 ms] EC32.U100: QEMU stopped: qemu-system-p2 (/home/me/.embsim/qemu/<target>/qemu-system-p2, pid 85168) was killed by signal 9 (SIGKILL) during a run; it wrote nothing to standard error
+stopped at 56.500000 ms of virtual time: EC32.U100 failed
+ran 56.500000 ms of virtual time in 4.123 s
+EC32.U100: core "qemu": started at 5.500000 ms
+EC32.U100: QEMU: 254670 pad yields; stopped: qemu-system-p2 (/home/me/.embsim/qemu/<target>/qemu-system-p2, pid 85168) was killed by signal 9 (SIGKILL) during a run; it wrote nothing to standard error; console empty
+…
+error: EC32.U100 failed at 56.500000 ms of virtual time, and the run stopped there: qemu-system-p2 (/home/me/.embsim/qemu/<target>/qemu-system-p2, pid 85168) was killed by signal 9 (SIGKILL) during a run; it wrote nothing to standard error
+```
+
 ## 4. How a board is populated
 
 Every board is built by `Board::from_netlist` with a `PartRegistry`, and
@@ -717,10 +735,33 @@ error: board EC32: [[board.model]] value = "P2X8C4M64P" (kind "p2"): no qemu-sys
 A program built from another target, or speaking another protocol, is
 refused the same way, naming both. Each part a `core = "qemu"` key reaches
 boots a program of its own. The chip boots when the board is built, which
-means `survey` never boots it and `check` does, with time held. No command makes a flash image
-yet. `embsim_p2_qemu::flashimage::boot_flash(STAGE1, &program)` lays out
-stage-1 and a program, as the test that boots this project does
-(`run_boots_the_p2_off_the_modules_flash`, `cli/tests/cli.rs`).
+means `survey` never boots it and `check` does, with time held.
+
+The ROM boots a flash whose first kilobyte is a loader whose 256 longs sum
+to `"Prop"`. `embsim flash-image` lays out a program as that flash: embsim's
+stage-1 loader in the first kilobyte, balanced to `"Prop"`, then the
+program's length at `$400` and the program, which stage-1 copies into hub
+RAM from `$0` and runs. The program is the P2 binary the compiler writes,
+what `loadp2` would load:
+
+```bash
+embsim flash-image build/firmware.binary -o boot.bin
+```
+
+```text
+wrote boot.bin: 1040 bytes, a flash image the P2's boot ROM boots
+  $000  embsim's stage-1 loader (164 bytes), its first kilobyte summing to "Prop"
+  $400  the program's length, 12 bytes
+  $404  build/firmware.binary, which stage-1 copies into hub RAM from $0 and runs
+  a w25q128jv part's `image` option names it, relative to the project file
+```
+
+A `w25q128jv` whose `image` is not one a P2 boots — a raw program with no
+stage-1 in front of it — says so at the run's first look, under the part's
+name, with the sum its first kilobyte has; the ROM would otherwise stop
+every cog with nothing to say why. The boot this section shows is
+`run_boots_the_p2_off_the_modules_flash` (`cli/tests/cli.rs`), its image
+made by `embsim flash-image`.
 
 ### Bench component kinds
 
@@ -1290,7 +1331,8 @@ catalog of the test tree's own beside the standard one
   from Rust. `System::scenario` replaces the scenario the project built, so
   a scenario set from Rust has to carry the project's lines too.
 - The `sd-card` kind needs a card image. There is no blank card.
-- There is no command that makes a P2 flash image (section 5).
+- The `w25q128jv` kind has no option that lays out a P2 program itself:
+  `embsim flash-image` makes the image as a step before the run (section 5).
 - `run` prints findings in their Rust form (`FloatingSense { … }`). At the
   end it reads again only the findings about a net (a
   floating sense, an unsourced power net, a down rail, a fight, a domain
@@ -1358,8 +1400,8 @@ project rig.toml
 Here `rig.toml` was a copy of `boards/projects/ec32-carrier.toml` in a
 directory of the embsim checkout, so the crate takes embsim by path; any
 project takes a crate the same way, and one outside a checkout takes
-embsim from its repository at the tool's revision ("The catalog crate",
-below). The first `check` compiles embsim, its
+embsim from its repository at the tool's revision when a remote holds it,
+or from where `--embsim` says ("The catalog crate", below). The first `check` compiles embsim, its
 dependencies and the crate: 54 crates in 19 s from an empty target directory on the eight-core machine
 these were run on. A second `check` or `run` with nothing changed is
 Cargo's no-op check and then the run: 0.3 s for `run rig.toml --for 10ms`.
@@ -1405,14 +1447,27 @@ project (`sim/catalog` gives `sim-board`, `sim-sensor`, `sim-core`,
 `sim-source`). Which embsim it writes, in order:
 
 1. for a crate that joins a project (`--add-to`) whose first catalog crate
-   names one, the same;
-2. the checkout the tool was built from, by a path relative to the crate,
+   names one, the same (and `--embsim` naming another is refused);
+2. `--embsim`'s: an embsim checkout's path, or a git repository at a tag
+   or a commit, `URL@REF` — a hex commit is a `rev`, anything else a `tag`,
+   and `rev=`, `tag=` or `branch=` before it says which:
+   `--embsim https://github.com/RileyMcCarthy/embsim@v0.2.0`;
+3. the checkout the tool was built from, by a path relative to the crate,
    when that checkout sits inside the crate's git repository (embsim as a
    submodule, as in MaD);
-3. embsim's repository at the revision the tool was built from, with its
+4. embsim's repository at the revision the tool was built from, with its
    release as the version Cargo checks: `{ git =
    "https://github.com/RileyMcCarthy/embsim", rev = "…", version = "0.2"
-   }` (at the release tag, `v0.2.0`, when the tool knows no revision).
+   }` (at the release tag, `v0.2.0`, when the tool knows no revision) —
+   when another machine can fetch exactly that revision: the tool was built
+   with no changes no commit holds, and from a release, a checkout Cargo
+   fetched, or a checkout whose remote-tracking branches hold the commit.
+   A tool built from a local commit never pushed, or with uncommitted
+   changes, takes its checkout by path instead, and says so:
+
+   ```text
+   note: this embsim's revision is on no git source another machine can fetch: it was built from /home/me/embsim at git rev 980fc103562f, which no branch of a remote that checkout tracks contains (`git branch -r --contains 980fc103562f` names none). So the crate takes embsim from that checkout by path, which is this machine's; to share the project, push the embsim it builds against and start the crate with `--embsim <repository>@<commit>`, or name a release: `--embsim https://github.com/RileyMcCarthy/embsim@v0.2.0`
+   ```
 
 That library is `cli/catalog-template`, a crate of embsim's workspace that
 every gate compiles and `cli/tests/template.rs` runs, with `yourproject`
@@ -1674,7 +1729,16 @@ hands the command line to (`cli/src/runner.rs`). It has one of two owners.
   ```
 
   A build that failed because its graph holds two copies of embsim says
-  that instead ("Which embsim the runner builds against", below).
+  that instead ("Which embsim the runner builds against", below). So does
+  one whose embsim Cargo could not fetch — a commit no remote has, a
+  repository it cannot reach — naming the source, Cargo's reason, and
+  where to point the crates instead:
+
+  ```text
+  error: the runner for rig.toml did not build: Cargo could not fetch embsim from git https://github.com/RileyMcCarthy/embsim rev 980fc103562f3bd418cfcc5208d9c5b3b5262f3c (embsim-board: revision 980fc103562f3bd418cfcc5208d9c5b3b5262f3c not found); Cargo's errors are above. Point the catalog crates' embsim dependencies at a source every machine can fetch — a published release tag (`{ git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0" }`) or a commit a remote holds — or at an embsim checkout by path; `embsim new --catalog DIR --embsim PATH|URL@REF` writes either (PROJECTS.md §10)
+  ```
+
+  A project's own runner says the same of its `embsim-cli` dependency.
 - **When there is no Cargo.** The tool builds with `$CARGO` (what Cargo
   sets for a program it runs), else `cargo` on the `PATH`. When neither
   starts, the command exits 1 saying the project's catalog crates need
@@ -1707,7 +1771,11 @@ directory reached from the runner's own (`concat!(env!("CARGO_MANIFEST_DIR"),
 "/../catalog")`). `embsim new --catalog sim/catalog --own-runner` starts it
 beside the catalog crate (`sim/runner`; `--own-runner DIR` puts it
 elsewhere) and names it, with `embsim-cli` from the catalog crate's embsim
-and the catalog crate by path:
+and the catalog crate by path. A runner crate that no Cargo workspace
+covers is a workspace of its own: Cargo builds it in its own `target/` and
+writes its `Cargo.lock` beside it, and `new` writes a `.gitignore` that
+keeps `target/` out of git, as `cargo new` does, so the commit that holds
+the project holds the crate and its lock and nothing a build made:
 
 ```rust,ignore
 use std::process::ExitCode;
@@ -2111,9 +2179,11 @@ A core's console, a PTY's path and a carriage's travel are not findings,
 and no net carries them. Anything a catalog builds can hand the run a
 **report** (`embsim_board::Report`): its `subject` (what the lines are
 about, `"EC32.U100"` or `"HOST"`), a `look(now_ns)` that returns what is
-new since the last look, and a `summary` of the state at the end. The
-example below, a doc test of `embsim-boards`, is a counter's report, and
-what the build and the run do with it:
+new since the last look, a `summary` of the state at the end, and — for
+something that can fail, such as a core whose program died — a `failure()`
+that says why once it has (`None`, the default, until then). The example
+below, a doc test of `embsim-boards`, is a counter's report, and what the
+build and the run do with it:
 
 ```rust
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2172,7 +2242,10 @@ component's; `Reports::add`). The run builds the system with
 built (`Reports::take`), asks each at every look and at the end, and prints
 what they return under their subject, stamped like a finding. A look reads
 state the engine's thread wrote while the run's thread was parked, so on
-the stepped clock two runs print the same report, as section 3 says.
+the stepped clock two runs print the same report, as section 3 says. After
+every look the run asks each report for a `failure()`; the first it finds
+ends the run there, with its summary, and the command exits non-zero with
+the subject, the instant and the failure's first line (section 3, "Step 6").
 
 A run also says what its binary is made of, under the project line, so a
 result can be traced to what produced it (`DESIGN.md` rule 9):
@@ -2198,7 +2271,7 @@ which program runs it, where that was found, and its protocol, target and
 QEMU:
 
 ```text
-[   0.000000 ms] EC32.U100: qemu-system-p2 /home/me/.embsim/qemu/fb2a01e4049c2979/qemu-system-p2 (installed by `embsim qemu install`): protocol 1, P2 target fb2a01e4049c2979, QEMU 10.1.0
+[   0.000000 ms] EC32.U100: qemu-system-p2 /home/me/.embsim/qemu/3fcd1d3208148650/qemu-system-p2 (installed by `embsim qemu install`): protocol 1, P2 target 3fcd1d3208148650, QEMU 10.1.0
 ```
 
 ### MaD, the first project to extend embsim

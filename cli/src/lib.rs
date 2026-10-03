@@ -18,13 +18,16 @@
 //!   with the text that says what to fix.
 //! - `embsim run <project>` — starts the system and runs it in virtual
 //!   time, until `--for` elapses or the run is interrupted (Ctrl-C), then
-//!   prints its summary.
+//!   prints its summary. A part that fails (a core whose program died)
+//!   ends the run there, and the command exits non-zero with it.
 //!
-//! And one for the P2's QEMU core, which runs in a program of its own:
-//! `embsim qemu install` builds that `qemu-system-p2` from the target this
-//! embsim carries and installs it where the core looks; `embsim qemu path`
-//! says which one a run would start and whether it is the right one
-//! (`embsim_p2_qemu`, "Where the CPU runs").
+//! And two for the P2. Its QEMU core runs in a program of its own: `embsim
+//! qemu install` builds that `qemu-system-p2` from the target this embsim
+//! carries and installs it where the core looks; `embsim qemu path` says
+//! which one a run would start and whether it is the right one
+//! (`embsim_p2_qemu`, "Where the CPU runs"). And `embsim flash-image
+//! PROGRAM -o IMAGE` lays out a program behind embsim's stage-1 loader as
+//! the boot flash the P2's ROM boots (`embsim_p2_qemu::flashimage`).
 //!
 //! Every kind a project names comes from a [`CatalogSet`]. A project with
 //! kinds of its own — a model, a board, an instruction-set simulator as the
@@ -199,6 +202,14 @@ enum Command {
             conflicts_with_all = ["catalog", "add_to"]
         )]
         project: Option<PathBuf>,
+        /// With `--catalog`: where the crate takes embsim from, and so the
+        /// runner — an embsim checkout's path, or a git repository at a tag
+        /// or revision, `URL@v0.2.0` or `URL@<commit>`. Without it: the
+        /// checkout this embsim was built from when it sits in the
+        /// project's repository, else embsim's repository at this embsim's
+        /// revision when a remote holds it, else that checkout, saying why.
+        #[arg(long, value_name = "PATH|URL@REF", requires = "catalog")]
+        embsim: Option<String>,
     },
     /// Load a project, survey its boards and build its system with time
     /// held; print what the build found. Exits non-zero, with the reason,
@@ -215,7 +226,8 @@ enum Command {
     },
     /// Start a project's system and run it in virtual time, printing
     /// findings and what its parts report as the run reaches them, and a
-    /// summary when it ends.
+    /// summary when it ends. A part that fails — a P2 core whose program
+    /// died — stops the run there, and it exits non-zero with the reason.
     Run {
         /// The project file.
         project: PathBuf,
@@ -242,6 +254,18 @@ enum Command {
     Qemu {
         #[command(subcommand)]
         command: QemuCommand,
+    },
+    /// Lay out a P2 program as a flash image the boot ROM boots: embsim's
+    /// stage-1 loader in the first kilobyte, balanced so its longs sum to
+    /// "Prop" as the ROM checks, then the program's length and the program
+    /// at $400. A `w25q128jv` part's `image` option names the file.
+    FlashImage {
+        /// The program: a P2 binary image, as the compiler writes it (what
+        /// `loadp2` loads into hub RAM at $0).
+        program: PathBuf,
+        /// Where to write the flash image.
+        #[arg(short, long, value_name = "IMAGE")]
+        output: PathBuf,
     },
 }
 
@@ -295,7 +319,7 @@ impl Command {
         match self {
             Self::Check { project, .. } | Self::Run { project, .. } => Some(project),
             Self::Survey { project, .. } | Self::New { project, .. } => project.as_deref(),
-            Self::Qemu { .. } => None,
+            Self::Qemu { .. } | Self::FlashImage { .. } => None,
         }
     }
 
@@ -303,7 +327,10 @@ impl Command {
     fn rebuild(&self) -> bool {
         match self {
             Self::Check { rebuild, .. } | Self::Run { rebuild, .. } => *rebuild,
-            Self::Survey { .. } | Self::New { .. } | Self::Qemu { .. } => false,
+            Self::Survey { .. }
+            | Self::New { .. }
+            | Self::Qemu { .. }
+            | Self::FlashImage { .. } => false,
         }
     }
 }
@@ -583,9 +610,17 @@ fn execute(
             own_runner,
             add_to,
             project,
+            embsim,
         } => {
             // An empty path is the default directory, beside the crate.
             let own_runner = own_runner.map(Option::unwrap_or_default);
+            let embsim = match embsim.as_deref().map(scaffold::parse_embsim).transpose() {
+                Ok(embsim) => embsim,
+                Err(message) => {
+                    let _ = writeln!(err, "error: {message}");
+                    return ExitCode::FAILURE;
+                }
+            };
             match (netlist, catalog) {
                 (Some(netlist), catalog) => checklist::new_project(
                     set,
@@ -597,12 +632,17 @@ fn execute(
                         catalog: catalog.as_deref(),
                         own_runner: own_runner.as_deref(),
                         project: project.as_deref(),
+                        embsim: embsim.as_ref(),
                     },
                     out,
                 ),
-                (None, Some(catalog)) => {
-                    scaffold::new_catalog(&catalog, own_runner.as_deref(), add_to.as_deref(), out)
-                }
+                (None, Some(catalog)) => scaffold::new_catalog(
+                    &catalog,
+                    own_runner.as_deref(),
+                    add_to.as_deref(),
+                    embsim.as_ref(),
+                    out,
+                ),
                 (None, None) => unreachable!("clap requires the netlist unless --catalog is given"),
             }
         }
@@ -649,6 +689,7 @@ fn execute(
             ),
             QemuCommand::Path => qemu::path(out),
         },
+        Command::FlashImage { program, output } => qemu::flash_image(&program, &output, out),
     };
     let _ = out.flush();
     match outcome {

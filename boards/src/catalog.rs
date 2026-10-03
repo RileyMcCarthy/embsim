@@ -1098,13 +1098,26 @@ fn w25q128jv_kind(
     // programmer that wrote only the image would have left.
     let mut array = vec![0xFF; W25Q128JV_CAPACITY_BYTES];
     array[..bytes.len()].copy_from_slice(&bytes);
+    // What a P2 booting from this flash checks first; said once the part is
+    // built, so a run off an image the ROM will not boot says why.
+    let sum = p2_boot_sum(&array);
+    let reports = assignment.reports.clone();
+    let board = assignment.board.to_string();
     Model::with_table(
         format!(
             "w25q128jv, pins = {:?}, id = {:?}, image = {image:?}",
             table.0, id.0
         ),
         table.1,
-        move |_| {
+        move |decl| {
+            if sum != P2_BOOT_SUM {
+                reports.add(FlashImageReport {
+                    subject: format!("{board}.{}", decl.reference),
+                    image: image.clone(),
+                    sum,
+                    said: false,
+                });
+            }
             Box::new(
                 SpiNorFlashComponent::new(
                     SpiNorFlash::with_image(array.clone()).with_jedec_id(id.1),
@@ -1115,6 +1128,55 @@ fn w25q128jv_kind(
     )
     .register(registry, assignment.key);
     Ok(())
+}
+
+/// What the Propeller 2's boot ROM requires of a boot flash's first
+/// kilobyte: its 256 little-endian longs sum to `"Prop"` (the ROM's flash
+/// loader; `p2-qemu/rom/rom_booter_v33k.spin2`, `embsim_p2_qemu::flashimage`).
+const P2_BOOT_SUM: u32 = u32::from_le_bytes(*b"Prop");
+
+/// The sum of the first kilobyte of `array` as the P2's boot ROM takes it.
+fn p2_boot_sum(array: &[u8]) -> u32 {
+    array[..1024]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|long| u32::from_le_bytes(*long))
+        .fold(0u32, u32::wrapping_add)
+}
+
+/// What a flash says in a run when its image is not one a P2 boots: at the
+/// first look, the sum the boot ROM would find and how to lay out one it
+/// boots. The part may hold an image for something else; the line says
+/// only what a P2 would do with it.
+struct FlashImageReport {
+    subject: String,
+    image: String,
+    sum: u32,
+    said: bool,
+}
+
+impl Report for FlashImageReport {
+    fn subject(&self) -> String {
+        self.subject.clone()
+    }
+
+    fn look(&mut self, _now_ns: u64) -> Vec<String> {
+        if std::mem::replace(&mut self.said, true) {
+            return Vec::new();
+        }
+        vec![format!(
+            "flash image {:?}: a P2 does not boot from it. The boot ROM runs the first \
+             kilobyte only when its 256 longs sum to \"Prop\" (${P2_BOOT_SUM:08X}), and these \
+             sum to ${:08X}; `embsim flash-image PROGRAM -o IMAGE` lays out a P2 program \
+             behind a stage-1 loader that does",
+            self.image, self.sum
+        )]
+    }
+
+    fn summary(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 fn sd_card_kind(
@@ -1546,9 +1608,22 @@ mod tests {
         options: &str,
         dir: &Path,
     ) -> Result<(), ProjectError> {
+        let reports = embsim_board::Reports::new();
+        register_reporting(registry, kind, key, decl, options, dir, &reports)
+    }
+
+    /// [`register`], what the part's constructor reports going to `reports`.
+    fn register_reporting(
+        registry: &mut PartRegistry,
+        kind: &str,
+        key: &str,
+        decl: &ComponentDecl,
+        options: &str,
+        dir: &Path,
+        reports: &embsim_board::Reports,
+    ) -> Result<(), ProjectError> {
         let parts = [decl];
         let netlist = no_nets();
-        let reports = embsim_board::Reports::new();
         let assignment = Assignment::new(
             "B",
             KeyField::Mpn,
@@ -1556,7 +1631,7 @@ mod tests {
             kind,
             &parts,
             &netlist,
-            &reports,
+            reports,
             &StandardCatalog,
         )
         .in_dir(dir);
@@ -2017,6 +2092,103 @@ mod tests {
             err.to_string().contains(&format!("is {len} bytes")),
             "{err}"
         );
+    }
+
+    /// A flash image whose first kilobyte sums to `"Prop"`: the word itself
+    /// in its first long, and nothing after it.
+    fn bootable_image() -> Vec<u8> {
+        let mut image = vec![0u8; 1024 + 12];
+        image[..4].copy_from_slice(b"Prop");
+        image
+    }
+
+    #[rstest]
+    #[case::raw_program(vec![0x42, 0xEC, 0x07, 0xF6, 0x3E, 0xEC, 0x27, 0xFC], true)]
+    #[case::laid_out(bootable_image(), false)]
+    fn a_flash_image_a_p2_does_not_boot_is_said_at_the_first_look(
+        #[case] image: Vec<u8>,
+        #[case] said: bool,
+    ) {
+        behaviour!(Test {
+            id: "catalog.flash-image-not-bootable",
+            covers: Some("boards/src/catalog.rs#w25q128jv_kind"),
+            given: "a W25Q128JV holding an image file, once with a raw P2 program at its start \
+                    and once with an image whose first kilobyte sums to the word Prop, built",
+        });
+        expect!(
+            "said",
+            "for the raw program, the built part reports at a run's first look that a P2 does \
+             not boot from the image, the sum its first kilobyte has beside the one the boot ROM \
+             wants, and the command that lays out an image it boots",
+            "the boot ROM runs the first kilobyte only when its 256 longs sum to Prop, and \
+             otherwise every cog stops with nothing to say why"
+        );
+        expect!("once", "the next look reports nothing more");
+        expect!(
+            "bootable-quiet",
+            "the part laid out for a P2 reports nothing"
+        );
+        expect!(
+            "built-not-registered",
+            "registering the kind reports nothing until the part is built",
+            "a survey registers every kind and builds none"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "embsim-catalog-flash-boot-{}-{said}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, &image).expect("the temp dir is writable");
+        let part = decl("W25Q128JVSIM");
+        let file = path
+            .file_name()
+            .expect("a file")
+            .to_string_lossy()
+            .into_owned();
+        let reports = embsim_board::Reports::new();
+        let mut registry = PartRegistry::new();
+        register_reporting(
+            &mut registry,
+            "w25q128jv",
+            "W25Q128JVSIM",
+            &part,
+            &format!("pins = \"by-function\"\nimage = {file:?}\n"),
+            path.parent().expect("a directory"),
+            &reports,
+        )
+        .expect("the image fits");
+        let _ = std::fs::remove_file(&path);
+        assert!(reports.is_empty(), "registered, nothing built");
+        let _part = registry.construct(&part).expect("the part builds");
+        let mut taken = reports.take();
+        if !said {
+            assert!(taken.is_empty());
+            return;
+        }
+        assert_eq!(taken.len(), 1);
+        let report = &mut taken[0];
+        assert_eq!(report.subject(), "B.U1");
+        let lines = report.look(0);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let sum = image
+            .chunks(4)
+            .map(|long| {
+                let mut word = [0xFF; 4];
+                word[..long.len()].copy_from_slice(long);
+                u32::from_le_bytes(word)
+            })
+            .chain(std::iter::repeat(0xFFFF_FFFF))
+            .take(256)
+            .fold(0u32, u32::wrapping_add);
+        assert_eq!(
+            lines[0],
+            format!(
+                "flash image {file:?}: a P2 does not boot from it. The boot ROM runs the first \
+                 kilobyte only when its 256 longs sum to \"Prop\" ($706F7250), and these sum \
+                 to ${sum:08X}; `embsim flash-image PROGRAM -o IMAGE` lays out a P2 program \
+                 behind a stage-1 loader that does"
+            )
+        );
+        assert!(report.look(100_000).is_empty(), "said once");
     }
 
     #[rstest]

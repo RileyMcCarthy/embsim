@@ -631,6 +631,8 @@ pub struct NewOptions<'a> {
     /// `--project`: a project whose `[catalog]` the starter project names
     /// too.
     pub project: Option<&'a Path>,
+    /// `--embsim`: where the catalog crate takes embsim from.
+    pub embsim: Option<&'a crate::runner::EmbsimSource>,
 }
 
 /// `embsim new <netlist> [--name N] [-o project.toml] [--force] [--catalog
@@ -648,6 +650,7 @@ pub fn new_project(
         catalog,
         own_runner,
         project,
+        embsim,
     } = *options;
     let name = name.map_or_else(|| default_name(netlist), str::to_string);
     let survey = survey_netlist(set, netlist, &name)?;
@@ -702,8 +705,8 @@ pub fn new_project(
     // The crate first: the project names its directory as it is on disk.
     let scaffold = match catalog {
         Some(dir) => {
-            let source = scaffold::embsim_for(dir, None);
-            let scaffold = scaffold::write_crate(dir, &source)?;
+            let choice = scaffold::embsim_for(dir, None, embsim)?;
+            let scaffold = scaffold::write_crate(dir, &choice)?;
             let runner = match &runner_dir {
                 Some(runner_dir) => Some(scaffold::write_runner_crate(runner_dir, &scaffold)?),
                 None => None,

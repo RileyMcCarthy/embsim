@@ -21,7 +21,7 @@ checks the program it starts against it.
 | `p2-softmmu.mak` | `configs/targets/p2-softmmu.mak` |
 | `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak` |
 | `register-p2.patch` | the five registration edits (`target/meson.build`, `hw/meson.build`, both `Kconfig`s, `QEMU_ARCH_P2` in `include/system/arch_init.h`) |
-| `host-thread.patch` | host-driven mode for round-robin TCG: QEMU's own vCPU thread parks at start-up, before it arms its kick timer, so `hostipc.c`'s thread runs the cogs; and real-time timers are kept out of a slice's icount budget |
+| `host-thread.patch` | host-driven mode for round-robin TCG: QEMU's own vCPU thread parks at start-up, before it arms its kick timer, so `hostipc.c`'s thread runs the cogs; a kick from any thread that runs no cog does nothing, so only that thread ends a slice; and real-time timers are kept out of a slice's icount budget |
 | `QEMU_PIN` | the QEMU release this is staged into: its tag and the commit the tag must resolve to |
 | `stage.sh` | puts all of the above into a QEMU source tree, and writes the target's identity there (`hostipc-identity.h`); `stage.sh --identity` prints it |
 | `LICENSE-PNut-TS` | the notice `target-p2/insn.decode`'s source carries |
@@ -127,10 +127,22 @@ socket pair) and the read end of a pipe only embsim holds the write end of.
   horizon, the `HUBSET` word changes, or nothing can run; the STOP says
   which, with the new `DIR`/`OUT`, changed mode words and `WYPIN` bytes.
 - **The process.** A watch thread blocks on the pipe and exits the process
-  at end of file — embsim gone, however it went. A QUIT, the socket
-  closing, or `SIGTERM`/`SIGINT`/`SIGHUP` also exit at once: QEMU's own
-  shutdown waits for vCPUs this mode has parked, so it is never asked. The
-  log `-d`/`-D` writes is flushed first.
+  at end of file — embsim gone, however it went. A QUIT or the socket
+  closing exits at once too. So does `SIGTERM`, `SIGINT` or `SIGHUP`:
+  QEMU's own handler takes the signal and asks the main loop to shut down,
+  and a shutdown notifier ends the process there, before QEMU's shutdown
+  pauses the vCPUs — which would wait for ever on the round-robin thread
+  this mode parks, kicking every cog while it waited. QEMU's line naming
+  the signal is on standard error, where the node reads it; the exit status
+  is 0. Each way out flushes the log `-d`/`-D` writes first.
+  (`../tests/lifecycle.rs`, `a_program_asked_to_terminate_mid_run_ends_at_once`.)
+- **Nothing but the slice loop ends a slice.** A kick sets every cog's
+  exit request, which ends the running slice at its next block. From QEMU's
+  main loop — a shutdown, `resume_all_vcpus` at start-up, work queued for a
+  vCPU — that is wherever the wall clock found the slice, so in this mode
+  `host-thread.patch` makes a kick from a thread that runs no cog do
+  nothing. A kick from inside a slice (`COGINIT` starting a cog) ends it
+  where it always did, at that instruction.
 - **The handshake.** Before the first turn: the protocol version, the
   target's identity (`hostipc-identity.h`, written by `stage.sh`) and
   `QEMU_VERSION`. The node refuses anything else.
@@ -288,7 +300,10 @@ program it installs.
 program and talks to it over a small fixed protocol through a shared page or
 a socket pair (`../src/protocol.rs`); no QEMU code is compiled into
 `embsim-p2-qemu`, the `embsim` command or any runner, and nothing of embsim
-is compiled into the program. `embsim-p2-qemu`, MIT as every embsim crate
-is, carries this directory as data it never compiles, to write out and
-build the program from; every file here keeps the licence it states. This
-describes how the pieces are put together; it is not legal advice.
+is compiled into the program. `embsim-p2-qemu` (its Rust MIT, as every
+embsim crate's is) embeds every file here, verbatim, in each binary that
+links it (`../src/target.rs`) — the `embsim` command included — as data it
+never compiles, to write out and build the program from. Every file keeps
+the licence it states, and the crate's licence names them:
+`MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later`. This describes how the
+pieces are put together; it is not legal advice.

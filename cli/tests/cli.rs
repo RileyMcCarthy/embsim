@@ -1122,20 +1122,173 @@ pole = 3
 state = "closed"
 "#;
 
-/// The project and its flash image in a directory of the test's own.
+/// `mov pa,#"B"` / `wypin pa,#62` / `jmp #$`: write `B` to the debug pin,
+/// and stay.
+const B_PROGRAM: [u32; 3] = [0xF607_EC42, 0xFC27_EC3E, 0xFD9F_FFFC];
+
+/// The project, and its flash image laid out by `embsim flash-image` from
+/// [`B_PROGRAM`], in a directory of the test's own.
 fn boot_project(test: &str) -> PathBuf {
     let dir = scratch(test);
-    // mov pa,#"B" / wypin pa,#62 / jmp #$
-    let program: Vec<u8> = [0xF607_EC42u32, 0xFC27_EC3E, 0xFD9F_FFFC]
+    let program: Vec<u8> = B_PROGRAM
         .iter()
         .flat_map(|word| word.to_le_bytes())
         .collect();
-    let image = embsim_p2_qemu::flashimage::boot_flash(embsim_p2_qemu::STAGE1, &program)
-        .expect("stage-1 fits its kilobyte");
-    std::fs::write(dir.join("boot.bin"), image).expect("the image is writable");
+    std::fs::write(dir.join("b.binary"), program).expect("the program is writable");
+    let made = embsim(&[
+        "flash-image",
+        path(&dir.join("b.binary")),
+        "-o",
+        path(&dir.join("boot.bin")),
+    ]);
+    assert!(made.status.success(), "{}", stderr(&made));
     let project = dir.join("boot.toml");
     std::fs::write(&project, PROJECT).expect("the project is writable");
     project
+}
+
+#[rstest]
+fn flash_image_lays_out_a_program_the_p2s_boot_rom_boots() {
+    behaviour!(Test {
+        id: "cli.flash-image",
+        covers: Some("cli/src/qemu.rs#flash_image"),
+        given: "`embsim flash-image` for a three-instruction P2 program, writing the image to a \
+                file",
+    });
+    expect!(
+        "layout",
+        "the image is embsim's stage-1 loader in its first kilobyte, then the program's \
+         length in bytes and the program itself, from byte $400",
+        "stage-1 reads the length at $400 and copies the program behind it into hub RAM"
+    );
+    expect!(
+        "sums-to-prop",
+        "the first kilobyte's 256 little-endian longs sum to the word Prop",
+        "the boot ROM runs the first kilobyte of the flash only when they do"
+    );
+    expect!(
+        "said",
+        "the command says where it wrote the image, what lies at $000, $400 and $404, and \
+         that a w25q128jv part's image option names the file"
+    );
+    let dir = scratch("flash_image");
+    let program: Vec<u8> = B_PROGRAM
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    std::fs::write(dir.join("b.binary"), &program).expect("writable");
+    let image_path = dir.join("boot.bin");
+    let output = embsim(&[
+        "flash-image",
+        path(&dir.join("b.binary")),
+        "-o",
+        path(&image_path),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let image = std::fs::read(&image_path).expect("the image is there");
+    let stage1 = embsim_p2_qemu::STAGE1;
+    assert_eq!(&image[..stage1.len()], stage1);
+    assert_eq!(&image[0x400..0x404], &12u32.to_le_bytes());
+    assert_eq!(&image[0x404..], &program[..]);
+    let sum = image[..0x400]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|long| u32::from_le_bytes(*long))
+        .fold(0u32, u32::wrapping_add);
+    assert_eq!(sum, u32::from_le_bytes(*b"Prop"));
+    assert_says(
+        &stdout(&output),
+        &[
+            &format!(
+                "wrote {}: {} bytes, a flash image the P2's boot ROM boots",
+                image_path.display(),
+                image.len()
+            ),
+            &format!(
+                "$000 embsim's stage-1 loader ({} bytes), its first kilobyte summing to \"Prop\"",
+                stage1.len()
+            ),
+            "$400 the program's length, 12 bytes",
+            "$404 ",
+            "a w25q128jv part's `image` option names it, relative to the project file",
+        ],
+    );
+}
+
+#[rstest]
+fn a_run_off_a_flash_image_a_p2_does_not_boot_says_so_at_its_first_look() {
+    behaviour!(Test {
+        id: "cli.run-flash-not-bootable",
+        covers: Some("boards/src/catalog.rs#w25q128jv_kind"),
+        given: "the P2-EC32MB powered from its carrier fingers, its processor held in reset, \
+                and its boot flash holding a raw three-instruction P2 program with no stage-1 \
+                loader in front of it, run for a millisecond",
+    });
+    expect!(
+        "said-at-start",
+        "the run prints at 0 milliseconds, under the flash's name, that a P2 does not boot \
+         from the image and that `embsim flash-image` lays out one it does",
+        "the boot ROM refuses a first kilobyte that does not sum to Prop, and every cog stops \
+         with nothing on the board to say why"
+    );
+    let dir = scratch("flash_not_bootable");
+    let program: Vec<u8> = B_PROGRAM
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    std::fs::write(dir.join("boot.bin"), program).expect("writable");
+    let project = dir.join("raw.toml");
+    std::fs::write(
+        &project,
+        PROJECT.replace("core = \"qemu\"", "core = \"held-in-reset\""),
+    )
+    .expect("writable");
+    let output = embsim(&["run", path(&project), "--for", "1ms"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_says(
+        &stdout(&output),
+        &[
+            "[ 0.000000 ms] EC32.U301: flash image \"boot.bin\": a P2 does not boot from it.",
+            "`embsim flash-image PROGRAM -o IMAGE` lays out a P2 program behind a stage-1 \
+             loader that does",
+        ],
+    );
+}
+
+#[rstest]
+#[case::missing(None, "cannot read the program")]
+#[case::empty(Some(0), "is empty; it is the P2 binary the compiler wrote")]
+#[case::too_big(Some(512 * 1024 + 1), "is 524289 bytes, and stage-1 copies it into the P2's hub RAM, which holds 524288")]
+fn flash_image_refuses_a_program_stage_1_cannot_load(
+    #[case] len: Option<usize>,
+    #[case] says: &str,
+) {
+    behaviour!(Test {
+        id: "cli.flash-image-refused",
+        covers: Some("cli/src/qemu.rs#flash_image"),
+        given: "`embsim flash-image` for a program file that is not there, one that is empty, \
+                and one a byte larger than the P2's 512 kilobytes of hub RAM",
+    });
+    expect!(
+        "refused",
+        "each is refused, saying which and why, and no image is written",
+        "stage-1 copies the program into hub RAM from address zero, so an image of nothing \
+         or of more than the hub holds would never run"
+    );
+    let dir = scratch(&format!(
+        "flash_image_refused_{}",
+        len.map_or(-1, |len| len as i64)
+    ));
+    let program = dir.join("p.binary");
+    if let Some(len) = len {
+        std::fs::write(&program, vec![0u8; len]).expect("writable");
+    }
+    let image = dir.join("boot.bin");
+    let output = embsim(&["flash-image", path(&program), "-o", path(&image)]);
+    assert!(!output.status.success());
+    assert_says(&stderr(&output), &[says]);
+    assert!(!image.exists());
 }
 
 #[test]
@@ -1173,6 +1326,79 @@ fn run_boots_the_p2_off_the_modules_flash() {
     assert!(text.contains("EC32.U100: qemu-system-p2 "), "{text}");
     assert!(text.contains("console P62 \"B\""), "{text}");
     assert!(text.contains("ran 20.000000 ms of virtual time"), "{text}");
+}
+
+#[test]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
+fn run_stops_when_its_qemu_core_dies() {
+    // The boot project with a guest that toggles P0 for ever in place of
+    // the boot ROM (`rom`), run for a minute; its qemu-system-p2 is killed
+    // once it runs. The core's report says the program died, the run stops
+    // at that look with its summary, and the command exits non-zero naming
+    // the part (`failure.rs` proves the run's half on any machine).
+    let project = boot_project("qemu_dies");
+    let dir = project.parent().expect("a directory").to_path_buf();
+    // drvnot #0 / jmp #\0
+    let toggle: Vec<u8> = [0xFD64_005Fu32, 0xFD80_0000]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    std::fs::write(dir.join("toggle.bin"), toggle).expect("writable");
+    let text = std::fs::read_to_string(&project)
+        .expect("the project reads")
+        .replace(
+            "core = \"qemu\"\n",
+            "core = \"qemu\"\nrom = \"toggle.bin\"\n",
+        );
+    std::fs::write(&project, text).expect("writable");
+    let child = Command::new(env!("CARGO_BIN_EXE_embsim"))
+        .args(["run", path(&project), "--for", "60s"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the embsim binary runs");
+    // The program is the run's child, in a process group of its own.
+    let started = std::time::Instant::now();
+    let program = loop {
+        let found = Command::new("pgrep")
+            .args(["-P", &child.id().to_string(), "qemu-system-p2"])
+            .output()
+            .expect("pgrep runs");
+        if let Some(pid) = String::from_utf8_lossy(&found.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "no qemu-system-p2 under the run"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // SAFETY: the run's own child, ended the way `kill -9` ends it.
+    assert_eq!(unsafe { libc::kill(program, libc::SIGKILL) }, 0);
+    let output = child.wait_with_output().expect("the run ends");
+    let text = stdout(&output);
+    assert!(!output.status.success(), "{text}");
+    assert_says(
+        &text,
+        &[
+            "EC32.U100: QEMU stopped: qemu-system-p2 (",
+            &format!("pid {program}) was killed by signal 9 (SIGKILL) during a run"),
+            "of virtual time: EC32.U100 failed",
+        ],
+    );
+    assert!(!text.contains("ran 60000.000000 ms"), "{text}");
+    assert_says(
+        &stderr(&output),
+        &[
+            "error: EC32.U100 failed at ",
+            "and the run stopped there: qemu-system-p2 (",
+        ],
+    );
 }
 
 /// `embsim` with `args`, started where there is no `qemu-system-p2` to

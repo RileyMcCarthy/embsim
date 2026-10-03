@@ -94,6 +94,9 @@ pub const LOCK_FILE: &str = "embsim.lock";
 /// takes.
 const BOARDS: &str = "embsim-boards";
 
+/// The embsim crate a runner depends on, for `runner_main`.
+const CLI: &str = "embsim-cli";
+
 /// embsim's own crates a catalog crate or a runner may depend on, each a
 /// directory of an embsim checkout's root named after it: every one a
 /// runner links must come from one embsim.
@@ -248,7 +251,7 @@ impl EmbsimSource {
     /// Whether `other` is the same copy: one checkout, however spelled;
     /// one repository at one revision; any release (which version one
     /// graph takes is Cargo's to resolve, and `links` refuses two).
-    fn same_copy(&self, other: &Self) -> bool {
+    pub(crate) fn same_copy(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Path(a), Self::Path(b)) => canonical(a) == canonical(b),
             (
@@ -338,13 +341,20 @@ pub(crate) fn is_checkout(dir: &Path) -> Result<(), String> {
 /// workspace's table when it says `workspace = true` — for when Cargo is
 /// not there to say.
 pub(crate) fn declared_source(dir: &Path) -> Option<EmbsimSource> {
+    declared_source_of(dir, BOARDS)
+}
+
+/// The source the manifest in `dir` gives its dependency on the embsim
+/// crate `package` ([`declared_source`]; `embsim-cli` for a runner crate).
+fn declared_source_of(dir: &Path, package: &str) -> Option<EmbsimSource> {
     let read = |path: &Path| -> Option<toml::Table> {
         toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
     };
     let manifest = read(&dir.join("Cargo.toml"))?;
     let dependencies = manifest.get("dependencies")?.as_table()?;
     let (_, value) = dependencies.iter().find(|(key, value)| {
-        key.as_str() == BOARDS || value.get("package").and_then(toml::Value::as_str) == Some(BOARDS)
+        key.as_str() == package
+            || value.get("package").and_then(toml::Value::as_str) == Some(package)
     })?;
     if value.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
         let root = dir.ancestors().skip(1).find(|ancestor| {
@@ -354,7 +364,7 @@ pub(crate) fn declared_source(dir: &Path) -> Option<EmbsimSource> {
         let value = workspace
             .get("workspace")?
             .get("dependencies")?
-            .get(BOARDS)?
+            .get(package)?
             .clone();
         return EmbsimSource::of_manifest(&value, root);
     }
@@ -574,7 +584,17 @@ fn build_failure(
     locked: bool,
     copies: &Copies,
 ) -> String {
-    let collision = two_copies(copies).or_else(|| cargo.collision(manifest));
+    let diagnosis = cargo.diagnose(manifest);
+    if let Some(unfetched) = &diagnosis.unfetched {
+        return format!(
+            "the runner for {} did not build: Cargo could not fetch embsim {} ({unfetched}); \
+             Cargo's errors are above. {}",
+            plan.project.display(),
+            plan.source_said(),
+            fetchable_embsim()
+        );
+    }
+    let collision = two_copies(copies).or(diagnosis.collision);
     if let Some(copies) = collision {
         return format!(
             "the runner for {} did not build: it met two copies of embsim ({copies}); Cargo's \
@@ -603,6 +623,18 @@ fn build_failure(
         plan.project.display(),
         plan.crate_names(),
         plan.source_said()
+    )
+}
+
+/// What to do about an embsim Cargo could not fetch.
+fn fetchable_embsim() -> String {
+    format!(
+        "Point the catalog crates' embsim dependencies at a source every machine can fetch — a \
+         published release tag (`{{ git = \"{}\", tag = \"v{}\" }}`) or a commit a remote \
+         holds — or at an embsim checkout by path; `embsim new --catalog DIR --embsim \
+         PATH|URL@REF` writes either (PROJECTS.md §10)",
+        env!("CARGO_PKG_REPOSITORY"),
+        crate::provenance::VERSION
     )
 }
 
@@ -1322,7 +1354,18 @@ fn hand_over_own(
             executable
         }
         Built::Failed { copies } => {
-            let collision = two_copies(&copies).or_else(|| cargo.collision(&manifest));
+            let diagnosis = cargo.diagnose(&manifest);
+            let embsim = declared_source_of(&dir, CLI)
+                .map_or_else(|| "unknown".to_string(), |source| source.describe());
+            if let Some(unfetched) = &diagnosis.unfetched {
+                return Err(format!(
+                    "the project's runner {} did not build: Cargo could not fetch embsim {embsim} \
+                     ({unfetched}); Cargo's errors are above. {}",
+                    own.package,
+                    fetchable_embsim()
+                ));
+            }
+            let collision = two_copies(&copies).or(diagnosis.collision);
             return Err(match collision {
                 Some(copies) => format!(
                     "the project's runner {} did not build: it met two copies of embsim \
@@ -1341,10 +1384,10 @@ fn hand_over_own(
                     own.workspace_root.display()
                 ),
                 None => format!(
-                    "the project's runner {} did not build; Cargo's errors are above. Its main \
-                     is embsim_cli::runner_main over the project's catalog crates, each a \
-                     library with `pub fn register(set: &mut CatalogSet) -> Result<(), \
-                     ProjectError>` at its root (PROJECTS.md §10)",
+                    "the project's runner {} did not build (embsim {embsim}); Cargo's errors \
+                     are above. Its main is embsim_cli::runner_main over the project's catalog \
+                     crates, each a library with `pub fn register(set: &mut CatalogSet) -> \
+                     Result<(), ProjectError>` at its root (PROJECTS.md §10)",
                     own.package
                 ),
             });
@@ -1384,6 +1427,76 @@ fn hand_over_own(
 // ============================================================
 // Cargo
 // ============================================================
+
+/// What Cargo's resolution of a runner that did not build says.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Diagnosis {
+    /// The graph holds two copies of embsim: two packages of one embsim
+    /// name ("package collision in the lockfile"), or a second claim on
+    /// `links = "embsim-core"`; Cargo's lines that say so.
+    collision: Option<String>,
+    /// Cargo could not get an embsim crate from its source (a revision no
+    /// remote has, a repository it cannot reach): the crate, and the last
+    /// cause Cargo gives.
+    unfetched: Option<String>,
+}
+
+impl Diagnosis {
+    /// Read Cargo's error `text`.
+    fn of_cargo_errors(text: &str) -> Self {
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        Self {
+            collision: Self::collision(&lines),
+            unfetched: Self::unfetched(&lines),
+        }
+    }
+
+    fn collision(lines: &[&str]) -> Option<String> {
+        if let Some(line) = lines
+            .iter()
+            .find(|line| line.contains("package collision") && line.contains("embsim-"))
+        {
+            return Some(line.trim_start_matches("error: ").to_string());
+        }
+        let at = lines
+            .iter()
+            .position(|line| line.contains("links to the native library `embsim-core`"))?;
+        let mut said = vec![lines[at].trim_end_matches(':').to_string()];
+        if let Some(first) = lines[at + 1..]
+            .iter()
+            .find(|line| line.starts_with("package `embsim-core"))
+        {
+            said.push(format!("the first is {first}"));
+        }
+        if let Some(second) = lines
+            .iter()
+            .find(|line| line.starts_with("... required by"))
+        {
+            said.push(format!("the second {}", second.trim_start_matches("... ")));
+        }
+        Some(said.join("; "))
+    }
+
+    /// `error: failed to get `embsim-board` as a dependency of …`, then its
+    /// causes, the last of which says what went wrong.
+    fn unfetched(lines: &[&str]) -> Option<String> {
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("error: failed to get `embsim-"))?;
+        let package = lines[at]
+            .trim_start_matches("error: failed to get `")
+            .split('`')
+            .next()
+            .unwrap_or_default();
+        let cause = lines[at + 1..]
+            .iter()
+            .rev()
+            .find(|line| !line.is_empty() && !line.starts_with("Caused by"))
+            .copied()
+            .unwrap_or_default();
+        Some(format!("{package}: {cause}"))
+    }
+}
 
 /// A runner build, as [`Cargo::build`] runs it.
 struct Build<'a> {
@@ -1602,12 +1715,11 @@ impl Cargo {
         })
     }
 
-    /// The lines of Cargo's error that say the runner's dependency graph
-    /// holds two copies of embsim, when it does: two packages of one embsim
-    /// name ("package collision in the lockfile"), or a second claim on
-    /// `links = "embsim-core"` — read off a `cargo metadata` of the runner
-    /// (which resolves as the build did), after a build failed.
-    fn collision(&self, manifest: &Path) -> Option<String> {
+    /// Why the build of `manifest` failed, when Cargo's resolution says:
+    /// read off a `cargo metadata` of the runner, which resolves as the
+    /// build did, after a build failed — once, its network retries off, so
+    /// a source Cargo cannot reach fails at once the second time.
+    fn diagnose(&self, manifest: &Path) -> Diagnosis {
         let output = self
             .command(
                 manifest.parent().unwrap_or(manifest),
@@ -1619,37 +1731,15 @@ impl Cargo {
                     manifest.as_os_str(),
                 ],
             )
+            .env("CARGO_NET_RETRY", "0")
             .stdout(Stdio::null())
-            .output()
-            .ok()?;
-        if output.status.success() {
-            return None;
+            .output();
+        match output {
+            Ok(output) if !output.status.success() => {
+                Diagnosis::of_cargo_errors(&String::from_utf8_lossy(&output.stderr))
+            }
+            _ => Diagnosis::default(),
         }
-        let text = String::from_utf8_lossy(&output.stderr);
-        let lines: Vec<&str> = text.lines().map(str::trim).collect();
-        if let Some(line) = lines
-            .iter()
-            .find(|line| line.contains("package collision") && line.contains("embsim-"))
-        {
-            return Some(line.trim_start_matches("error: ").to_string());
-        }
-        let at = lines
-            .iter()
-            .position(|line| line.contains("links to the native library `embsim-core`"))?;
-        let mut said = vec![lines[at].trim_end_matches(':').to_string()];
-        if let Some(first) = lines[at + 1..]
-            .iter()
-            .find(|line| line.starts_with("package `embsim-core"))
-        {
-            said.push(format!("the first is {first}"));
-        }
-        if let Some(second) = lines
-            .iter()
-            .find(|line| line.starts_with("... required by"))
-        {
-            said.push(format!("the second {}", second.trim_start_matches("... ")));
-        }
-        Some(said.join("; "))
     }
 
     /// Whether the lock file of the build of `manifest` no longer locks

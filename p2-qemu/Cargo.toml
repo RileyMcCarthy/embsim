@@ -3,16 +3,20 @@ name = "embsim-p2-qemu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# The crate's code is MIT, as every embsim crate's is, and links nothing of
+# The crate's Rust is MIT, as every embsim crate's is, and links nothing of
 # QEMU: QEMU runs as its own program, `qemu-system-p2`, a separate GPL-2.0
-# work, over a small fixed protocol (src/protocol.rs). The package also
-# carries, as data it never compiles, the QEMU target that program is built
-# from (qemu-target/: the target and board LGPL-2.1-or-later, its two QEMU
-# patches under the licences of the files they modify, insn.decode MIT), so
-# `embsim qemu install` writes out and builds exactly the target this crate
-# speaks to (src/target.rs). Each of those files keeps its own licence, said
-# in it and in qemu-target/README.md, the texts in LICENSES/.
-license.workspace = true
+# work, over a small fixed protocol (src/protocol.rs). But the package also
+# carries the QEMU target that program is built from (qemu-target/: the
+# target and board LGPL-2.1-or-later, its two QEMU patches GPL-2.0-or-later
+# and MIT by the QEMU files they modify, insn.decode MIT), and src/target.rs
+# embeds every one of those files, verbatim, in each binary that links the
+# crate (`include_bytes!`), so `embsim qemu install` writes out and builds
+# exactly the target this crate speaks to. None of it is compiled as code,
+# but all of it is distributed with the crate and in every `embsim` binary,
+# each file under its own licence: hence the expression, as embsim-boards
+# names the CC BY-SA netlist it embeds the same way. The texts are in
+# LICENSES/ and qemu-target/LICENSE-PNut-TS.
+license = "MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later"
 repository.workspace = true
 description = "The QEMU Propeller 2 target as an embsim board component: a node that drives pins as edges on nets and boots the way silicon does, with QEMU as a separately installed qemu-system-p2"
 keywords = ["embedded", "emulator", "simulation", "sil", "qemu"]

@@ -199,6 +199,12 @@ impl Report for QemuReport {
             }
         )]
     }
+
+    /// The program died or stopped answering: the core runs no further,
+    /// and neither does the run.
+    fn failure(&self) -> Option<String> {
+        self.core.failure()
+    }
 }
 
 #[cfg(test)]

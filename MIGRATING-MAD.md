@@ -666,12 +666,13 @@ that made them, are recorded in `NODES.md` §13. A fast load is a decision
 recorded there first, if the numbers call for one.
 
 **4. The images.** Two make targets write the files the project names, in
-`SIL/build/`: `flash-image` (stage-1 and the `propeller2_debug` program,
-`p2iss::flashimage::boot_flash` with `p2iss/rom/stage1.bin`) and
-`sd-image` (a 32 MiB FAT16 card mirroring `SIL/sd`,
-`p2iss::sdimage::mad_card`). *Files:* `p2iss/examples/flash_image.rs`
-(new), `p2iss/examples/dump_card.rs` (takes the directory to mirror),
-`SIL/makefile`; MaD's root `.gitignore` already ignores `build/`.
+`SIL/build/`: `flash-image` (stage-1 and the `propeller2_debug` program:
+`$(EMBSIM) flash-image <program> -o build/flash.bin`, embsim's own command
+since 0.2.0, which lays out the same stage-1 `p2iss::flashimage::boot_flash`
+does) and `sd-image` (a 32 MiB FAT16 card mirroring `SIL/sd`,
+`p2iss::sdimage::mad_card`). *Files:* `p2iss/examples/dump_card.rs` (takes
+the directory to mirror), `SIL/makefile`; MaD's root `.gitignore` already
+ignores `build/`.
 *Done when:* `make flash-image sd-image` writes both, and an EC32 project naming them (the module from
 its fingers, the two image entries of `mad.toml`) passes `embsim check`;
 the card entry was checked this way with a stand-in image. E5 retires both

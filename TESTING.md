@@ -183,8 +183,9 @@ cargo run -p embsim-board --release --example solve_bench
 # the guest drives, as the START gate and the pads' bank rule need; their
 # guests start 3 ms in, the restart delay after the build; `pad_modes` runs
 # two P2s, each its own program. `lifecycle`: a program killed mid-run stops
-# its core with the signal in the error, a dropped core takes its program
-# with it, and a program whose parent is killed ends itself.
+# its core with the signal in the error, one sent SIGTERM, SIGINT or SIGHUP
+# mid-run ends within a second over either channel, a dropped core takes
+# its program with it, and a program whose parent is killed ends itself.
 # EMBSIM_P2_QEMU_TRANSPORT=socket runs them over the fallback channel.
 cargo test -p embsim-p2-qemu -- --include-ignored --nocapture
 # Without QEMU (runs everywhere): `program` starts a stand-in that speaks
@@ -314,23 +315,31 @@ cargo test -p embsim-boards --test scripted_source --test host_serial
 # refused saying where it looked and how to install one, `qemu path` failing
 # the same way, and `qemu install --dry-run` naming the target, the QEMU
 # release and where it would go; with one installed (--include-ignored),
-# `run` boots the P2 off the module's flash and `qemu path` finds it. `run` with no
+# `run` boots the P2 off the module's flash (its image made by `embsim
+# flash-image`), a run whose qemu-system-p2 is killed stops there and exits
+# non-zero, and `qemu path` finds it. `flash-image` laying out a program and
+# refusing one stage-1 cannot load, and a run off a raw image saying a P2
+# does not boot from it, run everywhere. `run` with no
 # duration interrupted by SIGINT, its summary printed; `run --pty` putting a
 # host's PTY where it says and printing its path, and refusing a path that
 # holds a file. And the command as a
 # library (`cli/tests/library.rs`, in process): a catalog the test defines
 # adds a board kind, a part kind, a P2 core and a bench component, and a
-# project naming all four checks and runs through `embsim_cli::run`. A
+# project naming all four checks and runs through `embsim_cli::run`; and
+# (`cli/tests/failure.rs`) a part whose report fails stops the run there,
+# with its summary, and the command exits non-zero. A
 # project's own catalog crates (`cli/tests/runner.rs`): `new --catalog`
-# starting a crate (its embsim by path inside the project, else by git
-# revision, else the project's crates' own) and its own runner, naming them
+# starting a crate (its embsim by path inside the project, else what
+# `--embsim` names, else the project's crates' own) and its own runner (a
+# `.gitignore` for its builds when it is its own workspace), naming them
 # in a project, the tool's refusals before Cargo, the runner's files written
 # when no Cargo starts, a runner refusing a project naming other crates,
 # `survey` and `new` with `--project` through a runner, a command line the
 # tool cannot parse handed over; and, with a stand-in `$CARGO` that reads
 # manifests and builds nothing, a lone crate's runner built under
 # `.embsim/target`, the runner's embsim taken from the crates' git source,
-# a crate on another embsim refused before any build, a crate's dependency
+# a crate on another embsim refused before any build, an embsim Cargo cannot
+# fetch named with where to point the crates, a crate's dependency
 # on another checkout named as two copies when Cargo refuses the second
 # `links = "embsim-core"`, two copies refused by Cargo's resolver, a
 # symlinked checkout spelled as the crate spells it, `embsim.lock` copied in
@@ -346,7 +355,9 @@ cargo test -p embsim-cli
 # runner it builds, --locked against its committed embsim.lock, a quiet
 # second build and a --rebuild that keeps the lock, a started crate built
 # outside any workspace whose first run writes embsim.lock, a project's own
-# runner built in its workspace and run, and a crate that does not compile
+# runner built in its workspace and run, a runner crate that is its own
+# workspace, committed, whose line names its commit and no changes after a
+# build, and a crate that does not compile
 # shown with rustc's errors. The first build of embsim in the release
 # profile is the slow part.
 cargo test -p embsim-cli --test runner -- --ignored

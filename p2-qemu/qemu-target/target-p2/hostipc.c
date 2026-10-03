@@ -36,14 +36,22 @@
  * THE PROCESS: it lives exactly as long as embsim wants it. embsim holds the
  * write end of a pipe whose read end is `watch-fd`; a thread here blocks on
  * it, and end of file -- embsim exited, crashed or was killed -- ends this
- * process at once. A QUIT, the socket closing, or SIGTERM/SIGINT/SIGHUP end
- * it at once too: QEMU's own shutdown waits for vCPUs that are parked in this
- * mode, so it is never asked.
+ * process at once. A QUIT or the socket closing end it at once too. So does
+ * any shutdown QEMU's main loop is asked for, SIGTERM, SIGINT and SIGHUP
+ * among them (QEMU's own handler records the signal and wakes the main
+ * loop): a shutdown notifier ends the process there, before QEMU's shutdown
+ * pauses the vCPUs -- which would wait on the round-robin thread this mode
+ * parked, kicking every cog while it waited. Each way out flushes the log
+ * -d/-D writes first.
  *
  * DETERMINISM: no wall-clock input reaches the guest. The budget of a slice
  * is the instruction count asked for, bounded by virtual-clock deadlines
  * only: host-thread.patch keeps real-time timers out of the icount limit in
- * this mode (icount_get_limit), and the board arms no quantum timer.
+ * this mode (icount_get_limit), and the board arms no quantum timer. And
+ * only this process's host thread ends a slice: host-thread.patch makes a
+ * kick from any thread that runs no cog -- the main loop, a shutdown,
+ * start-up's resume_all_vcpus -- do nothing, where it would end the slice
+ * at whatever instant the wall clock found it.
  *
  * The wire format is mirrored field for field by embsim-p2-qemu's
  * src/protocol.rs; P2IPC_PROTOCOL changes whenever either moves, and the
@@ -71,7 +79,6 @@
 #include "pinbus.h"
 #include "hostipc.h"
 #include <stdatomic.h>
-#include <signal.h>
 #include <sys/mman.h>
 
 /*
@@ -876,18 +883,14 @@ static void *p2ipc_main(void *arg)
 }
 
 /*
- * The machine exists and its cogs are reset: start the threads, and take the
- * terminating signals back from QEMU, whose handler asks for a shutdown that
- * waits on vCPUs this mode has parked. The process is in a group of its own
- * (embsim puts it there), so a terminal's ^C reaches embsim, not it.
+ * The machine exists and its cogs are reset: start the threads. The process
+ * is in a group of its own (embsim puts it there), so a terminal's ^C
+ * reaches embsim, not it.
  */
 static void p2ipc_machine_ready(Notifier *n, void *data)
 {
     static QemuThread main_thread, watch_thread;
 
-    signal(SIGTERM, SIG_DFL);
-    signal(SIGINT, SIG_DFL);
-    signal(SIGHUP, SIG_DFL);
     qemu_thread_create(&watch_thread, "p2ipc-watch", p2ipc_watch, NULL,
                        QEMU_THREAD_DETACHED);
     qemu_thread_create(&main_thread, "p2ipc", p2ipc_main, NULL,
@@ -895,6 +898,22 @@ static void p2ipc_machine_ready(Notifier *n, void *data)
 }
 
 static Notifier p2ipc_notifier = { .notify = p2ipc_machine_ready };
+
+/*
+ * A shutdown the main loop was asked for: SIGTERM, SIGINT or SIGHUP through
+ * QEMU's handler (installed after the machine is ready, so it is QEMU's that
+ * takes them, from whichever thread the kernel picks; it only records the
+ * request), or any other. The main loop calls this before it pauses the
+ * vCPUs, so the process ends here, in the main loop's own thread, with the
+ * log flushed. QEMU's line saying which signal from which process is already
+ * on standard error, where embsim reads it.
+ */
+static void p2ipc_shutdown(Notifier *n, void *data)
+{
+    die_now(0);
+}
+
+static Notifier p2ipc_shutdown_notifier = { .notify = p2ipc_shutdown };
 
 void p2_hostipc_configure(const char *spec, Error **errp)
 {
@@ -956,6 +975,7 @@ void p2_hostipc_configure(const char *spec, Error **errp)
     p2_host_driven = true;
     p2_pin_ops_end_tb = true;
     qemu_add_machine_init_done_notifier(&p2ipc_notifier);
+    qemu_register_shutdown_notifier(&p2ipc_shutdown_notifier);
     return;
 
 bad:

@@ -11,11 +11,18 @@
 //!
 //! 1. the embsim the project's first catalog crate already depends on, for
 //!    a crate that joins a project (`--add-to`) naming one;
-//! 2. the checkout this embsim was built from, by a relative path, when it
+//! 2. `--embsim`'s: an embsim checkout by path, or a git repository at a
+//!    tag or revision (`https://github.com/RileyMcCarthy/embsim@v0.2.0`);
+//! 3. the checkout this embsim was built from, by a relative path, when it
 //!    sits inside the project's repository (a submodule, as in MaD);
-//! 3. embsim's repository at the revision this embsim was built from,
+//! 4. embsim's repository at the revision this embsim was built from,
 //!    with its release as the version (`{ git, rev, version = "0.2" }`), or
-//!    at its release tag when the revision is not known.
+//!    at its release tag when the revision is not known — but only a
+//!    revision another machine can fetch: one this embsim was built from
+//!    with changes no commit holds, or that no branch of a remote its
+//!    checkout tracks contains (a local commit, never pushed), would build
+//!    another embsim or none, so the crate takes that checkout by path
+//!    instead, and the command says why and how to name a published one.
 //!
 //! The project names the crate in its `[catalog]`: the starter project
 //! `embsim new` writes, or, with `--add-to`, an existing file, edited in
@@ -54,8 +61,8 @@ pub struct Scaffold {
     library: String,
     /// The project's name, in front of every kind.
     prefix: String,
-    /// Where its embsim comes from.
-    source: EmbsimSource,
+    /// Where its embsim comes from, and why.
+    choice: EmbsimChoice,
 }
 
 impl Scaffold {
@@ -77,8 +84,11 @@ impl Scaffold {
         let _ = writeln!(
             out,
             "  its embsim, and so the runner's: {}",
-            self.source.describe()
+            self.choice.source.describe()
         );
+        if let Some(note) = &self.choice.note {
+            let _ = writeln!(out, "note: {note}");
+        }
     }
 }
 
@@ -89,6 +99,9 @@ pub struct RunnerScaffold {
     dir: PathBuf,
     /// The package's name, its binary's too.
     package: String,
+    /// Whether it is a Cargo workspace of its own, its build and lock file
+    /// beside it.
+    own_workspace: bool,
 }
 
 impl RunnerScaffold {
@@ -101,6 +114,15 @@ impl RunnerScaffold {
             self.dir.join("src/main.rs").display(),
             self.package
         );
+        if self.own_workspace {
+            let _ = writeln!(
+                out,
+                "  in no Cargo workspace, it is one of its own: Cargo builds it in {} \
+                 ({} keeps that out of git) and writes its Cargo.lock beside it, to commit",
+                self.dir.join("target").display(),
+                self.dir.join(".gitignore").display()
+            );
+        }
     }
 }
 
@@ -217,36 +239,223 @@ fn project_root(dir: &Path) -> Option<PathBuf> {
     root.canonicalize().ok()
 }
 
-/// Where a crate started in `dir` takes embsim from (module docs): `joins`,
-/// the embsim of the project it joins, else this embsim's checkout when it
-/// sits inside the project, else this embsim's repository and revision.
-pub fn embsim_for(dir: &Path, joins: Option<EmbsimSource>) -> EmbsimSource {
-    if let Some(source) = joins {
-        return source;
+/// Where a crate's embsim comes from, as `new --catalog` chose it, and
+/// what the command says about the choice.
+#[derive(Debug, Clone)]
+pub(crate) struct EmbsimChoice {
+    /// The source its manifest names.
+    pub(crate) source: EmbsimSource,
+    /// Why it is that source, when the reader should know: a checkout
+    /// outside the project, because no git source holds this embsim.
+    pub(crate) note: Option<String>,
+}
+
+impl EmbsimChoice {
+    fn plain(source: EmbsimSource) -> Self {
+        Self { source, note: None }
     }
-    let checkout = Path::new(provenance::SOURCE_DIR);
-    if let (Ok(()), Ok(checkout), Some(root)) = (
-        is_checkout(checkout),
-        checkout.canonicalize(),
-        project_root(dir),
-    ) {
+}
+
+/// The source `--embsim` names: `URL@REF`, a git repository at a tag or
+/// revision (`REF` a hex commit of 7 to 40 digits is a `rev`, anything else
+/// a `tag`; `rev=`, `tag=` or `branch=` before it says which), or the path
+/// of an embsim checkout.
+pub(crate) fn parse_embsim(text: &str) -> Result<EmbsimSource, String> {
+    if let Some((scheme, rest)) = text.split_once("://") {
+        // The reference is after the last `@` that ends the URL, not one in
+        // its user part (`ssh://git@github.com/...`).
+        let (url, reference) = match rest.rsplit_once('@') {
+            Some((head, reference)) if !reference.contains('/') && !reference.is_empty() => {
+                (format!("{scheme}://{head}"), reference)
+            }
+            _ => {
+                return Err(format!(
+                    "--embsim {text}: name a tag or a revision after the repository \
+                     (`{text}@v{}`, or `{text}@<commit>`): every machine that builds the \
+                     project must build the same embsim, and a branch moves",
+                    provenance::VERSION
+                ))
+            }
+        };
+        let (key, value) = match reference.split_once('=') {
+            Some((key @ ("rev" | "tag" | "branch"), value)) if !value.is_empty() => {
+                (key.to_string(), value.to_string())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "--embsim {text}: `{reference}` is not `rev=`, `tag=` or `branch=` and a \
+                     value"
+                ))
+            }
+            None if (7..=40).contains(&reference.len())
+                && reference.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                ("rev".to_string(), reference.to_string())
+            }
+            None => ("tag".to_string(), reference.to_string()),
+        };
+        return Ok(EmbsimSource::Git {
+            url,
+            reference: Some((key, value)),
+        });
+    }
+    let path = Path::new(text);
+    is_checkout(path).map_err(|why| {
+        format!(
+            "--embsim {text}: neither a git repository at a tag or revision \
+             (`{REPOSITORY}@v{}`) nor an embsim checkout: {why}",
+            provenance::VERSION
+        )
+    })?;
+    path.canonicalize()
+        .map(EmbsimSource::Path)
+        .map_err(|error| format!("--embsim {text}: {error}"))
+}
+
+/// Whether a git source holds the commit this embsim was built from, as
+/// another machine would fetch it.
+#[derive(Debug, PartialEq, Eq)]
+enum Revision {
+    /// Built from `sha` exactly, and a remote holds it.
+    Published(String),
+    /// No git source holds what was built; why, in a clause.
+    Unpublished(String),
+    /// The build did not record its revision.
+    Unknown,
+}
+
+/// What the build `rev` (`provenance::GIT_REV`) of the sources at
+/// `source_dir` is, as a source another machine can fetch. A build with
+/// changes no commit holds is none. A checkout Cargo made from a git
+/// source (it leaves `.cargo-ok` there), or sources that are not a git
+/// checkout here (a published package, a binary built on another machine),
+/// came from a remote: published. A checkout of this machine's is
+/// published when a remote-tracking branch contains the commit.
+fn revision_of(rev: &str, source_dir: &Path) -> Revision {
+    let (sha, changes) = match rev.split_once('+') {
+        Some((sha, _)) => (sha, true),
+        None => (rev, false),
+    };
+    if sha.is_empty() {
+        return Revision::Unknown;
+    }
+    let short = &sha[..sha.len().min(12)];
+    if changes {
+        return Revision::Unpublished(format!(
+            "it was built from {} with changes no commit holds (git rev {short}+changes)",
+            source_dir.display()
+        ));
+    }
+    if source_dir.join(".cargo-ok").exists() {
+        return Revision::Published(sha.to_string());
+    }
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(source_dir)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    if git(&["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        return Revision::Published(sha.to_string());
+    }
+    let remotes = git(&[
+        "for-each-ref",
+        "--contains",
+        sha,
+        "--format=%(refname:short)",
+        "refs/remotes",
+    ]);
+    match remotes {
+        Some(names) if !names.is_empty() => Revision::Published(sha.to_string()),
+        _ => Revision::Unpublished(format!(
+            "it was built from {} at git rev {short}, which no branch of a remote that \
+             checkout tracks contains (`git branch -r --contains {short}` names none)",
+            source_dir.display()
+        )),
+    }
+}
+
+/// Where a crate started in `dir` takes embsim from (module docs): `joins`,
+/// the embsim of the project it joins, else `named`, `--embsim`'s, else
+/// this embsim's checkout when it sits inside the project, else this
+/// embsim's repository and revision when a remote holds it, else this
+/// embsim's checkout with a note saying why.
+pub(crate) fn embsim_for(
+    dir: &Path,
+    joins: Option<EmbsimSource>,
+    named: Option<&EmbsimSource>,
+) -> Result<EmbsimChoice, String> {
+    if let Some(source) = joins {
+        if let Some(named) = named.filter(|named| !named.same_copy(&source)) {
+            return Err(format!(
+                "--embsim names embsim {}, and the project's catalog crates take embsim {}: a \
+                 runner holds one copy of embsim, so a crate that joins the project takes the \
+                 same (leave out --embsim)",
+                named.describe(),
+                source.describe()
+            ));
+        }
+        return Ok(EmbsimChoice::plain(source));
+    }
+    if let Some(named) = named {
+        return Ok(EmbsimChoice::plain(named.clone()));
+    }
+    Ok(choose_embsim(
+        dir,
+        provenance::GIT_REV,
+        Path::new(provenance::SOURCE_DIR),
+    ))
+}
+
+/// [`embsim_for`] with nothing joined or named, for an embsim built as
+/// `rev` from the sources at `source_dir`.
+fn choose_embsim(dir: &Path, rev: &str, source_dir: &Path) -> EmbsimChoice {
+    let checkout = is_checkout(source_dir)
+        .ok()
+        .and_then(|()| source_dir.canonicalize().ok());
+    if let (Some(checkout), Some(root)) = (&checkout, project_root(dir)) {
         if checkout.starts_with(&root) {
-            return EmbsimSource::Path(checkout);
+            return EmbsimChoice::plain(EmbsimSource::Path(checkout.clone()));
         }
     }
-    let sha = provenance::GIT_REV
-        .split('+')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let reference = if sha.is_empty() {
-        ("tag".to_string(), format!("v{}", provenance::VERSION))
-    } else {
-        ("rev".to_string(), sha)
-    };
-    EmbsimSource::Git {
+    let release_tag = || EmbsimSource::Git {
         url: REPOSITORY.to_string(),
-        reference: Some(reference),
+        reference: Some(("tag".to_string(), format!("v{}", provenance::VERSION))),
+    };
+    let how = format!(
+        "to share the project, push the embsim it builds against and start the crate with \
+         `--embsim <repository>@<commit>`, or name a release: `--embsim {REPOSITORY}@v{}`",
+        provenance::VERSION
+    );
+    match revision_of(rev, source_dir) {
+        Revision::Published(sha) => EmbsimChoice::plain(EmbsimSource::Git {
+            url: REPOSITORY.to_string(),
+            reference: Some(("rev".to_string(), sha)),
+        }),
+        Revision::Unknown => EmbsimChoice::plain(release_tag()),
+        Revision::Unpublished(why) => match checkout {
+            Some(checkout) => EmbsimChoice {
+                note: Some(format!(
+                    "this embsim's revision is on no git source another machine can fetch: \
+                     {why}. So the crate takes embsim from that checkout by path, which is \
+                     this machine's; {how}"
+                )),
+                source: EmbsimSource::Path(checkout),
+            },
+            None => EmbsimChoice {
+                note: Some(format!(
+                    "this embsim's revision is on no git source another machine can fetch \
+                     ({why}), and its checkout is gone, so the crate takes embsim's release \
+                     tag v{}; {how}",
+                    provenance::VERSION
+                )),
+                source: release_tag(),
+            },
+        },
     }
 }
 
@@ -288,8 +497,9 @@ fn embsim_dependencies(
 }
 
 /// Write the crate into `dir` (which [`check_free`] accepted), its embsim
-/// dependencies on `source`.
-pub fn write_crate(dir: &Path, source: &EmbsimSource) -> Result<Scaffold, String> {
+/// dependencies on `choice`'s source.
+pub(crate) fn write_crate(dir: &Path, choice: &EmbsimChoice) -> Result<Scaffold, String> {
+    let source = &choice.source;
     check_free(dir).map_err(|why| format!("--catalog {why}"))?;
     let prefix = prefix_of(dir);
     let package = format!("{prefix}-catalog");
@@ -337,27 +547,32 @@ pub fn write_crate(dir: &Path, source: &EmbsimSource) -> Result<Scaffold, String
         library: package.replace('-', "_"),
         package,
         prefix,
-        source: source.clone(),
+        choice: choice.clone(),
     })
 }
 
 /// Write the project's own runner into `dir`: a binary crate over the
 /// catalog crate `catalog` made, against the same embsim. In no Cargo
-/// workspace, it is a workspace root of its own.
+/// workspace, it is a workspace root of its own, whose builds Cargo puts in
+/// its `target/`: a `.gitignore` keeps that out of version control, as
+/// `cargo new` writes one, so the project's commit holds the crate and its
+/// lock file and nothing a build made.
 pub fn write_runner_crate(dir: &Path, catalog: &Scaffold) -> Result<RunnerScaffold, String> {
     check_free(dir).map_err(|why| format!("--own-runner {why}"))?;
     let package = format!("{}-runner", catalog.prefix);
     let src = dir.join("src");
     std::fs::create_dir_all(&src)
         .map_err(|error| format!("cannot make {}: {error}", src.display()))?;
-    let cli = embsim_dependencies(&catalog.source, dir, &[("cli", "embsim-cli")])?;
+    let cli = embsim_dependencies(&catalog.choice.source, dir, &[("cli", "embsim-cli")])?;
     let to_catalog = relative_path(&catalog.dir, dir)?;
     let to_catalog = to_catalog.to_string_lossy();
-    let workspace = if enclosing_workspace(dir).is_some() {
-        String::new()
-    } else {
-        "\n# A Cargo workspace of its own: its Cargo.lock goes beside this file.\n[workspace]\n"
+    let own_workspace = enclosing_workspace(dir).is_none();
+    let workspace = if own_workspace {
+        "\n# A Cargo workspace of its own: its Cargo.lock goes beside this file, and its\n\
+         # builds into target/ here, which .gitignore keeps out of git.\n[workspace]\n"
             .to_string()
+    } else {
+        String::new()
     };
     let manifest = format!(
         "# {package}: this project's runner, the embsim command over its catalog crates\n\
@@ -401,16 +616,21 @@ pub fn write_runner_crate(dir: &Path, catalog: &Scaffold) -> Result<RunnerScaffo
         dir = format!("/{to_catalog}"),
         library = catalog.library,
     );
-    for (path, text) in [
+    let mut files = vec![
         (dir.join("Cargo.toml"), manifest),
         (src.join("main.rs"), main),
-    ] {
+    ];
+    if own_workspace {
+        files.push((dir.join(".gitignore"), "/target\n".to_string()));
+    }
+    for (path, text) in files {
         std::fs::write(&path, text)
             .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     }
     Ok(RunnerScaffold {
         dir: dir.to_path_buf(),
         package,
+        own_workspace,
     })
 }
 
@@ -512,11 +732,13 @@ fn add_crate(text: &str, path: &str, runner: Option<&str>) -> Result<String, Str
     Ok(document.to_string())
 }
 
-/// `embsim new --catalog DIR [--own-runner [RUNNER]] [--add-to PROJECT]`.
-pub fn new_catalog(
+/// `embsim new --catalog DIR [--own-runner [RUNNER]] [--add-to PROJECT]
+/// [--embsim SOURCE]`.
+pub(crate) fn new_catalog(
     dir: &Path,
     own_runner: Option<&Path>,
     add_to: Option<&Path>,
+    embsim: Option<&EmbsimSource>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     check_free(dir).map_err(|why| format!("--catalog {why}"))?;
@@ -544,8 +766,8 @@ pub fn new_catalog(
     let joins = project
         .as_ref()
         .and_then(|(project, _, catalog)| joined_embsim(project, catalog.as_ref()));
-    let source = embsim_for(dir, joins);
-    let scaffold = write_crate(dir, &source)?;
+    let choice = embsim_for(dir, joins, embsim)?;
+    let scaffold = write_crate(dir, &choice)?;
     scaffold.say(out);
     let runner = match &runner_dir {
         Some(runner_dir) => {
@@ -647,8 +869,260 @@ pub fn enclosing_workspace(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vibes_behaviour::{behaviour, expect, Test};
 
     use super::*;
+
+    /// `git` in `dir` with `args`, a commit needing no configuration.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=embsim",
+                "-c",
+                "user.email=embsim@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A directory of the test's own, outside every git repository and
+    /// Cargo workspace, emptied.
+    fn outside(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("embsim-scaffold-{}", std::process::id()))
+            .join(test);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the directory can be made");
+        dir.canonicalize().expect("the directory is there")
+    }
+
+    /// A stand-in embsim checkout in `dir` — its `cli/Cargo.toml` names the
+    /// `embsim-cli` package — committed as one commit: its revision.
+    fn checkout(dir: &Path) -> String {
+        std::fs::create_dir_all(dir.join("cli")).expect("writable");
+        std::fs::write(
+            dir.join("cli/Cargo.toml"),
+            "[package]\nname = \"embsim-cli\"\nversion = \"0.2.0\"\n",
+        )
+        .expect("writable");
+        git(dir, &["init", "-q"]);
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "embsim"]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// The choice for a crate started in `root/rig/catalog`, outside the
+    /// checkout's repository, by an embsim built as `rev` from `checkout`.
+    fn choice(root: &Path, rev: &str, checkout: &Path) -> EmbsimChoice {
+        let project = root.join("rig");
+        std::fs::create_dir_all(&project).expect("writable");
+        choose_embsim(&project.join("catalog"), rev, checkout)
+    }
+
+    #[rstest]
+    fn an_embsim_a_remote_holds_is_named_by_its_repository_and_revision() {
+        behaviour!(Test {
+            id: "cli.new-catalog-published",
+            covers: Some("cli/src/scaffold.rs#embsim_for"),
+            given: "a catalog crate started outside the repository of the embsim checkout the \
+                    command was built from, at a commit a branch of that checkout's remote \
+                    holds, and again from a checkout Cargo fetched from a git source",
+        });
+        expect!(
+            "repository-at-revision",
+            "the crate takes embsim from embsim's repository at the commit the command was \
+             built from, and the command adds no note",
+            "any machine can fetch a commit a remote holds, and builds the embsim the command is"
+        );
+        let root = outside("published");
+        let remote = root.join("remote.git");
+        git(&root, &["init", "-q", "--bare", "remote.git"]);
+        let embsim = root.join("embsim");
+        let sha = checkout(&embsim);
+        git(
+            &embsim,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        git(&embsim, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git(&embsim, &["fetch", "-q", "origin"]);
+        let chosen = choice(&root, &sha, &embsim);
+        assert_eq!(
+            chosen.source,
+            EmbsimSource::Git {
+                url: REPOSITORY.to_string(),
+                reference: Some(("rev".to_string(), sha.clone())),
+            }
+        );
+        assert_eq!(chosen.note, None);
+        // Cargo's checkout of a git dependency: no remote-tracking branch,
+        // and `.cargo-ok` beside the sources.
+        let fetched = root.join("cargo-checkout");
+        let fetched_sha = checkout(&fetched);
+        std::fs::write(fetched.join(".cargo-ok"), "").expect("writable");
+        let chosen = choice(&root, &fetched_sha, &fetched);
+        assert_eq!(
+            chosen.source,
+            EmbsimSource::Git {
+                url: REPOSITORY.to_string(),
+                reference: Some(("rev".to_string(), fetched_sha)),
+            }
+        );
+        assert_eq!(chosen.note, None);
+    }
+
+    #[rstest]
+    #[case::uncommitted(true)]
+    #[case::unpushed(false)]
+    fn an_embsim_no_remote_holds_is_named_by_its_checkout_saying_why(#[case] changes: bool) {
+        behaviour!(Test {
+            id: "cli.new-catalog-unpublished",
+            covers: Some("cli/src/scaffold.rs#embsim_for"),
+            given: "a catalog crate started outside the repository of the embsim checkout the \
+                    command was built from, once built with changes no commit holds and once \
+                    at a commit no branch of a remote holds",
+        });
+        expect!(
+            "checkout-by-path",
+            "the crate takes embsim from that checkout by path",
+            "no git source holds the embsim the command was built from, so a revision would \
+             build another embsim, or fail to fetch at the project's first check"
+        );
+        expect!(
+            "note-why",
+            "the command notes which of the two it was, that the path is this machine's, and \
+             how to name a source another machine can fetch: a pushed commit, or the release \
+             tag"
+        );
+        let root = outside(if changes { "uncommitted" } else { "unpushed" });
+        let embsim = root.join("embsim");
+        let sha = checkout(&embsim);
+        let rev = if changes {
+            format!("{sha}+changes")
+        } else {
+            sha.clone()
+        };
+        let chosen = choice(&root, &rev, &embsim);
+        assert_eq!(chosen.source, EmbsimSource::Path(embsim.clone()));
+        let note = chosen.note.expect("a note");
+        let why = if changes {
+            format!(
+                "it was built from {} with changes no commit holds (git rev {}+changes)",
+                embsim.display(),
+                &sha[..12]
+            )
+        } else {
+            format!(
+                "it was built from {} at git rev {short}, which no branch of a remote that \
+                 checkout tracks contains (`git branch -r --contains {short}` names none)",
+                embsim.display(),
+                short = &sha[..12]
+            )
+        };
+        assert!(note.contains(&why), "{note}");
+        assert!(note.contains("by path, which is this machine's"), "{note}");
+        assert!(
+            note.contains(&format!(
+                "`--embsim <repository>@<commit>`, or name a release: `--embsim \
+                 {REPOSITORY}@v{}`",
+                provenance::VERSION
+            )),
+            "{note}"
+        );
+    }
+
+    #[rstest]
+    #[case::checkout_gone("0123456789abcdef0123456789abcdef01234567", "rev")]
+    #[case::revision_unknown("", "tag")]
+    fn an_embsim_built_elsewhere_is_named_by_what_its_build_recorded(
+        #[case] rev: &str,
+        #[case] key: &str,
+    ) {
+        let root = outside(&format!("elsewhere-{key}"));
+        let chosen = choice(&root, rev, &root.join("no-such-checkout"));
+        let value = if key == "rev" {
+            rev.to_string()
+        } else {
+            format!("v{}", provenance::VERSION)
+        };
+        assert_eq!(
+            chosen.source,
+            EmbsimSource::Git {
+                url: REPOSITORY.to_string(),
+                reference: Some((key.to_string(), value)),
+            }
+        );
+        assert_eq!(chosen.note, None);
+    }
+
+    #[rstest]
+    #[case::tag(
+        "https://github.com/RileyMcCarthy/embsim@v0.2.0",
+        "https://github.com/RileyMcCarthy/embsim",
+        "tag",
+        "v0.2.0"
+    )]
+    #[case::commit(
+        "https://github.com/RileyMcCarthy/embsim@0123abcd",
+        "https://github.com/RileyMcCarthy/embsim",
+        "rev",
+        "0123abcd"
+    )]
+    #[case::keyed(
+        "https://example.com/embsim.git@branch=next",
+        "https://example.com/embsim.git",
+        "branch",
+        "next"
+    )]
+    #[case::user(
+        "ssh://git@github.com/RileyMcCarthy/embsim@v0.2.0",
+        "ssh://git@github.com/RileyMcCarthy/embsim",
+        "tag",
+        "v0.2.0"
+    )]
+    fn embsim_names_a_repository_at_a_reference(
+        #[case] text: &str,
+        #[case] url: &str,
+        #[case] key: &str,
+        #[case] value: &str,
+    ) {
+        assert_eq!(
+            parse_embsim(text),
+            Ok(EmbsimSource::Git {
+                url: url.to_string(),
+                reference: Some((key.to_string(), value.to_string())),
+            })
+        );
+    }
+
+    #[rstest]
+    #[case::no_reference("https://github.com/RileyMcCarthy/embsim", "name a tag or a revision")]
+    #[case::user_only(
+        "ssh://git@github.com/RileyMcCarthy/embsim",
+        "name a tag or a revision"
+    )]
+    #[case::bad_key(
+        "https://example.com/embsim@commit=1",
+        "is not `rev=`, `tag=` or `branch=`"
+    )]
+    #[case::not_a_checkout("/", "nor an embsim checkout")]
+    fn embsim_that_names_neither_is_refused_saying_what_it_takes(
+        #[case] text: &str,
+        #[case] says: &str,
+    ) {
+        let err = parse_embsim(text).expect_err("refused");
+        assert!(err.starts_with(&format!("--embsim {text}: ")), "{err}");
+        assert!(err.contains(says), "{err}");
+    }
 
     #[rstest]
     #[case::catalog_under_a_project("sim/catalog", "sim")]

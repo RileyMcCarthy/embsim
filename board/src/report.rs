@@ -7,6 +7,8 @@
 //! [`crate::ComponentRequest::reports`] for a bench component's). The run
 //! takes the reports once the system is built ([`Reports::take`]), asks
 //! each what is new at every look, and asks each for its state at the end.
+//! A report whose subject can fail — a core whose program died — says so
+//! ([`Report::failure`]), and the run stops there and exits with it.
 //!
 //! A look reads state the engine's thread wrote while the run's thread was
 //! parked, so on the stepped clock two runs of one project print the same
@@ -33,6 +35,15 @@ pub trait Report: Send {
 
     /// The state at the end of the run, one line each.
     fn summary(&self) -> Vec<String>;
+
+    /// Why what this reports has failed, once it has: a part whose model
+    /// can no longer run (a CPU core whose program died). A run asks after
+    /// every look, stops at the first look that finds one, prints its
+    /// summary, and exits with the failure as its error. `None` — the
+    /// default — for something that cannot fail.
+    fn failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The sink the reports of one project build go to: shared by every

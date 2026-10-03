@@ -351,6 +351,8 @@ embsim run board.toml --for 20ms --net BOARD.VCC
   reports of itself, the nets asked for with `--net`, and each finding's net
   read again: the ones the run cleared (a rail that came up) apart from the
   ones still true. `--pty` says where a `host-serial` component's PTY goes.
+  A part that fails — a P2 core whose `qemu-system-p2` died — ends the run
+  at that look, and the command exits non-zero with the reason.
 
 A project whose file names catalog crates of its own (`[catalog]`) is
 checked and run through a **runner**: the project's crates and embsim in
@@ -380,7 +382,8 @@ The `embsim` command's set adds one core for the `p2` kind to the standard
 catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its
 ROM (`rom = "file"` for another) off whatever the board gives it — on the
 P2-EC32MB, the flash, which `image = "boot.bin"` on the `w25q128jv` kind
-fills (`embsim_p2_qemu::flashimage` lays out stage-1 and a program). QEMU
+fills: `embsim flash-image PROGRAM -o boot.bin` lays out a P2 program
+behind embsim's stage-1 loader as the flash the ROM boots. QEMU
 is not linked into embsim: the P2 runs in `qemu-system-p2`, a program of its
 own that `embsim qemu install` builds from the target embsim carries and
 installs where the core looks (`embsim qemu path` says which one a run
@@ -428,7 +431,12 @@ embsim-core   = { path = "../../vendor/embsim/core" }   # the virtual clock
 
 `embsim new --catalog DIR` writes whichever fits: the path when the tool's
 own checkout sits inside the project's repository, else the repository at
-the tool's revision. Every catalog crate names the same embsim: the tool
+the tool's revision when a remote holds it — a tool built from a commit
+never pushed, or with uncommitted changes, writes its checkout's path and
+says why — or what `--embsim PATH|URL@REF` names
+(`--embsim https://github.com/RileyMcCarthy/embsim@v0.2.0`). A build that
+cannot fetch embsim from where the crates say is reported as that, with
+where to point them. Every catalog crate names the same embsim: the tool
 refuses another before it builds, and Cargo refuses a second copy anywhere
 in the graph (`embsim-core` claims `links = "embsim-core"`).
 
@@ -523,21 +531,24 @@ gracefully** when no C toolchain is present.
 ## License
 
 embsim's code, in every crate, is MIT: see [LICENSE](LICENSE). Two crates
-carry other people's material, under its own licence, beside that code:
+also carry material under other licences, which their licence fields name
+beside MIT, and every `embsim` binary carries it too:
 
 - `embsim-boards` compiles in `boards/netlists/p2_ec32mb.net`, a
   transcription of Parallax's P2-EC32MB schematic, which Parallax
   publishes under CC BY-SA 4.0; the transcription is CC BY-SA 4.0 too, so
   that crate's licence is `MIT AND CC-BY-SA-4.0` (`boards/netlists/LICENSE`).
 - `embsim-p2-qemu` carries the QEMU Propeller 2 target in
-  `p2-qemu/qemu-target/`, as data: the target and board are
-  LGPL-2.1-or-later, its two QEMU patches carry the licences of the QEMU
-  files they modify (GPL-2.0-or-later and MIT), its decode table is MIT
-  (from PNut-TS); each file says which,
-  and the texts are in [`LICENSES/`](LICENSES) and
-  `p2-qemu/qemu-target/LICENSE-PNut-TS`. embsim compiles none of it: `embsim
-  qemu install` writes it out and builds it into QEMU. The crate's own
-  code is MIT, and so is its licence field.
+  `p2-qemu/qemu-target/`: the target and board are LGPL-2.1-or-later, its
+  two QEMU patches carry the licences of the QEMU files they modify
+  (GPL-2.0-or-later and MIT), its decode table is MIT (from PNut-TS); each
+  file says which, and the texts are in [`LICENSES/`](LICENSES) and
+  `p2-qemu/qemu-target/LICENSE-PNut-TS`. The crate embeds every one of
+  those files, verbatim, in each binary that links it, as data for `embsim
+  qemu install` to write out and build into QEMU; none is compiled as
+  code. So that crate's licence is `MIT AND LGPL-2.1-or-later AND
+  GPL-2.0-or-later`: MIT for its Rust, and the other two for the files it
+  carries. A release's binary archive says the same in its `NOTICE`.
 
 **`qemu-system-p2` is a separate program**, a GPL-2.0 work: QEMU is
 released as a whole under version 2 of the GPL, and the target becomes part

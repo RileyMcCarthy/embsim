@@ -1,5 +1,6 @@
 //! The real `qemu-system-p2` lives exactly as long as its node: killed, it
-//! stops the core and says why; dropped with its node, it is gone; and when
+//! stops the core and says why; asked to terminate by a signal, it ends at
+//! once, and says which signal; dropped with its node, it is gone; and when
 //! the process that started it dies, however it dies, it ends itself.
 //!
 //! The guest is two instructions of PASM2 run from cog 0 in place of the
@@ -24,7 +25,9 @@ use std::time::{Duration, Instant};
 use embsim_board::{EndpointRef, Harness, System};
 use embsim_boards::p2::P2Package;
 use embsim_core::virtual_clock;
-use embsim_p2_qemu::P2Qemu;
+use embsim_p2_qemu::protocol::{reason, Run, OP_RUN};
+use embsim_p2_qemu::{P2Qemu, P2QemuError, Peer, QemuSystemP2, Transport};
+use rstest::rstest;
 
 /// `drvnot #0` / `jmp #\0`: toggle `P0` for ever.
 const TOGGLE: [u32; 2] = [0xFD64_005F, 0xFD80_0000];
@@ -108,6 +111,67 @@ fn a_program_killed_mid_run_stops_its_core_and_says_why() {
     assert!(system.engine_is_alive());
     assert!(system.net_state("P2.P0").is_some());
     drop(system);
+}
+
+/// SIGTERM, SIGINT and SIGHUP mid-run, over either channel. QEMU's own
+/// handler takes the signal and asks its main loop to shut down, and the
+/// program ends there, before QEMU's shutdown pauses the vCPUs: that waits
+/// forever on the thread host-driven mode parks, kicking every cog while it
+/// waits, and so ends slices at wall-clock instants. So the turn after the
+/// signal fails within a second, saying the program exited and, in QEMU's
+/// own line, which signal ended it. The node's half — a death noticed and
+/// reported — is `program.rs`'s; this is the program's.
+#[rstest]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
+fn a_program_asked_to_terminate_mid_run_ends_at_once(
+    #[values(libc::SIGTERM, libc::SIGINT, libc::SIGHUP)] signal: libc::c_int,
+    #[values(Transport::Shm { spin_ns: 20_000 }, Transport::Socket)] transport: Transport,
+) {
+    let program = QemuSystemP2::find().expect("qemu-system-p2 is installed");
+    let mut peer =
+        Peer::start(&program, &toggle_image(), &[], transport).expect("qemu-system-p2 starts");
+    let pid = peer.pid();
+    // Every turn ends at the guest's next toggle of P0: the run is never
+    // idle between turns.
+    let run = Run {
+        op: OP_RUN,
+        horizon_clocks: u64::MAX / 2,
+        banks_powered: 0xFFFF,
+        banks_high: 0xFFFF,
+        ..Run::default()
+    };
+    for _ in 0..1_000 {
+        let stop = peer.turn(&run).expect("a toggle");
+        assert_ne!(stop.reason & reason::YIELD, 0, "{stop:?}");
+    }
+    // SAFETY: the test's own child, signalled the way `kill` signals it.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+    let sent = Instant::now();
+    let err = loop {
+        match peer.turn(&run) {
+            Ok(_) => assert!(
+                sent.elapsed() < Duration::from_secs(1),
+                "qemu-system-p2 (pid {pid}) still answers a second after signal {signal}"
+            ),
+            Err(err) => break err,
+        }
+    };
+    assert!(
+        sent.elapsed() < Duration::from_secs(1),
+        "the end was noticed after {:?}",
+        sent.elapsed()
+    );
+    let text = err.to_string();
+    assert!(matches!(err, P2QemuError::Died { .. }), "{text}");
+    assert!(
+        text.contains(&format!("pid {pid}) exited with status 0 during a run")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("terminating on signal {signal} from pid")),
+        "QEMU's own line names the signal: {text}"
+    );
+    assert!(gone(pid), "the program was reaped");
 }
 
 #[test]

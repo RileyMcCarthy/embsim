@@ -101,7 +101,11 @@ rules the engine keeps, [`PROJECTS.md`](PROJECTS.md) is the guide, and
   - `check` builds the system with time held and says what is left;
   - `run` runs it in virtual time. `--for` sets how long, `--net` prints a
     net's state, `--pty` places a host serial port, and Ctrl-C ends the
-    run with its summary;
+    run with its summary. A part that fails — a P2 core whose program
+    died — ends the run there, and the command exits non-zero;
+  - `flash-image PROGRAM -o IMAGE` lays out a P2 program behind embsim's
+    stage-1 loader as the boot flash the ROM boots, and a `w25q128jv` whose
+    image a P2 would not boot says so at the run's first look;
   - `--version`, `check` and `run` say which release, git revision,
     compiler, target and profile the binary is.
 
@@ -127,8 +131,13 @@ rules the engine keeps, [`PROJECTS.md`](PROJECTS.md) is the guide, and
   a path, a git revision or a release. Cargo refuses two copies of embsim
   in one graph (`links = "embsim-core"`).
 - `embsim new --catalog DIR` starts a catalog crate, `--own-runner` starts
-  the runner crate beside it, and `--add-to PROJECT` names the crate in an
-  existing project. `survey` and `new` take `--project FILE` to offer the
+  the runner crate beside it (with a `.gitignore` for its builds when it is
+  a Cargo workspace of its own), and `--add-to PROJECT` names the crate in
+  an existing project. The crate takes embsim from `--embsim PATH|URL@REF`
+  when given; else from the tool's checkout when it sits in the project,
+  or from embsim's repository at the tool's revision when a remote holds
+  it, or, for a tool built from an unpushed commit or with uncommitted
+  changes, from its checkout by path, saying why. `survey` and `new` take `--project FILE` to offer the
   project's own kinds. A command line the tool cannot parse still goes to
   the project's runner when the project names catalog crates, so an older
   `embsim` runs a newer project rather than refusing a flag it does not
@@ -163,8 +172,11 @@ rules the engine keeps, [`PROJECTS.md`](PROJECTS.md) is the guide, and
   the README's [Install](README.md#install).
 - embsim's code is MIT in every crate. `embsim-boards` is
   `MIT AND CC-BY-SA-4.0`, because it compiles in a transcription of
-  Parallax's CC BY-SA 4.0 P2-EC32MB schematic. `qemu-system-p2` is a
-  separate GPL-2.0 program that embsim runs and does not link.
+  Parallax's CC BY-SA 4.0 P2-EC32MB schematic. `embsim-p2-qemu` is
+  `MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later`, because it embeds the
+  P2 target's sources, which `embsim qemu install` builds from, in every
+  binary. `qemu-system-p2` is a separate GPL-2.0 program that embsim runs
+  and does not link.
 
 ### Fixed
 
@@ -177,8 +189,6 @@ rules the engine keeps, [`PROJECTS.md`](PROJECTS.md) is the guide, and
 
 ### Known issues
 
-- `embsim run` exits 0 when a QEMU core's program dies mid-run. The run
-  prints the failure as that core's report.
 - Windows is not supported: the serial PTY and the QEMU channel use Unix
   APIs.
 - No prebuilt `qemu-system-p2` yet: `embsim qemu install` builds it, so the

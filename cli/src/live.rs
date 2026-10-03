@@ -4,7 +4,10 @@
 //! with, and build the system through the catalog set. `check` starts it
 //! with virtual time held — every part attached, every attach-time drive
 //! resolved, no wake fired: the state `System::build` analyzes — reads what
-//! the build found, and stops. `run` releases time and runs.
+//! the build found, and stops. `run` releases time and runs, until its
+//! duration, an interrupt, or the first look at which a part's report says
+//! it failed (`Report::failure`): then it prints its summary and returns
+//! the failure as its error, so the command exits non-zero.
 //!
 //! The clock is stepped (`TESTING.md` rule 9): this thread is a registered
 //! virtual-clock actor, and the engine advances only while it is parked in
@@ -316,6 +319,13 @@ impl Reporter {
         }
     }
 
+    /// The first report whose subject has failed: its subject, and why.
+    fn failure(&self) -> Option<(String, String)> {
+        self.reports
+            .iter()
+            .find_map(|report| report.failure().map(|why| (report.subject(), why)))
+    }
+
     /// What every report says at the end of a run.
     fn summary(&self, out: &mut dyn Write) {
         for report in &self.reports {
@@ -364,7 +374,11 @@ pub fn run(
     let origin = virtual_clock::virtual_ns();
     reporter.look(&handle, 0, out);
     let mut interrupted = false;
-    loop {
+    // A part that fails (a core whose program died) ends the run at the
+    // look that finds it: nothing after it is the system the project
+    // describes.
+    let mut failed = reporter.failure();
+    while failed.is_none() {
         let _ = out.flush();
         if watch.interrupted() {
             interrupted = true;
@@ -385,10 +399,18 @@ pub fn run(
             drop(watch);
             return Err("the engine stopped: a component's model failed".to_string());
         }
+        failed = reporter.failure();
     }
     let elapsed = virtual_clock::virtual_ns() - origin;
     if interrupted {
         say!(out, "interrupted at {} of virtual time", ms(elapsed));
+    }
+    if let Some((subject, _)) = &failed {
+        say!(
+            out,
+            "stopped at {} of virtual time: {subject} failed",
+            ms(elapsed)
+        );
     }
     say!(
         out,
@@ -449,7 +471,16 @@ pub fn run(
     drop(actor);
     drop(watch);
     handle.shutdown();
-    Ok(())
+    match failed {
+        // Its whole text was printed at the look that found it; the error
+        // is its first line.
+        Some((subject, why)) => Err(format!(
+            "{subject} failed at {} of virtual time, and the run stopped there: {}",
+            ms(elapsed),
+            why.lines().next().unwrap_or_default()
+        )),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
