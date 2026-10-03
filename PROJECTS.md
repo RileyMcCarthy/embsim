@@ -128,9 +128,13 @@ unless `Project::relative_to` gives another.
 ### The command
 
 ```bash
-cargo install --path cli          # installs `embsim` in Cargo's bin directory
+cargo install --locked --path cli # installs `embsim` in Cargo's bin directory
 cargo run -p embsim-cli -- --help # or run it in place, from the workspace
 ```
+
+A release's prebuilt binary, or `cargo install --locked --git
+https://github.com/RileyMcCarthy/embsim --tag v0.2.0 embsim-cli`, is the
+same command (the README's "Install").
 
 It has four subcommands:
 

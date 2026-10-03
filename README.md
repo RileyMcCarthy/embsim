@@ -14,11 +14,10 @@ them resolved as circuits at the instants things happen.
 You use it by writing a **project**: a TOML file that names the boards (a
 KiCad netlist each, or a board a catalog ships), the model each part takes,
 the bench components, the wires between the boards' connectors, and the
-scenario. The `embsim` command takes a netlist to a running system through
-one:
+scenario. The `embsim` command ([Install](#install)) takes a netlist to a
+running system through one:
 
 ```bash
-cargo install --path cli                    # from this checkout: the `embsim` tool
 embsim survey board.net                     # what the netlist asks for
 embsim new board.net -o board.toml          # a starter project answering it
 embsim check board.toml                     # build it, time held; say what is left
@@ -47,6 +46,67 @@ and MaD's own move onto a project with a catalog crate is
 project crate (below). Rust code can also use the crates directly: a
 project file loads with `embsim_board::Project`, and the command itself is
 a library, `embsim_cli`.
+
+## Install
+
+`embsim` runs on macOS and Linux. Take a release's prebuilt binary, or
+build it from source with Cargo; the P2 on QEMU needs one more program,
+which `embsim` builds for you.
+
+**A prebuilt binary**, from the
+[releases](https://github.com/RileyMcCarthy/embsim/releases): an
+`embsim-<version>-<target>.tar.gz` for macOS on Apple silicon
+(`aarch64-apple-darwin`), macOS on Intel (`x86_64-apple-darwin`) and Linux
+on x86_64 (`x86_64-unknown-linux-gnu`, glibc 2.35 or newer: Ubuntu 22.04,
+Debian 12), each with its SHA-256 beside it, and every one in
+`SHA256SUMS`:
+
+```bash
+v=0.2.0 t=aarch64-apple-darwin
+curl -fLO "https://github.com/RileyMcCarthy/embsim/releases/download/v$v/embsim-$v-$t.tar.gz"
+curl -fLO "https://github.com/RileyMcCarthy/embsim/releases/download/v$v/embsim-$v-$t.tar.gz.sha256"
+shasum -a 256 -c "embsim-$v-$t.tar.gz.sha256"           # or sha256sum -c
+tar -xzf "embsim-$v-$t.tar.gz"
+mkdir -p ~/.local/bin && install -m 755 "embsim-$v-$t/embsim" ~/.local/bin/   # any directory on PATH
+embsim --version
+```
+
+Beside the binary are this README, the changelog, the licences, a
+`NOTICE` for what the binary carries and `THIRD-PARTY-LICENSES.txt` for
+the crates compiled into it. The binaries are not signed: on macOS a copy
+a browser downloaded is quarantined, and `xattr -d com.apple.quarantine
+embsim` clears that (curl sets no quarantine).
+
+**From source, with Cargo** (Rust 1.88 or newer):
+
+```bash
+cargo install --locked --git https://github.com/RileyMcCarthy/embsim --tag v0.2.0 embsim-cli
+```
+
+or, in a checkout, `cargo install --locked --path cli`, or `cargo run -p
+embsim-cli --` in place. However it is installed, a project that names
+catalog crates of its own needs Cargo too: `embsim` builds the project's
+runner with it ([Using embsim from another
+repository](#using-embsim-from-another-repository)).
+
+**The P2 on QEMU** (`core = "qemu"` on the `p2` kind) runs in
+`qemu-system-p2`, a program of its own that embsim does not include. Build
+and install it once, for the embsim you have:
+
+```bash
+embsim qemu install   # QEMU v10.1.0 and embsim's P2 target, into ~/.embsim/qemu/<target>/
+embsim qemu path      # which qemu-system-p2 a run would start, and whether it fits
+```
+
+It needs git, a C compiler, ninja, pkg-config, glib's development files
+and python3 (on Debian or Ubuntu, `sudo apt-get install git
+build-essential ninja-build pkg-config libglib2.0-dev python3-venv flex
+bison`; on macOS, `xcode-select --install`, then `brew install ninja
+pkgconf glib`), and a few minutes the first time. Each release also
+attaches `embsim-<version>-qemu-target.tar.gz`: the target's sources,
+the same files `embsim qemu install` builds from, with the steps to build
+them by hand. [`p2-qemu/README.md`](p2-qemu/README.md) says where a run
+looks for the program, and the program's licence.
 
 ## What embsim is for, and what it is not
 
@@ -253,13 +313,11 @@ are in [`PROJECTS.md`](PROJECTS.md); the example projects are in
 
 ### The `embsim` command
 
-`cargo install --locked --git https://github.com/RileyMcCarthy/embsim
---tag v0.2.0 embsim-cli` (or, in a checkout, `cargo install --locked --path
-cli`, or `cargo run -p embsim-cli --`) gives the command that takes a
-netlist to a running system. `embsim --version` says which release, git
-revision, compiler, target and profile it is, and every `check` and `run`
-prints the same under its project line. Every step goes through the
-same project, catalog and survey as the Rust above.
+The command ([Install](#install)) takes a netlist to a running system.
+`embsim --version` says which release, git revision, compiler, target and
+profile it is, and every `check` and `run` prints the same under its
+project line. Every step goes through the same project, catalog and survey
+as the Rust above.
 
 ```bash
 embsim survey board.net                 # the checklist
@@ -330,13 +388,17 @@ would start; see `p2-qemu/README.md`). Without it the entry is refused,
 saying how to install it. The boot as a project file is in
 `cli/tests/cli.rs` (`run_boots_the_p2_off_the_modules_flash`).
 
-## Using embsim in your project
+## Using embsim from another repository
 
-embsim is a Cargo workspace (not yet on crates.io), released by git tag.
-A project's catalog crate names the embsim it builds against in its own
-`Cargo.toml`, and that is the embsim its runner holds, whichever `embsim`
-tool starts it (`PROJECTS.md` §10, "Which embsim the runner builds
-against"). Either from embsim's repository at a release:
+A project with no kinds of its own needs only the `embsim` tool
+([Install](#install)), and `requires-embsim = "0.2"` in its file to say
+which release it is written for (`embsim new` writes it).
+
+A project with a catalog crate names embsim in that crate's `Cargo.toml`,
+and that is the embsim its runner is built against, whichever `embsim`
+tool starts the build (`PROJECTS.md` §10, "Which embsim the runner builds
+against"). embsim is not on crates.io; take it as a **git dependency** at a
+release:
 
 ```toml
 # sim/catalog/Cargo.toml
@@ -346,12 +408,13 @@ embsim-boards = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0
 embsim-core   = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }   # the virtual clock
 ```
 
-or, with embsim kept as a **git submodule** of the project, by path into
-that checkout, so the catalog crate and the tool come from one pinned
-commit:
+or as a **git submodule**, by path, so the catalog crate and the tool come
+from one pinned commit (a Cargo workspace around it `exclude`s
+`vendor/embsim`, which is a workspace of its own):
 
 ```bash
 git submodule add https://github.com/RileyMcCarthy/embsim.git vendor/embsim
+git -C vendor/embsim checkout v0.2.0
 cargo run --release --manifest-path vendor/embsim/Cargo.toml -p embsim-cli -- check sim.toml
 ```
 
@@ -365,26 +428,26 @@ embsim-core   = { path = "../../vendor/embsim/core" }   # the virtual clock
 
 `embsim new --catalog DIR` writes whichever fits: the path when the tool's
 own checkout sits inside the project's repository, else the repository at
-the tool's revision. Every catalog crate's embsim must be the same one;
-the tool refuses another before it builds, and Cargo refuses a second copy
-anywhere in the graph (`embsim-core` claims `links = "embsim-core"`). A
-project workspace with embsim as a submodule should `exclude` the
-submodule directory (embsim is its own workspace root); path dependencies
-across the boundary work fine:
+the tool's revision. Every catalog crate names the same embsim: the tool
+refuses another before it builds, and Cargo refuses a second copy anywhere
+in the graph (`embsim-core` claims `links = "embsim-core"`).
+
+**Who owns the runner.** By default the tool writes it beside the project,
+under `.embsim/` (which git ignores), and keeps its lock as `embsim.lock`
+next to the project file: commit that, and every machine builds the same
+runner. A project in a Cargo workspace of its own owns its runner instead:
+a member crate whose `main` is `embsim_cli::runner_main` over the catalog
+crates, named in the file and built `--locked` against the workspace's
+`Cargo.lock`. `embsim new --catalog sim/catalog --own-runner` starts both:
 
 ```toml
-[workspace]
-exclude = ["vendor/embsim"]
+[catalog]
+crates = ["sim/catalog"]
+runner = "sim/runner"
 ```
 
-A project in a workspace of its own owns its runner: a member crate whose
-`main` is `embsim_cli::runner_main` over its catalog crates, named in
-`[catalog] runner` and built against the workspace's committed
-`Cargo.lock` (`embsim new --catalog DIR --own-runner` starts it).
-
-A project that would rather own its binary than have the tool build a
-runner writes ten lines over the command's library (`embsim_cli::shipped`,
-its registration function, `embsim_cli::main_with`); the example's is
+A project that would rather own the whole binary writes ten lines over the
+command's library (`embsim_cli::main_with`); the example's is
 `examples/custom-project/catalog/examples/own_binary.rs`.
 
 ## The QEMU P2 is a program of its own
