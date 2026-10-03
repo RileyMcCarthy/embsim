@@ -5,6 +5,10 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
+  # A manual run builds and packages the release binaries without
+  # publishing anything: the way to try a release before tagging it
+  # (TESTING.md, "Releases").
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -402,24 +406,90 @@ jobs:
           fi
           echo "CI Gate passed — every required job succeeded."
 
-  # Tag-driven GitHub Release (vX.Y.Z). Same gate as branch protection: only
-  # publishes after CI Gate succeeds on the tagged commit. No crates.io publish.
+  # The prebuilt `embsim` for each platform a release ships, on a v* tag
+  # (or a manual run, which keeps them as this run's artifacts and
+  # publishes nothing). Built where it runs, so each is run before it is
+  # packaged: its version and revision are the tag's with no changes, its
+  # QEMU plan is this checkout's P2 target, and it checks and runs a
+  # shipped project (.github/scripts/release.py). No cache: a release is
+  # built from nothing. Linux builds on the oldest Ubuntu runner GitHub
+  # has, so the binary needs glibc 2.35 at most, which the script checks.
+  # Starts beside the CI Gate; `release` publishes only when both pass.
+  release-binaries:
+    name: release binary (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: The tag is the version, and the changelog has it
+        run: python3 .github/scripts/release.py check
+      - name: Build
+        run: cargo build --release --locked -p embsim-cli --target ${{ matrix.target }}
+      - name: Run it, then package it
+        run: python3 .github/scripts/release.py binary --target ${{ matrix.target }} --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Tag-driven GitHub Release (vX.Y.Z), on the tag's push only. Same gate as
+  # branch protection: only publishes after CI Gate succeeds on the tagged
+  # commit, and every release binary was built, run and packaged. Attaches
+  # the binaries, the P2 target's sources (what `embsim qemu install` builds
+  # qemu-system-p2 from: the target every binary was checked to carry) and
+  # SHA256SUMS; the notes are CHANGELOG.md's section for the version and a
+  # table of the assets. No crates.io publish.
   release:
     name: GitHub Release
-    needs: ci-gate
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.ci-gate.result == 'success' }}
+    needs: [ci-gate, release-binaries]
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.ci-gate.result == 'success' && needs.release-binaries.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Version from tag
-        id: ver
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: The P2 target's sources, the checksums and the notes
+        id: assets
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release.py check
+          python3 .github/scripts/release.py qemu-target --out dist
+          python3 .github/scripts/release.py checksums dist
+          python3 .github/scripts/release.py notes --dir dist --out release-notes.md
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          ls -l dist
       - uses: softprops/action-gh-release@v3
         with:
-          name: embsim ${{ steps.ver.outputs.VERSION }}
+          name: embsim ${{ steps.assets.outputs.VERSION }}
           tag_name: ${{ github.ref_name }}
+          body_path: release-notes.md
           generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
         env:

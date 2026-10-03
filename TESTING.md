@@ -528,3 +528,34 @@ their own project files with the `embsim` built from that commit, which
 builds their catalog crates against it (`MIGRATING-MAD.md`, step 9).
 Upstream CI on this repo remains the primary gate for commits that land
 here.
+
+## Releases
+
+A release is a `v*` tag on a commit the CI Gate passed. CI's
+`release-binaries` job builds `embsim` for each platform the release
+ships, where it runs, and runs it before packaging it; `release` then
+publishes, on the tag's push only, once the gate and every binary have
+passed (`NODES.md` §13, "The release"). Both run
+`.github/scripts/release.py`, which a maintainer runs the same way.
+
+Before tagging:
+
+```bash
+# The version in Cargo.toml ([workspace.package]) is the release's, and
+# CHANGELOG.md has its `## [X.Y.Z]` section.
+python3 .github/scripts/release.py check --tag vX.Y.Z
+
+# This machine's binary, run and packaged as CI does (it must be built from
+# HEAD with no changes to embsim's crates), then the P2 target's sources
+# and the checksums. target/ keeps the archives out of git.
+cargo build --release --locked -p embsim-cli --target aarch64-apple-darwin
+python3 .github/scripts/release.py binary --target aarch64-apple-darwin --out target/dist
+python3 .github/scripts/release.py qemu-target --out target/dist
+python3 .github/scripts/release.py checksums target/dist
+```
+
+Every platform's binaries, without publishing anything: run the CI
+workflow by hand on the branch (Actions, CI, "Run workflow"). The
+`release-binaries` legs keep their archives as the run's artifacts. Then
+tag the merged commit, `git tag -a vX.Y.Z -m "embsim X.Y.Z"`, and push
+the tag.
