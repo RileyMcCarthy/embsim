@@ -721,6 +721,15 @@ fn contact_bounce_chatters_the_net_and_settles_closed() {
 
     // The immediate actuation edge plus four bounce changes: five deliveries,
     // strictly alternating between driven-low and floating.
+    //
+    // A drained burst is not yet a delivered one: the switch pops due bounce
+    // entries on its wake and hands the drives to the engine's queue, and the
+    // peer's sense deliveries follow on the engine thread. When the wake runs
+    // late (a coarse host timer, macOS CI) the whole burst pops in one wake,
+    // so `pending_bounce() == 0` and the net already reads the settled low
+    // before a single chatter edge has reached the peer. Wait for the peer to
+    // see the deliveries the contract promises, then check them exactly.
+    wait_for(|| log.lock().unwrap().len() >= 5, SETTLE);
     let seen = log.lock().unwrap().clone();
     assert_eq!(
         seen.len(),
