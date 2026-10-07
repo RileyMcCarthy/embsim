@@ -1562,8 +1562,18 @@ fn not_ready_hint(survey: &BoardSurvey, catalog: &dyn Catalog) -> String {
         hint.push_str(
             "a model that declares other pins than the netlist takes another pin table: give \
              the part a [[board.model]] whose options.pins picks the table with the netlist's \
-             pins\n",
+             pins, or another model when none of its tables has them:\n",
         );
+        let guide = catalog.part_kinds();
+        for group in survey.pin_table_groups() {
+            hint.push_str(&format!(
+                "  {}  {} {:?}: {}\n",
+                group.references.join(", "),
+                group.field,
+                group.key,
+                group.fix_sentence(&guide)
+            ));
+        }
     }
     hint
 }

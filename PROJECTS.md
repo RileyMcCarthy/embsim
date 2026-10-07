@@ -1344,8 +1344,6 @@ catalog of the test tree's own beside the standard one
 - The mates of a module and its carrier, or of a cable, are written by
   hand from the two surveys: nothing in the netlists says which connectors
   mate.
-- `check` names the parts whose pin table does not fit but not the table
-  that would. `survey` and `new` do name it.
 
 ## 10. Extending embsim from a project
 

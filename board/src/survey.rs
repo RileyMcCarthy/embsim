@@ -27,7 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use crate::kind::{fitting_option_table, KindGuide};
 use crate::netlist::{NetDecl, NodeDecl, ParsedNetlist};
+use crate::project::KeyField;
 use crate::registry::{
     normalize_part, Classification, Classified, ModelFacade, PartRegistry, RegistryError,
 };
@@ -355,6 +357,88 @@ impl BoardSurvey {
             .map(|conn| conn.reference.as_str())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// The [`Self::mismatched`] parts grouped by what placed them: the
+    /// registry key, the model and the netlist's pins, each group with the
+    /// references it covers, in the order the first of each was found.
+    pub fn pin_table_groups(&self) -> Vec<PinTableGroup<'_>> {
+        let mut groups: Vec<PinTableGroup<'_>> = Vec::new();
+        for mismatch in &self.mismatched {
+            let part = self
+                .parts
+                .get(&mismatch.reference)
+                .expect("a mismatched part is a surveyed part");
+            let key = part.key.as_deref().unwrap_or(&mismatch.value);
+            let netlist: Vec<&str> = mismatch.netlist.iter().map(String::as_str).collect();
+            if let Some(group) = groups.iter_mut().find(|group| {
+                group.key == key && group.model == mismatch.model && group.netlist == netlist
+            }) {
+                group.references.push(&mismatch.reference);
+                continue;
+            }
+            groups.push(PinTableGroup {
+                field: part.key_field(key),
+                key,
+                model: &mismatch.model,
+                declared: &mismatch.declared,
+                netlist,
+                references: vec![&mismatch.reference],
+            });
+        }
+        groups
+    }
+}
+
+impl SurveyedPart {
+    /// Which of the part's fields `key` is: the one the registry reached
+    /// it by.
+    pub fn key_field(&self, key: &str) -> KeyField {
+        if self.part == key {
+            KeyField::Part
+        } else if self.mpn.as_deref() == Some(key) {
+            KeyField::Mpn
+        } else {
+            KeyField::Value
+        }
+    }
+}
+
+/// Parts placed with a pin table the netlist does not use, by what placed
+/// them ([`BoardSurvey::pin_table_groups`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinTableGroup<'s> {
+    /// The field of the parts the registry reached them by.
+    pub field: KeyField,
+    /// The key in that field.
+    pub key: &'s str,
+    /// The model that placed them, with its pin table
+    /// ([`FacadeMismatch::model`]).
+    pub model: &'s str,
+    /// The pins the model declares.
+    pub declared: &'s [String],
+    /// The pins the netlist gives each of them.
+    pub netlist: Vec<&'s str>,
+    /// The parts, by reference.
+    pub references: Vec<&'s str>,
+}
+
+impl PinTableGroup<'_> {
+    /// The kind of `guide` that placed the group by its key, with its
+    /// option table that declares the netlist's pins
+    /// ([`fitting_option_table`]).
+    pub fn fix<'g>(&self, guide: &'g [KindGuide]) -> Option<(&'g KindGuide, &'g str)> {
+        fitting_option_table(guide, self.key, &self.netlist)
+    }
+
+    /// What `embsim survey` and `embsim check` say fixes the group: the
+    /// table that declares the netlist's pins, or that none of the model's
+    /// does.
+    pub fn fix_sentence(&self, guide: &[KindGuide]) -> String {
+        match self.fix(guide) {
+            Some((_, table)) => format!("pins = {table:?} declares the netlist's pins"),
+            None => "no pin table of this model declares the netlist's pins".to_string(),
+        }
     }
 }
 
