@@ -1732,6 +1732,9 @@ impl Cargo {
                 ],
             )
             .env("CARGO_NET_RETRY", "0")
+            // Parsed, not shown: plain text, whatever colour the user's
+            // environment asks Cargo for (CI sets CARGO_TERM_COLOR=always).
+            .env("CARGO_TERM_COLOR", "never")
             .stdout(Stdio::null())
             .output();
         match output {
@@ -1757,6 +1760,7 @@ impl Cargo {
                     manifest.as_os_str(),
                 ],
             )
+            .env("CARGO_TERM_COLOR", "never")
             .stdout(Stdio::null())
             .output();
         output.is_ok_and(|output| {

@@ -60,11 +60,32 @@ fn embsim_in(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
 }
 
 fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    plain(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
+    plain(&String::from_utf8_lossy(&output.stderr))
+}
+
+/// `text` without terminal colour escapes (`ESC [ ... letter`): Cargo and
+/// rustc colour their messages when the environment asks for it, as CI's
+/// CARGO_TERM_COLOR=always does, and the assertions compare the words.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn read(path: &Path) -> String {
@@ -2086,7 +2107,7 @@ fn a_runner_crate_of_its_own_names_the_commit_that_holds_it() {
             "-o",
             "rig.toml",
             "--catalog",
-            "sim/catalog",
+            "rig/catalog",
             "--own-runner",
             "--embsim",
             checkout.to_str().expect("text"),
@@ -2095,7 +2116,12 @@ fn a_runner_crate_of_its_own_names_the_commit_that_holds_it() {
     );
     assert!(new.status.success(), "{}", stderr(&new));
     let mut text = read(&dir.join("rig.toml"));
-    text.push_str(STARTED_KINDS);
+    // The started crate names its kinds after the catalog (rig-…).
+    text.push_str(
+        &STARTED_KINDS
+            .replace("sim-", "rig-")
+            .replace("SIM-", "RIG-"),
+    );
     std::fs::write(dir.join("rig.toml"), text).expect("writable");
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-qm", "the rig"]);
@@ -2107,13 +2133,13 @@ fn a_runner_crate_of_its_own_names_the_commit_that_holds_it() {
         &[("CARGO_TARGET_DIR", target)],
     );
     assert!(first.status.success(), "{}", stderr(&first));
-    assert_says(&stderr(&first), &["sim/runner/Cargo.lock: commit it"]);
+    assert_says(&stderr(&first), &["rig/runner/Cargo.lock: commit it"]);
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-qm", "the runner's lock"]);
     let rev = git(&dir, &["rev-parse", "HEAD"]);
-    let runner = dir.join("sim/runner");
+    let runner = dir.join("rig/runner");
     std::fs::create_dir_all(runner.join("target/release")).expect("writable");
-    std::fs::write(runner.join("target/release/sim-runner"), "built").expect("writable");
+    std::fs::write(runner.join("target/release/rig-runner"), "built").expect("writable");
     let again = embsim_in(
         &dir,
         &["check", "rig.toml"],
@@ -2123,7 +2149,7 @@ fn a_runner_crate_of_its_own_names_the_commit_that_holds_it() {
     let out = stdout(&again);
     let line = out
         .lines()
-        .find(|line| line.contains("runner crate sim-runner 0.1.0: "))
+        .find(|line| line.contains("runner crate rig-runner 0.1.0: "))
         .unwrap_or_else(|| panic!("no runner line in:\n{out}"));
     assert!(
         line.ends_with(&format!("{}, git rev {}", runner.display(), &rev[..12])),
