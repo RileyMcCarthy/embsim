@@ -383,11 +383,12 @@ fn every_declared_finger_is_one_node_across_the_socket() {
     assert_eq!(state_of(&system, "EC32MB.P2_IO2"), NetState::Floating);
     assert_eq!(state_of(&system, "EdgeBoard.P2"), NetState::Floating);
     // EdgeBoard → module: the force isolator's MCU-side output lands on
-    // P0 — one node across the socket. In the build snapshot the isolator
-    // drives nothing: its isolated side runs from the force domain, the
-    // Edge board's `IC4`, 750 µs from its input, and a repeater with one
-    // side dark releases; the byte exchange below is where the drive is
-    // seen, once the domain has risen.
+    // P0 — one node across the socket. In the build snapshot its isolated
+    // side (`IC5` `VCC1`) is still dark — the Edge board's `IC4`, 750 µs
+    // from its input — while the MCU side (`VCC2`) is up. Iso67xx then
+    // applies the family's default output (TI SLASEY9B Table 9-2, `VCCI`
+    // PD / `VCCO` PU → high for non-F parts), so `OUTA` drives P0 high
+    // until the force domain rises and the channel starts repeating.
     assert!(
         system.names_are_merged("EdgeBoard.P0", "EC32MB.P2_IO0"),
         "the isolator's output and the P2's force-gauge RX pin are one node"
@@ -396,10 +397,10 @@ fn every_declared_finger_is_one_node_across_the_socket() {
         state_of(&system, "EdgeBoard.P0"),
         state_of(&system, "EC32MB.P2_IO0")
     );
-    assert!(
-        matches!(state_of(&system, "EC32MB.P2_IO0"), NetState::Floating),
-        "before the force domain rises the isolator releases its output; got {:?}",
-        state_of(&system, "EC32MB.P2_IO0")
+    assert_eq!(
+        state_of(&system, "EC32MB.P2_IO0"),
+        NetState::Driven(Level::High),
+        "before the force domain rises IC5's MCU-side outputs ride the ISO6731 default high"
     );
 }
 

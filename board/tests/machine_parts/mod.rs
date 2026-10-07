@@ -36,16 +36,15 @@
 //!
 //! # Modeled parts (real behavior)
 //!
-//! Three parts carry behavior here, each with the datasheet header
+//! Two parts carry behavior here, each with the datasheet header
 //! `BOARD_ENGINE.md` ("Model provenance convention") requires:
 //!
 //! - [`Rs422Driver`] — TI AM26LS31, the servo step/direction pair;
-//! - [`Rs422Receiver`] — TI AM26LV32, the encoder A/B/ZI pairs;
-//! - [`SerialIsolator`] — TI ISO6731, the isolated force-gauge UART.
+//! - [`Rs422Receiver`] — TI AM26LV32, the encoder A/B/ZI pairs.
 //!
-//! The rest come from `embsim-models`: the other four ISO67xx isolators
-//! (`IC1`, `IC2`, `IC14` with its STEP channel carrying a rate, `IC15`,
-//! `IC16`), the 21 SN74LVC1G14 LED drivers and the five optocouplers
+//! The rest come from `embsim-models`: the ISO67xx isolators
+//! (`IC1`, `IC2`, `IC5` the force-gauge UART, `IC14` with its STEP channel
+//! carrying a rate, `IC15`, `IC16`), the 21 SN74LVC1G14 LED drivers and the five optocouplers
 //! (`U4` a 6N137, `U5`–`U8` VO2631s) on the Edge board; the TCXO, the two
 //! 74LVC2G04 inverters, the four PSRAMs and the boot flash `U301` (blank,
 //! the 16 MiB part `embsim-boards` ships the module with; `w25q128jv.rs`
@@ -702,224 +701,6 @@ impl Component for Rs422Receiver {
 }
 
 // ============================================================
-// ISO6731 — triple-channel digital isolator (the force-gauge UART)
-// ============================================================
-
-//
-// Provenance
-//   Part      : Texas Instruments ISO6731, one of the "ISO67xx High-Speed,
-//               Robust-EMC Reinforced and Basic Digital Isolators" family;
-//               the ISO6731 variant is triple-channel, 2 forward + 1 reverse.
-//               **Document number not recorded** — unlike the two TI interface
-//               parts above, no literature number is asserted here rather than
-//               guessing one. Pin the datasheet (number, revision, and the
-//               function/channel-map section) before this model leaves the
-//               test tree; the channel map below is instead cited to the
-//               *board*, whose netlist independently shows which pins are
-//               inputs and which outputs.
-//   Governs   : the channel directions (INA/INB on side 1 driving OUTA/OUTB
-//               on side 2; INC on side 2 driving OUTC on side 1 — confirmed
-//               against the EdgeBoard netlist's own wiring), the
-//               transparent-repeater behavior, and the default output state
-//               when a side loses power.
-//   Instance  : MaD EdgeBoard IC5 (`ISO6731DWR`), sheet `MaD_Edge_Sheet2`.
-//               Side 1 sits in the isolated force-gauge domain
-//               (`IFG_5V` / `IFG_GND`, brought out on connector J9); side 2
-//               is the P2's 3.3 V domain. The three channels are the
-//               force-gauge UART and its data-ready line:
-//                 P2 → INC → OUTC → IFG_TX  (MCU transmit, into the gauge)
-//                 IFG_RX → INA → OUTA → P0  (gauge transmit, into the MCU)
-//                 IFG_INT → INB → OUTB → P1 (the ADC's ~DRDY)
-//
-// Behavior modeled
-//   A transparent repeater: three identical level channels, each sensing its
-//   input net and driving its output net. That is what the part is — it has no
-//   idea a UART is on two of its channels, and it used to be told, because the
-//   force-gauge channels repeated *bytes* over stream pins so the isolator
-//   could be a hop on the engine's derived byte route. Now that the UART is on
-//   the net as levels, the special case is gone and all three channels are the
-//   same three lines of code.
-//   Repeating requires both sides powered. With either rail down the channel
-//   is dead and its output is released.
-//
-// Deliberately NOT modeled
-//   * Propagation delay (nanoseconds for this family) and pulse-width
-//     distortion, against a 115.2 kbaud bit time of 8.7 µs.
-//   * The datasheet's *default output* behavior on the failed side (outputs
-//     go high when the input side is unpowered). Here an unpowered side
-//     simply stops repeating and releases, which keeps the engine's
-//     `PowerNetUnsourced` / `FloatingSense` reports as the account of the
-//     failure instead of a plausible-looking idle-high line.
-//   * The EN1/EN2 enable pins: this board marks both no-connect, so the
-//     facade declares them passive and the model has no enable input.
-//   * Common-mode transient immunity, isolation rating, and every other
-//     safety characteristic — an isolator's *isolation* is exactly what a
-//     netlist-structural engine gets for free by never connecting the nets.
-//
-
-/// The ISO67xx family's input thresholds, **relative** to the input side's
-/// supply: `V_IL` 0.3 × VCCI, `V_IH` 0.7 × VCCI (SLLSFJ6G §7.3, the model
-/// crate's [`iso67xx::DEFAULT_VIL_RATIO`]/[`iso67xx::DEFAULT_VIH_RATIO`]).
-const ISO6731_INPUT_THRESHOLDS: Thresholds = Thresholds::new(
-    embsim_models::isolation::iso67xx::DEFAULT_VIL_RATIO,
-    embsim_models::isolation::iso67xx::DEFAULT_VIH_RATIO,
-    0.0,
-    DeadBand::Unknown,
-);
-
-/// An input on side 1 (`VCC1` against `GND1_1`) or side 2 (`VCC2` against
-/// `GND2_1`).
-const fn iso_in(number: &'static str, vcc: &'static str, gnd: &'static str) -> PinDecl {
-    dig_in(number, ISO6731_INPUT_THRESHOLDS)
-        .with_supply(vcc)
-        .with_reference(gnd)
-}
-
-/// Pin facade of the `ISO6731DWR` (SOIC-16 wide), pin numbers as the
-/// EdgeBoard netlist names them.
-#[rustfmt::skip]
-pub fn iso6731_pins() -> Vec<PinDecl> {
-    vec![
-        pwr_in("1"),    // VCC1   — isolated side
-        pwr_in("2"),    // GND1_1
-        iso_in("3", "1", "2"),    // INA    — gauge transmit in
-        iso_in("4", "1", "2"),    // INB    — gauge ~DRDY in
-        dig_out("5"),   // OUTC   — MCU transmit out (isolated side)
-        nc("6"),        // NC_1
-        nc("7"),        // EN1
-        pwr_in("8"),    // GND1_2
-        pwr_in("9"),    // GND2_1
-        nc("10"),       // EN2
-        nc("11"),       // NC_2
-        iso_in("12", "16", "9"),  // INC    — MCU transmit in
-        dig_out("13"),  // OUTB   — ~DRDY out
-        dig_out("14"),  // OUTA   — gauge transmit out
-        pwr_in("15"),   // GND2_2
-        pwr_in("16"),   // VCC2   — MCU side
-    ]
-}
-
-/// The three repeated channels, `(input pin, output pin)`, as the EdgeBoard
-/// wires them: MCU transmit, gauge transmit, and the ADC's `~DRDY`.
-const ISO6731_CHANNELS: [(&str, &str); 3] = [("12", "5"), ("3", "14"), ("4", "13")];
-
-/// The side each channel's output is on: `OUTC` on side 1, `OUTA`/`OUTB` on
-/// side 2 (index 0 is side 1).
-const ISO6731_OUTPUT_SIDE: [usize; 3] = [0, 1, 1];
-
-struct IsolatorCore {
-    state: Mutex<IsolatorState>,
-}
-
-#[derive(Default)]
-struct IsolatorState {
-    /// Each side's supply when it is up: `VCC1`, `VCC2`, at or above the
-    /// family's powered-up threshold.
-    rails: [Option<Volts>; 2],
-    /// Per channel: the level last sensed on its input, and its output pin.
-    level_in: [Option<Level>; 3],
-    level_out: [Option<PinHandle>; 3],
-}
-
-impl IsolatorCore {
-    fn live(state: &IsolatorState) -> bool {
-        state.rails.iter().all(Option::is_some)
-    }
-
-    /// Re-drive one channel's output from its input, at its own side's
-    /// supply — the family's level translation.
-    fn apply(&self, state: &mut IsolatorState, channel: usize) {
-        let Some(out) = state.level_out[channel].clone() else {
-            return;
-        };
-        let rail = state.rails[ISO6731_OUTPUT_SIDE[channel]];
-        match (Self::live(state), state.level_in[channel], rail) {
-            (true, Some(level), Some(rail)) => out.set_drive(Some(drive(level, rail))),
-            _ => out.set_drive(None),
-        }
-    }
-
-    /// Re-drive every channel — for a supply change, which affects all three.
-    fn apply_all(&self, state: &mut IsolatorState) {
-        for channel in 0..ISO6731_CHANNELS.len() {
-            self.apply(state, channel);
-        }
-    }
-}
-
-/// TI ISO6731 triple-channel digital isolator — see the provenance block
-/// above.
-pub struct SerialIsolator {
-    pins: Vec<PinDecl>,
-    core: Arc<IsolatorCore>,
-}
-
-impl SerialIsolator {
-    /// An isolator whose repeated outputs drive their own side's supply.
-    pub fn new() -> Self {
-        Self {
-            pins: iso6731_pins(),
-            core: Arc::new(IsolatorCore {
-                state: Mutex::new(IsolatorState::default()),
-            }),
-        }
-    }
-}
-
-impl Default for SerialIsolator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for SerialIsolator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SerialIsolator").finish_non_exhaustive()
-    }
-}
-
-impl Component for SerialIsolator {
-    fn pins(&self) -> &[PinDecl] {
-        &self.pins
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        {
-            let mut state = self.core.state.lock().unwrap();
-            for (channel, (_, output)) in ISO6731_CHANNELS.iter().enumerate() {
-                state.level_out[channel] = Some(io.pin(output)?);
-            }
-        }
-
-        // Rail senses first: a level delivered before the rails are known must
-        // not slip through the power gate.
-        for (pin, side) in [("1", 0usize), ("16", 1usize)] {
-            let core = Arc::clone(&self.core);
-            io.on_sense(pin, move |rail| {
-                let mut state = core.state.lock().unwrap();
-                state.rails[side] = rail
-                    .volts
-                    .filter(|&v| v >= iso67xx::DEFAULT_SUPPLY_MIN_VOLTS);
-                core.apply_all(&mut state);
-            })?;
-        }
-
-        // Each channel subscribes only to its own input, so one transition
-        // costs one drive rather than one per channel.
-        for (channel, (input, _)) in ISO6731_CHANNELS.iter().enumerate() {
-            let core = Arc::clone(&self.core);
-            let receiver = DigitalReceiver::new(io.pin(input)?);
-            io.on_sense(input, move |sensed| {
-                let mut state = core.state.lock().unwrap();
-                state.level_in[channel] = receiver.read(&sensed);
-                core.apply(&mut state, channel);
-            })?;
-        }
-        Ok(())
-    }
-}
-
-// ============================================================
 // P2-EC32MB module: the P2 behind its full package facade
 // ============================================================
 
@@ -1104,10 +885,10 @@ pub fn shipped_ec32mb_board() -> Board {
 //               MountingHole_Pad ×4 — mechanical nodes.
 //               (86 + 24 + 5 + 1 + 4 + 48 registered = the netlist's 168.)
 //   real model  AM26LS31CD (U24) and AM26LV32xD (U25), the encoder/servo
-//               RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator;
-//               ISO6742DWR (IC1, IC2), ISO6741DWR (IC14), ISO6721BDR (IC15)
-//               and ISO6740FDWR (IC16), the `embsim_models::isolation`
-//               family model configured from each part name; SN74LVC1G14DBV
+//               RS-422 pair; ISO6731DWR (IC5), ISO6742DWR (IC1, IC2),
+//               ISO6741DWR (IC14), ISO6721BDR (IC15) and ISO6740FDWR (IC16),
+//               the `embsim_models::isolation` family model configured from
+//               each part name; SN74LVC1G14DBV
 //               ×21 (U9–U34), the Schmitt inverters driving the front-panel
 //               LEDs (`embsim_models::logic_gate`); 6N137 (U4) and VO2631
 //               ×4 (U5–U8), the optocouplers (`embsim_models::opto`);
@@ -1170,13 +951,18 @@ pub fn edge_registry_without_socket() -> PartRegistry {
     registry.register("AM26LV32xD", |_decl| {
         Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
     });
-    registry.register("ISO6731DWR", |_decl| Box::new(SerialIsolator::new()));
-
-    // The other ISO67xx isolators, configured straight from their part
-    // names — `ISO6740FDWR` picks up its fail-safe-low default without
-    // anyone re-deriving it from the suffix. `IC14`'s STEP channel carries
-    // the servo step clock as a clock, like any channel handed one.
-    for part in ["ISO6742DWR", "ISO6741DWR", "ISO6740FDWR", "ISO6721BDR"] {
+    // The ISO67xx isolators, configured straight from their part names —
+    // `ISO6740FDWR` picks up its fail-safe-low default without anyone
+    // re-deriving it from the suffix; `ISO6731DWR` (IC5, the force-gauge
+    // UART) uses the same path. `IC14`'s STEP channel carries the servo
+    // step clock as a clock, like any channel handed one.
+    for part in [
+        "ISO6742DWR",
+        "ISO6741DWR",
+        "ISO6740FDWR",
+        "ISO6721BDR",
+        "ISO6731DWR",
+    ] {
         registry.register(part, move |decl: &ComponentDecl| {
             let name = normalize_part(decl);
             let config = iso67xx::Config::from_part_name(&name)
