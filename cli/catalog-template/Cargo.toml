@@ -1,0 +1,21 @@
+# The catalog crate `embsim new --catalog` starts, kept as a crate of this
+# workspace so every gate compiles, lints and documents it, and
+# `cli/tests/template.rs` checks and runs a project naming its kinds.
+# `embsim new --catalog DIR` copies `src/lib.rs` with the project's name in
+# place of "yourproject", and writes a manifest of its own like this one
+# whose embsim dependencies are the embsim the project builds against: a
+# path into a checkout inside the project, or embsim's repository at a
+# revision (cli/src/scaffold.rs).
+[package]
+name = "yourproject-catalog"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The catalog crate `embsim new --catalog` starts: one example of each sort of kind"
+
+[dependencies]
+embsim-board = { path = "../../board" }
+embsim-boards = { path = "../../boards" }
+# The virtual clock: the instant a component starts at, which its wakes
+# count from.
+embsim-core = { path = "../../core" }

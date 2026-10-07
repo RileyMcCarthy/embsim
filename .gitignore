@@ -3,3 +3,6 @@
 
 # Vibes runs on Node; nothing else here does.
 node_modules/
+
+# Release archives `.github/scripts/release.py` writes by default.
+/dist/

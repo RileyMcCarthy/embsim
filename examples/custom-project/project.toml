@@ -1,0 +1,100 @@
+# An embsim project with kinds of its own (README.md beside this file).
+#
+# A P2-EC32MB module, powered from its edge fingers the way a carrier
+# powers it, runs a core the project's catalog crate adds: it toggles P0
+# every half millisecond from the moment the processor leaves reset. P0
+# drives the input of an EX-BUF1 buffer (an example part, with a stand-in
+# datasheet) on a small board the catalog crate bundles, powered from the
+# module's own I/O rail on its V00 finger. The buffer's output goes to a
+# bench instrument, also the crate's, that counts its rising edges.
+#
+#   embsim check project.toml          builds the runner, then the system
+#   embsim run project.toml --for 10ms
+
+# The project's own kinds: the crate the `embsim` tool builds into the
+# runner that runs this file. Every kind named `example-…` below is its.
+[catalog]
+crates = ["catalog"]
+
+# ---- The module ------------------------------------------------------------
+
+[[board]]
+name = "EC32"
+kind = "p2-ec32mb"
+
+# The processor's package is embsim's; what runs inside it is the crate's.
+[[board.model]]
+value = "P2X8C4M64P"
+kind = "p2"
+[board.model.options]
+core = "example-blinker"
+pin = 0
+period = "1ms"
+
+[[wire]]
+from = "CARRIER.5V"
+to = "EC32.J203.41"
+volts = 5.0
+
+[[wire]]
+from = "CARRIER.5Vb"
+to = "EC32.J203.42"
+volts = 5.0
+
+[[wire]]
+from = "CARRIER.GND"
+to = "EC32.J203.43"
+volts = 0.0
+
+[[wire]]
+from = "CARRIER.GNDb"
+to = "EC32.J203.44"
+volts = 0.0
+
+[[wire]]
+from = "CARRIER.GNDc"
+to = "EC32.J203.45"
+volts = 0.0
+
+# ---- The buffer board ------------------------------------------------------
+
+# A board kind the crate ships: its netlist is bundled with it.
+[[board]]
+name = "BUF"
+kind = "example-buffer-board"
+
+# U1 needs a model before the board builds; the crate's kind is it.
+[[board.model]]
+value = "EX-BUF1"
+kind = "example-ex-buf1"
+
+# J1: 1 IN (the buffer's A), 2 OUT (its Y), 3 VCC, 4 GND.
+[[wire]]
+from = "EC32.J203.40"
+to = "BUF.J1.1"
+
+[[wire]]
+from = "EC32.J203.47"
+to = "BUF.J1.3"
+
+[[wire]]
+from = "EC32.J203.45"
+to = "BUF.J1.4"
+
+# ---- The bench -------------------------------------------------------------
+
+# Its trigger levels are the bench's choice: the buffer's own V_T- and V_T+.
+[[component]]
+name = "COUNTER"
+kind = "example-edge-counter"
+[component.options]
+low = 0.9
+high = 2.0
+
+[[wire]]
+from = "BUF.J1.2"
+to = "COUNTER.IN"
+
+[[wire]]
+from = "COUNTER.REF"
+to = "BUF.J1.4"

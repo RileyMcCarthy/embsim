@@ -165,9 +165,11 @@ cargo test -p embsim-board --lib cluster::tests
 cargo test -p embsim-board --test ec32mb_module --test isolation_bridge
 # ns/solve of the MNA at m = 2, 4, 8, 11, 47 (not a test; run in release).
 cargo run -p embsim-board --release --example solve_bench
-# The QEMU core inside the package (needs a QEMU P2 tree): the ROM boot
-# prints its edges / yields / publishes / START instant / wall time and
-# holds its escalated-solve count exactly (since phase 4 the module is
+# The QEMU core inside the package (needs `embsim qemu install`'s
+# qemu-system-p2, so these are #[ignore]d without --include-ignored): the
+# ROM boot prints its edges / yields / publishes / START instant / wall time
+# / turns and the channel's cost per turn, holds its yields, publishes and
+# clock edges exactly, and its escalated-solve count (since phase 4 the module is
 # powered from its J203 fingers, nothing stuck: the reset releases at the
 # bucks' 2.5 ms soft-start and the core starts the datasheet's 3 ms later,
 # at 5.5 ms, the TCXO's 20 MHz reaches XI, and the count is the power
@@ -179,8 +181,20 @@ cargo run -p embsim-board --release --example solve_bench
 # the 20 MHz that arrives — the scope reads its pad writes 12–13 ns apart,
 # and one yield per pad write. Both benches supply VDD, RESN and the bank
 # the guest drives, as the START gate and the pads' bank rule need; their
-# guests start 3 ms in, the restart delay after the build.
-EMBSIM_QEMU_P2_BUILD=<qemu-p2 build dir> cargo test -p embsim-p2-qemu -- --nocapture
+# guests start 3 ms in, the restart delay after the build; `pad_modes` runs
+# two P2s, each its own program. `lifecycle`: a program killed mid-run stops
+# its core with the signal in the error, one sent SIGTERM, SIGINT or SIGHUP
+# mid-run ends within a second over either channel, a dropped core takes
+# its program with it, and a program whose parent is killed ends itself.
+# EMBSIM_P2_QEMU_TRANSPORT=socket runs them over the fallback channel.
+cargo test -p embsim-p2-qemu -- --include-ignored --nocapture
+# Without QEMU (runs everywhere): `program` starts a stand-in that speaks
+# the protocol — a program of another protocol or target refused naming
+# both and saying how to install the right one, one that exits before its
+# handshake or dies mid-run reported with its status and standard error
+# within a second, one that will not quit killed when its node drops — and
+# checks that stage.sh and the crate compute one target identity.
+cargo test -p embsim-p2-qemu --test program
 # The interface phase's sense task (`NODES.md` §12 item 5; stepped, own
 # binary): what a pin is handed is a
 # voltage against its declared reference, and the level is the receiver's
@@ -227,7 +241,161 @@ cargo test -p embsim-board --lib rebasing_trails_the_original_by_at_most_one_pul
 # Or all schedule-arithmetic cases together:
 # cargo test -p embsim-board --lib
 cargo test -p embsim-models --lib stepper_motor
+# Projects (`board/src/project.rs`, `boards/src/catalog.rs`): a system written
+# down as a TOML file of boards, part models, wires and a scenario. Build
+# only: the P2-EC32MB from its netlist through the catalog equals the module
+# `Ec32mb` builds, part for part, net for net and cluster for cluster; the
+# checklist its netlist asks for with nothing assigned; the carrier file's
+# switch positions; connectors mated pin for pin and by a cable's map; and
+# every refusal, with the text that says what to fix — a kind on a part it is
+# not, one key twice, one supply name twice, a mate that does not fit, and
+# the MaD machine's three-board project waiting on its two unmodelled parts.
+cargo test -p embsim-boards --test ec32_project --test project_refusals --test mates
+# Live, stepped, each its own binary: the EC32 netlist project's power tree
+# from the carrier's fingers (every rail equal to the library module's); the
+# DS2 add-on project on its bench supplies (its ADC's protocol thread lives
+# for the process, rule 5); two boards joined connector to connector, a pad
+# on one read through the other's resistor.
+cargo test -p embsim-boards --test ec32_project_power --test ds2_project --test board_to_board
+# The MaD machine's three boards as a project (`boards/projects/edge-ec32-ds2.toml`),
+# with the Edge board's RS-422 pair given the board tests' models: its mates
+# join what the machine tests' hand-written harnesses join (build only), and
+# live, stepped, the module and the add-on run from the carrier's rails.
+cargo test -p embsim-board --test edge_project --test edge_project_live
+# The catalog's guide (`boards/src/catalog.rs`): every pin table it lists is
+# the one its kind registers; how a part fits a kind — by part number, by
+# part family, never by pins — and which kinds without a model a part may
+# take by its designator, symbol and nets; and PROJECTS.md's tables of
+# board and part kinds,
+# which are generated from the catalog (each option read off the kind's own
+# registration) and must match the document character for character — the
+# failure prints the tables to paste.
+cargo test -p embsim-boards --lib catalog
+# PROJECTS.md's Rust examples, run as doc tests of embsim-boards from its
+# directory: a project loaded, surveyed and built, a catalog of one's own
+# adding a board kind and a part kind to a catalog set, a core catalog
+# adding a P2 core, a board kind that brings its own entry for a socket of
+# its own symbol library, and a report as a run takes and reads it.
+cargo test -p embsim-boards --doc
+# The guides' quotations (build only): every code block README.md,
+# PROJECTS.md, TESTING.md, MIGRATING-MAD.md or the example's README marks
+# `<!-- quoted from PATH -->` is that file's text, line for line, and
+# PROJECTS.md quotes the worked example's registration function and its own
+# binary. The quoted files are the example's, which every gate compiles, so
+# the guide's code that is not a doc test is still code that builds.
+cargo test -p embsim-boards --test guide_quotes
+# Catalogs composed into one (`boards/src/set.rs`), build only: a kind two
+# catalogs provide refused where a project names it, naming both, and a
+# project that does not name it surveyed; a core and a base part number
+# the same; what a set refuses when a catalog joins; an added kind refused
+# on a part it is not before its catalog is asked; a board kind's own
+# entries, and a project entry replacing one.
+cargo test -p embsim-boards --test catalog_set
+# The standard bench component kinds, stepped, each its own binary: a
+# scripted source's steps landing at their instants across a divider (read a
+# nanosecond either side of each, and by a reader handed each at its
+# instant), two host serial ports as a null-modem cable carrying bytes
+# between their PTYs both ways (written once running, and before the
+# system starts, none shed), a host's TX driving at whatever its VIO
+# reads (unsourced, 1.8 V, 3.3 V, each at its instant), and a PTY path
+# holding a file or a directory refused and left; and what each kind
+# refuses. (`cargo test -p embsim-core --test serial_pty` holds the PTY
+# link's own rule: it replaces only a link, and removes only its own.)
+cargo test -p embsim-boards --test scripted_source --test host_serial
+# The `embsim` command (`cli/`), run as a user runs it, a process a case:
+# survey the EC32's netlist (every connector pin, what needs a model and what
+# could be it, the pin table that fits), the Edge board's (the two parts no
+# kind is for, the socket offered as a connector, a symbol and a part number
+# that name two parts) and the p2-ec32mb kind; `new` then `check` for the header
+# board, the DS2 add-on (refused with its survey until its stub is filled)
+# and the EC32 (the pin tables the hand-written project chooses); `run` of
+# the EC32 project for 10 ms, its rails up, the build's findings apart and
+# the ones the run cleared listed at the end, the report the same twice.
+# Where no qemu-system-p2 can be found, `check` of a `core = "qemu"` project
+# refused saying where it looked and how to install one, `qemu path` failing
+# the same way, and `qemu install --dry-run` naming the target, the QEMU
+# release and where it would go; with one installed (--include-ignored),
+# `run` boots the P2 off the module's flash (its image made by `embsim
+# flash-image`), a run whose qemu-system-p2 is killed stops there and exits
+# non-zero, and `qemu path` finds it. `flash-image` laying out a program and
+# refusing one stage-1 cannot load, and a run off a raw image saying a P2
+# does not boot from it, run everywhere. `run` with no
+# duration interrupted by SIGINT, its summary printed; `run --pty` putting a
+# host's PTY where it says and printing its path, and refusing a path that
+# holds a file. And the command as a
+# library (`cli/tests/library.rs`, in process): a catalog the test defines
+# adds a board kind, a part kind, a P2 core and a bench component, and a
+# project naming all four checks and runs through `embsim_cli::run`; and
+# (`cli/tests/failure.rs`) a part whose report fails stops the run there,
+# with its summary, and the command exits non-zero. A
+# project's own catalog crates (`cli/tests/runner.rs`): `new --catalog`
+# starting a crate (its embsim by path inside the project, else what
+# `--embsim` names, else the project's crates' own) and its own runner (a
+# `.gitignore` for its builds when it is its own workspace), naming them
+# in a project, the tool's refusals before Cargo, the runner's files written
+# when no Cargo starts, a runner refusing a project naming other crates,
+# `survey` and `new` with `--project` through a runner, a command line the
+# tool cannot parse handed over; and, with a stand-in `$CARGO` that reads
+# manifests and builds nothing, a lone crate's runner built under
+# `.embsim/target`, the runner's embsim taken from the crates' git source,
+# a crate on another embsim refused before any build, an embsim Cargo cannot
+# fetch named with where to point the crates, a crate's dependency
+# on another checkout named as two copies when Cargo refuses the second
+# `links = "embsim-core"`, two copies refused by Cargo's resolver, a
+# symlinked checkout spelled as the crate spells it, `embsim.lock` copied in
+# and built `--locked`, and a project's own runner built in its workspace.
+# What a binary is made of, on every check and in `--version`
+# (`cli/tests/cli.rs`). The crate `new --catalog` starts,
+# its four kinds run in process, its source driving at its instant
+# (`cli/tests/template.rs`).
+cargo test -p embsim-cli
+
+# The runner built with Cargo (`#[ignore]`d above; CI's project-runner job):
+# examples/custom-project checked and run through the real binary and the
+# runner it builds, --locked against its committed embsim.lock, a quiet
+# second build and a --rebuild that keeps the lock, a started crate built
+# outside any workspace whose first run writes embsim.lock, a project's own
+# runner built in its workspace and run, a runner crate that is its own
+# workspace, committed, whose line names its commit and no changes after a
+# build, and a crate that does not compile
+# shown with rustc's errors. The first build of embsim in the release
+# profile is the slow part.
+cargo test -p embsim-cli --test runner -- --ignored
+
+# The worked example's own test: its project run as its runner runs it, in
+# process, every edge at its nanosecond (stepped, own binary). The crate is
+# a workspace member, so `cargo test --workspace` (CI's test job) runs this
+# and compiles its own binary (`examples/own_binary.rs`); clippy and doc
+# take it too. Run it as a user would, from examples/custom-project:
+#   cargo run -p custom-project-catalog --example own_binary -- run project.toml --for 10ms
+cargo test -p custom-project-catalog
 ```
+
+How CI runs the project pieces: the `test` job's `cargo test --workspace
+--all-targets` and `--doc` run everything above but the `#[ignore]`d runner
+builds, among them the example's test, the started crate's test
+(`cli/tests/template.rs`), the guide's doc tests and `guide_quotes`; the
+`project-runner` job runs `cargo test -p embsim-cli --test runner --
+--ignored`, which builds real runners with Cargo; the `p2-qemu-boot` job
+installs `qemu-system-p2` with `embsim qemu install` and runs `cargo test
+-p embsim-p2-qemu` and `cargo test -p embsim-cli --test cli` with
+`--include-ignored`, where `run` boots the P2 off the module's flash. The
+behaviour ledger's suite (`vibes.suite.json`) runs `embsim-board`,
+`embsim-boards`, `embsim-cli`, `embsim-p2-qemu` and `custom-project-catalog`,
+so the runner builds and the QEMU boots declare no behaviours: the ledger's
+run builds no runner and installs no QEMU. What runs without them (the
+stand-in program, the refusals) declares its behaviours.
+
+**A project's own catalog** is tested the way the example's is, in the
+project's repository: a test that runs the project file through
+`embsim_cli::run_with_crates` with the crate's registration function, in
+process and stepped inside the command, asserting on what the run prints
+(`examples/custom-project/catalog/tests/project.rs`); and, for a property
+the printout does not carry (a byte crossing a PTY, a net's level at an
+instant), a test that loads the file with `embsim_board::Project`, builds
+it with the shipped set and the crate's kinds, and runs the system on the
+stepped clock as `board/tests/edge_project_live.rs` does (rule 9). Neither
+builds a runner. `MIGRATING-MAD.md` lists MaD's.
 
 Per-crate iteration:
 
@@ -359,7 +527,6 @@ cargo llvm-cov --workspace --summary-only
 
 When these land, each needs a dedicated integration binary:
 
-- `Harness::from_toml`
 - Live topology mutation after `System::start`
 - Dual-MCU firmware entry inversion (one image per process still applies)
 
@@ -367,5 +534,39 @@ When these land, each needs a dedicated integration binary:
 
 Consumer repos (e.g. MaD) should re-run this suite against the **pinned**
 submodule commit on SIL-related PRs (`cd vendor/embsim && cargo test
---workspace --all-targets`), mirroring how ProtoEmb is gated. Upstream CI on
-this repo remains the primary gate for commits that land here.
+--workspace --all-targets`), mirroring how ProtoEmb is gated, and check
+their own project files with the `embsim` built from that commit, which
+builds their catalog crates against it (`MIGRATING-MAD.md`, step 9).
+Upstream CI on this repo remains the primary gate for commits that land
+here.
+
+## Releases
+
+A release is a `v*` tag on a commit the CI Gate passed. CI's
+`release-binaries` job builds `embsim` for each platform the release
+ships, where it runs, and runs it before packaging it; `release` then
+publishes, on the tag's push only, once the gate and every binary have
+passed (`NODES.md` §13, "The release"). Both run
+`.github/scripts/release.py`, which a maintainer runs the same way.
+
+Before tagging:
+
+```bash
+# The version in Cargo.toml ([workspace.package]) is the release's, and
+# CHANGELOG.md has its `## [X.Y.Z]` section.
+python3 .github/scripts/release.py check --tag vX.Y.Z
+
+# This machine's binary, run and packaged as CI does (it must be built from
+# HEAD with no changes to embsim's crates), then the P2 target's sources
+# and the checksums. target/ keeps the archives out of git.
+cargo build --release --locked -p embsim-cli --target aarch64-apple-darwin
+python3 .github/scripts/release.py binary --target aarch64-apple-darwin --out target/dist
+python3 .github/scripts/release.py qemu-target --out target/dist
+python3 .github/scripts/release.py checksums target/dist
+```
+
+Every platform's binaries, without publishing anything: run the CI
+workflow by hand on the branch (Actions, CI, "Run workflow"). The
+`release-binaries` legs keep their archives as the run's artifacts. Then
+tag the merged commit, `git tag -a vX.Y.Z -m "embsim X.Y.Z"`, and push
+the tag.

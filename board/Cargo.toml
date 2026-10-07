@@ -12,6 +12,8 @@ categories = ["embedded", "simulation"]
 [dependencies]
 embsim-core = { path = "../core" }
 libc.workspace = true
+serde.workspace = true
+toml.workspace = true
 nix.workspace = true
 tracing.workspace = true
 

@@ -1,0 +1,26 @@
+# The example project's catalog crate: the kinds examples/custom-project adds
+# to embsim (README.md beside the project). It is written as a project's own
+# crate is: explicit fields, embsim by path. It is also a member of embsim's
+# workspace, so every gate compiles it and the runner it builds reuses what
+# the workspace built.
+[package]
+name = "custom-project-catalog"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "An example catalog crate: a part model, a board, a P2 core and a bench component a project adds to embsim"
+
+[dependencies]
+# The embsim this project builds against: the runner takes embsim-cli from
+# where embsim-boards comes from here (the checkout this example lives in, by
+# path), and embsim.lock beside the project locks the rest.
+embsim-board = { path = "../../../board" }
+embsim-boards = { path = "../../../boards" }
+embsim-core = { path = "../../../core" }
+
+[dev-dependencies]
+# The project's own test runs it as the runner does, in process.
+embsim-cli = { path = "../../../cli" }
+rstest = "0.27"
+# embsim's behaviour ledger; a project of its own does not need it.
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

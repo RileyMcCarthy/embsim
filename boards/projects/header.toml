@@ -1,0 +1,13 @@
+# A board the survey finishes on its own: one connector and one resistor.
+# J1's two pins are the endpoints a wire may use. Nothing here needs a
+# model. The netlist path is relative to this file.
+
+[[board]]
+name = "HDR"
+kind = "netlist"
+netlist = "header.net"
+
+[[wire]]
+from = "BENCH.GND"
+to = "HDR.J1.2"
+volts = 0.0

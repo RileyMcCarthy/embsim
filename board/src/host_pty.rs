@@ -21,7 +21,12 @@
 //! makes one non-blocking write attempt (`deliver`); the pump drains whatever
 //! the PTY would not take — see that function for why dropping instead would
 //! be much worse than it looks. The pump reads the host only while the wire
-//! queue has room, and counts every byte it has to shed.
+//! queue has room, and counts every byte it has to shed. On the host's own
+//! rail ([`HostPty::open_on_rail`]) it reads nothing until the engine has
+//! delivered the rail pins' first reading: the engine does that on its own
+//! thread after `attach`, and a byte read before then would be shed as if
+//! the host had no power, at whatever wall-clock instant the pump won the
+//! race. The host's bytes wait in the PTY instead.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
@@ -29,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::net::{Level, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::uart::{FramingError, UartFraming};
 use crate::{
     jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, PinDecl,
@@ -89,9 +95,53 @@ impl std::fmt::Debug for HostPtyCounters {
     }
 }
 
+/// The pins of a host whose I/O rail is its own `VIO` pin, against its own
+/// `GND` ([`HostPty::open_on_rail`]).
+const ON_RAIL_PINS: [PinDecl; 4] = [
+    // Driven at the sensed `VIO` above `GND`, through the bridge's ports;
+    // released while `VIO` reads no voltage.
+    PinDecl::digital_out("TX")
+        .with_idle(None)
+        .with_reference("GND"),
+    // The host's receiver: JESD8C.01's LVCMOS/LVTTL pair, against the
+    // host's own ground.
+    PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)).with_reference("GND"),
+    PinDecl::power_in("VIO").with_reference("GND"),
+    PinDecl::power_in("GND"),
+];
+
+/// What the host's rail pins last read: `VIO` against `GND`, and `GND` in
+/// the engine's frame; and whether the engine has delivered each yet.
+#[derive(Debug, Default, Clone, Copy)]
+struct Rail {
+    vio: Option<Volts>,
+    gnd: Option<Volts>,
+    vio_read: bool,
+    gnd_read: bool,
+}
+
+impl Rail {
+    /// The port the TX pin presents for `level`: `GND`, or `VIO` above it,
+    /// behind the push-pull default; `None` (released) while either reads
+    /// no voltage.
+    fn port(self, level: Level) -> Option<TheveninDrive> {
+        let (vio, gnd) = (self.vio?, self.gnd?);
+        Some(TheveninDrive {
+            volts: match level {
+                Level::High => gnd + vio,
+                Level::Low => gnd,
+            },
+            impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
+        })
+    }
+}
+
 /// A serial link whose far end is a PTY the host can open.
 pub struct HostPty {
-    pins: [PinDecl; 2],
+    pins: Vec<PinDecl>,
+    /// Whether TX drives at the sensed `VIO` above `GND`
+    /// ([`Self::open_on_rail`]) or at the crate's logic rail.
+    on_rail: bool,
     framing: UartFraming,
     /// Kept alive for the component's life: dropping it closes the PTY and
     /// removes the symlink.
@@ -119,14 +169,42 @@ impl HostPty {
     /// and `"RX"` (what the host receives), from the *host's* point of view —
     /// so a harness reads `HOST.TX → MCU.RX` the way a cable does.
     pub fn open(symlink_path: &str, baud_hz: u32) -> std::io::Result<Self> {
-        Ok(Self {
-            pins: [
+        Self::opened(
+            symlink_path,
+            baud_hz,
+            vec![
                 PinDecl::digital_out("TX"),
                 // The host's end is a bench adapter no datasheet here
                 // describes: its receiver reads at the 3.3 V LVCMOS pair
                 // the link signals at.
                 PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)),
             ],
+            false,
+        )
+    }
+
+    /// Open a PTY at `symlink_path`, framed at `baud_hz`, for a host whose
+    /// I/O rail and ground are pins of its own: `TX`, `RX`, `VIO` and `GND`.
+    ///
+    /// `TX` drives a high at `VIO` above `GND` and a low at `GND`, behind
+    /// the push-pull default, and is released while `VIO` reads no voltage;
+    /// `RX` reads JESD8C.01's 0.8 V / 2.0 V pair against `GND` — the pair a
+    /// 3.3 V LVCMOS input and a 5 V TTL input both take. A project wires
+    /// the host's real rail to `VIO` (a Raspberry Pi's 3.3 V), so a board
+    /// that expects another sees the margin it really has.
+    pub fn open_on_rail(symlink_path: &str, baud_hz: u32) -> std::io::Result<Self> {
+        Self::opened(symlink_path, baud_hz, ON_RAIL_PINS.to_vec(), true)
+    }
+
+    fn opened(
+        symlink_path: &str,
+        baud_hz: u32,
+        pins: Vec<PinDecl>,
+        on_rail: bool,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            pins,
+            on_rail,
             framing: UartFraming::new_8n1(baud_hz),
             pty: Pty::new(symlink_path)?,
             counters: Arc::new(HostPtyCounters {
@@ -151,6 +229,11 @@ impl HostPty {
     pub fn counters(&self) -> Arc<HostPtyCounters> {
         Arc::clone(&self.counters)
     }
+
+    /// The framing the link is clocked at.
+    pub fn framing(&self) -> UartFraming {
+        self.framing
+    }
 }
 
 impl Component for HostPty {
@@ -159,12 +242,56 @@ impl Component for HostPty {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        let bridge = Arc::new(SerialLevelBridge::new(
+        let rail = Arc::new(Mutex::new(Rail::default()));
+        // Whether the pump may read the host: at once on the fixed logic
+        // rail; on the host's own rail, once the engine has delivered both
+        // rail pins' first reading. The live engine delivers those on its
+        // own thread after `attach` returns, so a pump that read before
+        // then would shed the host's bytes as if it had no power, at a
+        // wall-clock instant: the bytes wait in the PTY instead.
+        let rail_known = Arc::new(AtomicBool::new(!self.on_rail));
+        let mut bridge = SerialLevelBridge::new(
             self.framing,
             io.pin("TX")?,
             io.clone(),
             Arc::clone(&self.shutdown),
-        ));
+        );
+        if self.on_rail {
+            let rail = Arc::clone(&rail);
+            bridge = bridge.with_ports(move |level| {
+                rail.lock()
+                    .expect("the rail reading is never poisoned")
+                    .port(level)
+            });
+        }
+        let bridge = Arc::new(bridge);
+        if self.on_rail {
+            // Unpowered until `VIO` reads a voltage: a host with no rail
+            // drives nothing.
+            bridge.set_output_enabled(false);
+            for pin in ["VIO", "GND"] {
+                let (rail, bridge) = (Arc::clone(&rail), Arc::clone(&bridge));
+                let rail_known = Arc::clone(&rail_known);
+                io.on_sense(pin, move |sense| {
+                    let (powered, known) = {
+                        let mut rail = rail.lock().expect("the rail reading is never poisoned");
+                        if pin == "VIO" {
+                            rail.vio = sense.volts;
+                            rail.vio_read = true;
+                        } else {
+                            rail.gnd = sense.volts;
+                            rail.gnd_read = true;
+                        }
+                        (rail.vio.is_some(), rail.vio_read && rail.gnd_read)
+                    };
+                    bridge.set_output_enabled(powered);
+                    bridge.ports_changed();
+                    if known {
+                        rail_known.store(true, Ordering::Release);
+                    }
+                })?;
+            }
+        }
         // An idle asynchronous line still drives: without it the far end has no
         // reference against which the first start bit is a falling edge.
         bridge.idle();
@@ -208,7 +335,16 @@ impl Component for HostPty {
             .name("host-pty-pump".to_string())
             .spawn({
                 let (outbound, counters) = (Arc::clone(&self.outbound), counters);
-                move || pump_loop(master, &bridge, &shutdown, &outbound, &counters)
+                move || {
+                    pump_loop(
+                        master,
+                        &bridge,
+                        &rail_known,
+                        &shutdown,
+                        &outbound,
+                        &counters,
+                    );
+                }
             })
             .map_err(|e| AttachError::Failed {
                 message: format!("host PTY: cannot spawn pump thread: {e}"),
@@ -296,14 +432,25 @@ fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, counters: &HostPtyCou
     }
 }
 
-/// Read whatever the host wrote and frame it onto the wire.
+/// Read whatever the host wrote and frame it onto the wire, once
+/// `rail_known` says the bridge knows whether it is powered.
 fn pump_loop(
     master: RawFd,
     bridge: &SerialLevelBridge,
+    rail_known: &AtomicBool,
     shutdown: &AtomicBool,
     outbound: &Mutex<VecDeque<u8>>,
     counters: &HostPtyCounters,
 ) {
+    // Bytes the wire would take now: none until the rail is known, so a
+    // byte is never read to be shed for a rail not yet delivered.
+    let wire_room = || {
+        if rail_known.load(Ordering::Acquire) {
+            bridge.tx_room()
+        } else {
+            0
+        }
+    };
     let mut buf = [0u8; PUMP_READ_CHUNK];
     while !shutdown.load(Ordering::Relaxed) {
         // Anything the engine could not hand over goes now. `POLLOUT` only
@@ -315,7 +462,7 @@ fn pump_loop(
             drain_outbound(master, &mut queue, counters);
             !queue.is_empty()
         };
-        let room = bridge.tx_room();
+        let room = wire_room();
         let mut events = 0;
         if room > 0 {
             events |= libc::POLLIN;
@@ -345,7 +492,7 @@ fn pump_loop(
         // thread in `Drop`.
         let fd = unsafe { BorrowedFd::borrow_raw(master) };
         loop {
-            let room = bridge.tx_room();
+            let room = wire_room();
             if room == 0 {
                 break;
             }

@@ -8,6 +8,14 @@ repository.workspace = true
 description = "Embedded MCU simulator — core infrastructure (virtual clock, serial PTY, events)"
 keywords = ["embedded", "emulator", "simulation", "sil"]
 categories = ["embedded", "simulation"]
+# One copy of embsim in a binary. The virtual clock is process-global state
+# (src/virtual_clock.rs): a second copy of this crate would be a second clock,
+# and a part on one would wait on time nobody advances. Cargo lets one package
+# in a dependency graph claim a `links` name, so a graph that reaches two
+# copies of embsim — two checkouts, a path and a git source, two releases — is
+# refused when Cargo resolves it, before anything compiles. `links` needs a
+# build script; build.rs does nothing else.
+links = "embsim-core"
 
 [dependencies]
 nix = { workspace = true, features = ["term", "fs"] }

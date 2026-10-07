@@ -1465,3 +1465,37 @@ pub fn force_domain_ground(ds2: &str) -> Harness {
         )
         .power(ep("BENCH.AGND"), ep(&format!("{ds2}.J2.2")), 0.0)
 }
+
+// ============================================================
+// The standard catalog, with the Edge board's RS-422 pair
+// ============================================================
+
+/// The Edge board's RS-422 pair, `U24` and `U25`, as these tests model them
+/// and keyed as [`edge_registry`] keys them, as base registrations: the two
+/// Edge parts the standard catalog has no kind for yet (`PROJECTS.md` §9).
+/// A project builds with them through [`edge_catalogs`].
+pub struct EdgeCatalog;
+
+impl embsim_board::Catalog for EdgeCatalog {
+    fn name(&self) -> &str {
+        "embsim-board-tests"
+    }
+
+    fn register_base(&self, registry: &mut PartRegistry) {
+        registry.register("AM26LS31CD", |_decl| {
+            Box::new(Rs422Driver::new(SERVO_RAIL_VOLTS))
+        });
+        registry.register("AM26LV32xD", |_decl| {
+            Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
+        });
+    }
+}
+
+/// The standard catalog with [`EdgeCatalog`] beside it: everything else is
+/// the standard catalog's.
+pub fn edge_catalogs() -> embsim_boards::catalog::CatalogSet {
+    let mut set = embsim_boards::catalog::CatalogSet::new();
+    set.add(EdgeCatalog)
+        .expect("the test catalog provides no kind, only two part numbers");
+    set
+}

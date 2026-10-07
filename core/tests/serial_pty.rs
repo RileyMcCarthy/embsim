@@ -201,3 +201,60 @@ fn drop_removes_the_symlink() {
         "symlink must be removed once the Pty is dropped"
     );
 }
+
+/// A path that holds a file is refused, with `AlreadyExists`, and the file
+/// is left as it was: a PTY link never deletes what a path held.
+#[rstest]
+fn new_refuses_a_path_holding_a_file_and_leaves_it() {
+    let path = unique_path("file");
+    std::fs::write(&path, "precious notes").expect("the file is writable");
+
+    let refused = Pty::new(path.to_str().unwrap())
+        .err()
+        .expect("a file is not replaced");
+    assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        refused.to_string().contains("is not a symlink"),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is still there"),
+        "precious notes"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A directory at the path is refused the same way, and left.
+#[rstest]
+fn new_refuses_a_path_holding_a_directory() {
+    let path = unique_path("dir");
+    std::fs::create_dir(&path).expect("the directory can be made");
+
+    let refused = Pty::new(path.to_str().unwrap())
+        .err()
+        .expect("a directory is not replaced");
+    assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(path.is_dir(), "the directory is still there");
+    let _ = std::fs::remove_dir(&path);
+}
+
+/// A `Pty` whose link another `Pty` replaced leaves that link when it is
+/// dropped: only its own link is its to remove.
+#[rstest]
+fn drop_leaves_a_link_another_pty_replaced() {
+    let path = unique_path("replaced");
+    let first = Pty::new(path.to_str().unwrap()).expect("first Pty::new");
+    let second = Pty::new(path.to_str().unwrap()).expect("second Pty::new");
+    let target = std::fs::read_link(&path).expect("the path is a link");
+
+    drop(first);
+    assert_eq!(
+        std::fs::read_link(&path).expect("the second link is still there"),
+        target
+    );
+    drop(second);
+    assert!(
+        std::fs::symlink_metadata(&path).is_err(),
+        "the second Pty removes its own link"
+    );
+}

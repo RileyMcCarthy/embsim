@@ -150,10 +150,9 @@ pub struct HarnessConnection {
 /// Deliberately wrong harnesses (swapped pins) are valid fixtures — the
 /// `Contention`/`Floating` findings are the assertion targets.
 ///
-/// `Harness::from_toml` is deferred: the `toml` crate is not in the
-/// workspace's dependency tree, so harnesses are built via this plain Rust
-/// builder API for now. Revisit if/when the workspace adopts a TOML
-/// dependency.
+/// A harness written in a file is a project's `[[wire]]` list
+/// ([`crate::project`]), which checks every board end is a connector pin
+/// before it builds this.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Harness {
     connections: Vec<HarnessConnection>,

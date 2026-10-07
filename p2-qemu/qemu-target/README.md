@@ -1,23 +1,29 @@
 # `target/p2` — the QEMU Propeller 2 target
 
-The source of truth for the P2 target `embsim-p2-qemu` links, and for the
-standalone `qemu-system-p2` the MaD differential harnesses run. It is carried
-here rather than in a QEMU fork so a change to the target and the node that
-drives it land in one review; a fork pinned as a submodule is the eventual
-shape, as `embsim` and `ProtoEmb` are to MaD.
+The source of truth for the P2 target `qemu-system-p2` is built from: the
+program `embsim-p2-qemu`'s node runs the P2 in (host-driven mode,
+`target-p2/hostipc.c`), and the standalone emulator the MaD differential
+harnesses run. It is carried here rather than in a QEMU fork so a change to
+the target and the node that drives it land in one review; a fork pinned as
+a submodule is the eventual shape, as `embsim` and `ProtoEmb` are to MaD.
+
+`embsim-p2-qemu` embeds every file here (`src/target.rs`) so `embsim qemu
+install` builds exactly this target wherever embsim was installed from, and
+checks the program it starts against it.
 
 ## Layout
 
 | path | goes to |
 |---|---|
 | `target-p2/` | `target/p2/` in the QEMU tree |
-| `hw-p2/` | `hw/p2/`: the board |
+| `target-p2/hostipc.c`, `hostipc.h` | host-driven mode: the guest-facing pin bus, the slice loop, the channel to embsim, the process's watch (below) |
+| `hw-p2/` | `hw/p2/`: the board, and its `hostipc` machine property |
 | `p2-softmmu.mak` | `configs/targets/p2-softmmu.mak` |
-| `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak`: the standalone build |
-| `p2-softmmu-node-devices.mak` | `configs/devices/p2-softmmu/node.mak`: `embsim-p2-qemu`'s build (`--with-devices-p2=node`) |
+| `p2-softmmu-devices.mak` | `configs/devices/p2-softmmu/default.mak` |
 | `register-p2.patch` | the five registration edits (`target/meson.build`, `hw/meson.build`, both `Kconfig`s, `QEMU_ARCH_P2` in `include/system/arch_init.h`) |
-| `host-thread.patch` | parks QEMU's own vCPU thread when the host sets `rr_host_driven`, so a host thread — embsim's engine — can run the cogs itself (`../hostdrive.c`) |
-| `stage.sh` | puts all of the above into a QEMU source tree |
+| `host-thread.patch` | host-driven mode for round-robin TCG: QEMU's own vCPU thread parks at start-up, before it arms its kick timer, so `hostipc.c`'s thread runs the cogs; a kick from any thread that runs no cog does nothing, so only that thread ends a slice; and real-time timers are kept out of a slice's icount budget |
+| `QEMU_PIN` | the QEMU release this is staged into: its tag and the commit the tag must resolve to |
+| `stage.sh` | puts all of the above into a QEMU source tree, and writes the target's identity there (`hostipc-identity.h`); `stage.sh --identity` prints it |
 | `LICENSE-PNut-TS` | the notice `target-p2/insn.decode`'s source carries |
 
 `target-p2/insn.decode` is **generated** from p2core's decoder table, so the
@@ -45,48 +51,49 @@ stderr rather than silently doing the wrong thing.
 
 ## Building
 
-**QEMU is pinned at `v10.1.0`**, and the pin lives in one place: `QEMU_TAG`
-and `QEMU_COMMIT` of the `p2-qemu-boot` job in `.github/workflows/ci.yml`,
-which checks the fetched tag against the commit. Both patches carry upstream
-context, so they will reject on a different tree — if one does, that tag is
-what moved.
+**QEMU is pinned in `QEMU_PIN`** — `v10.1.0`, which must resolve to commit
+`f8b2f64…` (a tag can be moved; a commit cannot). Both patches carry
+upstream context, so they will reject on a different tree — if one does,
+that tag is what moved.
 
-`stage.sh` copies this directory into a QEMU checkout and applies both
-patches. It replaces `target/p2` and `hw/p2` outright and skips a patch that
-is already applied, so re-run it after every edit here:
+The way to build it is the command:
+
+```bash
+embsim qemu install      # into ~/.embsim/qemu/<identity>/, where the node looks
+```
+
+which fetches QEMU at the pin, stages this directory, configures and builds
+(`embsim_p2_qemu::install`), installs the program with its licence and
+source, and checks its handshake. By hand, the same steps:
 
 ```bash
 git clone --depth 1 --branch v10.1.0 https://gitlab.com/qemu-project/qemu.git <qemu>
 p2-qemu/qemu-target/stage.sh <qemu>
-```
-
-`embsim-p2-qemu` links a tree configured with `--with-devices-p2=node`:
-
-```bash
 mkdir <qemu>/build-p2 && cd <qemu>/build-p2
-../configure --target-list=p2-softmmu --disable-containers --enable-pie \
-    --disable-docs --disable-werror --with-devices-p2=node
+../configure --target-list=p2-softmmu --without-default-features \
+    --disable-containers --disable-docs --disable-werror
 ninja qemu-system-p2
 # Then, from this repository's root:
-EMBSIM_QEMU_P2_BUILD=<qemu>/build-p2 cargo test -p embsim-p2-qemu
+EMBSIM_QEMU_SYSTEM_P2=<qemu>/build-p2/qemu-system-p2 \
+    cargo test -p embsim-p2-qemu -- --include-ignored
 ```
 
-The standalone `qemu-system-p2` MaD's CPU differentials run (`difftest.sh`,
-`edgetest.sh`, `cogtest.sh`, `fwtest.sh`) is the same configure without
-`--with-devices-p2=node`. Its pin model is `target-p2/pinbus.c`. The boot
-ROM's flash is not a device of that binary: `romtest.sh` diffs p2core against
-the node, which bit-bangs the flash over the EC32MB nets.
+`stage.sh` replaces `target/p2` and `hw/p2` outright and skips a patch that
+is already applied, so re-run it after every edit here (and `ninja`): the
+identity it writes is the digest of what it staged, and the node refuses a
+program whose identity is not the one the crate computes from its own copy.
 
-`--disable-containers` matters on macOS: `configure` otherwise hangs in
-`docker version`. `--enable-pie` is what lets the objects link into a Rust
-test binary, which is position-independent; leave it off on macOS, whose
-toolchain builds position-independent executables anyway and fails
-`configure`'s `-pie` probe.
+`--without-default-features` leaves out every UI, network back-end and tool
+QEMU builds by default: the binary is about 8 MB and needs only the system's
+libraries and glib. `--disable-containers` matters on macOS: `configure`
+otherwise hangs in `docker version`.
 
-`embsim-p2-qemu`'s `build.rs` refuses a tree that is not what this directory
-says it should be: a file here that differs from the staged copy, a tree
-without `host-thread.patch`, or a stale build that still links `flashbus.c.o`.
-Re-stage and run `ninja` after an edit here, and the next `cargo test` relinks.
+The same binary is the standalone `qemu-system-p2` MaD's CPU differentials
+run (`difftest.sh`, `edgetest.sh`, `cogtest.sh`, `fwtest.sh`): without the
+`hostipc` property, host-driven mode stays off and its pin model is
+`target-p2/pinbus.c`. The boot ROM's flash is not a device of that binary:
+`romtest.sh` diffs p2core against the node, which bit-bangs the flash over
+the EC32MB nets.
 
 ## Adding an instruction
 
@@ -101,7 +108,46 @@ Re-stage and run `ninja` after an edit here, and the next `cargo test` relinks.
 4. Diff it against p2core with MaD's `SIL/p2core/tools/difftest.sh` (`cog=1`
    for the interpreter).
 
-## Host-facing flags (`target-p2/pinbus.h`)
+## Host-driven mode (`target-p2/hostipc.c`)
+
+`-M p2,hostipc=<shm|sock>:<channel-fd>:<watch-fd>[:<spin-ns>]` turns it on
+— a machine property, so a binary built without it refuses the option at
+once rather than booting a machine nobody drives. The node passes it with
+the descriptors it hands down: the channel (a shared page, or one end of a
+socket pair) and the read end of a pipe only embsim holds the write end of.
+
+- **The bus lives here, once.** Per-cog `DIR`/`OUT` ORed at the pad, the
+  `WRPIN` words, the IN flags, the `TESTP`/`RDPIN`/`WYPIN`/`AKPIN` rules,
+  and the drive key: a pad's key is equal for two states exactly when the
+  node's Thevenin drive is equal, given the bank states each RUN carries
+  (powered; and not 0 V). The node keeps only the electrical model.
+- **The slice loop lives here.** One RUN runs the cogs round-robin from
+  their own clocks until one changes a pad (the cog stops after that
+  instruction, its clock the edge's instant), every running cog reaches the
+  horizon, the `HUBSET` word changes, or nothing can run; the STOP says
+  which, with the new `DIR`/`OUT`, changed mode words and `WYPIN` bytes.
+- **The process.** A watch thread blocks on the pipe and exits the process
+  at end of file — embsim gone, however it went. A QUIT or the socket
+  closing exits at once too. So does `SIGTERM`, `SIGINT` or `SIGHUP`:
+  QEMU's own handler takes the signal and asks the main loop to shut down,
+  and a shutdown notifier ends the process there, before QEMU's shutdown
+  pauses the vCPUs — which would wait for ever on the round-robin thread
+  this mode parks, kicking every cog while it waited. QEMU's line naming
+  the signal is on standard error, where the node reads it; the exit status
+  is 0. Each way out flushes the log `-d`/`-D` writes first.
+  (`../tests/lifecycle.rs`, `a_program_asked_to_terminate_mid_run_ends_at_once`.)
+- **Nothing but the slice loop ends a slice.** A kick sets every cog's
+  exit request, which ends the running slice at its next block. From QEMU's
+  main loop — a shutdown, `resume_all_vcpus` at start-up, work queued for a
+  vCPU — that is wherever the wall clock found the slice, so in this mode
+  `host-thread.patch` makes a kick from a thread that runs no cog do
+  nothing. A kick from inside a slice (`COGINIT` starting a cog) ends it
+  where it always did, at that instruction.
+- **The handshake.** Before the first turn: the protocol version, the
+  target's identity (`hostipc-identity.h`, written by `stage.sh`) and
+  `QEMU_VERSION`. The node refuses anything else.
+
+The flags it sets, from `target-p2/pinbus.h`:
 
 - `p2_pinbus_yield` — a bus sets it from inside a pin op: stop this cog after
   the current instruction. The interpreter checks it after every instruction;
@@ -128,8 +174,8 @@ state, registers, flags, stack pointer and cycle count (MaD's
 mnemonic the firmware executes: 80 in hub space, 41 in cog space, measured over
 20 M instructions with MaD's `SIL/p2core/examples/ophist.rs`.
 
-It also **boots the way silicon does**, on the node rather than in
-`qemu-system-p2`. `p2-qemu/tests/rom_boot_ec32mb.rs` puts nothing in hub but
+It also **boots the way silicon does**, driven by the node rather than
+running free. `p2-qemu/tests/rom_boot_ec32mb.rs` puts nothing in hub but
 Parallax's own 16 KB boot ROM; the ROM samples the pull-up strap on P61,
 bit-bangs the module's SPI flash over the nets, loads its first kilobyte,
 verifies the 256 longs sum to `"Prop"`, copies them into cog RAM and jumps.
@@ -237,11 +283,27 @@ node, on the P2-EC32MB board, over nets — `p2-qemu-boot` in CI, in
   ([`LICENSE-PNut-TS`](LICENSE-PNut-TS)). It is generated, so it carries no
   licence line of its own.
 - Each patch carries the licence of the QEMU files it modifies, stated at its
-  top: `register-p2.patch` GPL-2.0-or-later; `host-thread.patch` MIT for
-  `tcg-accel-ops-rr.c` and GPL-2.0-or-later for `tcg-accel-ops-rr.h`.
-- `../hostdrive.c`, like the rest of `embsim-p2-qemu`, is MIT.
+  top: `register-p2.patch` GPL-2.0-or-later
+  ([`LICENSES/GPL-2.0-or-later.txt`](../../LICENSES/GPL-2.0-or-later.txt));
+  `host-thread.patch` MIT for `tcg-accel-ops-rr.c` and
+  `tcg-accel-ops-icount.c`, and GPL-2.0-or-later for `tcg-accel-ops-rr.h`.
 
-Linked into QEMU, the whole is a GPL-2.0-or-later work: a `qemu-system-p2`
-built from a tree staged from here, or an `embsim-p2-qemu` test binary built
-with `EMBSIM_QEMU_P2_BUILD`, is distributable only under the GPL, version 2 or
-later, with its corresponding source.
+**`qemu-system-p2` is a GPL-2.0 program.** Built into QEMU, whose `LICENSE`
+licenses it "as a whole" under the GPL, version 2 (and some of whose files are
+GPL-2.0-only), the target becomes part of a GPL-2.0 work, distributable only
+under that licence with its corresponding source: QEMU at the pinned commit,
+this directory, and the steps above. `embsim qemu install` puts QEMU's
+licence texts, this directory and a `NOTICE` with those steps beside the
+program it installs.
+
+**embsim links nothing of it.** The node runs `qemu-system-p2` as a separate
+program and talks to it over a small fixed protocol through a shared page or
+a socket pair (`../src/protocol.rs`); no QEMU code is compiled into
+`embsim-p2-qemu`, the `embsim` command or any runner, and nothing of embsim
+is compiled into the program. `embsim-p2-qemu` (its Rust MIT, as every
+embsim crate's is) embeds every file here, verbatim, in each binary that
+links it (`../src/target.rs`) — the `embsim` command included — as data it
+never compiles, to write out and build the program from. Every file keeps
+the licence it states, and the crate's licence names them:
+`MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later`. This describes how the
+pieces are put together; it is not legal advice.

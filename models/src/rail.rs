@@ -206,6 +206,10 @@ pub const NCP114_DISCHARGE_OHMS: Ohms = 100.0;
 /// NCP114 dropout, 135 mV typ at 300 mA for the 3.3 V option, UDFN
 /// (NCP114/D p.3). Recorded; not modelled.
 pub const NCP114_DROPOUT_VOLTS: Volts = 0.135;
+/// `NCP114AMX330TCG`'s output, 3.3 V: Version A (with the active discharge)
+/// in UDFN4, the 3.3 V option (NCP114/D Ordering Information, p.15) — the
+/// part the P2-EC32MB's `U501`–`U508` are.
+pub const NCP114AMX330_V_OUT_VOLTS: Volts = 3.3;
 
 /// XL1509 input operation voltage, 4.5 V min (Rev 2.6 DC Parameters, p.6;
 /// 40 V max).
@@ -424,6 +428,15 @@ impl Config {
     /// `V`. `None` when no token says a voltage.
     pub fn ncp114_from_value(value: &str) -> Option<Self> {
         parse_volts_token(value).map(Self::ncp114)
+    }
+
+    /// The NCP114 an orderable part number is, for the numbers this model
+    /// cites: `NCP114AMX330TCG` → Version A at
+    /// [`NCP114AMX330_V_OUT_VOLTS`]. `None` for any other — a Version B
+    /// part has no discharge, and another voltage option is a number this
+    /// model does not carry.
+    pub fn ncp114_from_part_number(part_number: &str) -> Option<Self> {
+        (part_number.trim() == "NCP114AMX330TCG").then(|| Self::ncp114(NCP114AMX330_V_OUT_VOLTS))
     }
 
     /// The XLSEMI XL1509 fixed-output buck at `v_set`: runs from 4.5 V in

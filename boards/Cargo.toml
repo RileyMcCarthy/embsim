@@ -13,7 +13,13 @@ categories = ["embedded", "simulation"]
 embsim-board = { path = "../board" }
 embsim-core = { path = "../core" }
 embsim-models = { path = "../models" }
+# A bench component kind's options that are lists (`scripted-source`'s
+# `steps`), read as the project file wrote them.
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
+# The host-serial test opens its PTYs non-blocking, as host software does.
+libc.workspace = true
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

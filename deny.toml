@@ -61,14 +61,19 @@ confidence-threshold = 0.8
 crate = "embsim-boards"
 allow = ["CC-BY-SA-4.0"]
 
-# embsim-p2-qemu carries the QEMU Propeller 2 target in p2-qemu/qemu-target/,
-# LGPL-2.1-or-later as QEMU targets are, and links it into the test binary when
-# EMBSIM_QEMU_P2_BUILD names a QEMU tree; its own Rust and hostdrive.c are MIT.
-# So the crate is `MIT AND LGPL-2.1-or-later`. See LICENSES/ and
-# p2-qemu/qemu-target/README.md.
+# embsim-p2-qemu's Rust is MIT and links nothing of QEMU, which runs as a
+# separate program. But the crate carries the QEMU Propeller 2 target in
+# p2-qemu/qemu-target/, and src/target.rs embeds every one of its files,
+# verbatim, in each binary that links the crate, for `embsim qemu install`
+# to write out and build qemu-system-p2 from: the target and board
+# LGPL-2.1-or-later, its two QEMU patches GPL-2.0-or-later (and MIT for the
+# hunks to MIT files). They are data, never compiled as code, but they are
+# distributed in every `embsim` binary under their own licences, so the
+# crate is `MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later`. See LICENSES/,
+# p2-qemu/qemu-target/README.md and the README's licence section.
 [[licenses.exceptions]]
 crate = "embsim-p2-qemu"
-allow = ["LGPL-2.1-or-later"]
+allow = ["LGPL-2.1-or-later", "GPL-2.0-or-later"]
 
 [licenses.private]
 # embsim-minimal-example is `publish = false` and carries no license field;

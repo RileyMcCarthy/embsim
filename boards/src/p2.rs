@@ -190,10 +190,12 @@
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use embsim_board::report::instant;
 use embsim_board::{
-    jesd8c01_lvcmos_thresholds, Amps, AttachError, Component, ComponentNetIo, DeadBand,
-    DigitalReceiver, Level, Ohms, PinDecl, PinHandle, Sense, TheveninDrive, Thresholds, Volts,
-    WakeGate, WakeHandler,
+    jesd8c01_lvcmos_thresholds, Amps, Assignment, AttachError, Component, ComponentDecl,
+    ComponentNetIo, DeadBand, DigitalReceiver, KindInfo, Level, ModelFacade, Ohms, PartOptions,
+    PartRegistry, PinDecl, PinHandle, ProjectError, Report, Sense, TheveninDrive, Thresholds,
+    Volts, WakeGate, WakeHandler,
 };
 use embsim_core::virtual_clock;
 
@@ -1167,6 +1169,289 @@ pub struct HeldInReset;
 impl P2Core for HeldInReset {
     fn attach(&mut self, _pads: P2Pads) -> Result<(), AttachError> {
         Ok(())
+    }
+}
+
+/// A core chosen at run time — the one a project's `core` option names —
+/// is a core like any other: the package holds it behind the same gate.
+impl P2Core for Box<dyn P2Core> {
+    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
+        (**self).attach(pads)
+    }
+
+    fn start(&mut self) {
+        (**self).start();
+    }
+
+    fn reset(&mut self) {
+        (**self).reset();
+    }
+}
+
+// ============================================================
+// Core kinds: what a project's `core` option names
+// ============================================================
+
+/// Builds the core for one part when its board is built. An `Err` is a
+/// core that could not be made, with the reason: the package refuses to
+/// attach with it, so the system does not start.
+pub type CoreCtor =
+    Box<dyn Fn(&ComponentDecl) -> Result<Box<dyn P2Core>, String> + Send + Sync + 'static>;
+
+/// What runs inside the `p2` part kind's package: a catalog of core kinds.
+///
+/// The `p2` kind is the package — its pins, the START gate, the bank
+/// supplies, the brownout hold — and it is the same whichever core runs:
+/// it takes `core` from the entry's options, asks the core catalogs it was
+/// given for that kind, hands the rest of the options to the core
+/// ([`Self::seat`]), and wraps whatever the core's constructor returns in a
+/// [`P2Package`], so no core skips the gate ([`register_p2`]).
+pub trait CoreCatalog {
+    /// The catalog's name, as an error naming two catalogs prints it.
+    fn name(&self) -> &str;
+
+    /// The core kinds it provides, each described as every sort of kind
+    /// is ([`KindInfo`]): the name a project's `core` option gives
+    /// (`"qemu"`), what runs in a phrase (`"the chip booting its ROM on
+    /// QEMU"`), and the options it cannot be seated without.
+    fn core_kinds(&self) -> Vec<KindInfo>;
+
+    /// Check `options` — every option of the entry but `core` — for the
+    /// core `core` in the parts `assignment` reaches, refusing any it does
+    /// not take ([`PartOptions::finish`]), and return the constructor the
+    /// board build calls once per part. Starts nothing: a survey calls this
+    /// too. A core with something to say in a run adds its
+    /// [`Report`] to `assignment.reports` from the constructor.
+    fn seat(
+        &self,
+        core: &str,
+        assignment: &Assignment<'_>,
+        options: PartOptions,
+    ) -> Result<CoreCtor, ProjectError>;
+}
+
+/// The one core the standard catalog has: `held-in-reset`, the chip before
+/// it runs ([`HeldInReset`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HeldInResetCores;
+
+impl CoreCatalog for HeldInResetCores {
+    fn name(&self) -> &str {
+        crate::catalog::NAME
+    }
+
+    fn core_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("held-in-reset", "the chip before it runs")]
+    }
+
+    fn seat(
+        &self,
+        _core: &str,
+        _assignment: &Assignment<'_>,
+        options: PartOptions,
+    ) -> Result<CoreCtor, ProjectError> {
+        options.finish()?;
+        Ok(Box::new(|_| Ok(Box::new(HeldInReset) as Box<dyn P2Core>)))
+    }
+}
+
+/// The core kinds `cores` provide, as an option taking one says them:
+/// `"held-in-reset", the chip before it runs; or "qemu", …`.
+pub fn core_kinds_listed(cores: &[KindInfo]) -> String {
+    let kinds: Vec<String> = cores
+        .iter()
+        .map(|kind| format!("{:?}, {}", kind.name, kind.summary))
+        .collect();
+    match kinds.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{}, or {last}", rest.join("; ")),
+    }
+}
+
+/// The `core` option's meaning, naming every core `cores` provide: what
+/// the `p2` kind's refusal of a missing `core` says.
+pub fn core_option_means(cores: &[&dyn CoreCatalog]) -> String {
+    let kinds: Vec<KindInfo> = cores
+        .iter()
+        .flat_map(|catalog| catalog.core_kinds())
+        .collect();
+    format!(
+        "what runs inside the package: {}",
+        core_kinds_listed(&kinds)
+    )
+}
+
+/// Register the `p2` part kind under `assignment`'s key: the package around
+/// the core its `core` option names, from whichever of `cores` provides it.
+/// `clash` names the catalogs that each provide a name, when two or more
+/// do (a set's [`embsim_board::Catalog::kind_clash`]); a core two catalogs
+/// provide is refused, naming them.
+///
+/// The package adds a report for every part it seats: its START instant at
+/// the look that sees it, and at the end the state of its gate and the
+/// core it holds.
+pub fn register_p2(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+    cores: &[&dyn CoreCatalog],
+    clash: &dyn Fn(&str) -> Vec<String>,
+) -> Result<(), ProjectError> {
+    let mut owned: Vec<String> = Vec::new();
+    for kind in cores.iter().flat_map(|catalog| catalog.core_kinds()) {
+        if !owned.iter().any(|name| *name == kind.name) {
+            owned.push(kind.name.into_owned());
+        }
+    }
+    let names: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let core = options.choice("core", &names)?.ok_or_else(|| {
+        assignment.error(format!("options.core says {}", core_option_means(cores)))
+    })?;
+    let providers: Vec<&dyn CoreCatalog> = cores
+        .iter()
+        .copied()
+        .filter(|catalog| catalog.core_kinds().iter().any(|kind| kind.name == core))
+        .collect();
+    let mut named: Vec<String> = clash(core);
+    if named.len() < 2 && providers.len() >= 2 {
+        named = providers
+            .iter()
+            .map(|catalog| catalog.name().to_string())
+            .collect();
+    }
+    if named.len() >= 2 {
+        return Err(assignment.error(format!(
+            "core {core:?} is provided by {} catalogs, {}; a kind means one thing, so a \
+             catalog a project adds gives each of its kinds a name no other catalog has, its \
+             project's prefix in front (PROJECTS.md §10)",
+            named.len(),
+            and_list(&named)
+        )));
+    }
+    let ctor = providers[0].seat(core, assignment, options)?;
+    let reports = assignment.reports.clone();
+    let board = assignment.board.to_string();
+    let core_name = core.to_string();
+    registry.register_model(
+        assignment.key,
+        ModelFacade::of(format!("p2, core = {core:?}"), &p2x8c4m64p_pins()),
+        move |decl| -> Box<dyn Component> {
+            // The package's report goes first: a core adds its own while
+            // it is built, and the package's handle exists only once the
+            // core is in it.
+            let handle = Arc::new(Mutex::new(None));
+            reports.add(PackageReport {
+                subject: format!("{board}.{}", decl.reference),
+                core: core_name.clone(),
+                package: Arc::clone(&handle),
+                started: false,
+            });
+            match ctor(decl) {
+                Ok(core) => {
+                    let package = P2Package::new(core);
+                    *handle
+                        .lock()
+                        .expect("the report's handle is never poisoned") = Some(package.handle());
+                    Box::new(package)
+                }
+                Err(message) => Box::new(Unbooted {
+                    pins: p2x8c4m64p_pins(),
+                    message: format!("{}: core {core_name:?}: {message}", decl.reference),
+                }),
+            }
+        },
+    );
+    Ok(())
+}
+
+/// `"a and b"`, `"a, b and c"`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// What a seated package says in a run: when its core started, and at the
+/// end the state of its gate and the core it holds.
+struct PackageReport {
+    subject: String,
+    core: String,
+    /// Filled once the core is in the package; `None` for a core that
+    /// could not be made, whose package refuses to attach.
+    package: Arc<Mutex<Option<P2PackageHandle>>>,
+    started: bool,
+}
+
+impl PackageReport {
+    fn handle(&self) -> Option<P2PackageHandle> {
+        self.package
+            .lock()
+            .expect("the report's handle is never poisoned")
+            .clone()
+    }
+}
+
+impl Report for PackageReport {
+    fn subject(&self) -> String {
+        self.subject.clone()
+    }
+
+    fn look(&mut self, _now_ns: u64) -> Vec<String> {
+        if self.started {
+            return Vec::new();
+        }
+        match self.handle().and_then(|handle| handle.started_at_ns()) {
+            Some(at) => {
+                self.started = true;
+                vec![format!("the core started at {}", instant(at))]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn summary(&self) -> Vec<String> {
+        let Some(handle) = self.handle() else {
+            return vec![format!("core {:?}: not made", self.core)];
+        };
+        let state = match handle.start_state() {
+            StartState::Started { at_ns } => format!("started at {}", instant(at_ns)),
+            StartState::BrownoutWithoutReset {
+                started_at_ns,
+                at_ns,
+                ..
+            } => format!(
+                "started at {}, held by a brownout without a reset at {}",
+                instant(started_at_ns),
+                instant(at_ns)
+            ),
+            StartState::Restarting { starts_at_ns, .. } => {
+                format!("reset released, starting at {}", instant(starts_at_ns))
+            }
+            StartState::Held { reset } => format!("held in reset ({reset:?})"),
+        };
+        vec![format!("core {:?}: {state}", self.core)]
+    }
+}
+
+/// The package's pins around a core that could not be made: it refuses to
+/// attach with the reason, so the system does not start.
+struct Unbooted {
+    pins: Vec<PinDecl>,
+    message: String,
+}
+
+impl Component for Unbooted {
+    fn pins(&self) -> &[PinDecl] {
+        &self.pins
+    }
+
+    fn attach(&mut self, _io: ComponentNetIo) -> Result<(), AttachError> {
+        Err(AttachError::Failed {
+            message: self.message.clone(),
+        })
     }
 }
 

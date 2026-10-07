@@ -3,19 +3,24 @@ name = "embsim-p2-qemu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# The node (Rust, hostdrive.c) is MIT; the QEMU target it carries in
-# qemu-target/ is LGPL-2.1-or-later (LICENSES/, qemu-target/README.md).
-license = "MIT AND LGPL-2.1-or-later"
+# The crate's Rust is MIT, as every embsim crate's is, and links nothing of
+# QEMU: QEMU runs as its own program, `qemu-system-p2`, a separate GPL-2.0
+# work, over a small fixed protocol (src/protocol.rs). But the package also
+# carries the QEMU target that program is built from (qemu-target/: the
+# target and board LGPL-2.1-or-later, its two QEMU patches GPL-2.0-or-later
+# and MIT by the QEMU files they modify, insn.decode MIT), and src/target.rs
+# embeds every one of those files, verbatim, in each binary that links the
+# crate (`include_bytes!`), so `embsim qemu install` writes out and builds
+# exactly the target this crate speaks to. None of it is compiled as code,
+# but all of it is distributed with the crate and in every `embsim` binary,
+# each file under its own licence: hence the expression, as embsim-boards
+# names the CC BY-SA netlist it embeds the same way. The texts are in
+# LICENSES/ and qemu-target/LICENSE-PNut-TS.
+license = "MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later"
 repository.workspace = true
-description = "The QEMU Propeller 2 target as an embsim board component: a node that drives pins as edges on nets and boots the way silicon does"
+description = "The QEMU Propeller 2 target as an embsim board component: a node that drives pins as edges on nets and boots the way silicon does, with QEMU as a separately installed qemu-system-p2"
 keywords = ["embedded", "emulator", "simulation", "sil", "qemu"]
 categories = ["embedded", "simulation"]
-
-# The node links QEMU as a library — several hundred objects scraped from a
-# configured QEMU build tree. That tree is found through EMBSIM_QEMU_P2_BUILD at
-# build time. When the variable is unset the crate still compiles, to a stub
-# that says so, because a workspace must build on a machine with no QEMU.
-build = "build.rs"
 
 [dependencies]
 embsim-core = { path = "../core" }
@@ -23,10 +28,17 @@ embsim-board = { path = "../board" }
 # The node is the core inside `embsim_boards::p2::P2Package`, and the pad
 # strengths are decoded there (boards never depends back on this crate).
 embsim-boards = { path = "../boards" }
+# The shared page (mmap), the futex the two processes hand off on, the
+# child's process group and its inherited descriptors.
+libc.workspace = true
+# The target's identity: the digest stage.sh computes with sha256sum.
+sha2 = "0.10"
+# The `p2` kind's options, handed on to the standard catalog
+# (`catalog::QemuCores`).
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 embsim-models = { path = "../models" }
-
-[build-dependencies]
-cc = "1"
+rstest.workspace = true
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

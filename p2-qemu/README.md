@@ -33,39 +33,149 @@ ROM instructions apart, never collapsed and never a slice late. The same
 boot diffs state-for-state against p2core (`SIL/p2core/tools/romtest.sh` in
 MaD) — 60 000 states identical.
 
-## Building it
+## Getting `qemu-system-p2`
 
-QEMU is linked into the process as a library. The crate finds a configured
-QEMU build tree through one variable:
+QEMU is not linked into embsim. The P2 runs in `qemu-system-p2`, a program
+of its own, built from the target this crate carries
+([`qemu-target/`](qemu-target/README.md), embedded in the crate so any
+embsim can build it) and installed once:
 
 ```bash
-EMBSIM_QEMU_P2_BUILD=/path/to/qemu/build-p2 cargo test -p embsim-p2-qemu
+embsim qemu install      # fetch QEMU v10.1.0, stage the target, build, install
+embsim qemu path         # which qemu-system-p2 a run would start, and whether it fits
 ```
 
-Unset, the crate compiles to a stub: `P2Qemu::with_boot_rom` returns
-`Err(P2QemuError::Unavailable)`, and `tests/rom_boot_ec32mb.rs` is not built
-(`cfg(qemu_linked)`), so a stub `cargo test -p embsim-p2-qemu` cannot report
-the boot as a passing test. Unit tests in `lib.rs` / `flashimage.rs` still
-run. The workspace builds on a machine with no QEMU; CI's `p2-qemu-boot` job
-is the real boot gate.
+`install` checks out QEMU at the tag and commit `qemu-target/QEMU_PIN`
+names, stages the target with `qemu-target/stage.sh`, configures the one
+target and none of QEMU's default features (`install::CONFIGURE`; an
+8 MB binary needing only the system's libraries and glib), builds with
+ninja and installs into `~/.embsim/qemu/<identity>/` (or `--prefix DIR`),
+then starts the installed program and checks its handshake. It needs git, a
+C compiler, ninja, pkg-config, glib's development files and python3, and
+says how to get them when one is missing; a few minutes the first time.
+`--build-dir DIR` builds there (and an install that stopped picks up where
+it was), `--keep-build` keeps it, `--qemu-git URL` fetches from a mirror or
+a local clone (the pinned commit is checked whatever the source),
+`--dry-run` says what it would do.
 
-Making that tree is [`qemu-target/README.md`](qemu-target/README.md): QEMU
-`v10.1.0`, the `target/p2` and `hw/p2` sources from this directory, two
-patches. `build.rs` then replays QEMU's own link line out of `build.ninja` —
-every object but `system_main.c.o` (the only `main()`). A stale build that
-still contains `flashbus.c.o` is refused. It compiles `hostdrive.c`
-against QEMU's headers with the target's own flags. `.github/workflows/ci.yml`'s
-`p2-qemu-boot` job does all of it from a clean checkout.
+The node finds the program in three places, in order: the file
+`EMBSIM_QEMU_SYSTEM_P2` names; `qemu-system-p2` on `PATH`; and
+`~/.embsim/qemu/<identity>/`. `<identity>` is the target's identity
+(`target::identity`): the first 16 hex digits of the SHA-256 over the
+target's sources, which `stage.sh` computes the same way (`stage.sh
+--identity` prints it). The program reports it in its handshake, with its
+protocol version and its QEMU version, and a program that differs in any is
+refused, the error saying which and how to install the matching one — so
+two embsims whose targets differ keep two programs side by side, and an
+out-of-date program is never driven by a newer node.
+
+With no program to find, the crate still builds and its unit tests run;
+starting a node fails with where it looked and how to install one. The
+tests that boot the P2 (`tests/rom_boot_ec32mb.rs`, `crystal_pll.rs`,
+`pad_modes.rs`, `lifecycle.rs`) are `#[ignore]`d for that reason, so a
+workspace run without QEMU cannot report a boot it did not run; with one
+installed:
+
+```bash
+cargo test -p embsim-p2-qemu -- --include-ignored
+EMBSIM_P2_QEMU_TRANSPORT=socket cargo test -p embsim-p2-qemu -- --include-ignored
+```
+
+CI's `p2-qemu-boot` job installs the program with `embsim qemu install`
+(cached on the target's identity and the QEMU pin) and runs exactly those,
+on both channels, and the command's own QEMU tests. `tests/program.rs`
+runs everywhere: a stand-in program speaking the protocol proves the node's
+half — the refusals, a death reported with its status and standard error,
+a program that will not quit killed — and that `stage.sh` and the crate
+compute one identity.
+
+### The licence of the program
+
+`qemu-system-p2` is QEMU, and QEMU as a whole is GPL-2.0: the installed
+program is a GPL-2.0 work. `install` puts QEMU's licence texts beside it,
+the target sources it was built from under `source/`, and a `NOTICE`
+saying how it was built — its corresponding source. embsim runs it as a
+separate program and talks to it over a small fixed protocol (a shared page
+or a socket pair, `src/protocol.rs`); it links none of QEMU, and nothing of
+embsim is in the program. The crate's Rust is MIT, as every embsim
+crate's is; it also carries the target's sources, each file under its own
+licence (`qemu-target/README.md`, "License"), and embeds them verbatim in
+every binary that links it, as data it never compiles — so its licence is
+`MIT AND LGPL-2.1-or-later AND GPL-2.0-or-later`. This is a statement of
+how the pieces are put together, not legal advice.
+
+## In a project
+
+`catalog::QemuCores` is a core catalog of one kind, `qemu`, for the `p2`
+part kind, and `catalog::register` adds it to a catalog set: the package
+holds a `P2Qemu` that boots `BOOT_ROM` (or the file the core's `rom` option
+names) when the board is built, never when it is only surveyed. Seating the
+entry finds the program, and with none refuses it saying how to install
+one. Each part the key reaches boots a program of its own. The core
+reports its console, per pad, its yields, and — if its program died — why
+it stopped. The `embsim` command's set (`embsim_cli::shipped`) holds it:
+`embsim run` on a project whose P2 is `core = "qemu"` boots the ROM off the
+board's flash, as `tests/rom_boot_ec32mb.rs` does.
 
 ## Where the CPU runs, and why
 
-On the engine thread, called from the node's own wake — the same shape `p2iss`
-runs `p2core` in. QEMU's vCPU thread parks at start-up (`host-thread.patch`);
-the engine thread registers itself with RCU and TCG and runs the round-robin
-loop's own slice triple, one cog and one bounded instruction budget at a time
-(`hostdrive.c`). Spike 1d measured a slice at 172–254 ns, exact to the
-instruction, against 10 900 ns for a cross-thread park/wake. A pin edge is a
-function call.
+In `qemu-system-p2`, in host-driven mode (`qemu-target/target-p2/hostipc.c`,
+turned on by the machine property `-M p2,hostipc=…` the node passes). QEMU's
+own vCPU thread parks at start-up (`host-thread.patch`); a thread of
+`hostipc.c` registers with RCU and TCG and runs the round-robin loop's own
+slice triple, one cog and one bounded instruction budget at a time, as the
+node asks.
+
+The node and the program take turns in lockstep: one RUN — run the cogs
+until this cog clock, with these net levels, these pads reading their own
+`OUT` and these banks powered — and one STOP — why it stopped (a pad
+changed, the horizon, the clock word, nothing could run), at what cog
+clock, and what the guest now drives — per stop (`src/protocol.rs`). The
+guest-facing half of the pin bus lives in the program, next to the CPU, so
+not one pin operation crosses: every read inside a slice is answered from
+the RUN's snapshot, because a slice ends at the first instruction that
+changes what the chip drives and the nets move only between slices. The
+electrical model — what a pad presents, the banks, the nets, the clock —
+stays here. The program decides only *whether* a pad's drive changed, by a
+key that is equal exactly when the node's drive is equal given the bank
+states each RUN carries.
+
+Over the shared page each side spins 20 µs for the other's turn, then
+blocks on a futex (`__ulock` on macOS, `futex(2)` on Linux; both in CI), so
+a turn costs a fraction of a microsecond while both turns are short; a
+socket pair is the fallback (`EMBSIM_P2_QEMU_TRANSPORT=socket`, about 5 µs
+a turn). Measured by the spike that chose this (2026-10-01, the M2 under
+load): the ROM boot in 29–34 ms against 28–32 ms with QEMU linked, the
+transport adding 0.24–0.39 µs a stop; the boot's edges, instants, yields,
+publishes and 60 000 p2core states, and a two-cog race over 1.2e8
+instructions, bit-identical across both transports and linked. The cost is
+a second core spinning while the two take turns; with the engine's turn
+longer than the spin, a turn pays a futex wake (about 5 µs).
+
+The program never outlives its node. It is started in a process group of
+its own (a terminal's ^C reaches embsim, whose run ends cleanly, and not
+it), with three descriptors and nothing on disk: the channel, the boot ROM
+as an unlinked file read as `/dev/fd/N`, and the read end of a pipe whose
+write end only embsim holds — when embsim dies, however it dies, the
+program's watch thread reads end of file and the program exits at once.
+Dropping a node asks its program to quit and kills it if it has not within
+a second. A program that dies is noticed within 100 ms (a blocked wait asks
+the kernel every 100 ms; the socket closes at once) and reported with its
+exit status and the last of its standard error, which the node also passes
+through to embsim's own; the core then runs no further
+(`P2QemuHandle::failure`), and `embsim run` stops there and exits
+non-zero. One that lives but has not answered a turn in 30 s is killed and
+reported as unresponsive. A program sent `SIGTERM`, `SIGINT` or `SIGHUP`
+ends at once: QEMU's own handler takes the signal, and the program exits
+from its main loop before QEMU's shutdown would pause the parked vCPUs
+(`qemu-target/README.md`, "Host-driven mode").
+
+No wall-clock input reaches the guest. A slice is exactly the instruction
+count asked for: the parked vCPU thread parks before it arms QEMU's kick
+timer, the board arms no quantum timer, and `host-thread.patch` keeps
+real-time timers out of the icount limit in host-driven mode, so no timer a
+main-loop option arms can cut a slice short; and it makes a kick from any
+thread that runs no cog do nothing, so neither can QEMU's main loop.
 
 ## How an edge gets its instant
 
@@ -116,7 +226,7 @@ flash edge at fourteen seconds.
 
 ## What the bus models
 
-`P2PinBusOps` (`qemu-target/target-p2/pinbus.h`), in Rust:
+The guest-facing bus, in `qemu-target/target-p2/hostipc.c`:
 
 - `DIRx`/`OUTx` are per-cog registers and the pad sees the OR across all
   eight. A pad the guest drives is a Thevenin source at the strength its
@@ -131,6 +241,10 @@ flash edge at fourteen seconds.
   pad pulling a line high through 15 kΩ reads the sink holding it low
   (`tests/pad_modes.rs`) — the read an I2C master's clock stretch and ACK
   depend on.
+- A pad's high is its bank's supply; a pad driven in a bank whose supply
+  names no voltage presents nothing and the package reports the bank once;
+  a supply that moves takes the pads driven in its bank with it at the
+  node's next wake.
 - `TESTP` on a pin with no smart-pin mode reads its **level**. In an ADC mode
   it reads the (unmodelled) bit stream as zeros, matching p2core; a receiver
   reports no byte waiting. Anything else configured reads ready.
@@ -141,11 +255,11 @@ flash edge at fourteen seconds.
 - A net that floats or contends holds the pin's last level. An unresolvable
   net is not a logic value; inventing one hides the fault.
 
-## One machine per process
+## One program per P2
 
-`qemu_init` is process-global and not repeatable. The first
-`P2Qemu::with_boot_rom` boots it; a second in the same process is refused with
-`AlreadyBooted`. Put each system that needs a P2 in its own test binary.
+Each `P2Qemu` starts a `qemu-system-p2` of its own, so a board may carry two
+P2s and a test binary may hold as many as it likes: `tests/pad_modes.rs`
+runs two on one bench, each reading its own nets.
 
 ## The state trace, and the p2core differential
 
@@ -166,20 +280,12 @@ end because it is large and carries nothing the numbers do not.
 SIL=~/Documents/MaD/SIL              # the MaD checkout; p2core is not a dependency of embsim
 W=$(mktemp -d)
 
-# 1. The flash image the boot test builds (flashimage::boot_flash): stage-1
-#    in the first KB balanced to "Prop", the payload's length and image at
-#    $400 — the same bytes as romtest.sh's python.
-python3 - p2-qemu/rom/stage1.bin "$W/flash.bin" <<'PY'
-import sys, struct
-stage1 = open(sys.argv[1], 'rb').read()
-payload = b''.join(struct.pack('<I', w) for w in (0xF607EC42, 0xFC27EC3E, 0xFD9FFFFC))
-img = bytearray(0x404 + len(payload)); img[:len(stage1)] = stage1
-img[0x400:0x404] = struct.pack('<I', len(payload)); img[0x404:] = payload
-PROP = struct.unpack('<I', b'Prop')[0]
-s = sum(struct.unpack_from('<I', img, i)[0] for i in range(0, 0x400, 4)) & 0xFFFFFFFF
-img[0x3FC:0x400] = struct.pack('<I', (PROP - s) & 0xFFFFFFFF)
-open(sys.argv[2], 'wb').write(bytes(img))
-PY
+# 1. The flash image the boot test builds (`embsim flash-image`, over
+#    flashimage::boot_flash): stage-1 in the first KB balanced to "Prop",
+#    the payload's length and image at $400 — the same bytes as
+#    romtest.sh's python. The payload is mov pa,#"B" / wypin pa,#62 / jmp #$.
+printf '\102\354\007\366\076\354\047\374\374\377\237\375' > "$W/payload.binary"
+cargo run --quiet -p embsim-cli -- flash-image "$W/payload.binary" -o "$W/flash.bin"
 
 # 2. The reference: p2core's cog-0 state, one line per instruction, 60 000
 #    of them, booting the same ROM off the same image (P2CORE_NO_FF turns
@@ -188,9 +294,10 @@ cargo build --release --quiet --manifest-path "$SIL/Cargo.toml" -p p2core --exam
 P2CORE_NO_FF=1 P2STATE_ROM=p2-qemu/rom/rom_booter_v33k.bin P2STATE_FLASH="$W/flash.bin" \
     "$SIL/target/release/examples/p2state" - 60000 > "$W/ref.txt"
 
-# 3. The node's trace: the boot test, traced.
-EMBSIM_QEMU_P2_BUILD=~/Documents/qemu-p2/build-p2 EMBSIM_P2_QEMU_TRACE="$W/trace.txt" \
-    cargo test -p embsim-p2-qemu --test rom_boot_ec32mb -- --nocapture
+# 3. The node's trace: the boot test, traced (the installed qemu-system-p2;
+#    the trace is flushed when the node asks the program to quit).
+EMBSIM_P2_QEMU_TRACE="$W/trace.txt" \
+    cargo test -p embsim-p2-qemu --test rom_boot_ec32mb -- --include-ignored --nocapture
 
 # 4. Cog 0's first 60 000 states, and the comparison romtest.sh makes
 #    (a QEMU line repeated where the reference does not repeat is a
@@ -224,7 +331,10 @@ and 2026-09-25 once more with the core started 3 ms after the reset releases
 2026-09-25 after that phase's review (a clock's phases combined on their
 voltages, a supply's move re-delivering its pads, the resolver's scratch
 buffers; the reference reused again), and 2026-09-26 with the clock decode
-reading `%CC` and `%E` beside `%SS` (the final lows; the reference reused)
+reading `%CC` and `%E` beside `%SS` (the final lows; the reference reused),
+and 2026-10-02 with QEMU out of process, the `qemu-system-p2` `embsim qemu
+install` built (`NODES.md` §14; the reference regenerated from MaD's
+prebuilt `p2state`, byte-identical to the last)
 — `compared 60000, identical` each time.
 
 ## Facts of the board the boot test states as scenario
