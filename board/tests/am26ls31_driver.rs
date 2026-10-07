@@ -296,3 +296,96 @@ fn the_am26ls31_follows_its_function_table(
         }
     }
 }
+
+/// A held voltage inside `A`'s and the enables' 0.8 V to 2 V band
+/// (SLLS114N §5.3): neither level is guaranteed, so the model reads none.
+const IN_BAND: Volts = 1.4;
+
+/// `V_IL` max and `V_IH` min (SLLS114N §5.3), the band's two edges, as
+/// the datasheet prints them rather than read back from the model, so a
+/// drifted threshold constant fails here.
+const V_IL: Volts = 0.8;
+const V_IH: Volts = 2.0;
+
+/// What one channel's pair presents: `Y` at the level and `Z` its
+/// complement, or both released.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pair {
+    Drives(Level),
+    Released,
+}
+
+const H: Pair = Pair::Drives(Level::High);
+const L: Pair = Pair::Drives(Level::Low);
+const RELEASED: Pair = Pair::Released;
+
+#[rstest]
+#[case::in_band_input_on_channel_1(5.0, 0.0, [IN_BAND, 0.0, 3.0, 0.0], [RELEASED, L, H, L])]
+#[case::in_band_input_on_channel_4(5.0, 0.0, [3.0, 0.0, 3.0, IN_BAND], [H, L, H, RELEASED])]
+#[case::inputs_at_v_il(5.0, 0.0, [V_IL; 4], [L; 4])]
+#[case::inputs_at_v_ih(5.0, 0.0, [V_IH; 4], [H; 4])]
+#[case::in_band_g_not_g_high(IN_BAND, 5.0, [3.0, 0.0, 3.0, 0.0], [RELEASED; 4])]
+#[case::in_band_g_not_g_low(IN_BAND, 0.0, [3.0, 0.0, 3.0, 0.0], [H, L, H, L])]
+#[case::in_band_not_g_g_low(0.0, IN_BAND, [3.0, 0.0, 3.0, 0.0], [RELEASED; 4])]
+#[case::in_band_not_g_g_high(5.0, IN_BAND, [3.0, 0.0, 3.0, 0.0], [H, L, H, L])]
+#[case::both_enables_in_band(IN_BAND, IN_BAND, [3.0, 0.0, 3.0, 0.0], [RELEASED; 4])]
+fn the_am26ls31_reads_its_input_and_enable_levels_at_its_thresholds(
+    #[case] g: Volts,
+    #[case] not_g: Volts,
+    #[case] inputs: [Volts; 4],
+    #[case] pairs: [Pair; 4],
+) {
+    behaviour!(Test {
+        id: "am26ls31.input-levels",
+        covers: Some("models/src/am26ls31.rs#Am26ls31"),
+        given: "an AM26LS31 from the catalog at a 5 volt supply, each input and enable held \
+                at a steady voltage",
+    });
+    expect!(
+        "in-band-releases-pair",
+        "with the part enabled and one input held at 1.4 volts, that channel's outputs are \
+         released while the other three channels still drive",
+        "SLLS114N guarantees a low input only up to 0.8 volts and a high one only from 2 \
+         volts, and Table 7-1 names no output for an input with neither level"
+    );
+    expect!(
+        "threshold-edges",
+        "an input at exactly 0.8 volts drives its channel low, and one at exactly 2 volts \
+         drives it high",
+        "0.8 volts is SLLS114N's low-level input maximum and 2 volts its high-level input \
+         minimum, so each edge still reads its level"
+    );
+    expect!(
+        "in-band-enable-enables-nothing",
+        "an enable held at 1.4 volts enables nothing: the outputs are released unless the \
+         other enable is at G high or not-G low",
+        "an enable inside SLLS114N's 0.8 to 2 volt band has neither level, and Table 7-1 \
+         enables the drivers only on G high or not-G low"
+    );
+    let mut held = vec![("G", g), ("NG", not_g)];
+    let names = ["1A", "2A", "3A", "4A"];
+    held.extend(names.iter().copied().zip(inputs));
+    let outputs: Vec<String> = (1..=4)
+        .flat_map(|n| [format!("{n}Y"), format!("{n}Z")])
+        .collect();
+    let read: Vec<&str> = outputs.iter().map(String::as_str).collect();
+    let states = run(false, 5.0, &held, &read);
+    for (i, pair) in pairs.iter().enumerate() {
+        let n = i + 1;
+        let (y, z) = (states[2 * i], states[2 * i + 1]);
+        match pair {
+            Pair::Drives(level) => {
+                let complement = match level {
+                    Level::High => Level::Low,
+                    Level::Low => Level::High,
+                };
+                assert_eq!(y, NetState::Driven(*level), "{n}Y");
+                assert_eq!(z, NetState::Driven(complement), "{n}Z");
+            }
+            Pair::Released => {
+                assert_eq!(y, NetState::Floating, "{n}Y");
+                assert_eq!(z, NetState::Floating, "{n}Z");
+            }
+        }
+    }
+}
