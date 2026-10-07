@@ -413,11 +413,11 @@ project ds2.toml
   board DS2 (netlist): 31 parts: 31 classified, 0 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
   1 board, 0 bench components, 4 wires, 0 mates
 build findings (11), the system before its first wake:
-  FloatingSense { net: "DS2.GPIO1", kind: Digital }
-  FloatingSense { net: "DS2.GPIO0", kind: Digital }
-  FloatingSense { net: "DS2.~RESET", kind: Digital }
+  no source reaches DS2.GPIO1, which a digital input reads
+  no source reaches DS2.GPIO0, which a digital input reads
+  no source reaches DS2.~RESET, which a digital input reads
   …
-  FloatingSense { net: "DS2.AIN0", kind: Analog }
+  no source reaches DS2.AIN0, which an analog input reads
 ok: ds2.toml builds
 ```
 
@@ -444,7 +444,7 @@ project ds2.toml
   …
 running for 5.000000 ms of virtual time
 findings at build, before any wake (11):
-  FloatingSense { net: "DS2.GPIO1", kind: Digital }
+  no source reaches DS2.GPIO1, which a digital input reads
   …
 ran 5.000000 ms of virtual time in 0.001 s
 net DS2.+3V3: Analog(3.3)
@@ -454,7 +454,7 @@ findings: 11 (11 at build, 0 while running)
 at 5.000000 ms, each finding's net read again:
   no longer true (0):
   still true (11):
-    FloatingSense { net: "DS2.GPIO1", kind: Digital }
+    no source reaches DS2.GPIO1, which a digital input reads
     …
   about the board as built and wired (0):
 ```
@@ -492,8 +492,8 @@ each as no longer true at the voltage its regulator holds:
 ```text
   no longer true (18):
     …
-    PowerNetUnsourced { net: "EC32.Common_VDD" }: EC32.Common_VDD reads Analog(1.8133333333333335)
-    PowerNetUnsourced { net: "EC32.VIO_00_07" }: EC32.VIO_00_07 reads Analog(3.3)
+    power net EC32.Common_VDD has no source; EC32.Common_VDD now reads Analog(1.8133333333333335)
+    power net EC32.VIO_00_07 has no source; EC32.VIO_00_07 now reads Analog(3.3)
     …
 ```
 
@@ -1333,8 +1333,11 @@ catalog of the test tree's own beside the standard one
 - The `sd-card` kind needs a card image. There is no blank card.
 - The `w25q128jv` kind has no option that lays out a P2 program itself:
   `embsim flash-image` makes the image as a step before the run (section 5).
-- `run` prints findings in their Rust form (`FloatingSense { … }`). At the
-  end it reads again only the findings about a net (a
+- `check` and `run` print findings in plain words, but a net's state in
+  the engine's own names (`Floating`, `Analog(3.3)`, `Pulled(High,
+  10500.0)`, a periodic net's whole schedule): on the `--net` lines and
+  where a cleared finding says what its net reads now. At the
+  end `run` reads again only the findings about a net (a
   floating sense, an unsourced power net, a down rail, a fight, a domain
   with no reference); every other finding is listed as about the board,
   and the engine itself never withdraws a finding.

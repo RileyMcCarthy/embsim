@@ -5,6 +5,8 @@
 //! tooling can consume the same bus later. The [`Diagnostics`] collector is
 //! Vec-based; every reported finding is also emitted as a `tracing` warning.
 
+use std::fmt;
+
 use crate::net::{Ohms, PinRef, Volts};
 
 // ============================================================
@@ -312,6 +314,209 @@ pub enum Finding {
 }
 
 // ============================================================
+// Plain words
+// ============================================================
+
+/// A list of pins as `Reference.Pin`, comma-separated, in the order held.
+fn pins(pins: &[PinRef]) -> String {
+    pins.iter()
+        .map(|pin| format!("{}.{}", pin.reference, pin.pin))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl fmt::Display for SenseKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Digital => "digital",
+            Self::Analog => "analog",
+        })
+    }
+}
+
+impl fmt::Display for CallbackKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Sense => "sense",
+            Self::Wake => "wake",
+            Self::Topology => "topology",
+        })
+    }
+}
+
+/// One line in plain words: what on the board the finding is about — the
+/// net, the pins as `Reference.Pin`, the part — and what is wrong with it.
+/// Deterministic: lists print in the order the finding holds them and
+/// numbers in Rust's shortest round-trip form, so two runs that make the
+/// same finding print the same line. `Debug` stays the structural form
+/// (traces, test failures).
+impl fmt::Display for Finding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contention { net, drivers } if drivers.is_empty() => {
+                write!(f, "contention on {net}: ideal sources fight to hold it")
+            }
+            Self::Contention { net, drivers } => {
+                write!(
+                    f,
+                    "contention on {net}: {} fight to drive it",
+                    pins(drivers)
+                )
+            }
+            Self::FloatingSense { net, kind } => {
+                let article = match kind {
+                    SenseKind::Digital => "a",
+                    SenseKind::Analog => "an",
+                };
+                write!(
+                    f,
+                    "no source reaches {net}, which {article} {kind} input reads"
+                )
+            }
+            Self::AmbiguousLevel { net, volts } => write!(
+                f,
+                "{net} sits at {volts} V, neither a valid low nor a valid high"
+            ),
+            Self::CurrentIntoFloatingNode { net, pin } => write!(
+                f,
+                "{}.{} injects a current into {net}, which no voltage source reaches, so the \
+                 current goes nowhere",
+                pin.reference, pin.pin
+            ),
+            Self::PeriodicNotCoupled {
+                net,
+                capacitor,
+                hz,
+                reactance_ohms,
+                far_ohms,
+            } => {
+                write!(
+                    f,
+                    "a {hz} Hz signal does not cross {capacitor} to {net}: the capacitor's \
+                     {reactance_ohms} Ω at that rate is not small against "
+                )?;
+                if far_ohms.is_finite() {
+                    write!(f, "the {far_ohms} Ω at the far node")
+                } else {
+                    write!(f, "the far node, which no resistor touches")
+                }
+            }
+            Self::NonConvergent {
+                cluster,
+                elements,
+                solves,
+            } => write!(
+                f,
+                "the cluster at {cluster} has no operating point: its elements ({}) found no \
+                 consistent regions in {solves} solves, so its nets float",
+                elements.join(", ")
+            ),
+            Self::PowerNetUnsourced { net } => {
+                write!(f, "power net {net} has no source")
+            }
+            Self::ClassificationError {
+                reference,
+                part,
+                message,
+            } => write!(f, "{reference} ({part}) cannot be classified: {message}"),
+            Self::CallbackPanic { kind, subscriber } => write!(
+                f,
+                "a {kind} callback for {subscriber} panicked on the engine thread: the engine \
+                 carries on, but that part's own state is suspect"
+            ),
+            Self::VirtualClockUninitialized { context } => write!(
+                f,
+                "{context} needed the virtual clock before it was started, and the request was \
+                 dropped"
+            ),
+            Self::DriveSeqGap { seq } => write!(
+                f,
+                "drive {seq} never arrived (the thread that sent it died), and the engine \
+                 skipped it"
+            ),
+            Self::QuiescenceTimeout { actors } if actors.is_empty() => write!(
+                f,
+                "the engine advanced without waiting for a part: this run is not reproducible"
+            ),
+            Self::QuiescenceTimeout { actors } => write!(
+                f,
+                "the engine advanced without waiting for {}: this run is not reproducible",
+                actors.join(", ")
+            ),
+            Self::UnconnectedRegistryPin {
+                reference,
+                pin,
+                direction: PinMismatchDirection::DeclaredButAbsent,
+            } => write!(
+                f,
+                "{reference}'s model declares pin {pin}, which the netlist does not have"
+            ),
+            Self::UnconnectedRegistryPin {
+                reference,
+                pin,
+                direction: PinMismatchDirection::PresentButUndeclared,
+            } => write!(
+                f,
+                "the netlist gives {reference} a pin {pin} its model does not declare"
+            ),
+            Self::RailDown { part, pin, reason } => {
+                write!(f, "rail {part}.{pin} is down at build: ")?;
+                match reason {
+                    RailDownReason::InputUnsourced { pin: input } => {
+                        write!(f, "its supply pin {part}.{input} has no source")
+                    }
+                    RailDownReason::ReferenceUnheld { pin: reference } => write!(
+                        f,
+                        "its reference {part}.{reference} is on a net no source reaches"
+                    ),
+                    RailDownReason::HeldDown => write!(
+                        f,
+                        "the part holds it off (its input below threshold, its enable off, or \
+                         its soft-start not done)"
+                    ),
+                }
+            }
+            Self::UnreferencedDomain {
+                part,
+                pin,
+                reference,
+            } => write!(
+                f,
+                "{part}.{pin} is live, but its reference {part}.{reference} is on a net no \
+                 source reaches"
+            ),
+            Self::UndecoupledPowerPin {
+                part,
+                pin,
+                reference,
+            } => write!(
+                f,
+                "supply pin {part}.{pin} has no capacitor to its reference {part}.{reference}"
+            ),
+            Self::OpenDrainWithoutPullUp { part, pin, net } => write!(
+                f,
+                "open-drain pin {part}.{pin} has no pull-up on {net}: released, it leaves the \
+                 net floating"
+            ),
+            Self::MechanicalOnDrivenNet { part, net, drivers } => write!(
+                f,
+                "mechanical pad {part} is on {net}, which {} drive{}",
+                pins(drivers),
+                if drivers.len() == 1 { "s" } else { "" }
+            ),
+            Self::BuildNotSettled { passes, nets } if nets.is_empty() => {
+                write!(f, "the build did not settle in {passes} passes")
+            }
+            Self::BuildNotSettled { passes, nets } => write!(
+                f,
+                "the build did not settle in {passes} passes: {} still changing",
+                nets.join(", ")
+            ),
+        }
+    }
+}
+
+// ============================================================
 // Collector
 // ============================================================
 
@@ -390,6 +595,7 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vibes_behaviour::{behaviour, expect, Test};
 
     use super::*;
 
@@ -480,5 +686,223 @@ mod tests {
             }
             other => panic!("unexpected finding {other:?}"),
         }
+    }
+
+    // --------------------------------------------------------
+    // Plain words
+    // --------------------------------------------------------
+
+    fn pin(reference: &str, pin: &str) -> PinRef {
+        PinRef::new(reference, pin)
+    }
+
+    /// Every variant, and the variants a variant's text branches on, once:
+    /// the line `embsim check` and `embsim run` print for it.
+    #[rstest]
+    #[case::contention(
+        Finding::Contention {
+            net: "EC32.P2_IO0".into(),
+            drivers: vec![pin("EC32.U1", "3"), pin("EC32.U2", "5")],
+        },
+        "contention on EC32.P2_IO0: EC32.U1.3, EC32.U2.5 fight to drive it"
+    )]
+    #[case::contention_ideal(
+        Finding::Contention { net: "BENCH.3V3".into(), drivers: vec![] },
+        "contention on BENCH.3V3: ideal sources fight to hold it"
+    )]
+    #[case::floating_digital(
+        Finding::FloatingSense { net: "DS2.~RESET".into(), kind: SenseKind::Digital },
+        "no source reaches DS2.~RESET, which a digital input reads"
+    )]
+    #[case::floating_analog(
+        Finding::FloatingSense { net: "DS2.AIN0".into(), kind: SenseKind::Analog },
+        "no source reaches DS2.AIN0, which an analog input reads"
+    )]
+    #[case::ambiguous_level(
+        Finding::AmbiguousLevel { net: "DRV.A".into(), volts: 1.65 },
+        "DRV.A sits at 1.65 V, neither a valid low nor a valid high"
+    )]
+    #[case::current_into_floating_node(
+        Finding::CurrentIntoFloatingNode { net: "LC.SENSE".into(), pin: pin("LC.U4", "2") },
+        "LC.U4.2 injects a current into LC.SENSE, which no voltage source reaches, so the \
+         current goes nowhere"
+    )]
+    #[case::periodic_not_coupled(
+        Finding::PeriodicNotCoupled {
+            net: "EDGE.STEP_B".into(),
+            capacitor: "EDGE.C7".into(),
+            hz: 1000,
+            reactance_ohms: 1591.5,
+            far_ohms: 100.0,
+        },
+        "a 1000 Hz signal does not cross EDGE.C7 to EDGE.STEP_B: the capacitor's 1591.5 Ω at \
+         that rate is not small against the 100 Ω at the far node"
+    )]
+    #[case::periodic_not_coupled_no_resistor(
+        Finding::PeriodicNotCoupled {
+            net: "EDGE.STEP_B".into(),
+            capacitor: "EDGE.C7".into(),
+            hz: 10,
+            reactance_ohms: 159154.9,
+            far_ohms: f64::INFINITY,
+        },
+        "a 10 Hz signal does not cross EDGE.C7 to EDGE.STEP_B: the capacitor's 159154.9 Ω at \
+         that rate is not small against the far node, which no resistor touches"
+    )]
+    #[case::non_convergent(
+        Finding::NonConvergent {
+            cluster: "OSC.N1".into(),
+            elements: vec!["OSC.Q1".into(), "OSC.Q2".into()],
+            solves: 8,
+        },
+        "the cluster at OSC.N1 has no operating point: its elements (OSC.Q1, OSC.Q2) found no \
+         consistent regions in 8 solves, so its nets float"
+    )]
+    #[case::power_net_unsourced(
+        Finding::PowerNetUnsourced { net: "EC32.Common_VDD".into() },
+        "power net EC32.Common_VDD has no source"
+    )]
+    #[case::classification_error(
+        Finding::ClassificationError {
+            reference: "U9".into(),
+            part: "XYZ123".into(),
+            message: "no model for the part".into(),
+        },
+        "U9 (XYZ123) cannot be classified: no model for the part"
+    )]
+    #[case::callback_panic(
+        Finding::CallbackPanic { kind: CallbackKind::Wake, subscriber: "component 4".into() },
+        "a wake callback for component 4 panicked on the engine thread: the engine carries on, \
+         but that part's own state is suspect"
+    )]
+    #[case::virtual_clock_uninitialized(
+        Finding::VirtualClockUninitialized { context: "schedule_at".into() },
+        "schedule_at needed the virtual clock before it was started, and the request was dropped"
+    )]
+    #[case::drive_seq_gap(
+        Finding::DriveSeqGap { seq: 42 },
+        "drive 42 never arrived (the thread that sent it died), and the engine skipped it"
+    )]
+    #[case::quiescence_timeout(
+        Finding::QuiescenceTimeout { actors: vec!["cog 0".into(), "uart pump".into()] },
+        "the engine advanced without waiting for cog 0, uart pump: this run is not reproducible"
+    )]
+    #[case::quiescence_timeout_unnamed(
+        Finding::QuiescenceTimeout { actors: vec![] },
+        "the engine advanced without waiting for a part: this run is not reproducible"
+    )]
+    #[case::declared_but_absent(
+        Finding::UnconnectedRegistryPin {
+            reference: "U1".into(),
+            pin: "3".into(),
+            direction: PinMismatchDirection::DeclaredButAbsent,
+        },
+        "U1's model declares pin 3, which the netlist does not have"
+    )]
+    #[case::present_but_undeclared(
+        Finding::UnconnectedRegistryPin {
+            reference: "U1".into(),
+            pin: "9".into(),
+            direction: PinMismatchDirection::PresentButUndeclared,
+        },
+        "the netlist gives U1 a pin 9 its model does not declare"
+    )]
+    #[case::rail_down_input(
+        Finding::RailDown {
+            part: "EC32.U5".into(),
+            pin: "OUT".into(),
+            reason: RailDownReason::InputUnsourced { pin: "VIN".into() },
+        },
+        "rail EC32.U5.OUT is down at build: its supply pin EC32.U5.VIN has no source"
+    )]
+    #[case::rail_down_reference(
+        Finding::RailDown {
+            part: "ISO.U3".into(),
+            pin: "VOUT".into(),
+            reason: RailDownReason::ReferenceUnheld { pin: "GND2".into() },
+        },
+        "rail ISO.U3.VOUT is down at build: its reference ISO.U3.GND2 is on a net no source \
+         reaches"
+    )]
+    #[case::rail_down_held(
+        Finding::RailDown {
+            part: "EC32.U5".into(),
+            pin: "OUT".into(),
+            reason: RailDownReason::HeldDown,
+        },
+        "rail EC32.U5.OUT is down at build: the part holds it off (its input below threshold, \
+         its enable off, or its soft-start not done)"
+    )]
+    #[case::unreferenced_domain(
+        Finding::UnreferencedDomain {
+            part: "ISO.U2".into(),
+            pin: "VOA".into(),
+            reference: "GND2".into(),
+        },
+        "ISO.U2.VOA is live, but its reference ISO.U2.GND2 is on a net no source reaches"
+    )]
+    #[case::undecoupled_power_pin(
+        Finding::UndecoupledPowerPin {
+            part: "DS2.U1".into(),
+            pin: "DVDD".into(),
+            reference: "DGND".into(),
+        },
+        "supply pin DS2.U1.DVDD has no capacitor to its reference DS2.U1.DGND"
+    )]
+    #[case::open_drain_without_pull_up(
+        Finding::OpenDrainWithoutPullUp {
+            part: "DS2.U3".into(),
+            pin: "RESET".into(),
+            net: "DS2.~RESET".into(),
+        },
+        "open-drain pin DS2.U3.RESET has no pull-up on DS2.~RESET: released, it leaves the net \
+         floating"
+    )]
+    #[case::mechanical_one_driver(
+        Finding::MechanicalOnDrivenNet {
+            part: "EC32.H1".into(),
+            net: "EC32.P2_IO7".into(),
+            drivers: vec![pin("EC32.U1", "12")],
+        },
+        "mechanical pad EC32.H1 is on EC32.P2_IO7, which EC32.U1.12 drives"
+    )]
+    #[case::mechanical_drivers(
+        Finding::MechanicalOnDrivenNet {
+            part: "EC32.H1".into(),
+            net: "EC32.P2_IO7".into(),
+            drivers: vec![pin("EC32.U1", "12"), pin("EC32.U7", "1")],
+        },
+        "mechanical pad EC32.H1 is on EC32.P2_IO7, which EC32.U1.12, EC32.U7.1 drive"
+    )]
+    #[case::build_not_settled(
+        Finding::BuildNotSettled { passes: 64, nets: vec!["OSC.A".into(), "OSC.B".into()] },
+        "the build did not settle in 64 passes: OSC.A, OSC.B still changing"
+    )]
+    #[case::build_not_settled_unnamed(
+        Finding::BuildNotSettled { passes: 64, nets: vec![] },
+        "the build did not settle in 64 passes"
+    )]
+    fn a_finding_prints_in_plain_words(#[case] finding: Finding, #[case] line: &str) {
+        behaviour!(Test {
+            id: "diagnostics.finding-in-plain-words",
+            covers: Some("board/src/diagnostics.rs#Finding"),
+            given: "one finding of each kind, and each variation its text depends on",
+        });
+        expect!(
+            "one-line-of-names",
+            "the finding prints as one line naming the net, the pins as Reference.Pin or the \
+             part it is about, and what is wrong with it",
+            "the line is what embsim check and embsim run print to a terminal or a CI log"
+        );
+        expect!(
+            "same-every-time",
+            "printing the same finding twice gives the same line, its names in the order the \
+             finding holds them",
+            "two runs of a project print the same report"
+        );
+        let text = finding.to_string();
+        assert_eq!(text, line);
+        assert!(!text.contains('\n'), "{text}");
+        assert_eq!(finding.to_string(), text);
     }
 }

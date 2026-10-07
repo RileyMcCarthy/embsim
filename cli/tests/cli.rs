@@ -448,6 +448,45 @@ fn a_check_says_what_its_binary_is_made_of() {
 }
 
 #[rstest]
+fn a_check_prints_the_builds_findings_in_plain_words() {
+    behaviour!(Test {
+        id: "cli.check-findings-in-plain-words",
+        covers: Some("cli/src/live.rs#check"),
+        given: "the force-gauge add-on's project, whose connector pins and converter inputs \
+                nothing on the bench drives, checked from the command line",
+    });
+    expect!(
+        "plain-words",
+        "each build finding prints as one line in plain words: the net no source reaches and \
+         whether a digital or an analog input reads it",
+        "someone reading the check in a terminal or a CI log is told what is wrong on the board"
+    );
+    expect!(
+        "words-and-names",
+        "every finding line is made of words and the board's own names"
+    );
+    let project = workspace().join("boards/projects/ds2-addon.toml");
+    let checked = embsim(&["check", path(&project)]);
+    assert!(checked.status.success(), "{}", stderr(&checked));
+    let text = stdout(&checked);
+    assert_says(
+        &text,
+        &[
+            "build findings (11), the system before its first wake:\nno source reaches \
+             DS2Addon.GPIO1, which a digital input reads\n",
+            "\nno source reaches DS2Addon.AIN0, which an analog input reads\n",
+            "ok: ",
+        ],
+    );
+    for rust in ["FloatingSense", "{ net: ", "kind: "] {
+        assert!(
+            !text.contains(rust),
+            "a finding printed in its Rust form ({rust}):\n{text}"
+        );
+    }
+}
+
+#[rstest]
 fn version_says_what_the_binary_is_made_of() {
     behaviour!(Test {
         id: "cli.version-provenance",
@@ -801,6 +840,12 @@ fn a_run_of_the_ec32_project_reads_its_rails_up_and_repeats_exactly() {
         "at the end, the core rail's unsourced finding is listed as cleared with the rail's \
          voltage, and the undriven floating pins as still true"
     );
+    expect!(
+        "findings-in-plain-words",
+        "every finding prints in plain words: an unsourced rail as a power net with no source, \
+         an undriven pin as a net no source reaches that a digital input reads",
+        "someone reading the report in a terminal or a CI log is told what is wrong on the board"
+    );
     let project = workspace().join("boards/projects/ec32-netlist.toml");
     let args = [
         "run",
@@ -827,14 +872,21 @@ fn a_run_of_the_ec32_project_reads_its_rails_up_and_repeats_exactly() {
     assert_says(
         &text,
         &[
-            "findings at build, before any wake (35):\nFloatingSense",
-            "PowerNetUnsourced { net: \"EC32.Common_VDD\" }\n",
+            "findings at build, before any wake (35):\nno source reaches EC32.P2_RESN, which a \
+             digital input reads\n",
+            "\npower net EC32.Common_VDD has no source\n",
             "findings: 35 (35 at build, 0 while running)",
             "at 10.000000 ms, each finding's net read again:\nno longer true (18):",
-            "PowerNetUnsourced { net: \"EC32.Common_VDD\" }: EC32.Common_VDD reads Analog(1.81",
-            "still true (17):\nFloatingSense { net: \"EC32.P2_IO59\", kind: Digital }",
+            "\npower net EC32.Common_VDD has no source; EC32.Common_VDD now reads Analog(1.81",
+            "still true (17):\nno source reaches EC32.P2_IO59, which a digital input reads\n",
         ],
     );
+    for rust in ["FloatingSense", "PowerNetUnsourced", "{ net: "] {
+        assert!(
+            !text.contains(rust),
+            "a finding printed in its Rust form ({rust}):\n{text}"
+        );
+    }
     let second = embsim(&args);
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(virtual_report(&first), virtual_report(&second));
