@@ -1,8 +1,9 @@
 //! The MaD machine's three boards as a project, live:
 //! `boards/projects/edge-ec32-ds2.toml` run from the bench supplies it
-//! wires, past every soft-start, with the Edge board's RS-422 pair given
-//! the board tests' models (`machine_parts::edge_catalogs`: the standard
-//! catalog does not ship them yet).
+//! wires, past every soft-start, with the Edge board's RS-422 line receiver
+//! given the board tests' model (`machine_parts::edge_catalogs`: the
+//! standard catalog does not ship it yet; the line driver beside it is the
+//! catalog's `am26ls31`).
 //!
 //! Stepped (`TESTING.md` rule 9), its own binary: the clock stepped before
 //! the project builds the converter (its protocol thread joins the clock as
@@ -86,7 +87,7 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
     let system = Project::load(&path)
         .expect("the project loads")
         .instantiate(&edge_catalogs())
-        .expect("the project builds with the two line parts modelled")
+        .expect("the project builds with the line receiver modelled")
         .hold_time()
         .start()
         .expect("the three boards start");

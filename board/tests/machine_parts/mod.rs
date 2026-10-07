@@ -36,14 +36,15 @@
 //!
 //! # Modeled parts (real behavior)
 //!
-//! Three parts carry behavior here, each with the datasheet header
+//! Two parts carry behavior here, each with the datasheet header
 //! `BOARD_ENGINE.md` ("Model provenance convention") requires:
 //!
-//! - [`Rs422Driver`] — TI AM26LS31, the servo step/direction pair;
 //! - [`Rs422Receiver`] — TI AM26LV32, the encoder A/B/ZI pairs;
 //! - [`SerialIsolator`] — TI ISO6731, the isolated force-gauge UART.
 //!
-//! The rest come from `embsim-models`: the other four ISO67xx isolators
+//! The rest come from `embsim-models`: the AM26LS31 line driver `U24`, the
+//! servo step/direction pairs (`embsim_models::am26ls31`); the other four
+//! ISO67xx isolators
 //! (`IC1`, `IC2`, `IC14` with its STEP channel carrying a rate, `IC15`,
 //! `IC16`), the 21 SN74LVC1G14 LED drivers and the five optocouplers
 //! (`U4` a 6N137, `U5`–`U8` VO2631s) on the Edge board; the TCXO, the two
@@ -68,12 +69,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use embsim_board::registry::normalize_part;
 use embsim_board::{
-    AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver, Drive,
-    EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PeriodicSchedule,
-    PinDecl, PinHandle, Scenario, Sense, SwitchPole, TheveninDrive, Thresholds, Volts,
+    AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver,
+    EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PinDecl, PinHandle,
+    Scenario, SwitchPole, TheveninDrive, Thresholds, Volts,
 };
 use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
+use embsim_models::am26ls31::Am26ls31;
 use embsim_models::isolation::{iso67xx, Iso67xx};
 use embsim_models::logic_gate::{self, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION};
 use embsim_models::opto::Opto;
@@ -151,288 +153,6 @@ fn drive(level: Level, rail_volts: Volts) -> TheveninDrive {
             Level::Low => 0.0,
         },
         impedance: OUTPUT_IMPEDANCE_OHMS,
-    }
-}
-
-// ============================================================
-// AM26LS31 — quad differential line driver (RS-422/RS-485)
-// ============================================================
-
-//
-// Provenance
-//   Part      : Texas Instruments AM26LS31C, "AM26LS31 Quadruple Differential
-//               Line Driver" (TI literature number SLLS114N, revised June
-//               2026; see the citation note at the end of this block).
-//   Governs   : the datasheet's **function table** — input A and the two
-//               enables G / ~G against outputs Y / Z — which is the whole of
-//               the behavior modeled here.
-//   Instance  : MaD EdgeBoard U24 (`AM26LS31CD`), sheet `MaD_Edge_Sheet3`,
-//               driving the servo step/direction pairs `SC_PUL±` / `SC_DIR±`
-//               out of connector J21.
-//
-// Behavior modeled
-//   Per channel, when the outputs are enabled: Y follows the channel's A
-//   input and Z is its complement — the differential pair. When A carries a
-//   running (or held, crossing) periodic whose phases settle to two different
-//   levels through `AM26LS31_INPUT_THRESHOLDS`, the pair is published as
-//   `Drive::Periodic` around that segment — the same "relay when it crosses"
-//   contract as the ISO67xx / logic-gate rate path. A non-crossing wave or a
-//   single-level input stays on today's level (or release) path; nothing
-//   invents a differential for an ambiguous input. When disabled or
-//   unpowered, both outputs are released to high-Z (the function table's
-//   high-impedance row).
-//   Enable is the datasheet's OR structure: outputs are active when G is high
-//   OR ~G is low, and high-Z only when G is low AND ~G is high. On the
-//   EdgeBoard both enables are strapped active (G to the isolated 5 V rail,
-//   ~G to the isolated ground), so the driver is unconditionally on — which
-//   this model reproduces rather than assumes.
-//
-// Deliberately NOT modeled
-//   * Propagation delay and channel skew (tens of nanoseconds): far below one
-//     bit of any step train the machine produces, and the engine has no
-//     sub-microsecond scheduling granularity to express it.
-//   * The output stage's drive current, short-circuit limit, and output
-//     voltage protection: an unloaded Thevenin source at
-//     OUTPUT_IMPEDANCE_OHMS stands in for it.
-//   * V_OH tracking the supply. Outputs drive at the configured rail voltage;
-//     a rail-referred V_OH is the regulator-model slice.
-//   * Channels 3 and 4. The EdgeBoard schematic marks 3A/3Y/3Z/4A/4Y/4Z
-//     no-connect, so they are declared `Passive` (see the module docs) — the
-//     part has them, this board does not use them.
-//
-// Citation note
-//   The behavior above is the function table, which is stable across every
-//   revision of this part. The literature number and revision were pinned
-//   when the input thresholds were declared (SLLS114N §5.3, see
-//   `AM26LS31_INPUT_THRESHOLDS`); when this model is promoted out of the test
-//   tree, add per-behavior "(§x.y, p.N)" citations the way `embsim-models`'
-//   ADS122U04 model does against SBAS752B.
-//
-
-/// The AM26LS31's inputs — A and the two enables — read against GND at the
-/// datasheet's TTL levels, absolute: `V_IL` max 0.8 V, `V_IH` min 2 V (TI
-/// SLLS114N, §5.3 Recommended Operating Conditions); no hysteresis is named,
-/// so between the two neither level is guaranteed ([`DeadBand::Unknown`]).
-pub const AM26LS31_INPUT_THRESHOLDS: Thresholds = Thresholds::new(0.8, 2.0, 0.0, DeadBand::Unknown);
-
-/// The AM26LS31's power-on-reset threshold, `V_POR` max with `V_CC` rising:
-/// 3.04 V (TI SLLS114N, §5.5 Electrical Characteristics) — the supply at
-/// which every part is out of reset and driving. Below it the outputs are
-/// released.
-pub const AM26LS31_VPOR_MAX_VOLTS: Volts = 3.04;
-
-/// Pin facade of the `AM26LS31CD` (SOIC-16), pin numbers as the EdgeBoard
-/// netlist names them.
-#[rustfmt::skip]
-pub const AM26LS31_PINS: [PinDecl; 16] = [
-    dig_in("1", AM26LS31_INPUT_THRESHOLDS),   // 1A  — channel-1 input
-    dig_out("2"),  // 1Y  — channel-1 true output
-    dig_out("3"),  // 1Z  — channel-1 complement
-    dig_in("4", AM26LS31_INPUT_THRESHOLDS),   // G   — active-high enable
-    dig_out("5"),  // 2Z  — channel-2 complement
-    dig_out("6"),  // 2Y  — channel-2 true output
-    dig_in("7", AM26LS31_INPUT_THRESHOLDS),   // 2A  — channel-2 input
-    pwr_in("8"),   // GND
-    nc("9"),       // 3A  — unused on this board
-    nc("10"),      // 3Y
-    nc("11"),      // 3Z
-    dig_in("12", AM26LS31_INPUT_THRESHOLDS),  // ~G  — active-low enable
-    nc("13"),      // 4Z
-    nc("14"),      // 4Y
-    nc("15"),      // 4A
-    pwr_in("16"),  // VDD
-];
-
-/// `(input, true output, complement output)` for the two channels this board
-/// wires.
-const AM26LS31_CHANNELS: [(&str, &str, &str); 2] = [("1", "2", "3"), ("7", "6", "5")];
-
-/// What one enabled channel's pair should present: a static differential
-/// level, or a differential square wave around a relayed segment.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ChannelOut {
-    /// `Y` at `level`, `Z` at its complement.
-    Level(Level),
-    /// `Y` swings `hi`/`lo` (as levels) around `segment`; `Z` is the
-    /// complement of each phase — the differential pair of a relayed clock.
-    Periodic {
-        hi: Level,
-        lo: Level,
-        segment: PeriodicSchedule,
-    },
-}
-
-/// Mutable driver state. Every field is written only from engine-thread sense
-/// callbacks, so the mutex is uncontended in practice and exists to keep the
-/// component `Sync`.
-#[derive(Default)]
-struct DriverState {
-    powered: bool,
-    enable_high: Option<Level>,
-    enable_low: Option<Level>,
-    inputs: [Option<ChannelOut>; 2],
-    outputs: Vec<(PinHandle, PinHandle)>,
-    /// What each channel's pair last published: `Some(out)` driving the
-    /// differential, `None` released; `None` in the outer option before the
-    /// first publish. A pair re-issued unchanged would resolve nothing and
-    /// cost an engine event per sense — the same discipline as the isolator
-    /// and the gates, so `isolation_bridge` event budgets do not regress from
-    /// republishing an identical pair.
-    applied: [Option<Option<ChannelOut>>; 2],
-}
-
-struct DriverCore {
-    rail_volts: Volts,
-    state: Mutex<DriverState>,
-}
-
-impl DriverCore {
-    /// True when the SLLS114N enable structure has the outputs active: G high
-    /// OR ~G low.
-    fn enabled(state: &DriverState) -> bool {
-        state.enable_high == Some(Level::High) || state.enable_low == Some(Level::Low)
-    }
-
-    /// Re-drive every channel from the current inputs (or release when
-    /// disabled/unpowered) — only a channel whose output changed, as the
-    /// isolator and the gates publish.
-    fn apply(&self, state: &mut DriverState) {
-        let active = state.powered && Self::enabled(state);
-        for (channel, (y, z)) in state.outputs.iter().enumerate() {
-            // Disabled, unpowered, or an input with no defensible level /
-            // crossing clock: high-Z, never a guessed differential.
-            let desired = if active { state.inputs[channel] } else { None };
-            if state.applied[channel] == Some(desired) {
-                continue;
-            }
-            state.applied[channel] = Some(desired);
-            match desired {
-                Some(ChannelOut::Level(level)) => {
-                    y.set_drive(Some(drive(level, self.rail_volts)));
-                    z.set_drive(Some(drive(invert(level), self.rail_volts)));
-                }
-                Some(ChannelOut::Periodic { hi, lo, segment }) => {
-                    y.drive(Drive::Periodic {
-                        hi: drive(hi, self.rail_volts),
-                        lo: drive(lo, self.rail_volts),
-                        segment,
-                    });
-                    z.drive(Drive::Periodic {
-                        hi: drive(invert(hi), self.rail_volts),
-                        lo: drive(invert(lo), self.rail_volts),
-                        segment,
-                    });
-                }
-                None => {
-                    y.release();
-                    z.release();
-                }
-            }
-        }
-    }
-}
-
-/// The other logic level.
-fn invert(level: Level) -> Level {
-    match level {
-        Level::High => Level::Low,
-        Level::Low => Level::High,
-    }
-}
-
-/// What the channel's A input asks the pair to present: a relayed crossing
-/// clock (running, or a held segment whose phases still cross — the
-/// isolator's held-segment rule), else a single level, else release.
-fn channel_out_from_sense(receiver: &DigitalReceiver, sensed: &Sense) -> Option<ChannelOut> {
-    if let Some(clock) = sensed.periodic {
-        if let (Some(hi), Some(lo)) = clock.levels(&AM26LS31_INPUT_THRESHOLDS, None) {
-            let relayed = clock.rate(&AM26LS31_INPUT_THRESHOLDS).is_some()
-                || (clock.segment.freq_hz == 0 && hi != lo);
-            if relayed {
-                // Keep the receiver's last level in step with the delivery so
-                // a later single-level path starts from a known last.
-                let _ = receiver.read(sensed);
-                return Some(ChannelOut::Periodic {
-                    hi,
-                    lo,
-                    segment: clock.segment,
-                });
-            }
-        }
-    }
-    receiver.read(sensed).map(ChannelOut::Level)
-}
-
-/// TI AM26LS31 quad differential line driver — see the provenance block above.
-pub struct Rs422Driver {
-    core: Arc<DriverCore>,
-}
-
-impl Rs422Driver {
-    /// A driver whose outputs swing between 0 V and `rail_volts`.
-    pub fn new(rail_volts: Volts) -> Self {
-        Self {
-            core: Arc::new(DriverCore {
-                rail_volts,
-                state: Mutex::new(DriverState::default()),
-            }),
-        }
-    }
-}
-
-impl std::fmt::Debug for Rs422Driver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rs422Driver")
-            .field("rail_volts", &self.core.rail_volts)
-            .finish()
-    }
-}
-
-impl Component for Rs422Driver {
-    fn pins(&self) -> &[PinDecl] {
-        &AM26LS31_PINS
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        // Output handles first: a sense callback registered below fires
-        // immediately with the current state and must find them.
-        {
-            let mut state = self.core.state.lock().unwrap();
-            for (_, y, z) in AM26LS31_CHANNELS {
-                state.outputs.push((io.pin(y)?, io.pin(z)?));
-            }
-        }
-
-        let core = Arc::clone(&self.core);
-        io.on_sense("16", move |rail| {
-            let mut state = core.state.lock().unwrap();
-            state.powered = rail.volts.is_some_and(|v| v >= AM26LS31_VPOR_MAX_VOLTS);
-            core.apply(&mut state);
-        })?;
-        for (pin, slot) in [("4", true), ("12", false)] {
-            let core = Arc::clone(&self.core);
-            let receiver = DigitalReceiver::new(io.pin(pin)?);
-            io.on_sense(pin, move |sensed| {
-                let mut state = core.state.lock().unwrap();
-                let level = receiver.read(&sensed);
-                if slot {
-                    state.enable_high = level;
-                } else {
-                    state.enable_low = level;
-                }
-                core.apply(&mut state);
-            })?;
-        }
-        for (channel, (a, _, _)) in AM26LS31_CHANNELS.into_iter().enumerate() {
-            let core = Arc::clone(&self.core);
-            let receiver = DigitalReceiver::new(io.pin(a)?);
-            io.on_sense(a, move |sensed| {
-                let mut state = core.state.lock().unwrap();
-                state.inputs[channel] = channel_out_from_sense(&receiver, &sensed);
-                core.apply(&mut state);
-            })?;
-        }
-        Ok(())
     }
 }
 
@@ -1103,8 +823,8 @@ pub fn shipped_ec32mb_board() -> Board {
 //               SW_Push ×1 (SW1, the reset button) — a one-pole switch, open;
 //               MountingHole_Pad ×4 — mechanical nodes.
 //               (86 + 24 + 5 + 1 + 4 + 48 registered = the netlist's 168.)
-//   real model  AM26LS31CD (U24) and AM26LV32xD (U25), the encoder/servo
-//               RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator;
+//   real model  AM26LS31CD (U24, `embsim_models::am26ls31`) and AM26LV32xD
+//               (U25), the encoder/servo RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator;
 //               ISO6742DWR (IC1, IC2), ISO6741DWR (IC14), ISO6721BDR (IC15)
 //               and ISO6740FDWR (IC16), the `embsim_models::isolation`
 //               family model configured from each part name; SN74LVC1G14DBV
@@ -1164,9 +884,7 @@ pub fn edge_registry_without_socket() -> PartRegistry {
     let mut registry = PartRegistry::new();
 
     // Modeled parts.
-    registry.register("AM26LS31CD", |_decl| {
-        Box::new(Rs422Driver::new(SERVO_RAIL_VOLTS))
-    });
+    registry.register("AM26LS31CD", |_decl| Box::new(Am26ls31::new()));
     registry.register("AM26LV32xD", |_decl| {
         Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
     });
@@ -1336,7 +1054,7 @@ pub fn force_gauge_harness(edge: &str, ds2: &str) -> Harness {
 /// silkscreen do not agree and the netlist wins:
 ///
 /// 1. **The motor takes the `+` leg of the differential pair.** `SC_PUL±` and
-///    `SC_DIR±` leave J21 as RS-422 pairs driven by [`Rs422Driver`]; a real
+///    `SC_DIR±` leave J21 as RS-422 pairs driven by `U24` ([`Am26ls31`]); a real
 ///    stepper driver's own receiver turns each pair back into one logic
 ///    signal. `embsim-models`' `StepperMotor` stands in for driver *and*
 ///    motor, so it reads `SC_PUL+` / `SC_DIR+` and the complementary legs go
@@ -1467,13 +1185,14 @@ pub fn force_domain_ground(ds2: &str) -> Harness {
 }
 
 // ============================================================
-// The standard catalog, with the Edge board's RS-422 pair
+// The standard catalog, with the Edge board's RS-422 line receiver
 // ============================================================
 
-/// The Edge board's RS-422 pair, `U24` and `U25`, as these tests model them
-/// and keyed as [`edge_registry`] keys them, as base registrations: the two
-/// Edge parts the standard catalog has no kind for yet (`PROJECTS.md` §9).
-/// A project builds with them through [`edge_catalogs`].
+/// The Edge board's RS-422 line receiver `U25`, as these tests model it and
+/// keyed as [`edge_registry`] keys it, as a base registration: the one Edge
+/// part the standard catalog has no kind for yet (`PROJECTS.md` §9). The
+/// line driver `U24` beside it is the standard catalog's `am26ls31`. A
+/// project builds with it through [`edge_catalogs`].
 pub struct EdgeCatalog;
 
 impl embsim_board::Catalog for EdgeCatalog {
@@ -1482,9 +1201,6 @@ impl embsim_board::Catalog for EdgeCatalog {
     }
 
     fn register_base(&self, registry: &mut PartRegistry) {
-        registry.register("AM26LS31CD", |_decl| {
-            Box::new(Rs422Driver::new(SERVO_RAIL_VOLTS))
-        });
         registry.register("AM26LV32xD", |_decl| {
             Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
         });
@@ -1496,6 +1212,6 @@ impl embsim_board::Catalog for EdgeCatalog {
 pub fn edge_catalogs() -> embsim_boards::catalog::CatalogSet {
     let mut set = embsim_boards::catalog::CatalogSet::new();
     set.add(EdgeCatalog)
-        .expect("the test catalog provides no kind, only two part numbers");
+        .expect("the test catalog provides no kind, only a part number");
     set
 }

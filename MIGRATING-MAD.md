@@ -60,7 +60,7 @@ project crate does not fork a model.
 
 | | What | Why MaD needs it | MaD's step that waits |
 |---|---|---|---|
-| E1 | kinds for the TI AM26LS31 line driver and the AM26LV32 line receiver (`PROJECTS.md` §9), with `U25`'s part-number disagreement settled | the Edge carrier's servo step and direction pairs (`U24`, `J21`) and encoder pairs (`U25`, `J20`); until they ship, `check` refuses `EDGE` and names the two parts | 9 |
+| E1 | a kind for the AM26LV32 line receiver (`PROJECTS.md` §9), with `U25`'s part-number disagreement settled; the TI AM26LS31 line driver's, `am26ls31`, has shipped | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`) the catalog now places; until it ships, `check` refuses `EDGE` and names `U25` | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS` | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
 | E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component") | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
 | E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open") | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5) | 11 (step 10 moves only the unpaced e2e target) |
@@ -719,7 +719,7 @@ keeps building. *Files:* `SIL/mad-catalog/netlists/`,
 *Done when:* `SIL/mad-catalog/tests/boards.rs` builds `mad-ds2` on its
 bench supplies (the scenario lines of `mad.toml`, as
 `boards/projects/ds2-addon.toml` does), and refuses `mad-edge` naming
-exactly `U24` and `U25`, the parts E1 is for. That refusal is a gate that
+exactly `U25`, the part E1 is for. That refusal is a gate that
 flips when E1 lands.
 
 **8. The core, then the machine.** `mad-p2iss` (section 3) once step 2 is
