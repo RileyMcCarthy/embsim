@@ -614,6 +614,149 @@ fn check_refuses_a_board_whose_converter_has_no_model_with_the_survey() {
     );
 }
 
+/// A project whose one board is `netlist`, with no `[[board.model]]`.
+fn bare_project(dir: &Path, netlist: &Path) -> PathBuf {
+    let project = dir.join("bare.toml");
+    std::fs::write(
+        &project,
+        format!(
+            "[[board]]\nname = \"BARE\"\nkind = \"netlist\"\nnetlist = {:?}\n",
+            path(netlist)
+        ),
+    )
+    .expect("the project is writable");
+    project
+}
+
+#[rstest]
+fn check_names_the_pin_table_that_fits_as_the_survey_does() {
+    behaviour!(Test {
+        id: "cli.check-names-pin-table",
+        covers: Some("board/src/project.rs#not_ready_hint"),
+        given: "a project of the P2-EC32MB's transcribed netlist alone, no model chosen for any \
+                part, checked from the command line",
+    });
+    expect!(
+        "refused",
+        "the check fails with a non-zero exit, the board not ready to build"
+    );
+    expect!(
+        "names-each-table",
+        "each part placed with the datasheet's numbered pins is named once by its part number, \
+         with the function-named table that has the netlist's pins",
+        "the catalog places the part by its number with its default table, and the fix is a \
+         [[board.model]] that picks the other one"
+    );
+    expect!(
+        "same-as-survey",
+        "the check names the same table for the same parts as the survey of the netlist",
+        "the survey and the check find the table the same way, so what one says the other says"
+    );
+    let dir = scratch("check_pin_table");
+    let project = bare_project(&dir, &ec32_netlist());
+    let checked = embsim(&["check", path(&project)]);
+    assert!(!checked.status.success(), "{}", stdout(&checked));
+    let error = stderr(&checked);
+    assert_says(
+        &error,
+        &[
+            "error: board BARE is not ready to build",
+            "give the part a [[board.model]] whose options.pins picks the table with the \
+             netlist's pins",
+            "U101, U601 mpn \"74LVC2G04GW,125\": pins = \"by-function\" declares the netlist's \
+             pins",
+            "U501, U502, U503, U504, U505, U506, U507, U508 mpn \"NCP114AMX330TCG\": pins = \
+             \"by-function\" declares the netlist's pins",
+        ],
+    );
+    let in_check: Vec<String> = squeezed(&error)
+        .lines()
+        .filter(|line| line.ends_with(": pins = \"by-function\" declares the netlist's pins"))
+        .map(|line| line.trim().to_string())
+        .collect();
+    assert_eq!(
+        in_check.len(),
+        7,
+        "one fix per model the catalog placed:\n{error}"
+    );
+
+    let surveyed = embsim(&["survey", path(&ec32_netlist())]);
+    assert!(surveyed.status.success(), "{}", stderr(&surveyed));
+    // The survey's group head, `U101, U601  mpn "…": model`, then its fix
+    // three lines on: the same as the check's one line.
+    let survey = squeezed(&stdout(&surveyed));
+    let lines: Vec<&str> = survey
+        .lines()
+        .skip_while(|line| *line != "placed with a pin table the netlist does not use:")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .collect();
+    let in_survey: Vec<String> = lines
+        .chunks(4)
+        .map(|group| {
+            let head = group[0].trim();
+            let parts = &head[..head.find(": ").expect("a group head names its model")];
+            format!("{parts}: {}", group[3].trim())
+        })
+        .collect();
+    assert_eq!(in_check, in_survey);
+}
+
+/// One NCP114 LDO wired by function, one wired with three pins no table
+/// of the model has.
+const TWO_LDOS: &str = r#"(export (version "E")
+  (components
+    (comp (ref "U1") (value "LDO")
+      (fields (field (name "MPN") "NCP114AMX330TCG")))
+    (comp (ref "U2") (value "LDO")
+      (fields (field (name "MPN") "NCP114AMX330TCG"))))
+  (nets
+    (net (code "1") (name "VIN")
+      (node (ref "U1") (pin "IN"))
+      (node (ref "U2") (pin "1")))
+    (net (code "2") (name "VOUT")
+      (node (ref "U1") (pin "OUT"))
+      (node (ref "U2") (pin "2")))
+    (net (code "3") (name "GND")
+      (node (ref "U1") (pin "GND"))
+      (node (ref "U1") (pin "GND_P"))
+      (node (ref "U1") (pin "EN"))
+      (node (ref "U2") (pin "3")))))
+"#;
+
+#[rstest]
+fn check_says_plainly_when_no_pin_table_of_the_model_fits() {
+    behaviour!(Test {
+        id: "cli.check-no-pin-table",
+        covers: Some("board/src/project.rs#not_ready_hint"),
+        given: "a board of two LDOs of one part number, one wired by pin function and one with \
+                three pins no table of the LDO's model has, checked from the command line",
+    });
+    expect!(
+        "table-for-one",
+        "the check names the function-named table for the LDO wired by function"
+    );
+    expect!(
+        "none-for-other",
+        "the check says no pin table of the model has the other LDO's pins",
+        "a part whose pins are in none of its model's tables takes another model"
+    );
+    let dir = scratch("check_no_pin_table");
+    let netlist = dir.join("ldos.net");
+    std::fs::write(&netlist, TWO_LDOS).expect("the netlist is writable");
+    let project = bare_project(&dir, &netlist);
+    let checked = embsim(&["check", path(&project)]);
+    assert!(!checked.status.success(), "{}", stdout(&checked));
+    let error = stderr(&checked);
+    assert_says(
+        &error,
+        &[
+            "U1 mpn \"NCP114AMX330TCG\": pins = \"by-function\" declares the netlist's pins",
+            "U2 mpn \"NCP114AMX330TCG\": no pin table of this model declares the netlist's pins",
+        ],
+    );
+}
+
 #[rstest]
 fn the_add_ons_starter_project_checks_once_its_stub_is_uncommented() {
     behaviour!(Test {

@@ -393,6 +393,23 @@ pub struct KindGuide {
     pub is: Named,
 }
 
+/// The kind of `guide` that places parts by the number `key`, with its
+/// option table that declares exactly `pins` ([`KindGuide::option_table_with`]):
+/// the `[[board.model]]` that gives a part placed with a pin table the
+/// netlist does not use the table it does. `None` when no kind places parts
+/// by `key`, or the kind that does has no such table. `embsim survey`,
+/// `embsim new` and a project's refusal of a board all find the table here.
+pub fn fitting_option_table<'g>(
+    guide: &'g [KindGuide],
+    key: &str,
+    pins: &[&str],
+) -> Option<(&'g KindGuide, &'g str)> {
+    guide
+        .iter()
+        .find(|kind| kind.numbers.iter().any(|number| number == key))
+        .and_then(|kind| kind.option_table_with(pins).map(|table| (kind, table)))
+}
+
 /// How a part kind is a part's model, strongest first. Pins alone say
 /// nothing: an EDA export numbers every package's pins from 1, so two parts
 /// with as many pins share a table whatever they are.
@@ -511,6 +528,15 @@ impl KindGuide {
             table.pins.len() == wanted.len()
                 && table.pins.iter().all(|pin| wanted.contains(pin.as_str()))
         })
+    }
+
+    /// The option table that declares exactly `pins`: one a
+    /// `[[board.model]]` picks with `options.pins`, never the default
+    /// table a part is placed with.
+    pub fn option_table_with(&self, pins: &[&str]) -> Option<&str> {
+        self.table_with(pins)
+            .filter(|table| table.option)
+            .map(|table| table.name.as_ref())
     }
 
     /// Refuse the entry unless every part it reaches is what this kind
