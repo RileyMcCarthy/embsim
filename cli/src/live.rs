@@ -258,7 +258,7 @@ pub fn check(
             findings.len()
         );
         for finding in &findings {
-            say!(out, "  {finding:?}");
+            say!(out, "  {finding}");
         }
     }
     handle.shutdown();
@@ -297,7 +297,7 @@ impl Reporter {
             );
         }
         for finding in &findings {
-            say!(out, "  {finding:?}");
+            say!(out, "  {finding}");
         }
         self.findings = findings.len();
         self.at_build = findings.len();
@@ -308,7 +308,7 @@ impl Reporter {
         let stamp = format!("[{:>14}]", ms(now));
         let findings = system.findings();
         for finding in findings.iter().skip(self.findings) {
-            say!(out, "{stamp} {finding:?}");
+            say!(out, "{stamp} {finding}");
         }
         self.findings = findings.len();
         for report in &mut self.reports {
@@ -423,6 +423,12 @@ pub fn run(
         let state = handle
             .net_state(net)
             .expect("every named net was checked before the run");
+        // A net state prints in the engine's own names (`Floating`,
+        // `Analog(3.3)`, `Pulled(High, 10500.0)`), here and where a cleared
+        // finding says what its net reads now: the guide quotes them by those
+        // names and scripts read the volts out of `Analog(…)`. Findings are
+        // what print in plain words; a plain form for net states would change
+        // these lines too, and is its own change (`PROJECTS.md` §9).
         say!(out, "net {net}: {state:?}");
     }
     let findings = handle.findings();
@@ -442,11 +448,11 @@ pub fn run(
         let mut standing = Vec::new();
         for finding in &findings {
             match now(finding, &handle, &pin_nets) {
-                Now::Holds => holds.push(format!("{finding:?}")),
+                Now::Holds => holds.push(finding.to_string()),
                 Now::Cleared(net, state) => {
-                    cleared.push(format!("{finding:?}: {net} reads {state:?}"));
+                    cleared.push(format!("{finding}; {net} now reads {state:?}"));
                 }
-                Now::Standing => standing.push(format!("{finding:?}")),
+                Now::Standing => standing.push(finding.to_string()),
             }
         }
         say!(out, "at {}, each finding's net read again:", ms(elapsed));
