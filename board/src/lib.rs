@@ -87,8 +87,8 @@ pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
 pub use host_pty::{HostPty, HostPtyCounters};
 pub use kind::{
-    is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, KindInfo, Named, OptionValues,
-    PinTable, RequiredOption,
+    fitting_option_table, is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, KindInfo,
+    Named, OptionValues, PinTable, RequiredOption,
 };
 pub use net::{
     digital_drive, level_of, Amps, Level, Net, NetId, NetState, Ohms, PinRef, TheveninDrive, Volts,
@@ -109,7 +109,8 @@ pub use report::{Report, Reports};
 pub use scripted_source::{ScriptedSource, Step};
 pub use serial_levels::SerialLevelBridge;
 pub use survey::{
-    BoardSurvey, ConnectorReport, FacadeMismatch, PinSite, SurveyedPart, UnmodelledPart,
+    BoardSurvey, ConnectorReport, FacadeMismatch, PinSite, PinTableGroup, SurveyedPart,
+    UnmodelledPart,
 };
 pub use system::{
     BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,

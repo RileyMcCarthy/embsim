@@ -98,17 +98,6 @@ fn class_label(class: &Classification) -> &'static str {
     }
 }
 
-/// Which of a part's fields `key` is: the one the registry reached it by.
-fn key_field(part: &SurveyedPart, key: &str) -> KeyField {
-    if part.part == key {
-        KeyField::Part
-    } else if part.mpn.as_deref() == Some(key) {
-        KeyField::Mpn
-    } else {
-        KeyField::Value
-    }
-}
-
 /// The field and key a new `[[board.model]]` for an unmodelled part is
 /// keyed by: its manufacturer part number, else its symbol's part name,
 /// else its value — the most specific key it carries.
@@ -285,59 +274,6 @@ fn keys_clause(part: &str, value: &str, mpn: Option<&str>, gap: &str) -> String 
     keys.join(gap)
 }
 
-/// The mismatched parts grouped by what placed them: the key, the model
-/// and the netlist's pins, each with the references it covers.
-struct PinTableGroup<'s> {
-    field: KeyField,
-    key: &'s str,
-    model: &'s str,
-    declared: &'s [String],
-    netlist: Vec<&'s str>,
-    references: Vec<&'s str>,
-}
-
-fn pin_table_groups(survey: &BoardSurvey) -> Vec<PinTableGroup<'_>> {
-    let mut groups: Vec<PinTableGroup<'_>> = Vec::new();
-    for mismatch in &survey.mismatched {
-        let part = survey
-            .parts()
-            .find(|part| part.reference == mismatch.reference)
-            .expect("a mismatched part is a surveyed part");
-        let key = part.key.as_deref().unwrap_or(&mismatch.value);
-        let netlist: Vec<&str> = mismatch.netlist.iter().map(String::as_str).collect();
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group.key == key && group.model == mismatch.model && group.netlist == netlist
-        }) {
-            group.references.push(&mismatch.reference);
-            continue;
-        }
-        groups.push(PinTableGroup {
-            field: key_field(part, key),
-            key,
-            model: &mismatch.model,
-            declared: &mismatch.declared,
-            netlist,
-            references: vec![&mismatch.reference],
-        });
-    }
-    groups
-}
-
-/// The catalog kind a key places parts as, when the key is one of the
-/// numbers the catalog places a kind by.
-fn kind_placed_by<'g>(guide: &'g [KindGuide], key: &str) -> Option<&'g KindGuide> {
-    guide
-        .iter()
-        .find(|kind| kind.numbers.iter().any(|number| number == key))
-}
-
-/// The option table of `kind` that declares exactly `pins`.
-fn option_table_for<'g>(kind: &'g KindGuide, pins: &[&str]) -> Option<&'g str> {
-    kind.table_with(pins)
-        .filter(|table| table.option)
-        .map(|table| table.name.as_ref())
-}
-
 // ============================================================
 // embsim survey
 // ============================================================
@@ -451,7 +387,7 @@ fn survey_report(source: &str, survey: &BoardSurvey, guide: &[KindGuide]) -> Str
     let mut by_key: Vec<(String, String, Vec<&str>)> = Vec::new();
     for part in placed.iter().filter(|part| part.key.is_some()) {
         let key = part.key.as_deref().expect("filtered on a key");
-        let field = key_field(part, key);
+        let field = part.key_field(key);
         let what = part
             .model
             .clone()
@@ -513,7 +449,7 @@ fn survey_report(source: &str, survey: &BoardSurvey, guide: &[KindGuide]) -> Str
         let _ = writeln!(out, "      {}", candidates_sentence(&found, part));
     }
 
-    let groups = pin_table_groups(survey);
+    let groups = survey.pin_table_groups();
     if !groups.is_empty() {
         let _ = writeln!(out, "\nplaced with a pin table the netlist does not use:");
     }
@@ -529,19 +465,7 @@ fn survey_report(source: &str, survey: &BoardSurvey, guide: &[KindGuide]) -> Str
         let declared: Vec<&str> = group.declared.iter().map(String::as_str).collect();
         let _ = writeln!(out, "      declares {}", pin_list(&declared));
         let _ = writeln!(out, "      the netlist has {}", pin_list(&group.netlist));
-        let fix = kind_placed_by(guide, group.key)
-            .and_then(|kind| option_table_for(kind, &group.netlist).map(|table| (kind, table)));
-        match fix {
-            Some((_, table)) => {
-                let _ = writeln!(out, "      pins = {table:?} declares the netlist's pins");
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "      no pin table of this model declares the netlist's pins"
-                );
-            }
-        }
+        let _ = writeln!(out, "      {}", group.fix_sentence(guide));
     }
 
     if !survey.refused.is_empty() {
@@ -936,7 +860,7 @@ fn starter_project(
         );
     }
 
-    let groups = pin_table_groups(survey);
+    let groups = survey.pin_table_groups();
     if !groups.is_empty() {
         let _ = writeln!(out);
         section(&mut out, "Pin tables");
@@ -949,8 +873,7 @@ fn starter_project(
     }
     for group in &groups {
         let _ = writeln!(out);
-        let fix = kind_placed_by(guide, group.key)
-            .and_then(|kind| option_table_for(kind, &group.netlist).map(|table| (kind, table)));
+        let fix = group.fix(guide);
         let declared: Vec<&str> = group.declared.iter().map(String::as_str).collect();
         match fix {
             Some((kind, table)) => {
@@ -1062,7 +985,7 @@ fn starter_project(
             }
             let _ = writeln!(options, "# {} = {}", option.name, option.example);
         }
-        if let Some(table) = option_table_for(kind, &pins) {
+        if let Some(table) = kind.option_table_with(&pins) {
             if kind.tables.first().map(|first| first.name.as_ref()) != Some(table) {
                 let _ = writeln!(options, "# pins = {}", toml_string(table));
             }
