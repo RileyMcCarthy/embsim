@@ -1714,9 +1714,21 @@ fn the_projects_own_runner_is_built_in_its_workspace(#[case] lock: bool) {
 }
 
 #[rstest]
-#[case::not_there("runner = \"sim/nowhere\"", "[catalog] runner = \"sim/nowhere\"")]
-#[case::no_binary("runner = \"sim/catalog\"", "the package rig-catalog has no binary")]
-fn a_runner_that_is_not_one_is_refused_saying_what_it_is(#[case] line: &str, #[case] says: &str) {
+#[case::not_there(
+    "not_there",
+    "runner = \"sim/nowhere\"",
+    "[catalog] runner = \"sim/nowhere\""
+)]
+#[case::no_binary(
+    "no_binary",
+    "runner = \"sim/catalog\"",
+    "the package rig-catalog has no binary"
+)]
+fn a_runner_that_is_not_one_is_refused_saying_what_it_is(
+    #[case] case: &str,
+    #[case] line: &str,
+    #[case] says: &str,
+) {
     behaviour!(Test {
         id: "cli.own-runner-refused",
         covers: Some("cli/src/runner.rs#Cargo::own_runner"),
@@ -1728,7 +1740,9 @@ fn a_runner_that_is_not_one_is_refused_saying_what_it_is(#[case] line: &str, #[c
         "the tool refuses it before any build, naming the runner as the file gives it and \
          saying a runner is a binary crate over the catalog crates"
     );
-    let dir = outside(&format!("own_refused_{}", line.len()));
+    // Each case its own directory: the cases run in parallel, and `outside`
+    // empties the directory it is given.
+    let dir = outside(&format!("own_refused_{case}"));
     let (cargo, log) = logging_cargo_with(&dir, false);
     crate_on(
         &dir.join("sim/catalog"),
