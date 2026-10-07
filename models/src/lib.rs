@@ -5,6 +5,10 @@
 //! - [`ads122u04`] — TI ADS122U04 UART ADC IC protocol model
 //! - [`ads122u04_component`] — that model as a live `embsim-board` component
 //!   (pin facade, power/reset gate, stream pump)
+//! - [`am26ls31`] — the TI AM26LS31 quadruple RS-422 line driver: each
+//!   channel's input turned into a complementary pair driven from the
+//!   part's own supply through the datasheet's output lines, behind the
+//!   G / G̅ enables, a crossing clock relayed as a clock
 //! - [`isolation`] — the parts between an MCU pin and the machine: the TI
 //!   ISO67xx digital isolator family, and the supply-gating and projection
 //!   helpers the interface models share
@@ -60,6 +64,7 @@
 
 pub mod ads122u04;
 pub mod ads122u04_component;
+pub mod am26ls31;
 pub mod edge;
 pub mod fat16;
 pub mod isolation;

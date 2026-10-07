@@ -1,9 +1,9 @@
-//! The harness AM26LS31 (`Rs422Driver`, Edge `U24`) relays a crossing step
-//! clock as a differential `Drive::Periodic` — issue #80 / `NODES.md` §12
-//! item 5's open harness gap.
+//! The AM26LS31 (`embsim_models::am26ls31`, Edge `U24`) relays a crossing
+//! step clock as a differential `Drive::Periodic` — issue #80 / `NODES.md`
+//! §12 item 5's open harness gap.
 //!
 //! A square wave on channel-1 `A` whose phases settle to two levels through
-//! [`machine_parts::AM26LS31_INPUT_THRESHOLDS`] reaches `Y`/`Z` as a
+//! [`AM26LS31_INPUT_THRESHOLDS`] reaches `Y`/`Z` as a
 //! complementary pair around that segment. A non-crossing wave stays on the
 //! single-level path (released here: neither phase is a defensible level),
 //! and an unchanged pair is not republished.
@@ -18,7 +18,8 @@ use embsim_board::{
     PeriodicSchedule, PinDecl, PinHandle, System, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
-use machine_parts::{Rs422Driver, AM26LS31_INPUT_THRESHOLDS, SERVO_RAIL_VOLTS};
+use embsim_models::am26ls31::{Am26ls31, AM26LS31_INPUT_THRESHOLDS};
+use machine_parts::SERVO_RAIL_VOLTS;
 use rstest::rstest;
 
 static SUITE_LOCK: Mutex<()> = Mutex::new(());
@@ -146,7 +147,7 @@ fn bench() -> Bench {
                 handle: Arc::clone(&q_handle),
             }),
         )
-        .component("U24", Box::new(Rs422Driver::new(SERVO_RAIL_VOLTS)))
+        .component("U24", Box::new(Am26ls31::new()))
         .component(
             "PROBE",
             Box::new(Probe {

@@ -620,6 +620,7 @@ here.
 | `6n137` | Lite-On optocoupler | a part whose part name, mpn or value contains 6N137 | `6N137` | fixed: `6N137` (7 pins) | — |
 | `vo2631` | Vishay dual optocoupler | a part whose part name, mpn or value contains VO2631 | `VO2631` | fixed: `VO2631` (8 pins) | — |
 | `iso67xx` | TI digital isolator, the member the key names | a part whose part name, mpn or value contains ISO6720, ISO6721, ISO6731, ISO6740, ISO6741 or ISO6742 | `ISO6721BDR`, `ISO6731DWR`, `ISO6740DWR`, `ISO6740FDWR`, `ISO6741DWR`, `ISO6742DWR` | fixed, the member's: `ISO6721BDR` (8 pins), `ISO6731DWR` (16 pins), `ISO6740DWR` (16 pins), `ISO6740FDWR` (16 pins), `ISO6741DWR` (16 pins), `ISO6742DWR` (16 pins) | — |
+| `am26ls31` | TI quad RS-422 line driver, driving from its own supply | a part whose part name, mpn or value contains AM26LS31C | `AM26LS31CD`, `AM26LS31CDR`, `AM26LS31CDBR`, `AM26LS31CN`, `AM26LS31CNSR` | `"numbered"` (16 pins) | — |
 | `ads122u04` | TI 24-bit ADC, as it comes out of reset | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
 | `switch` | a switch whose poles pair the part's pins, each open | a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that says switch, jumper or solder link | — | the part's own | `poles = [["1", "2"]]` — the part's pins paired into poles, each open until a [[switch]] closes it (required) |
 | `mechanical` | a part with pads and nothing electrical | a part whose pads sit on one net at most | — | the part's own | — |
@@ -1032,12 +1033,12 @@ return and the add-on's analog supply, which nothing on the boards makes.
 The module takes its 5 V from the carrier's own regulator, through the
 mate.
 
-`embsim check` refuses the project today, naming exactly two parts: the
-carrier's RS-422 line driver `U24` and line receiver `U25`, which the
-catalog does not model yet (section 9). Every other part of the three
-boards is placed, and the mates and wires are checked once the boards
-build. `board/tests/edge_project.rs` builds the file with those two parts
-given the models the board tests use, and holds the mates to the
+`embsim check` refuses the project today, naming exactly one part: the
+carrier's RS-422 line receiver `U25`, which the catalog does not model yet
+(section 9). Every other part of the three boards is placed, the line
+driver `U24` by the catalog's `am26ls31`, and the mates and wires are
+checked once the boards build. `board/tests/edge_project.rs` builds the
+file with the receiver given the model the board tests use, and holds the mates to the
 hand-written harnesses the machine tests use (every finger and every cable
 pin joined as they join it, every empty socket contact and the shield
 open); `board/tests/edge_project_live.rs` runs it, and the module's core
@@ -1307,12 +1308,13 @@ model.
 
 | Part | Board, reference | What exists, and what is owed |
 |---|---|---|
-| TI AM26LS31 quad RS-422 line driver (`AM26LS31CD`) | MaD Edge, `U24` (the servo step and direction pairs on `J21`) | `Rs422Driver` in `board/tests/machine_parts/mod.rs`, the model the board tests run the Edge board with. It is test-tree code, not a catalog model: its outputs drive through a 25 Ω source impedance no datasheet line gives; their high level is a voltage the test passes in (the servo domain's 5 V), not the part's own supply pin; its pin table declares channels 3 and 4 as passive pins because this board leaves them unwired; and its provenance block asks for per-behaviour datasheet citations (SLLS114N) before it moves out of the tests. |
-| TI AM26LV32 quad RS-422 line receiver | MaD Edge, `U25` (the encoder pairs on `J20`) | `Rs422Receiver`, beside the driver, with the same 25 Ω output, the same voltage passed in, and channel 4's inputs declared passive for this board; its input thresholds, input resistance and fail-safe bias are cited (SLLS202H). The netlist disagrees with itself here: the symbol is the 3.3 V `AM26LV32xD`, the manufacturer part number field the 5 V `AM26LS32CD`, and the alternate part number field `AM26LV32IDR`. A model is one part's, so which part the board carries has to be settled first; the survey flags the disagreement. |
+| TI AM26LV32 quad RS-422 line receiver | MaD Edge, `U25` (the encoder pairs on `J20`) | `Rs422Receiver` in `board/tests/machine_parts/mod.rs`, the model the board tests run the Edge board with: test-tree code, with outputs behind a 25 Ω source impedance no datasheet line gives, their high level a voltage the test passes in rather than the part's own supply pin, and channel 4's inputs declared passive for this board; its input thresholds, input resistance and fail-safe bias are cited (SLLS202H). The netlist disagrees with itself here: the symbol is the 3.3 V `AM26LV32xD`, the manufacturer part number field the 5 V `AM26LS32CD`, and the alternate part number field `AM26LV32IDR`. A model is one part's, so which part the board carries has to be settled first; the survey flags the disagreement. |
 
-`boards/projects/edge-ec32-ds2.toml` waits on these two, and
-`board/tests/edge_project.rs` builds and runs it with the test models in a
-catalog of the test tree's own beside the standard one
+The line driver beside it, `U24` (TI AM26LS31, `AM26LS31CD`), is the
+standard catalog's `am26ls31` (section 5), placed by its part number.
+`boards/projects/edge-ec32-ds2.toml` waits on the receiver alone, and
+`board/tests/edge_project.rs` builds and runs it with the receiver's test
+model in a catalog of the test tree's own beside the standard one
 (`machine_parts::edge_catalogs`).
 
 ### The rest
@@ -2293,5 +2295,5 @@ submodule; and one file, `SIL/mad.toml`:
 the crate's contents, and the ordered changes on both sides, each with the
 files it touches and the test that says it is done. `NODES.md` §13 maps
 each of `mad-emulator`'s pieces to a kind, and lists what embsim owes
-first: kinds for the Edge carrier's RS-422 pair (section 9), the ADS122U04
+first: a kind for the Edge carrier's RS-422 line receiver (section 9), the ADS122U04
 applying the firmware's register writes, and the `Assembly`.

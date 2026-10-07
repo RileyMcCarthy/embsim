@@ -242,11 +242,16 @@ fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
         given: "the MaD Edge board's KiCad export, surveyed from the command line",
     });
     expect!(
-        "line-parts-need-models",
-        "the RS-422 line driver and line receiver are listed as needing a model, each told it \
-         needs one written for it",
-        "no kind the catalog ships is for either part, by its numbers or by what the board \
-         says it is"
+        "receiver-needs-model",
+        "the RS-422 line receiver is listed as needing a model, told it needs one written for \
+         it",
+        "no kind the catalog ships is for it, by its numbers or by what the board says it is"
+    );
+    expect!(
+        "driver-placed",
+        "the RS-422 line driver is listed as populated by the catalog's am26ls31 model, by its \
+         part number, with its numbered pin table",
+        "the catalog places the AM26LS31 by the ordering codes its datasheet lists"
     );
     expect!(
         "socket-is-a-connector",
@@ -264,13 +269,11 @@ fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
     let output = embsim(&["survey", path(&netlist)]);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = squeezed(&stdout(&output));
-    assert_says(&text, &["168 parts", "3 need a model"]);
+    assert_says(&text, &["168 parts", "2 need a model"]);
     assert_says(
         &text,
         &[
-            "U24 part \"AM26LS31CD\" value \"AM26LS31CD\" mpn \"AM26LS31CD\"\n\
-             16 pins: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\n\
-             no catalog kind is for this part: it needs a model (PROJECTS.md §7)",
+            "part \"AM26LS31CD\": am26ls31, pins = \"numbered\"\nU24\n",
             "U25 part \"AM26LV32xD\" value \"AM26LV32xD\" mpn \"AM26LS32CD\"\n\
              16 pins: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\n\
              its symbol names \"AM26LV32xD\" and its mpn \"AM26LS32CD\": two parts; give it the \
