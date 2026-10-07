@@ -480,14 +480,14 @@ fn a_switch_pole_the_part_does_not_have_is_refused() {
 #[rstest]
 fn the_three_board_machine_project_waits_on_the_part_the_catalog_lacks() {
     behaviour!(Test {
-        id: "project.machine-waits-on-the-receiver",
+        id: "project.machine-waits-on-two-parts",
         covers: Some("board/src/project.rs#Project::instantiate"),
         given: "the shipped project of the MaD machine's three boards, the Edge carrier, the P2 \
                 module in its socket and the force-gauge add-on on its cable, built with the \
                 standard catalog alone",
     });
     expect!(
-        "names-the-receiver",
+        "names-the-two",
         "the project is refused naming the carrier's RS-422 line receiver, and only it, as \
          the part that needs a model",
         "every other part of the three boards is placed by the catalog or by the file, the \

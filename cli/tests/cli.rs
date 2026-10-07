@@ -242,7 +242,7 @@ fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
         given: "the MaD Edge board's KiCad export, surveyed from the command line",
     });
     expect!(
-        "receiver-needs-model",
+        "line-parts-need-models",
         "the RS-422 line receiver is listed as needing a model, told it needs one written for \
          it",
         "no kind the catalog ships is for it, by its numbers or by what the board says it is"
