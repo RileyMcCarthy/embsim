@@ -148,7 +148,7 @@ fn the_started_catalogs_four_kinds_check_and_run_in_one_project() {
     let (code, out, err) = runner(&["check", project]);
     assert_eq!(code, ExitCode::SUCCESS, "{err}\n{out}");
     assert!(
-        out.contains("catalogs: embsim-boards, embsim-p2-qemu, yourproject-catalog"),
+        out.contains("catalogs: embsim-boards, embsim-p2-qemu, embsim-qemu, yourproject-catalog"),
         "{out}"
     );
 

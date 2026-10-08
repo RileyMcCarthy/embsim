@@ -27,6 +27,9 @@ embsim-boards = { path = "../boards" }
 embsim-core = { path = "../core" }
 # QEMU as a P2 core, in a `qemu-system-p2` of its own (`embsim qemu`).
 embsim-p2-qemu = { path = "../p2-qemu" }
+# The host computer as a VM the board's clock meters: the `qemu-vm` and
+# `chrome-vm` bench component kinds, on the host's own system QEMU.
+embsim-qemu = { path = "../qemu" }
 clap.workspace = true
 # `run`'s SIGINT/SIGTERM handler: the first signal ends the run with its
 # summary.

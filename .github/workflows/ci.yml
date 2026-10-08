@@ -357,6 +357,29 @@ jobs:
       - name: Boot the P2 from a project with embsim run
         run: cargo test -p embsim-cli --test cli -- --include-ignored --nocapture
 
+  # The host computer as a VM the board's clock meters (embsim-qemu,
+  # NODES.md §15): the node against the host's real system QEMU, its guest
+  # six aarch64 instructions that store the CPU's counter, so the guest's own
+  # clock can be read with nothing installed in it — under TCG here, an
+  # aarch64 guest on an x86 runner. It needs no image; the Chrome guest's
+  # tests need one (~3 GB, minutes to build) and run by hand where it is
+  # built (qemu/guest/chrome/README.md). The cases are #[ignore]d in the test
+  # job, so this is the one job that installs QEMU for them.
+  qemu-vm:
+    name: qemu-vm
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the host's QEMU (qemu-system-aarch64)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm
+      - name: The node against real QEMU
+        run: cargo test -p embsim-qemu --test real_qemu -- --ignored --nocapture
+
   # A project's own catalog crates (PROJECTS.md §10, "The runner"): the
   # `embsim` binary writes a runner beside examples/custom-project, builds
   # it with Cargo in the release profile and runs the project through it; a
@@ -386,6 +409,7 @@ jobs:
       - supply-chain
       - msrv
       - p2-qemu-boot
+      - qemu-vm
       - project-runner
     if: ${{ always() }}
     runs-on: ubuntu-latest

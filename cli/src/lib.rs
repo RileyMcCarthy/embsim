@@ -337,12 +337,17 @@ impl Command {
 
 /// The catalogs the `embsim` command ships: the standard catalog
 /// (`embsim_boards::catalog::StandardCatalog`, its `held-in-reset` core
-/// with it) and QEMU as a P2 core (`embsim_p2_qemu::catalog`). A project's
+/// with it), QEMU as a P2 core (`embsim_p2_qemu::catalog`), and the host
+/// computer as a virtual machine the board's clock meters, the `qemu-vm`
+/// and `chrome-vm` bench components (`embsim_qemu::catalog`). A project's
 /// own catalogs join this set.
 pub fn shipped() -> CatalogSet {
     let mut set = CatalogSet::new();
     embsim_p2_qemu::catalog::register(&mut set).expect(
         "QEMU's core is spelled as a kind is, and the set holds no other catalog by its name",
+    );
+    embsim_qemu::catalog::register(&mut set).expect(
+        "the VM kinds are spelled as kinds are, and the set holds no other catalog by its name",
     );
     set
 }

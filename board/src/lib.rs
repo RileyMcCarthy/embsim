@@ -39,7 +39,8 @@
 //!   seats only on a part that is what it says ([`Named`])
 //! - [`report`] — [`Report`]: what a run prints about what a catalog built
 //! - [`host_pty`] — [`HostPty`]: the host's end of a serial link, a PTY whose
-//!   bytes are levels on two pins
+//!   bytes are levels on its pins; [`HostRailLine`], a host's line at its own
+//!   rail, for any bench host whose bytes come from elsewhere
 //! - [`scripted_source`] — [`ScriptedSource`]: a pin driven through a list of
 //!   steps at their instants
 //! - [`diagnostics`] — structured [`Finding`]s on a [`Diagnostics`] collector, mirrored to `tracing`
@@ -87,7 +88,7 @@ pub use diagnostics::{
 };
 pub use engine::{ComponentId, EndpointId, EngineHandle};
 pub use event_log::{EngineEvent, EngineEventRecord, EventLog};
-pub use host_pty::{HostPty, HostPtyCounters};
+pub use host_pty::{HostPty, HostPtyCounters, HostRailLine, HOST_RAIL_PINS};
 pub use kind::{
     fitting_option_table, is_connector, is_switch, kinds_without_a_model, Fit, KindGuide, KindInfo,
     Named, OptionValues, PinTable, RequiredOption,

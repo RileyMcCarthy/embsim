@@ -18,6 +18,16 @@ cargo test -p embsim-board --test determinism -- --nocapture
 # Stepped-clock mechanics (the barrier, the time-release, the wedge report).
 cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 
+# The host the board's clock meters (embsim-qemu, NODES.md §15), stepped:
+# a fake guest on a socketpair, run a slice a quantum, bytes both ways as
+# levels; and the qemu-vm / chrome-vm kinds built without booting. The
+# #[ignore]d cases need the host's QEMU (real_qemu: qemu-system-aarch64, CI's
+# qemu-vm job, TCG there) or the Chrome guest's image as well (chrome_guest:
+# qemu/guest/chrome/build.sh first, by hand).
+cargo test -p embsim-qemu
+cargo test -p embsim-qemu --test real_qemu -- --ignored --nocapture
+cargo test -p embsim-qemu --test chrome_guest -- --ignored --nocapture
+
 # The EdgeBoard's RS-422 pair live, an SD card driven bit by bit over nets,
 # and the RS-422 receiver started twelve times in one process (each stepped,
 # its own binary; live reads at a settled instant, rule 9).
@@ -435,7 +445,8 @@ cargo llvm-cov --workspace --summary-only
    wait for what a stepped run must do *eventually* — a burst to finish
    crossing, a node to reach its next slice — is sized for a hang, never for
    a speed: the wall time a stepped run takes is the engine's cost per edge
-   times its edges, and the runner decides that.
+   times its edges, and the runner decides that (`qemu/tests/loopback.rs`'s
+   `HANG`, with the measurement that sized it).
 
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`

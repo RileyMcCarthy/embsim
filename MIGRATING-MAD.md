@@ -63,7 +63,7 @@ project crate does not fork a model.
 | E1 | *shipped:* `am26lv32`, the AM26LV32 line receiver's kind, placing `U25` by its part number `AM26LV32IDR`, beside the AM26LS31 line driver's `am26ls31`. MaD's schematic owes the matching fix: `U25`'s `Manufacturer_Part_Number` and value set to `AM26LV32IDR` in `Hardware/EdgeBoard/KiCad` | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`); until the schematic fix, a netlist exported from MaD names `AM26LS32CD` and `check` refuses `EDGE` naming `U25` | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS` | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
 | E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component") | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
-| E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open") | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5) | 11 (step 10 moves only the unpaced e2e target) |
+| E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open"). *Built 2026-10-07* (`NODES.md` §15): the `chrome-vm` and `qemu-vm` bench kinds, the host on `host-serial`'s four pins in a VM whose guest runs only while the board's clock advances; `run` has no pace | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5), whose answer for the e2e is the user's rule: Chrome in a VM the board's clock meters, which `chrome-vm` is | 11 (step 10 moves only the unpaced e2e target) |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
 
 ## 3. The catalog crate, `SIL/mad-catalog`
@@ -818,6 +818,15 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   board's clock meters. `make e2e-emulator` today is the ISS with a PTY
   host, unpaced. Step 10 moves that configuration onto the project; whether
   it is one MaD keeps, or the metered host replaces it, is the user's call.
+  The metered host is now a kind (E4, `NODES.md` §15): `mad.toml`'s `HOST`
+  as `kind = "chrome-vm"` instead of `"host-serial"`, on the same four
+  pins and wires, is the second configuration, the board on the ISS and the
+  app in Chrome in a VM whose guest runs only while the board's clock
+  advances. What `mad-emulator --computer` did before 0.2.0 (`make
+  vm-image`, `make playground-cosim`, the nightly's `CDP_URL`) maps onto
+  it: the image is `qemu/guest/chrome/build.sh`'s, the run is `embsim run
+  mad.toml`, and the harness attaches to the DevTools port the run prints
+  (`devtools_port` fixes it).
 - **The loop supply.** `loop_volts = 24.0` is the isolation test's bench
   figure. Does the real machine source its switch loops from a supply of
   its own, or from the carrier's `5V_IO`/`GND_IO` (`J5`–`J8`)?

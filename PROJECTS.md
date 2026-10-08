@@ -440,7 +440,7 @@ embsim run ds2.toml --for 5ms --net DS2.+3V3 --net DS2.VDDA --net DS2.~RESET
 
 ```text
 project ds2.toml
-  catalogs: embsim-boards, embsim-p2-qemu
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-qemu
   …
 running for 5.000000 ms of virtual time
 findings at build, before any wake (11):
@@ -769,7 +769,9 @@ made by `embsim flash-image`.
 
 A `[[component]]` is a part with pins and no board. Its pins are its
 endpoints, `Name.Pin`, and its options are `[component.options]`. The
-standard catalog ships two kinds.
+standard catalog ships two kinds, `host-serial` and `scripted-source`; the
+`embsim` command's set adds two more from `embsim-qemu`, `qemu-vm` and
+`chrome-vm`: the host as a computer whose clock the board's meters.
 
 **`host-serial`**: the host's end of a serial link, a PTY whose bytes are
 levels on the wire (`embsim_board::HostPty::open_on_rail`). A host program
@@ -834,6 +836,86 @@ Before its first instant the pin is released; after its last it holds.
 Each step is one drive published at its instant, on a wake the source arms
 for it (`boards/tests/scripted_source.rs` reads each step land at its own
 nanosecond).
+
+**`qemu-vm`** and **`chrome-vm`**: the host as a computer on the board, a
+virtual machine on the host's own system QEMU whose clock the board's clock
+meters (`embsim_qemu::QemuNode`, `NODES.md` §15). A `host-serial`'s host
+keeps wall time: when the board runs at a hundredth of real time, every
+timeout the host holds against it fires a hundred times early. A VM's guest
+runs only while the board's clock advances: every quantum of virtual time
+(1 ms by default) the node stops the board, lets the guest run that long in
+host time, and stops the guest again over QMP before the board moves on, so
+the guest's clock — its OS, its browser, the page's workers — is the
+board's, a quantum behind at most, and a host timeout means what it says.
+
+Both have `host-serial`'s four pins, `TX`, `RX`, `VIO` and `GND`, declared
+and driven the same way (`embsim_board::HostRailLine`), so a project swaps
+one kind for the other without touching a wire. Inside the guest the line
+is an emulated FTDI FT232 USB serial adapter (`/dev/ttyUSB0`, `usbVendorId`
+`0x0403` to Web Serial), plugged in while the run lasts; `serial = "uart"`
+puts it on the machine's first UART instead, for a guest with no USB stack.
+
+`chrome-vm` is the Chrome guest: the image `qemu/guest/chrome/build.sh`
+builds once (`qemu/guest/chrome/README.md` is the guide), a headless
+Chromium whose DevTools are forwarded to a host port, which a harness
+attaches to (Playwright's `connectOverCDP`), and whose managed policy hands
+a page served from the host (`http://10.0.2.2:<port>`) the serial port
+without a picker. `qemu-vm` is any image or kernel QEMU boots, on any
+machine and accelerator.
+
+| Option | Kind | What it says |
+|---|---|---|
+| `baud` | both | required: the serial line's rate, framed 8N1 |
+| `quantum` | both | the virtual time between two slices of the guest, `"1ms"` by default, at most `"1s"`: the most the guest lags the board, and how often the board stops for a slice. A stop and a cont cost the host about a quarter of a millisecond and let the guest live at least about a seventh of one (NODES.md §15), so a quantum much under a millisecond buys little |
+| `qemu` | both | the `qemu-system-*` binary: a name looked up on `PATH`, or a path relative to the project file; `qemu-system-<host arch>` by default. Homebrew's `qemu` on macOS, `qemu-system-arm` or `qemu-system-x86` on Debian |
+| `accel` | both | `"auto"` (the default: HVF on macOS, KVM on Linux when `/dev/kvm` opens, for a guest of the host's own architecture; TCG otherwise), `"hvf"`, `"kvm"` or `"tcg"` |
+| `firmware` | both | UEFI firmware (`-bios`), relative to the project file; an aarch64 guest's is found beside QEMU or in the usual places (`edk2-aarch64-code.fd`, Debian's `qemu-efi-aarch64`) when it boots an image |
+| `memory` | both | the guest's memory, as QEMU's `-m` reads it; `"2G"` for `chrome-vm`, QEMU's own default for `qemu-vm` |
+| `cpus` | both | the guest's vCPUs; 2 for `chrome-vm`, QEMU's own default for `qemu-vm` |
+| `image` | both | the disk, relative to the project file, booted from a throw-away copy-on-write overlay so the file is never written. `chrome-vm`'s default is where `build.sh` writes it (`~/.cache/embsim/qemu/chrome-debian13-<arch>.qcow2`, or under `$EMBSIM_QEMU_CACHE` or `$XDG_CACHE_HOME`); `qemu-vm` boots none unless it is named |
+| `devtools_port` | `chrome-vm` | the host port DevTools is forwarded to; a free one, picked when the project is built and printed, by default |
+| `warmup_timeout` | `chrome-vm` | how long the guest may take to boot until DevTools answers, `"180s"` by default |
+| `machine` | `qemu-vm` | QEMU's `-M`: `"virt,kernel-irqchip=off"` for an aarch64 guest by default (the interrupt controller in QEMU: with Hypervisor.framework's own, a guest that idles cannot be stopped), `"q35"` otherwise |
+| `serial` | `qemu-vm` | `"usb-ftdi"` (the default) or `"uart"` |
+| `agent` | `qemu-vm` | `true` attaches the virtio-serial port the Chrome image's clock agent answers on (`embsim_qemu::AGENT_PORT_NAME`), so every slice is booked from the guest's own clock; `false` by default |
+| `args` | `qemu-vm` | more of QEMU's arguments, a list of strings, appended as written (a `-kernel`, a `-netdev`) |
+| `warmup` | `qemu-vm` | host time the guest runs before the board's clock takes over, such as `"30s"` for an OS to boot; none by default, so the whole boot is metered |
+
+Building the project checks what it can without launching anything — that
+the binary, the image and the firmware are there — so `embsim check` boots
+nothing. The VM boots at the node's first slice, one quantum after the run
+starts, with the board's clock held there while it does: a boot, and a
+`chrome-vm`'s warm-up until DevTools answers (about ten seconds on an M2),
+is nobody's simulated time. A guest that does not boot, or whose QEMU dies,
+stops the run at the next look, saying why. A run of a `chrome-vm` named
+`PC`, wired as a null-modem cable to a `host-serial` named `HOST`, a page in
+the guest writing 17 bytes to its Web Serial port and reading 20 back, ended
+with SIGINT:
+
+```text
+[   0.000000 ms] PC: Chrome guest ../chrome-cache/chrome-debian13-aarch64.qcow2 on /opt/homebrew/bin/qemu-system-aarch64, 115200 baud 8N1, metered every 1.000000 ms of virtual time; it boots at the first slice
+[   0.000000 ms] HOST: host serial at host.pty, 115200 baud 8N1
+[   1.100000 ms] PC: the guest booted in 10.069 s of host time, the board's clock held at 1.000000 ms; it runs only while the board's clock advances
+[   1.100000 ms] PC: DevTools at http://127.0.0.1:9333
+interrupted at 614.500000 ms of virtual time
+ran 614.500000 ms of virtual time in 10.826 s
+PC: 365 slices: the guest lived 614.171959 ms of the board's 614.000000 ms (365 booked from its own clock), 171 µs ahead of the board at the last slice
+PC: 17 bytes from the guest, 20 to it, 0 framing errors
+PC: the guest sent during the run: its bytes entered the line in the slice it sent them in, so this run is reproducible in what it sent, not in when
+```
+
+The slices are fewer than the quanta: a Chrome guest lives a third to two
+thirds of a millisecond past the slice it is owed before a `stop` takes
+(measured, `NODES.md` §15), and the node pays that back by skipping a slice
+once the guest is a quantum ahead, so over a run the guest's own clock and
+the board's agree to within a quantum.
+
+The board's side of such a run is the board's: every slice falls at a
+multiple of the quantum after the start, and every byte the guest sent
+enters the line at one. What the guest sent, and in which slice, is a real
+computer's, so a run with a VM is reproducible in what it sent, not in when
+(`DETERMINISM.md`). A host-time wait inside the guest — a browser's
+timeout, a protocol's retry — now waits the board's time.
 
 ## 6. Board to board
 
@@ -1319,12 +1401,15 @@ alone.
 
 ### The rest
 
-- The standard catalog's bench component kinds are `host-serial` and
-  `scripted-source` (section 5). A `host-serial` for a host that must run on
-  the board's clock (a browser co-simulated in a VM that stops when the
-  board's clock does) is not one of them, and neither is a pace for `run`
-  against wall time: `run` is stepped, so a quiet system's virtual time runs
-  ahead of a host's wall time.
+- The bench component kinds are `host-serial`, `scripted-source`,
+  `qemu-vm` and `chrome-vm` (section 5). There is no pace for `run` against
+  wall time: `run` is stepped, so a quiet system's virtual time runs ahead
+  of a `host-serial` host's wall time. A host that must keep the board's
+  time is a `qemu-vm` or a `chrome-vm`, whose guest runs only while the
+  board's clock advances.
+- A VM's QEMU is a process of its own. `embsim run` stops it when the run
+  ends, on SIGINT and SIGTERM too; a run killed outright (SIGKILL) leaves it
+  running, frozen, to be killed by hand.
 - The standard catalog has no part kind for a diode, LED, FET or transistor.
   One the element library does not know by part number has no way into a
   project yet.
@@ -1393,7 +1478,7 @@ embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim
 …
 embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
 project rig.toml
-  catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-qemu, sim-catalog
   embsim 0.2.0, git rev a47bf442f5a5, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate sim-catalog 0.1.0: /home/me/embsim/rig/sim/catalog, in the git repository at rev a47bf442f5a5, but no commit holds its files
@@ -1592,7 +1677,7 @@ An unknown kind is refused as before, listing every kind the set holds.
 
 ```text
 project project.toml
-  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-qemu, custom-project-catalog
 ```
 
 ### The `[catalog]` table
@@ -2255,7 +2340,7 @@ result can be traced to what produced it (`DESIGN.md` rule 9):
 
 ```text
 project project.toml
-  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-qemu, custom-project-catalog
   embsim 0.2.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate custom-project-catalog 0.1.0: /home/me/embsim/examples/custom-project/catalog, git rev 4f0c2a1b3d5e

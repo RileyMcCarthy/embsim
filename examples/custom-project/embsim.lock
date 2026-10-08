@@ -195,6 +195,7 @@ dependencies = [
  "embsim-boards",
  "embsim-core",
  "embsim-p2-qemu",
+ "embsim-qemu",
  "libc",
  "serde_json",
  "toml",
@@ -229,6 +230,19 @@ dependencies = [
  "embsim-core",
  "libc",
  "sha2",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "embsim-qemu"
+version = "0.2.0"
+dependencies = [
+ "embsim-board",
+ "embsim-boards",
+ "embsim-core",
+ "libc",
+ "serde_json",
  "toml",
  "tracing",
 ]

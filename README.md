@@ -204,6 +204,7 @@ and refused.
                       │
    boards        embsim-boards     off-the-shelf modules (P2-EC32MB) and the P2 package
    cpu           embsim-p2-qemu    QEMU Propeller 2, pads on nets
+   host          embsim-qemu       a VM the board's clock meters (Chrome guest)
                       │
    board         embsim-board      netlist, nets, one quasi-static solve
    models        embsim-models     flash, SD, regulators, gates, the plant
@@ -224,6 +225,7 @@ place the two meet.
 | `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface, projects and the netlist survey |
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets, with QEMU in a `qemu-system-p2` of its own. Carries the `target/p2` sources that program is built from |
+| `embsim-qemu` | [`qemu/`](qemu) | The host computer as a board component: a virtual machine on the host's own system QEMU, its serial port levels on nets, its guest run only while the board's clock advances (`qemu-vm`, `chrome-vm`). Carries the Chrome guest's image recipe, [`qemu/guest/chrome`](qemu/guest/chrome/README.md) |
 | `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
 | `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core, `embsim qemu install` installing the program it runs in), and build a project's own catalog crates into the runner that runs it. The guide is [`PROJECTS.md`](PROJECTS.md) |
 | `yourproject-catalog` | [`cli/catalog-template/`](cli/catalog-template) | The catalog crate `embsim new --catalog` starts, compiled here so it stays true to the API |
@@ -482,6 +484,7 @@ Per-crate, if you want to iterate on one area:
 cargo test -p embsim-core           # virtual clock, observers, serial PTY
 cargo test -p embsim-models         # ADS122U04, flash, SD, regulators, the plant
 cargo test -p embsim-p2-qemu        # P2 core; with `embsim qemu install` done, -- --include-ignored boots the ROM, the pad-mode and PLL benches
+cargo test -p embsim-qemu          # the VM host on the board's clock; -- --ignored runs it against real QEMU (qemu-system-aarch64), and the Chrome guest once its image is built
 cargo test -p embsim-boards         # the P2-EC32MB board against its netlist
 cargo test -p embsim-memory-inspect # DWARF parser (compiles a tiny C fixture at test time)
 cargo test -p embsim-trace          # trace recorder

@@ -458,6 +458,24 @@ that answer it:
   are the ones scripted inside the emulator process — which is what the
   bench-bug suite wants anyway.
 
+- **A computer on the board (`embsim-qemu`) is host I/O with a metered
+  clock.** The `QemuNode` behind the `qemu-vm` and `chrome-vm` kinds runs a
+  real OS and a real browser inside a VM, so its scheduling, its network
+  stack and its JIT are as non-reproducible as a human at a terminal — a
+  run with one in it is T1-with-host-io like the PTY above, not T1. What it
+  adds over the PTY is a *bound*, and it adds it without a thread of its
+  own: the node meters the guest with its own wakes, on the engine thread.
+  Every quantum of virtual time (`QemuNode::with_quantum`, default 1 ms) a
+  wake lets the guest run for that much host time and stops it again over
+  QMP, so the guest is frozen whenever the engine advances, its clock and
+  the virtual clock never drift apart by more than a quantum, and a
+  host-side timeout counts simulated time. The instants are the board's:
+  every slice falls at a multiple of the quantum after the start, and every
+  byte the guest sent enters the line at one, so the board's side of a run
+  is reproducible given what the guest sent in each slice. That is the
+  property to assert about such a run — `NodeStats::skew_ns` bounded, slices
+  at their instants, `shed` zero — not a golden trace (`qemu/tests/`).
+
 - **Wall-clock deadlines inside the simulation** must become virtual:
   `Serial::receive_data_timeout`'s `Instant` deadline and its EAGAIN sleep,
   and the trace poller's 500 ms warm-up. A slow host must not be a behavioral

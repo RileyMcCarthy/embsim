@@ -4,6 +4,34 @@ What each release of embsim changes for someone using it. Releases are
 git tags, `vX.Y.Z`; while embsim is 0.x, a minor release may break what
 the one before it promised, and says so here under **Breaking**.
 
+## [Unreleased]
+
+### Added
+
+- **A host the board's clock meters** (`NODES.md` §15). The `embsim`
+  command's set has two more bench component kinds, from the restored
+  `embsim-qemu` crate (`qemu/`): `qemu-vm`, a virtual machine on the
+  host's own system QEMU (`qemu-system-aarch64` under HVF,
+  `qemu-system-x86_64` under KVM, or TCG), and `chrome-vm`, the Chrome
+  guest whose image `qemu/guest/chrome/build.sh` builds, its DevTools
+  forwarded to a host port. Either sits on `host-serial`'s four pins, its
+  serial port an emulated FTDI adapter in the guest, and its guest runs only
+  while the board's clock advances: every quantum (1 ms by default) the
+  node stops the board, runs the guest that long in host time and stops it
+  again over QMP, so a host's timeouts count the board's time. The VM boots
+  at the first slice, so `embsim check` boots nothing. `PROJECTS.md` §5
+  has the options; `qemu/guest/chrome/README.md` is the guide to building
+  the image.
+- `embsim_board::HostRailLine` and `HOST_RAIL_PINS`: a host's serial line
+  at its own rail, the one `HostPty::open_on_rail` and the VM kinds attach.
+- CI's `qemu-vm` job runs the node against real QEMU (TCG) with a guest of
+  six instructions whose own clock the tests read.
+
+### Changed
+
+- `check` and `run` name `embsim-qemu` among the catalogs: `catalogs:
+  embsim-boards, embsim-p2-qemu, embsim-qemu, …`.
+
 ## [0.2.0]
 
 embsim is now a board simulator you use as a tool. 0.1.0 linked a

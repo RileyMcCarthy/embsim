@@ -96,8 +96,8 @@ impl std::fmt::Debug for HostPtyCounters {
 }
 
 /// The pins of a host whose I/O rail is its own `VIO` pin, against its own
-/// `GND` ([`HostPty::open_on_rail`]).
-const ON_RAIL_PINS: [PinDecl; 4] = [
+/// `GND` ([`HostPty::open_on_rail`], [`HostRailLine`]).
+pub const HOST_RAIL_PINS: [PinDecl; 4] = [
     // Driven at the sensed `VIO` above `GND`, through the bridge's ports;
     // released while `VIO` reads no voltage.
     PinDecl::digital_out("TX")
@@ -133,6 +133,95 @@ impl Rail {
             },
             impedance: DEFAULT_PUSH_PULL_IMPEDANCE,
         })
+    }
+}
+
+/// A host's serial line at the host's own rail, on [`HOST_RAIL_PINS`]:
+/// `TX` drives a high at the sensed `VIO` above the sensed `GND` and a low
+/// at `GND`, behind the push-pull default, and is released while `VIO`
+/// reads no voltage.
+///
+/// What [`HostPty::open_on_rail`] attaches, and what any bench host whose
+/// bytes come from somewhere other than a PTY attaches the same way — a
+/// virtual machine's serial port (`embsim-qemu`) — so there is one copy of
+/// how a host's line follows its rail. The owner subscribes `RX` and
+/// registers the wake handler that calls [`SerialLevelBridge::service`],
+/// as for any bridge; this subscribes the two rail pins and idles the line.
+#[derive(Debug, Clone)]
+pub struct HostRailLine {
+    bridge: Arc<SerialLevelBridge>,
+    rail_known: Arc<AtomicBool>,
+}
+
+impl HostRailLine {
+    /// Attach the line to `io`'s `TX`, `VIO` and `GND`, framed at
+    /// `framing`. `shutdown` is the owner's teardown flag, as the bridge
+    /// takes it.
+    pub fn attach(
+        io: &ComponentNetIo,
+        framing: UartFraming,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self, AttachError> {
+        let rail = Arc::new(Mutex::new(Rail::default()));
+        // The live engine delivers a subscription's first reading on its
+        // own thread after `attach` returns, so a host that sent before
+        // then would have its bytes shed as if it had no power, at a
+        // wall-clock instant: `rail_known` says when it may send.
+        let rail_known = Arc::new(AtomicBool::new(false));
+        let bridge = {
+            let rail = Arc::clone(&rail);
+            SerialLevelBridge::new(framing, io.pin("TX")?, io.clone(), shutdown).with_ports(
+                move |level| {
+                    rail.lock()
+                        .expect("the rail reading is never poisoned")
+                        .port(level)
+                },
+            )
+        };
+        let bridge = Arc::new(bridge);
+        // Unpowered until `VIO` reads a voltage: a host with no rail
+        // drives nothing.
+        bridge.set_output_enabled(false);
+        for pin in ["VIO", "GND"] {
+            let (rail, bridge) = (Arc::clone(&rail), Arc::clone(&bridge));
+            let rail_known = Arc::clone(&rail_known);
+            io.on_sense(pin, move |sense| {
+                let (powered, known) = {
+                    let mut rail = rail.lock().expect("the rail reading is never poisoned");
+                    if pin == "VIO" {
+                        rail.vio = sense.volts;
+                        rail.vio_read = true;
+                    } else {
+                        rail.gnd = sense.volts;
+                        rail.gnd_read = true;
+                    }
+                    (rail.vio.is_some(), rail.vio_read && rail.gnd_read)
+                };
+                bridge.set_output_enabled(powered);
+                bridge.ports_changed();
+                if known {
+                    rail_known.store(true, Ordering::Release);
+                }
+            })?;
+        }
+        // An idle asynchronous line still drives: without it the far end has no
+        // reference against which the first start bit is a falling edge.
+        bridge.idle();
+        Ok(Self { bridge, rail_known })
+    }
+
+    /// The bridge the line's bytes go through: the owner transmits on it,
+    /// feeds it `RX`'s senses, and services it on its wakes.
+    pub fn bridge(&self) -> &Arc<SerialLevelBridge> {
+        &self.bridge
+    }
+
+    /// Whether the engine has delivered both rail pins' first reading, so
+    /// the bridge knows whether the host is powered. Until then a host's
+    /// bytes wait where they are; once it has, a byte sent while `VIO`
+    /// reads no voltage is shed, as a host with no rail sends nothing.
+    pub fn rail_known(&self) -> bool {
+        self.rail_known.load(Ordering::Acquire)
     }
 }
 
@@ -193,7 +282,7 @@ impl HostPty {
     /// the host's real rail to `VIO` (a Raspberry Pi's 3.3 V), so a board
     /// that expects another sees the margin it really has.
     pub fn open_on_rail(symlink_path: &str, baud_hz: u32) -> std::io::Result<Self> {
-        Self::opened(symlink_path, baud_hz, ON_RAIL_PINS.to_vec(), true)
+        Self::opened(symlink_path, baud_hz, HOST_RAIL_PINS.to_vec(), true)
     }
 
     fn opened(
@@ -242,59 +331,25 @@ impl Component for HostPty {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        let rail = Arc::new(Mutex::new(Rail::default()));
         // Whether the pump may read the host: at once on the fixed logic
         // rail; on the host's own rail, once the engine has delivered both
-        // rail pins' first reading. The live engine delivers those on its
-        // own thread after `attach` returns, so a pump that read before
-        // then would shed the host's bytes as if it had no power, at a
-        // wall-clock instant: the bytes wait in the PTY instead.
-        let rail_known = Arc::new(AtomicBool::new(!self.on_rail));
-        let mut bridge = SerialLevelBridge::new(
-            self.framing,
-            io.pin("TX")?,
-            io.clone(),
-            Arc::clone(&self.shutdown),
-        );
-        if self.on_rail {
-            let rail = Arc::clone(&rail);
-            bridge = bridge.with_ports(move |level| {
-                rail.lock()
-                    .expect("the rail reading is never poisoned")
-                    .port(level)
-            });
-        }
-        let bridge = Arc::new(bridge);
-        if self.on_rail {
-            // Unpowered until `VIO` reads a voltage: a host with no rail
-            // drives nothing.
-            bridge.set_output_enabled(false);
-            for pin in ["VIO", "GND"] {
-                let (rail, bridge) = (Arc::clone(&rail), Arc::clone(&bridge));
-                let rail_known = Arc::clone(&rail_known);
-                io.on_sense(pin, move |sense| {
-                    let (powered, known) = {
-                        let mut rail = rail.lock().expect("the rail reading is never poisoned");
-                        if pin == "VIO" {
-                            rail.vio = sense.volts;
-                            rail.vio_read = true;
-                        } else {
-                            rail.gnd = sense.volts;
-                            rail.gnd_read = true;
-                        }
-                        (rail.vio.is_some(), rail.vio_read && rail.gnd_read)
-                    };
-                    bridge.set_output_enabled(powered);
-                    bridge.ports_changed();
-                    if known {
-                        rail_known.store(true, Ordering::Release);
-                    }
-                })?;
-            }
-        }
-        // An idle asynchronous line still drives: without it the far end has no
-        // reference against which the first start bit is a falling edge.
-        bridge.idle();
+        // rail pins' first reading (`HostRailLine::rail_known`).
+        let (bridge, rail_known) = if self.on_rail {
+            let line = HostRailLine::attach(&io, self.framing, Arc::clone(&self.shutdown))?;
+            (line.bridge, line.rail_known)
+        } else {
+            let bridge = Arc::new(SerialLevelBridge::new(
+                self.framing,
+                io.pin("TX")?,
+                io.clone(),
+                Arc::clone(&self.shutdown),
+            ));
+            // An idle asynchronous line still drives: without it the far
+            // end has no reference against which the first start bit is a
+            // falling edge.
+            bridge.idle();
+            (bridge, Arc::new(AtomicBool::new(true)))
+        };
 
         let master: RawFd = self.pty.master.as_raw_fd();
         let counters = Arc::clone(&self.counters);
