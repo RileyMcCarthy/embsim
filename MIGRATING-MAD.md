@@ -60,7 +60,7 @@ project crate does not fork a model.
 
 | | What | Why MaD needs it | MaD's step that waits |
 |---|---|---|---|
-| E1 | a kind for the AM26LV32 line receiver (`PROJECTS.md` §9), with `U25`'s part-number disagreement settled; the TI AM26LS31 line driver's, `am26ls31`, has shipped | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`) the catalog now places; until it ships, `check` refuses `EDGE` and names `U25` | 9 |
+| E1 | *shipped:* `am26lv32`, the AM26LV32 line receiver's kind, placing `U25` by its part number `AM26LV32IDR`, beside the AM26LS31 line driver's `am26ls31`. MaD's schematic owes the matching fix: `U25`'s `Manufacturer_Part_Number` and value set to `AM26LV32IDR` in `Hardware/EdgeBoard/KiCad` | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`); until the schematic fix, a netlist exported from MaD names `AM26LS32CD` and `check` refuses `EDGE` naming `U25` | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS` | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
 | E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component") | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
 | E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open") | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5) | 11 (step 10 moves only the unpaced e2e target) |
@@ -718,9 +718,9 @@ keeps building. *Files:* `SIL/mad-catalog/netlists/`,
 `SIL/mad-catalog/src/boards.rs`, `SIL/MaDSim/src/system_description.rs`.
 *Done when:* `SIL/mad-catalog/tests/boards.rs` builds `mad-ds2` on its
 bench supplies (the scenario lines of `mad.toml`, as
-`boards/projects/ds2-addon.toml` does), and refuses `mad-edge` naming
-exactly `U25`, the part E1 is for. That refusal is a gate that
-flips when E1 lands.
+`boards/projects/ds2-addon.toml` does), and builds `mad-edge` too once its
+netlist is exported from a schematic carrying `U25`'s corrected part number
+(E1). Exported before that fix, it refuses `mad-edge` naming exactly `U25`.
 
 **8. The core, then the machine.** `mad-p2iss` (section 3) once step 2 is
 done; `mad-machine` once E3 is. *Files:* `SIL/mad-catalog/src/iss.rs`,

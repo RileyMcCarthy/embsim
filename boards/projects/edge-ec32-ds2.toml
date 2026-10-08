@@ -3,14 +3,13 @@
 # add-on on the Edge board's force cable, on the bench supplies a bring-up
 # rig gives the carrier.
 #
-# `embsim check` refuses this project until the catalog models one of the
-# Edge board's parts: U25, the AM26LV32 RS-422 line receiver (PROJECTS.md
-# §9, the parts the catalog does not model yet). Everything else is placed,
-# U24, the AM26LS31 line driver, by the catalog's `am26ls31`, and every mate
-# and wire here is checked against the boards' connectors.
-# `board/tests/edge_project.rs` builds and runs this file with the receiver
-# given the model the board tests use, and holds its mates to the
-# hand-written harnesses.
+# `embsim check` accepts this project with the standard catalog alone: every
+# part is placed, the Edge board's RS-422 line driver U24 and line receiver
+# U25 by the catalog's `am26ls31` and `am26lv32`, each by its part number,
+# and every mate and wire here is checked against the boards' connectors.
+# U25 runs from the carrier's 5 V, above its recommended 3.6 V, and the run
+# reports it. `board/tests/edge_project.rs` builds this file and holds its
+# mates to the hand-written harnesses; `edge_project_live.rs` runs it.
 
 [[board]]
 name = "EDGE"

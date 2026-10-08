@@ -9,6 +9,11 @@
 //!   channel's input turned into a complementary pair driven from the
 //!   part's own supply through the datasheet's output lines, behind the
 //!   G / G̅ enables, a crossing clock relayed as a clock
+//! - [`am26lv32`] — the TI AM26LV32 quadruple RS-422 line receiver: each
+//!   differential pair turned into a logic output driven from the part's
+//!   own supply, the open-input fail-safe through each input's own port,
+//!   and a finding when its supply leaves the 3 V to 3.6 V it is
+//!   recommended to run from
 //! - [`isolation`] — the parts between an MCU pin and the machine: the TI
 //!   ISO67xx digital isolator family, and the supply-gating and projection
 //!   helpers the interface models share
@@ -65,6 +70,7 @@
 pub mod ads122u04;
 pub mod ads122u04_component;
 pub mod am26ls31;
+pub mod am26lv32;
 pub mod edge;
 pub mod fat16;
 pub mod isolation;

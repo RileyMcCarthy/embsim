@@ -31,8 +31,8 @@ use vibes_behaviour::{behaviour, expect, Test};
 
 mod machine_parts;
 
-use machine_parts::{
-    Rs422Receiver, AM26LV32_INPUT_OHMS, AM26LV32_OPEN_A_VOLTS, AM26LV32_OPEN_B_VOLTS,
+use embsim_models::am26lv32::{
+    Am26lv32, AM26LV32_INPUT_OHMS, AM26LV32_OPEN_A_VOLTS, AM26LV32_OPEN_B_VOLTS,
 };
 
 // ============================================================
@@ -528,7 +528,7 @@ fn an_open_am26lv32_input_reads_its_own_bias_and_the_failsafe_holds_the_output_h
     );
     let _guard = stepped();
     let mut registry = PartRegistry::new();
-    registry.register("AM26LV32", |_| Box::new(Rs422Receiver::new(RECEIVER_VCC)));
+    registry.register("AM26LV32", |_| Box::new(Am26lv32::new()));
     let board =
         Board::from_netlist(embsim_board::netlist::parse(RECEIVER).unwrap(), &registry).unwrap();
     let (pad, pad_handle) = Driver::new(None);

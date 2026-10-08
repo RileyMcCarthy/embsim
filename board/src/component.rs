@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
-use crate::diagnostics::SenseKind;
+use crate::diagnostics::{Finding, SenseKind};
 use crate::engine::{Command, ComponentId, Delivery, EndpointId, EngineLink, ReadKind};
 use crate::net::{Amps, Level, NetId, NetState, NetVolts, Ohms, TheveninDrive, Volts};
 
@@ -1766,6 +1766,51 @@ impl fmt::Debug for GatedWakes {
     }
 }
 
+/// What a part's model raises about the part itself, onto the findings
+/// bus ([`ComponentNetIo::findings`]): a finding only the part's datasheet
+/// can decide, such as a supply outside its recommended range. Each report
+/// names the part as `Board.Reference`; the bus dedups on equality like
+/// every finding, so the model decides how often to speak (once each time
+/// a condition starts holding, say), and reporting never blocks or fails.
+#[derive(Debug, Clone)]
+pub struct PartFindings {
+    part: Arc<str>,
+    link: EngineLink,
+}
+
+impl PartFindings {
+    /// The part, as `Board.Reference` (empty on a table built without a
+    /// system).
+    pub fn part(&self) -> &str {
+        &self.part
+    }
+
+    /// Report [`Finding::SupplyOutsideRecommended`]: supply pin `pin` sits
+    /// at `volts` against its reference, outside the recommended
+    /// `min..=max`; `note` says what that costs, in plain words (empty for
+    /// nothing more).
+    pub fn supply_outside_recommended(
+        &self,
+        pin: &str,
+        volts: Volts,
+        (min, max): (Volts, Volts),
+        note: &str,
+    ) {
+        self.report(Finding::SupplyOutsideRecommended {
+            part: self.part.to_string(),
+            pin: pin.to_string(),
+            volts,
+            min,
+            max,
+            note: note.to_string(),
+        });
+    }
+
+    fn report(&self, finding: Finding) {
+        self.link.send(Command::Report { finding });
+    }
+}
+
 /// Per-component net I/O passed to [`Component::attach`]: typed pin-handle
 /// lookup, sense subscription, and engine-owned scheduling.
 #[derive(Debug, Clone, Default)]
@@ -1783,6 +1828,10 @@ pub struct ComponentNetIo {
     /// ([`Self::with_wake_gate`]); `None` for a node the engine wakes
     /// directly.
     wake_gate: Option<GatedWakes>,
+    /// The part the table belongs to, as `Board.Reference`
+    /// ([`Self::findings`] names it); `None` on a table built without a
+    /// system (tests).
+    part: Option<Arc<str>>,
 }
 
 impl ComponentNetIo {
@@ -1796,6 +1845,7 @@ impl ComponentNetIo {
             link: EngineLink::default(),
             topology: None,
             wake_gate: None,
+            part: None,
         }
     }
 
@@ -1811,6 +1861,27 @@ impl ComponentNetIo {
             link,
             topology: None,
             wake_gate: None,
+            part: None,
+        }
+    }
+
+    /// The same handle table, naming the part it belongs to as
+    /// `Board.Reference` (system-build internal use; [`Self::findings`]).
+    pub(crate) fn with_part(mut self, part: &str) -> Self {
+        self.part = Some(Arc::from(part));
+        self
+    }
+
+    /// The part's own voice on the findings bus: what its model raises
+    /// about itself, named as the part and reported beside the engine's
+    /// findings — onto the live bus on the live path, into the build's
+    /// findings on the build path. Kept by the component and used from its
+    /// callbacks. On a table built without a system the part is unnamed
+    /// and a report goes nowhere.
+    pub fn findings(&self) -> PartFindings {
+        PartFindings {
+            part: self.part.clone().unwrap_or_else(|| Arc::from("")),
+            link: self.link.clone(),
         }
     }
 
@@ -2211,6 +2282,7 @@ mod tests {
             Arc::new(Mutex::new(crate::engine::CurrentTable::default())),
             Arc::new(Mutex::new(Vec::new())),
             &crate::engine::SenseLog::default(),
+            Arc::new(Mutex::new(Vec::new())),
         );
         let handle = PinHandle::wired(NetId(0), None, link.clone());
         let io = ComponentNetIo::wired([("1".to_string(), handle)], None, link);

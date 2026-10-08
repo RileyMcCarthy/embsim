@@ -673,6 +673,7 @@ impl System {
         let volts = Arc::new(VoltsTable::of(nets.iter().map(|n| n.volts)));
         let currents: Arc<Mutex<CurrentTable>> = Arc::new(Mutex::new(resolver.current_table()));
         let recorded_drives = Arc::new(Mutex::new(Vec::new()));
+        let recorded_findings: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_senses = SenseLog::default();
         // The build holds the sense log's one strong reference: the inert
         // link inside every handle the components keep sees it weakly, so
@@ -683,12 +684,14 @@ impl System {
             Arc::clone(&currents),
             Arc::clone(&recorded_drives),
             &recorded_senses,
+            Arc::clone(&recorded_findings),
         );
         let mut attached = Vec::with_capacity(components.len());
         for mut prepared in components {
             let io =
                 ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone())
-                    .with_topology(Arc::clone(&topology));
+                    .with_topology(Arc::clone(&topology))
+                    .with_part(&format!("{}.{}", prepared.board, prepared.reference));
             prepared
                 .component
                 .attach(io)
@@ -866,6 +869,13 @@ impl System {
             let late = std::mem::replace(&mut *log, senses);
             log.extend(late);
         };
+        // What the parts raised about themselves through the build
+        // (`PartFindings`), in the order they raised it: the fixed point
+        // starts each pass's findings afresh, and a part speaks once per
+        // condition, so they join after it.
+        for finding in std::mem::take(&mut *recorded_findings.lock().expect("never poisoned")) {
+            diagnostics.report(finding);
+        }
         if !settled {
             diagnostics.report(Finding::BuildNotSettled {
                 passes,
@@ -947,7 +957,8 @@ impl System {
                 Some(ComponentId(index)),
                 link.clone(),
             )
-            .with_topology(Arc::clone(&topology));
+            .with_topology(Arc::clone(&topology))
+            .with_part(&format!("{}.{}", prepared.board, prepared.reference));
             if let Err(error) = prepared.component.attach(io) {
                 let error = SystemError::Board {
                     name: prepared.board.clone(),

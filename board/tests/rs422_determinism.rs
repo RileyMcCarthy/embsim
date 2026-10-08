@@ -37,8 +37,9 @@
 //! supply's delivery reaches the part before either enable has been read,
 //! and `G`'s next reads no level with `Z+` open; `~G`'s, `Z−` at the
 //! isolated ground through `JP4`, then drives it high. That start-up
-//! release is the test-tree model's (`machine_parts`' `Rs422Receiver`
-//! publishes before it has read all its inputs), not the engine's: it
+//! release is the model's (the test tree's `Rs422Receiver` then, the
+//! catalog's `embsim_models::am26lv32` now: each releases its outputs until
+//! it has read its supply and an enable), not the engine's: it
 //! happens in every run, stepped or not, and leaves the settled state
 //! alone. The free-running run polled until the net read `Driven(High)`,
 //! which the idle satisfied at the first glance, before `U25` had run, and

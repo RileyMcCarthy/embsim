@@ -478,7 +478,7 @@ fn a_switch_pole_the_part_does_not_have_is_refused() {
 }
 
 #[rstest]
-fn the_three_board_machine_project_waits_on_the_part_the_catalog_lacks() {
+fn the_three_board_machine_project_builds_with_the_standard_catalog_alone() {
     behaviour!(Test {
         id: "project.machine-waits-on-two-parts",
         covers: Some("board/src/project.rs#Project::instantiate"),
@@ -488,35 +488,15 @@ fn the_three_board_machine_project_waits_on_the_part_the_catalog_lacks() {
     });
     expect!(
         "names-the-two",
-        "the project is refused naming the carrier's RS-422 line receiver, and only it, as \
-         the part that needs a model",
-        "every other part of the three boards is placed by the catalog or by the file, the \
-         line driver beside the receiver by its part number, and the catalog has no model of \
-         the receiver yet"
+        "the project is accepted, with no part of the three boards left needing a model",
+        "every part is placed by the catalog or by the file, the carrier's RS-422 line driver \
+         and line receiver each by its part number"
     );
     let path = projects().join("edge-ec32-ds2.toml");
-    let message = Project::load(&path)
-        .expect("the project loads")
-        .instantiate(&StandardCatalog)
-        .expect_err("one part has no model")
-        .to_string();
-    assert_says(
-        &message,
-        &[
-            "board EDGE is not ready to build",
-            "168 parts: 167 classified, 1 need a model, 0 with pins the netlist does not have, \
-             0 refused",
-            "U25  part \"AM26LV32xD\"",
-        ],
-    );
-    assert!(!message.contains("U24"), "{message}");
-    let listed = message
-        .lines()
-        .skip_while(|line| *line != "needs a model:")
-        .skip(1)
-        .take_while(|line| line.starts_with("  "))
-        .count();
-    assert_eq!(listed, 1, "{message}");
+    let project = Project::load(&path).expect("the project loads");
+    if let Err(err) = project.instantiate(&StandardCatalog) {
+        panic!("the project is refused: {err}");
+    }
 }
 
 #[rstest]

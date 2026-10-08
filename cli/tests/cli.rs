@@ -234,18 +234,54 @@ fn the_survey_names_what_each_unmodelled_part_could_be_and_the_pin_table_that_fi
     );
 }
 
+/// The Edge board's netlist with `U25`'s part-number fields as the MaD
+/// schematic still carries them: the value `AM26LV32xD`, the symbol's own
+/// name, and the manufacturer part number `AM26LS32CD`, a 5 V part of the
+/// same family.
+fn edge_netlist_with_old_receiver_number(dir: &Path) -> PathBuf {
+    let text = std::fs::read_to_string(workspace().join("board/tests/fixtures/mad_edge.net"))
+        .expect("the Edge netlist reads");
+    let start = text
+        .find("    (comp (ref \"U25\")")
+        .expect("the netlist has a U25");
+    let end = start
+        + 10
+        + text[start + 10..]
+            .find("    (comp ")
+            .expect("a part follows U25");
+    let receiver = text[start..end]
+        .replacen("(value \"AM26LV32IDR\")", "(value \"AM26LV32xD\")", 1)
+        .replace(
+            "(name \"Manufacturer_Part_Number\") \"AM26LV32IDR\"",
+            "(name \"Manufacturer_Part_Number\") \"AM26LS32CD\"",
+        )
+        .replace(
+            "(name \"Manufacturer_Part_Number\") (value \"AM26LV32IDR\")",
+            "(name \"Manufacturer_Part_Number\") (value \"AM26LS32CD\")",
+        );
+    let netlist = dir.join("mad_edge_old_u25.net");
+    std::fs::write(
+        &netlist,
+        format!("{}{receiver}{}", &text[..start], &text[end..]),
+    )
+    .expect("the netlist is writable");
+    netlist
+}
+
 #[rstest]
 fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
     behaviour!(Test {
         id: "cli.survey-edge-gaps",
         covers: Some("cli/src/checklist.rs#survey"),
-        given: "the MaD Edge board's KiCad export, surveyed from the command line",
+        given: "the MaD Edge board's KiCad export, surveyed from the command line, and the same \
+                export with the line receiver's part number as the MaD schematic still has it",
     });
     expect!(
         "line-parts-need-models",
-        "the RS-422 line receiver is listed as needing a model, told it needs one written for \
-         it",
-        "no kind the catalog ships is for it, by its numbers or by what the board says it is"
+        "the line receiver is populated by the catalog's am26lv32 by its part number, and only \
+         the module socket needs a model",
+        "the receiver's part number names the AM26LV32 the board carries, and the catalog \
+         places it by the ordering codes its datasheet lists"
     );
     expect!(
         "driver-placed",
@@ -260,8 +296,8 @@ fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
     );
     expect!(
         "names-disagree",
-        "the receiver is reported with its symbol and its manufacturer part number naming two \
-         different parts",
+        "with the schematic's part number, the receiver's symbol and part number are reported \
+         naming two parts, offered a kind only by family",
         "the symbol names the 3.3 volt AM26LV32 and the part number the 5 volt AM26LS32, and a \
          model is one part's"
     );
@@ -269,18 +305,31 @@ fn the_edge_boards_survey_names_the_parts_no_kind_is_for() {
     let output = embsim(&["survey", path(&netlist)]);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = squeezed(&stdout(&output));
-    assert_says(&text, &["168 parts", "2 need a model"]);
+    assert_says(&text, &["168 parts", "1 need a model"]);
     assert_says(
         &text,
         &[
             "part \"AM26LS31CD\": am26ls31, pins = \"numbered\"\nU24\n",
-            "U25 part \"AM26LV32xD\" value \"AM26LV32xD\" mpn \"AM26LS32CD\"\n\
-             16 pins: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\n\
-             its symbol names \"AM26LV32xD\" and its mpn \"AM26LS32CD\": two parts; give it the \
-             model of the one the board carries\n\
-             no catalog kind is for this part: it needs a model (PROJECTS.md §7)",
+            "mpn \"AM26LV32IDR\": am26lv32, pins = \"numbered\"\nU25\n",
             "J3 part \"P2_EDGE_MODULE_SOCKET\" value \"P2_EDGE_MODULE_SOCKET\" mpn \"450-00309\"",
             "no catalog model is for this part; it may be boundary (its designator J)",
+        ],
+    );
+    assert!(!text.contains("U25 part"), "{text}");
+
+    let old = edge_netlist_with_old_receiver_number(&scratch("survey_edge_old_u25"));
+    let output = embsim(&["survey", path(&old)]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = squeezed(&stdout(&output));
+    assert_says(&text, &["168 parts", "2 need a model"]);
+    assert_says(
+        &text,
+        &[
+            "U25 part \"AM26LV32xD\" value \"AM26LV32xD\" mpn \"AM26LS32CD\"\n\
+           16 pins: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16\n\
+           its symbol names \"AM26LV32xD\" and its mpn \"AM26LS32CD\": two parts; give it the \
+           model of the one the board carries\n\
+           could be: am26lv32 (part family AM26LV32)",
         ],
     );
 }

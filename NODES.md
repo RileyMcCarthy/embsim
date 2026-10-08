@@ -644,7 +644,7 @@ Every piece of `mad-emulator` becomes a kind, a line of `SIL/mad.toml` (`MIGRATI
 
 **What embsim owes before MaD's file checks:**
 
-- a kind for the Edge carrier's RS-422 line receiver `U25` (AM26LV32), `PROJECTS.md` §9's part, with the `U25` part-number disagreement settled; the line driver `U24` (AM26LS31) beside it is the standard catalog's `am26ls31`. It is a generic TI part, so it is embsim's to ship: a project crate should not fork a model. Until it lands, `check` refuses `EDGE` and names `U25`, as it refuses `edge-ec32-ds2.toml` today;
+- ~~a kind for the Edge carrier's RS-422 line receiver `U25` (AM26LV32)~~ *shipped (#108)*: the standard catalog's `am26lv32` places `U25` by its part number `AM26LV32IDR`, beside `U24`'s `am26ls31`, and `check` accepts `edge-ec32-ds2.toml`. MaD's own schematic still carries `U25`'s old part-number fields (`AM26LS32CD`) and needs the same correction before its exported netlist places it;
 - the ADS122U04 model applying `GAIN` and `VREF` from the firmware's register writes, with `VREF = AVDD` taken as the sensed `AVDD − AVSS` (the firmware's write names the reference, rule 6), proved by a stepped test: 1 mV of differential input at gain 128 on a 3.3 V `AVDD` reads the code the datasheet's transfer function gives. Without it the force path reads about 79 times low, and MaD must not fork an `mad-ads122u04` kind to work around it;
 - a P2 flash-boot layout option on `w25q128jv` (a `p2_program` file, laid out behind embsim's stage-1 when the board is built), and a `dir` option on `sd-card` (a FAT16 card holding a directory): both are generic P2 and FlexC needs;
 - the `Assembly`, for a plant made of embsim's models;

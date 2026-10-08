@@ -298,6 +298,28 @@ pub enum Finding {
         /// The pins driving it.
         drivers: Vec<PinRef>,
     },
+    /// A part's supply pin sits outside the supply range its datasheet
+    /// recommends: the part runs, and its model says what is no longer
+    /// guaranteed. Raised by the part's own model, not by the engine — the
+    /// recommended range is the part's figure — through
+    /// [`crate::PartFindings::supply_outside_recommended`], at build and
+    /// live, once each time the supply leaves the range (the voltage named
+    /// is the first one outside it).
+    SupplyOutsideRecommended {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The supply pin.
+        pin: String,
+        /// The supply pin's voltage against its reference.
+        volts: Volts,
+        /// The recommended range's minimum.
+        min: Volts,
+        /// The recommended range's maximum.
+        max: Volts,
+        /// What the model says the supply costs, in plain words; empty for
+        /// nothing more.
+        note: String,
+    },
     /// The build-time fixed point did not settle within its bound: after
     /// `passes` rounds of replaying the drives components issued in response
     /// to the states they were delivered, some component was still changing
@@ -504,6 +526,25 @@ impl fmt::Display for Finding {
                 pins(drivers),
                 if drivers.len() == 1 { "s" } else { "" }
             ),
+            Self::SupplyOutsideRecommended {
+                part,
+                pin,
+                volts,
+                min,
+                max,
+                note,
+            } => {
+                write!(
+                    f,
+                    "supply pin {part}.{pin} is at {volts} V, outside the {min} V to {max} V the \
+                     part is recommended to run from"
+                )?;
+                if note.is_empty() {
+                    Ok(())
+                } else {
+                    write!(f, ": {note}")
+                }
+            }
             Self::BuildNotSettled { passes, nets } if nets.is_empty() => {
                 write!(f, "the build did not settle in {passes} passes")
             }
@@ -881,6 +922,30 @@ mod tests {
     #[case::build_not_settled_unnamed(
         Finding::BuildNotSettled { passes: 64, nets: vec![] },
         "the build did not settle in 64 passes"
+    )]
+    #[case::supply_outside_recommended(
+        Finding::SupplyOutsideRecommended {
+            part: "EDGE.U25".into(),
+            pin: "16".into(),
+            volts: 5.0,
+            min: 3.0,
+            max: 3.6,
+            note: "its open-input bias is not characterised above 3.6 V".into(),
+        },
+        "supply pin EDGE.U25.16 is at 5 V, outside the 3 V to 3.6 V the part is recommended to \
+         run from: its open-input bias is not characterised above 3.6 V"
+    )]
+    #[case::supply_outside_recommended_no_note(
+        Finding::SupplyOutsideRecommended {
+            part: "B.U1".into(),
+            pin: "VCC".into(),
+            volts: 2.5,
+            min: 3.0,
+            max: 3.6,
+            note: String::new(),
+        },
+        "supply pin B.U1.VCC is at 2.5 V, outside the 3 V to 3.6 V the part is recommended to run \
+         from"
     )]
     fn a_finding_prints_in_plain_words(#[case] finding: Finding, #[case] line: &str) {
         behaviour!(Test {

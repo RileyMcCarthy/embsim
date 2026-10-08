@@ -330,6 +330,13 @@ pub(crate) enum Command {
     /// the `Component::start` loop; a no-op in free-running mode, where time
     /// runs regardless.
     ReleaseTime,
+    /// A finding a part's own model raises
+    /// ([`crate::PartFindings`]): reported onto the cumulative live bus,
+    /// deduped like every finding.
+    Report {
+        /// The finding, naming the part.
+        finding: Finding,
+    },
     /// Stop the engine loop; pending drives and timers are discarded.
     Shutdown,
 }
@@ -337,6 +344,11 @@ pub(crate) enum Command {
 /// Attach-time drives recorded on the inert (build-time) link, in issue
 /// order: the build pass applies them before it resolves for real.
 pub(crate) type RecordedDriveLog = Arc<Mutex<Vec<(EndpointId, Option<Drive>)>>>;
+
+/// Findings parts raised on the inert (build-time) link
+/// ([`Command::Report`]), in issue order: the build merges them into its
+/// findings once its fixed point is done.
+pub(crate) type RecordedFindingLog = Arc<Mutex<Vec<Finding>>>;
 
 /// Sense subscriptions made on the inert build-time path, in registration
 /// order, so `System::build`'s fixed point can deliver the states its
@@ -577,6 +589,9 @@ pub(crate) struct EngineLink {
     /// build pass's fixed point to deliver changed states to. A weak
     /// reference on purpose — see [`SenseLog`].
     pub(crate) recorded_senses: Option<WeakSenseLog>,
+    /// Inert path only: findings parts raised ([`Command::Report`]), for
+    /// the build to merge into its own.
+    pub(crate) recorded_findings: Option<RecordedFindingLog>,
 }
 
 impl EngineLink {
@@ -589,6 +604,7 @@ impl EngineLink {
         currents: Arc<Mutex<CurrentTable>>,
         recorded_drives: RecordedDriveLog,
         recorded_senses: &SenseLog,
+        recorded_findings: RecordedFindingLog,
     ) -> Self {
         Self {
             tx: None,
@@ -600,6 +616,7 @@ impl EngineLink {
             currents,
             recorded_drives: Some(recorded_drives),
             recorded_senses: Some(Arc::downgrade(&recorded_senses.0)),
+            recorded_findings: Some(recorded_findings),
         }
     }
 
@@ -652,6 +669,14 @@ impl EngineLink {
                     log.lock()
                         .expect("drive log never poisoned")
                         .push((*endpoint, *drive));
+                    return true;
+                }
+                if let (Command::Report { finding }, Some(log)) =
+                    (&command, &self.recorded_findings)
+                {
+                    log.lock()
+                        .expect("finding log never poisoned")
+                        .push(finding.clone());
                     return true;
                 }
                 tracing::debug!("inert engine link (build-time analysis path); command dropped");
@@ -5520,6 +5545,9 @@ impl EngineCore {
             Command::ReleaseTime => {
                 self.clock_released = true;
             }
+            Command::Report { finding } => {
+                self.report_finding(finding);
+            }
             Command::Shutdown => return true,
         }
         false
@@ -5883,6 +5911,7 @@ impl EngineHandle {
                 // log.
                 recorded_drives: None,
                 recorded_senses: None,
+                recorded_findings: None,
             },
             diagnostics,
             event_log,
