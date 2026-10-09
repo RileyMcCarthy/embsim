@@ -622,7 +622,7 @@ here.
 | `iso67xx` | TI digital isolator, the member the key names | a part whose part name, mpn or value contains ISO6720, ISO6721, ISO6731, ISO6740, ISO6741 or ISO6742 | `ISO6721BDR`, `ISO6731DWR`, `ISO6740DWR`, `ISO6740FDWR`, `ISO6741DWR`, `ISO6742DWR` | fixed, the member's: `ISO6721BDR` (8 pins), `ISO6731DWR` (16 pins), `ISO6740DWR` (16 pins), `ISO6740FDWR` (16 pins), `ISO6741DWR` (16 pins), `ISO6742DWR` (16 pins) | — |
 | `am26ls31` | TI quad RS-422 line driver, driving from its own supply | a part whose part name, mpn or value contains AM26LS31C | `AM26LS31CD`, `AM26LS31CDR`, `AM26LS31CDBR`, `AM26LS31CN`, `AM26LS31CNSR` | `"numbered"` (16 pins) | — |
 | `am26lv32` | TI quad RS-422 line receiver, driving from its own supply | a part whose part name, mpn or value contains AM26LV32 | `AM26LV32IDR`, `AM26LV32IDRG4`, `AM26LV32INSR`, `AM26LV32CD`, `AM26LV32ID` | `"numbered"` (16 pins) | — |
-| `ads122u04` | TI 24-bit ADC, as it comes out of reset | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
+| `ads122u04` | TI 24-bit ADC, converting as its register writes set it up | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
 | `switch` | a switch whose poles pair the part's pins, each open | a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that says switch, jumper or solder link | — | the part's own | `poles = [["1", "2"]]` — the part's pins paired into poles, each open until a [[switch]] closes it (required) |
 | `mechanical` | a part with pads and nothing electrical | a part whose pads sit on one net at most | — | the part's own | — |
 | `boundary` | a connector, by its symbol's part name | a connector: designator J, P or CN, or a Conn… symbol | — | the part's own | — |
@@ -2383,5 +2383,5 @@ submodule; and one file, `SIL/mad.toml`:
 the crate's contents, and the ordered changes on both sides, each with the
 files it touches and the test that says it is done. `NODES.md` §13 maps
 each of `mad-emulator`'s pieces to a kind, and lists what embsim owes
-first: the ADS122U04 applying the firmware's register writes, and the
-`Assembly`.
+first: the ADS122U04 applying the firmware's register writes (shipped:
+`ads122u04` converts as they set it up), and the `Assembly`.

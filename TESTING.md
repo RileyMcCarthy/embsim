@@ -459,8 +459,12 @@ cargo llvm-cov --workspace --summary-only
    or a fresh `now = 0`) must serialize every case behind one suite mutex
    (`determinism.rs` and `stepped_clock.rs` both do). Re-`init` with a live
    actor is allowed — the actor stays registered — so a binary whose cases
-   spawn long-lived actor threads (the ADS122U04 model does) still belongs in
-   its own test binary so leftover actors cannot hold a later case's barrier.
+   spawn long-lived actor threads still belongs in its own test binary so
+   leftover actors cannot hold a later case's barrier. The ADS122U04 model's
+   protocol thread is an actor only while its part lives: it ends when the
+   system drops the part, so a binary of several converter cases waits after
+   each shutdown for the actor count to fall back before the next case
+   re-anchors the clock (`board/tests/ads122u04_registers.rs`).
 
 6. **Property tests (`proptest`)** only for continuous domains (e.g. analog
    resistor ladders). Use fixed seeds when non-determinism would flake CI.
