@@ -32,6 +32,19 @@ the one before it promised, and says so here under **Breaking**.
   at the first slice, so `embsim check` boots nothing. `PROJECTS.md` §5
   has the options; `qemu/guest/chrome/README.md` is the guide to building
   the image.
+- **`embsim_board::Assembly`: a plant as one component** (`NODES.md`
+  §17). A bench component kind can return several components — embsim's
+  models and a project's own — as one: `Assembly::member` renames each
+  member's pins onto the assembly's, declarations kept;
+  `Assembly::reference` measures pins against a return the assembly
+  declares (a drive's `DRIVE_GND`, an encoder's `ENC_GND`); the members'
+  wakes go through the assembly, each member woken at its own instants in
+  the order added; and the links between members (a shaft turning an
+  encoder, a carriage reaching a switch) are closures between their
+  handles, run on the engine's thread inside the member that emits. The
+  engine sees one node and records the same events as for the members
+  apart. `PROJECTS.md` §10, "A plant: an `Assembly`", has the guide, with
+  MaD's machine as the example.
 - `embsim_board::HostRailLine` and `HOST_RAIL_PINS`: a host's serial line
   at its own rail, the one `HostPty::open_on_rail` and the VM kinds attach.
 - CI's `qemu-vm` job runs the node against real QEMU (TCG) with a guest of

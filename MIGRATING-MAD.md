@@ -26,8 +26,9 @@ for this plan) and the add-on (as `boards/projects/ds2-addon.toml` builds
 it). The Edge carrier builds with the catalogs embsim ships since E1
 (`boards/projects/edge-ec32-ds2.toml`; a netlist exported from MaD's
 schematic before `U25`'s part number is corrected does not, section 2),
-and since E2 the add-on's converter is configured by the firmware's own
-register writes; the whole file waits on MaD's own kinds. The Rust below is MaD's to write and is marked
+since E2 the add-on's converter is configured by the firmware's own
+register writes, and since E3 the machine's parts are one component, an
+`embsim_board::Assembly`; the whole file waits on MaD's own kinds. The Rust below is MaD's to write and is marked
 `ignore`; each piece names the compiled file in embsim's worked example,
 [`examples/custom-project`](examples/custom-project/README.md), that has
 its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
@@ -65,7 +66,7 @@ project crate does not fork a model.
 |---|---|---|---|
 | E1 | *shipped:* `am26lv32`, the AM26LV32 line receiver's kind, placing `U25` by its part number `AM26LV32IDR`, beside the AM26LS31 line driver's `am26ls31`. MaD's schematic owes the matching fix: `U25`'s `Manufacturer_Part_Number` and value set to `AM26LV32IDR` in `Hardware/EdgeBoard/KiCad` | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`); until the schematic fix, a netlist exported from MaD names `AM26LS32CD` and `check` refuses `EDGE` naming `U25` | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS`. *Built 2026-10-08* (`NODES.md` §16): every conversion reads the register file — the multiplexer, the gain (the PGA's bypass included), the reference — and a held reset or a lost supply returns it to its defaults; MaD's start-up bytes, sent to the add-on as `boards/projects/ds2-addon.toml` builds it, give the force path the code the firmware expects (`board/tests/ads122u04_registers.rs`) | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
-| E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component") | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
+| E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component"). *Built 2026-10-08* (`NODES.md` §17): members' pins renamed onto the assembly's, returns it declares (`DRIVE_GND`, `ENC_GND`), members' wakes through it in the order added, the links between them code on the engine's time; `PROJECTS.md` §10, "MaD's plant", is the machine as one | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
 | E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open"). *Built 2026-10-07* (`NODES.md` §15): the `chrome-vm` and `qemu-vm` bench kinds, the host on `host-serial`'s four pins in a VM whose guest runs only while the board's clock advances; `run` has no pace | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5), whose answer for the e2e is the user's rule: Chrome in a VM the board's clock meters, which `chrome-vm` is | 11 (step 10 moves only the unpaced e2e target) |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
 
@@ -272,8 +273,19 @@ the same report, and `run` prints the wall time already.
 ### `src/machine.rs`: `mad-machine`
 
 One bench component: the machine's mechanism inside, electrical pins
-outside (`PROJECTS.md` §10, "What a project can add"). It waits on E3 for
-the `Assembly` that hosts embsim's models.
+outside (`PROJECTS.md` §10, "What a project can add"): an
+`embsim_board::Assembly` (E3) of embsim's `StepperMotor`, `QuadratureEncoder`
+and two `EndSwitch`es and MaD's own load cell, the gantry, the sample and
+the strain gauge the link from the shaft to the load cell (`PROJECTS.md`
+§10, "MaD's plant", sketches the constructor). `DRIVE_GND` and `ENC_GND`
+are returns the assembly declares (`Assembly::reference`): neither model
+has a return pin of its own. A switch loop is a contact and the loop
+supply; embsim's `EndSwitch` is the contact, `COM` to `NO`, `NO` the
+loop's `+`. Where the supply comes from (section 6, "The loop supply")
+decides the rest: a supply of the machine's own makes `COM` a pin the file
+powers at `loop_volts`, with `-` its return, or a loop member of MaD's own
+with the supply and the contact inside it; the carrier's `5V_IO` makes
+`COM` a pin wired to it.
 
 | Pins | What they are |
 |---|---|
@@ -726,7 +738,7 @@ netlist is exported from a schematic carrying `U25`'s corrected part number
 (E1). Exported before that fix, it refuses `mad-edge` naming exactly `U25`.
 
 **8. The core, then the machine.** `mad-p2iss` (section 3) once step 2 is
-done; `mad-machine` once E3 is. *Files:* `SIL/mad-catalog/src/iss.rs`,
+done; `mad-machine` now that E3 is built (`NODES.md` §17). *Files:* `SIL/mad-catalog/src/iss.rs`,
 `SIL/mad-catalog/src/machine.rs`; `MaDSim/src/iss_description.rs`,
 `system_description.rs` and `main.rs` lose what moved (section 3's table)
 only at step 11. *Done when:* `tests/boot.rs` runs a project of the

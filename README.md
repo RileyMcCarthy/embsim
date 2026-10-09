@@ -378,7 +378,11 @@ section 2).
 
 The standard catalog's bench component kinds are `host-serial`, a host's
 serial port as a PTY on the host's own rail, and `scripted-source`, a pin
-driven through a list of steps (`PROJECTS.md` section 5).
+driven through a list of steps (`PROJECTS.md` section 5). A project's own
+bench kind may be a plant made of several models — a drive turning an
+encoder and reaching an end switch — as one component with electrical
+pins, an `embsim_board::Assembly` (`PROJECTS.md` section 10, "A plant: an
+`Assembly`").
 
 The `embsim` command's set adds one core for the `p2` kind to the standard
 catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its

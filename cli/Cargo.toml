@@ -47,4 +47,7 @@ rstest.workspace = true
 # The crate `embsim new --catalog` starts, run in process
 # (`tests/template.rs`).
 yourproject-catalog = { path = "catalog-template" }
+# A catalog kind built as an `Assembly` of embsim's machine models
+# (`tests/assembly.rs`).
+embsim-models = { path = "../models" }
 vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }
