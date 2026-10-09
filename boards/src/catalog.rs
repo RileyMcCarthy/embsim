@@ -74,6 +74,7 @@ pub use embsim_board::kind::{
 use embsim_models::ads122u04::Config as AdcConfig;
 use embsim_models::ads122u04_component::{Ads122u04Component, ADS122U04_PINS};
 use embsim_models::am26ls31::{Am26ls31, AM26LS31_PINS};
+use embsim_models::am26lv32::{Am26lv32, AM26LV32_PINS};
 use embsim_models::isolation::iso67xx::{self, Iso67xx};
 use embsim_models::logic_gate::{
     self, GatePin, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION, LVC2G04_PINS_SOT363,
@@ -269,6 +270,16 @@ const PART_KINDS: &[PartKind] = &[
         is: Seat::Family(&["AM26LS31C"]),
         unplaced: &[],
         register: am26ls31_kind,
+    },
+    PartKind {
+        name: "am26lv32",
+        summary: "TI quad RS-422 line receiver, driving from its own supply",
+        // Both grades: the C and I grades share every electrical figure
+        // the model reads (SLLS202H §6.3, §6.5); only the temperature
+        // range differs.
+        is: Seat::Family(&["AM26LV32"]),
+        unplaced: &[],
+        register: am26lv32_kind,
     },
     PartKind {
         name: "ads122u04",
@@ -748,6 +759,12 @@ fn line_driver_model(table: (&'static str, &'static [PinDecl])) -> Model {
     })
 }
 
+fn line_receiver_model(table: (&'static str, &'static [PinDecl])) -> Model {
+    Model::with_table(named("am26lv32", table.0), table.1, |_| {
+        Box::new(Am26lv32::new())
+    })
+}
+
 fn adc_model() -> Model {
     Model::with_table(named("ads122u04", "tssop16"), &ADS122U04_PINS, |_| {
         Box::new(Ads122u04Component::new(AdcConfig::at_reset()))
@@ -796,6 +813,9 @@ const UCC12040_TABLES: [(&str, &[RailPin]); 1] = [("soic16", &UCC12040_PINS_SOIC
 /// The 16-pin table SLLS114N's Figure 4-1 numbers for every package but
 /// the 20-pin FK.
 const AM26LS31_TABLES: [(&str, &[PinDecl]); 1] = [("numbered", &AM26LS31_PINS)];
+/// The 16-pin table SLLS202H's Figure 5-1 numbers for the D and NS
+/// packages.
+const AM26LV32_TABLES: [(&str, &[PinDecl]); 1] = [("numbered", &AM26LV32_PINS)];
 pub(crate) const STM1061_TABLES: [(&str, &[DetectorPin]); 2] = [
     ("sot23", &STM1061_PINS_SOT23),
     ("by-function", &STM1061_PINS_BY_FUNCTION),
@@ -892,6 +912,8 @@ fn known_parts() -> Vec<KnownPart> {
     let adc = |number: &'static str| known(number, "ads122u04", adc_model());
     let line_driver =
         |number: &'static str| known(number, "am26ls31", line_driver_model(AM26LS31_TABLES[0]));
+    let line_receiver =
+        |number: &'static str| known(number, "am26lv32", line_receiver_model(AM26LV32_TABLES[0]));
     vec![
         // EPSON TG2520SMN (oscillator.rs provenance: the ordering key).
         tcxo("TG2520SMN 20.0000M-ECGNNM3"),
@@ -964,6 +986,15 @@ fn known_parts() -> Vec<KnownPart> {
         line_driver("AM26LS31CDBR"),
         line_driver("AM26LS31CN"),
         line_driver("AM26LS31CNSR"),
+        // TI AM26LV32, SLLS202H's package option addendum: the I grade's
+        // active codes, the D (SOIC; `AM26LV32IDR`, LCSC C524786, is the
+        // Edge board's `U25`) and NS (SO) reels, and the obsolete C- and
+        // I-grade SOIC tubes.
+        line_receiver("AM26LV32IDR"),
+        line_receiver("AM26LV32IDRG4"),
+        line_receiver("AM26LV32INSR"),
+        line_receiver("AM26LV32CD"),
+        line_receiver("AM26LV32ID"),
         // TI ADS122U04 in TSSOP-16.
         adc("ADS122U04IPW"),
         adc("ADS122U04IPWR"),
@@ -1394,6 +1425,17 @@ fn am26ls31_kind(
     Ok(())
 }
 
+fn am26lv32_kind(
+    registry: &mut PartRegistry,
+    assignment: &Assignment<'_>,
+    mut options: PartOptions,
+) -> Result<(), ProjectError> {
+    let table = choose(&mut options, "pins", &AM26LV32_TABLES)?;
+    options.finish()?;
+    line_receiver_model(table).register(registry, assignment.key);
+    Ok(())
+}
+
 fn ads122u04_kind(
     registry: &mut PartRegistry,
     assignment: &Assignment<'_>,
@@ -1547,6 +1589,7 @@ fn kind_tables(name: &str, known: &[KnownPart]) -> Vec<PinTable> {
             .map(|part| PinTable::fixed(part.number, part.model.facade.pins.clone()))
             .collect(),
         "am26ls31" => decls(&AM26LS31_TABLES),
+        "am26lv32" => decls(&AM26LV32_TABLES),
         "ads122u04" => vec![PinTable::option(
             "tssop16",
             ModelFacade::of("", &ADS122U04_PINS).pins,
@@ -1740,8 +1783,8 @@ mod tests {
         }
         let _ = std::fs::remove_file(&image);
         // Two tables for each of six kinds, three for the flash and the
-        // card, one for each of five.
-        assert_eq!(checked, 23);
+        // card, one for each of six.
+        assert_eq!(checked, 24);
     }
 
     #[rstest]
@@ -1758,6 +1801,8 @@ mod tests {
     #[case::another_part("ads122u04", &["AM26LS31CD"], None)]
     #[case::line_driver_reel("am26ls31", &["AM26LS31CDR.A"], Some(Fit::Number("AM26LS31CD")))]
     #[case::another_grade("am26ls31", &["AM26LS31MJB"], None)]
+    #[case::line_receiver_reel("am26lv32", &["AM26LV32IDR.A"], Some(Fit::Number("AM26LV32IDR")))]
+    #[case::another_line_receiver("am26lv32", &["AM26LS32ACDR"], None)]
     fn a_part_number_fits_the_kind_it_shares_a_stem_with(
         #[case] kind: &str,
         #[case] keys: &[&str],
@@ -1794,7 +1839,7 @@ mod tests {
     #[rstest]
     #[case::processor_under_another_name(&["Propeller", "MCU"])]
     #[case::option_switch(&["DIP Switch 4 way", "218-4LPSTJR"])]
-    #[case::line_receiver(&["AM26LV32xD", "AM26LS32CD"])]
+    #[case::line_receiver(&["AM26LS32ACDR"])]
     fn a_part_named_as_no_family_the_catalog_models_fits_no_kind(#[case] keys: &[&str]) {
         behaviour!(Test {
             id: "catalog.unnamed-part-fits-no-kind",

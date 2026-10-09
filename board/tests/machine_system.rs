@@ -59,6 +59,7 @@ use embsim_board::{
     BuiltSystem, Finding, JumperState, Level, NetState, PinRef, RailDownReason, Scenario, System,
     SystemHandle,
 };
+use embsim_models::am26lv32::{AM26LV32_INPUT_OHMS, AM26LV32_OPEN_A_VOLTS};
 use embsim_models::machine::{
     end_switch, quadrature_encoder, stepper_motor, ActuationSense, EndSwitch, QuadratureEncoder,
     StepperMotor,
@@ -67,7 +68,6 @@ use embsim_models::machine::{
 use machine_parts::{
     bench_rails, ds2_board, ec32mb_board, edge_board, edge_fingers, encoder_jumpers_closed,
     force_domain_ground, force_gauge_harness, machine_harness, module_socket_harness,
-    AM26LV32_INPUT_OHMS, AM26LV32_OPEN_A_VOLTS,
 };
 
 /// Board names used throughout.

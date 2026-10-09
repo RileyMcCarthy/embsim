@@ -1,9 +1,8 @@
 //! The MaD machine's three boards as a project, live:
 //! `boards/projects/edge-ec32-ds2.toml` run from the bench supplies it
-//! wires, past every soft-start, with the Edge board's RS-422 line receiver
-//! given the board tests' model (`machine_parts::edge_catalogs`: the
-//! standard catalog does not ship it yet; the line driver beside it is the
-//! catalog's `am26ls31`).
+//! wires, past every soft-start, with the standard catalog alone: every
+//! part of the three boards is the catalog's, the Edge board's RS-422 line
+//! driver and receiver (`am26ls31`, `am26lv32`) included.
 //!
 //! Stepped (`TESTING.md` rule 9), its own binary: the clock stepped before
 //! the project builds the converter (its protocol thread joins the clock as
@@ -11,22 +10,20 @@
 //! registered actor, one virtual settle longer than every instant the
 //! boards arm, no `QuiescenceTimeout` at the end.
 
-mod machine_parts;
-
 use std::path::PathBuf;
 
 use embsim_board::{Finding, NetState, Project};
+use embsim_boards::catalog::StandardCatalog;
 use embsim_boards::p2::P2_RESTART_DELAY_NS;
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::ads122u04_component::PUMP_POLL_VIRTUAL_US;
+use embsim_models::am26lv32::AM26LV32_SUPPLY_NOTE;
 use embsim_models::oscillator::TG2520SMN_START_UP_NS;
 use embsim_models::rail::{
     AP62301_SOFT_START_NS, AP62301_V_FB_VOLTS, UCC12040_VISO_SEL_TO_VISO_VOLTS, XL1509_5V0_VOLTS,
 };
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
-
-use machine_parts::edge_catalogs;
 
 /// The virtual time the run is handed before it reads: 10.1 ms, past the
 /// longest chain the boards arm from their supplies — the module's bucks'
@@ -74,6 +71,13 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
         "the carrier's isolated converter for the force domain is strapped for 5 volts and \
          reaches the add-on over the cable"
     );
+    expect!(
+        "receiver-over-range",
+        "U25, the carrier's line receiver, is reported once for its supply at 5 volts, above \
+         its recommended 3.6 volts",
+        "the Edge board runs its AM26LV32 from 5 volts, inside its 6 volt absolute maximum \
+         but above its recommended range, where its open-input bias is not characterised"
+    );
     let path: PathBuf = [
         env!("CARGO_MANIFEST_DIR"),
         "..",
@@ -86,8 +90,8 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
     let system = Project::load(&path)
         .expect("the project loads")
-        .instantiate(&edge_catalogs())
-        .expect("the project builds with the line receiver modelled")
+        .instantiate(&StandardCatalog)
+        .expect("the project builds with the standard catalog alone")
         .hold_time()
         .start()
         .expect("the three boards start");
@@ -108,8 +112,26 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
         "DS2.+3V3 reads {addon}"
     );
 
-    let stalled: Vec<Finding> = system
-        .findings()
+    let findings = system.findings();
+    let over_range: Vec<&Finding> = findings
+        .iter()
+        .filter(|finding| matches!(finding, Finding::PinAboveRecommended { .. }))
+        .collect();
+    assert_eq!(
+        over_range,
+        [&Finding::PinAboveRecommended {
+            part: "EDGE.U25".to_string(),
+            pin: "16".to_string(),
+            volts: XL1509_5V0_VOLTS,
+            min: 3.0,
+            max: 3.6,
+            absolute_max: Some(6.0),
+            note: AM26LV32_SUPPLY_NOTE.to_string(),
+        }],
+        "{findings:?}"
+    );
+
+    let stalled: Vec<Finding> = findings
         .into_iter()
         .filter(|finding| matches!(finding, Finding::QuiescenceTimeout { .. }))
         .collect();

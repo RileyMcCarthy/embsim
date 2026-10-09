@@ -2,14 +2,10 @@
 //! carrier, the P2-EC32MB seated in its socket and the DS2 add-on on its
 //! force cable, all said by `boards/projects/edge-ec32-ds2.toml`.
 //!
-//! The standard catalog does not model one of the Edge board's parts yet,
-//! the AM26LV32 line receiver `U25` (`PROJECTS.md` §9), so the file builds
-//! here with a catalog of the test tree's own beside the standard one
-//! (`machine_parts::edge_catalogs`): its one base registration is the
-//! receiver model the board tests run the Edge board with. Everything else
-//! the project names is the standard catalog's, the AM26LS31 line driver
-//! `U24` beside the receiver included: its `am26ls31` kind places it by its
-//! part number.
+//! The file builds with the standard catalog alone: every part it names is
+//! the catalog's, the Edge board's AM26LS31 line driver `U24` and AM26LV32
+//! line receiver `U25` included, each placed by its part number (`am26ls31`,
+//! `am26lv32`).
 //!
 //! What it holds the file to is the hand-written harnesses the machine
 //! tests assemble the three boards with (`machine_parts`): the socket's
@@ -29,7 +25,7 @@ use embsim_core::virtual_clock::{self, ClockMode};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
-use machine_parts::{edge_catalogs, edge_fingers, force_gauge_harness, module_socket_harness};
+use machine_parts::{edge_fingers, force_gauge_harness, module_socket_harness};
 
 fn project() -> Project {
     let path: PathBuf = [
@@ -100,8 +96,8 @@ fn the_three_board_projects_mates_join_what_the_machines_harnesses_join() {
     // Building attaches the converter, whose protocol thread joins the clock.
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
     let built = project()
-        .instantiate(&edge_catalogs())
-        .expect("the project builds with the line receiver modelled")
+        .instantiate(&StandardCatalog)
+        .expect("the project builds with the standard catalog alone")
         .build()
         .expect("the system builds");
     let map = nets_of_pins(&built);
@@ -168,7 +164,7 @@ fn the_three_board_projects_mates_join_what_the_machines_harnesses_join() {
 }
 
 #[rstest]
-fn the_edge_boards_line_driver_is_the_standard_catalogs() {
+fn the_edge_boards_line_parts_are_the_standard_catalogs() {
     behaviour!(Test {
         id: "project.edge-line-driver-from-catalog",
         covers: Some("boards/src/catalog.rs#StandardCatalog::base_registry"),
@@ -184,26 +180,39 @@ fn the_edge_boards_line_driver_is_the_standard_catalogs() {
     );
     expect!(
         "receiver-left",
-        "the line receiver U25 is the one part the board still needs a model for",
-        "U25's netlist names two different parts, so a kind for it waits on which part the \
-         board carries"
+        "U25 is placed by its part number AM26LV32IDR as the catalog's am26lv32 kind, and no \
+         part of the board needs a model",
+        "U25's part number now names the part its LCSC code says was bought, and the catalog \
+         ships the AM26LV32 placed by the ordering codes its datasheet lists"
     );
     let survey = project()
         .survey(&StandardCatalog, "EDGE")
         .expect("the carrier surveys");
-    let driver = survey
-        .parts()
-        .find(|part| part.reference == "U24")
-        .expect("the carrier has a U24");
-    assert_eq!(driver.key.as_deref(), Some("AM26LS31CD"));
+    let model = |reference: &str| {
+        let part = survey
+            .parts()
+            .find(|part| part.reference == reference)
+            .unwrap_or_else(|| panic!("the carrier has a {reference}"));
+        (part.key.clone(), part.model.clone())
+    };
     assert_eq!(
-        driver.model.as_deref(),
-        Some("am26ls31, pins = \"numbered\"")
+        model("U24"),
+        (
+            Some("AM26LS31CD".to_string()),
+            Some("am26ls31, pins = \"numbered\"".to_string())
+        )
+    );
+    assert_eq!(
+        model("U25"),
+        (
+            Some("AM26LV32IDR".to_string()),
+            Some("am26lv32, pins = \"numbered\"".to_string())
+        )
     );
     let unplaced: Vec<&str> = survey
         .needs_model
         .iter()
         .map(|part| part.reference.as_str())
         .collect();
-    assert_eq!(unplaced, ["U25"]);
+    assert!(unplaced.is_empty(), "{unplaced:?}");
 }

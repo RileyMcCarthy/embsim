@@ -36,14 +36,15 @@
 //!
 //! # Modeled parts (real behavior)
 //!
-//! Two parts carry behavior here, each with the datasheet header
+//! One part carries behavior here, with the datasheet header
 //! `BOARD_ENGINE.md` ("Model provenance convention") requires:
 //!
-//! - [`Rs422Receiver`] — TI AM26LV32, the encoder A/B/ZI pairs;
 //! - [`SerialIsolator`] — TI ISO6731, the isolated force-gauge UART.
 //!
 //! The rest come from `embsim-models`: the AM26LS31 line driver `U24`, the
-//! servo step/direction pairs (`embsim_models::am26ls31`); the other four
+//! servo step/direction pairs (`embsim_models::am26ls31`); the AM26LV32
+//! line receiver `U25`, the encoder A/B/ZI pairs
+//! (`embsim_models::am26lv32`); the other four
 //! ISO67xx isolators
 //! (`IC1`, `IC2`, `IC14` with its STEP channel carrying a rate, `IC15`,
 //! `IC16`), the 21 SN74LVC1G14 LED drivers and the five optocouplers
@@ -70,12 +71,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use embsim_board::registry::normalize_part;
 use embsim_board::{
     AttachError, Board, Component, ComponentDecl, ComponentNetIo, DeadBand, DigitalReceiver,
-    EndpointRef, Harness, InputPort, JumperState, Level, Ohms, PartRegistry, PinDecl, PinHandle,
-    Scenario, SwitchPole, TheveninDrive, Thresholds, Volts,
+    EndpointRef, Harness, JumperState, Level, Ohms, PartRegistry, PinDecl, PinHandle, Scenario,
+    SwitchPole, TheveninDrive, Thresholds, Volts,
 };
 use embsim_boards::ec32mb::{FLASH_CAPACITY, FLASH_PART};
 use embsim_boards::p2::P2Package;
 use embsim_models::am26ls31::Am26ls31;
+use embsim_models::am26lv32::Am26lv32;
 use embsim_models::isolation::{iso67xx, Iso67xx};
 use embsim_models::logic_gate::{self, LogicGate, LVC1G14_PINS_SOT23, LVC2G04_PINS_BY_FUNCTION};
 use embsim_models::opto::Opto;
@@ -153,271 +155,6 @@ fn drive(level: Level, rail_volts: Volts) -> TheveninDrive {
             Level::Low => 0.0,
         },
         impedance: OUTPUT_IMPEDANCE_OHMS,
-    }
-}
-
-// ============================================================
-// AM26LV32 — quad differential line receiver (RS-422/RS-423)
-// ============================================================
-
-//
-// Provenance
-//   Part      : Texas Instruments AM26LV32, "Low-Voltage Quadruple
-//               Differential Line Receiver" (TI literature number SLLS202H,
-//               revised August 2023: the ±200 mV thresholds and the input
-//               resistance are §6.5 Electrical Characteristics, the
-//               fail-safe §8.4.1, each input's open-circuit voltage Figure
-//               9-2 of §9.2.3).
-//   Governs   : the differential input thresholds (V_IT± = ±200 mV), the
-//               enable structure (G / ~G, same OR form as the AM26LS31), and
-//               the input failsafe that forces Y high for open, shorted, or
-//               idle-terminated inputs.
-//   Instance  : MaD EdgeBoard U25 (`AM26LV32xD`), sheet `MaD_Edge_Sheet3`,
-//               receiving the encoder's `A±` / `B±` / `ZI±` pairs from
-//               connector J20.
-//
-// Behavior modeled
-//   Per channel, when enabled and powered: V_ID = V(A) − V(B) is taken from
-//   the *solved node voltages* (the input pins are analog readers — senses
-//   with no thresholds), and Y is driven high for V_ID >= +200 mV, low for
-//   V_ID <= −200 mV. Inside the ±200 mV band — the shorted-pair and
-//   idle-terminated cases — and whenever either leg has no defensible voltage,
-//   the datasheet's failsafe forces Y **high**. Disabled or unpowered releases
-//   Y to high-Z.
-//   Each input declares its own port (`InputPort`, `NODES.md` §10), the open
-//   fail-safe's mechanism (§8.4.1): r_I 12 kΩ typical (§6.5) to the input's
-//   open-circuit voltage, 0.83 V on an A input and 0.70 V on a B input —
-//   read off Figure 9-2, "RS422 Port Open-Circuit Voltage vs V_CC", flat
-//   from V_CC 1.6 V to 3.6 V. An open pair therefore reads +130 mV, inside
-//   the band: high, by the failsafe, through the part's own bias and no
-//   other source.
-//   Channel 4 is exactly that failsafe case on this board: 4A/4B are marked
-//   no-connect while 4Y is wired to the encoder isolator, so 4Y sits high.
-//
-// Board note worth stating, because it looks like a mistake and is not
-//   The EdgeBoard wires the encoder's index pair to the receiver's *enable*
-//   pins — `Z+` to G (pin 4) and `Z−` to ~G (pin 12) — rather than to a
-//   receiver channel. Closing the board's `Z_GND` jumper (JP4) ties `Z−` to
-//   the isolated ground, which asserts ~G low and enables all four channels
-//   unconditionally. That jumper is therefore load-bearing for the encoder
-//   path, and the machine system description closes it.
-//
-// Deliberately NOT modeled
-//   * Propagation delay (tens of nanoseconds) and hysteresis around V_IT, for
-//     the reasons given on the driver.
-//   * Input common-mode range, and the ports' fall below V_CC 1.6 V
-//     (Figure 9-2: 0.42 V / 0.35 V at 0.8 V): a port is a declaration,
-//     stamped once and never republished, so it holds its flat-band figure
-//     whatever the supply. The bias is stamped in the engine's frame, exact
-//     while GND sits at 0 V. r_I's minimum, 7 kΩ, is not modeled.
-//   * The supply-range check beyond its minimum — an over-range VDD is a
-//     rail finding, not a receiver behavior; under `V_CC` min 3 V (SLLS202H
-//     §6.3) the outputs are released.
-//
-
-/// The AM26LV32's enables, G and ~G, read against GND, absolute: `V_IL(EN)`
-/// max 0.8 V, `V_IH(EN)` min 2 V (TI SLLS202H, §6.3 Recommended Operating
-/// Conditions); no hysteresis is named, so between the two neither level is
-/// guaranteed ([`DeadBand::Unknown`]).
-pub const AM26LV32_ENABLE_THRESHOLDS: Thresholds =
-    Thresholds::new(0.8, 2.0, 0.0, DeadBand::Unknown);
-
-/// The AM26LV32's input resistance, `r_I` 12 kΩ typical (TI SLLS202H, §6.5
-/// Electrical Characteristics; 7 kΩ minimum): each input's own port.
-pub const AM26LV32_INPUT_OHMS: Ohms = 12_000.0;
-
-/// The open-circuit voltage of an A (non-inverting) input, 0.83 V: read off
-/// Figure 9-2, "RS422 Port Open-Circuit Voltage vs V_CC" (TI SLLS202H,
-/// §9.2.3 Application Curve), curve A, flat from `V_CC` 1.6 V to 3.6 V.
-pub const AM26LV32_OPEN_A_VOLTS: Volts = 0.83;
-
-/// The open-circuit voltage of a B (inverting) input, 0.70 V: the same
-/// figure's curve B.
-pub const AM26LV32_OPEN_B_VOLTS: Volts = 0.70;
-
-/// An A input's own port: [`AM26LV32_INPUT_OHMS`] to
-/// [`AM26LV32_OPEN_A_VOLTS`].
-pub const AM26LV32_A_PORT: InputPort = InputPort {
-    v_bias: AM26LV32_OPEN_A_VOLTS,
-    r_in: AM26LV32_INPUT_OHMS,
-};
-
-/// A B input's own port: [`AM26LV32_INPUT_OHMS`] to
-/// [`AM26LV32_OPEN_B_VOLTS`].
-pub const AM26LV32_B_PORT: InputPort = InputPort {
-    v_bias: AM26LV32_OPEN_B_VOLTS,
-    r_in: AM26LV32_INPUT_OHMS,
-};
-
-/// Pin facade of the `AM26LV32xD` (SOIC-16), pin numbers as the EdgeBoard
-/// netlist names them.
-#[rustfmt::skip]
-pub const AM26LV32_PINS: [PinDecl; 16] = [
-    analog("1").with_input(AM26LV32_B_PORT),   // 1B
-    analog("2").with_input(AM26LV32_A_PORT),   // 1A
-    dig_out("3"),  // 1Y
-    dig_in("4", AM26LV32_ENABLE_THRESHOLDS),   // G   — active-high enable (wired to the encoder's Z+)
-    dig_out("5"),  // 2Y
-    analog("6").with_input(AM26LV32_A_PORT),   // 2A
-    analog("7").with_input(AM26LV32_B_PORT),   // 2B
-    pwr_in("8"),   // GND
-    analog("9").with_input(AM26LV32_B_PORT),   // 3B
-    analog("10").with_input(AM26LV32_A_PORT),  // 3A
-    dig_out("11"), // 3Y
-    dig_in("12", AM26LV32_ENABLE_THRESHOLDS),  // ~G  — active-low enable (wired to the encoder's Z−)
-    dig_out("13"), // 4Y
-    nc("14"),      // 4A  — no-connect: channel 4 rides the input failsafe
-    nc("15"),      // 4B
-    pwr_in("16"),  // VDD
-];
-
-/// `(A, B, Y)` per channel; `None` inputs are the no-connect channel.
-const AM26LV32_CHANNELS: [(Option<&str>, Option<&str>, &str); 4] = [
-    (Some("2"), Some("1"), "3"),
-    (Some("6"), Some("7"), "5"),
-    (Some("10"), Some("9"), "11"),
-    (None, None, "13"),
-];
-
-/// The AM26LV32's supply minimum, `V_CC` min 3 V (TI SLLS202H, §6.3
-/// Recommended Operating Conditions): below it the outputs are released.
-pub const AM26LV32_VCC_MIN_VOLTS: Volts = 3.0;
-
-/// SLLS202H differential input threshold magnitude: V_IT+ <= +200 mV,
-/// V_IT- >= -200 mV.
-const VID_THRESHOLD_VOLTS: Volts = 0.200;
-
-#[derive(Default)]
-struct ReceiverState {
-    powered: bool,
-    enable_high: Option<Level>,
-    enable_low: Option<Level>,
-    /// `(A volts, B volts)` per channel.
-    inputs: [(Option<Volts>, Option<Volts>); 4],
-    outputs: Vec<PinHandle>,
-}
-
-struct ReceiverCore {
-    rail_volts: Volts,
-    state: Mutex<ReceiverState>,
-}
-
-impl ReceiverCore {
-    /// SLLS202H enable structure — identical OR form to the driver's.
-    fn enabled(state: &ReceiverState) -> bool {
-        state.enable_high == Some(Level::High) || state.enable_low == Some(Level::Low)
-    }
-
-    /// The level a channel's differential pair resolves to, with the
-    /// datasheet's failsafe covering open, shorted, and idle pairs.
-    fn channel_level(inputs: (Option<Volts>, Option<Volts>)) -> Level {
-        match inputs {
-            (Some(a), Some(b)) => {
-                let vid = a - b;
-                if vid >= VID_THRESHOLD_VOLTS {
-                    Level::High
-                } else if vid <= -VID_THRESHOLD_VOLTS {
-                    Level::Low
-                } else {
-                    Level::High // input failsafe (|V_ID| < 200 mV)
-                }
-            }
-            // Open input: the same failsafe.
-            _ => Level::High,
-        }
-    }
-
-    fn apply(&self, state: &mut ReceiverState) {
-        let active = state.powered && Self::enabled(state);
-        for (channel, y) in state.outputs.iter().enumerate() {
-            if active {
-                y.set_drive(Some(drive(
-                    Self::channel_level(state.inputs[channel]),
-                    self.rail_volts,
-                )));
-            } else {
-                y.set_drive(None);
-            }
-        }
-    }
-}
-
-/// TI AM26LV32 quad differential line receiver — see the provenance block
-/// above.
-pub struct Rs422Receiver {
-    core: Arc<ReceiverCore>,
-}
-
-impl Rs422Receiver {
-    /// A receiver whose outputs swing between 0 V and `rail_volts`.
-    pub fn new(rail_volts: Volts) -> Self {
-        Self {
-            core: Arc::new(ReceiverCore {
-                rail_volts,
-                state: Mutex::new(ReceiverState::default()),
-            }),
-        }
-    }
-}
-
-impl std::fmt::Debug for Rs422Receiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rs422Receiver")
-            .field("rail_volts", &self.core.rail_volts)
-            .finish()
-    }
-}
-
-impl Component for Rs422Receiver {
-    fn pins(&self) -> &[PinDecl] {
-        &AM26LV32_PINS
-    }
-
-    fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        {
-            let mut state = self.core.state.lock().unwrap();
-            for (_, _, y) in AM26LV32_CHANNELS {
-                state.outputs.push(io.pin(y)?);
-            }
-        }
-
-        let core = Arc::clone(&self.core);
-        io.on_sense("16", move |rail| {
-            let mut state = core.state.lock().unwrap();
-            state.powered = rail.volts.is_some_and(|v| v >= AM26LV32_VCC_MIN_VOLTS);
-            core.apply(&mut state);
-        })?;
-        for (pin, is_active_high) in [("4", true), ("12", false)] {
-            let core = Arc::clone(&self.core);
-            let receiver = DigitalReceiver::new(io.pin(pin)?);
-            io.on_sense(pin, move |sensed| {
-                let mut state = core.state.lock().unwrap();
-                let level = receiver.read(&sensed);
-                if is_active_high {
-                    state.enable_high = level;
-                } else {
-                    state.enable_low = level;
-                }
-                core.apply(&mut state);
-            })?;
-        }
-        for (channel, (a, b, _)) in AM26LV32_CHANNELS.into_iter().enumerate() {
-            for (pin, is_a) in [(a, true), (b, false)] {
-                let Some(pin) = pin else { continue };
-                let core = Arc::clone(&self.core);
-                io.on_sense(pin, move |sensed| {
-                    let mut state = core.state.lock().unwrap();
-                    let volts = sensed.volts;
-                    if is_a {
-                        state.inputs[channel].0 = volts;
-                    } else {
-                        state.inputs[channel].1 = volts;
-                    }
-                    core.apply(&mut state);
-                })?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -824,7 +561,8 @@ pub fn shipped_ec32mb_board() -> Board {
 //               MountingHole_Pad ×4 — mechanical nodes.
 //               (86 + 24 + 5 + 1 + 4 + 48 registered = the netlist's 168.)
 //   real model  AM26LS31CD (U24, `embsim_models::am26ls31`) and AM26LV32xD
-//               (U25), the encoder/servo RS-422 pair; ISO6731DWR (IC5), the force-gauge UART isolator;
+//               (U25, `embsim_models::am26lv32`), the encoder/servo RS-422
+//               pair; ISO6731DWR (IC5), the force-gauge UART isolator;
 //               ISO6742DWR (IC1, IC2), ISO6741DWR (IC14), ISO6721BDR (IC15)
 //               and ISO6740FDWR (IC16), the `embsim_models::isolation`
 //               family model configured from each part name; SN74LVC1G14DBV
@@ -885,9 +623,7 @@ pub fn edge_registry_without_socket() -> PartRegistry {
 
     // Modeled parts.
     registry.register("AM26LS31CD", |_decl| Box::new(Am26ls31::new()));
-    registry.register("AM26LV32xD", |_decl| {
-        Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
-    });
+    registry.register("AM26LV32xD", |_decl| Box::new(Am26lv32::new()));
     registry.register("ISO6731DWR", |_decl| Box::new(SerialIsolator::new()));
 
     // The other ISO67xx isolators, configured straight from their part
@@ -1065,7 +801,7 @@ pub fn force_gauge_harness(edge: &str, ds2: &str) -> Harness {
 ///    they land on `A+`/`B+`; JP2/JP3 (`A_GND`/`B_GND`) tie `A−`/`B−` to the
 ///    isolated ground, which is exactly what those jumpers are on the board
 ///    for. Closing JP4 (`Z_GND`) additionally asserts the receiver's
-///    active-low enable — see [`Rs422Receiver`]'s board note. All three are
+///    active-low enable — see [`encoder_jumpers_closed`]. All three are
 ///    scenario state, so [`encoder_jumpers_closed`] carries them.
 /// 3. **The end-switch connector labels are crossed with their nets.** J14 is
 ///    silkscreened `ENDUpper` but wired to `IDOOR±`, while J16 is
@@ -1133,7 +869,16 @@ pub fn bench_rails(edge: &str) -> Harness {
 /// they tie the `−` leg of each pair to the isolated ground so the receiver
 /// sees a real differential, and JP4 additionally asserts the receiver's
 /// active-low enable, which the board wires to `Z−`. See [`machine_harness`]
-/// item 2 and [`Rs422Receiver`]'s board note.
+/// item 2.
+///
+/// A board note worth stating, because it looks like a mistake and is not:
+/// the Edge board wires the encoder's index pair to the receiver `U25`'s
+/// *enable* pins — `Z+` to `G` (pin 4) and `Z−` to `G̅` (pin 12) — rather
+/// than to a receiver channel. Closing JP4 ties `Z−` to the isolated ground,
+/// which asserts `G̅` low and enables all four channels unconditionally, so
+/// that jumper is load-bearing for the encoder path. Channel 4's inputs are
+/// no-connects on this board: they rest at the part's own open-input bias,
+/// and the fail-safe holds `4Y` high (`embsim_models::am26lv32`).
 pub fn encoder_jumpers_closed(scenario: Scenario, edge: &str) -> Scenario {
     scenario
         .jumper(&format!("{edge}.JP2"), JumperState::Closed)
@@ -1182,36 +927,4 @@ pub fn force_domain_ground(ds2: &str) -> Harness {
             LOGIC_RAIL_VOLTS,
         )
         .power(ep("BENCH.AGND"), ep(&format!("{ds2}.J2.2")), 0.0)
-}
-
-// ============================================================
-// The standard catalog, with the Edge board's RS-422 line receiver
-// ============================================================
-
-/// The Edge board's RS-422 line receiver `U25`, as these tests model it and
-/// keyed as [`edge_registry`] keys it, as a base registration: the one Edge
-/// part the standard catalog has no kind for yet (`PROJECTS.md` §9). The
-/// line driver `U24` beside it is the standard catalog's `am26ls31`. A
-/// project builds with it through [`edge_catalogs`].
-pub struct EdgeCatalog;
-
-impl embsim_board::Catalog for EdgeCatalog {
-    fn name(&self) -> &str {
-        "embsim-board-tests"
-    }
-
-    fn register_base(&self, registry: &mut PartRegistry) {
-        registry.register("AM26LV32xD", |_decl| {
-            Box::new(Rs422Receiver::new(SERVO_RAIL_VOLTS))
-        });
-    }
-}
-
-/// The standard catalog with [`EdgeCatalog`] beside it: everything else is
-/// the standard catalog's.
-pub fn edge_catalogs() -> embsim_boards::catalog::CatalogSet {
-    let mut set = embsim_boards::catalog::CatalogSet::new();
-    set.add(EdgeCatalog)
-        .expect("the test catalog provides no kind, only a part number");
-    set
 }

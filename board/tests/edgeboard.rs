@@ -13,7 +13,7 @@
 //!    bench straps clear exactly those.
 //! 3. **The encoder/servo RS-422 pair works, live.** The differential driver
 //!    and receiver (`embsim_models::am26ls31::Am26ls31`,
-//!    [`machine_parts::Rs422Receiver`]) are the two parts on this board with
+//!    `embsim_models::am26lv32::Am26lv32`) are the two parts on this board with
 //!    real behavior, because the motion path is the one place where "the wire
 //!    is connected" is not the interesting claim. Their tests drive the real
 //!    netlist's nets and read the real netlist's nets.

@@ -129,12 +129,25 @@ pub struct PinDecl {
                                        //   when the pin names one, else volts
     pub reference: Option<&'static str>, // the pin its voltages are measured against
     pub supply: Option<&'static str>,  // the pin its relative thresholds scale with
+    pub limits: Option<PinLimits>,     // { recommended: (min, max), absolute_max, note }:
+                                       //   checked by the engine against the solved net
     pub can_source: bool,              // drives high
     pub can_sink: bool,                // drives low; neither = an input
 }
 
 pub enum PinRole { Signal, PowerIn, PowerOut, Passive }
 ```
+
+A pin's **operating limits** are declared like everything else about it
+(`with_limits(PinLimits { recommended, absolute_max, note })`, the
+datasheet's recommended range and absolute maximum, against the pin's
+`reference`), and checked by the engine, never by the part: `System::build`
+observes each declaring pin over its settled snapshot, and the live engine
+after every pass that moves the pin's net or its reference. A pin that rises
+above its recommended maximum raises `Finding::PinAboveRecommended` once per
+excursion, at the first voltage above it; the part keeps running, and what
+it does out of range is its model's. Only the top is checked: every supply
+passes under its minimum as it rises and falls.
 
 There are no pin kinds (`NODES.md` §11 and §12 item 5): what a
 pin reads and drives follows from its role and its declarations. A pin is
@@ -654,7 +667,11 @@ resistive network: no rail, supply above 0 V, sourcing pin or input port
 biased above 0 V; asked of the declarations and the network, not of the
 settled states, so a rail still in its soft-start counts; an open drain
 whose net reaches no other part's pin — a no-connect, a net that leaves the
-board only through a connector — raises nothing).
+board only through a connector — raises nothing). Beside them the build
+observes the declared pin limits over the same snapshot, and the live
+engine keeps observing them: `PinAboveRecommended` (a pin above the
+recommended range its part declares, against its reference, once per
+excursion).
 
 ## Testing conventions
 

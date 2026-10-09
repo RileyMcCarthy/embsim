@@ -226,9 +226,9 @@ with (section 4) and sorts the parts into these lists:
   Pins name no kind. An EDA export numbers every package's pins from 1, so
   two parts with as many pins share a table whatever each is. A part whose
   symbol names one part and whose manufacturer part number names another of
-  its family (the Edge board's `U25`: `AM26LV32xD` and `AM26LS32CD`) is
-  flagged: a model is one part's, and the netlist does not say which the
-  board carries.
+  its family (the Edge board's `U25` as MaD's schematic had it:
+  `AM26LV32xD` and `AM26LS32CD`) is flagged: a model is one part's, and
+  the netlist does not say which the board carries.
 - **Placed with a pin table the netlist does not use.** The model's pins and
   the netlist's pins are shown side by side, with the table that fits.
 - **Refused.** A class the part cannot be, such as a resistor with three
@@ -621,6 +621,7 @@ here.
 | `vo2631` | Vishay dual optocoupler | a part whose part name, mpn or value contains VO2631 | `VO2631` | fixed: `VO2631` (8 pins) | — |
 | `iso67xx` | TI digital isolator, the member the key names | a part whose part name, mpn or value contains ISO6720, ISO6721, ISO6731, ISO6740, ISO6741 or ISO6742 | `ISO6721BDR`, `ISO6731DWR`, `ISO6740DWR`, `ISO6740FDWR`, `ISO6741DWR`, `ISO6742DWR` | fixed, the member's: `ISO6721BDR` (8 pins), `ISO6731DWR` (16 pins), `ISO6740DWR` (16 pins), `ISO6740FDWR` (16 pins), `ISO6741DWR` (16 pins), `ISO6742DWR` (16 pins) | — |
 | `am26ls31` | TI quad RS-422 line driver, driving from its own supply | a part whose part name, mpn or value contains AM26LS31C | `AM26LS31CD`, `AM26LS31CDR`, `AM26LS31CDBR`, `AM26LS31CN`, `AM26LS31CNSR` | `"numbered"` (16 pins) | — |
+| `am26lv32` | TI quad RS-422 line receiver, driving from its own supply | a part whose part name, mpn or value contains AM26LV32 | `AM26LV32IDR`, `AM26LV32IDRG4`, `AM26LV32INSR`, `AM26LV32CD`, `AM26LV32ID` | `"numbered"` (16 pins) | — |
 | `ads122u04` | TI 24-bit ADC, as it comes out of reset | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
 | `switch` | a switch whose poles pair the part's pins, each open | a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that says switch, jumper or solder link | — | the part's own | `poles = [["1", "2"]]` — the part's pins paired into poles, each open until a [[switch]] closes it (required) |
 | `mechanical` | a part with pads and nothing electrical | a part whose pads sit on one net at most | — | the part's own | — |
@@ -1033,16 +1034,19 @@ return and the add-on's analog supply, which nothing on the boards makes.
 The module takes its 5 V from the carrier's own regulator, through the
 mate.
 
-`embsim check` refuses the project today, naming exactly one part: the
-carrier's RS-422 line receiver `U25`, which the catalog does not model yet
-(section 9). Every other part of the three boards is placed, the line
-driver `U24` by the catalog's `am26ls31`, and the mates and wires are
-checked once the boards build. `board/tests/edge_project.rs` builds the
-file with the receiver given the model the board tests use, and holds the mates to the
-hand-written harnesses the machine tests use (every finger and every cable
-pin joined as they join it, every empty socket contact and the shield
-open); `board/tests/edge_project_live.rs` runs it, and the module's core
-rail and the add-on's supply come up from the carrier's rails.
+`embsim check` accepts the project with the standard catalog alone: every
+part of the three boards is placed, the carrier's RS-422 line driver `U24`
+by the catalog's `am26ls31` and its line receiver `U25` by `am26lv32`,
+each by its part number, and the mates and wires are checked once the
+boards build. The receiver runs from the carrier's 5 V, above the 3.6 V
+its datasheet recommends: its supply pin declares that range, the engine
+checks it against the solved net, and the build and the run report it
+(`PinAboveRecommended`). `board/tests/edge_project.rs` builds the file and
+holds the mates to the hand-written harnesses the machine tests use (every
+finger and every cable pin joined as they join it, every empty socket
+contact and the shield open); `board/tests/edge_project_live.rs` runs it,
+and the module's core rail and the add-on's supply come up from the
+carrier's rails.
 
 ## 7. Adding kinds: a catalog of your own
 
@@ -1306,16 +1310,12 @@ catalog is for. A project with one does not build until a kind for it ships
 (section 7 for a catalog of your own); the survey names each as needing a
 model.
 
-| Part | Board, reference | What exists, and what is owed |
-|---|---|---|
-| TI AM26LV32 quad RS-422 line receiver | MaD Edge, `U25` (the encoder pairs on `J20`) | `Rs422Receiver` in `board/tests/machine_parts/mod.rs`, the model the board tests run the Edge board with: test-tree code, with outputs behind a 25 Ω source impedance no datasheet line gives, their high level a voltage the test passes in rather than the part's own supply pin, and channel 4's inputs declared passive for this board; its input thresholds, input resistance and fail-safe bias are cited (SLLS202H). The netlist disagrees with itself here: the symbol is the 3.3 V `AM26LV32xD`, the manufacturer part number field the 5 V `AM26LS32CD`, and the alternate part number field `AM26LV32IDR`. A model is one part's, so which part the board carries has to be settled first; the survey flags the disagreement. |
-
-The line driver beside it, `U24` (TI AM26LS31, `AM26LS31CD`), is the
-standard catalog's `am26ls31` (section 5), placed by its part number.
-`boards/projects/edge-ec32-ds2.toml` waits on the receiver alone, and
-`board/tests/edge_project.rs` builds and runs it with the receiver's test
-model in a catalog of the test tree's own beside the standard one
-(`machine_parts::edge_catalogs`).
+None today. The last was the MaD Edge carrier's RS-422 line receiver `U25`
+(TI AM26LV32), which the standard catalog's `am26lv32` (section 5) now
+places by its part number `AM26LV32IDR`, as it places the line driver
+beside it, `U24` (TI AM26LS31, `AM26LS31CD`), by `am26ls31`.
+`boards/projects/edge-ec32-ds2.toml` builds with the standard catalog
+alone.
 
 ### The rest
 
@@ -2298,5 +2298,5 @@ submodule; and one file, `SIL/mad.toml`:
 the crate's contents, and the ordered changes on both sides, each with the
 files it touches and the test that says it is done. `NODES.md` §13 maps
 each of `mad-emulator`'s pieces to a kind, and lists what embsim owes
-first: a kind for the Edge carrier's RS-422 line receiver (section 9), the ADS122U04
-applying the firmware's register writes, and the `Assembly`.
+first: the ADS122U04 applying the firmware's register writes, and the
+`Assembly`.

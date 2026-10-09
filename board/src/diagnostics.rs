@@ -298,6 +298,29 @@ pub enum Finding {
         /// The pins driving it.
         drivers: Vec<PinRef>,
     },
+    /// A pin sits above the recommended operating range its part declares
+    /// for it ([`crate::PinLimits`]): the part runs, and the finding says
+    /// what is no longer guaranteed. The part declares the limits; the
+    /// engine checks them against the solved net — at build over the
+    /// settled snapshot, and live once each time the pin's voltage leaves
+    /// the range upward (the voltage named is the first one above it).
+    PinAboveRecommended {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The pin, by number.
+        pin: String,
+        /// The pin's voltage against its declared reference.
+        volts: Volts,
+        /// The recommended range's minimum.
+        min: Volts,
+        /// The recommended range's maximum.
+        max: Volts,
+        /// The absolute maximum rating, where the part declares one.
+        absolute_max: Option<Volts>,
+        /// What the part says running above the range costs, in plain
+        /// words; empty for nothing more.
+        note: String,
+    },
     /// The build-time fixed point did not settle within its bound: after
     /// `passes` rounds of replaying the drives components issued in response
     /// to the states they were delivered, some component was still changing
@@ -504,6 +527,29 @@ impl fmt::Display for Finding {
                 pins(drivers),
                 if drivers.len() == 1 { "s" } else { "" }
             ),
+            Self::PinAboveRecommended {
+                part,
+                pin,
+                volts,
+                min,
+                max,
+                absolute_max,
+                note,
+            } => {
+                write!(
+                    f,
+                    "pin {part}.{pin} is at {volts} V, above its recommended {min} V to {max} V"
+                )?;
+                if let Some(abs) = absolute_max {
+                    let side = if volts > abs { "beyond" } else { "within" };
+                    write!(f, ", {side} its {abs} V absolute maximum")?;
+                }
+                if note.is_empty() {
+                    Ok(())
+                } else {
+                    write!(f, ": {note}")
+                }
+            }
             Self::BuildNotSettled { passes, nets } if nets.is_empty() => {
                 write!(f, "the build did not settle in {passes} passes")
             }
@@ -881,6 +927,44 @@ mod tests {
     #[case::build_not_settled_unnamed(
         Finding::BuildNotSettled { passes: 64, nets: vec![] },
         "the build did not settle in 64 passes"
+    )]
+    #[case::pin_above_recommended(
+        Finding::PinAboveRecommended {
+            part: "EDGE.U25".into(),
+            pin: "16".into(),
+            volts: 5.0,
+            min: 3.0,
+            max: 3.6,
+            absolute_max: Some(6.0),
+            note: "its open-input bias is not characterised above 3.6 V".into(),
+        },
+        "pin EDGE.U25.16 is at 5 V, above its recommended 3 V to 3.6 V, within its 6 V absolute \
+         maximum: its open-input bias is not characterised above 3.6 V"
+    )]
+    #[case::pin_beyond_absolute_max(
+        Finding::PinAboveRecommended {
+            part: "EDGE.U25".into(),
+            pin: "16".into(),
+            volts: 6.5,
+            min: 3.0,
+            max: 3.6,
+            absolute_max: Some(6.0),
+            note: String::new(),
+        },
+        "pin EDGE.U25.16 is at 6.5 V, above its recommended 3 V to 3.6 V, beyond its 6 V absolute \
+         maximum"
+    )]
+    #[case::pin_above_recommended_bare(
+        Finding::PinAboveRecommended {
+            part: "B.U1".into(),
+            pin: "VCC".into(),
+            volts: 3.7,
+            min: 3.0,
+            max: 3.6,
+            absolute_max: None,
+            note: String::new(),
+        },
+        "pin B.U1.VCC is at 3.7 V, above its recommended 3 V to 3.6 V"
     )]
     fn a_finding_prints_in_plain_words(#[case] finding: Finding, #[case] line: &str) {
         behaviour!(Test {

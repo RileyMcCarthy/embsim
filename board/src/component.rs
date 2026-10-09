@@ -630,6 +630,38 @@ pub struct Clamp {
     pub r_d: Ohms,
 }
 
+/// A pin's declared operating limits (`NODES.md` §11, beside its other
+/// static facts on [`PinDecl`]): the datasheet's recommended operating
+/// range for the pin's voltage, measured against the pin's
+/// [`PinDecl::reference`] (the engine's 0 V where it declares none), and
+/// its absolute maximum where the datasheet gives one. The part declares
+/// them and the **engine** checks them against the solved net: a pin whose
+/// voltage rises above `recommended.1` raises
+/// [`crate::Finding::PinAboveRecommended`] once per excursion — at
+/// [`crate::System::build`] over the settled snapshot, and live each time
+/// the pin's net or its reference moves above the range from inside it or
+/// from no voltage. The part keeps running: what it does out of range is
+/// its model's, and the finding is the report.
+///
+/// Only the top of the range is checked. Every supply passes below its
+/// recommended minimum as it rises and falls, so a pin under the range is
+/// its model's behaviour (an output released, a core held in reset), not
+/// a finding; the minimum is declared so the finding names the whole
+/// range. The build refuses limits that are not finite, a range whose
+/// minimum is above its maximum, and an absolute maximum below the range
+/// ([`crate::BoardError::InvalidDeclaration`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PinLimits {
+    /// The recommended operating range, `(min, max)`, volts against the
+    /// pin's reference.
+    pub recommended: (Volts, Volts),
+    /// The absolute maximum rating, volts against the pin's reference.
+    pub absolute_max: Option<Volts>,
+    /// What running above the range costs, in the datasheet's terms, for
+    /// the finding to say (`""`: nothing to add).
+    pub note: &'static str,
+}
+
 /// The idle a push-pull output presents until its component drives it:
 /// high, at the crate's logic rail behind the push-pull impedance —
 /// [`crate::net::digital_drive`]`(High)`, as a constant a constructor can
@@ -701,6 +733,9 @@ pub struct PinDecl {
     /// The pin whose voltage the pin's relative thresholds (and its power
     /// clamp) are declared against — a pad's bank supply.
     pub supply: Option<&'static str>,
+    /// The pin's declared operating limits, which the engine checks
+    /// against its solved net (see [`PinLimits`]).
+    pub limits: Option<PinLimits>,
     /// Whether the pin can source current onto its net — drive it high. A
     /// pin that can sink and not source is open-drain.
     pub can_source: bool,
@@ -723,6 +758,7 @@ impl PinDecl {
             thresholds: None,
             reference: None,
             supply: None,
+            limits: None,
             can_source: false,
             can_sink: false,
         }
@@ -857,6 +893,13 @@ impl PinDecl {
         self
     }
 
+    /// The same pin with declared operating limits, which the engine
+    /// checks against its solved net ([`PinLimits`]).
+    pub const fn with_limits(mut self, limits: PinLimits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
     /// The same pin with a capacitance to its reference, picofarads
     /// (declared; armed in phase 6).
     pub const fn with_capacitance_pf(mut self, picofarads: f64) -> Self {
@@ -918,7 +961,8 @@ impl PinDecl {
 /// declaration names (a reference, a supply) is a declared pin and not the
 /// pin itself; thresholds are fractions on a pin that names a supply and
 /// volts on one that names none; a clamp's rail is declared; an idle drive
-/// sits on a pin with a slot. The first violation, in declaration order.
+/// sits on a pin with a slot; declared limits are finite and ordered. The
+/// first violation, in declaration order.
 pub(crate) fn validate_declarations(pins: &[PinDecl]) -> Result<(), DeclarationError> {
     for pin in pins {
         if matches!(pin.role, PinRole::PowerIn | PinRole::Passive) && pin.idle.is_some() {
@@ -978,6 +1022,24 @@ pub(crate) fn validate_declarations(pins: &[PinDecl]) -> Result<(), DeclarationE
                     pin: pin.number.to_string(),
                     reason: "an input port's resistance must be at least the weak-drive boundary \
                              (1 kOhm): a load that ranks as a driver would contend",
+                });
+            }
+        }
+        if let Some(PinLimits {
+            recommended: (min, max),
+            absolute_max,
+            ..
+        }) = pin.limits
+        {
+            let ordered = min.is_finite()
+                && max.is_finite()
+                && min <= max
+                && absolute_max.is_none_or(|abs| abs.is_finite() && abs >= max);
+            if !ordered {
+                return Err(DeclarationError::Invalid {
+                    pin: pin.number.to_string(),
+                    reason: "operating limits must be finite volts, a recommended minimum at or \
+                             below its maximum, and an absolute maximum at or above the range",
                 });
             }
         }
