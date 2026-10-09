@@ -50,11 +50,13 @@
 //!   condition, as `crate::am26ls31` reads its own lines.
 //! - **Supply** — §6.3: `V_CC` 3 V min, 3.3 V nominal, **3.6 V max**; §6.1
 //!   absolute maximum 6 V. Under 3 V the outputs are released. Above 3.6 V
-//!   the part runs — `V_OH` follows the supply — and its model raises
-//!   [`embsim_board::Finding::SupplyOutsideRecommended`] once each time the
-//!   supply leaves the range, noting that the open-input bias Figure 9-2
+//!   the part runs — `V_OH` follows the supply. The supply pin **declares**
+//!   the range and the absolute maximum ([`AM26LV32_VCC_LIMITS`]), and the
+//!   engine checks them against the solved net: it raises
+//!   [`embsim_board::Finding::PinAboveRecommended`] once each time the
+//!   supply rises above 3.6 V, noting that the open-input bias Figure 9-2
 //!   draws is not characterised there ([`AM26LV32_SUPPLY_NOTE`]). The Edge
-//!   board runs `U25` from `SC_5V`, so it raises it there.
+//!   board runs `U25` from `SC_5V`, so it is raised there.
 //!
 //! # Deliberate simplifications
 //!
@@ -84,7 +86,7 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::{
     AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver, Drive, InputPort, Level,
-    Ohms, PartFindings, PinDecl, PinHandle, TheveninDrive, Thresholds, Volts,
+    Ohms, PinDecl, PinHandle, PinLimits, TheveninDrive, Thresholds, Volts,
 };
 
 // ============================================================
@@ -132,8 +134,8 @@ pub const AM26LV32_B_PORT: InputPort = InputPort {
 pub const AM26LV32_VCC_MIN_VOLTS: Volts = 3.0;
 
 /// `V_CC` maximum recommended: 3.6 V (SLLS202H §6.3). Above it the part
-/// runs and its model raises
-/// [`embsim_board::Finding::SupplyOutsideRecommended`].
+/// runs and the engine raises [`embsim_board::Finding::PinAboveRecommended`]
+/// from [`AM26LV32_VCC_LIMITS`].
 pub const AM26LV32_VCC_MAX_VOLTS: Volts = 3.6;
 
 /// `V_CC`'s absolute maximum rating: 6 V (SLLS202H §6.1).
@@ -161,10 +163,20 @@ pub const AM26LV32_R_OL_OHMS: Ohms = AM26LV32_VOL_MAX_VOLTS / AM26LV32_OUTPUT_TE
 
 /// What a supply above [`AM26LV32_VCC_MAX_VOLTS`] costs, as the finding
 /// says it: the open-input bias the fail-safe rests on is drawn only up to
-/// 3.6 V (SLLS202H Figure 9-2), and 6 V is the absolute maximum (§6.1).
+/// 3.6 V (SLLS202H Figure 9-2). The finding names the 6 V absolute maximum
+/// (§6.1) from the declaration itself.
 pub const AM26LV32_SUPPLY_NOTE: &str =
-    "the part runs, but its open-input bias is not characterised above 3.6 V, and 6 V is its \
-     absolute maximum";
+    "the part runs, but its open-input bias is not characterised above 3.6 V";
+
+/// `V_CC`'s declared operating limits, against `GND`: the recommended 3 V to
+/// 3.6 V (SLLS202H §6.3) and the 6 V absolute maximum (§6.1), which the
+/// engine checks against the supply pin's solved net
+/// ([`embsim_board::PinLimits`]).
+pub const AM26LV32_VCC_LIMITS: PinLimits = PinLimits {
+    recommended: (AM26LV32_VCC_MIN_VOLTS, AM26LV32_VCC_MAX_VOLTS),
+    absolute_max: Some(AM26LV32_VCC_ABS_MAX_VOLTS),
+    note: AM26LV32_SUPPLY_NOTE,
+};
 
 // ============================================================
 // Pin table
@@ -210,7 +222,10 @@ pub const AM26LV32_PINS: [PinDecl; 16] = [
     output("13", "4Y"),
     input("14", "4A", AM26LV32_A_PORT),
     input("15", "4B", AM26LV32_B_PORT),
-    PinDecl::power_in("16").with_reference("8").with_name("VCC"),
+    PinDecl::power_in("16")
+        .with_reference("8")
+        .with_name("VCC")
+        .with_limits(AM26LV32_VCC_LIMITS),
 ];
 
 /// `(A, B, Y)` for each of the four receivers (Table 5-1).
@@ -238,9 +253,6 @@ type Out = Option<(Level, Volts)>;
 struct State {
     /// `V_CC` against `GND`, when it names a voltage.
     vcc: Option<Volts>,
-    /// Whether the supply sits above the recommended maximum: the finding
-    /// is raised when this turns true.
-    over_range: bool,
     enable_high: Option<Level>,
     enable_low: Option<Level>,
     /// `(A volts, B volts)` per channel, against `GND`.
@@ -254,7 +266,6 @@ struct State {
 #[derive(Debug)]
 struct Core {
     state: Mutex<State>,
-    findings: Mutex<Option<PartFindings>>,
 }
 
 /// An output port: high is `V_CC` behind [`AM26LV32_R_OH_OHMS`], low is
@@ -307,24 +318,6 @@ impl Core {
             }
         }
     }
-
-    /// Take a new supply reading, raising the finding as the supply leaves
-    /// the recommended range.
-    fn supply(&self, state: &mut State, vcc: Option<Volts>) {
-        state.vcc = vcc;
-        let over = vcc.is_some_and(|volts| volts > AM26LV32_VCC_MAX_VOLTS);
-        if over && !state.over_range {
-            if let (Some(volts), Some(findings)) = (vcc, self.findings.lock().unwrap().as_ref()) {
-                findings.supply_outside_recommended(
-                    VCC,
-                    volts,
-                    (AM26LV32_VCC_MIN_VOLTS, AM26LV32_VCC_MAX_VOLTS),
-                    AM26LV32_SUPPLY_NOTE,
-                );
-            }
-        }
-        state.over_range = over;
-    }
 }
 
 // ============================================================
@@ -357,7 +350,6 @@ impl Am26lv32 {
         Self {
             core: Arc::new(Core {
                 state: Mutex::new(State::default()),
-                findings: Mutex::new(None),
             }),
         }
     }
@@ -369,10 +361,8 @@ impl Component for Am26lv32 {
     }
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
-        // Output handles and the findings voice first: a sense callback
-        // registered below fires at once with the current state and must
-        // find them.
-        *self.core.findings.lock().unwrap() = Some(io.findings());
+        // Output handles first: a sense callback registered below fires at
+        // once with the current state and must find them.
         {
             let mut state = self.core.state.lock().unwrap();
             for (_, _, y) in AM26LV32_CHANNELS {
@@ -383,7 +373,7 @@ impl Component for Am26lv32 {
         let core = Arc::clone(&self.core);
         io.on_sense(VCC, move |sensed| {
             let mut state = core.state.lock().unwrap();
-            core.supply(&mut state, sensed.volts);
+            state.vcc = sensed.volts;
             Core::apply(&mut state);
         })?;
         for (pin, active_high) in [(ENABLE_HIGH, true), (ENABLE_LOW, false)] {
@@ -467,5 +457,9 @@ mod tests {
             assert_eq!(pin(y).idle, None, "{y} rests released");
         }
         assert_eq!(pin(VCC).reference, Some("8"));
+        // SLLS202H §6.3 and §6.1: 3 V to 3.6 V recommended, 6 V absolute.
+        let limits = pin(VCC).limits.expect("VCC declares its limits");
+        assert_eq!(limits.recommended, (3.0, 3.6));
+        assert_eq!(limits.absolute_max, Some(6.0));
     }
 }

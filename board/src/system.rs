@@ -41,6 +41,7 @@ use crate::engine::{
     RecordedCallback, Resolver, SenseLog, TerminalDrive, VoltsTable,
 };
 use crate::event_log::EventLog;
+use crate::limits::LimitWatch;
 use crate::net::{Amps, Net, NetId, NetState, NetVolts, PinRef, TheveninDrive, Volts};
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
 
@@ -536,6 +537,11 @@ struct LintInputs {
     /// `(Board.Reference, global net)` of every mechanical node's pad.
     mechanical: Vec<(String, usize)>,
     parts: Vec<PartLint>,
+    /// One watch per pin that declares operating limits
+    /// ([`crate::PinLimits`]), on its global net and its reference's: the
+    /// build observes them over its snapshot, the live engine after every
+    /// pass ([`LimitWatch`]).
+    limits: Vec<LimitWatch>,
 }
 
 /// Output of the shared assembly pass: the merged net table, the populated
@@ -673,7 +679,6 @@ impl System {
         let volts = Arc::new(VoltsTable::of(nets.iter().map(|n| n.volts)));
         let currents: Arc<Mutex<CurrentTable>> = Arc::new(Mutex::new(resolver.current_table()));
         let recorded_drives = Arc::new(Mutex::new(Vec::new()));
-        let recorded_findings: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded_senses = SenseLog::default();
         // The build holds the sense log's one strong reference: the inert
         // link inside every handle the components keep sees it weakly, so
@@ -684,14 +689,12 @@ impl System {
             Arc::clone(&currents),
             Arc::clone(&recorded_drives),
             &recorded_senses,
-            Arc::clone(&recorded_findings),
         );
         let mut attached = Vec::with_capacity(components.len());
         for mut prepared in components {
             let io =
                 ComponentNetIo::wired(handle_entries(&prepared.pins, &link), None, link.clone())
-                    .with_topology(Arc::clone(&topology))
-                    .with_part(&format!("{}.{}", prepared.board, prepared.reference));
+                    .with_topology(Arc::clone(&topology));
             prepared
                 .component
                 .attach(io)
@@ -869,13 +872,6 @@ impl System {
             let late = std::mem::replace(&mut *log, senses);
             log.extend(late);
         };
-        // What the parts raised about themselves through the build
-        // (`PartFindings`), in the order they raised it: the fixed point
-        // starts each pass's findings afresh, and a part speaks once per
-        // condition, so they join after it.
-        for finding in std::mem::take(&mut *recorded_findings.lock().expect("never poisoned")) {
-            diagnostics.report(finding);
-        }
         if !settled {
             diagnostics.report(Finding::BuildNotSettled {
                 passes,
@@ -899,6 +895,13 @@ impl System {
         // states and the declarations, and the live engine re-derives
         // nothing of them.
         lint_build(&nets, &roots, &mut resolver, &lints, &mut diagnostics);
+        // The declared pin limits, over the settled snapshot: the engine's
+        // own check (`LimitWatch`), observed once.
+        for mut watch in lints.limits {
+            if let Some(finding) = watch.observe(&nets) {
+                diagnostics.report(finding);
+            }
+        }
         let cluster_roots = resolver.cluster_roots(nets.len());
         let escalated_solves = resolver.escalated_solves();
         let currents = resolver.current_table();
@@ -937,7 +940,7 @@ impl System {
             components,
             paths,
             topology,
-            lints: _,
+            lints,
         } = self.assemble()?;
 
         let net_names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
@@ -948,6 +951,7 @@ impl System {
             event_log,
             quiescence_timeout,
         );
+        engine.watch_limits(lints.limits);
         let link = engine.link();
 
         let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
@@ -957,8 +961,7 @@ impl System {
                 Some(ComponentId(index)),
                 link.clone(),
             )
-            .with_topology(Arc::clone(&topology))
-            .with_part(&format!("{}.{}", prepared.board, prepared.reference));
+            .with_topology(Arc::clone(&topology));
             if let Err(error) = prepared.component.attach(io) {
                 let error = SystemError::Board {
                     name: prepared.board.clone(),
@@ -1498,6 +1501,30 @@ impl System {
                                 }
                             }
                         }
+                        // The pins that declare operating limits, for the
+                        // engine to check (a detached pin is on no net and
+                        // drops out; a detached reference measures nothing,
+                        // so the pin goes with it).
+                        for pin in pins.iter() {
+                            let Some(limits) = pin.limits else { continue };
+                            let Some(net) = net_of(pin.number) else {
+                                continue;
+                            };
+                            let reference = match pin.reference {
+                                Some(named) => match net_of(named) {
+                                    Some(net) => Some(net),
+                                    None => continue,
+                                },
+                                None => None,
+                            };
+                            lints.limits.push(LimitWatch::new(
+                                path.clone(),
+                                pin.number,
+                                net,
+                                reference,
+                                limits,
+                            ));
+                        }
                         // The lints' view of the part: its pins on their
                         // nets and its references by pin number (a detached
                         // pin is on no net and drops out).
@@ -1618,6 +1645,17 @@ impl System {
                     .position(|p| p.number == id || p.name == Some(id))
             };
             let net_of = |id: &str| -> Option<usize> { position_of(id).map(|i| pin_nets[i]) };
+            for (pin, &net) in pins.iter().zip(pin_nets) {
+                let Some(limits) = pin.limits else { continue };
+                let reference = pin.reference.and_then(net_of);
+                lints.limits.push(LimitWatch::new(
+                    bench.name.clone(),
+                    pin.number,
+                    net,
+                    reference,
+                    limits,
+                ));
+            }
             lints.parts.push(PartLint {
                 path: bench.name.clone(),
                 pins: pins

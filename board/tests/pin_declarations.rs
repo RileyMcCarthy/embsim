@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use embsim_board::{
     jesd8c01_lvcmos_thresholds, AttachError, Board, BoardError, Clamp, ClampRail, Component,
     ComponentNetIo, DeadBand, EndpointRef, Harness, InputPort, Level, NetState, PartRegistry,
-    PinDecl, Scenario, System, SystemError, TheveninDrive, Thresholds,
+    PinDecl, PinLimits, Scenario, System, SystemError, TheveninDrive, Thresholds,
 };
 use embsim_boards::p2::P2_PAD_THRESHOLDS;
 use embsim_core::virtual_clock::{self, ClockMode};
@@ -363,6 +363,51 @@ fn a_declaration_naming_an_undeclared_pin_is_a_facade_mismatch(
         matches!(
             &error,
             BoardError::PinFacadeMismatch { reference, pin } if reference == "U1" && pin == named
+        ),
+        "{error:?}"
+    );
+}
+
+/// Declared operating limits the engine could not check — a range upside
+/// down, an absolute maximum below the range, a figure that is not finite —
+/// are refused.
+#[rstest]
+#[case::range_upside_down(PinLimits { recommended: (3.6, 3.0), absolute_max: None, note: "" })]
+#[case::absolute_below_the_range(
+    PinLimits { recommended: (3.0, 3.6), absolute_max: Some(3.3), note: "" }
+)]
+#[case::not_finite(PinLimits { recommended: (3.0, f64::NAN), absolute_max: None, note: "" })]
+fn limits_the_engine_cannot_check_are_refused(
+    #[case] limits: PinLimits,
+    #[values(Route::Netlist, Route::Bench)] route: Route,
+) {
+    behaviour!(Test {
+        id: "pin.limits-are-ordered",
+        covers: Some("board/src/component.rs#validate_declarations"),
+        given: "a supply pin declaring a recommended range upside down, an absolute maximum \
+                below its range, or a limit that is not a number, as a netlist part or a bench \
+                component",
+    });
+    expect!(
+        "declaration-refused",
+        "the build fails naming the part and the pin",
+        "a limit the engine would compare the solved net against has to be finite volts, a \
+         range from its minimum to its maximum, and an absolute maximum at or above it"
+    );
+    let _guard = stepped();
+    let error = refused(
+        vec![
+            PinDecl::power_in("1")
+                .with_reference("2")
+                .with_limits(limits),
+            PinDecl::power_in("2"),
+        ],
+        route,
+    );
+    assert!(
+        matches!(
+            &error,
+            BoardError::InvalidDeclaration { reference, pin, .. } if reference == "U1" && pin == "1"
         ),
         "{error:?}"
     );

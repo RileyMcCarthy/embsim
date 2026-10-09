@@ -1,7 +1,8 @@
 //! The TI AM26LV32 line receiver (`embsim_models::am26lv32`) as the
 //! standard catalog places it, alone on a bench: its output lines, its
-//! function table with the fail-safe, and the finding it raises over its
-//! recommended supply, each against TI SLLS202H.
+//! function table with the fail-safe, and the supply range its `VCC` pin
+//! declares, which the engine checks and reports above, each against TI
+//! SLLS202H.
 //!
 //! The part is placed by the base registry's number (`AM26LV32IDR`, the
 //! MaD Edge board's `U25`), so what is tested is what a project gets. Its
@@ -323,7 +324,7 @@ fn the_am26lv32_follows_its_function_table_and_fails_safe_high(
 fn supply_findings(findings: &[Finding]) -> Vec<&Finding> {
     findings
         .iter()
-        .filter(|finding| matches!(finding, Finding::SupplyOutsideRecommended { .. }))
+        .filter(|finding| matches!(finding, Finding::PinAboveRecommended { .. }))
         .collect()
 }
 
@@ -331,13 +332,13 @@ fn supply_findings(findings: &[Finding]) -> Vec<&Finding> {
 #[case::at_vcc_nominal(3.3, false)]
 #[case::at_vcc_max(VCC_MAX, false)]
 #[case::from_the_edge_boards_5_volts(5.0, true)]
-fn the_am26lv32_reports_a_supply_above_its_recommended_range(
+fn the_am26lv32s_declared_supply_range_is_checked_by_the_engine(
     #[case] vcc: Volts,
     #[case] over: bool,
 ) {
     behaviour!(Test {
         id: "am26lv32.supply-range",
-        covers: Some("models/src/am26lv32.rs#Am26lv32"),
+        covers: Some("models/src/am26lv32.rs#AM26LV32_VCC_LIMITS"),
         given: "an enabled AM26LV32 from the catalog, channel 1 reading high, its supply at 3.3 \
                 volts, at its 3.6 volt recommended maximum, or at 5 volts",
     });
@@ -345,8 +346,9 @@ fn the_am26lv32_reports_a_supply_above_its_recommended_range(
         "over-range-finding",
         "at 5 volts, the build and the live run each report once that the supply pin is above \
          the 3.6 volts recommended",
-        "SLLS202H recommends 3 to 3.6 volts and rates 6 volts absolute, so the part runs \
-         there, but its open-input bias is not characterised"
+        "the supply pin declares SLLS202H's 3 to 3.6 volts recommended and 6 volts absolute, \
+         and the engine checks the solved supply against them; the part runs there, but its \
+         open-input bias is not characterised"
     );
     expect!(
         "in-range-silent",
@@ -358,12 +360,13 @@ fn the_am26lv32_reports_a_supply_above_its_recommended_range(
         "an over-range supply is a finding, and the part keeps to its function table"
     );
     let held = [("G", 3.3), ("NG", 3.3), ("1A", 2.0), ("1B", 1.0)];
-    let expected = Finding::SupplyOutsideRecommended {
+    let expected = Finding::PinAboveRecommended {
         part: "B.U1".to_string(),
         pin: "16".to_string(),
         volts: vcc,
         min: VCC_MIN,
         max: VCC_MAX,
+        absolute_max: Some(6.0),
         note: AM26LV32_SUPPLY_NOTE.to_string(),
     };
     let built = {

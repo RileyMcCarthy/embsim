@@ -1039,13 +1039,14 @@ part of the three boards is placed, the carrier's RS-422 line driver `U24`
 by the catalog's `am26ls31` and its line receiver `U25` by `am26lv32`,
 each by its part number, and the mates and wires are checked once the
 boards build. The receiver runs from the carrier's 5 V, above the 3.6 V
-its datasheet recommends, and the run reports it
-(`SupplyOutsideRecommended`). `board/tests/edge_project.rs` builds the
-file and holds the mates to the hand-written harnesses the machine tests
-use (every finger and every cable pin joined as they join it, every empty
-socket contact and the shield open); `board/tests/edge_project_live.rs`
-runs it, and the module's core rail and the add-on's supply come up from
-the carrier's rails.
+its datasheet recommends: its supply pin declares that range, the engine
+checks it against the solved net, and the build and the run report it
+(`PinAboveRecommended`). `board/tests/edge_project.rs` builds the file and
+holds the mates to the hand-written harnesses the machine tests use (every
+finger and every cable pin joined as they join it, every empty socket
+contact and the shield open); `board/tests/edge_project_live.rs` runs it,
+and the module's core rail and the add-on's supply come up from the
+carrier's rails.
 
 ## 7. Adding kinds: a catalog of your own
 

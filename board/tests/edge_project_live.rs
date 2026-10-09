@@ -115,16 +115,17 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
     let findings = system.findings();
     let over_range: Vec<&Finding> = findings
         .iter()
-        .filter(|finding| matches!(finding, Finding::SupplyOutsideRecommended { .. }))
+        .filter(|finding| matches!(finding, Finding::PinAboveRecommended { .. }))
         .collect();
     assert_eq!(
         over_range,
-        [&Finding::SupplyOutsideRecommended {
+        [&Finding::PinAboveRecommended {
             part: "EDGE.U25".to_string(),
             pin: "16".to_string(),
             volts: XL1509_5V0_VOLTS,
             min: 3.0,
             max: 3.6,
+            absolute_max: Some(6.0),
             note: AM26LV32_SUPPLY_NOTE.to_string(),
         }],
         "{findings:?}"

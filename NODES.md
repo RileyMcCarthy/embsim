@@ -306,6 +306,7 @@ pub struct PinDecl {
     pub thresholds: Option<Thresholds>,  // { v_il, v_ih, hysteresis, dead_band }; fractions of `supply` when it names one
     pub reference: Option<&'static str>, // the pin its voltages are measured against
     pub supply: Option<&'static str>,    // the pin its relative thresholds scale with
+    pub limits: Option<PinLimits>,       // { recommended, absolute_max, note }: the engine checks them (PinAboveRecommended)
     pub can_source: bool,                // what a publish is checked against, and the open-drain lint;
     pub can_sink: bool,                  //   neither = an input (a sense)
 }
@@ -313,7 +314,8 @@ impl PinDecl {
     // digital_in(n, thresholds), digital_out(n), digital_io(n, thresholds),
     // analog(n) — a reader —, analog_source(n), power_in(n), power_out(n),
     // passive(n); with_idle / with_impedance / with_thresholds / with_reference /
-    // with_supply / with_input / with_clamps / with_capacitance_pf / sink_only.
+    // with_supply / with_input / with_clamps / with_capacitance_pf / with_limits /
+    // sink_only.
 }
 
 /// A nonlinear element is a branch between two of the part's pins, with an

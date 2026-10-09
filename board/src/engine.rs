@@ -126,6 +126,7 @@ use crate::cluster::{
 use crate::component::{Drive, PinHandle, PwlCurve, RegionTest};
 use crate::diagnostics::{CallbackKind, Diagnostics, Finding, SenseKind};
 use crate::event_log::{EngineEvent, EventLog};
+use crate::limits::LimitWatch;
 use crate::net::{
     level_of, Amps, Level, Net, NetId, NetState, NetVolts, Ohms, PeriodicSchedule, PinRef,
     TheveninDrive, Volts, COUPLED_REACH_OHMS, COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO,
@@ -330,12 +331,14 @@ pub(crate) enum Command {
     /// the `Component::start` loop; a no-op in free-running mode, where time
     /// runs regardless.
     ReleaseTime,
-    /// A finding a part's own model raises
-    /// ([`crate::PartFindings`]): reported onto the cumulative live bus,
-    /// deduped like every finding.
-    Report {
-        /// The finding, naming the part.
-        finding: Finding,
+    /// Watch the operating limits the parts declared on their pins
+    /// ([`crate::PinLimits`]): each watch is observed at once, against the
+    /// nets as they stand, and again after every pass that moves its pin's
+    /// net or reference ([`EngineCore::check_limits`]). Sent once by
+    /// `System::start`, before any component attaches.
+    WatchLimits {
+        /// One per declaring pin, in part then pin declaration order.
+        watches: Vec<LimitWatch>,
     },
     /// Stop the engine loop; pending drives and timers are discarded.
     Shutdown,
@@ -344,11 +347,6 @@ pub(crate) enum Command {
 /// Attach-time drives recorded on the inert (build-time) link, in issue
 /// order: the build pass applies them before it resolves for real.
 pub(crate) type RecordedDriveLog = Arc<Mutex<Vec<(EndpointId, Option<Drive>)>>>;
-
-/// Findings parts raised on the inert (build-time) link
-/// ([`Command::Report`]), in issue order: the build merges them into its
-/// findings once its fixed point is done.
-pub(crate) type RecordedFindingLog = Arc<Mutex<Vec<Finding>>>;
 
 /// Sense subscriptions made on the inert build-time path, in registration
 /// order, so `System::build`'s fixed point can deliver the states its
@@ -589,9 +587,6 @@ pub(crate) struct EngineLink {
     /// build pass's fixed point to deliver changed states to. A weak
     /// reference on purpose — see [`SenseLog`].
     pub(crate) recorded_senses: Option<WeakSenseLog>,
-    /// Inert path only: findings parts raised ([`Command::Report`]), for
-    /// the build to merge into its own.
-    pub(crate) recorded_findings: Option<RecordedFindingLog>,
 }
 
 impl EngineLink {
@@ -604,7 +599,6 @@ impl EngineLink {
         currents: Arc<Mutex<CurrentTable>>,
         recorded_drives: RecordedDriveLog,
         recorded_senses: &SenseLog,
-        recorded_findings: RecordedFindingLog,
     ) -> Self {
         Self {
             tx: None,
@@ -616,7 +610,6 @@ impl EngineLink {
             currents,
             recorded_drives: Some(recorded_drives),
             recorded_senses: Some(Arc::downgrade(&recorded_senses.0)),
-            recorded_findings: Some(recorded_findings),
         }
     }
 
@@ -669,14 +662,6 @@ impl EngineLink {
                     log.lock()
                         .expect("drive log never poisoned")
                         .push((*endpoint, *drive));
-                    return true;
-                }
-                if let (Command::Report { finding }, Some(log)) =
-                    (&command, &self.recorded_findings)
-                {
-                    log.lock()
-                        .expect("finding log never poisoned")
-                        .push(finding.clone());
                     return true;
                 }
                 tracing::debug!("inert engine link (build-time analysis path); command dropped");
@@ -5025,6 +5010,9 @@ struct EngineCore {
     /// recording site is closure-guarded, so an off log costs one `Option`
     /// check.
     event_log: EventLog,
+    /// The declared pin limits the engine checks ([`Command::WatchLimits`]),
+    /// in the order they were handed over.
+    limit_watches: Vec<LimitWatch>,
 }
 
 impl EngineCore {
@@ -5036,6 +5024,26 @@ impl EngineCore {
             self.event_log
                 .record(|| EngineEvent::Finding(finding.clone()));
             cumulative.report(finding);
+        }
+    }
+
+    /// Check the declared pin limits a pass may have moved
+    /// ([`LimitWatch`]): each watch whose pin's net or reference is among
+    /// `moves` is observed, and an excursion above its recommended range is
+    /// reported once, at the voltage it first reached. Nothing to walk when
+    /// no part declared limits.
+    fn check_limits(&mut self, moves: &[(usize, NetMove)]) {
+        if self.limit_watches.is_empty() || moves.is_empty() {
+            return;
+        }
+        for index in 0..self.limit_watches.len() {
+            let watch = &self.limit_watches[index];
+            if !moves.iter().any(|&(net, _)| watch.depends_on(net)) {
+                continue;
+            }
+            if let Some(finding) = self.limit_watches[index].observe(&self.nets) {
+                self.report_finding(finding);
+            }
         }
     }
 
@@ -5121,6 +5129,7 @@ impl EngineCore {
             Some((i, moved))
         }));
         self.old = old;
+        self.check_limits(&moves);
         self.deliver_senses(&moves);
         self.moves = moves;
         if currents_published {
@@ -5336,6 +5345,7 @@ impl EngineCore {
         }));
         self.scope = scope;
         self.old = old;
+        self.check_limits(&moves);
         self.deliver_senses(&moves);
         self.moves = moves;
         if currents_published {
@@ -5545,8 +5555,13 @@ impl EngineCore {
             Command::ReleaseTime => {
                 self.clock_released = true;
             }
-            Command::Report { finding } => {
-                self.report_finding(finding);
+            Command::WatchLimits { watches } => {
+                for mut watch in watches {
+                    if let Some(finding) = watch.observe(&self.nets) {
+                        self.report_finding(finding);
+                    }
+                    self.limit_watches.push(watch);
+                }
             }
             Command::Shutdown => return true,
         }
@@ -5885,6 +5900,7 @@ impl EngineHandle {
             quiescence_timeout: quiescence_timeout.unwrap_or(STEPPED_QUIESCENCE_TIMEOUT),
             stepped_gap_logged: None,
             event_log: event_log.clone(),
+            limit_watches: Vec::new(),
         };
         core.resolve_and_publish();
         // Pulse routes are derived from net resolution, never installed beside
@@ -5911,7 +5927,6 @@ impl EngineHandle {
                 // log.
                 recorded_drives: None,
                 recorded_senses: None,
-                recorded_findings: None,
             },
             diagnostics,
             event_log,
@@ -5924,6 +5939,15 @@ impl EngineHandle {
     /// Cloneable client link for attaching components.
     pub(crate) fn link(&self) -> EngineLink {
         self.link.clone()
+    }
+
+    /// Hand the engine the declared pin limits to watch
+    /// ([`Command::WatchLimits`]). Called once by `System::start`, before
+    /// any component attaches.
+    pub(crate) fn watch_limits(&self, watches: Vec<LimitWatch>) {
+        if !watches.is_empty() {
+            self.link.send(Command::WatchLimits { watches });
+        }
     }
 
     /// Tell the engine the system is fully assembled, so virtual time may
