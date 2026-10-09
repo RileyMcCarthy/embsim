@@ -153,6 +153,7 @@ fn split(request: ComponentRequest<'_>) -> (Entry<'_>, PartOptions) {
 struct Common {
     baud: u32,
     quantum_ns: u64,
+    max_lead_ns: Option<u64>,
     binary: PathBuf,
     arch: String,
     accel: Accel,
@@ -195,6 +196,14 @@ impl Common {
                  and each slice holds the board for one",
                 instant(max_ns)
             )));
+        }
+        let max_lead_ns = options.duration("max_lead")?;
+        if max_lead_ns == Some(0) {
+            return Err(request.error(
+                "options.max_lead is how far the guest may end a slice ahead of the board \
+                 before the run stops; every slice ends some way ahead (its `stop` takes \
+                 time), so it is more than 0",
+            ));
         }
         let binary = match options.string("qemu")? {
             Some(name) if name.contains('/') => request.dir.join(name),
@@ -242,6 +251,7 @@ impl Common {
         Ok(Self {
             baud,
             quantum_ns,
+            max_lead_ns,
             binary,
             arch,
             accel,
@@ -249,6 +259,19 @@ impl Common {
             memory,
             cpus,
         })
+    }
+}
+
+impl Common {
+    /// The node both kinds are: the guest `boot` makes, metered as the
+    /// options say.
+    fn node(&self, boot: crate::Boot) -> QemuNode {
+        let node =
+            QemuNode::booting(boot, self.baud).with_quantum(Duration::from_nanos(self.quantum_ns));
+        match self.max_lead_ns {
+            Some(lead) => node.with_max_lead(Duration::from_nanos(lead)),
+            None => node,
+        }
     }
 }
 
@@ -345,8 +368,7 @@ fn qemu_vm(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectE
         }
         Ok(Box::new(vm) as Box<dyn Guest>)
     });
-    let node =
-        QemuNode::booting(boot, common.baud).with_quantum(Duration::from_nanos(common.quantum_ns));
+    let node = common.node(boot);
     request.reports.add(VmReport {
         subject: request.spec.name.clone(),
         what: format!(
@@ -357,6 +379,12 @@ fn qemu_vm(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectE
                 .map(|image| format!(", booting {}", image.display()))
                 .unwrap_or_default()
         ),
+        unclocked: if agent {
+            "the guest's clock agent stopped answering"
+        } else {
+            "agent = true, with an image that runs embsim's clock agent (qemu/guest/chrome's \
+             user-data has it), books every slice from the guest's own clock"
+        },
         devtools: None,
         baud: common.baud,
         quantum_ns: common.quantum_ns,
@@ -422,8 +450,7 @@ fn chrome_vm(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Projec
             .map(|vm| Box::new(vm) as Box<dyn Guest>)
             .map_err(|e| e.to_string())
     });
-    let node =
-        QemuNode::booting(boot, common.baud).with_quantum(Duration::from_nanos(common.quantum_ns));
+    let node = common.node(boot);
     request.reports.add(VmReport {
         subject: request.spec.name.clone(),
         what: format!(
@@ -431,6 +458,7 @@ fn chrome_vm(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Projec
             image.display(),
             common.binary.display()
         ),
+        unclocked: "the image's clock agent did not answer",
         devtools: Some(format!("http://127.0.0.1:{port}")),
         baud: common.baud,
         quantum_ns: common.quantum_ns,
@@ -440,11 +468,17 @@ fn chrome_vm(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Projec
     Ok(Box::new(node))
 }
 
+/// A span of time as a summary prints it, to the microsecond: `1.250 ms`.
+fn span(ns: u64) -> String {
+    format!("{:.3} ms", ns as f64 / 1e6)
+}
+
 /// What a report has said so far.
 #[derive(Debug, Default)]
 struct Said {
     start: bool,
     boot: bool,
+    unpowered: bool,
 }
 
 /// What a VM kind says in a run: what it runs at the first look, when its
@@ -453,6 +487,9 @@ struct Said {
 struct VmReport {
     subject: String,
     what: String,
+    /// What bounds the drift for this kind, said when a run was not
+    /// clocked every slice.
+    unclocked: &'static str,
     devtools: Option<String>,
     baud: u32,
     quantum_ns: u64,
@@ -488,25 +525,47 @@ impl Report for VmReport {
                 }
             }
         }
+        if self.stats.unpowered() > 0 && !std::mem::replace(&mut self.said.unpowered, true) {
+            lines.push(
+                "the guest sent while its line's VIO read no voltage, and its bytes were shed: \
+                 a host's line is driven from its own rail, so wire VIO and GND"
+                    .to_string(),
+            );
+        }
         lines
     }
 
     fn summary(&self) -> Vec<String> {
         let stats = &self.stats;
-        let skew_us = stats.skew_ns() / 1_000;
-        let apart = match skew_us {
-            0 => "level with the board at the last slice".to_string(),
-            us if us > 0 => format!("{us} µs behind the board at the last slice"),
-            us => format!("{} µs ahead of the board at the last slice", -us),
-        };
         let mut lines = vec![format!(
-            "{} slices: the guest lived {} of the board's {} ({} booked from its own clock), \
-             {apart}",
+            "{} slices: the guest lived {} of the board's {} ({} booked from its own clock)",
             stats.slices(),
             instant(stats.guest_ns()),
             instant(stats.virtual_ns()),
             stats.clocked(),
         )];
+        if stats.slices() > 0 && stats.clocked() == stats.slices() {
+            let skew_us = stats.skew_ns() / 1_000;
+            lines.push(match skew_us {
+                0 => "level with the board at the last slice".to_string(),
+                us if us > 0 => format!("{us} µs behind the board at the last slice"),
+                us => format!("{} µs ahead of the board at the last slice", -us),
+            });
+        } else if stats.slices() > 0 {
+            lines.push(format!(
+                "the guest's own clock was not read every slice, so the books are the node's \
+                 stopwatch, which runs from when QEMU answers `cont` to when it answers `stop`: \
+                 how far the guest is from the board is not verified, and its drift is not \
+                 bounded; {}",
+                self.unclocked
+            ));
+        }
+        lines.push(format!(
+            "at most {} ahead of the board at a slice's end; the longest slice ran {} past its \
+             budget",
+            span(stats.peak_lead_ns()),
+            span(stats.peak_overrun_ns()),
+        ));
         lines.push(format!(
             "{} bytes from the guest, {} to it, {} framing errors",
             stats.from_guest(),

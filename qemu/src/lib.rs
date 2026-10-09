@@ -28,10 +28,14 @@
 //! freezes it again over QMP, and asks to be woken a quantum on. The engine
 //! cannot advance the board while the wake runs, and the guest is frozen
 //! whenever it does, so the guest's clock advances only while the board's
-//! does and lags it by at most a quantum. A closed loop carries the guest's
-//! owed time forward so the two clocks stay together over a run, not just
-//! per slice, and a guest that can read its own clock books every slice
-//! from it.
+//! does. A closed loop carries the guest's owed time forward so the two
+//! clocks stay together over a run, not just per slice, and a guest that
+//! can read its own clock ([`Guest::clock_ns`]) books every slice from it:
+//! its clock then lags the board's by at most a quantum, and leads it by at
+//! most the last slice's overrun (the time its `stop` took to take), which
+//! the next slices pay back ([`NodeStats::peak_lead_ns`]). A guest that
+//! cannot is booked by the node's stopwatch, which drifts from the guest's
+//! clock by as much as the host's QMP latency makes it.
 //!
 //! Bytes the board sends while the guest is frozen wait in a queue and are
 //! handed over when the guest next runs; bytes the guest sends during its
@@ -57,8 +61,9 @@
 //! instants the node acts at are the board's — every slice is at a multiple
 //! of the quantum after the start, and every byte enters the line at one —
 //! but what the guest sends, and in which slice, is the guest's. What the
-//! node guarantees is bounded skew between the two clocks — enough for a
-//! host's timeouts to mean what they say.
+//! node guarantees, for a guest whose clock it reads, is bounded skew
+//! between the two clocks — enough for a host's timeouts to mean what they
+//! say.
 //!
 //! [`SerialLevelBridge`]: embsim_board::SerialLevelBridge
 

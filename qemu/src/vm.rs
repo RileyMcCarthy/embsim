@@ -64,6 +64,17 @@ const QMP_ATTEMPTS: u32 = 20;
 /// How often [`QemuVm::run_until`] re-checks its predicate.
 const WARMUP_POLL: Duration = Duration::from_millis(100);
 
+/// How many of the last lines of QEMU's log a failure quotes: enough for
+/// QEMU's own error line and what led to it, short enough for a report.
+const LOG_TAIL_LINES: usize = 10;
+
+/// How long a failure waits for QEMU's exit status. A QEMU that is killed
+/// closes its sockets before the host has its status to give (measured: a
+/// SIGKILLed QEMU's QMP socket read end-of-file while `waitpid` still found
+/// it running), so a closed socket is followed by a short wait for the
+/// status; process plumbing, not a simulated wait.
+const EXIT_STATUS_GRACE: Duration = Duration::from_millis(500);
+
 /// Which emulated device carries the node's serial bytes into the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SerialDevice {
@@ -375,6 +386,7 @@ impl QemuSpec {
         Ok(QemuVm {
             child,
             workdir,
+            keep_workdir: false,
             qmp,
             serial: Some(serial),
             agent,
@@ -442,10 +454,14 @@ impl AgentLink {
 /// A running QEMU process, frozen unless a node is running it.
 ///
 /// Dropping it quits QEMU (killing it if `quit` is not honoured promptly)
-/// and removes the working directory.
+/// and removes the working directory, unless a failure was explained
+/// ([`Guest::explain`]): then the directory, with QEMU's log in it, stays
+/// for a post-mortem, and the explanation says where.
 pub struct QemuVm {
     child: Child,
     workdir: PathBuf,
+    /// Keep the working directory at drop: a failure pointed at its log.
+    keep_workdir: bool,
     qmp: Qmp,
     /// `None` while the port is unplugged. Closing this stream is what QEMU
     /// turns into a USB detach, so the absence IS the unplug -- there is no
@@ -490,6 +506,23 @@ impl QemuVm {
     /// Whether the in-guest agent is attached and still answering.
     pub fn has_agent(&self) -> bool {
         self.agent.is_some()
+    }
+
+    /// The last [`LOG_TAIL_LINES`] lines of QEMU's log, joined, or what
+    /// stopped them being read.
+    fn log_tail(&self) -> String {
+        match fs::read_to_string(self.log_path()) {
+            Ok(log) => {
+                let lines: Vec<&str> = log.lines().filter(|line| !line.trim().is_empty()).collect();
+                if lines.is_empty() {
+                    "it is empty".to_string()
+                } else {
+                    let tail = &lines[lines.len().saturating_sub(LOG_TAIL_LINES)..];
+                    format!("it ends: {}", tail.join(" | "))
+                }
+            }
+            Err(e) => format!("it could not be read: {e}"),
+        }
     }
 
     /// Let the guest run on host time until `ready` returns true, then
@@ -633,6 +666,33 @@ impl Guest for QemuVm {
         Ok(())
     }
 
+    fn explain(&mut self, error: io::Error) -> io::Error {
+        self.keep_workdir = true;
+        let deadline = Instant::now() + EXIT_STATUS_GRACE;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(None) if Instant::now() < deadline => {
+                    // Host process teardown, not a simulated wait.
+                    thread::sleep(Duration::from_millis(10));
+                }
+                other => break other,
+            }
+        };
+        let exited = match status {
+            Ok(Some(status)) => format!("QEMU exited ({status}) during a slice: "),
+            Ok(None) => String::new(),
+            Err(e) => format!("QEMU's state could not be read ({e}): "),
+        };
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{exited}{error}; QEMU's log is kept at {}, and {}",
+                self.log_path().display(),
+                self.log_tail()
+            ),
+        )
+    }
+
     fn clock_ns(&mut self) -> Option<u64> {
         let link = self.agent.as_mut()?;
         match link.clock_ns() {
@@ -658,6 +718,13 @@ impl Guest for QemuVm {
 impl Drop for QemuVm {
     fn drop(&mut self) {
         self.shutdown();
-        let _ = fs::remove_dir_all(&self.workdir);
+        if self.keep_workdir {
+            tracing::warn!(
+                workdir = %self.workdir.display(),
+                "QEMU's working directory is kept for its log: the guest failed"
+            );
+        } else {
+            let _ = fs::remove_dir_all(&self.workdir);
+        }
     }
 }

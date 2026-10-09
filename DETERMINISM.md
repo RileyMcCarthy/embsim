@@ -467,14 +467,23 @@ that answer it:
   own: the node meters the guest with its own wakes, on the engine thread.
   Every quantum of virtual time (`QemuNode::with_quantum`, default 1 ms) a
   wake lets the guest run for that much host time and stops it again over
-  QMP, so the guest is frozen whenever the engine advances, its clock and
-  the virtual clock never drift apart by more than a quantum, and a
-  host-side timeout counts simulated time. The instants are the board's:
-  every slice falls at a multiple of the quantum after the start, and every
-  byte the guest sent enters the line at one, so the board's side of a run
-  is reproducible given what the guest sent in each slice. That is the
-  property to assert about such a run — `NodeStats::skew_ns` bounded, slices
-  at their instants, `shed` zero — not a golden trace (`qemu/tests/`).
+  QMP, so the guest is frozen whenever the engine advances, and a
+  host-side timeout counts simulated time. Where the node reads the guest's
+  own clock (`Guest::clock_ns`: the Chrome image's agent, a `qemu-vm` with
+  `agent = true`), the guest's clock lags the virtual clock by at most a
+  quantum and leads it by at most the last slice's overrun — the time its
+  `stop` took past the slice, which a loaded host stretches — paid back by
+  the slices that follow (`NodeStats::peak_lead_ns` and `peak_overrun_ns`
+  report the largest; `QemuNode::with_max_lead` makes a lead past a bound
+  the run's failure). Where it cannot, the books are the node's stopwatch,
+  and the two clocks drift apart without a bound the node can state
+  (`NODES.md` §15's review measures it); the run's summary says so. The
+  instants are the board's: every slice falls at a multiple of the quantum
+  after the start, and every byte the guest sent enters the line at one, so
+  the board's side of a run is reproducible given what the guest sent in
+  each slice. That is the property to assert about such a run —
+  `NodeStats::skew_ns` and the peak lead bounded, slices at their instants,
+  `shed` zero — not a golden trace (`qemu/tests/`).
 
 - **Wall-clock deadlines inside the simulation** must become virtual:
   `Serial::receive_data_timeout`'s `Instant` deadline and its EAGAIN sleep,

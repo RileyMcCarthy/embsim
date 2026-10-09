@@ -144,6 +144,11 @@ struct FakeGuest {
     far: Arc<Mutex<Option<UnixStream>>>,
     clock: Arc<Mutex<Stopwatch>>,
     dropped: Arc<AtomicBool>,
+    /// The pause after this many resumes takes this long to be answered,
+    /// the guest running meanwhile, as a loaded host's `stop` does.
+    slow_pause: Option<(u64, Duration)>,
+    /// Resumes after this many fail, as a QEMU that has exited does.
+    dies_after: Option<u64>,
 }
 
 impl Drop for FakeGuest {
@@ -201,6 +206,8 @@ impl FakeGuest {
                 far: Arc::clone(&far),
                 clock: Arc::clone(&clock),
                 dropped: Arc::clone(&dropped),
+                slow_pause: None,
+                dies_after: None,
             },
             FarEnd {
                 far,
@@ -208,6 +215,18 @@ impl FakeGuest {
                 dropped,
             },
         )
+    }
+
+    /// The pause that ends the `resume`th slice takes `delay` to answer.
+    fn slow_pause_at(mut self, resume: u64, delay: Duration) -> Self {
+        self.slow_pause = Some((resume, delay));
+        self
+    }
+
+    /// Every resume after the first `resumes` fails.
+    fn dying_after(mut self, resumes: u64) -> Self {
+        self.dies_after = Some(resumes);
+        self
     }
 
     fn open_pair() -> (UnixStream, UnixStream) {
@@ -221,6 +240,12 @@ impl FakeGuest {
 impl Guest for FakeGuest {
     fn resume(&mut self) -> io::Result<()> {
         let mut c = self.clock.lock().unwrap();
+        if self.dies_after.is_some_and(|after| c.resumes >= after) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the fake guest's process has exited",
+            ));
+        }
         assert!(c.running_since.is_none(), "resumed twice without a pause");
         c.running_since = Some(Instant::now());
         c.resumes += 1;
@@ -228,11 +253,20 @@ impl Guest for FakeGuest {
     }
 
     fn pause(&mut self) -> io::Result<()> {
+        let resumes = self.clock.lock().unwrap().resumes;
+        if let Some((_, delay)) = self.slow_pause.filter(|(at, _)| *at == resumes) {
+            // The guest runs on while the `stop` is not answered.
+            std::thread::sleep(delay);
+        }
         let mut c = self.clock.lock().unwrap();
         if let Some(since) = c.running_since.take() {
             c.total += since.elapsed();
         }
         Ok(())
+    }
+
+    fn explain(&mut self, error: io::Error) -> io::Error {
+        io::Error::new(error.kind(), format!("{error}; its log says why"))
     }
 
     fn serial_fd(&self) -> RawFd {
@@ -496,9 +530,186 @@ fn a_guest_that_does_not_boot_stops_the_node_saying_why() {
     finish(system, actor);
 }
 
+#[rstest]
+fn a_late_stop_leaves_the_guest_ahead_which_is_reported_and_paid_back() {
+    behaviour!(Test {
+        id: "qemu-node.late-stop",
+        covers: Some("qemu/src/node.rs#NodeStats::peak_lead_ns"),
+        given: "a computer on the board metered every 10 milliseconds whose third slice's \
+                freeze is answered 50 milliseconds late, the guest running on meanwhile, run \
+                for twenty quanta on the stepped clock",
+    });
+    expect!(
+        "lead-reported",
+        "the node reports the guest at least 50 milliseconds ahead of the board at a slice's \
+         end, and a slice that ran at least 50 milliseconds past its budget",
+        "a slice ends when its freeze takes, so the guest leaves it ahead by what it \
+         outlived its budget"
+    );
+    expect!(
+        "paid-back",
+        "the guest is not run again until the board has caught up, so by the end it has \
+         lived the board's time to within a quantum, in at least four fewer slices"
+    );
+
+    let _suite = suite_lock();
+    let late = Duration::from_millis(50);
+    let (guest, end) = FakeGuest::new();
+    let node = QemuNode::new(Box::new(guest.slow_pause_at(3, late)), 115_200).with_quantum(QUANTUM);
+    let stats = node.stats();
+    let (system, actor) = bench(vec![("PC", node)], &[]);
+    let origin = virtual_clock::virtual_ns();
+    let quantum_ns = QUANTUM.as_nanos() as u64;
+    virtual_clock::wait_until_ns(origin + 20 * quantum_ns);
+
+    let late_ns = late.as_nanos() as u64;
+    assert!(
+        stats.peak_lead_ns() >= late_ns,
+        "lead-reported: the peak lead is {} ns",
+        stats.peak_lead_ns()
+    );
+    assert!(
+        stats.peak_overrun_ns() >= late_ns,
+        "lead-reported: the longest overrun is {} ns",
+        stats.peak_overrun_ns()
+    );
+    let lived = guest_total(&end.clock).as_nanos() as u64;
+    let board = stats.virtual_ns();
+    assert_eq!(board, 19 * quantum_ns);
+    assert!(
+        lived.abs_diff(board) <= quantum_ns,
+        "paid-back: the guest lived {lived} ns of the board's {board} ns"
+    );
+    assert!(
+        stats.slices() <= 19 - 4,
+        "paid-back: {} slices in nineteen quanta",
+        stats.slices()
+    );
+    assert_eq!(stats.failure(), None);
+    finish(system, actor);
+}
+
+#[rstest]
+fn a_lead_past_the_nodes_bound_stops_it_saying_so() {
+    behaviour!(Test {
+        id: "qemu-node.max-lead",
+        covers: Some("qemu/src/node.rs#QemuNode::with_max_lead"),
+        given: "a computer on the board metered every 10 milliseconds and allowed to lead the \
+                board by 20 milliseconds, whose third slice's freeze is answered 50 \
+                milliseconds late, on the stepped clock",
+    });
+    expect!(
+        "failure-says-so",
+        "the node stops with a failure saying how far ahead of the board the guest ended the \
+         slice, and the bound it passed"
+    );
+    expect!("no-more-slices", "no slice runs after the third");
+
+    let _suite = suite_lock();
+    let (guest, _end) = FakeGuest::new();
+    let node = QemuNode::new(
+        Box::new(guest.slow_pause_at(3, Duration::from_millis(50))),
+        115_200,
+    )
+    .with_quantum(QUANTUM)
+    .with_max_lead(2 * QUANTUM);
+    let stats = node.stats();
+    let (system, actor) = bench(vec![("PC", node)], &[]);
+    let quantum_ns = QUANTUM.as_nanos() as u64;
+    virtual_clock::wait_virtual_ns(10 * quantum_ns);
+    let failure = stats.failure().expect("failure-says-so: the node failed");
+    assert!(
+        failure.starts_with("the guest ended a slice ")
+            && failure.contains(" ahead of the board, past the 20.000 ms the node allows"),
+        "failure-says-so: {failure}"
+    );
+    assert_eq!(stats.slices(), 3, "no-more-slices");
+    virtual_clock::wait_virtual_ns(10 * quantum_ns);
+    assert_eq!(stats.slices(), 3, "no-more-slices");
+    finish(system, actor);
+}
+
+#[rstest]
+fn a_guest_that_dies_mid_run_stops_the_node_saying_why() {
+    behaviour!(Test {
+        id: "qemu-node.guest-dies",
+        covers: Some("qemu/src/node.rs#QemuNode"),
+        given: "a computer on the board metered every 10 milliseconds whose guest cannot be \
+                run again after its third slice, as when its process has exited, on the stepped \
+                clock",
+    });
+    expect!(
+        "failure-says-why",
+        "the node stops with a failure that carries the guest's own error and what the guest \
+         adds about why",
+        "a QEMU guest adds its exit status and the end of its log, which it keeps"
+    );
+    expect!("no-more-slices", "no slice runs after the third");
+
+    let _suite = suite_lock();
+    let (guest, _end) = FakeGuest::new();
+    let node = QemuNode::new(Box::new(guest.dying_after(3)), 115_200).with_quantum(QUANTUM);
+    let stats = node.stats();
+    let (system, actor) = bench(vec![("PC", node)], &[]);
+    let quantum_ns = QUANTUM.as_nanos() as u64;
+    virtual_clock::wait_virtual_ns(10 * quantum_ns);
+    assert_eq!(
+        stats.failure().as_deref(),
+        Some("the guest failed mid-slice: the fake guest's process has exited; its log says why"),
+        "failure-says-why"
+    );
+    assert_eq!(stats.slices(), 3, "no-more-slices");
+    virtual_clock::wait_virtual_ns(10 * quantum_ns);
+    assert_eq!(stats.slices(), 3, "no-more-slices");
+    finish(system, actor);
+}
+
 // ============================================================
 // Bytes
 // ============================================================
+
+#[rstest]
+fn a_guest_on_an_unpowered_line_sends_nothing_and_is_counted() {
+    behaviour!(Test {
+        id: "qemu-node.unpowered-line",
+        covers: Some("qemu/src/node.rs#NodeStats::unpowered"),
+        given: "a computer on the board whose line's rail and return are wired to nothing, \
+                as a harness of only the transmit and receive wires leaves them, its guest \
+                writing twelve bytes, on the stepped clock",
+    });
+    expect!(
+        "counted-unpowered",
+        "the node counts all twelve as sent while its line was unpowered, and as shed",
+        "a host's line is driven from its own rail, and a host with no rail sends nothing"
+    );
+
+    let _suite = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let (guest, end) = FakeGuest::new();
+    let node = QemuNode::new(Box::new(guest), 2_000_000).with_quantum(QUANTUM);
+    let stats = node.stats();
+    let system = System::new()
+        .component("PC", Box::new(node))
+        .hold_time()
+        .start()
+        .expect("the bench starts");
+    let actor = virtual_clock::register_actor("qemu-loopback-case");
+    system.release_time();
+    let bytes = b"hello, board";
+    end.write(bytes);
+    let start = Instant::now();
+    while stats.unpowered() < bytes.len() as u64 {
+        assert!(
+            start.elapsed() < HANG,
+            "the bytes were never taken: {stats:?}"
+        );
+        virtual_clock::wait_virtual_ns(SETTLE_NS);
+    }
+    assert_eq!(stats.unpowered(), bytes.len() as u64, "counted-unpowered");
+    assert_eq!(stats.shed(), bytes.len() as u64, "counted-unpowered");
+    assert_eq!(stats.from_guest(), 0, "counted-unpowered");
+    finish(system, actor);
+}
 
 /// Two nodes as a null-modem cable at `baud`, each one's `TX` to the
 /// other's `RX`.

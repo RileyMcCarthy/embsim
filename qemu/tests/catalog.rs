@@ -148,6 +148,11 @@ fn a_vm_in_a_project_is_built_and_checked_without_booting(#[case] kind: &str, #[
     "baud = 9600\nquantum = \"2s\"",
     "options.quantum is at most 1000.000000 ms"
 )]
+#[case::zero_max_lead(
+    "qemu-vm",
+    "baud = 9600\nmax_lead = \"0ms\"",
+    "options.max_lead is how far the guest may end a slice ahead of the board"
+)]
 #[case::no_image(
     "qemu-vm",
     "baud = 9600\nimage = \"missing.qcow2\"",
@@ -186,9 +191,9 @@ fn a_vm_entry_that_cannot_run_is_refused(
     behaviour!(Test {
         id: "qemu-vm.refusals",
         covers: Some("qemu/src/catalog.rs#VmCatalog"),
-        given: "a VM entry missing its baud rate, or with a zero or over-long quantum, a \
-                missing image, or an option, serial device or DevTools port the kind does not \
-                take",
+        given: "a VM entry missing its baud rate, or with a zero or over-long quantum, a zero \
+                bound on how far the guest may lead the board, a missing image, or an option, \
+                serial device or DevTools port the kind does not take",
     });
     expect!(
         "refused-saying-why",

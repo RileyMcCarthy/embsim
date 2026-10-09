@@ -86,6 +86,9 @@ pub struct NodeStats {
     booted: AtomicBool,
     boot_wall_ns: AtomicU64,
     boot_at_ns: AtomicU64,
+    peak_lead_ns: AtomicU64,
+    peak_overrun_ns: AtomicU64,
+    unpowered: AtomicU64,
     failure: Mutex<Option<String>>,
 }
 
@@ -101,6 +104,9 @@ impl fmt::Debug for NodeStats {
             .field("shed", &self.shed())
             .field("framing_errors", &self.framing_errors())
             .field("disconnected", &self.disconnected())
+            .field("peak_lead_ns", &self.peak_lead_ns())
+            .field("peak_overrun_ns", &self.peak_overrun_ns())
+            .field("unpowered", &self.unpowered())
             .field("failure", &self.failure())
             .finish()
     }
@@ -134,6 +140,34 @@ impl NodeStats {
     /// as of the node's last slice.
     pub fn skew_ns(&self) -> i64 {
         self.virtual_ns() as i64 - self.guest_ns() as i64
+    }
+
+    /// The furthest the guest's clock has been ahead of the board's at the
+    /// end of a slice, by the node's books, in nanoseconds.
+    ///
+    /// A slice ends when its `stop` takes, so the guest leaves every slice
+    /// ahead by that slice's overrun ([`Self::peak_overrun_ns`]), and the
+    /// node pays a lead back by not running the guest until the board has
+    /// caught up. A `stop` that QEMU answers late — a loaded host, a retried
+    /// round trip — leaves the guest that much ahead, and the board's bytes
+    /// reach it that much later by the guest's own clock.
+    pub fn peak_lead_ns(&self) -> u64 {
+        self.peak_lead_ns.load(Ordering::Relaxed)
+    }
+
+    /// The most host time any one slice ran past its budget, by the node's
+    /// stopwatch, in nanoseconds: the sleep's overshoot and the `stop`'s
+    /// round trip, retries included.
+    pub fn peak_overrun_ns(&self) -> u64 {
+        self.peak_overrun_ns.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the guest sent while its line's `VIO` read no voltage. A host
+    /// with no rail sends nothing, so they were shed (and counted in
+    /// [`Self::shed`] too); the first is logged as an error, since it is
+    /// most often a line whose `VIO` and `GND` nobody wired.
+    pub fn unpowered(&self) -> u64 {
+        self.unpowered.load(Ordering::Relaxed)
     }
 
     /// Bytes the guest sent that reached the line.
@@ -177,7 +211,9 @@ impl NodeStats {
     }
 
     /// Why the node stopped running its guest, once it has: the guest did
-    /// not boot, or failed mid-slice. The guest is left frozen.
+    /// not boot, failed mid-slice, or ran further ahead of the board than
+    /// [`QemuNode::with_max_lead`] allows. No slice runs after it; the
+    /// guest goes down when the node is dropped.
     pub fn failure(&self) -> Option<String> {
         self.failure
             .lock()
@@ -185,11 +221,36 @@ impl NodeStats {
             .clone()
     }
 
-    fn fail(&self, why: String) {
-        tracing::error!(%why, "qemu node: the guest is left frozen");
+    fn fail(&self, why: String, left: Left) {
+        let left = match left {
+            Left::Frozen => "the guest is left frozen",
+            Left::MaybeRunning => {
+                "the guest could not be frozen and may still be running until the node is dropped"
+            }
+            Left::NoGuest => "there is no guest",
+        };
+        tracing::error!(%why, "qemu node: {left}");
         let mut failure = self.failure.lock().expect("the failure is never poisoned");
         failure.get_or_insert(why);
     }
+}
+
+/// What a failure left of the guest, as the node's log says it: a guest
+/// is frozen only once a `stop` has been answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Left {
+    /// The last freeze was answered, or the guest was never thawed.
+    Frozen,
+    /// A thaw or a freeze failed: the guest's state is unknown.
+    MaybeRunning,
+    /// The guest was never made.
+    NoGuest,
+}
+
+/// A slice that failed, and what it left of the guest.
+struct SliceFailure {
+    error: io::Error,
+    left: Left,
 }
 
 /// The guest, or what makes it, shared between the node, its slices and
@@ -299,12 +360,17 @@ impl LinkControl {
 /// be woken a quantum on. The slice runs on the engine's thread inside the
 /// wake, so the engine cannot advance the board while the guest runs, and
 /// the guest is frozen whenever the engine does. The guest's clock
-/// therefore advances only while the board's does, at the same rate, and
-/// lags it by at most a quantum. A closed loop carries the guest's owed time
-/// from slice to slice — a slice the guest overran (a late `stop`) is paid
-/// back by a shorter one next — and a guest that can read its own clock
+/// therefore advances only while the board's does, at the same rate. A
+/// closed loop carries the guest's owed time from slice to slice — a slice
+/// the guest overran (a late `stop`) is paid back by not running it until
+/// the board has caught up — and a guest that can read its own clock
 /// ([`Guest::clock_ns`]) has each slice booked from it, so the books do not
-/// drift.
+/// drift: its clock lags the board's by at most a quantum and leads it by
+/// at most the last slice's overrun ([`NodeStats::peak_lead_ns`],
+/// [`QemuNode::with_max_lead`]). A guest whose clock cannot be read is
+/// booked by the node's stopwatch, which runs from QEMU's answer to `cont`
+/// to its answer to `stop`, not from the one taking to the other, and
+/// drifts from the guest's clock without a bound the node can state.
 ///
 /// Bytes the board sends while the guest is frozen wait in a queue and are
 /// written to the guest's port at the start of its next slice; bytes the
@@ -316,6 +382,7 @@ impl LinkControl {
 pub struct QemuNode {
     framing: UartFraming,
     quantum_ns: u64,
+    max_lead_ns: Option<u64>,
     guest: GuestSlot,
     shutdown: Arc<AtomicBool>,
     outbound: ByteQueue,
@@ -368,6 +435,7 @@ impl QemuNode {
         Self {
             framing: UartFraming::new_8n1(baud_hz),
             quantum_ns: DEFAULT_QUANTUM.as_nanos() as u64,
+            max_lead_ns: None,
             guest: Arc::new(Mutex::new(slot)),
             shutdown: Arc::new(AtomicBool::new(false)),
             outbound: Arc::new(Mutex::new(VecDeque::new())),
@@ -382,7 +450,7 @@ impl QemuNode {
 
     /// Set the quantum (default [`DEFAULT_QUANTUM`], clamped to
     /// [`MAX_QUANTUM`] and to at least a nanosecond). Shorter quanta bound
-    /// the skew tighter and cost proportionally more stop/cont round trips.
+    /// the lag tighter and cost proportionally more stop/cont round trips.
     pub fn with_quantum(mut self, quantum: Duration) -> Self {
         let quantum = if quantum > MAX_QUANTUM {
             tracing::warn!(?quantum, ?MAX_QUANTUM, "qemu node: quantum clamped");
@@ -397,6 +465,15 @@ impl QemuNode {
     /// The quantum, in nanoseconds of virtual time.
     pub fn quantum_ns(&self) -> u64 {
         self.quantum_ns
+    }
+
+    /// Stop the node, as a failure saying so, the first time the guest
+    /// ends a slice further ahead of the board than `lead`
+    /// ([`NodeStats::peak_lead_ns`]). By default no lead stops it: the
+    /// node pays a lead back and reports the largest.
+    pub fn with_max_lead(mut self, lead: Duration) -> Self {
+        self.max_lead_ns = Some(lead.as_nanos().min(u128::from(u64::MAX)) as u64);
+        self
     }
 
     /// The framing the line is clocked at.
@@ -430,6 +507,7 @@ impl Component for QemuNode {
         let line = HostRailLine::attach(&io, self.framing, Arc::clone(&self.shutdown))?;
         let meter = Arc::new(Meter {
             quantum_ns: self.quantum_ns,
+            max_lead_ns: self.max_lead_ns,
             guest: Arc::clone(&self.guest),
             line,
             io: io.clone(),
@@ -489,8 +567,10 @@ impl Component for QemuNode {
         {
             Ok(handle) => self.pump = Some(handle),
             Err(e) => {
-                self.stats
-                    .fail(format!("could not spawn the serial pump thread: {e}"));
+                self.stats.fail(
+                    format!("could not spawn the serial pump thread: {e}"),
+                    Left::Frozen,
+                );
                 return;
             }
         }
@@ -540,6 +620,7 @@ struct Books {
 /// callbacks once it is attached.
 struct Meter {
     quantum_ns: u64,
+    max_lead_ns: Option<u64>,
     guest: GuestSlot,
     line: HostRailLine,
     io: ComponentNetIo,
@@ -601,8 +682,13 @@ impl Meter {
                 let mut slot = self.guest.lock().expect("guest slot never poisoned");
                 match self.ready(&mut slot, now_ns) {
                     Ok(guest) => run_slice(guest.as_mut(), &self.outbound, &self.stats, budget)
-                        .map_err(|e| format!("the guest failed mid-slice: {e}")),
-                    Err(why) => Err(why),
+                        .map_err(|failure| {
+                            (
+                                format!("the guest failed mid-slice: {}", failure.error),
+                                failure.left,
+                            )
+                        }),
+                    Err(why) => Err((why, Left::NoGuest)),
                 }
             };
             // Whatever the guest sent during its slice goes on the line at
@@ -610,11 +696,30 @@ impl Meter {
             self.feed_bridge();
             match outcome {
                 Ok((lived, clock)) => self.book(&mut books, lived, clock),
-                Err(why) => {
+                Err((why, left)) => {
                     books.next_slice_ns = None;
-                    self.stats.fail(why);
+                    self.stats.fail(why, left);
                     return;
                 }
+            }
+            // The guest left the slice when its `stop` took: ahead of the
+            // board by what it outlived its budget, which the slices that
+            // follow pay back by not running it.
+            let lead =
+                (self.stats.guest_ns() as i64 - self.stats.virtual_ns() as i64).max(0) as u64;
+            self.stats.peak_lead_ns.fetch_max(lead, Ordering::Relaxed);
+            if let Some(max) = self.max_lead_ns.filter(|&max| lead > max) {
+                books.next_slice_ns = None;
+                self.stats.fail(
+                    format!(
+                        "the guest ended a slice {} ahead of the board, past the {} the node \
+                         allows: the slice's `stop` took that long to be answered",
+                        span(lead),
+                        span(max),
+                    ),
+                    Left::Frozen,
+                );
+                return;
             }
         }
         let next = now_ns + self.quantum_ns;
@@ -706,6 +811,19 @@ impl Meter {
         if shed > 0 {
             // The rail reads no voltage: a host with no rail sends nothing.
             self.stats.shed.fetch_add(shed as u64, Ordering::Relaxed);
+            if self
+                .stats
+                .unpowered
+                .fetch_add(shed as u64, Ordering::Relaxed)
+                == 0
+            {
+                tracing::error!(
+                    shed,
+                    "qemu node: the guest sent while its line's VIO read no voltage, and \
+                     its bytes were shed; a host's line is driven from its own rail, so \
+                     wire the host's I/O rail to VIO and its return to GND"
+                );
+            }
         }
     }
 
@@ -739,13 +857,19 @@ impl Meter {
 
 /// Run the guest for `budget` of host time, writing it the board's bytes
 /// meanwhile. Returns how long it ran by the node's stopwatch, and the
-/// guest's own clock reading at the start of the run if it offers one.
+/// guest's own clock reading at the start of the run if it offers one; or
+/// the failure, explained by the guest ([`Guest::explain`]), and whether a
+/// `stop` was answered after it.
 fn run_slice(
     guest: &mut dyn Guest,
     outbound: &Mutex<VecDeque<u8>>,
     stats: &NodeStats,
     budget: Duration,
-) -> io::Result<(Duration, Option<u64>)> {
+) -> Result<(Duration, Option<u64>), SliceFailure> {
+    let failed = |guest: &mut dyn Guest, error: io::Error, left: Left| SliceFailure {
+        error: guest.explain(error),
+        left,
+    };
     let fd = guest.serial_fd();
     if fd < 0 {
         // Unplugged. Anything the board sent meanwhile is DISCARDED rather
@@ -759,17 +883,47 @@ fn run_slice(
     } else {
         // Hand the guest what the board sent while it was frozen. Whatever the
         // socket will not take yet goes on the first POLLOUT below.
-        drain_outbound(fd, outbound, stats)?;
+        if let Err(e) = drain_outbound(fd, outbound, stats) {
+            // Not thawed yet: still frozen.
+            return Err(failed(guest, e, Left::Frozen));
+        }
     }
-    guest.resume()?;
+    if let Err(e) = guest.resume() {
+        // The thaw may have landed without its answer: freeze it again if
+        // it can be.
+        let left = if guest.pause().is_ok() {
+            Left::Frozen
+        } else {
+            Left::MaybeRunning
+        };
+        return Err(failed(guest, e, left));
+    }
     let start = Instant::now();
     let clock = guest.clock_ns();
     let outcome = hold_slice(fd, outbound, stats, start, budget);
     let pause = guest.pause();
     let lived = start.elapsed();
-    outcome?;
-    pause?;
-    Ok((lived, clock))
+    stats.peak_overrun_ns.fetch_max(
+        lived.saturating_sub(budget).as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    match (outcome, pause) {
+        (Ok(()), Ok(())) => Ok((lived, clock)),
+        (Err(e), pause) => {
+            let left = if pause.is_ok() {
+                Left::Frozen
+            } else {
+                Left::MaybeRunning
+            };
+            Err(failed(guest, e, left))
+        }
+        (Ok(()), Err(e)) => Err(failed(guest, e, Left::MaybeRunning)),
+    }
+}
+
+/// A span of time as a report prints it: `1.250 ms`.
+fn span(ns: u64) -> String {
+    format!("{:.3} ms", ns as f64 / 1e6)
 }
 
 /// The body of a slice: write the guest its bytes until the budget is spent.

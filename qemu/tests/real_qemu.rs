@@ -83,6 +83,16 @@ fn qemu_binary() -> PathBuf {
         )
 }
 
+/// `EMBSIM_QEMU_ACCEL=tcg` runs the cases under TCG on a host with a
+/// hypervisor, as CI's Linux runner runs them; otherwise the host's own
+/// accelerator for an aarch64 guest.
+fn accel() -> Accel {
+    match std::env::var("EMBSIM_QEMU_ACCEL").as_deref() {
+        Ok("tcg") => Accel::Tcg,
+        _ => Accel::Auto,
+    }
+}
+
 /// The counter guest written where QEMU can load it, in a directory of the
 /// case's own that goes when the case ends.
 struct CounterImage(PathBuf);
@@ -118,7 +128,7 @@ impl Drop for CounterImage {
 /// the guest.
 fn counter_args(image: &std::path::Path) -> Vec<String> {
     let mut args = vec!["-M".to_string(), "virt,kernel-irqchip=off".to_string()];
-    args.extend(Accel::Auto.args("aarch64"));
+    args.extend(accel().args("aarch64"));
     args.extend([
         "-m".to_string(),
         "64M".to_string(),
@@ -185,10 +195,33 @@ impl Guest for CounterGuest {
         self.vm.serial_fd()
     }
 
+    fn explain(&mut self, error: std::io::Error) -> std::io::Error {
+        self.vm.explain(error)
+    }
+
     fn clock_ns(&mut self) -> Option<u64> {
         let (counter, frequency) = read_counter(&mut self.monitor.lock().unwrap());
         // Zero until the guest's first instructions have run.
         (frequency > 0).then(|| ticks_to_ns(counter, frequency))
+    }
+}
+
+/// The counter guest with its clock hidden from the node, as a `qemu-vm`
+/// without an agent is: every slice booked from the node's stopwatch. The
+/// case still reads the counter.
+struct StopwatchOnly(CounterGuest);
+
+impl Guest for StopwatchOnly {
+    fn resume(&mut self) -> std::io::Result<()> {
+        self.0.resume()
+    }
+
+    fn pause(&mut self) -> std::io::Result<()> {
+        self.0.pause()
+    }
+
+    fn serial_fd(&self) -> std::os::fd::RawFd {
+        self.0.serial_fd()
     }
 }
 
@@ -291,7 +324,11 @@ fn a_real_qemu_runs_only_while_the_boards_clock_advances() {
         stats.clocked(),
     );
     // Each slice booked from the guest's own counter: the books are the
-    // guest's clock, and the guest's clock is the board's, to a quantum.
+    // guest's clock, and the guest's clock is the board's. It lags the
+    // board by at most a quantum, and leads it by at most what a slice's
+    // `stop` overran (the node's peak), plus the stopwatch's error on the
+    // one slice no later reading has corrected yet, under the floor and so
+    // under a quantum (`the_metering_floor_is_below_the_default_quantum`).
     assert!(
         stats.clocked() + 1 >= stats.slices(),
         "{} of {} slices clocked",
@@ -299,8 +336,14 @@ fn a_real_qemu_runs_only_while_the_boards_clock_advances() {
         stats.slices()
     );
     assert!(
-        lived.abs_diff(board) <= quantum_ns,
-        "the guest lived {lived} ns of the board's {board} ns"
+        board <= lived + quantum_ns,
+        "the guest lived {lived} ns of the board's {board} ns: more than a quantum behind"
+    );
+    assert!(
+        lived <= board + stats.peak_overrun_ns() + quantum_ns,
+        "the guest lived {lived} ns of the board's {board} ns, further ahead than the longest \
+         overrun, {} ns",
+        stats.peak_overrun_ns()
     );
     assert!(stats.failure().is_none(), "{:?}", stats.failure());
 
@@ -312,6 +355,119 @@ fn a_real_qemu_runs_only_while_the_boards_clock_advances() {
         wait_for(|| !alive(pid), Duration::from_secs(5)),
         "QEMU (pid {pid}) outlived the node"
     );
+}
+
+/// A thousand slices of the counter guest through a node, its clock read
+/// by the node or hidden from it: the node's stats, and the guest's own
+/// counter at the end, in nanoseconds.
+fn thousand_slices(clocked: bool) -> (std::sync::Arc<embsim_qemu::NodeStats>, u64) {
+    let image = CounterImage::write();
+    let guest = CounterGuest::spawn(&image);
+    let shared = Arc::clone(&guest.monitor);
+    let guest: Box<dyn Guest> = if clocked {
+        Box::new(guest)
+    } else {
+        Box::new(StopwatchOnly(guest))
+    };
+    let node = QemuNode::new(guest, 115_200);
+    let stats = node.stats();
+    let (system, actor) = bench(node);
+    let origin = virtual_clock::virtual_ns();
+    // A thousand quanta after the first slice's; the slice due at the last
+    // instant fires after the case parks again.
+    let quanta = 1_001;
+    virtual_clock::wait_until_ns(origin + quanta * DEFAULT_QUANTUM.as_nanos() as u64);
+    let (counter, frequency) = read_counter(&mut shared.lock().unwrap());
+    assert!(stats.failure().is_none(), "{:?}", stats.failure());
+    drop(actor);
+    system.shutdown();
+    (stats, ticks_to_ns(counter, frequency))
+}
+
+#[test]
+#[ignore = "needs qemu-system-aarch64; CI's qemu-vm job runs it"]
+fn a_stopwatch_only_node_drifts_from_the_guest_further_than_a_clocked_one() {
+    let _suite = suite_lock();
+    let quantum_ns = DEFAULT_QUANTUM.as_nanos() as u64;
+    let mut errors = Vec::new();
+    for clocked in [true, false] {
+        let (stats, lived) = thousand_slices(clocked);
+        let (booked, board) = (stats.guest_ns(), stats.virtual_ns());
+        eprintln!(
+            "{}: {} slices of {} ms ({} booked from the counter); the board {:.3} ms, the node \
+             booked {:.3} ms, the guest's counter {:.3} ms: {:+.2} % against the books",
+            if clocked { "clocked" } else { "stopwatch only" },
+            stats.slices(),
+            quantum_ns as f64 / 1e6,
+            stats.clocked(),
+            board as f64 / 1e6,
+            booked as f64 / 1e6,
+            lived as f64 / 1e6,
+            (lived as f64 - booked as f64) * 100.0 / booked as f64,
+        );
+        assert_eq!(board, 1_000 * quantum_ns);
+        assert_eq!(stats.clocked() > 0, clocked);
+        // Either way the books are the board's, as the loop keeps them:
+        // behind by at most a quantum, ahead by at most the longest overrun.
+        assert!(
+            board <= booked + quantum_ns && booked <= board + stats.peak_overrun_ns(),
+            "the node booked {booked} ns of the board's {board} ns; the longest overrun was \
+             {} ns",
+            stats.peak_overrun_ns()
+        );
+        errors.push(lived.abs_diff(booked));
+    }
+    // What the books are worth is the guest's clock: read, they are it to
+    // a slice; unread, the stopwatch runs from `cont`'s answer to `stop`'s
+    // while the guest runs from `cont` taking to `stop` taking, and the
+    // difference, either way, is the host's (measured: +1 % to +13 % under
+    // HVF, -13 % under TCG, on a loaded M2). The summary of such a run says
+    // so.
+    assert!(
+        errors[1] > errors[0],
+        "the stopwatch's books are {} ns from the guest's clock, the clocked books {} ns",
+        errors[1],
+        errors[0]
+    );
+}
+
+#[test]
+#[ignore = "needs qemu-system-aarch64; CI's qemu-vm job runs it"]
+fn a_qemu_that_dies_mid_run_stops_the_node_saying_why() {
+    let _suite = suite_lock();
+    let image = CounterImage::write();
+    let guest = CounterGuest::spawn(&image);
+    let pid = guest.vm.pid();
+    let node = QemuNode::new(Box::new(guest), 115_200);
+    let stats = node.stats();
+    let (system, actor) = bench(node);
+    let quantum_ns = DEFAULT_QUANTUM.as_nanos() as u64;
+    virtual_clock::wait_virtual_ns(20 * quantum_ns);
+    assert!(stats.failure().is_none(), "{:?}", stats.failure());
+    // SAFETY: `pid` is the QEMU this case spawned, still running; SIGKILL
+    // ends it as an outside kill or a crash would.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    virtual_clock::wait_virtual_ns(20 * quantum_ns);
+    let failure = stats.failure().expect("the node failed");
+    eprintln!("{failure}");
+    assert!(
+        failure.starts_with("the guest failed mid-slice: QEMU exited (")
+            && failure.contains("during a slice: "),
+        "{failure}"
+    );
+    let kept = failure
+        .split("QEMU's log is kept at ")
+        .nth(1)
+        .and_then(|rest| rest.split(", and ").next())
+        .map(PathBuf::from)
+        .expect("the failure says where the log is");
+    let slices = stats.slices();
+    virtual_clock::wait_virtual_ns(20 * quantum_ns);
+    assert_eq!(stats.slices(), slices, "a slice ran after the failure");
+    drop(actor);
+    system.shutdown();
+    assert!(kept.is_file(), "{} was kept", kept.display());
+    let _ = std::fs::remove_dir_all(kept.parent().expect("the log is in the VM's directory"));
 }
 
 /// Percentiles of `samples` in milliseconds: tenth, median, ninetieth.
@@ -456,8 +612,17 @@ volts = 0.0
             .any(|line| line.contains("the board's clock held at 1.000000 ms")),
         "{said:?}"
     );
+    // Forty-nine quanta passed after the boot; how many of them ran a slice
+    // is the host's (a slice that overruns is paid back by skipping one).
     assert!(
-        summary[0].starts_with("49 slices") || summary[0].starts_with("48 slices"),
+        summary[0].contains(" of the board's 49.000000 ms"),
+        "{summary:?}"
+    );
+    // No agent: the summary says the books are the stopwatch's.
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.contains("is not verified, and its drift is not bounded")),
         "{summary:?}"
     );
 }

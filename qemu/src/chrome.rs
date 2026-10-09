@@ -430,6 +430,10 @@ impl Guest for ChromeVm {
         self.vm.set_serial_attached(attached)
     }
 
+    fn explain(&mut self, error: io::Error) -> io::Error {
+        self.vm.explain(error)
+    }
+
     fn clock_ns(&mut self) -> Option<u64> {
         self.vm.clock_ns()
     }

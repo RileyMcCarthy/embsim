@@ -56,10 +56,25 @@ pub trait Guest: Send {
     /// consecutive readings as the exact length of the slice between them —
     /// whatever latency the read has, it has at both ends and cancels — and
     /// falls back to its own stopwatch when this returns `None`. The
-    /// stopwatch is good to a tenth of a millisecond per slice but biased,
-    /// so a long run drifts about a percent at 10 ms slices; a guest that
-    /// can answer this question does not drift at all.
+    /// stopwatch runs from QEMU's answer to `cont` to its answer to `stop`,
+    /// and the guest from the one taking to the other, so its books drift
+    /// from the guest's clock by whatever the host's QMP latency makes them,
+    /// either way and without a bound (measured on a loaded M2 over a
+    /// thousand 1 ms slices: +1 % to +13 % under HVF, −13 % to −21 % under
+    /// TCG). A guest that can answer this question does not drift at all.
     fn clock_ns(&mut self) -> Option<u64> {
         None
+    }
+
+    /// Say what the guest knows about a failure of one of the calls above
+    /// or of its serial port, which the node reports as the reason it
+    /// stopped. Called once, on the slice that failed.
+    ///
+    /// The default hands the error back. [`QemuVm`](crate::QemuVm) adds
+    /// whether QEMU has exited, with its status, and the end of QEMU's log,
+    /// and keeps its working directory (the log, and a Chrome guest's
+    /// console) for a post-mortem.
+    fn explain(&mut self, error: io::Error) -> io::Error {
+        error
     }
 }
