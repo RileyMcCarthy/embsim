@@ -846,7 +846,19 @@ runs only while the board's clock advances: every quantum of virtual time
 (1 ms by default) the node stops the board, lets the guest run that long in
 host time, and stops the guest again over QMP before the board moves on, so
 the guest's clock — its OS, its browser, the page's workers — is the
-board's, a quantum behind at most, and a host timeout means what it says.
+board's, and a host timeout means what it says. The guest is behind the
+board by at most a quantum, and ahead of it by at most what the last
+slice's `stop` overran (a loaded host answers late), which the node pays
+back by not running the guest until the board catches up and reports as
+the run's largest lead. That holds where the node reads the guest's own
+clock: a `chrome-vm`'s image answers it, and a `qemu-vm` with `agent =
+true` and an image that runs the agent does. Without it the node books
+each slice by its own stopwatch, which runs from QEMU's answer to `cont`
+to its answer to `stop` while the guest runs from the one taking to the
+other, and the two drift apart by as much as the host makes them
+(measured on a loaded M2 over a thousand slices: the guest lived 1 % to
+13 % more than the stopwatch booked under HVF, 13 % to 21 % less under
+TCG, `NODES.md` §15); the run's summary says when the clock was not read.
 
 Both have `host-serial`'s four pins, `TX`, `RX`, `VIO` and `GND`, declared
 and driven the same way (`embsim_board::HostRailLine`), so a project swaps
@@ -867,6 +879,7 @@ machine and accelerator.
 |---|---|---|
 | `baud` | both | required: the serial line's rate, framed 8N1 |
 | `quantum` | both | the virtual time between two slices of the guest, `"1ms"` by default, at most `"1s"`: the most the guest lags the board, and how often the board stops for a slice. A stop and a cont cost the host about a quarter of a millisecond and let the guest live at least about a seventh of one (NODES.md §15), so a quantum much under a millisecond buys little |
+| `max_lead` | both | stop the run, as the node's failure, the first time the guest ends a slice further ahead of the board than this, such as `"5ms"`: a host whose timeouts must not see a late `stop`. None by default: the node pays a lead back and the summary reports the largest |
 | `qemu` | both | the `qemu-system-*` binary: a name looked up on `PATH`, or a path relative to the project file; `qemu-system-<host arch>` by default. Homebrew's `qemu` on macOS, `qemu-system-arm` or `qemu-system-x86` on Debian |
 | `accel` | both | `"auto"` (the default: HVF on macOS, KVM on Linux when `/dev/kvm` opens, for a guest of the host's own architecture; TCG otherwise), `"hvf"`, `"kvm"` or `"tcg"` |
 | `firmware` | both | UEFI firmware (`-bios`), relative to the project file; an aarch64 guest's is found beside QEMU or in the usual places (`edk2-aarch64-code.fd`, Debian's `qemu-efi-aarch64`) when it boots an image |
@@ -877,7 +890,7 @@ machine and accelerator.
 | `warmup_timeout` | `chrome-vm` | how long the guest may take to boot until DevTools answers, `"180s"` by default |
 | `machine` | `qemu-vm` | QEMU's `-M`: `"virt,kernel-irqchip=off"` for an aarch64 guest by default (the interrupt controller in QEMU: with Hypervisor.framework's own, a guest that idles cannot be stopped), `"q35"` otherwise |
 | `serial` | `qemu-vm` | `"usb-ftdi"` (the default) or `"uart"` |
-| `agent` | `qemu-vm` | `true` attaches the virtio-serial port the Chrome image's clock agent answers on (`embsim_qemu::AGENT_PORT_NAME`), so every slice is booked from the guest's own clock; `false` by default |
+| `agent` | `qemu-vm` | `true` attaches the virtio-serial port the Chrome image's clock agent answers on (`embsim_qemu::AGENT_PORT_NAME`), so every slice is booked from the guest's own clock; `false` by default, for an image without the agent, whose run is booked by the node's stopwatch and is not held to the bound above |
 | `args` | `qemu-vm` | more of QEMU's arguments, a list of strings, appended as written (a `-kernel`, a `-netdev`) |
 | `warmup` | `qemu-vm` | host time the guest runs before the board's clock takes over, such as `"30s"` for an OS to boot; none by default, so the whole boot is metered |
 
@@ -887,7 +900,12 @@ nothing. The VM boots at the node's first slice, one quantum after the run
 starts, with the board's clock held there while it does: a boot, and a
 `chrome-vm`'s warm-up until DevTools answers (about ten seconds on an M2),
 is nobody's simulated time. A guest that does not boot, or whose QEMU dies,
-stops the run at the next look, saying why. A run of a `chrome-vm` named
+stops the run at the next look, saying why: a QEMU that exited says so with
+its exit status and the end of its log, and its working directory (the log,
+and a `chrome-vm`'s guest console) is kept for a post-mortem at the path
+the failure names. A guest that sends while its line's `VIO` reads no
+voltage, a `VIO` and `GND` nobody wired, has its bytes shed, as a host with
+no rail sends nothing, and the run says so once. A run of a `chrome-vm` named
 `PC`, wired as a null-modem cable to a `host-serial` named `HOST`, a page in
 the guest writing 17 bytes to its Web Serial port and reading 20 back, ended
 with SIGINT:
@@ -904,11 +922,19 @@ PC: 17 bytes from the guest, 20 to it, 0 framing errors
 PC: the guest sent during the run: its bytes entered the line in the slice it sent them in, so this run is reproducible in what it sent, not in when
 ```
 
+That run predates two lines the summary has now: the skew at the last
+slice is a line of its own, said only when every slice was booked from the
+guest's clock (otherwise the summary says the books are the stopwatch's,
+unverified), and the largest lead and overrun follow it, such as `at most
+1.749 ms ahead of the board at a slice's end; the longest slice ran 1.749 ms
+past its budget` from a `qemu-vm` on a loaded M2.
+
 The slices are fewer than the quanta: a Chrome guest lives a third to two
 thirds of a millisecond past the slice it is owed before a `stop` takes
-(measured, `NODES.md` §15), and the node pays that back by skipping a slice
-once the guest is a quantum ahead, so over a run the guest's own clock and
-the board's agree to within a quantum.
+(measured, `NODES.md` §15), and the node pays that back by not running the
+guest until the board has caught up, so over a run the guest's own clock
+and the board's agree to within a quantum behind and the largest overrun
+ahead.
 
 The board's side of such a run is the board's: every slice falls at a
 multiple of the quantum after the start, and every byte the guest sent
@@ -2419,7 +2445,7 @@ parts and the same closures are one component:
 | Member | What it is | Its pins, as the machine's |
 |---|---|---|
 | `DRIVE` | `StepperMotor`, 8192 steps a millimetre, `DIR` low forward, enable active low, no load loss (`BenchMachine::build`'s conventions) | `STEP`, `DIR`, `ENA`, measured against `DRIVE_GND`, a return the assembly declares |
-| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, with its index | `ENC_A`, `ENC_B`, `ENC_Z`, against `ENC_GND`, another |
+| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, with its index and its complements (`Config::with_complements`): each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-`, against `ENC_GND`, another. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high (`board/tests/edge_encoder_pairs.rs`) |
 | `UPPER`, `LOWER` | `EndSwitch`, closing at 100 mm (`TRAVEL_MM`) and at 0 mm | each contact's `COM` and `NO`: `NO` is the loop's `+` to the carrier, and the machine's loop supply reaches `COM` (`MIGRATING-MAD.md` §6, "The loop supply") |
 | `LOAD_CELL` | MaD's own: `LoadCellBridge` and `BridgeDrive` (`MaDSim/src/system_description.rs`) | `E+`, `E-` sensed, `S+`, `S-` driven |
 
@@ -2443,12 +2469,16 @@ fn machine(sample: Sample) -> Result<Assembly, AssemblyError> {
     });
     Assembly::new()
         .member("DRIVE", Box::new(drive), &[("STEP", "STEP"), ("DIR", "DIR"), ("ENA", "ENA")])?
-        .member("ENCODER", Box::new(encoder), &[("A", "ENC_A"), ("B", "ENC_B"), ("Z", "ENC_Z")])?
+        .member("ENCODER", Box::new(encoder), &[
+            ("A", "ENC_A+"), ("A-", "ENC_A-"),
+            ("B", "ENC_B+"), ("B-", "ENC_B-"),
+            ("Z", "ENC_Z+"), ("Z-", "ENC_Z-"),
+        ])?
         .member("UPPER", Box::new(upper), &[("COM", "UPPER_COM"), ("NO", "UPPER+")])?
         .member("LOWER", Box::new(lower), &[("COM", "LOWER_COM"), ("NO", "LOWER+")])?
         .member("LOAD_CELL", Box::new(load_cell), &[("E+", "E+"), ("E-", "E-"), ("S+", "S+"), ("S-", "S-")])?
         .reference("DRIVE_GND", &["STEP", "DIR", "ENA"])?
-        .reference("ENC_GND", &["ENC_A", "ENC_B", "ENC_Z"])
+        .reference("ENC_GND", &["ENC_A+", "ENC_A-", "ENC_B+", "ENC_B-", "ENC_Z+", "ENC_Z-"])
 }
 ```
 

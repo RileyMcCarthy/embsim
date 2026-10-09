@@ -15,6 +15,8 @@ the one before it promised, and says so here under **Breaking**.
   against `AVSS`, replaces `set_voltage(mv)`; `INTERNAL_VREF_VOLTS`
   replaces `INTERNAL_VREF_MV`, and `RESET_GAIN` is gone (a gain is the
   register's).
+- `machine::quadrature_encoder::Config` has a `complements` field (below):
+  a struct literal names it, or ends `..Config::new(counts_per_mm)`.
 
 ### Added
 
@@ -49,6 +51,25 @@ the one before it promised, and says so here under **Breaking**.
   at its own rail, the one `HostPty::open_on_rail` and the VM kinds attach.
 - CI's `qemu-vm` job runs the node against real QEMU (TCG) with a guest of
   six instructions whose own clock the tests read.
+- **What a VM run reports about its clock.** `NodeStats::peak_lead_ns` and
+  `peak_overrun_ns`: the furthest the guest ended a slice ahead of the
+  board, and the most a slice ran past its budget (a `stop` a loaded host
+  answers late), both in the run's summary; `QemuNode::with_max_lead` and
+  the kinds' `max_lead` option make a lead past a bound the run's failure.
+  The summary says the skew only when every slice was booked from the
+  guest's own clock, and otherwise that the books are the node's
+  stopwatch, unverified, its drift unbounded. `NodeStats::unpowered`
+  counts what the guest sent while its line's `VIO` read no voltage, logged
+  once as an error and said once in the report.
+- `Guest::explain`: a guest's word on a failure. A `QemuVm` that dies
+  mid-run is reported with its exit status and the end of QEMU's log, and
+  its working directory is kept for a post-mortem.
+- **`QuadratureEncoder` as an RS-422 encoder**
+  (`quadrature_encoder::Config::with_complements`, `NODES.md` §18): `A-`,
+  `B-` and, with an index, `Z-`, each driven to the inverse of its leg in
+  the same publish, the pairs a differential receiver such as the Edge
+  board's `U25` reads. `Config` has a `complements` field, `false` by
+  default.
 
 ### Changed
 
@@ -56,8 +77,10 @@ the one before it promised, and says so here under **Breaking**.
   (`NODES.md` §16). Every conversion reads the register file the host
   writes over the part's own serial pins: the input multiplexer, the gain
   (the PGA's bypass included, which leaves every gain as it is and limits
-  the inputs that bypass the PGA to 4), and the reference — the internal
-  2.048 V, `REFP − REFN`, or the analog supply as the part's pins sense it.
+  a pin read against `AVSS` to 4), and the reference — the internal
+  2.048 V, `REFP − REFN`, or the analog supply as the part's pins sense it;
+  the two system monitors convert at gain 1 against the internal reference
+  whatever the gain and reference bits say (SBAS752B §8.3.9).
   A part held in reset or without both supplies goes back to its defaults,
   gain 1 against 2.048 V, as the RESET command already did; single-shot
   mode sends one conversion per START. MaD's firmware start-up, sent to the
