@@ -57,16 +57,25 @@
 //! reach the P2 as the single-ended `ENC_A`, `ENC_B`, `ENC_Z` — see
 //! `Hardware/EdgeBoard/KiCad/MaD_Edge_Sheet3.kicad_sch` (the complementary
 //! AM26LS31 driver U24 on the same sheet handles the outbound step/direction
-//! pairs). **This component models the logic-level pair on the MCU side of
-//! that receiver**: each differential pair collapses to one logical channel,
-//! so a system description wires `ENCODER.A` to whatever net carries `ENC_A`.
-//! Modeling the pair itself would mean modeling the receiver, which buys
-//! nothing until a fault scenario wants to break one leg of a pair.
+//! pairs). By default **this component is the logic-level side of that
+//! receiver**: one output per channel, so a system description wires
+//! `ENCODER.A` to whatever net carries `ENC_A`.
+//!
+//! [`Config::with_complements`] makes it the encoder MaD's machine has: each
+//! channel a pair, `A` and `A-`, `B` and `B-`, and `Z` and `Z-` with an
+//! index, the `-` leg driven as the inverse of its leg in the same publish,
+//! as an RS-422 line driver presents it. The board's receiver then reads
+//! the pair as the datasheet does — a valid differential either way. A
+//! single-ended output on `A+` with `A-` held at the encoder's ground gives
+//! the receiver no differential for its low, which an AM26LV32 reads as its
+//! fail-safe high (TI SLLS202H §8.4.1, Table 8-1; `embsim_models::am26lv32`),
+//! so on the Edge board's `U25` only the pair counts.
 //!
 //! ## Not modeled
 //!
-//! - **The differential pair and its receiver** (above): no common-mode range,
-//!   no failsafe bias, no single-ended-leg fault.
+//! - **The driver behind a pair**: the legs are the configured push-pull
+//!   outputs, `0 V` and [`Config::high_volts`]; no common-mode offset, no
+//!   single-ended-leg fault.
 //! - **Quadrature error**: no phase error between channels, no duty-cycle
 //!   error, no jitter, no line-count tolerance. Every transition is exactly one
 //!   count wide.
@@ -149,6 +158,10 @@ pub struct Config {
     /// Transitions one position update may emit before snapping
     /// ([`DEFAULT_MAX_COUNTS_PER_UPDATE`]).
     pub max_counts_per_update: u32,
+    /// Whether each channel is a complementary pair: `A-`, `B-` (and `Z-`
+    /// with an index) declared beside `A`, `B` (and `Z`), each driven as the
+    /// inverse of its leg ([`Config::with_complements`]).
+    pub complements: bool,
 }
 
 impl Config {
@@ -162,12 +175,23 @@ impl Config {
             high_volts: DEFAULT_HIGH_VOLTS,
             drive_impedance_ohms: DEFAULT_PUSH_PULL_IMPEDANCE,
             max_counts_per_update: DEFAULT_MAX_COUNTS_PER_UPDATE,
+            complements: false,
         }
     }
 
     /// Add an index channel (and its `Z` pin).
     pub fn with_index(mut self, index: IndexConfig) -> Self {
         self.index = Some(index);
+        self
+    }
+
+    /// Make every channel a complementary pair, as an RS-422 encoder's line
+    /// driver presents it: `A-`, `B-` (and `Z-` with an index) are declared
+    /// after the single-ended pins, each driven to the inverse of its leg's
+    /// level in the same publish, so the pair's differential is
+    /// `±high_volts` and never zero once attached.
+    pub fn with_complements(mut self) -> Self {
+        self.complements = true;
         self
     }
 
@@ -220,6 +244,11 @@ struct Wire {
     a: Option<PinHandle>,
     b: Option<PinHandle>,
     z: Option<PinHandle>,
+    /// The complementary legs, `None` until attach or without
+    /// [`Config::complements`].
+    a_n: Option<PinHandle>,
+    b_n: Option<PinHandle>,
+    z_n: Option<PinHandle>,
     /// Last levels actually driven, so unchanged channels enqueue nothing.
     driven: Option<(Level, Level, Level)>,
     /// Position updates that exceeded [`Config::max_counts_per_update`] and
@@ -288,6 +317,13 @@ impl EncoderCore {
         }));
     }
 
+    /// Drive a channel: its leg to `level` and, with
+    /// [`Config::complements`], its complement to the inverse, together.
+    fn drive_pair(&self, leg: &Option<PinHandle>, complement: &Option<PinHandle>, level: Level) {
+        self.drive(leg, level);
+        self.drive(complement, invert(level));
+    }
+
     /// Publish the current count's levels, enqueueing only the channels that
     /// actually changed. `force` re-drives everything (used at attach, where
     /// the engine has assigned each output its default idle drive).
@@ -296,13 +332,13 @@ impl EncoderCore {
         let z = self.index_level(wire.count);
         let previous = wire.driven;
         if force || previous.is_none_or(|(pa, _, _)| pa != a) {
-            self.drive(&wire.a, a);
+            self.drive_pair(&wire.a, &wire.a_n, a);
         }
         if force || previous.is_none_or(|(_, pb, _)| pb != b) {
-            self.drive(&wire.b, b);
+            self.drive_pair(&wire.b, &wire.b_n, b);
         }
         if wire.z.is_some() && (force || previous.is_none_or(|(_, _, pz)| pz != z)) {
-            self.drive(&wire.z, z);
+            self.drive_pair(&wire.z, &wire.z_n, z);
         }
         wire.driven = Some((a, b, z));
     }
@@ -423,7 +459,8 @@ impl EncoderInput {
 /// An incremental quadrature encoder as a live board-engine component.
 ///
 /// Its pins are outputs: `A`, `B`, and — only when an [`IndexConfig`] is
-/// configured — `Z`. Attach drives the initial phase, so the count and the
+/// configured — `Z`; with [`Config::with_complements`], `A-`, `B-` (and
+/// `Z-`) after them. Attach drives the initial phase, so the count and the
 /// nets agree before any traffic.
 #[derive(Debug)]
 pub struct QuadratureEncoder {
@@ -440,9 +477,17 @@ impl QuadratureEncoder {
         if config.index.is_some() {
             pins.push(output("Z", impedance));
         }
+        if config.complements {
+            pins.push(output("A-", impedance));
+            pins.push(output("B-", impedance));
+            if config.index.is_some() {
+                pins.push(output("Z-", impedance));
+            }
+        }
         tracing::info!(
             counts_per_mm = config.counts_per_mm,
             index = config.index.is_some(),
+            complements = config.complements,
             "quadrature_encoder: init"
         );
         Ok(Self {
@@ -453,6 +498,9 @@ impl QuadratureEncoder {
                     a: None,
                     b: None,
                     z: None,
+                    a_n: None,
+                    b_n: None,
+                    z_n: None,
                     driven: None,
                     snapped: 0,
                 }),
@@ -486,6 +534,13 @@ impl Component for QuadratureEncoder {
         wire.b = Some(io.pin("B")?);
         if self.core.config.index.is_some() {
             wire.z = Some(io.pin("Z")?);
+        }
+        if self.core.config.complements {
+            wire.a_n = Some(io.pin("A-")?);
+            wire.b_n = Some(io.pin("B-")?);
+            if self.core.config.index.is_some() {
+                wire.z_n = Some(io.pin("Z-")?);
+            }
         }
         // Force the initial phase: every channel is declared push-pull and
         // idles high from assembly, which is not the encoder's count-0
@@ -729,6 +784,30 @@ mod tests {
         assert_eq!(
             indexed.pins().iter().map(|p| p.number).collect::<Vec<_>>(),
             vec!["A", "B", "Z"]
+        );
+    }
+
+    /// Complements add one `-` pin per channel after the single-ended ones,
+    /// the index's included.
+    #[rstest]
+    fn complements_declare_a_minus_leg_per_channel() {
+        let pair = encoder(Config::new(1.0).with_complements());
+        assert_eq!(
+            pair.pins().iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec!["A", "B", "A-", "B-"]
+        );
+        let indexed = encoder(
+            Config::new(1.0)
+                .with_index(IndexConfig {
+                    counts_per_revolution: 4,
+                    width_counts: 1,
+                    active_level: Level::High,
+                })
+                .with_complements(),
+        );
+        assert_eq!(
+            indexed.pins().iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec!["A", "B", "Z", "A-", "B-", "Z-"]
         );
     }
 
