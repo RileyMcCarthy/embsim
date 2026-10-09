@@ -23,8 +23,11 @@ in the commit that lands them. The project file was checked against the Edge
 carrier's netlist by reading it, and its pieces embsim can already build
 were built: the module with a flash image and a card image (`embsim check`,
 for this plan) and the add-on (as `boards/projects/ds2-addon.toml` builds
-it). It has not been built whole, because the Edge carrier's RS-422
-pair has no kind yet. The Rust below is MaD's to write and is marked
+it). The Edge carrier builds with the catalogs embsim ships since E1
+(`boards/projects/edge-ec32-ds2.toml`; a netlist exported from MaD's
+schematic before `U25`'s part number is corrected does not, section 2),
+and since E2 the add-on's converter is configured by the firmware's own
+register writes; the whole file waits on MaD's own kinds. The Rust below is MaD's to write and is marked
 `ignore`; each piece names the compiled file in embsim's worked example,
 [`examples/custom-project`](examples/custom-project/README.md), that has
 its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
@@ -61,7 +64,7 @@ project crate does not fork a model.
 | | What | Why MaD needs it | MaD's step that waits |
 |---|---|---|---|
 | E1 | *shipped:* `am26lv32`, the AM26LV32 line receiver's kind, placing `U25` by its part number `AM26LV32IDR`, beside the AM26LS31 line driver's `am26ls31`. MaD's schematic owes the matching fix: `U25`'s `Manufacturer_Part_Number` and value set to `AM26LV32IDR` in `Hardware/EdgeBoard/KiCad` | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`); until the schematic fix, a netlist exported from MaD names `AM26LS32CD` and `check` refuses `EDGE` naming `U25` | 9 |
-| E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS` | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
+| E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS`. *Built 2026-10-08* (`NODES.md` §15): every conversion reads the register file — the multiplexer, the gain (the PGA's bypass included), the reference — and a held reset or a lost supply returns it to its defaults; MaD's start-up bytes, sent to the add-on as `boards/projects/ds2-addon.toml` builds it, give the force path the code the firmware expects (`board/tests/ads122u04_registers.rs`) | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
 | E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component") | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
 | E4 | a pace for `run`, or a host kind the board's clock meters (`NODES.md` §13, "Open") | `make playground`, `playground-iss` and `playground-rom` run at real time for a person watching; and whether the ISS may run with a host that keeps wall time is the user's open question (§13 review item 5) | 11 (step 10 moves only the unpaced e2e target) |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
@@ -749,8 +752,13 @@ report carries the firmware's boot console (skipped, saying why, when the
 
 **9. The project files.** `SIL/mad.toml` and `SIL/mad-serial-boot.toml`
 (section 4), and a `make check` target running `$(EMBSIM) check` on both.
-*Needs:* E1 and E2. *Files:* `SIL/mad.toml`, `SIL/mad-serial-boot.toml`,
-`SIL/makefile`. *Done when:* `make check` exits 0, and
+*Needs:* E1 and E2. The pin bump that brings E2 changes
+`embsim_models::ads122u04::Config`, which no longer has `vref_mv` or
+`gain` (`CHANGELOG.md`): until step 11 retires it, `mad-emulator`'s
+`BenchForcePath::build` (`MaDSim/src/iss_description.rs`) registers
+`Config::default()`, and the firmware's own writes set the gain and the
+reference it set by hand. *Files:* `SIL/mad.toml`, `SIL/mad-serial-boot.toml`,
+`SIL/makefile`, `SIL/MaDSim/src/iss_description.rs` (the registration). *Done when:* `make check` exits 0, and
 `SIL/mad-catalog/tests/mad.rs`, stepped, holds what `NODES.md` §13 review
 item 1 proposed: a byte from the host reaches `P53`, a byte the firmware
 sends on `P55` reaches `HOST.RX`, `P19`–`P21` read inactive at rest, the

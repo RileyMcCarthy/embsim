@@ -11,9 +11,20 @@
 //!  ──────────                        ───────                     ──────────────
 //!  RX pin 16  on_sense ──deframe──► write(firmware_fd) ──► read(model_fd) loop
 //!  TX pin 15  bit clock ◄──frame─── engine wake ◄── read(firmware_fd) ◄── write
-//!  AIN0/AIN1  on_sense ──► V(AIN0) − V(AIN1) [mV] ──► set_voltage()
-//!  ~RESET / DVDD / AVDD  on_sense ──► power/reset gate (adapter-level)
+//!  AIN0–AIN3, REFP, REFN, AVDD  on_sense ──► V against AVSS ──► sense(pin)
+//!  ~RESET / DVDD / AVDD  on_sense ──► power/reset gate ──► reset() while down
 //! ```
+//!
+//! # The converter converts what its registers say
+//!
+//! The model keeps the register file the firmware writes, and every
+//! conversion reads it: the multiplexer, the gain and the reference
+//! (`crate::ads122u04`, "A conversion, from the registers"). So the
+//! component hands it every analog pin a conversion can select — the four
+//! inputs, `REFP` and `REFN`, and `AVDD` — each as the voltage the engine
+//! solves against `AVSS`, the pins' declared reference. A reference of
+//! `AVDD − AVSS` is the analog supply as sensed, not a number the system
+//! description supplies.
 //!
 //! # The UART is on the net, not beside it
 //!
@@ -55,12 +66,16 @@
 //!
 //! ## Deliberate simplifications
 //!
-//! - The gate pauses I/O at the adapter boundary (RX bytes ignored, TX bytes
-//!   discarded); it does not model the POR release delay (~600 µs after both
-//!   supplies) nor reset the model's registers on a reset edge — the protocol
-//!   thread is untouched, per the adapter contract.
-//! - Floating/unsolvable analog inputs hold the last fed differential; the
-//!   datasheet floating-input noise policy is a later slice.
+//! - A chip held in reset or without both supplies is reset: every register
+//!   to its default, conversions stopped (SBAS752B §8.4.1.1, §8.4.1.2), so a
+//!   part that comes back converts as it left reset until the firmware
+//!   writes it again. The gate also pauses I/O at the adapter boundary (RX
+//!   bytes ignored, TX bytes discarded). It does not model the POR release
+//!   delay (~600 µs after both supplies, §8.4.1.1). A command byte already
+//!   in the model's pipe when the reset lands is still read after it: the
+//!   pipe is the byte path `DETERMINISM.md` Phase D2 removes.
+//! - A floating or unsolvable analog pin holds the last voltage it was
+//!   sensed at; the datasheet floating-input noise policy is a later slice.
 //! - Baud-rate auto-detection is unmodeled in the protocol model, so the UART
 //!   pins frame at the fixed rate the consuming firmware uses
 //!   ([`ADS122U04_BAUD_HZ`]). A peer at another rate now produces *framing
@@ -82,7 +97,7 @@ use embsim_board::{
 };
 use tracing::{debug, trace, warn};
 
-use crate::ads122u04::{Ads122u04, Config};
+use crate::ads122u04::{Ads122u04, AnalogPin, Config, ADS122U04_SUPPLY_MIN_VOLTS};
 
 // ============================================================
 // Pin facade (single source of truth)
@@ -165,11 +180,6 @@ pub fn ads122u04_framing() -> UartFraming {
 // Power/reset gate
 // ============================================================
 
-/// Minimum operating supply voltage: AVDD and DVDD are specified
-/// 2.3 V–5.5 V (SBAS752B §6.3 Recommended Operating Conditions). A rail
-/// solved below this — including a rail stuck at 0 V — is a down domain.
-const SUPPLY_MIN_VOLTS: f64 = 2.3;
-
 /// The three gating inputs, as their pins were last handed them: each a
 /// voltage against the pin's own ground (`DGND` for `~RESET` and `DVDD`,
 /// `AVSS` for `AVDD`), `None` where no source reaches the net or no voltage
@@ -251,12 +261,14 @@ fn regate_output(gate: &Gate, uart: &SerialLevelBridge) {
 }
 
 /// A supply rail counts as up when it is at an operating voltage against
-/// its ground, [`SUPPLY_MIN_VOLTS`] or more. A rail that names no voltage —
-/// floating, a clock, fought for half of every cycle, only an unmodelled
-/// rail behind it, a ground that is not held — is down: the engine never
-/// invents a value, and neither does the chip model (`DESIGN.md` rule 6).
+/// its ground, [`ADS122U04_SUPPLY_MIN_VOLTS`] (2.3 V, SBAS752B §6.3) or
+/// more; a rail solved below it, a rail stuck at 0 V included, is a down
+/// domain. A rail that names no voltage — floating, a clock, fought for half
+/// of every cycle, only an unmodelled rail behind it, a ground that is not
+/// held — is down: the engine never invents a value, and neither does the
+/// chip model (`DESIGN.md` rule 6).
 fn supply_ok(volts: Option<Volts>) -> bool {
-    volts.is_some_and(|v| v >= SUPPLY_MIN_VOLTS)
+    volts.is_some_and(|v| v >= ADS122U04_SUPPLY_MIN_VOLTS)
 }
 
 // ============================================================
@@ -297,9 +309,6 @@ pub struct Ads122u04Component {
     /// the engine wakeup reads the model's output from it.
     firmware_fd: Arc<OwnedFd>,
     gate: Arc<Gate>,
-    /// Last numerically solved AIN0/AIN1 node voltages (V), for the
-    /// differential feed.
-    ain_volts: Arc<Mutex<[f64; 2]>>,
     /// Set on drop, so a callback that outlives the component stops driving.
     shutdown: Arc<AtomicBool>,
 }
@@ -316,7 +325,6 @@ impl Ads122u04Component {
             model,
             firmware_fd: Arc::new(firmware_fd),
             gate: Arc::new(Gate::new()),
-            ain_volts: Arc::new(Mutex::new([0.0; 2])),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -344,6 +352,11 @@ impl Component for Ads122u04Component {
         uart.idle();
 
         // -- power/reset gate ------------------------------------------
+        // A part that is not alive is in reset (SBAS752B §8.4.1.1: "During
+        // power up, the device is held in reset"; §8.4.1.2, the `RESET`
+        // pin), so its registers go back to their defaults every time the
+        // gate reads it down. `AVDD` is also the analog supply a conversion
+        // can take as its reference, `AVDD − AVSS` as the pin senses it.
         for (pin, set) in [
             ("~RESET", Gate::set_reset as fn(&Gate, &Sense)),
             ("DVDD", Gate::set_dvdd),
@@ -351,43 +364,45 @@ impl Component for Ads122u04Component {
         ] {
             let gate = Arc::clone(&self.gate);
             let uart = Arc::clone(&uart);
-            let is_dvdd = pin == "DVDD";
+            let model = Arc::clone(&self.model);
             io.on_sense(pin, move |sense| {
                 set(&gate, &sense);
-                // The UART's output high is the digital supply: `V_OH` is
-                // 0.8 × `DVDD` min at 1 mA (SBAS752B §6.5), so a part on a
-                // 5 V `DVDD` drives 5 V, not the crate's 3.3 V logic rail.
-                if let (true, Some(dvdd)) = (is_dvdd, sense.volts) {
-                    uart.set_high_volts(dvdd);
+                match (pin, sense.volts) {
+                    // The UART's output high is the digital supply: `V_OH` is
+                    // 0.8 × `DVDD` min at 1 mA (SBAS752B §6.5), so a part on a
+                    // 5 V `DVDD` drives 5 V, not the crate's 3.3 V logic rail.
+                    ("DVDD", Some(dvdd)) => uart.set_high_volts(dvdd),
+                    ("AVDD", Some(avdd)) => model.sense(AnalogPin::Avdd, avdd),
+                    _ => {}
+                }
+                if !gate.alive() {
+                    model.reset();
                 }
                 regate_output(&gate, &uart);
             })?;
         }
 
-        // -- differential analog input ---------------------------------
-        // The engine delivers solved node voltages in volts; the model's
-        // `set_voltage` input is the differential in millivolts. Sign
-        // convention matches the hand-wired force path (and the firmware's
-        // MUX config, AINP = AIN0 / AINN = AIN1): a strain-gauge output of
-        // +x mV presents V(AIN0) − V(AIN1) = +x mV, fed in directly.
-        for (index, pin) in [(0usize, "AIN0"), (1usize, "AIN1")] {
-            let ain_volts = Arc::clone(&self.ain_volts);
+        // -- analog pins -----------------------------------------------
+        // The engine delivers each solved node voltage in volts against the
+        // pin's reference, `AVSS` (the pin table's); the model takes them
+        // as they are and converts whichever the registers select. A pin
+        // that names no voltage keeps the last one it had.
+        for (pin, analog) in [
+            ("AIN0", AnalogPin::Ain0),
+            ("AIN1", AnalogPin::Ain1),
+            ("AIN2", AnalogPin::Ain2),
+            ("AIN3", AnalogPin::Ain3),
+            ("REFP", AnalogPin::Refp),
+            ("REFN", AnalogPin::Refn),
+        ] {
             let model = Arc::clone(&self.model);
-            io.on_sense(pin, move |sense| {
-                let Some(volts) = sense.volts else {
-                    trace!(
-                        pin,
-                        ?sense,
-                        "ADS122U04: input names no voltage; holding last differential"
-                    );
-                    return;
-                };
-                let diff_mv = {
-                    let mut ain = ain_volts.lock().unwrap();
-                    ain[index] = volts;
-                    (ain[0] - ain[1]) * 1_000.0
-                };
-                model.set_voltage(diff_mv);
+            io.on_sense(pin, move |sense| match sense.volts {
+                Some(volts) => model.sense(analog, volts),
+                None => trace!(
+                    pin,
+                    ?sense,
+                    "ADS122U04: pin names no voltage; holding its last"
+                ),
             })?;
         }
 
@@ -449,7 +464,8 @@ impl Drop for Ads122u04Component {
         // Dropping `firmware_fd` closes the pipe end once the engine has
         // dropped its wake callback (SystemHandle joins the engine *before* it
         // drops components — the documented drop order). The model's protocol
-        // thread then reads EOF and idles, exactly as in the hand-wired setup.
+        // thread then reads EOF and ends, exactly as in the hand-wired setup,
+        // taking its clock actor with it.
         debug!("ADS122U04 component shut down");
     }
 }

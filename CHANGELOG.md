@@ -4,6 +4,33 @@ What each release of embsim changes for someone using it. Releases are
 git tags, `vX.Y.Z`; while embsim is 0.x, a minor release may break what
 the one before it promised, and says so here under **Breaking**.
 
+## [Unreleased]
+
+### Breaking
+
+- **`ads122u04::Config` has no gain or reference.** The converter takes
+  both from its registers (below), so `vref_mv` and `gain` are gone;
+  `zero_offset` stays, and `Config::default()` replaces
+  `Config::at_reset()`. `Ads122u04::sense(pin, volts)`, each analog pin
+  against `AVSS`, replaces `set_voltage(mv)`; `INTERNAL_VREF_VOLTS`
+  replaces `INTERNAL_VREF_MV`, and `RESET_GAIN` is gone (a gain is the
+  register's).
+
+### Changed
+
+- **The `ads122u04` kind converts as its register writes set it up**
+  (`NODES.md` §15). Every conversion reads the register file the host
+  writes over the part's own serial pins: the input multiplexer, the gain
+  (the PGA's bypass included, which leaves every gain as it is and limits
+  the inputs that bypass the PGA to 4), and the reference — the internal
+  2.048 V, `REFP − REFN`, or the analog supply as the part's pins sense it.
+  A part held in reset or without both supplies goes back to its defaults,
+  gain 1 against 2.048 V, as the RESET command already did; single-shot
+  mode sends one conversion per START. MaD's firmware start-up, sent to the
+  DS2 add-on's project, reads the force path's code at gain 128 against the
+  3.3 V analog supply. The model's protocol thread ends when its part is
+  dropped.
+
 ## [0.2.0]
 
 embsim is now a board simulator you use as a tool. 0.1.0 linked a

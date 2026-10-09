@@ -283,7 +283,7 @@ const PART_KINDS: &[PartKind] = &[
     },
     PartKind {
         name: "ads122u04",
-        summary: "TI 24-bit ADC, as it comes out of reset",
+        summary: "TI 24-bit ADC, converting as its register writes set it up",
         is: Seat::Family(&["ADS122U04"]),
         unplaced: &[],
         register: ads122u04_kind,
@@ -767,7 +767,7 @@ fn line_receiver_model(table: (&'static str, &'static [PinDecl])) -> Model {
 
 fn adc_model() -> Model {
     Model::with_table(named("ads122u04", "tssop16"), &ADS122U04_PINS, |_| {
-        Box::new(Ads122u04Component::new(AdcConfig::at_reset()))
+        Box::new(Ads122u04Component::new(AdcConfig::default()))
     })
 }
 

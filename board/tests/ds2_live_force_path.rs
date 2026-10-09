@@ -60,17 +60,18 @@ fn ep(s: &str) -> EndpointRef {
 // ADC transfer-function fixture (mirrors the registered Config)
 // ============================================================
 
-/// Reference voltage handed to the registered model (mV).
-const VREF_MV: f64 = 2_048.0;
-/// PGA gain handed to the registered model.
+/// The reference the converter converts against as it leaves reset, which
+/// nothing here writes: the internal 2.048 V (SBAS752B §8.6.2.2, V).
+const VREF_VOLTS: f64 = 2.048;
+/// The gain it leaves reset with, 1 (SBAS752B §8.6.2.1).
 const GAIN: f64 = 1.0;
 
-/// Expected output code for a differential input, reusing the model's
-/// `voltage_to_adc` math bit for bit (SBAS752B §8.5.2 Eq. 8:
+/// Expected output code for a differential input in volts, the model's
+/// arithmetic step for step (SBAS752B §8.5.2 Eq. 8:
 /// `code = VIN · Gain · 2^23 / VREF`, truncated toward zero, clipped at
 /// 7FFFFFh / 800000h; zero offset 0 in this fixture).
-fn expected_code(diff_mv: f64) -> i32 {
-    let code = (diff_mv * GAIN * 8_388_608.0) / VREF_MV;
+fn expected_code(diff_volts: f64) -> i32 {
+    let code = (diff_volts * GAIN * 8_388_608.0) / VREF_VOLTS;
     (code as i64).clamp(-0x80_0000, 0x7F_FFFF) as i32
 }
 
@@ -132,11 +133,7 @@ fn ds2_live_system(reset_bodge: bool, diff_volts: f64, host: &ProbeHandle) -> Sy
         registry.register("FAKE_HOST", move |_decl| Box::new(fake_host(host.clone())));
     }
     registry.register("ADS122U04", |_decl| {
-        Box::new(Ads122u04Component::new(Config {
-            vref_mv: VREF_MV,
-            gain: GAIN,
-            zero_offset: 0,
-        }))
+        Box::new(Ads122u04Component::new(Config::default()))
     });
 
     let host_board = Board::from_netlist(
@@ -197,7 +194,7 @@ fn analog_volts(system: &SystemHandle, net: &str) -> f64 {
 /// With the bodge in place the chip is alive: SYNC + RDATA (0x55 0x10,
 /// SBAS752B §8.5.3.4) into the ADS RX stream endpoint answers with the
 /// 3-byte conversion for the MNA-solved bridge differential — the whole
-/// force path (bridge sources → jumpers → AIN senses → set_voltage →
+/// force path (bridge sources → jumpers → AIN senses → the model's pins →
 /// protocol model → TX stream) live, no hand wiring.
 #[rstest]
 fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
@@ -250,14 +247,13 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
     assert_eq!(rx.len(), 3, "exactly one conversion frame; got {rx:?}");
 
     // The returned code matches the model transfer function applied to the
-    // differential the component computed from the same solved voltages —
-    // V(AIN0) − V(AIN1) in mV, fed straight into set_voltage.
-    let diff_mv = (v0 - v1) * 1_000.0;
-    let expected = expected_code(diff_mv);
+    // same solved voltages: V(AIN0) − V(AIN1), the reset multiplexer's pair.
+    let diff_volts = v0 - v1;
+    let expected = expected_code(diff_volts);
     let got = code_from_le3(&rx);
     assert_eq!(
         got, expected,
-        "conversion must encode the solved differential ({diff_mv} mV)"
+        "conversion must encode the solved differential ({diff_volts} V)"
     );
     // Human sanity: 256 mV at gain 1 / VREF 2048 mV ≈ 2^20.
     assert!(
