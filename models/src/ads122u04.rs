@@ -37,15 +37,22 @@
 //!   bypassed only at gains 1, 2 and 4, which the switched-capacitor stage
 //!   provides without it, and stays on at 8 to 128 whatever the bit says
 //!   (Table 18; §8.3.2, Table 9, p.22). What the PGA's bypass does change is
-//!   the absolute input range, which the model does not police (below). The
-//!   multiplexer settings that bypass the PGA themselves — a pin against
-//!   `AVSS` (`1000`–`1011`) and the two monitors (`1100`, `1101`) — leave
+//!   the absolute input range, which the model does not police (below). A
+//!   pin against `AVSS` (`1000`–`1011`) bypasses the PGA itself and leaves
 //!   only the switched-capacitor stage, so a gain above 4 is 4 (§8.3.2.2,
 //!   p.24; Table 9's switched-capacitor column).
 //! - **`VREF[1:0]`** (configuration register 1, bits 2:1; §8.6.2.2 Table 19,
 //!   p.42) is the reference: `00` the internal 2.048 V, `01` the
 //!   `REFP` − `REFN` pair, `10` and `11` the analog supply, read as the
 //!   sensed `AVDD` − `AVSS` (§8.3.3, p.24).
+//! - **The two system monitors** (`MUX` `1100`, `(REFP − REFN)/4`, and
+//!   `1101`, `(AVDD − AVSS)/4`) take neither field: the device "bypasses the
+//!   PGA and sets the gain to 1, irrespective of the configuration register
+//!   settings", and converts against the internal 2.048 V reference
+//!   "regardless of what reference source is selected in the configuration
+//!   register (`VREF[1:0]`)" (§8.3.9, p.28). A monitor of an external
+//!   reference below §6.3's 0.75 V still converts: the pair is the input
+//!   then, not the reference.
 //! - **`TS`** (register 1, bit 0) is temperature-sensor mode, whose code is
 //!   the die temperature (§8.3.10): nothing on a board names that, so the
 //!   model holds its last code (below).
@@ -184,6 +191,12 @@ const SWITCHED_CAPACITOR_GAIN_MAX: f64 = 4.0;
 /// p.41).
 const MONITOR_DIVISOR: f64 = 4.0;
 
+/// The gain the two monitors convert at, 1: "The device automatically
+/// bypasses the PGA and sets the gain to 1, irrespective of the configuration
+/// register settings when the monitoring feature is used" (SBAS752B §8.3.9,
+/// p.28).
+const MONITOR_GAIN: f64 = 1.0;
+
 /// Compute the conversion interval (virtual µs) from the contents of CONFIG1.
 ///
 /// CONFIG1 bit layout (SBAS752B §8.6.2.2 Fig. 70, p.42):
@@ -255,22 +268,37 @@ const fn mux(reg_config0: u8) -> u8 {
     reg_config0 >> 4
 }
 
-/// The multiplexer settings that bypass the PGA whatever `PGA_BYPASS` says:
-/// a pin against `AVSS` (`1000`–`1011`, SBAS752B §8.3.2.2, p.24) and the two
-/// monitors (`1100`, `1101`, Table 18's "(PGA bypassed)").
-const fn mux_bypasses_pga(mux: u8) -> bool {
-    matches!(mux, 0b1000..=0b1101)
+/// The multiplexer settings that read a pin against `AVSS` (`1000`–`1011`):
+/// they bypass the PGA whatever `PGA_BYPASS` says, so a gain above 4 is
+/// limited to 4 (SBAS752B §8.3.2.2, p.24: "When configuring the internal
+/// multiplexer for settings where AINN = AVSS (MUX[3:0] = 1000 through
+/// 1011) … In case gain is set to greater than 4, the device limits gain to
+/// 4").
+const fn mux_limits_gain_to_four(mux: u8) -> bool {
+    matches!(mux, 0b1000..=0b1011)
+}
+
+/// The two system monitors, `(V(REFP) − V(REFN)) / 4` (`1100`) and
+/// `(AVDD − AVSS) / 4` (`1101`) (SBAS752B Table 18): each converts at gain 1
+/// against the internal reference whatever `GAIN` and `VREF` say (§8.3.9,
+/// p.28).
+const fn mux_is_monitor(mux: u8) -> bool {
+    matches!(mux, 0b1100 | 0b1101)
 }
 
 /// The gain a conversion applies: `GAIN[2:0]` selects 2^`GAIN`, 1 to 128
 /// (SBAS752B Table 18). `PGA_BYPASS` changes none of them: gains 1, 2 and 4
 /// are the switched-capacitor stage's with or without the PGA, and the PGA
-/// is always on at 8 to 128 (Table 18; §8.3.2, Table 9). A multiplexer
-/// setting that bypasses the PGA leaves only the switched-capacitor stage,
-/// so it limits the gain to 4 (§8.3.2.2).
+/// is always on at 8 to 128 (Table 18; §8.3.2, Table 9). A pin against
+/// `AVSS` leaves only the switched-capacitor stage, so it limits the gain
+/// to 4 (§8.3.2.2); a monitor is converted at gain 1, "irrespective of the
+/// configuration register settings" (§8.3.9).
 fn conversion_gain(reg_config0: u8) -> f64 {
     let gain = f64::from(1u8 << ((reg_config0 >> 1) & 0b111));
-    if mux_bypasses_pga(mux(reg_config0)) {
+    let mux = mux(reg_config0);
+    if mux_is_monitor(mux) {
+        MONITOR_GAIN
+    } else if mux_limits_gain_to_four(mux) {
         gain.min(SWITCHED_CAPACITOR_GAIN_MAX)
     } else {
         gain
@@ -310,7 +338,8 @@ fn input_volts(mux: u8, pins: &PinVolts) -> Option<Volts> {
 /// The reference `VREF[1:0]` selects (SBAS752B §8.6.2.2 Table 19, p.42;
 /// §8.3.3, p.24): the internal 2.048 V, `V(REFP) − V(REFN)`, or the analog
 /// supply `AVDD − AVSS` as sensed. `None` when the selected pins have never
-/// been sensed, or put the reference below its minimum (§6.3).
+/// been sensed, or put the reference below its minimum (§6.3). The two
+/// monitors do not ask (§8.3.9; [`conversion_code`]).
 fn reference_volts(reg_config1: u8, pins: &PinVolts) -> Option<Volts> {
     let at = |pin: AnalogPin| pins[pin.index()];
     match (reg_config1 >> 1) & 0b11 {
@@ -336,8 +365,16 @@ fn conversion_code(
     if reg_config1 & CONFIG1_TS != 0 {
         return None;
     }
-    let vin = input_volts(mux(reg_config0), pins)?;
-    let vref = reference_volts(reg_config1, pins)?;
+    let mux = mux(reg_config0);
+    let vin = input_volts(mux, pins)?;
+    // A monitor converts against the internal reference whatever `VREF`
+    // selects (§8.3.9), so a reference pin never sensed, or below its
+    // minimum, names no less a code for it.
+    let vref = if mux_is_monitor(mux) {
+        INTERNAL_VREF_VOLTS
+    } else {
+        reference_volts(reg_config1, pins)?
+    };
     let code = (vin * conversion_gain(reg_config0) * FULL_SCALE_CODES) / vref;
     let with_offset = (code as i64) + i64::from(zero_offset);
     Some(with_offset.clamp(CODE_MIN, CODE_MAX) as i32)
@@ -1007,9 +1044,10 @@ mod tests {
         assert_eq!(rdata(&mut device), 4_096 * gain, "PGA_BYPASS set");
     }
 
-    /// Every pin pair, pin-against-AVSS, monitor and the mid-supply short
-    /// reads what Table 18 says (at gain 1, so every input is inside full
-    /// scale and each reads its own code).
+    /// Every pin pair, pin-against-AVSS and the mid-supply short reads what
+    /// Table 18 says against the selected reference (at gain 1, so every
+    /// input is inside full scale and each reads its own code). The two
+    /// monitors take no reference from `VREF` (the next test).
     #[rstest]
     #[case::ain0_ain1(0b0000, 1.0 - 0.5)]
     #[case::ain0_ain2(0b0001, 1.0 - 0.25)]
@@ -1023,8 +1061,6 @@ mod tests {
     #[case::ain1_avss(0b1001, 0.5)]
     #[case::ain2_avss(0b1010, 0.25)]
     #[case::ain3_avss(0b1011, 0.125)]
-    #[case::ref_monitor(0b1100, (EXACT_REFP - EXACT_REFN) / 4.0)]
-    #[case::avdd_monitor(0b1101, 3.3 / 4.0)]
     #[case::shorted(0b1110, 0.0)]
     fn the_multiplexer_selects_its_input(#[case] mux: u8, #[case] vin: Volts) {
         let mut device = device_with([1.0, 0.5, 0.25, 0.125], 0);
@@ -1038,10 +1074,51 @@ mod tests {
         assert_eq!(rdata(&mut device), code, "MUX {mux:#06b}");
     }
 
-    /// A bypassing multiplexer setting limits a gain above 4 to 4 and leaves
-    /// 1, 2 and 4 as they are (§8.3.2.2).
+    /// The two monitors convert at gain 1 against the internal 2.048 V
+    /// reference whatever `GAIN` and `VREF` say (§8.3.9): the supply monitor
+    /// with `VREF` external, an analog supply of 3.3 V, is
+    /// trunc(0.825 · 2^23 / 2.048), at every gain.
     #[rstest]
-    fn a_pga_bypassing_input_limits_the_gain_to_four() {
+    #[case::ref_monitor(0b1100, (EXACT_REFP - EXACT_REFN) / 4.0)]
+    #[case::avdd_monitor(0b1101, 3.3 / 4.0)]
+    fn the_monitors_convert_at_gain_one_against_the_internal_reference(
+        #[case] mux: u8,
+        #[case] vin: Volts,
+    ) {
+        let expected = ((vin * FULL_SCALE_CODES) / INTERNAL_VREF_VOLTS) as i32;
+        if mux == 0b1101 {
+            assert_eq!(expected, (0.825 * FULL_SCALE_CODES / 2.048) as i32);
+        }
+        for vref in [0, CONFIG1_VREF_EXTERNAL, CONFIG1_VREF_AVDD] {
+            for gain_code in 0u8..8 {
+                let mut device = device_with([1.0, 0.5, 0.25, 0.125], 0);
+                feed(&mut device, &wreg(1, vref));
+                feed(&mut device, &wreg(0, (mux << 4) | (gain_code << 1)));
+                assert_eq!(
+                    rdata(&mut device),
+                    expected,
+                    "MUX {mux:#06b}, VREF {vref:#04b}, GAIN {gain_code:#05b}"
+                );
+            }
+        }
+        // A reference pair below its 0.75 V minimum is an input to the
+        // reference monitor, not its reference: it still converts.
+        let mut device = device_with([1.0, 0.5, 0.25, 0.125], 0);
+        device.pins[AnalogPin::Refp.index()] = Some(0.75);
+        device.pins[AnalogPin::Refn.index()] = Some(0.25);
+        feed(&mut device, &wreg(1, CONFIG1_VREF_EXTERNAL));
+        feed(&mut device, &wreg(0, 0b1100 << 4));
+        assert_eq!(
+            rdata(&mut device),
+            ((0.5 / 4.0 * FULL_SCALE_CODES) / INTERNAL_VREF_VOLTS) as i32
+        );
+    }
+
+    /// A pin against `AVSS` limits a gain above 4 to 4 and leaves 1, 2 and 4
+    /// as they are (§8.3.2.2); a monitor is gain 1 at every `GAIN` (§8.3.9);
+    /// the pin pairs keep every gain.
+    #[rstest]
+    fn a_pin_against_avss_limits_the_gain_to_four() {
         for (gain_code, gain) in [
             (0b000u8, 1.0),
             (0b001, 2.0),
@@ -1049,7 +1126,15 @@ mod tests {
             (0b011, 4.0),
             (0b111, 4.0),
         ] {
-            assert_eq!(conversion_gain((0b1000 << 4) | (gain_code << 1)), gain);
+            for single_ended in 0b1000u8..=0b1011 {
+                assert_eq!(
+                    conversion_gain((single_ended << 4) | (gain_code << 1)),
+                    gain
+                );
+            }
+            for monitor in [0b1100u8, 0b1101] {
+                assert_eq!(conversion_gain((monitor << 4) | (gain_code << 1)), 1.0);
+            }
             assert_eq!(conversion_gain(gain_code << 1), f64::from(1u8 << gain_code));
         }
     }
