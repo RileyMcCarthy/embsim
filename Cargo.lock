@@ -329,6 +329,7 @@ dependencies = [
  "embsim-board",
  "embsim-boards",
  "embsim-core",
+ "embsim-models",
  "embsim-p2-qemu",
  "libc",
  "rstest",

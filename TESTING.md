@@ -31,6 +31,17 @@ cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_dete
 # hundredfold apart.
 cargo test -p embsim-board --test isolation_bridge -- --nocapture
 
+# The Assembly, a plant as one component (NODES.md §16; stepped, own
+# binary; every read after a virtual settle, rule 9): a drive and an
+# encoder as one bench component, a rate-carried step train in and the
+# encoder's edges out to a board's inverters, the drive's inputs read
+# against the return the assembly declares, the engine's events for the
+# train the same as for the two components apart (`--nocapture` prints
+# them), and members woken at their own instants in the order added. The
+# command checks and runs a project naming a catalog's assembly kind.
+cargo test -p embsim-board --test assembly -- --nocapture
+cargo test -p embsim-cli --test assembly
+
 # Re-bless the golden traces after an INTENDED engine/model behavior change.
 # Review the diff: it is the wire behavior of the system.
 EMBSIM_BLESS=1 cargo test -p embsim-board --test determinism

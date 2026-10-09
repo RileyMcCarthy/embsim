@@ -16,6 +16,22 @@ the one before it promised, and says so here under **Breaking**.
   replaces `INTERNAL_VREF_MV`, and `RESET_GAIN` is gone (a gain is the
   register's).
 
+### Added
+
+- **`embsim_board::Assembly`: a plant as one component** (`NODES.md`
+  §16). A bench component kind can return several components — embsim's
+  models and a project's own — as one: `Assembly::member` renames each
+  member's pins onto the assembly's, declarations kept;
+  `Assembly::reference` measures pins against a return the assembly
+  declares (a drive's `DRIVE_GND`, an encoder's `ENC_GND`); the members'
+  wakes go through the assembly, each member woken at its own instants in
+  the order added; and the links between members (a shaft turning an
+  encoder, a carriage reaching a switch) are closures between their
+  handles, run on the engine's thread inside the member that emits. The
+  engine sees one node and records the same events as for the members
+  apart. `PROJECTS.md` §10, "A plant: an `Assembly`", has the guide, with
+  MaD's machine as the example.
+
 ### Changed
 
 - **The `ads122u04` kind converts as its register writes set it up**

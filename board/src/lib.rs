@@ -25,6 +25,9 @@
 //! Module map (mirrors the design doc's crate layout):
 //! - [`netlist`] — KiCad s-expression netlist parser → [`ComponentDecl`]/[`NetDecl`] graph
 //! - [`component`] — [`Component`] trait, [`PinDecl`], [`PinRole`], [`Drive`], [`ComponentNetIo`]
+//! - [`assembly`] — [`Assembly`]: several components as one node behind one
+//!   set of pins, their wakes through the assembly, the links between them
+//!   its own code (a plant made of models)
 //! - [`registry`] — [`PartRegistry`]: identity → constructor; auto-classification tiers
 //! - [`engine`] — the live single-writer net engine: drive queue, resolution, timer wheel
 //! - [`net`] — net state model ([`NetState`]) and shared net/pin identity types
@@ -50,6 +53,7 @@
 //! - [`serial_levels`] — [`SerialLevelBridge`]: that codec wired to a pin, with
 //!   the bit clock and frame deadlines a live UART needs
 
+pub mod assembly;
 pub mod board;
 pub mod cluster;
 pub mod component;
@@ -70,6 +74,7 @@ pub mod survey;
 pub mod system;
 pub mod uart;
 
+pub use assembly::{Assembly, AssemblyError};
 pub use board::{Board, BoardError, PartClass};
 pub use cluster::{
     Cluster, ClusterElement, ClusterInjection, ClusterInputs, ClusterResistor, ClusterSolution,
