@@ -33,6 +33,12 @@ cargo test -p embsim-qemu --test chrome_guest -- --ignored --nocapture
 # its own binary; live reads at a settled instant, rule 9).
 cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_determinism
 
+# The MaD machine's three boards as a project with an encoder on the
+# carrier's J20 (stepped, own binary; every read after a virtual settle,
+# rule 9): the encoder's pairs counted at P9/P10/P11 through U25, and a
+# single-ended encoder on the + legs reading the receiver's fail-safe high.
+cargo test -p embsim-board --test edge_encoder_pairs
+
 # The isolation parts, promoted from stubs on the real EdgeBoard netlist
 # (stepped, own binary; every read after a 1 ms virtual settle, rule 9):
 # levels and a rate-carried step train crossing the barrier, the fail-safe
