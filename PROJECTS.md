@@ -1320,11 +1320,12 @@ alone.
 ### The rest
 
 - The standard catalog's bench component kinds are `host-serial` and
-  `scripted-source` (section 5). A `host-serial` for a host that must run on
-  the board's clock (a browser co-simulated in a VM that stops when the
-  board's clock does) is not one of them, and neither is a pace for `run`
-  against wall time: `run` is stepped, so a quiet system's virtual time runs
-  ahead of a host's wall time.
+  `scripted-source` (section 5). A host that must run on the board's clock
+  (a browser whose page and workers the board's clock meters over the
+  DevTools protocol, the `chrome-cdp` kind `NODES.md` §18 plans) is not one
+  of them, and neither is a pace for `run` against wall time: `run` is
+  stepped, so a quiet system's virtual time runs ahead of a host's wall
+  time.
 - The standard catalog has no part kind for a diode, LED, FET or transistor.
   One the element library does not know by part number has no way into a
   project yet.
@@ -2334,7 +2335,7 @@ parts and the same closures are one component:
 | Member | What it is | Its pins, as the machine's |
 |---|---|---|
 | `DRIVE` | `StepperMotor`, 8192 steps a millimetre, `DIR` low forward, enable active low, no load loss (`BenchMachine::build`'s conventions) | `STEP`, `DIR`, `ENA`, measured against `DRIVE_GND`, a return the assembly declares |
-| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, with its index | `ENC_A`, `ENC_B`, `ENC_Z`, against `ENC_GND`, another |
+| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, with its index and its complements (`Config::with_complements`): each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-`, against `ENC_GND`, another. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high (`board/tests/edge_encoder_pairs.rs`) |
 | `UPPER`, `LOWER` | `EndSwitch`, closing at 100 mm (`TRAVEL_MM`) and at 0 mm | each contact's `COM` and `NO`: `NO` is the loop's `+` to the carrier, and the machine's loop supply reaches `COM` (`MIGRATING-MAD.md` §6, "The loop supply") |
 | `LOAD_CELL` | MaD's own: `LoadCellBridge` and `BridgeDrive` (`MaDSim/src/system_description.rs`) | `E+`, `E-` sensed, `S+`, `S-` driven |
 
@@ -2358,12 +2359,16 @@ fn machine(sample: Sample) -> Result<Assembly, AssemblyError> {
     });
     Assembly::new()
         .member("DRIVE", Box::new(drive), &[("STEP", "STEP"), ("DIR", "DIR"), ("ENA", "ENA")])?
-        .member("ENCODER", Box::new(encoder), &[("A", "ENC_A"), ("B", "ENC_B"), ("Z", "ENC_Z")])?
+        .member("ENCODER", Box::new(encoder), &[
+            ("A", "ENC_A+"), ("A-", "ENC_A-"),
+            ("B", "ENC_B+"), ("B-", "ENC_B-"),
+            ("Z", "ENC_Z+"), ("Z-", "ENC_Z-"),
+        ])?
         .member("UPPER", Box::new(upper), &[("COM", "UPPER_COM"), ("NO", "UPPER+")])?
         .member("LOWER", Box::new(lower), &[("COM", "LOWER_COM"), ("NO", "LOWER+")])?
         .member("LOAD_CELL", Box::new(load_cell), &[("E+", "E+"), ("E-", "E-"), ("S+", "S+"), ("S-", "S-")])?
         .reference("DRIVE_GND", &["STEP", "DIR", "ENA"])?
-        .reference("ENC_GND", &["ENC_A", "ENC_B", "ENC_Z"])
+        .reference("ENC_GND", &["ENC_A+", "ENC_A-", "ENC_B+", "ENC_B-", "ENC_Z+", "ENC_Z-"])
 }
 ```
 

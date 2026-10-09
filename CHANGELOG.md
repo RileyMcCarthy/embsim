@@ -15,6 +15,8 @@ the one before it promised, and says so here under **Breaking**.
   against `AVSS`, replaces `set_voltage(mv)`; `INTERNAL_VREF_VOLTS`
   replaces `INTERNAL_VREF_MV`, and `RESET_GAIN` is gone (a gain is the
   register's).
+- `machine::quadrature_encoder::Config` has a `complements` field (below):
+  a struct literal names it, or ends `..Config::new(counts_per_mm)`.
 
 ### Added
 
@@ -31,6 +33,12 @@ the one before it promised, and says so here under **Breaking**.
   engine sees one node and records the same events as for the members
   apart. `PROJECTS.md` §10, "A plant: an `Assembly`", has the guide, with
   MaD's machine as the example.
+- **`QuadratureEncoder` as an RS-422 encoder**
+  (`quadrature_encoder::Config::with_complements`, `NODES.md` §17): `A-`,
+  `B-` and, with an index, `Z-`, each driven to the inverse of its leg in
+  the same publish, the pairs a differential receiver such as the Edge
+  board's `U25` reads. `Config` has a `complements` field, `false` by
+  default.
 
 ### Changed
 
@@ -38,8 +46,10 @@ the one before it promised, and says so here under **Breaking**.
   (`NODES.md` §15). Every conversion reads the register file the host
   writes over the part's own serial pins: the input multiplexer, the gain
   (the PGA's bypass included, which leaves every gain as it is and limits
-  the inputs that bypass the PGA to 4), and the reference — the internal
-  2.048 V, `REFP − REFN`, or the analog supply as the part's pins sense it.
+  a pin read against `AVSS` to 4), and the reference — the internal
+  2.048 V, `REFP − REFN`, or the analog supply as the part's pins sense it;
+  the two system monitors convert at gain 1 against the internal reference
+  whatever the gain and reference bits say (SBAS752B §8.3.9).
   A part held in reset or without both supplies goes back to its defaults,
   gain 1 against 2.048 V, as the RESET command already did; single-shot
   mode sends one conversion per START. MaD's firmware start-up, sent to the
