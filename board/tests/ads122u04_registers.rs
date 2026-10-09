@@ -575,6 +575,64 @@ fn the_ads122u04_converts_against_the_reference_its_host_selects(#[case] avdd: V
     bench.finish();
 }
 
+/// The two system monitors (SBAS752B Table 18, `MUX` `1100` and `1101`).
+const MUX_REFERENCE_MONITOR: u8 = 0b1100;
+const MUX_SUPPLY_MONITOR: u8 = 0b1101;
+
+/// The divisor both monitors apply (SBAS752B Table 18).
+const MONITOR_DIVISOR: f64 = 4.0;
+
+#[rstest]
+#[case::analog_supply_at_3v3(3.3)]
+#[case::analog_supply_at_5v(5.0)]
+fn the_ads122u04s_monitors_convert_at_gain_one_against_the_internal_reference(#[case] avdd: Volts) {
+    behaviour!(Test {
+        id: "ads122u04.system-monitors",
+        covers: Some("models/src/ads122u04.rs#Ads122u04"),
+        given: "an ADS122U04 from the catalog with reference pins 2 volts apart and a 3.3 or \
+                5 volt analog supply, its host selecting each system monitor with gain 128 \
+                and the reference pins or the analog supply as the reference",
+    });
+    expect!(
+        "supply-monitor",
+        "the analog supply monitor reads a quarter of the analog supply as the converter's \
+         supply pins sense it, at gain 1 against the internal 2.048 volt reference",
+        "SBAS752B section 8.3.9: the monitors bypass the amplifier and set the gain to 1 \
+         whatever the configuration registers say, and the supply monitor uses the internal \
+         reference whatever the reference bits select"
+    );
+    expect!(
+        "reference-monitor",
+        "the reference monitor reads a quarter of the voltage between the reference pins, \
+         at gain 1 against the internal 2.048 volt reference",
+        "SBAS752B section 8.3.9: monitoring the external reference uses the internal \
+         reference"
+    );
+    let mut bench = Bench::catalog_part(avdd);
+    let sensed = bench.volts("B.AVDD") - bench.volts("B.AVSS");
+    assert_eq!(sensed, avdd);
+    for vref in [VREF_EXTERNAL, VREF_ANALOG_SUPPLY] {
+        bench.exchange(&wreg(1, config1(0, false, false, vref)), 0);
+        bench.exchange(&wreg(0, config0(MUX_SUPPLY_MONITOR, 0b111, false)), 0);
+        assert_eq!(
+            bench.rdata(),
+            code(sensed / MONITOR_DIVISOR, 1.0, INTERNAL_REFERENCE),
+            "the supply monitor, VREF {vref:#04b}"
+        );
+        bench.exchange(&wreg(0, config0(MUX_REFERENCE_MONITOR, 0b111, false)), 0);
+        assert_eq!(
+            bench.rdata(),
+            code(
+                (REFP_VOLTS - REFN_VOLTS) / MONITOR_DIVISOR,
+                1.0,
+                INTERNAL_REFERENCE
+            ),
+            "the reference monitor, VREF {vref:#04b}"
+        );
+    }
+    bench.finish();
+}
+
 /// MaD's firmware (`Firmware/MaDCore/src/IO/IO_ADS122U04.c`), as
 /// `IO_ADS122U04_start` and `IO_ADS122U04_receiveConversion` run it on the
 /// force-gauge channel: its `IO_ADS122U04_channelConfig` register values,
