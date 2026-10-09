@@ -21,7 +21,7 @@ resolver = "2"
 # Shared package metadata. A crate opts in with `version.workspace = true`,
 # `license.workspace = true`, etc.
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # Minimum supported Rust version. Determined empirically: gimli 0.34 (pulled in
 # by tools/memory-inspect) requires rustc 1.88, and 1.88 builds the whole

@@ -600,7 +600,7 @@ fn a_project_written_for_this_release_is_read(#[case] key: &str) {
 
 #[rstest]
 #[case::the_next_release(&format!("requires-embsim = {:?}\n", next_release()))]
-#[case::the_last_release("requires-embsim = \"0.1\"\n")]
+#[case::the_last_release("requires-embsim = \"0.2\"\n")]
 fn a_project_written_for_another_release_is_refused(#[case] key: &str) {
     behaviour!(Test {
         id: "project.requires-another-embsim",

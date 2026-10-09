@@ -6,6 +6,16 @@ the one before it promised, and says so here under **Breaking**.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
+What a project like MaD needs from embsim to move onto a project file,
+beyond 0.2.0: the Edge carrier's RS-422 parts in the standard catalog, an
+ADS122U04 the firmware configures over its own pins, a plant of several
+models as one component, and an encoder that presents RS-422 pairs.
+[`MIGRATING-MAD.md`](MIGRATING-MAD.md) §2 lists what is still owed; the
+host the board's clock meters is one, and `NODES.md` §18 records why it
+will be the host's Chrome metered over DevTools, not a VM.
+
 ### Breaking
 
 - **`ads122u04::Config` has no gain or reference.** The converter takes
@@ -17,6 +27,8 @@ the one before it promised, and says so here under **Breaking**.
   register's).
 - `machine::quadrature_encoder::Config` has a `complements` field (below):
   a struct literal names it, or ends `..Config::new(counts_per_mm)`.
+- `Finding` has a new variant, `PinAboveRecommended` (below): an
+  exhaustive `match` over it needs an arm for it.
 
 ### Added
 
@@ -39,6 +51,23 @@ the one before it promised, and says so here under **Breaking**.
   the same publish, the pairs a differential receiver such as the Edge
   board's `U25` reads. `Config` has a `complements` field, `false` by
   default.
+- **The Edge carrier's RS-422 pair in the standard catalog.** `am26ls31`,
+  the AM26LS31 line driver (TI SLLS114N; the carrier's `U24`, placed by
+  `AM26LS31CD`, `CDR`, `CDBR`, `CN` and `CNSR`), and `am26lv32`, the
+  AM26LV32 line receiver (TI SLLS202H; the carrier's `U25`, placed by
+  `AM26LV32IDR`, `IDRG4` and `INSR` and the obsolete `CD` and `ID`), each
+  with its numbered pin table and its outputs driven from its own `VCC`.
+  `boards/projects/edge-ec32-ds2.toml` builds with the standard catalog
+  alone.
+- **A pin's operating limits.** `PinDecl::with_limits(PinLimits {
+  recommended, absolute_max, note })` declares a pin's range against its
+  declared reference; the engine checks it against the solved net when the
+  system is built and after every pass that moves the pin's net or its
+  reference, and raises `Finding::PinAboveRecommended` once per excursion.
+  The `am26lv32` declares `VCC` 3.0–3.6 V recommended, 6 V absolute.
+- **Findings in plain words.** `Finding` implements `Display`: one line
+  naming the net, the pins as `Reference.Pin` or the part, and what is
+  wrong. `check` and `run` print it in place of the Rust form.
 
 ### Changed
 
@@ -56,6 +85,11 @@ the one before it promised, and says so here under **Breaking**.
   DS2 add-on's project, reads the force path's code at gain 128 against the
   3.3 V analog supply. The model's protocol thread ends when its part is
   dropped.
+- `embsim check` names the pin table that fits a board's parts, as
+  `survey` does: per group of parts placed with a table the netlist does
+  not use, the `options.pins` table that declares the netlist's pins, or
+  that no table of the model does (`fitting_option_table`,
+  `BoardSurvey::pin_table_groups`, `PinTableGroup`).
 
 ## [0.2.0]
 

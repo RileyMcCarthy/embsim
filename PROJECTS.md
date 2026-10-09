@@ -86,7 +86,7 @@ unknown field `colour`, expected one of `name`, `kind`, `netlist`, `model`
 
 | Table | Key | What it says |
 |---|---|---|
-| (top level) | `requires-embsim` | optional: the embsim release the project is written for, `"0.2"`, read as Cargo reads a caret requirement (`0.2` is any `0.2.x`). An embsim of another release refuses the project, naming both, before it reads the rest; `embsim new` writes it |
+| (top level) | `requires-embsim` | optional: the embsim release the project is written for, `"0.3"`, read as Cargo reads a caret requirement (`0.3` is any `0.3.x`). An embsim of another release refuses the project, naming both, before it reads the rest; `embsim new` writes it |
 | `[catalog]` | `crates` | optional table: the project's own catalog crates, each a directory relative to the project file; the `embsim` tool builds them into the runner that runs the project (section 10) |
 | | `runner` | optional: the project's own runner crate, relative to the project file, which the tool builds and runs instead of writing a runner of its own (section 10) |
 | `[[board]]` | `name` | the board's name in the system: the first word of every endpoint and net on it (`EC32.J203.41`, `EC32.Common_VDD`) |
@@ -112,7 +112,7 @@ project written for a newer embsim to the runner whose embsim reads it,
 and a project written for another release says so:
 
 ```text
-error: p.toml: this project is written for embsim 0.3 (requires-embsim = "0.3"), and this is embsim 0.2.0: run it with an embsim 0.3, or, if it is written for this one, say so with requires-embsim = "0.2" (PROJECTS.md §2)
+error: p.toml: this project is written for embsim 0.4 (requires-embsim = "0.4"), and this is embsim 0.3.0: run it with an embsim 0.4, or, if it is written for this one, say so with requires-embsim = "0.3" (PROJECTS.md §2)
 ```
 
 A board or component name is not empty and has no dot or space, and no two
@@ -133,7 +133,7 @@ cargo run -p embsim-cli -- --help # or run it in place, from the workspace
 ```
 
 A release's prebuilt binary, or `cargo install --locked --git
-https://github.com/RileyMcCarthy/embsim --tag v0.2.0 embsim-cli`, is the
+https://github.com/RileyMcCarthy/embsim --tag v0.3.0 embsim-cli`, is the
 same command (the README's "Install").
 
 It has four subcommands:
@@ -1395,7 +1395,7 @@ embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim
 embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
 project rig.toml
   catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
-  embsim 0.2.0, git rev a47bf442f5a5, from /home/me/embsim
+  embsim 0.3.0, git rev a47bf442f5a5, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate sim-catalog 0.1.0: /home/me/embsim/rig/sim/catalog, in the git repository at rev a47bf442f5a5, but no commit holds its files
 …
@@ -1456,14 +1456,14 @@ project (`sim/catalog` gives `sim-board`, `sim-sensor`, `sim-core`,
 2. `--embsim`'s: an embsim checkout's path, or a git repository at a tag
    or a commit, `URL@REF` — a hex commit is a `rev`, anything else a `tag`,
    and `rev=`, `tag=` or `branch=` before it says which:
-   `--embsim https://github.com/RileyMcCarthy/embsim@v0.2.0`;
+   `--embsim https://github.com/RileyMcCarthy/embsim@v0.3.0`;
 3. the checkout the tool was built from, by a path relative to the crate,
    when that checkout sits inside the crate's git repository (embsim as a
    submodule, as in MaD);
 4. embsim's repository at the revision the tool was built from, with its
    release as the version Cargo checks: `{ git =
-   "https://github.com/RileyMcCarthy/embsim", rev = "…", version = "0.2"
-   }` (at the release tag, `v0.2.0`, when the tool knows no revision) —
+   "https://github.com/RileyMcCarthy/embsim", rev = "…", version = "0.3"
+   }` (at the release tag, `v0.3.0`, when the tool knows no revision) —
    when another machine can fetch exactly that revision: the tool was built
    with no changes no commit holds, and from a release, a checkout Cargo
    fetched, or a checkout whose remote-tracking branches hold the commit.
@@ -1819,7 +1819,7 @@ for the `CatalogSet` its registration function takes:
 |---|---|
 | `{ path = "../embsim/boards" }`, a checkout | `{ path = "<the checkout>/cli" }`, spelled as the crate spells it |
 | `{ git = "…", rev = "…" }` (or `branch`, `tag`, or neither) | the same repository at the same revision |
-| `"0.2"`, a crates.io release | `"0.2"` |
+| `"0.3"`, a crates.io release | `"0.3"` |
 
 So the embsim a project builds against is its choice, written in its
 crate's manifest and locked in its lock file, and the same on every
@@ -2459,7 +2459,7 @@ result can be traced to what produced it (`DESIGN.md` rule 9):
 ```text
 project project.toml
   catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
-  embsim 0.2.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
+  embsim 0.3.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate custom-project-catalog 0.1.0: /home/me/embsim/examples/custom-project/catalog, git rev 4f0c2a1b3d5e
 ```

@@ -349,7 +349,7 @@ harness was checked against `mad_edge.net` (the nets of `J4`, `J9`–`J16`,
 # force-gauge add-on on the force cable, the machine on the carrier's
 # connectors, and the Raspberry Pi's serial port as a PTY.
 
-requires-embsim = "0.2"
+requires-embsim = "0.3"
 
 [catalog]
 crates = ["mad-catalog"]
