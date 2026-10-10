@@ -104,26 +104,38 @@ impl Heard {
 /// Each launch's profile gets a number of its own within the process.
 static PROFILES: AtomicU64 = AtomicU64::new(0);
 
-/// The renderer prefix, on Linux. Other platforms start renderers as Chrome does.
-fn renderer_prefix_arg(profile: &Path) -> io::Result<Option<String>> {
+/// Browser arguments for the Linux renderer, empty on every other platform.
+fn renderer_launch_args(profile: &Path) -> io::Result<Vec<String>> {
     #[cfg(target_os = "linux")]
-    let prefix = Some(renderer_crashpad_switch(profile)?);
+    {
+        linux_renderer_launch_args(profile)
+    }
     #[cfg(not(target_os = "linux"))]
-    let prefix = {
+    {
         let _ = profile;
-        None
-    };
-    Ok(prefix)
+        Ok(Vec::new())
+    }
+}
+
+/// `--renderer-cmd-prefix` plus `--no-sandbox`.
+///
+/// A non-empty prefix makes Chrome skip the zygote for that renderer and pass
+/// it `--no-zygote`. The Linux sandbox is applied by the zygote, so the
+/// renderer starts only with the sandbox off. The script execs the real Chrome
+/// binary with `--disable-crashpad-for-testing`, and that startup path then
+/// skips Crashpad, so `Page.crash` ends the process and Chrome reports
+/// `Target.targetCrashed`. The browser process must not receive that switch:
+/// it starts the crash handler, and a zygote-forked child that finds no
+/// handler descriptor aborts at startup.
+#[cfg(any(target_os = "linux", test))]
+fn linux_renderer_launch_args(profile: &Path) -> io::Result<Vec<String>> {
+    Ok(vec![
+        renderer_crashpad_switch(profile)?,
+        "--no-sandbox".to_string(),
+    ])
 }
 
 /// `--renderer-cmd-prefix` naming a script in `profile`.
-///
-/// The script execs the real Chrome binary with `--disable-crashpad-for-testing`.
-/// A non-empty prefix makes Chrome pass `--no-zygote` to the renderer, and that
-/// startup path skips Crashpad when the switch is present, so `Page.crash`
-/// ends the process and Chrome reports `Target.targetCrashed`. The browser
-/// process must not receive the switch: it starts the crash handler, and a
-/// zygote-forked child that finds no handler descriptor aborts at startup.
 #[cfg(any(target_os = "linux", test))]
 fn renderer_crashpad_switch(profile: &Path) -> io::Result<String> {
     use std::os::unix::fs::PermissionsExt;
@@ -193,17 +205,16 @@ impl ChromeProcess {
         if spec.headless {
             command.arg("--headless=new");
         }
-        // Linux renderers skip Crashpad. See `renderer_crashpad_switch`.
-        let prefix = match renderer_prefix_arg(&profile) {
-            Ok(prefix) => prefix,
+        // Linux renderers skip the zygote, so the sandbox is off and Crashpad
+        // is left off in the renderer. See `linux_renderer_launch_args`.
+        let extra = match renderer_launch_args(&profile) {
+            Ok(extra) => extra,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&profile);
                 return Err(error);
             }
         };
-        if let Some(prefix) = prefix {
-            command.arg(prefix);
-        }
+        command.args(extra);
         command
             .arg("about:blank")
             .stdin(Stdio::null())
@@ -543,13 +554,13 @@ mod tests {
     fn a_linux_launch_starts_each_renderer_with_crash_reporting_off() {
         behaviour!(Test {
             id: "chrome-cdp.linux-renderer-prefix",
-            covers: Some("cdp/src/chrome.rs#renderer_crashpad_switch"),
+            covers: Some("cdp/src/chrome.rs#linux_renderer_launch_args"),
             given: "Chrome is launched on Linux",
         });
         expect!(
             "renderer-skips-crash-reporting",
             "each renderer is started by a prefix that runs the real Chrome binary with crash \
-             reporting left off in that process"
+             reporting left off in that process, and the sandbox is off"
         );
         let dir = std::env::temp_dir().join(format!(
             "embsim-cdp-prefix-{}-{}",
@@ -557,7 +568,8 @@ mod tests {
             PROFILES.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("the profile directory");
-        let switch = renderer_crashpad_switch(&dir).expect("the prefix script");
+        let args = linux_renderer_launch_args(&dir).expect("the Linux launch arguments");
+        let switch = args.first().expect("the prefix").clone();
         let script = dir.join("renderer-crashpad.sh");
         let body = std::fs::read_to_string(&script).expect("the script");
         let executable = std::fs::metadata(&script)
@@ -575,6 +587,11 @@ mod tests {
         assert_eq!(
             switch,
             format!("--renderer-cmd-prefix='{path}'"),
+            "renderer-skips-crash-reporting"
+        );
+        assert_eq!(
+            args.get(1).map(String::as_str),
+            Some("--no-sandbox"),
             "renderer-skips-crash-reporting"
         );
     }
