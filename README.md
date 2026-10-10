@@ -204,6 +204,7 @@ and refused.
                       │
    boards        embsim-boards     off-the-shelf modules (P2-EC32MB) and the P2 package
    cpu           embsim-p2-qemu    QEMU Propeller 2, pads on nets
+   host          embsim-cdp        the host's Chrome, its pages metered over DevTools
                       │
    board         embsim-board      netlist, nets, one quasi-static solve
    models        embsim-models     flash, SD, regulators, gates, the plant
@@ -224,6 +225,7 @@ place the two meet.
 | `embsim-board` | [`board/`](board) | Netlist ingestion, net resolution, the one drive/sense interface, projects and the netlist survey |
 | `embsim-models` | [`models/`](models) | Device models: ADS122U04, serial NOR flash, SD card, FAT16, regulators, gates, oscillators |
 | `embsim-p2-qemu` | [`p2-qemu/`](p2-qemu) | The QEMU Propeller 2 target as a board component: boots the real ROM off a flash on the board's nets, with QEMU in a `qemu-system-p2` of its own. Carries the `target/p2` sources that program is built from |
+| `embsim-cdp` | [`cdp/`](cdp) | The host's Chrome as a bench component, `chrome-cdp`: its pages' Web Serial on a host's serial line, every page's and dedicated worker's clock metered by the board's over the Chrome DevTools Protocol |
 | `embsim-boards` | [`boards/`](boards) | The P2-EC32MB from its vendor netlist, the P2 package a core sits in, and the standard catalog of board and part kinds a project names |
 | `embsim-cli` | [`cli/`](cli) | The `embsim` command: survey a netlist, write a starter project, check it, run it (with QEMU as the P2's core, `embsim qemu install` installing the program it runs in), and build a project's own catalog crates into the runner that runs it. The guide is [`PROJECTS.md`](PROJECTS.md) |
 | `yourproject-catalog` | [`cli/catalog-template/`](cli/catalog-template) | The catalog crate `embsim new --catalog` starts, compiled here so it stays true to the API |
@@ -380,7 +382,12 @@ driven through a list of steps (`PROJECTS.md` section 5). A project's own
 bench kind may be a plant made of several models — a drive turning an
 encoder and reaching an end switch — as one component with electrical
 pins, an `embsim_board::Assembly` (`PROJECTS.md` section 10, "A plant: an
-`Assembly`").
+`Assembly`"). The `embsim` command's set adds `chrome-cdp`, the host's
+Chrome on the same four pins as `host-serial`: its pages' Web Serial is the
+line, and every page's clock and every dedicated worker's advances only with
+the board's, a millisecond at a time over DevTools, so a web app's timeouts
+hold in board time against a board far slower than real time (`PROJECTS.md`
+section 5, `NODES.md` §15).
 
 The `embsim` command's set adds one core for the `p2` kind to the standard
 catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its
@@ -491,6 +498,7 @@ cargo test -p embsim-memory-inspect # DWARF parser (compiles a tiny C fixture at
 cargo test -p embsim-trace          # trace recorder
 cargo test -p embsim-ui             # web shell render + handlers
 cargo test -p embsim-cli            # the command as a user runs it, and as a library
+cargo test -p embsim-cdp            # chrome-cdp against a stand-in DevTools endpoint; -- --ignored against the host's Chrome (CI: chrome-cdp)
 cargo test -p custom-project-catalog                # the worked example's project, in process
 cargo test -p embsim-cli --test runner -- --ignored # the tool building runners with Cargo (CI: project-runner)
 ```

@@ -6,6 +6,29 @@ the one before it promised, and says so here under **Breaking**.
 
 ## [Unreleased]
 
+### Added
+
+- **`chrome-cdp`, the host's Chrome on the board** (`embsim-cdp`, in the
+  `embsim` command's set). A bench component on `host-serial`'s four pins
+  whose far end is Web Serial in every page of the host's Chrome, launched
+  or attached to at the first slice. Every page and every dedicated worker
+  is held from birth and its clock metered by the board's over the Chrome
+  DevTools Protocol, a quantum (1 ms) at a time: timers, `Date.now()`,
+  `performance.now()` and a WASM module's clock advance only with the
+  board's, so a web app's timeouts hold in board time. The port follows
+  Chrome's rules — a `close()` refused while a stream is locked, streams
+  released a slice after their flush, a disconnect that errors both streams,
+  a replug that hands out a new `SerialPort` — and the cable can be pulled
+  from the page (`__embsim.link('unplug')`) or from Rust. A drain barrier
+  waits for a worker that owns the port's stream to read what it was handed
+  before the board's clock moves on. Options: `baud`, `quantum`,
+  `max_lead`, `stuck_after`, `chrome`, `devtools_port`, `headless`,
+  `attach`, `url`, `usb_vendor_id`, `usb_product_id`, `granted`
+  ([`PROJECTS.md`](PROJECTS.md) §5, [`NODES.md`](NODES.md) §15).
+- `embsim_board::HostRailLine` and `HOST_RAIL_PINS`: a host's serial line at
+  its own rail, the one `host-serial` attaches, for any bench host whose
+  bytes come from elsewhere; `SerialLevelBridge::tx_idle`.
+
 ## [0.3.0] - 2026-10-09
 
 What a project like MaD needs from embsim to move onto a project file,

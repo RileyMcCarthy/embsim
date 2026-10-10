@@ -1008,10 +1008,47 @@ force path + gantry):
   *when* a race demands it.
 - **T3.** Nothing this machine needs.
 
+### The host's Chrome, metered (`chrome-cdp`)
+
+A run with a `chrome-cdp` component (`PROJECTS.md` §5, `NODES.md` §15) is
+**T1-with-host-io**, as a run with a host PTY is. The node acts only at the
+board's instants — a slice at every multiple of the quantum after the
+start, every byte the page wrote entering the line at one, every byte the
+board sent handed over at one — but which slice a page's byte reaches the
+node in is Chrome's: its threads' scheduling decides some of it. So a run
+is reproducible in what the page sent and, to within a slice, when; three
+identical runs of the shipped MaD app put the board's first request at
+board 13, 11 and 12 ms (hc_design). Absolute clock values differ from run
+to run (the page's first script runs a variable time after its navigation
+starts); durations do not.
+
+*Metered:* each page's main thread and each of its dedicated workers —
+timers, `Date.now()`, `performance.now()`, a WASM module's imported clock —
+advance only in grants, by exactly the budget (the canary: a worker's 4 ms
+timer ticks exactly 100 times in 400 grants of 1 ms). A network fetch in
+flight holds a grant until it completes (`pauseIfNetworkFetchesPending`),
+on host time. Chrome moves a page's clock outside a budget at a worker's
+birth and at storage calls (IndexedDB, OPFS, Cache Storage): the node books
+that as a lead, reports it, and pays it back by skipping grants.
+
+*Not metered:* JavaScript runs in no virtual time, so an app's own CPU time
+is never board time. Rendering barely runs under virtual time —
+`requestAnimationFrame`, `ResizeObserver`, `IntersectionObserver` and CSS
+transitions fire a few times a run, not at 60 Hz — so a chart that draws on
+animation frames is untested, and Playwright's actionability checks (which
+wait on frames) stall: a harness clicks with `force` after a hit test of its
+own and waits on the page's clock. Service workers, shared workers and
+out-of-process frames run on host time. Messages from a worker to its page
+land at the next grant, so a byte a worker writes reaches the line up to two
+quanta after it wrote it. Chrome's own Web Serial, the OS's driver and a USB
+adapter are not in the byte path: the port is the node's shim, which follows
+Chrome's rules but not Chrome's code.
+
 ## Non-goals
 
 - Deterministic host-PTY or browser-driven E2E (structurally impossible;
-  flagged and excluded instead).
+  flagged and excluded instead). A metered browser (`chrome-cdp`, above)
+  bounds a run to within a slice; it does not make it bit-identical.
 - Cross-architecture bit-identical floats without quantization.
 - Instruction-level Propeller 2 emulation.
 - Deterministic *wall* runtime. Stepped mode is faster or slower than real time
