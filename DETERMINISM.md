@@ -1018,18 +1018,25 @@ board sent handed over at one — but which slice a page's byte reaches the
 node in is Chrome's: its threads' scheduling decides some of it. So a run
 is reproducible in what the page sent and, to within a slice, when; three
 identical runs of the shipped MaD app put the board's first request at
-board 13, 11 and 12 ms (hc_design). Absolute clock values differ from run
+board 13, 11 and 12 ms (`NODES.md` §15, evidence E14). Absolute clock values differ from run
 to run (the page's first script runs a variable time after its navigation
 starts); durations do not.
 
-*Metered:* each page's main thread and each of its dedicated workers —
-timers, `Date.now()`, `performance.now()`, a WASM module's imported clock —
-advance only in grants, by exactly the budget (the canary: a worker's 4 ms
-timer ticks exactly 100 times in 400 grants of 1 ms). A network fetch in
-flight holds a grant until it completes (`pauseIfNetworkFetchesPending`),
-on host time. Chrome moves a page's clock outside a budget at a worker's
-birth and at storage calls (IndexedDB, OPFS, Cache Storage): the node books
-that as a lead, reports it, and pays it back by skipping grants.
+*Metered:* each page's main thread, each of its dedicated workers and the
+workers they start — timers, `Date.now()`, `performance.now()`, a WASM
+module's imported clock — advance only in grants, by exactly the budget
+(the canary: a worker's 4 ms timer ticks exactly 100 times in 400 grants of
+1 ms). The node books a page from what it granted it, so the fuzz Chrome
+puts below a clock's resolution never enters the books, and every grant is
+a whole quantum unless a lead is being paid back. A network fetch in flight
+holds a grant until it completes (`pauseIfNetworkFetchesPending`), on host
+time. Chrome moves a page's clock outside a budget at a worker's birth and
+at storage calls (IndexedDB, OPFS, Cache Storage): the node books that as a
+lead, reports it, and pays it back by skipping grants. Those are the only
+leads: a new document — a navigation, a reload, into a new renderer or not
+— starts level with the board, since its clock's origin is its own. Pages
+that share a renderer's main thread (a page and a window it opened) share
+one clock, granted once between them.
 
 *Not metered:* JavaScript runs in no virtual time, so an app's own CPU time
 is never board time. Rendering barely runs under virtual time —
@@ -1038,11 +1045,14 @@ transitions fire a few times a run, not at 60 Hz — so a chart that draws on
 animation frames is untested, and Playwright's actionability checks (which
 wait on frames) stall: a harness clicks with `force` after a hit test of its
 own and waits on the page's clock. Service workers, shared workers and
-out-of-process frames run on host time. Messages from a worker to its page
-land at the next grant, so a byte a worker writes reaches the line up to two
-quanta after it wrote it. Chrome's own Web Serial, the OS's driver and a USB
-adapter are not in the byte path: the port is the node's shim, which follows
-Chrome's rules but not Chrome's code.
+out-of-process frames run on host time. A hidden page (a background tab) is
+metered, but Chrome holds back what it says over DevTools until the node
+pokes it, so its slices cost more host time, never board time. Messages
+from a worker to its page land at the next grant, so a byte a worker writes
+reaches the line up to two quanta after it wrote it. Chrome's own Web
+Serial, the OS's driver and a USB adapter are not in the byte path: the
+port is the node's shim, which follows Chrome's rules but not Chrome's
+code.
 
 ## Non-goals
 

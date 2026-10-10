@@ -398,8 +398,9 @@ installs `qemu-system-p2` with `embsim qemu install` and runs `cargo test
 -p embsim-p2-qemu` and `cargo test -p embsim-cli --test cli` with
 `--include-ignored`, where `run` boots the P2 off the module's flash; the
 `chrome-cdp` job runs `cargo test -p embsim-cdp --test real_chrome --
---ignored` against the runner's `google-chrome` (the test job runs the
-node's stand-in suite, `loopback.rs`, with no Chrome). The behaviour
+--ignored` against the runner's `google-chrome`, among them
+`examples/chrome-ping` run as a project (the test job runs the node's
+stand-in suite, `loopback.rs`, with no Chrome). The behaviour
 ledger's suite (`vibes.suite.json`) runs `embsim-board`, `embsim-boards`,
 `embsim-cli`, `embsim-p2-qemu`, `embsim-cdp` and `custom-project-catalog`,
 so the runner builds, the QEMU boots and the real-Chrome cases declare no

@@ -11,23 +11,42 @@ the one before it promised, and says so here under **Breaking**.
 - **`chrome-cdp`, the host's Chrome on the board** (`embsim-cdp`, in the
   `embsim` command's set). A bench component on `host-serial`'s four pins
   whose far end is Web Serial in every page of the host's Chrome, launched
-  or attached to at the first slice. Every page and every dedicated worker
-  is held from birth and its clock metered by the board's over the Chrome
-  DevTools Protocol, a quantum (1 ms) at a time: timers, `Date.now()`,
-  `performance.now()` and a WASM module's clock advance only with the
-  board's, so a web app's timeouts hold in board time. The port follows
-  Chrome's rules — a `close()` refused while a stream is locked, streams
-  released a slice after their flush, a disconnect that errors both streams,
-  a replug that hands out a new `SerialPort` — and the cable can be pulled
+  or attached to at the first slice. Every page, every dedicated worker and
+  every worker those start is held from birth and its clock metered by the
+  board's over the Chrome DevTools Protocol, a quantum (1 ms) at a time:
+  timers, `Date.now()`, `performance.now()` and a WASM module's clock
+  advance only with the board's, so a web app's timeouts hold in board
+  time. Pages that share a renderer share one clock, granted once; a new
+  document starts level with the board; a hidden page is metered too. The
+  port follows Chrome's rules — a `close()` refused while a stream is
+  locked, streams released a slice after their flush, a disconnect that
+  errors both streams once the pipe is read, a replug that hands out a new
+  `SerialPort`, a write paced by the line — and the cable can be pulled
   from the page (`__embsim.link('unplug')`) or from Rust. A drain barrier
-  waits for a worker that owns the port's stream to read what it was handed
-  before the board's clock moves on. Options: `baud`, `quantum`,
-  `max_lead`, `stuck_after`, `chrome`, `devtools_port`, `headless`,
-  `attach`, `url`, `usb_vendor_id`, `usb_product_id`, `granted`
-  ([`PROJECTS.md`](PROJECTS.md) §5, [`NODES.md`](NODES.md) §15).
+  waits for a worker that owns the port's transferred stream to read what
+  it was handed before the board's clock moves on. A stuck grant, a page
+  that does not return (an unanswered dialog), a crash, a page Chrome made
+  with a URL (which it does not hold) and a URL that does not open each stop
+  the run saying which. Options: `baud`, `quantum`, `max_lead`,
+  `stuck_after`, `chrome`, `devtools_port`, `headless`, `attach`, `url`,
+  `usb_vendor_id`, `usb_product_id`, `granted` ([`PROJECTS.md`](PROJECTS.md)
+  §5, [`NODES.md`](NODES.md) §15). `examples/chrome-ping` is a project with
+  one, and a Playwright harness for it.
 - `embsim_board::HostRailLine` and `HOST_RAIL_PINS`: a host's serial line at
   its own rail, the one `host-serial` attaches, for any bench host whose
   bytes come from elsewhere; `SerialLevelBridge::tx_idle`.
+- `PartOptions::boolean`: a kind's `true`/`false` option, read as the
+  project file wrote it.
+
+### Changed
+
+- **A project's committed `embsim.lock` is stale until refreshed.** Every
+  runner now links `embsim-cdp`, and with it `tungstenite`'s dependency
+  tree, so a runner's `--locked` build against a lock written by 0.2.0
+  fails, and the tool says to remove the file and run again; the new
+  `embsim.lock` it writes is the one to commit ([`PROJECTS.md`](PROJECTS.md)
+  §10, "Its lock file is the project's"). `examples/custom-project`'s is
+  refreshed.
 
 ## [0.3.0] - 2026-10-09
 

@@ -362,10 +362,14 @@ jobs:
   # pages (cdp/tests/pages) served by the test. The cases are #[ignore]d in
   # the test job, so this is the one job that launches Chrome for them: the
   # worker canary (a dedicated worker's 4 ms timer ticks 100 times in 400
-  # grants of 1 ms), the clocks, bytes round trip through the port shim,
-  # Chrome's close-while-locked and replug rules, and a page shaped like
-  # MaD Control against a stand-in board. What they assert is virtual time
-  # and bytes; host time per slice is printed, never asserted.
+  # grants of 1 ms), a harness's fresh context held from birth and let go
+  # when closed, a hidden tab and a popup, a nested worker, a page made with
+  # a URL, a crash, a dialog, bytes round trip through the port shim, a
+  # write paced by the line, Chrome's close-while-locked, replug and
+  # disconnect rules, examples/chrome-ping as a project, and a page shaped
+  # like MaD Control against a stand-in board. What they assert is virtual
+  # time, bytes and failures' words; host time per slice is printed, never
+  # asserted.
   chrome-cdp:
     name: chrome-cdp
     runs-on: ubuntu-latest
