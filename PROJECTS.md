@@ -1459,12 +1459,11 @@ alone.
 ### The rest
 
 - The standard catalog's bench component kinds are `host-serial` and
-  `scripted-source` (section 5). A host that must run on the board's clock
-  (a browser whose page and workers the board's clock meters over the
-  DevTools protocol, the `chrome-cdp` kind `NODES.md` §18 plans) is not one
-  of them, and neither is a pace for `run` against wall time: `run` is
-  stepped, so a quiet system's virtual time runs ahead of a host's wall
-  time.
+  `scripted-source` (section 5); a host that must run on the board's clock,
+  a browser whose pages and workers the board's clock meters, is
+  `chrome-cdp`, in the `embsim` command's set (section 5). There is no pace
+  for `run` against wall time: `run` is stepped, so a quiet system's virtual
+  time runs ahead of a host's wall time.
 - The standard catalog has no part kind for a diode, LED, FET or transistor.
   One the element library does not know by part number has no way into a
   project yet.
