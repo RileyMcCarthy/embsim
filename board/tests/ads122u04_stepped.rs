@@ -16,9 +16,8 @@
 //! log. Making that hold is `DETERMINISM.md` Phase D2's in-process transport.
 //!
 //! Its own test binary per `TESTING.md` rule 5: creating an
-//! [`Ads122u04Component`] starts a protocol thread that lives for the rest of
-//! the process, and a leftover actor would hold a later case's quiescence
-//! barrier.
+//! [`Ads122u04Component`] starts a protocol thread, a clock actor until the
+//! system drops the part, and the clock is stepped before it exists.
 
 use rstest::rstest;
 use std::time::{Duration, Instant};
@@ -35,8 +34,9 @@ use uart_probe::{ProbeHandle, UartProbe};
 const AIN0_VOLTS: f64 = 1.778;
 const AIN1_VOLTS: f64 = 1.522;
 
-/// Model configuration, matching the DS2Addon force path.
-const VREF_MV: f64 = 2048.0;
+/// The converter as it leaves reset, which nothing here writes: gain 1
+/// against the internal 2.048 V reference (SBAS752B §8.6.2.1, §8.6.2.2).
+const VREF_VOLTS: f64 = 2.048;
 const GAIN: f64 = 1.0;
 
 fn ep(s: &str) -> EndpointRef {
@@ -54,9 +54,9 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
     pred()
 }
 
-/// Expected 24-bit code for a differential, per SBAS752B §8.5.2.
-fn expected_code(diff_mv: f64) -> i32 {
-    ((diff_mv * GAIN * 8_388_608.0) / VREF_MV) as i32
+/// Expected 24-bit code for a differential in volts, per SBAS752B §8.5.2.
+fn expected_code(diff_volts: f64) -> i32 {
+    ((diff_volts * GAIN * 8_388_608.0) / VREF_VOLTS) as i32
 }
 
 /// Decode a little-endian 3-byte two's-complement conversion word.
@@ -105,14 +105,7 @@ fn rdata_round_trip_completes_under_a_stepped_clock() {
         .power(ep("BENCH.AIN1"), ep("ADC.AIN1"), AIN1_VOLTS);
 
     let system = System::new()
-        .component(
-            "ADC",
-            Box::new(Ads122u04Component::new(Config {
-                vref_mv: VREF_MV,
-                gain: GAIN,
-                zero_offset: 0,
-            })),
-        )
+        .component("ADC", Box::new(Ads122u04Component::new(Config::default())))
         .component(
             "HOST",
             Box::new(UartProbe::new(
@@ -140,7 +133,7 @@ fn rdata_round_trip_completes_under_a_stepped_clock() {
     );
 
     let frame = host.received()[..3].to_vec();
-    let expected = expected_code((AIN0_VOLTS - AIN1_VOLTS) * 1_000.0);
+    let expected = expected_code(AIN0_VOLTS - AIN1_VOLTS);
     assert_eq!(
         code_from_le3(&frame),
         expected,

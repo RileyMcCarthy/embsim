@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-board"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embsim-core",
  "libc",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-boards"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embsim-board",
  "embsim-core",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "embsim-board",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nix",
  "tracing",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-models"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embsim-board",
  "embsim-core",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-p2-qemu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embsim-board",
  "embsim-boards",

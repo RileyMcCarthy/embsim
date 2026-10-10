@@ -279,7 +279,7 @@ impl Core {
     fn apply(state: &mut State) {
         let rail = Self::rail(state).filter(|_| Self::enabled(state));
         for channel in 0..state.outputs.len() {
-            let desired: PairOut = rail.and_then(|vcc| state.inputs[channel].map(|i| (i, vcc)));
+            let desired: PairOut = state.inputs[channel].zip(rail);
             if state.applied[channel] == Some(desired) {
                 continue;
             }

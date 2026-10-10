@@ -86,7 +86,7 @@ unknown field `colour`, expected one of `name`, `kind`, `netlist`, `model`
 
 | Table | Key | What it says |
 |---|---|---|
-| (top level) | `requires-embsim` | optional: the embsim release the project is written for, `"0.2"`, read as Cargo reads a caret requirement (`0.2` is any `0.2.x`). An embsim of another release refuses the project, naming both, before it reads the rest; `embsim new` writes it |
+| (top level) | `requires-embsim` | optional: the embsim release the project is written for, `"0.3"`, read as Cargo reads a caret requirement (`0.3` is any `0.3.x`). An embsim of another release refuses the project, naming both, before it reads the rest; `embsim new` writes it |
 | `[catalog]` | `crates` | optional table: the project's own catalog crates, each a directory relative to the project file; the `embsim` tool builds them into the runner that runs the project (section 10) |
 | | `runner` | optional: the project's own runner crate, relative to the project file, which the tool builds and runs instead of writing a runner of its own (section 10) |
 | `[[board]]` | `name` | the board's name in the system: the first word of every endpoint and net on it (`EC32.J203.41`, `EC32.Common_VDD`) |
@@ -112,7 +112,7 @@ project written for a newer embsim to the runner whose embsim reads it,
 and a project written for another release says so:
 
 ```text
-error: p.toml: this project is written for embsim 0.3 (requires-embsim = "0.3"), and this is embsim 0.2.0: run it with an embsim 0.3, or, if it is written for this one, say so with requires-embsim = "0.2" (PROJECTS.md §2)
+error: p.toml: this project is written for embsim 0.4 (requires-embsim = "0.4"), and this is embsim 0.3.0: run it with an embsim 0.4, or, if it is written for this one, say so with requires-embsim = "0.3" (PROJECTS.md §2)
 ```
 
 A board or component name is not empty and has no dot or space, and no two
@@ -133,7 +133,7 @@ cargo run -p embsim-cli -- --help # or run it in place, from the workspace
 ```
 
 A release's prebuilt binary, or `cargo install --locked --git
-https://github.com/RileyMcCarthy/embsim --tag v0.2.0 embsim-cli`, is the
+https://github.com/RileyMcCarthy/embsim --tag v0.3.0 embsim-cli`, is the
 same command (the README's "Install").
 
 It has four subcommands:
@@ -622,7 +622,7 @@ here.
 | `iso67xx` | TI digital isolator, the member the key names | a part whose part name, mpn or value contains ISO6720, ISO6721, ISO6731, ISO6740, ISO6741 or ISO6742 | `ISO6721BDR`, `ISO6731DWR`, `ISO6740DWR`, `ISO6740FDWR`, `ISO6741DWR`, `ISO6742DWR` | fixed, the member's: `ISO6721BDR` (8 pins), `ISO6731DWR` (16 pins), `ISO6740DWR` (16 pins), `ISO6740FDWR` (16 pins), `ISO6741DWR` (16 pins), `ISO6742DWR` (16 pins) | — |
 | `am26ls31` | TI quad RS-422 line driver, driving from its own supply | a part whose part name, mpn or value contains AM26LS31C | `AM26LS31CD`, `AM26LS31CDR`, `AM26LS31CDBR`, `AM26LS31CN`, `AM26LS31CNSR` | `"numbered"` (16 pins) | — |
 | `am26lv32` | TI quad RS-422 line receiver, driving from its own supply | a part whose part name, mpn or value contains AM26LV32 | `AM26LV32IDR`, `AM26LV32IDRG4`, `AM26LV32INSR`, `AM26LV32CD`, `AM26LV32ID` | `"numbered"` (16 pins) | — |
-| `ads122u04` | TI 24-bit ADC, as it comes out of reset | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
+| `ads122u04` | TI 24-bit ADC, converting as its register writes set it up | a part whose part name, mpn or value contains ADS122U04 | `ADS122U04IPW`, `ADS122U04IPWR` | `"tssop16"` (16 pins) | — |
 | `switch` | a switch whose poles pair the part's pins, each open | a switch or jumper: designator S, SW, JP or SJ, a SW_… symbol, or a name that says switch, jumper or solder link | — | the part's own | `poles = [["1", "2"]]` — the part's pins paired into poles, each open until a [[switch]] closes it (required) |
 | `mechanical` | a part with pads and nothing electrical | a part whose pads sit on one net at most | — | the part's own | — |
 | `boundary` | a connector, by its symbol's part name | a connector: designator J, P or CN, or a Conn… symbol | — | the part's own | — |
@@ -1320,11 +1320,12 @@ alone.
 ### The rest
 
 - The standard catalog's bench component kinds are `host-serial` and
-  `scripted-source` (section 5). A `host-serial` for a host that must run on
-  the board's clock (a browser co-simulated in a VM that stops when the
-  board's clock does) is not one of them, and neither is a pace for `run`
-  against wall time: `run` is stepped, so a quiet system's virtual time runs
-  ahead of a host's wall time.
+  `scripted-source` (section 5). A host that must run on the board's clock
+  (a browser whose page and workers the board's clock meters over the
+  DevTools protocol, the `chrome-cdp` kind `NODES.md` §18 plans) is not one
+  of them, and neither is a pace for `run` against wall time: `run` is
+  stepped, so a quiet system's virtual time runs ahead of a host's wall
+  time.
 - The standard catalog has no part kind for a diode, LED, FET or transistor.
   One the element library does not know by part number has no way into a
   project yet.
@@ -1349,9 +1350,9 @@ alone.
 
 ## 10. Extending embsim from a project
 
-*Status, 2026-10-02 on `feat/embsim-catalogs`, for embsim 0.2.0.
-Everything this section describes is built, except a plant's `Assembly`
-("Adding a bench component"), which is still a design. The Rust below either runs as a doc test of `embsim-boards` or
+*Status, 2026-10-02 on `feat/embsim-catalogs`, for embsim 0.2.0, and
+2026-10-08 on `feat/e1-e4`: everything this section describes is built, a
+plant's `Assembly` ("Adding a bench component") the last of it. The Rust below either runs as a doc test of `embsim-boards` or
 is quoted from the worked example,
 [`examples/custom-project`](examples/custom-project/README.md), whose crate
 every gate compiles; `boards/tests/guide_quotes.rs` fails when a quotation
@@ -1394,7 +1395,7 @@ embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim
 embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
 project rig.toml
   catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
-  embsim 0.2.0, git rev a47bf442f5a5, from /home/me/embsim
+  embsim 0.3.0, git rev a47bf442f5a5, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate sim-catalog 0.1.0: /home/me/embsim/rig/sim/catalog, in the git repository at rev a47bf442f5a5, but no commit holds its files
 …
@@ -1434,7 +1435,8 @@ in Rust. Its outside is electrical pins: a drive's step and direction
 inputs, an encoder's outputs, a switch's loop, a bridge's terminals, and
 the reference each of them is measured against. The project wires those
 pins like any other ([`DESIGN.md`](DESIGN.md) rule 2: one interface, no
-second channel).
+second channel). A plant made of several models is still one component,
+an `Assembly` ("Adding a bench component", below).
 
 ### The catalog crate
 
@@ -1454,14 +1456,14 @@ project (`sim/catalog` gives `sim-board`, `sim-sensor`, `sim-core`,
 2. `--embsim`'s: an embsim checkout's path, or a git repository at a tag
    or a commit, `URL@REF` — a hex commit is a `rev`, anything else a `tag`,
    and `rev=`, `tag=` or `branch=` before it says which:
-   `--embsim https://github.com/RileyMcCarthy/embsim@v0.2.0`;
+   `--embsim https://github.com/RileyMcCarthy/embsim@v0.3.0`;
 3. the checkout the tool was built from, by a path relative to the crate,
    when that checkout sits inside the crate's git repository (embsim as a
    submodule, as in MaD);
 4. embsim's repository at the revision the tool was built from, with its
    release as the version Cargo checks: `{ git =
-   "https://github.com/RileyMcCarthy/embsim", rev = "…", version = "0.2"
-   }` (at the release tag, `v0.2.0`, when the tool knows no revision) —
+   "https://github.com/RileyMcCarthy/embsim", rev = "…", version = "0.3"
+   }` (at the release tag, `v0.3.0`, when the tool knows no revision) —
    when another machine can fetch exactly that revision: the tool was built
    with no changes no commit holds, and from a release, a checkout Cargo
    fetched, or a checkout whose remote-tracking branches hold the commit.
@@ -1817,7 +1819,7 @@ for the `CatalogSet` its registration function takes:
 |---|---|
 | `{ path = "../embsim/boards" }`, a checkout | `{ path = "<the checkout>/cli" }`, spelled as the crate spells it |
 | `{ git = "…", rev = "…" }` (or `branch`, `tag`, or neither) | the same repository at the same revision |
-| `"0.2"`, a crates.io release | `"0.2"` |
+| `"0.3"`, a crates.io release | `"0.3"` |
 
 So the embsim a project builds against is its choice, written in its
 crate's manifest and locked in its lock file, and the same on every
@@ -2163,18 +2165,219 @@ information is a rate travels as one `Drive::Periodic` a rate change, not a
 wake an edge (`embsim_board::Drive::Periodic`); `scripted-source` (section
 5) is the shipped stimulus for a few steps over time.
 
-*Design; not built:* a component made of models embsim already has would
-build them into an **`embsim_board::Assembly`**: one component that hosts
-several, each part's pins renamed onto the assembly's, every part reaching
-the engine through the one interface, its pins through the assembly's
-handle table and its wakes through a `WakeGate` the assembly holds, as the
-P2 package hosts its core. At a shared instant the assembly would wake its
-parts in the order they were added. The links between the parts (a shaft
-turning an encoder, a carriage opening a switch) are Rust inside the
-assembly; the engine sees one node with pins, and no node sees another
-(rule 4). `NODES.md` §13 records what such a plant samples, and how often.
-MaD's machine, a servo drive, an encoder, switches and a load cell on one
-carriage, is the plant it is for ([`MIGRATING-MAD.md`](MIGRATING-MAD.md)).
+#### A plant: an `Assembly`
+
+A plant made of models embsim already has is one bench component too: an
+**`embsim_board::Assembly`** hosts several components behind one set of
+pins, and the kind returns it as its component (`board/src/assembly.rs`;
+the decision record is `NODES.md` §16).
+
+- **Members.** `Assembly::member(name, component, pins)` adds a component,
+  one of embsim's models or the project's own, and renames each pin it
+  declares onto an assembly pin: `pins` pairs the member's pin (its number
+  or its alias) with the assembly's name for it. The declarations come
+  along — role, idle, thresholds, input port, clamps, branches — and a pin
+  a declaration names is renamed with it. Every pin a member declares is
+  exactly one assembly pin: a pin left out, named twice, or given a name
+  the assembly already has is refused, naming it. Members are never wired
+  to each other: a net inside the node would be one the engine cannot see
+  (`DESIGN.md` rule 4), so a link between members is code (below).
+- **Returns.** `Assembly::reference(ret, pins)` measures `pins`, which
+  their members measure against nothing, against `ret`: one of the
+  assembly's pins, or a power input the assembly declares itself. A
+  drive's inputs read across their own return and an encoder's outputs sit
+  on their own ground, each a pin the file wires to where the board joins
+  it, so no ground is common inside the plant that the board does not
+  join. A sense through such a pin is measured against its return, as any
+  part's is against its declared reference; a drive's volts stay in the
+  engine's frame (`DESIGN.md` §2). A member's own reference stands: a pin
+  it already measures against another is refused.
+- **Time.** The engine holds one wake handler for the assembly. Each
+  member's wake handler and its schedules go through a `WakeGate` the
+  assembly holds for it, as the P2 package holds its core's: the assembly
+  keeps each member's instants, arms each on the engine as its own, and
+  hands an instant to exactly the members that asked for it, once each,
+  in the order they were added. A member that asks for the instant it is
+  handed is woken again at it, and a periodic request keeps the engine's
+  rule (anchored where it is asked for, a missed period one wake), as on
+  the engine. An assembly can be a member of another.
+- **Links.** The links between members — a shaft turning an encoder, a
+  carriage reaching a switch, a sample straining a load cell — are
+  closures between the members' handles, connected before the kind
+  returns the assembly. A link runs where the member that emits runs:
+  inside that member's sense callback or wake, on the engine's thread, at
+  that instant, so its time is the engine's and no other clock's. A link
+  that needs instants of its own is a member with no pins that asks for
+  them.
+- **What the engine sees.** One node with pins, whose drives, senses and
+  wakes are its members', each through the one interface; no member sees
+  another. `board/tests/assembly.rs` sends one step train through a drive
+  and an encoder assembled and through the same two as separate
+  components: the engine records the same number of events both ways.
+
+What a link hands on is what the emitting member samples, when it
+samples it. `StepperMotor` observes its carriage on a periodic wake, every
+millisecond unless its configuration says otherwise
+(`stepper_motor::DEFAULT_OBSERVE_INTERVAL_US`), and its position observer
+runs there: an encoder it turns moves at those instants, its count
+trailing the carriage by at most one observation's travel, and a switch it
+reaches trips within one observation of the carriage arriving. The
+carriage itself is the drive's closed form, exact at every observation, so
+the cadence moves when an edge lands and never how far the carriage went:
+at rest the count is the steps the drive folded. `board/tests/assembly.rs`
+reads it so on a board: a rate-carried train of 102 steps and then 61 back
+leaves the encoder at 102 and then 41, the 74LVC2G04 it drives showing
+that count's quadrature state, every count one edge of one of its outputs.
+
+The example below, a doc test of `embsim-boards`, is a kind whose
+component is an axis: embsim's drive, its encoder, and an end switch where
+the travel ends, on one carriage.
+
+```rust
+use embsim_board::{Assembly, Catalog, Component, ComponentRequest, KindInfo, Project, ProjectError};
+use embsim_boards::catalog::CatalogSet;
+use embsim_models::machine::{
+    end_switch, quadrature_encoder, stepper_motor, ActuationSense, EndSwitch, QuadratureEncoder,
+    StepperMotor,
+};
+
+/// One bench component kind, `my-axis`.
+struct MyPlants;
+
+impl Catalog for MyPlants {
+    fn name(&self) -> &str {
+        "my-catalog"
+    }
+
+    fn component_kinds(&self) -> Vec<KindInfo> {
+        vec![KindInfo::new("my-axis", "a drive, its encoder and an end switch on one carriage")
+            .requires("steps_per_mm", "8192.0", "drive steps, and encoder counts, per millimetre")
+            .requires("travel_mm", "100.0", "where the end switch closes")]
+    }
+
+    fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
+        let context = request.context();
+        let fail = |err: &dyn std::fmt::Display| ProjectError::message(format!("{context}: {err}"));
+        let mut options = request.options;
+        let per_mm = options.number("steps_per_mm")?.ok_or_else(|| options.error("steps_per_mm"))?;
+        let travel = options.number("travel_mm")?.ok_or_else(|| options.error("travel_mm"))?;
+        options.finish()?;
+
+        // The members: embsim's models, each a component of its own.
+        let drive = StepperMotor::new(stepper_motor::Config::new(per_mm)).map_err(|e| fail(&e))?;
+        let encoder = QuadratureEncoder::new(quadrature_encoder::Config::new(per_mm))
+            .map_err(|e| fail(&e))?;
+        let end = EndSwitch::new(end_switch::Config::new(travel, ActuationSense::Increasing))
+            .map_err(|e| fail(&e))?;
+
+        // The links: the carriage turns the encoder and reaches the switch.
+        let (count, reach) = (encoder.input(), end.actuator());
+        drive.shaft().on_position_change(move |mm| {
+            count.set_position_mm(mm);
+            reach.set_position_mm(mm);
+        });
+
+        // One component: the members' pins renamed, two returns of its own.
+        let axis = Assembly::new()
+            .member("DRIVE", Box::new(drive), &[("STEP", "STEP"), ("DIR", "DIR"), ("ENA", "ENA")])
+            .and_then(|a| a.member("ENCODER", Box::new(encoder), &[("A", "ENC_A"), ("B", "ENC_B")]))
+            .and_then(|a| a.member("END", Box::new(end), &[("COM", "END_COM"), ("NO", "END_NO")]))
+            .and_then(|a| a.reference("DRIVE_GND", &["STEP", "DIR", "ENA"]))
+            .and_then(|a| a.reference("ENC_GND", &["ENC_A", "ENC_B"]))
+            .map_err(|e| fail(&e))?;
+        Ok(Box::new(axis))
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut set = CatalogSet::new();
+    set.add(MyPlants)?;
+    let project = Project::parse(
+        r#"
+        [[component]]
+        name = "AXIS"
+        kind = "my-axis"
+        [component.options]
+        steps_per_mm = 8192.0
+        travel_mm = 100.0
+
+        [[wire]]
+        from = "BENCH.GND"
+        to = "AXIS.DRIVE_GND"
+        volts = 0.0
+        "#,
+    )?;
+    // Built as `embsim check` builds it: nothing runs.
+    let built = project.instantiate(&set)?.build()?;
+    // One component, its pins the members' as renamed and its returns.
+    for pin in ["STEP", "DIR", "ENA", "ENC_A", "ENC_B", "END_COM", "END_NO", "DRIVE_GND", "ENC_GND"] {
+        assert!(built.net_id(&format!("AXIS.{pin}")).is_some(), "AXIS.{pin}");
+    }
+    Ok(())
+}
+```
+
+`cli/tests/assembly.rs` checks and runs a project whose kind is built the
+same way, through the command's library: six steps from a
+`scripted-source` leave its encoder at six counts.
+
+##### MaD's plant
+
+MaD's machine (`mad-machine`, [`MIGRATING-MAD.md`](MIGRATING-MAD.md) §3)
+is the plant the `Assembly` is for. `mad-emulator` builds it today as
+four components and a closure (`BenchMachine::build`,
+`MaDSim/src/iss_description.rs`): embsim's drive, encoder and two end
+switches, the drive's shaft moving the other three, each wired to bare
+processor pins, and the gantry, the sample and the strain gauge chained by
+more closures in `run_iss` (`MaDSim/src/main.rs`). As a kind, the same
+parts and the same closures are one component:
+
+| Member | What it is | Its pins, as the machine's |
+|---|---|---|
+| `DRIVE` | `StepperMotor`, 8192 steps a millimetre, `DIR` low forward, enable active low, no load loss (`BenchMachine::build`'s conventions) | `STEP`, `DIR`, `ENA`, measured against `DRIVE_GND`, a return the assembly declares |
+| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, with its index and its complements (`Config::with_complements`): each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-`, against `ENC_GND`, another. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high (`board/tests/edge_encoder_pairs.rs`) |
+| `UPPER`, `LOWER` | `EndSwitch`, closing at 100 mm (`TRAVEL_MM`) and at 0 mm | each contact's `COM` and `NO`: `NO` is the loop's `+` to the carrier, and the machine's loop supply reaches `COM` (`MIGRATING-MAD.md` §6, "The loop supply") |
+| `LOAD_CELL` | MaD's own: `LoadCellBridge` and `BridgeDrive` (`MaDSim/src/system_description.rs`) | `E+`, `E-` sensed, `S+`, `S-` driven |
+
+The gantry, the sample and the strain gauge have no pins: they are the
+link from the shaft to the load cell, MaD's code moved into the kind
+beside the others. In the kind's constructor (MaD's to write; the names
+are its):
+
+```rust,ignore
+fn machine(sample: Sample) -> Result<Assembly, AssemblyError> {
+    let (drive, encoder, upper, lower) = bench_machine_parts()?; // BenchMachine::build's four
+    let load_cell = LoadCell::new(STRAIN_GAUGE);                  // MaD's own member
+    let (count, up, down, cell) =
+        (encoder.input(), upper.actuator(), lower.actuator(), load_cell.input());
+    let gantry = Gantry::new(GANTRY_SLACK_MM);
+    drive.shaft().on_position_change(move |mm| {
+        count.set_position_mm(mm);
+        up.set_position_mm(mm);
+        down.set_position_mm(mm);
+        cell.set_force_n(sample.force_n(gantry.extension_mm(mm)));
+    });
+    Assembly::new()
+        .member("DRIVE", Box::new(drive), &[("STEP", "STEP"), ("DIR", "DIR"), ("ENA", "ENA")])?
+        .member("ENCODER", Box::new(encoder), &[
+            ("A", "ENC_A+"), ("A-", "ENC_A-"),
+            ("B", "ENC_B+"), ("B-", "ENC_B-"),
+            ("Z", "ENC_Z+"), ("Z-", "ENC_Z-"),
+        ])?
+        .member("UPPER", Box::new(upper), &[("COM", "UPPER_COM"), ("NO", "UPPER+")])?
+        .member("LOWER", Box::new(lower), &[("COM", "LOWER_COM"), ("NO", "LOWER+")])?
+        .member("LOAD_CELL", Box::new(load_cell), &[("E+", "E+"), ("E-", "E-"), ("S+", "S+"), ("S-", "S-")])?
+        .reference("DRIVE_GND", &["STEP", "DIR", "ENA"])?
+        .reference("ENC_GND", &["ENC_A+", "ENC_A-", "ENC_B+", "ENC_B-", "ENC_Z+", "ENC_Z-"])
+}
+```
+
+The engine sees one node with the machine's pins; the shaft, the
+carriage and the sample are inside it, and no net carries them. Its
+report (`CarriageTravel` today) is the kind's, added to `request.reports`.
+The door and the emergency stops are contacts no carriage moves, members
+the same way, and the drive's ready output waits on MaD's answer
+(`MIGRATING-MAD.md` §6).
 
 ### What a run prints about what a catalog built
 
@@ -2256,7 +2459,7 @@ result can be traced to what produced it (`DESIGN.md` rule 9):
 ```text
 project project.toml
   catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
-  embsim 0.2.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
+  embsim 0.3.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate custom-project-catalog 0.1.0: /home/me/embsim/examples/custom-project/catalog, git rev 4f0c2a1b3d5e
 ```
@@ -2292,11 +2495,12 @@ submodule; and one file, `SIL/mad.toml`:
 | `mad-edge` | board | the MaD Edge carrier, from its KiCad export; its module socket `J3` a `boundary` |
 | `mad-ds2` | board | the DS2 force-gauge add-on, from its KiCad export; its converter `U1` an `ads122u04` |
 | `mad-p2iss` | P2 core | MaD's instruction-set simulator, `p2iss::P2Iss`, once it implements `P2Core`, booting the ROM off the module's flash |
-| `mad-machine` | bench component | the machine: servo drive, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant |
+| `mad-machine` | bench component | the machine: servo drive, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant: an `Assembly` ("MaD's plant", above) |
 
 [`MIGRATING-MAD.md`](MIGRATING-MAD.md) holds the file as it would read,
 the crate's contents, and the ordered changes on both sides, each with the
 files it touches and the test that says it is done. `NODES.md` §13 maps
 each of `mad-emulator`'s pieces to a kind, and lists what embsim owes
-first: the ADS122U04 applying the firmware's register writes, and the
-`Assembly`.
+first: the ADS122U04 applying the firmware's register writes (shipped:
+`ads122u04` converts as they set it up), and the `Assembly` (shipped:
+"A plant: an `Assembly`", above, with MaD's plant).

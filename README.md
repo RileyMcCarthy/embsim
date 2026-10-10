@@ -62,7 +62,7 @@ Debian 12), each with its SHA-256 beside it, and every one in
 `SHA256SUMS`:
 
 ```bash
-v=0.2.0 t=aarch64-apple-darwin
+v=0.3.0 t=aarch64-apple-darwin
 curl -fLO "https://github.com/RileyMcCarthy/embsim/releases/download/v$v/embsim-$v-$t.tar.gz"
 curl -fLO "https://github.com/RileyMcCarthy/embsim/releases/download/v$v/embsim-$v-$t.tar.gz.sha256"
 shasum -a 256 -c "embsim-$v-$t.tar.gz.sha256"           # or sha256sum -c
@@ -80,7 +80,7 @@ embsim` clears that (curl sets no quarantine).
 **From source, with Cargo** (Rust 1.88 or newer):
 
 ```bash
-cargo install --locked --git https://github.com/RileyMcCarthy/embsim --tag v0.2.0 embsim-cli
+cargo install --locked --git https://github.com/RileyMcCarthy/embsim --tag v0.3.0 embsim-cli
 ```
 
 or, in a checkout, `cargo install --locked --path cli`, or `cargo run -p
@@ -182,7 +182,7 @@ every pull request.
 | Protocols on wires | SPI on shared pins, UART as levels at real baud, step/dir as exact counts, RS-422 receivers, the ROM boot off the flash | I2C wired-AND with clock stretching and arbitration, the P2 pad reading the net in its pull modes (2, 6); CAN/USB only if a model is written | transaction-level bus models |
 | Timing | every edge at its own nanosecond; deterministic stepped clock; golden traces | RC delays as one pole with exact integer-ns crossings; rail soft-start instants; symmetric differential filters (5) | slew, setup/hold against slow edges, multi-pole transients, ringing |
 | Power | rails present or absent; enable trees as senses | rails as sources with soft-start and UVLO; supervisor with hysteresis; isolated domains; brown-out ordering (4) | regulator ripple, current limit, load transients |
-| Analog | ADS122U04 front end at settled values; force and encoder plants; input ports stamped on senses (the AM26LV32's open-input bias); a single source into an analog reader delivered unsolved | RC settling at conversion instants (5) | noise, amplifier loops, oscillator start-up |
+| Analog | ADS122U04 front end at settled values, its input, gain and reference the firmware's register writes; force and encoder plants; input ports stamped on senses (the AM26LV32's open-input bias); a single source into an analog reader delivered unsolved | RC settling at conversion instants (5) | noise, amplifier loops, oscillator start-up |
 | CPU | P2 on QEMU or p2core, instruction-accurate, verified against each other and silicon captures; hub-exec and cog-exec; HUBSET clock; inside the P2 package, any core — QEMU, an ISS, the native firmware — started 3 ms after `RESN` releases inside `VDD`'s window, its pads at their bank's supply and the `WRPIN` strengths (fast fitted to the datasheet), the crystal the rate on `XI`, a brownout without a reset reported and the core held | — (a `RESN` pulse after START re-running the boot is open: no core has the entry) | cycle-exact hub timing, interrupts until modelled |
 | Faults and what-ifs | shorts, detached pins, stuck nets, DNP, value overrides, jumper states | switch positions by name, declared leaks, capacitance on a harness (1, 5) | faults nobody injects; tolerances and corners |
 | Speed | 16 901 flash edges in 0.2 s; step trains as rates | a census and a solve benchmark as CI gates; nothing added to the fast path (0, 6) | a timestep, ever |
@@ -371,12 +371,16 @@ beside it. `check --rebuild` builds the runner afresh. `survey` and `new`
 take `--project FILE` to run in that project's runner, so the checklist
 offers the project's own kinds (`PROJECTS.md` section 10, "The runner").
 A project names the embsim release it is written for with
-`requires-embsim = "0.2"`, which every embsim reads first (`PROJECTS.md`
+`requires-embsim = "0.3"`, which every embsim reads first (`PROJECTS.md`
 section 2).
 
 The standard catalog's bench component kinds are `host-serial`, a host's
 serial port as a PTY on the host's own rail, and `scripted-source`, a pin
-driven through a list of steps (`PROJECTS.md` section 5).
+driven through a list of steps (`PROJECTS.md` section 5). A project's own
+bench kind may be a plant made of several models — a drive turning an
+encoder and reaching an end switch — as one component with electrical
+pins, an `embsim_board::Assembly` (`PROJECTS.md` section 10, "A plant: an
+`Assembly`").
 
 The `embsim` command's set adds one core for the `p2` kind to the standard
 catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its
@@ -394,7 +398,7 @@ saying how to install it. The boot as a project file is in
 ## Using embsim from another repository
 
 A project with no kinds of its own needs only the `embsim` tool
-([Install](#install)), and `requires-embsim = "0.2"` in its file to say
+([Install](#install)), and `requires-embsim = "0.3"` in its file to say
 which release it is written for (`embsim new` writes it).
 
 A project with a catalog crate names embsim in that crate's `Cargo.toml`,
@@ -406,9 +410,9 @@ release:
 ```toml
 # sim/catalog/Cargo.toml
 [dependencies]
-embsim-board  = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }
-embsim-boards = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }
-embsim-core   = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.2.0", version = "0.2" }   # the virtual clock
+embsim-board  = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.3.0", version = "0.3" }
+embsim-boards = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.3.0", version = "0.3" }
+embsim-core   = { git = "https://github.com/RileyMcCarthy/embsim", tag = "v0.3.0", version = "0.3" }   # the virtual clock
 ```
 
 or as a **git submodule**, by path, so the catalog crate and the tool come
@@ -417,7 +421,7 @@ from one pinned commit (a Cargo workspace around it `exclude`s
 
 ```bash
 git submodule add https://github.com/RileyMcCarthy/embsim.git vendor/embsim
-git -C vendor/embsim checkout v0.2.0
+git -C vendor/embsim checkout v0.3.0
 cargo run --release --manifest-path vendor/embsim/Cargo.toml -p embsim-cli -- check sim.toml
 ```
 
@@ -434,7 +438,7 @@ own checkout sits inside the project's repository, else the repository at
 the tool's revision when a remote holds it — a tool built from a commit
 never pushed, or with uncommitted changes, writes its checkout's path and
 says why — or what `--embsim PATH|URL@REF` names
-(`--embsim https://github.com/RileyMcCarthy/embsim@v0.2.0`). A build that
+(`--embsim https://github.com/RileyMcCarthy/embsim@v0.3.0`). A build that
 cannot fetch embsim from where the crates say is reported as that, with
 where to point them. Every catalog crate names the same embsim: the tool
 refuses another before it builds, and Cargo refuses a second copy anywhere

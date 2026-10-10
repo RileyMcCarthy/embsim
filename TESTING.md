@@ -23,6 +23,12 @@ cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 # its own binary; live reads at a settled instant, rule 9).
 cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_determinism
 
+# The MaD machine's three boards as a project with an encoder on the
+# carrier's J20 (stepped, own binary; every read after a virtual settle,
+# rule 9): the encoder's pairs counted at P9/P10/P11 through U25, and a
+# single-ended encoder on the + legs reading the receiver's fail-safe high.
+cargo test -p embsim-board --test edge_encoder_pairs
+
 # The isolation parts, promoted from stubs on the real EdgeBoard netlist
 # (stepped, own binary; every read after a 1 ms virtual settle, rule 9):
 # levels and a rate-carried step train crossing the barrier, the fail-safe
@@ -30,6 +36,17 @@ cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_dete
 # prints the measured engine-event cost of a step train at two rates a
 # hundredfold apart.
 cargo test -p embsim-board --test isolation_bridge -- --nocapture
+
+# The Assembly, a plant as one component (NODES.md §16; stepped, own
+# binary; every read after a virtual settle, rule 9): a drive and an
+# encoder as one bench component, a rate-carried step train in and the
+# encoder's edges out to a board's inverters, the drive's inputs read
+# against the return the assembly declares, the engine's events for the
+# train the same as for the two components apart (`--nocapture` prints
+# them), and members woken at their own instants in the order added. The
+# command checks and runs a project naming a catalog's assembly kind.
+cargo test -p embsim-board --test assembly -- --nocapture
+cargo test -p embsim-cli --test assembly
 
 # Re-bless the golden traces after an INTENDED engine/model behavior change.
 # Review the diff: it is the wire behavior of the system.
@@ -448,8 +465,12 @@ cargo llvm-cov --workspace --summary-only
    or a fresh `now = 0`) must serialize every case behind one suite mutex
    (`determinism.rs` and `stepped_clock.rs` both do). Re-`init` with a live
    actor is allowed — the actor stays registered — so a binary whose cases
-   spawn long-lived actor threads (the ADS122U04 model does) still belongs in
-   its own test binary so leftover actors cannot hold a later case's barrier.
+   spawn long-lived actor threads still belongs in its own test binary so
+   leftover actors cannot hold a later case's barrier. The ADS122U04 model's
+   protocol thread is an actor only while its part lives: it ends when the
+   system drops the part, so a binary of several converter cases waits after
+   each shutdown for the actor count to fall back before the next case
+   re-anchors the clock (`board/tests/ads122u04_registers.rs`).
 
 6. **Property tests (`proptest`)** only for continuous domains (e.g. analog
    resistor ladders). Use fixed seeds when non-determinism would flake CI.

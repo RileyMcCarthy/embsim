@@ -4,6 +4,93 @@ What each release of embsim changes for someone using it. Releases are
 git tags, `vX.Y.Z`; while embsim is 0.x, a minor release may break what
 the one before it promised, and says so here under **Breaking**.
 
+## [Unreleased]
+
+## [0.3.0] - 2026-10-09
+
+What a project like MaD needs from embsim to move onto a project file,
+beyond 0.2.0: the Edge carrier's RS-422 parts in the standard catalog, an
+ADS122U04 the firmware configures over its own pins, a plant of several
+models as one component, and an encoder that presents RS-422 pairs.
+[`MIGRATING-MAD.md`](MIGRATING-MAD.md) §2 lists what is still owed; the
+host the board's clock meters is one, and `NODES.md` §18 records why it
+will be the host's Chrome metered over DevTools, not a VM.
+
+### Breaking
+
+- **`ads122u04::Config` has no gain or reference.** The converter takes
+  both from its registers (below), so `vref_mv` and `gain` are gone;
+  `zero_offset` stays, and `Config::default()` replaces
+  `Config::at_reset()`. `Ads122u04::sense(pin, volts)`, each analog pin
+  against `AVSS`, replaces `set_voltage(mv)`; `INTERNAL_VREF_VOLTS`
+  replaces `INTERNAL_VREF_MV`, and `RESET_GAIN` is gone (a gain is the
+  register's).
+- `machine::quadrature_encoder::Config` has a `complements` field (below):
+  a struct literal names it, or ends `..Config::new(counts_per_mm)`.
+- `Finding` has a new variant, `PinAboveRecommended` (below): an
+  exhaustive `match` over it needs an arm for it.
+
+### Added
+
+- **`embsim_board::Assembly`: a plant as one component** (`NODES.md`
+  §16). A bench component kind can return several components — embsim's
+  models and a project's own — as one: `Assembly::member` renames each
+  member's pins onto the assembly's, declarations kept;
+  `Assembly::reference` measures pins against a return the assembly
+  declares (a drive's `DRIVE_GND`, an encoder's `ENC_GND`); the members'
+  wakes go through the assembly, each member woken at its own instants in
+  the order added; and the links between members (a shaft turning an
+  encoder, a carriage reaching a switch) are closures between their
+  handles, run on the engine's thread inside the member that emits. The
+  engine sees one node and records the same events as for the members
+  apart. `PROJECTS.md` §10, "A plant: an `Assembly`", has the guide, with
+  MaD's machine as the example.
+- **`QuadratureEncoder` as an RS-422 encoder**
+  (`quadrature_encoder::Config::with_complements`, `NODES.md` §17): `A-`,
+  `B-` and, with an index, `Z-`, each driven to the inverse of its leg in
+  the same publish, the pairs a differential receiver such as the Edge
+  board's `U25` reads. `Config` has a `complements` field, `false` by
+  default.
+- **The Edge carrier's RS-422 pair in the standard catalog.** `am26ls31`,
+  the AM26LS31 line driver (TI SLLS114N; the carrier's `U24`, placed by
+  `AM26LS31CD`, `CDR`, `CDBR`, `CN` and `CNSR`), and `am26lv32`, the
+  AM26LV32 line receiver (TI SLLS202H; the carrier's `U25`, placed by
+  `AM26LV32IDR`, `IDRG4` and `INSR` and the obsolete `CD` and `ID`), each
+  with its numbered pin table and its outputs driven from its own `VCC`.
+  `boards/projects/edge-ec32-ds2.toml` builds with the standard catalog
+  alone.
+- **A pin's operating limits.** `PinDecl::with_limits(PinLimits {
+  recommended, absolute_max, note })` declares a pin's range against its
+  declared reference; the engine checks it against the solved net when the
+  system is built and after every pass that moves the pin's net or its
+  reference, and raises `Finding::PinAboveRecommended` once per excursion.
+  The `am26lv32` declares `VCC` 3.0–3.6 V recommended, 6 V absolute.
+- **Findings in plain words.** `Finding` implements `Display`: one line
+  naming the net, the pins as `Reference.Pin` or the part, and what is
+  wrong. `check` and `run` print it in place of the Rust form.
+
+### Changed
+
+- **The `ads122u04` kind converts as its register writes set it up**
+  (`NODES.md` §15). Every conversion reads the register file the host
+  writes over the part's own serial pins: the input multiplexer, the gain
+  (the PGA's bypass included, which leaves every gain as it is and limits
+  a pin read against `AVSS` to 4), and the reference — the internal
+  2.048 V, `REFP − REFN`, or the analog supply as the part's pins sense it;
+  the two system monitors convert at gain 1 against the internal reference
+  whatever the gain and reference bits say (SBAS752B §8.3.9).
+  A part held in reset or without both supplies goes back to its defaults,
+  gain 1 against 2.048 V, as the RESET command already did; single-shot
+  mode sends one conversion per START. MaD's firmware start-up, sent to the
+  DS2 add-on's project, reads the force path's code at gain 128 against the
+  3.3 V analog supply. The model's protocol thread ends when its part is
+  dropped.
+- `embsim check` names the pin table that fits a board's parts, as
+  `survey` does: per group of parts placed with a table the netlist does
+  not use, the `options.pins` table that declares the netlist's pins, or
+  that no table of the model does (`fitting_option_table`,
+  `BoardSurvey::pin_table_groups`, `PinTableGroup`).
+
 ## [0.2.0]
 
 embsim is now a board simulator you use as a tool. 0.1.0 linked a
@@ -201,5 +288,6 @@ project's firmware C against Rust implementations of its HAL, with
 emulated peripherals, device models and a virtual clock, extracted from
 the MaD tensile tester.
 
+[0.3.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/RileyMcCarthy/embsim/releases/tag/v0.1.0

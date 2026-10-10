@@ -1888,6 +1888,27 @@ impl ComponentNetIo {
         self
     }
 
+    /// The handle table a node this one hosts **behind its own pins** is
+    /// handed: `entries` key each of the hosted node's identities to one of
+    /// this table's handles, and its wakes go to `gate`; the engine link,
+    /// the component it reaches the engine as and the build topology are
+    /// this table's. What an [`crate::Assembly`] hands each of its members,
+    /// so a member's drives, senses and wakes are the assembly's, under the
+    /// names the member declared.
+    pub(crate) fn for_member(
+        &self,
+        entries: impl IntoIterator<Item = (String, PinHandle)>,
+        gate: Arc<dyn WakeGate>,
+    ) -> Self {
+        Self {
+            pins: entries.into_iter().collect(),
+            component: self.component,
+            link: self.link.clone(),
+            topology: self.topology.clone(),
+            wake_gate: Some(GatedWakes(gate)),
+        }
+    }
+
     /// The same handle table with the build-time topology behind it
     /// (system-build internal use).
     pub(crate) fn with_topology(mut self, topology: Arc<BuildTopology>) -> Self {

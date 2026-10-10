@@ -692,11 +692,7 @@ pub fn ds2_board() -> Board {
     let mut registry = PartRegistry::new();
     registry.register("ADS122U04", |_decl| {
         Box::new(embsim_models::ads122u04_component::Ads122u04Component::new(
-            Config {
-                vref_mv: 2_048.0,
-                gain: 1.0,
-                zero_offset: 0,
-            },
+            Config::default(),
         ))
     });
     let parsed = embsim_board::netlist::parse(include_str!("../fixtures/ds2_addon.net"))
