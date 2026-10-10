@@ -30,7 +30,7 @@ the one before it promised, and says so here under **Breaking**.
   the run saying which. Options: `baud`, `quantum`, `max_lead`,
   `stuck_after`, `chrome`, `devtools_port`, `headless`, `attach`, `url`,
   `usb_vendor_id`, `usb_product_id`, `granted` ([`PROJECTS.md`](PROJECTS.md)
-  §5, [`NODES.md`](NODES.md) §15). `examples/chrome-ping` is a project with
+  §5, [`NODES.md`](NODES.md) §19). `examples/chrome-ping` is a project with
   one, and a Playwright harness for it.
 - `embsim_board::HostRailLine` and `HOST_RAIL_PINS`: a host's serial line at
   its own rail, the one `host-serial` attaches, for any bench host whose
@@ -42,7 +42,7 @@ the one before it promised, and says so here under **Breaking**.
 
 - **A project's committed `embsim.lock` is stale until refreshed.** Every
   runner now links `embsim-cdp`, and with it `tungstenite`'s dependency
-  tree, so a runner's `--locked` build against a lock written by 0.2.0
+  tree, so a runner's `--locked` build against a lock written by 0.3.0
   fails, and the tool says to remove the file and run again; the new
   `embsim.lock` it writes is the one to commit ([`PROJECTS.md`](PROJECTS.md)
   §10, "Its lock file is the project's"). `examples/custom-project`'s is

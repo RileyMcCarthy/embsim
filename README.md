@@ -387,11 +387,11 @@ Chrome on the same four pins as `host-serial`: its pages' Web Serial is the
 line, and every page's clock and every dedicated worker's advances only with
 the board's, a millisecond at a time over DevTools, so a web app's timeouts
 hold in board time against a board far slower than real time (`PROJECTS.md`
-section 5, `NODES.md` §15).
-The port is the page's main thread's: an app opens it there and transfers
-its streams to a worker, whose own `navigator.serial` is Chrome's. The line
-has no modem-control pins. [`examples/chrome-ping`](examples/chrome-ping)
-is a project with one, and a Playwright harness that drives it.
+section 5, `NODES.md` §19). The port is the page's main thread's: an app
+opens it there and transfers its streams to a worker, whose own
+`navigator.serial` is Chrome's. The line has no modem-control pins.
+[`examples/chrome-ping`](examples/chrome-ping) is a project with one, and a
+Playwright harness that drives it.
 
 The `embsim` command's set adds one core for the `p2` kind to the standard
 catalog's: `core = "qemu"` seats the QEMU P2 in the package, which boots its

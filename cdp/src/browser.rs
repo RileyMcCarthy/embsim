@@ -20,13 +20,13 @@ const PROBE: &str = include_str!("probe.js");
 
 /// A worker's budget: so long it never expires in a run. A worker given
 /// `advance` with no budget, or with `pauseIfNetworkFetchesPending`, froze
-/// the shared clock in some boots (`NODES.md` §15, evidence E4).
+/// the shared clock in some boots (`NODES.md` §19, evidence E4).
 const WORKER_BUDGET_MS: f64 = 1e9;
 
 /// How often, and how far apart, the probe is tried in a worker whose
 /// global scope is not ready yet: up to [`PROBE_BEFORE_RELEASE`] times
 /// before the worker is released, then up to [`PROBE_TRIES`] more after
-/// (`NODES.md` §15, evidence E4: every 2 ms took within 4 tries).
+/// (`NODES.md` §19, evidence E4: every 2 ms took within 4 tries).
 const PROBE_BEFORE_RELEASE: u32 = 8;
 const PROBE_TRIES: u32 = 200;
 const PROBE_RETRY: Duration = Duration::from_millis(2);
@@ -41,7 +41,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// last slice, every [`POKE_EVERY`] for any other. Chrome holds back what a
 /// hidden page (a background tab) says over DevTools — an expiry, an
 /// evaluate's answer — until something else reaches the page, sometimes for
-/// good; a visible page's comes within 5 ms of host time (`NODES.md` §15,
+/// good; a visible page's comes within 5 ms of host time (`NODES.md` §19,
 /// evidence E11).
 const POKE_EVERY: Duration = Duration::from_millis(20);
 const POKE_HIDDEN: Duration = Duration::from_millis(2);

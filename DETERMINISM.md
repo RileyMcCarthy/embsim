@@ -1010,7 +1010,7 @@ force path + gantry):
 
 ### The host's Chrome, metered (`chrome-cdp`)
 
-A run with a `chrome-cdp` component (`PROJECTS.md` §5, `NODES.md` §15) is
+A run with a `chrome-cdp` component (`PROJECTS.md` §5, `NODES.md` §19) is
 **T1-with-host-io**, as a run with a host PTY is. The node acts only at the
 board's instants — a slice at every multiple of the quantum after the
 start, every byte the page wrote entering the line at one, every byte the
@@ -1018,7 +1018,7 @@ board sent handed over at one — but which slice a page's byte reaches the
 node in is Chrome's: its threads' scheduling decides some of it. So a run
 is reproducible in what the page sent and, to within a slice, when; three
 identical runs of the shipped MaD app put the board's first request at
-board 13, 11 and 12 ms (`NODES.md` §15, evidence E14). Absolute clock values differ from run
+board 13, 11 and 12 ms (`NODES.md` §19, evidence E14). Absolute clock values differ from run
 to run (the page's first script runs a variable time after its navigation
 starts); durations do not.
 

@@ -358,7 +358,7 @@ jobs:
         run: cargo test -p embsim-cli --test cli -- --include-ignored --nocapture
 
   # The host's Chrome metered by the board's clock (embsim-cdp, NODES.md
-  # §15): the node against the runner's own google-chrome, headless, its
+  # §19): the node against the runner's own google-chrome, headless, its
   # pages (cdp/tests/pages) served by the test. The cases are #[ignore]d in
   # the test job, so this is the one job that launches Chrome for them: the
   # worker canary (a dedicated worker's 4 ms timer ticks 100 times in 400

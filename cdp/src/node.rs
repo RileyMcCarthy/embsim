@@ -26,7 +26,7 @@ use crate::devtools::CdpError;
 /// it, and the most the two clocks are apart, so shorter is better until a
 /// slice's round trips dominate. A grant and the clock read cost about
 /// 0.72 ms of host time a slice (median) and 1.1 ms (90th percentile) with
-/// the shipped MaD app on an Apple M2 (`NODES.md` §15, evidence E1). One
+/// the shipped MaD app on an Apple M2 (`NODES.md` §19, evidence E1). One
 /// millisecond is the USB full-speed frame period, the latency a USB serial
 /// adapter has anyway.
 pub const DEFAULT_QUANTUM: Duration = Duration::from_millis(1);
@@ -39,7 +39,7 @@ pub const MAX_QUANTUM: Duration = Duration::from_secs(1);
 /// How long one grant may hold before the run fails as stuck, by default.
 /// Chrome holds a `pauseIfNetworkFetchesPending` budget while a fetch is in
 /// flight and while a task runs (a 1.5 s fetch held a 1 ms grant for 1.5 s,
-/// `NODES.md` §15, evidence E6), so the bound is seconds, not a quantum.
+/// `NODES.md` §19, evidence E6), so the bound is seconds, not a quantum.
 pub const DEFAULT_STUCK_AFTER: Duration = Duration::from_secs(30);
 
 /// How long the drain barrier waits for a worker that owns the port's
@@ -285,7 +285,7 @@ impl NodeStats {
         lived_ns,
         /// The furthest a page's clock has been ahead of the board's at a
         /// slice, in nanoseconds. Chrome moves a page's clock outside a
-        /// budget at a worker's birth and at storage calls (`NODES.md` §15,
+        /// budget at a worker's birth and at storage calls (`NODES.md` §19,
         /// evidence E5); the node pays a lead back by skipping grants.
         peak_lead_ns,
         /// The most a page's clock passed its budget in one slice, in
