@@ -104,6 +104,49 @@ impl Heard {
 /// Each launch's profile gets a number of its own within the process.
 static PROFILES: AtomicU64 = AtomicU64::new(0);
 
+/// The renderer prefix, on Linux. Other platforms start renderers as Chrome does.
+fn renderer_prefix_arg(profile: &Path) -> io::Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    let prefix = Some(renderer_crashpad_switch(profile)?);
+    #[cfg(not(target_os = "linux"))]
+    let prefix = {
+        let _ = profile;
+        None
+    };
+    Ok(prefix)
+}
+
+/// `--renderer-cmd-prefix` naming a script in `profile`.
+///
+/// The script execs the real Chrome binary with `--disable-crashpad-for-testing`.
+/// A non-empty prefix makes Chrome pass `--no-zygote` to the renderer, and that
+/// startup path skips Crashpad when the switch is present, so `Page.crash`
+/// ends the process and Chrome reports `Target.targetCrashed`. The browser
+/// process must not receive the switch: it starts the crash handler, and a
+/// zygote-forked child that finds no handler descriptor aborts at startup.
+#[cfg(any(target_os = "linux", test))]
+fn renderer_crashpad_switch(profile: &Path) -> io::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = profile.join("renderer-crashpad.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nbin=$1\nshift\nexec \"$bin\" --disable-crashpad-for-testing \"$@\"\n",
+    )?;
+    let mut permissions = std::fs::metadata(&script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions)?;
+    let path = script.display().to_string();
+    if path.contains(['\'', '"', '\n', '\r']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Chrome's renderer prefix cannot quote this profile path: {path}"),
+        ));
+    }
+    // `CommandLine::PrependWrapper` splits this value on spaces and keeps quotes.
+    Ok(format!("--renderer-cmd-prefix='{path}'"))
+}
+
 impl ChromeProcess {
     /// Start Chrome as `spec` says, on `about:blank`, in a fresh profile.
     ///
@@ -149,6 +192,17 @@ impl ChromeProcess {
             ]);
         if spec.headless {
             command.arg("--headless=new");
+        }
+        // Linux renderers skip Crashpad. See `renderer_crashpad_switch`.
+        let prefix = match renderer_prefix_arg(&profile) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&profile);
+                return Err(error);
+            }
+        };
+        if let Some(prefix) = prefix {
+            command.arg(prefix);
         }
         command
             .arg("about:blank")
@@ -385,6 +439,8 @@ impl Drop for ChromeProcess {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use rstest::rstest;
     use vibes_behaviour::{behaviour, expect, Test};
@@ -480,6 +536,46 @@ mod tests {
                 "name another devtools_port, or leave it out and Chrome picks a free one"
             ),
             "names-the-way-out: {message}"
+        );
+    }
+
+    #[test]
+    fn a_linux_launch_starts_each_renderer_with_crash_reporting_off() {
+        behaviour!(Test {
+            id: "chrome-cdp.linux-renderer-prefix",
+            covers: Some("cdp/src/chrome.rs#renderer_crashpad_switch"),
+            given: "Chrome is launched on Linux",
+        });
+        expect!(
+            "renderer-skips-crash-reporting",
+            "each renderer is started by a prefix that runs the real Chrome binary with crash \
+             reporting left off in that process"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "embsim-cdp-prefix-{}-{}",
+            std::process::id(),
+            PROFILES.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("the profile directory");
+        let switch = renderer_crashpad_switch(&dir).expect("the prefix script");
+        let script = dir.join("renderer-crashpad.sh");
+        let body = std::fs::read_to_string(&script).expect("the script");
+        let executable = std::fs::metadata(&script)
+            .expect("the script metadata")
+            .permissions()
+            .mode()
+            & 0o111;
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = script.display().to_string();
+        assert_eq!(
+            body, "#!/bin/sh\nbin=$1\nshift\nexec \"$bin\" --disable-crashpad-for-testing \"$@\"\n",
+            "renderer-skips-crash-reporting"
+        );
+        assert_eq!(executable, 0o111, "renderer-skips-crash-reporting");
+        assert_eq!(
+            switch,
+            format!("--renderer-cmd-prefix='{path}'"),
+            "renderer-skips-crash-reporting"
         );
     }
 }
