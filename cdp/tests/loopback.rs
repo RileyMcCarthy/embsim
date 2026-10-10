@@ -108,7 +108,8 @@ struct Script {
     /// From this grant on, budgets never expire.
     stuck_from: Option<usize>,
     /// An open fetch holds every `pauseIfNetworkFetchesPending` budget.
-    /// A later `pause` budget expires, and the fetch is then done.
+    /// A later `advance` budget expires, and the fetch is then done.
+    /// A `pause` budget does not: Chrome refuses a budget on `pause`.
     hold_fetches: bool,
     /// A dedicated worker owns the port's stream (it was transferred) and
     /// acknowledges each delivery after this delay of host time (`None`: it
@@ -296,7 +297,7 @@ struct FakeBrowser {
     next_id: u64,
     pending: HashMap<u64, Act>,
     worker_reads: u64,
-    /// A `pause` budget has ended the held fetch.
+    /// An `advance` budget has ended the held fetch.
     fetch_released: bool,
 }
 
@@ -500,7 +501,7 @@ impl FakeBrowser {
     fn grant(&mut self, page: &str, m: &Value, budget: f64) {
         let policy = m["params"]["policy"].as_str().unwrap_or("").to_string();
         self.seen.lock().unwrap().policies.push(policy.clone());
-        if policy == "pause" {
+        if policy == "advance" {
             self.fetch_released = true;
         }
         let n = {
@@ -518,7 +519,7 @@ impl FakeBrowser {
         let (stuck, at) = {
             let script = self.script.lock().unwrap();
             let first = page == PAGE;
-            let held = script.hold_fetches && !self.fetch_released && policy != "pause";
+            let held = script.hold_fetches && !self.fetch_released && policy != "advance";
             (
                 first && (held || script.stuck_from.is_some_and(|from| n >= from)),
                 if first { script.at(n) } else { None },
@@ -1180,9 +1181,9 @@ fn a_fetch_that_holds_a_budget_lets_that_budget_end() {
         "the held budget ends and the page is granted again"
     );
     expect!(
-        "pause-policy",
-        "the held budget is granted again under the policy that lets it end while the fetch \
-         is still open"
+        "advances-while-open",
+        "the held budget is granted again under the advance policy, so virtual time moves \
+         while the fetch stays open"
     );
 
     let _suite = suite_lock();
@@ -1199,8 +1200,8 @@ fn a_fetch_that_holds_a_budget_lets_that_budget_end() {
     assert!(stats.slices() >= 8, "budget-ends: {stats:?}");
     let policies = fake.seen().policies.clone();
     assert!(
-        policies.iter().any(|policy| policy == "pause"),
-        "pause-policy: {policies:?}"
+        policies.iter().any(|policy| policy == "advance"),
+        "advances-while-open: {policies:?}"
     );
 }
 

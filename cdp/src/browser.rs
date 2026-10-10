@@ -47,10 +47,12 @@ const POKE_EVERY: Duration = Duration::from_millis(20);
 const POKE_HIDDEN: Duration = Duration::from_millis(2);
 
 /// How long `pauseIfNetworkFetchesPending` may hold a budget before the
-/// node grants that same budget under `pause`. A fetch whose body is read
-/// on the renderer's clock never finishes while the first policy holds the
-/// budget, so the grant would wait out `stuck_after`. `pause` lets the
-/// budget end; the read then runs, and the fetch can finish.
+/// node grants that same budget under `advance`. A fetch whose body is
+/// read on the renderer's clock stays open for as long as the first
+/// policy holds the budget, so the grant would wait out `stuck_after`.
+/// `advance` moves virtual time while the fetch is still open; the read
+/// then runs, and the fetch can finish. Chrome accepts a budget only on
+/// a policy other than `pause`.
 const FETCH_HOLD: Duration = Duration::from_secs(2);
 
 /// How the node reaches its browser.
@@ -699,7 +701,7 @@ impl Browser {
                     self.devtools.send_and_forget(
                         Some(session),
                         "Emulation.setVirtualTimePolicy",
-                        json!({ "policy": "pause", "budget": budget }),
+                        json!({ "policy": "advance", "budget": budget }),
                     )?;
                 }
                 released = true;
