@@ -1,0 +1,33 @@
+[package]
+name = "embsim-cdp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The host's Chrome on the board: its pages' Web Serial on a host's serial pins, every page's and worker's clock metered by the board's over the Chrome DevTools Protocol"
+keywords = ["embedded", "emulator", "simulation", "sil", "chrome"]
+categories = ["embedded", "simulation"]
+
+# The host's own Chrome, run as a program of its own (or one already running)
+# and driven over DevTools: nothing of Chrome is linked or carried, so the
+# crate is MIT alone.
+
+[dependencies]
+embsim-core = { path = "../core" }
+embsim-board = { path = "../board" }
+# The bench component kind joins a project's set (`catalog::register`).
+embsim-boards = { path = "../boards" }
+# kill(2) on the process group of a Chrome the node launched; waitid(2).
+libc.workspace = true
+# DevTools is JSON over a WebSocket.
+serde_json.workspace = true
+# The WebSocket, synchronous, client side, no TLS (DevTools is on loopback).
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+# The kind's true/false options, read as the project file wrote them.
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

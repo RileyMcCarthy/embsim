@@ -5,6 +5,7 @@ members = [
     "models",
     "boards",
     "p2-qemu",
+    "cdp",
     "tools/memory-inspect",
     "tools/ui",
     "tools/trace",
