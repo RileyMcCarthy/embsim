@@ -673,6 +673,65 @@ fn a_confirm_dialog_in_chrome_nobody_answers_stops_the_run_naming_it() {
 }
 
 // ============================================================
+// The DevTools port
+// ============================================================
+
+/// Given the node launching Chrome on a DevTools port the project names (a
+/// free one, as MaD's cosim files name 9222), where Chrome writes no
+/// DevToolsActivePort file to its profile:
+/// - the node reaches Chrome on that port: its DevTools endpoint is
+///   127.0.0.1 at the named port (`on-the-named-port`)
+/// - a harness attached there finds the page held from birth and metered,
+///   its 4 ms timer ticking 25 times in 100 ms of board time (`metered`)
+///
+/// Not a declared behaviour: the case is `#[ignore]`d where the ledger is
+/// collected (TESTING.md).
+#[test]
+#[ignore = "launches the host's Chrome; CI's chrome-cdp job runs it"]
+fn a_devtools_port_the_project_names_is_where_the_node_reaches_chrome() {
+    let _suite = suite_lock();
+    let server = Server::start(&pages());
+    let url = format!("{}ticks.html?main", server.url);
+    // Free now; the node checks it again just before it launches Chrome.
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let node = node_with(&url, 115_200, |s| {
+        if let Browse::Launch(spec) = &mut s.browse {
+            spec.port = port;
+        }
+    });
+    let stats = node.stats();
+    let (peer, _peer) = Peer::new(115_200, false);
+    let (system, actor) = bench(node, Box::new(peer));
+    let wall = Instant::now();
+    let mut page = page_up(&url, &stats);
+    eprintln!(
+        "named port {port}: the page up {:.2} s of host time after the bench started",
+        wall.elapsed().as_secs_f64()
+    );
+    assert_eq!(
+        stats.devtools_endpoint(),
+        Some(format!("http://127.0.0.1:{port}")),
+        "on-the-named-port"
+    );
+    assert_eq!(
+        page.eval("window.firstSawShim"),
+        Value::Bool(true),
+        "metered: the shim before the page's first script"
+    );
+    // The timer starts as the page loads; its first period can be short.
+    virtual_clock::wait_virtual_ns(20 * MS);
+    let from = page.eval("performance.now()").as_f64().unwrap();
+    virtual_clock::wait_virtual_ns(106 * MS);
+    let ticks = f64s(&page.eval("window.ticks"));
+    assert_eq!(ticks_in(&ticks, from, 100.0, 4.0), 25, "metered: {ticks:?}");
+    assert_eq!(stats.failure(), None);
+    finish(system, actor);
+}
+
+// ============================================================
 // The port
 // ============================================================
 

@@ -459,32 +459,12 @@ impl DevTools {
 /// (`http://127.0.0.1:9222`, or `127.0.0.1:9222`) at `/json/version`,
 /// retried until `timeout` while nothing answers there yet.
 pub fn browser_ws_url(endpoint: &str, timeout: Duration) -> io::Result<String> {
-    let host = endpoint
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_string();
+    let host = host_of(endpoint);
     let deadline = Instant::now() + timeout;
     let mut last: io::Error;
     loop {
         match get_json_version(&host) {
-            Ok(body) => {
-                let version: Value = serde_json::from_str(&body).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{endpoint}/json/version is not JSON ({e}): {body:.200}"),
-                    )
-                })?;
-                return version
-                    .get("webSocketDebuggerUrl")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("{endpoint}/json/version names no webSocketDebuggerUrl"),
-                        )
-                    });
-            }
+            Ok(body) => return ws_url_in(endpoint, &body),
             Err(e) => last = e,
         }
         if Instant::now() >= deadline {
@@ -498,6 +478,41 @@ pub fn browser_ws_url(endpoint: &str, timeout: Duration) -> io::Result<String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// [`browser_ws_url`] asked once: what `/json/version` at `endpoint` names,
+/// or why it named nothing.
+pub(crate) fn ask_browser_ws_url(endpoint: &str) -> io::Result<String> {
+    let body = get_json_version(&host_of(endpoint))?;
+    ws_url_in(endpoint, &body)
+}
+
+/// `HOST:PORT` of an `http://HOST:PORT` endpoint.
+fn host_of(endpoint: &str) -> String {
+    endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The `webSocketDebuggerUrl` a `/json/version` body names.
+fn ws_url_in(endpoint: &str, body: &str) -> io::Result<String> {
+    let version: Value = serde_json::from_str(body).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{endpoint}/json/version is not JSON ({e}): {body:.200}"),
+        )
+    })?;
+    version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{endpoint}/json/version names no webSocketDebuggerUrl"),
+            )
+        })
 }
 
 /// `GET /json/version` over a plain socket, the body returned.
