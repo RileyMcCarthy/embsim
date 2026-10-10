@@ -46,6 +46,13 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const POKE_EVERY: Duration = Duration::from_millis(20);
 const POKE_HIDDEN: Duration = Duration::from_millis(2);
 
+/// How long `pauseIfNetworkFetchesPending` may hold a budget before the
+/// node grants that same budget under `pause`. A fetch whose body is read
+/// on the renderer's clock never finishes while the first policy holds the
+/// budget, so the grant would wait out `stuck_after`. `pause` lets the
+/// budget end; the read then runs, and the fetch can finish.
+const FETCH_HOLD: Duration = Duration::from_secs(2);
+
 /// How the node reaches its browser.
 #[derive(Debug, Clone)]
 pub enum Browse {
@@ -653,12 +660,14 @@ impl Browser {
             sent.push((id, session.clone()));
         }
         let deadline = Instant::now() + stuck;
+        let release_at = Instant::now() + FETCH_HOLD;
         let interval = budgets
             .iter()
             .map(|(session, _)| self.poke_interval(session))
             .min()
             .unwrap_or(POKE_EVERY);
         let mut poke_at = Instant::now() + interval;
+        let mut released = false;
         loop {
             while let Some(event) = self.devtools.pop_event() {
                 self.handle(event)?;
@@ -684,6 +693,16 @@ impl Browser {
                     });
                 }
                 break;
+            }
+            if !released && now >= release_at && !pending.is_empty() {
+                for (session, budget) in &pending {
+                    self.devtools.send_and_forget(
+                        Some(session),
+                        "Emulation.setVirtualTimePolicy",
+                        json!({ "policy": "pause", "budget": budget }),
+                    )?;
+                }
+                released = true;
             }
             if now >= poke_at {
                 let sessions: Vec<String> = pending.iter().map(|(s, _)| s.clone()).collect();

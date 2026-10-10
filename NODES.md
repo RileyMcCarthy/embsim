@@ -972,6 +972,7 @@ The record this branch first wrote rejected CDP virtual time because "it covers 
 - *`getPorts()` returns the port only to an origin granted it*, as Chrome does in a fresh profile; the design's fake always returned it. `granted` is the scenario's policy line for a page with no harness to click.
 - *`stuck_after` is an option*, 30 s by default (E6). It bounds a page's side of a slice too: a page whose main thread does not return (a dialog, a loop waiting on its own clock) stops the run saying so.
 - *On Linux Chrome is started with `--no-sandbox`.* The renderer still starts from the zygote. With the sandbox on, Crashpad's dump of a crashed renderer can sit in `waitpid` inside that renderer's pid namespace, the process never exits, and the run waits out `stuck_after` on the grant. With the sandbox off the dump finishes and Chrome reports `Target.targetCrashed`. macOS reports the same crash with the sandbox on, and `--no-sandbox` is Linux only.
+- *A fetch that holds a budget for 2 s is granted that budget again under `pause`.* `pauseIfNetworkFetchesPending` does not end a budget while a fetch is open, and a fetch whose body is read on the renderer's clock then never finishes. `pause` ends the budget so that read runs. One millisecond of virtual time passes with the fetch still open; a budget that still does not end stops the run at `stuck_after`, as before.
 - *Books are per page and kept from grants* (E13); clocks are per renderer (E10), granted once.
 - *Hidden pages are poked* (E11).
 - *Options added*: `attach`, `url`, `stuck_after`, `granted`.

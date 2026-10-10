@@ -107,6 +107,9 @@ struct Script {
     at: Vec<(usize, At)>,
     /// From this grant on, budgets never expire.
     stuck_from: Option<usize>,
+    /// An open fetch holds every `pauseIfNetworkFetchesPending` budget.
+    /// A later `pause` budget expires, and the fetch is then done.
+    hold_fetches: bool,
     /// A dedicated worker owns the port's stream (it was transferred) and
     /// acknowledges each delivery after this delay of host time (`None`: it
     /// never does).
@@ -163,6 +166,8 @@ struct Seen {
     early: u64,
     /// Pokes: evaluates of no effect.
     pokes: u64,
+    /// Virtual-time policies the node sent, in order.
+    policies: Vec<String>,
     /// The navigation the node asked for.
     navigated: Option<String>,
     /// Messages for a page after it closed.
@@ -221,6 +226,7 @@ impl Fake {
                     next_id: 1,
                     pending: HashMap::new(),
                     worker_reads: 0,
+                    fetch_released: false,
                 };
                 fake.serve(&stop);
             })
@@ -290,6 +296,8 @@ struct FakeBrowser {
     next_id: u64,
     pending: HashMap<u64, Act>,
     worker_reads: u64,
+    /// A `pause` budget has ended the held fetch.
+    fetch_released: bool,
 }
 
 impl FakeBrowser {
@@ -490,6 +498,11 @@ impl FakeBrowser {
     }
 
     fn grant(&mut self, page: &str, m: &Value, budget: f64) {
+        let policy = m["params"]["policy"].as_str().unwrap_or("").to_string();
+        self.seen.lock().unwrap().policies.push(policy.clone());
+        if policy == "pause" {
+            self.fetch_released = true;
+        }
         let n = {
             let tab = self.tabs.get_mut(page).expect("a page");
             tab.grants += 1;
@@ -505,8 +518,9 @@ impl FakeBrowser {
         let (stuck, at) = {
             let script = self.script.lock().unwrap();
             let first = page == PAGE;
+            let held = script.hold_fetches && !self.fetch_released && policy != "pause";
             (
-                first && script.stuck_from.is_some_and(|from| n >= from),
+                first && (held || script.stuck_from.is_some_and(|from| n >= from)),
                 if first { script.at(n) } else { None },
             )
         };
@@ -1151,6 +1165,43 @@ fn a_grant_that_never_expires_stops_the_run_saying_why() {
     virtual_clock::wait_virtual_ns(10 * MS);
     assert_eq!(fake.seen().grants.len(), 3, "no-more-grants");
     finish(system, actor);
+}
+
+#[test]
+fn a_fetch_that_holds_a_budget_lets_that_budget_end() {
+    behaviour!(Test {
+        id: "chrome-cdp.fetch-hold",
+        covers: Some("cdp/src/browser.rs#Browser::grant"),
+        given: "a page whose open network fetch holds every virtual-time budget until the \
+                budget is allowed to end",
+    });
+    expect!(
+        "budget-ends",
+        "the held budget ends and the page is granted again"
+    );
+    expect!(
+        "pause-policy",
+        "the held budget is granted again under the policy that lets it end while the fetch \
+         is still open"
+    );
+
+    let _suite = suite_lock();
+    let (fake, stats) = run_until(
+        Script {
+            hold_fetches: true,
+            ..Script::default()
+        },
+        |s| s.stuck_after = Duration::from_secs(5),
+        "8 slices",
+        |_, stats| stats.slices() >= 8 || stats.failure().is_some(),
+    );
+    assert_eq!(stats.failure(), None, "budget-ends: {stats:?}");
+    assert!(stats.slices() >= 8, "budget-ends: {stats:?}");
+    let policies = fake.seen().policies.clone();
+    assert!(
+        policies.iter().any(|policy| policy == "pause"),
+        "pause-policy: {policies:?}"
+    );
 }
 
 #[test]
