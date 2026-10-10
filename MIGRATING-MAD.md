@@ -29,11 +29,13 @@ schematic before `U25`'s part number is corrected does not, section 2),
 since E2 the add-on's converter is configured by the firmware's own
 register writes, since E3 the machine's parts are one component, an
 `embsim_board::Assembly`, and since E6 the encoder presents the pairs
-`U25` reads; the host the board's clock meters, `chrome-cdp`, is owed
-(E4). Revised 2026-10-09: E4's first answer, Chrome in a VM, was built and
-withdrawn for Chrome on the host metered over DevTools (`NODES.md` §18),
-and section 1's four files, steps 1b, 9, 10 and 11 and section 6 follow
-that route; the whole file waits on MaD's own kinds. The Rust below is MaD's to write and is marked
+`U25` reads; since E4 the host the board's clock meters is the
+`chrome-cdp` kind (`NODES.md` §19), in no release yet. Revised 2026-10-09:
+E4's first answer, Chrome in a VM, was built and withdrawn for Chrome on
+the host metered over DevTools (`NODES.md` §18), and section 1's files,
+steps 1b, 9, 10 and 11 and section 6 follow that route, as the kind was
+built (`PROJECTS.md` §5, `chrome-cdp`); the whole file waits on MaD's own
+kinds. The Rust below is MaD's to write and is marked
 `ignore`; each piece names the compiled file in embsim's worked example,
 [`examples/custom-project`](examples/custom-project/README.md), that has
 its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
@@ -51,7 +53,7 @@ its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
 | bench pulls on every input (`BenchPulls`, `IDLE_PULLS`) | nothing: the carrier's isolators, optocouplers and resistors set those lines |
 | `BenchSd` on four bare pins with a bench pull-up | embsim's `sd-card` in the module's own socket `J301` |
 | the stepper, encoder, switches, gantry, sample and load cell, coupled by callbacks | the `mad-machine` bench component, one plant with electrical pins |
-| `make playground`, `e2e-emulator`, `playground-iss`, `playground-rom`, and the nightly | `embsim run mad-cosim.toml …` and `embsim run mad-serial-boot-cosim.toml …`: the app in the host's Chrome, its clock metered by the board's over DevTools |
+| `make playground`, `e2e-emulator`, `playground-iss`, `playground-rom`, and the nightly | `embsim run mad-cosim.toml …` and `embsim run mad-serial-boot-cosim.toml …` (the playgrounds on their headed copies): the app in the host's Chrome, its clock metered by the board's over DevTools |
 
 Four project files, two machines each with two hosts. The user's rule for
 MaD's SIL (`NODES.md` §18) is that the firmware on the ISS runs with the
@@ -75,7 +77,12 @@ keep a `host-serial`, which needs no browser:
   The browser flashes the firmware through it (`make playground-rom`
   today).
 
-Each `-cosim` file differs from its base in the `HOST` entry alone.
+Each `-cosim` file differs from its base in the `HOST` entry alone. The
+kind launches Chrome headless unless its entry says `headless = false`, and
+a project's options come from its file alone, so the playgrounds (step 11),
+where a person watches the app, run two copies of the `-cosim` files that
+differ from them in that one line: `SIL/mad-playground.toml` and
+`SIL/mad-serial-boot-playground.toml`.
 
 ## 2. What embsim owes first
 
@@ -87,7 +94,7 @@ project crate does not fork a model.
 | E1 | *shipped:* `am26lv32`, the AM26LV32 line receiver's kind, placing `U25` by its part number `AM26LV32IDR`, beside the AM26LS31 line driver's `am26ls31`. MaD's schematic owes the matching fix: `U25`'s `Manufacturer_Part_Number` and value set to `AM26LV32IDR` in `Hardware/EdgeBoard/KiCad` | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`); until the schematic fix, a netlist exported from MaD names `AM26LS32CD` and `check` refuses `EDGE` naming `U25` | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS`. *Built 2026-10-08* (`NODES.md` §15): every conversion reads the register file — the multiplexer, the gain (the PGA's bypass included), the reference — and a held reset or a lost supply returns it to its defaults; MaD's start-up bytes, sent to the add-on as `boards/projects/ds2-addon.toml` builds it, give the force path the code the firmware expects (`board/tests/ads122u04_registers.rs`) | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
 | E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component"). *Built 2026-10-08* (`NODES.md` §16): members' pins renamed onto the assembly's, returns it declares (`DRIVE_GND`, `ENC_GND`), members' wakes through it in the order added, the links between them code on the engine's time; `PROJECTS.md` §10, "MaD's plant", is the machine as one | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
-| E4 | *owed:* `chrome-cdp`, the host the board's clock meters (`NODES.md` §18): a bench kind on `host-serial`'s four pins, `TX`, `RX`, `VIO` and `GND`, driven and read the same way, so a project swaps one for the other without touching a wire. It launches the host's Chrome and holds every page and dedicated worker to the board's time over one DevTools connection, which carries the line's bytes too: each quantum (1 ms) the board's time is granted with `Emulation.setVirtualTimePolicy`, one evaluation hands the page the board's bytes and reads its clock, and the page's bytes come back on a binding, so no second channel races the grants. The page's `navigator.serial` is a shim the node owns, the host's half of the line (the port, its USB ids, `connect` and `disconnect`, an unplug and a replug), so MaD's e2e installs no serial fake of its own. The first answer, the `qemu-vm` and `chrome-vm` kinds, was built and withdrawn (§18) | the user's rule (§18): the ISS runs with the app in a Chrome whose clock the board's meters, and with no host that keeps wall time. Unmetered, the app's 2000 ms response timeout fired at 200 ms of the board's time; metered, at 2000 | 1b, 10, 11 |
+| E4 | `chrome-cdp`, the host the board's clock meters. *Built 2026-10-09, in no release yet* (`NODES.md` §19; the kind's contract is `PROJECTS.md` §5, `chrome-cdp`, and [`examples/chrome-ping`](examples/chrome-ping) is a project with one): a bench kind in the `embsim` command's set (`embsim_cdp::catalog`; `embsim_cdp::CdpNode` from Rust) on `host-serial`'s four pins, `TX`, `RX`, `VIO` and `GND`, driven and read the same way, so a project swaps one for the other without touching a wire. At its first slice, the board held there, it launches the host's Chrome (or attaches to one) and holds every page and dedicated worker from birth. Each quantum (1 ms) it grants each page's clock what the page is owed with `Emulation.setVirtualTimePolicy`, puts what the page wrote on the line, and in one evaluation hands the page the board's bytes and reads its clock, all over one DevTools connection, so no second channel races the grants; when a worker owns the port's transferred stream, the next grant waits until it has read what it was handed. The page's `navigator.serial` is a shim the node owns, by Chrome's rules (a `close()` refused while a stream is locked, a replug that hands out a new `SerialPort`): the host's half of the line, the port, its USB ids, `connect` and `disconnect`, an unplug and a replug (`__embsim.link`), so MaD's e2e installs no serial fake of its own. The first answer, the `qemu-vm` and `chrome-vm` kinds, was built and withdrawn (§18) | the user's rule (§18): the ISS runs with the app in a Chrome whose clock the board's meters, and with no host that keeps wall time. Unmetered, the app's 2000 ms response timeout fired at 200 ms of the board's time; metered, at 2000 | 1b, 10, 11 |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
 | E6 | complementary outputs on `embsim_models::machine::QuadratureEncoder`. *Built 2026-10-09* (`NODES.md` §17): `Config::with_complements()` declares `A-`, `B-` and, with an index, `Z-`, each driven to the inverse of its leg in the same publish; `board/tests/edge_encoder_pairs.rs` counts the quadrature at `P9`/`P10` through `U25` with `JP2`, `JP3` and `JP5` open | the carrier's `J20` takes an RS-422 encoder and `U25` reads differences: a single-ended encoder on `A+`/`B+` with `JP2`/`JP3` grounding `A−`/`B−` gives no differential for its low, which `U25` reads as its fail-safe high (SLLS202H §8.4.1), so `P9` and `P10` never move (section 6, "The encoder through `U25`") | 8 (the machine's pins), 9 (the encoder case) |
 | E7 | *not blocking:* a control surface for `run`, such as `--control <port>` serving `embsim-ui`'s actions, a host kind registering `<NAME>/link/unplug` and `<NAME>/link/plug` | three of the e2e's scenarios (B5's reconnect, M11's idle drop and its mid-test drop) pull the host's cable. A `chrome-cdp` takes that from the page, on its own binding, so they wait on nothing; a project whose host is a `host-serial` has no way to pull it | none |
@@ -666,10 +673,14 @@ usb_vendor_id = 0x0403
 usb_product_id = 0x6001
 ```
 
-The option names are the design's (`NODES.md` §18) until E4 ships them. The
-node launches Chrome at its first slice, the board held there, and prints
-the DevTools URL; the e2e attaches to it with Playwright's
-`connectOverCDP`.
+The options are the kind's (`PROJECTS.md` §5). `check` launches nothing,
+but refuses the file on a machine where it finds no Chrome. `run` launches
+Chrome, headless, at the node's first slice, the board held there, and
+prints where its DevTools are once Chrome is reached (the "reached" line);
+the e2e waits for that line, then attaches with Playwright's
+`connectOverCDP`. The port is the top frame's `navigator.serial`, and the
+app opens it on its main thread and transfers the streams to its worker
+(`src/device/DeviceSession.worker.ts`), the shape the shim serves.
 
 ## 5. The ordered changes
 
@@ -689,10 +700,13 @@ with `feat/embsim-catalogs` merged (MaD's CI gates embsim pin bumps).
 0.2.0). *Done when:* MaD's CI is green on the bump, with `mad-emulator`
 unchanged.
 
-**1b. The metered host on `mad-emulator`.** Once E4 ships, the pin bump
-that brings it puts the e2e, the nightly and a playground in the one valid
-configuration, long before steps 2–9 move the machine onto a project.
-`mad-emulator` places the `chrome-cdp` node where its host is today, on
+**1b. The metered host on `mad-emulator`.** E4 is built (`NODES.md` §19);
+once a release ships it, the pin bump that brings it puts the e2e, the
+nightly and a playground in the one valid configuration, long before steps
+2–9 move the machine onto a project. `mad-emulator` places an
+`embsim_cdp::CdpNode` (`Settings::new(Browse::Launch(..))`, 2 Mbaud, the
+DevTools port fixed, headless but for the playground) where its host is
+today, on
 the harness's host pins (`HOST.TX` to `P2.P53`, `P2.P55` to `HOST.RX`), with
 the two wires a host's rail needs: `.power(ep("BENCH.HOST3V3"),
 ep("HOST.VIO"), 3.3)`, the P2's I/O rail, and `.power(ep("BENCH.HOSTGND"),
@@ -702,15 +716,26 @@ launched, a fresh context per scenario, and changes with it:
 
 - `installFakeSerial` goes: the node's shim is the page's
   `navigator.serial`. `installOpfsDataDir` stays.
-- `dropLink` asks the shim to unplug and replug (`__embsim.link` in the
-  design), which the node does at its next slice.
+- Each scenario makes a fresh browser context, and its page with
+  `newPage()` then `goto(APP_URL)`: Chrome holds a page made at about:blank
+  until the node has set it up, but not one it makes with a URL, and the
+  run stops on such a page; a context of its own gives the page a window
+  of its own, since a hidden page costs host time.
+- `dropLink` asks the shim to unplug and replug
+  (`__embsim.link('unplug')`, then `'plug'`, from the harness's
+  `evaluate`), which the node does at its next slice: `disconnect`, both
+  streams errored "The device has been lost." once the page has read what
+  the port held, then `connect` with a new `SerialPort`.
 - Waits count the board's time: each `waitForTimeout` becomes a helper
-  that polls the page's `performance.now()`, and `T()` takes its scale
-  from the board's measured speed, not a fixed `E2E_TIMEOUT_SCALE`.
-- Clicks: animation frames do not run on virtual time, so a plain
+  that polls the page's `performance.now()`, and a wait for the page
+  carries no host timeout (`timeout: 0`, as
+  `examples/chrome-ping/harness.mjs` waits) where `T()` scales one today:
+  a page that stops answering stops the run after the kind's
+  `stuck_after`, naming why.
+- Clicks: animation frames barely run on virtual time, so a plain
   `click()` waits forever for a stable element. A `press()` helper checks
   that the element is visible and enabled and is what `elementFromPoint`
-  finds at its centre, then forces the click.
+  finds at its centre, then forces the click (`PROJECTS.md` §5).
 - `APP_URL` serves the production bundle from the host, not the dev
   server. Only the production build compiles the worker's
   `this.sink?.(events)` (`DeviceSession.worker.ts`) into `n.call(this, e)`,
@@ -720,15 +745,19 @@ launched, a fresh context per scenario, and changes with it:
   without `.call`, so nothing asks the proxy to clone the session.
 - Two scenarios join: Disconnect then Connect, and flashing while
   connected. Chrome refuses `close()` while a stream of the port is still
-  locked and keeps the port open until the stream lets go; the shim must
-  do the same, which today's fake does not. Under a shim that does, the
-  app's own teardown failed 40 times of 40, so the app is fixed in this
-  step too: the main thread waits until the port's streams are released
-  before it calls `close()`, and before it opens the port again.
+  locked and keeps the port open until the stream lets go; the shim does
+  the same (`PROJECTS.md` §5), which today's fake does not. Under a shim
+  that does, the app's own teardown failed 40 times of 40, so the app is
+  fixed in this step too: the main thread waits until the port's streams
+  are released before it calls `close()`, and before it opens the port
+  again.
 
-*Files:* `SIL/MaDSim/Cargo.toml` (the crate E4 ships), `SIL/MaDSim/src/main.rs`
-(the node on the host pins, the two power wires, the DevTools port
-printed), `Software/Control/e2e/fixtures.mjs` and `run-all.mjs`,
+*Files:* `SIL/MaDSim/Cargo.toml` (`embsim-cdp`, by path through the
+submodule), `SIL/MaDSim/src/main.rs` (the node on the host pins, the two
+power wires, the DevTools endpoint printed once
+`NodeStats::devtools_endpoint` has it, and the run stopped when
+`NodeStats::failure` says why), `Software/Control/e2e/fixtures.mjs` and
+`run-all.mjs`,
 `Software/Control/src/device/DeviceSession.worker.ts` (the sink call),
 `Software/Control/src/device/session.ts` (the wait before `close()` and
 the next `open()`), `SIL/makefile`, `.github/workflows/e2e-nightly.yml`
@@ -859,7 +888,8 @@ report carries the firmware's boot console (skipped, saying why, when the
 
 **9. The project files.** The four files of section 1 (section 4), and a
 `make check` target running `$(EMBSIM) check` on `mad.toml` and
-`mad-serial-boot.toml`, and on the two `-cosim` files once E4 ships.
+`mad-serial-boot.toml`, and on the two `-cosim` files once the pin bump
+brings E4 (on a machine with Chrome: section 4).
 *Needs:* E1, E2 and E6 (the encoder's pairs). The first pin bump past
 0.2.0 brings E2 (embsim 0.3.0) and changes
 `embsim_models::ads122u04::Config`, which no longer has `vref_mv` or
@@ -899,16 +929,18 @@ on the cosim file, as step 1b ran `mad-emulator`:
 
 | Target | Becomes |
 |---|---|
-| `e2e-emulator` | `$(EMBSIM) run mad-cosim.toml`, unpaced (the page lives only the time the board grants it), until SIGTERM, then the summary; the suite attaches with `CDP_URL=http://127.0.0.1:9222` and serves `APP_URL` from the host |
+| `e2e-emulator` | `$(EMBSIM) run mad-cosim.toml`, unpaced (the page lives only the time the board grants it), until SIGTERM, then the summary; once the run prints Chrome's "reached" line the suite attaches with `CDP_URL=http://127.0.0.1:9222` and serves `APP_URL` from the host |
 | `playground`, `playground-iss`, `playground-rom` | stay on `mad-emulator` until step 11, a person using step 1b's route meanwhile: on a PTY they are the ISS with a host that keeps wall time, which the rule does not keep |
 
 `MaDSim/tests/pty_protocol.rs` (one protocol round trip on the host's PTY)
 moves to `SIL/mad-catalog/tests/pty_protocol.rs`, spawning `embsim run
 mad.toml --pty <path>`: a test of the line, not of the app, which needs no
-browser. *Needs:* E4 and step 9's cosim file. *Files:* `SIL/makefile`,
-`SIL/mad-catalog/tests/pty_protocol.rs`, `.github/workflows/ci.yml` (a
-`make check` step joins the e2e job, whose `make e2e-emulator` runs on the
-runner's own Chrome: no image, no VM), `.github/workflows/e2e-nightly.yml`
+browser. *Needs:* E4 in the pinned embsim and step 9's cosim file.
+*Files:* `SIL/makefile`, `SIL/mad-catalog/tests/pty_protocol.rs`,
+`.github/workflows/ci.yml` (a `make check` step joins the e2e job, whose
+`make e2e-emulator` runs on the runner's own Chrome, headless, as embsim's
+`chrome-cdp` CI job runs it: no image, no VM; that job's first run on
+Linux is `NODES.md` §19's Open), `.github/workflows/e2e-nightly.yml`
 (`make e2e-emulator` in place of step 1b's invocation), and the docs that
 describe the emulator: `docs/dev/sil-testing.md`,
 `docs/how-it-works/sil-emulator.md`, `docs/dev/sil-iss-components.md`,
@@ -920,24 +952,26 @@ passes against `make e2e-emulator` on the project.
 
 **11. Retire `mad-emulator`.** The playgrounds move onto the tool with the
 same host: `playground` and `playground-iss` to `$(EMBSIM) run
-mad-cosim.toml`, `playground-rom` to `$(EMBSIM) run
-mad-serial-boot-cosim.toml`, each printing the DevTools URL; a person
-watches the app in the Chrome the node launched, headed. The page lives the
-board's time, so a playground of the ISS runs as fast as the board does and
-no faster, and needs no pace; `run --pace` (`NODES.md` §13, "Open") is for
-a fast board with a host that keeps wall time, which MaD's rule rules out
-for the ISS. Animation frames do not run on virtual time, so the live
-charts redraw only now and then (`NODES.md` §18). *Needs:* step 10, and
-step 3's numbers. *Files:* `SIL/makefile`, `SIL/MaDSim/` (removed),
-`SIL/Cargo.toml` (`members`), `.github/workflows/ci.yml` (`-p
-mad-emulator` dropped from the `rustfmt (gating)` step),
-`p2iss/src/lib.rs` (the `Component` impl, `SerialLink` and the pin lists
-removed), the `p2iss` tests and examples that use them
+mad-playground.toml`, `playground-rom` to `$(EMBSIM) run
+mad-serial-boot-playground.toml` (section 1: the `-cosim` files with
+`headless = false`), each printing where Chrome's DevTools are; a person
+watches the app in the Chrome the node launched, headed (every figure in
+`NODES.md` §19 was measured headless). The page lives the board's time, so
+a playground of the ISS runs as fast as the board does and no faster, and
+needs no pace; `run --pace` (`NODES.md` §13, "Open") is for a fast board
+with a host that keeps wall time, which MaD's rule rules out for the ISS.
+Animation frames barely run on virtual time, so the live charts redraw only
+now and then (`NODES.md` §19, evidence E9). *Needs:* step 10, and step 3's
+numbers. *Files:* `SIL/makefile`, `SIL/MaDSim/` (removed), `SIL/Cargo.toml`
+(`members`), the two playground copies (section 1),
+`.github/workflows/ci.yml` (`-p mad-emulator` dropped from the `rustfmt
+(gating)` step), `p2iss/src/lib.rs` (the `Component` impl, `SerialLink` and
+the pin lists removed), the `p2iss` tests and examples that use them
 (`tests/level_pins.rs`, `protocol_on_levels.rs`, `rom_boot_net.rs`,
 `rom_serial_net.rs`, `sd_mount.rs`, `sd_node.rs`, `pty_protocol.rs`;
-`examples/iss_speed.rs`, `sd_probe.rs`) moved onto
-the core in the package. *Done when:* `make test` and the e2e suite pass
-with no `mad-emulator` in the tree.
+`examples/iss_speed.rs`, `sd_probe.rs`) moved onto the core in the package.
+*Done when:* `make test` and the e2e suite pass with no `mad-emulator` in
+the tree.
 
 ## 6. Questions for MaD
 
@@ -950,8 +984,8 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   over DevTools, and with no host that keeps wall time; `make e2e-emulator`
   as the ISS with a PTY host is not a configuration MaD keeps. The plan
   follows the rule: step 1b puts the e2e, the nightly and a playground on
-  `mad-emulator` with a `chrome-cdp` host once E4 ships, and steps 10 and 11
-  move them onto the `-cosim` files. Chrome's own Web Serial and the OS's
+  `mad-emulator` with a `chrome-cdp` host once a release ships E4 (built,
+  `NODES.md` §19), and steps 10 and 11 move them onto the `-cosim` files. Chrome's own Web Serial and the OS's
   serial driver are not in that path. On the machine they have so far been
   exercised only by hand: the hardware harness,
   `e2e/hw-read-save-config.mjs`, uses the same fake `navigator.serial`

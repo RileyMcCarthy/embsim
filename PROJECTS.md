@@ -34,8 +34,9 @@ Catalogs compose in a set (`embsim_boards::catalog::CatalogSet`), which
 starts with the standard catalog and answers each kind from the catalog that
 provides it. The `embsim` command builds every project with the set
 `embsim_cli::shipped()`: the standard catalog with QEMU as a core the P2 can
-hold (section 5). A project's own kinds join a set the same way (sections 7
-and 10). The file itself holds no behaviour.
+hold, and the host's Chrome as the `chrome-cdp` bench component (section
+5). A project's own kinds join a set the same way (sections 7 and 10). The
+file itself holds no behaviour.
 Every number a model uses stays in the model, with its citation. The file
 says only which model sits where, which of the tables a model already
 offers it takes, and what the bench does: the harness and the scenario.
@@ -440,7 +441,7 @@ embsim run ds2.toml --for 5ms --net DS2.+3V3 --net DS2.VDDA --net DS2.~RESET
 
 ```text
 project ds2.toml
-  catalogs: embsim-boards, embsim-p2-qemu
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp
   …
 running for 5.000000 ms of virtual time
 findings at build, before any wake (11):
@@ -769,7 +770,8 @@ made by `embsim flash-image`.
 
 A `[[component]]` is a part with pins and no board. Its pins are its
 endpoints, `Name.Pin`, and its options are `[component.options]`. The
-standard catalog ships two kinds.
+standard catalog ships two kinds, and the `embsim` command's set a third,
+`chrome-cdp`, in a catalog of its own, since it starts a process.
 
 **`host-serial`**: the host's end of a serial link, a PTY whose bytes are
 levels on the wire (`embsim_board::HostPty::open_on_rail`). A host program
@@ -834,6 +836,143 @@ Before its first instant the pin is released; after its last it holds.
 Each step is one drive published at its instant, on a wake the source arms
 for it (`boards/tests/scripted_source.rs` reads each step land at its own
 nanosecond).
+
+**`chrome-cdp`** (the `embsim` command's set; the catalog `embsim-cdp`):
+the host's Chrome on a host's serial line. Every page Chrome opens has Web
+Serial whose one port is this line, and every page's clock, and every
+dedicated worker's, is metered by the board's over the Chrome DevTools
+Protocol (`embsim_cdp::CdpNode`), so a web app's timeouts mean in board
+time what they say. Its pins are `host-serial`'s, the same four, so a
+project swaps one kind for the other without touching a wire.
+[`examples/chrome-ping`](examples/chrome-ping) is a project with one, and
+a Playwright harness for it.
+
+| Pin | What it is |
+|---|---|
+| `TX` | what the page writes, driven onto the wire: a high at `VIO` above `GND`, a low at `GND`, behind the push-pull default; released while `VIO` reads no voltage |
+| `RX` | what the page reads: JESD8C.01's 0.8 V / 2.0 V pair against `GND` |
+| `VIO` | the host's I/O rail, against `GND` |
+| `GND` | the host's ground |
+
+| Option | What it says |
+|---|---|
+| `baud` | required: the line's rate, framed 8N1 |
+| `quantum` | the virtual time between two slices (default `1ms`, at most `1s`): the most the page's clock and the board's are apart, and the latency a byte can wait |
+| `max_lead` | stop the run, saying so, once a page's clock is this far ahead of the board's at a slice. By default a lead is paid back by skipping the page's grants, and reported |
+| `stuck_after` | how long, in host time, one grant, or a page's side of a slice, may hold before the run stops as stuck (default `30s`). Chrome holds a budget while a fetch is in flight and while a task runs, so this is seconds |
+| `chrome` | the Chrome binary to launch: a path relative to the project file, or a name on `PATH`. By default `CHROME`, Google Chrome's macOS application, or `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser` on `PATH` |
+| `devtools_port` | the DevTools port Chrome listens on, 1 to 65535. By default Chrome picks a free one; either way the run prints where DevTools are once Chrome is reached. A port another program holds is refused |
+| `headless` | `true` (the default) or `false` |
+| `attach` | attach to a Chrome already running instead of launching one: its DevTools endpoint, `http://HOST:PORT` or the browser's `ws://` URL. Not with `chrome`, `devtools_port` or `headless`. The node then holds, shims and meters every page of that browser, the user's own tabs among them; a page already open ran its scripts before the shim (the report counts it; reload it to put it on the board's time), and with `granted` every origin in it gets the line |
+| `url` | a page to open once it is held: a URL (`http://`, `https://`, `file://`, `about:`, `data:`), or a file beside the project file. A launched Chrome opens it in its first tab; a browser the node attached to, in a new window. A page that does not open stops the run, saying why |
+| `usb_vendor_id`, `usb_product_id` | the adapter the port is, as `getInfo()` reports it and `requestPort()` filters match it (`0x0403`, `0x6001` for an FTDI FT232R). Without them the port has no USB ids |
+| `granted` | `true`: every origin may use the port without a prompt, as Chrome's `SerialAllowUsbDevicesForUrls` policy grants it, so `getPorts()` returns it at once. By default a page gets the port from `requestPort()`, which needs a user gesture (a harness's click), and keeps it for its origin |
+
+Nothing starts at `check`. Chrome is launched, or attached to, at the
+node's first slice, a quantum after the run starts, with the board's clock
+held there while it comes up. From then on Chrome holds every page and
+dedicated worker from birth, before its first script, and the node runs a
+slice every quantum on the engine's thread: it grants each page's clock the
+time the page is owed — the board's time since its document was first
+booked, less what it has lived since — and waits for the budget to expire;
+puts on the line what the page wrote meanwhile; hands the page the board's
+bytes and the answers to what it asked of its port, and reads its clock;
+and, when it handed bytes to a page whose port's readable went to a
+dedicated worker, waits for that worker to call `read()` again before the
+next grant. A page lives exactly what it is granted. Chrome moves a page's
+clock past a budget at a worker's birth and at a storage call; the node
+books that as a lead and pays it back by skipping the page's grants. A new
+document (a navigation, a reload) starts level with the board. Pages whose
+main thread is one renderer's — a page and a window it opened — share one
+clock, and the node grants it once between them. JavaScript runs in no
+virtual time: timers, `Date.now()`, `performance.now()` and a WASM module's
+imported clock advance only in grants. A page's bytes reach the line within
+a quantum of when its clock says it wrote them (two, when they cross from a
+worker), and the board's reach the page within a quantum of leaving the
+wire.
+
+The port is the node's, by Chrome's rules (`third_party/blink/renderer/
+modules/serial/`): every request is answered at the next slice, as Chrome
+answers through the browser process; `close()` rejects with a `TypeError`
+while a stream it holds is locked, and the streams are released a slice
+after their flush or drain; `open()` on an open port rejects
+`InvalidStateError` "The port is already open."; a page opening the port
+at another rate or framing than the line's opens it, and what crosses is
+shed and counted. A write resolves once its last byte is in the writer's
+window — the port's `bufferSize`, or two quanta of the line's bytes when
+that is more — so a write larger than the window waits on the line, as
+Chrome's waits on its data pipe; an aborted write discards what the node
+still holds for the line. `forget()` gives up a port the page asked for
+and closes it if it is open; a port `granted` gives cannot be given up.
+Pulling the cable — `__embsim.link('unplug')` in the page, from the page or
+a harness's `evaluate`, or `CdpNode::link()` from Rust, acting at the next
+slice — fires `disconnect` for the port of every origin that may use it,
+asked for or not, and errors both streams with `NetworkError` "The device
+has been lost." once the page has read what the port's pipe already held;
+putting it back (`'plug'`) fires `connect` with a new `SerialPort`, the old
+one dead. The line has no modem-control pins: `setSignals()` (DTR, RTS, a
+break) is answered and reaches nothing, an open with hardware flow control
+opens with nothing to pace it, `getSignals()` reads every input inactive,
+and the report counts the first two. The port lives in the top frame's
+`navigator.serial`; a frame's and a dedicated worker's own
+`navigator.serial` are Chrome's, so an app opens the port on its page's
+main thread and transfers the streams to a worker (the report says when a
+worker asks for its own).
+
+Once Chrome is reached the run prints where its DevTools are (the
+"reached" line); a harness waits for that line, then connects
+(Playwright's `connectOverCDP`). It makes a fresh browser context per
+scenario and its pages there: `newPage()` makes a page at about:blank,
+which Chrome holds until the node has set it up, and `goto()` navigates
+it. A page Chrome makes with a URL (`Target.createTarget` with a url,
+`/json/new`) is not held: its first document runs before the shim, and the
+run stops saying so. Pages in one context share a window, so a second page
+hides the first, a background tab: the node meters a hidden page too, but
+Chrome holds back what it says over DevTools until it is poked, which costs
+host time; a fresh context gives a page a window of its own. A dialog a
+page opens (`alert`, `confirm`) holds its main thread until the harness
+answers it (Playwright dismisses dialogs a test does not handle); one
+nobody answers stops the run after `stuck_after`, naming it, as does a page
+whose main thread never returns. Under virtual time animation frames,
+`ResizeObserver` and `IntersectionObserver` barely run, so Playwright's
+actionability checks stall: click with `force` after checking
+`document.elementFromPoint` at the element's centre, and wait on the page's
+own clock (`performance.now()`), never a host timeout. Service workers,
+shared workers and out-of-process frames run unmetered. A page that
+crashes, or a Chrome that exits, stops the run at once, saying which.
+
+[`examples/chrome-ping`](examples/chrome-ping): a page writing `ping`
+every 100 ms of its own time to a `host-serial` on the same rail,
+`granted = true`, `url` the page beside the project, run for a second
+(`embsim run project.toml --for 1s`):
+
+```text
+project project.toml
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp
+  0 boards, 2 bench components, 6 wires, 0 mates
+running for 1000.000000 ms of virtual time
+findings at build, before any wake (2):
+  no source reaches PC.RX, which a digital input reads
+  no source reaches HOST.RX, which a digital input reads
+[   0.000000 ms] PC: Chrome /Applications/Google Chrome.app/Contents/MacOS/Google Chrome (headless), DevTools on a port it picks, 115200 baud 8N1, metered every 1.000000 ms of virtual time; Chrome is reached at the first slice
+[   0.000000 ms] HOST: host serial at .embsim/HOST.pty, 115200 baud 8N1
+[   1.100000 ms] PC: Chrome/153.0.8010.55 reached in 0.839 s of host time, the board's clock held at 1.000000 ms; DevTools at http://127.0.0.1:53377; its pages live only while the board's clock advances
+ran 1000.000000 ms of virtual time in 3.155 s
+PC: 999 slices (999 booked from the page's clock, 0 grants skipped to pay a lead back): the page lived 998.000000 ms of the board's 998.000000 ms
+PC: at most 0.000 ms ahead of the board at a slice; a page's clock passed its budget by at most 0.000 ms in one slice
+PC: host time per slice: median 0.68 ms, 90th percentile 2.18 ms, 99th 20.77 ms
+PC: 1 page and 0 dedicated workers held; 0 drain waits, 0 ran out
+PC: 45 bytes from the page, 0 to it, 0 framing errors
+PC: the page sent during the run: its bytes entered the line in the slice they reached the node in, so this run is reproducible in what the page sent, and in when to within a slice
+HOST: host serial at .embsim/HOST.pty: 0 bytes from the host, 45 to it, 0 framing errors
+```
+
+A page's clock is read to 100 µs in a page that is not cross-origin
+isolated and to 5 µs in one that is (COOP and COEP); the node books what a
+page was granted, and a jump past a grant only when it is more than three
+times the clock's resolution. A slice costs host time: about 0.5–0.9 ms
+(median) here, more under load or with a hidden page, for each millisecond
+of board time.
 
 ## 6. Board to board
 
@@ -1320,12 +1459,11 @@ alone.
 ### The rest
 
 - The standard catalog's bench component kinds are `host-serial` and
-  `scripted-source` (section 5). A host that must run on the board's clock
-  (a browser whose page and workers the board's clock meters over the
-  DevTools protocol, the `chrome-cdp` kind `NODES.md` §18 plans) is not one
-  of them, and neither is a pace for `run` against wall time: `run` is
-  stepped, so a quiet system's virtual time runs ahead of a host's wall
-  time.
+  `scripted-source` (section 5); a host that must run on the board's clock,
+  a browser whose pages and workers the board's clock meters, is
+  `chrome-cdp`, in the `embsim` command's set (section 5). There is no pace
+  for `run` against wall time: `run` is stepped, so a quiet system's virtual
+  time runs ahead of a host's wall time.
 - The standard catalog has no part kind for a diode, LED, FET or transistor.
   One the element library does not know by part number has no way into a
   project yet.
@@ -1394,7 +1532,7 @@ embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim
 …
 embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
 project rig.toml
-  catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, sim-catalog
   embsim 0.3.0, git rev a47bf442f5a5, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate sim-catalog 0.1.0: /home/me/embsim/rig/sim/catalog, in the git repository at rev a47bf442f5a5, but no commit holds its files
@@ -1540,7 +1678,8 @@ examples and tests use; a project's own binary crate depends on
 linked into any binary, and a project's binary runs the P2's QEMU core the
 way the tool does, starting the installed `qemu-system-p2`.
 
-`embsim_cli::shipped()` is the standard catalog with QEMU's core;
+`embsim_cli::shipped()` is the standard catalog with QEMU's core and the
+`chrome-cdp` kind;
 `embsim_cli::main_with(set)` reads the process's arguments and runs the
 four subcommands over `set`; `embsim_cli::run(&set, args, out, err)` is the
 same with the arguments and the output handed in, which is how
@@ -1594,7 +1733,7 @@ An unknown kind is refused as before, listing every kind the set holds.
 
 ```text
 project project.toml
-  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, custom-project-catalog
 ```
 
 ### The `[catalog]` table
@@ -2458,7 +2597,7 @@ result can be traced to what produced it (`DESIGN.md` rule 9):
 
 ```text
 project project.toml
-  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, custom-project-catalog
   embsim 0.3.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate custom-project-catalog 0.1.0: /home/me/embsim/examples/custom-project/catalog, git rev 4f0c2a1b3d5e
