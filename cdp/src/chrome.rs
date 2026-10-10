@@ -104,59 +104,28 @@ impl Heard {
 /// Each launch's profile gets a number of its own within the process.
 static PROFILES: AtomicU64 = AtomicU64::new(0);
 
-/// Browser arguments for the Linux renderer, empty on every other platform.
-fn renderer_launch_args(profile: &Path) -> io::Result<Vec<String>> {
+/// Extra browser arguments on Linux. Other platforms add none.
+fn platform_launch_args() -> &'static [&'static str] {
     #[cfg(target_os = "linux")]
     {
-        linux_renderer_launch_args(profile)
+        linux_launch_args()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = profile;
-        Ok(Vec::new())
+        &[]
     }
 }
 
-/// `--renderer-cmd-prefix` plus `--no-sandbox`.
+/// `--no-sandbox` on Linux.
 ///
-/// A non-empty prefix makes Chrome skip the zygote for that renderer and pass
-/// it `--no-zygote`. The Linux sandbox is applied by the zygote, so the
-/// renderer starts only with the sandbox off. The script execs the real Chrome
-/// binary with `--disable-crashpad-for-testing`, and that startup path then
-/// skips Crashpad, so `Page.crash` ends the process and Chrome reports
-/// `Target.targetCrashed`. The browser process must not receive that switch:
-/// it starts the crash handler, and a zygote-forked child that finds no
-/// handler descriptor aborts at startup.
+/// The renderer keeps starting from the zygote. With the sandbox on, Crashpad's
+/// dump of a crashed renderer can sit in `waitpid` inside that renderer's pid
+/// namespace, so the process never exits and Chrome never sends
+/// `Target.targetCrashed` before `stuck_after`. The sandbox off, the dump
+/// finishes and the run hears the crash.
 #[cfg(any(target_os = "linux", test))]
-fn linux_renderer_launch_args(profile: &Path) -> io::Result<Vec<String>> {
-    Ok(vec![
-        renderer_crashpad_switch(profile)?,
-        "--no-sandbox".to_string(),
-    ])
-}
-
-/// `--renderer-cmd-prefix` naming a script in `profile`.
-#[cfg(any(target_os = "linux", test))]
-fn renderer_crashpad_switch(profile: &Path) -> io::Result<String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = profile.join("renderer-crashpad.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\nbin=$1\nshift\nexec \"$bin\" --disable-crashpad-for-testing \"$@\"\n",
-    )?;
-    let mut permissions = std::fs::metadata(&script)?.permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions)?;
-    let path = script.display().to_string();
-    if path.contains(['\'', '"', '\n', '\r']) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Chrome's renderer prefix cannot quote this profile path: {path}"),
-        ));
-    }
-    // `CommandLine::PrependWrapper` splits this value on spaces and keeps quotes.
-    Ok(format!("--renderer-cmd-prefix='{path}'"))
+fn linux_launch_args() -> &'static [&'static str] {
+    &["--no-sandbox"]
 }
 
 impl ChromeProcess {
@@ -205,16 +174,9 @@ impl ChromeProcess {
         if spec.headless {
             command.arg("--headless=new");
         }
-        // Linux renderers skip the zygote, so the sandbox is off and Crashpad
-        // is left off in the renderer. See `linux_renderer_launch_args`.
-        let extra = match renderer_launch_args(&profile) {
-            Ok(extra) => extra,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&profile);
-                return Err(error);
-            }
-        };
-        command.args(extra);
+        // Linux leaves the sandbox off so a crashed renderer is reported.
+        // See `linux_launch_args`.
+        command.args(platform_launch_args());
         command
             .arg("about:blank")
             .stdin(Stdio::null())
@@ -450,8 +412,6 @@ impl Drop for ChromeProcess {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
     use rstest::rstest;
     use vibes_behaviour::{behaviour, expect, Test};
@@ -551,48 +511,13 @@ mod tests {
     }
 
     #[test]
-    fn a_linux_launch_starts_each_renderer_with_crash_reporting_off() {
+    fn a_linux_launch_runs_with_the_sandbox_off() {
         behaviour!(Test {
-            id: "chrome-cdp.linux-renderer-prefix",
-            covers: Some("cdp/src/chrome.rs#linux_renderer_launch_args"),
+            id: "chrome-cdp.linux-sandbox",
+            covers: Some("cdp/src/chrome.rs#linux_launch_args"),
             given: "Chrome is launched on Linux",
         });
-        expect!(
-            "renderer-skips-crash-reporting",
-            "each renderer is started by a prefix that runs the real Chrome binary with crash \
-             reporting left off in that process, and the sandbox is off"
-        );
-        let dir = std::env::temp_dir().join(format!(
-            "embsim-cdp-prefix-{}-{}",
-            std::process::id(),
-            PROFILES.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("the profile directory");
-        let args = linux_renderer_launch_args(&dir).expect("the Linux launch arguments");
-        let switch = args.first().expect("the prefix").clone();
-        let script = dir.join("renderer-crashpad.sh");
-        let body = std::fs::read_to_string(&script).expect("the script");
-        let executable = std::fs::metadata(&script)
-            .expect("the script metadata")
-            .permissions()
-            .mode()
-            & 0o111;
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = script.display().to_string();
-        assert_eq!(
-            body, "#!/bin/sh\nbin=$1\nshift\nexec \"$bin\" --disable-crashpad-for-testing \"$@\"\n",
-            "renderer-skips-crash-reporting"
-        );
-        assert_eq!(executable, 0o111, "renderer-skips-crash-reporting");
-        assert_eq!(
-            switch,
-            format!("--renderer-cmd-prefix='{path}'"),
-            "renderer-skips-crash-reporting"
-        );
-        assert_eq!(
-            args.get(1).map(String::as_str),
-            Some("--no-sandbox"),
-            "renderer-skips-crash-reporting"
-        );
+        expect!("sandbox-off", "the sandbox is off");
+        assert_eq!(linux_launch_args(), ["--no-sandbox"], "sandbox-off");
     }
 }
