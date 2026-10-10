@@ -427,6 +427,22 @@ impl Browser {
                     page.crashed = true;
                 }
             }
+            // Browser-session form. Some Chrome builds emit this and not
+            // the session-scoped Inspector event when a renderer dies.
+            "Target.targetCrashed" => {
+                let target = str_of(&event.params, "targetId");
+                let session = self
+                    .pages
+                    .values()
+                    .find(|page| page.target == target)
+                    .map(|page| page.session.clone());
+                if let Some(session) = session {
+                    self.devtools.session_gone(&session);
+                    if let Some(page) = self.pages.get_mut(&session) {
+                        page.crashed = true;
+                    }
+                }
+            }
             "Page.javascriptDialogOpening" => {
                 if let Some(page) = event.session.and_then(|s| self.pages.get_mut(&s)) {
                     page.dialog = Some(Dialog {
@@ -459,6 +475,10 @@ impl Browser {
         let commands = [
             ("Runtime.enable", json!({})),
             ("Page.enable", json!({})),
+            // Without this, Chrome does not deliver Inspector.targetCrashed.
+            // A renderer that dies mid-grant then holds the budget until
+            // stuck_after, and the run reports a stuck grant.
+            ("Inspector.enable", json!({})),
             (
                 "Emulation.setVirtualTimePolicy",
                 json!({ "policy": "pause" }),
