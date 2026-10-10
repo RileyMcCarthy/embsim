@@ -302,6 +302,13 @@ impl SerialLevelBridge {
         shed
     }
 
+    /// Whether the transmitter is quiet: nothing queued, no frame on the
+    /// wire, no edge armed. A host that answers a drain (Web Serial's
+    /// `WritableStream.close()`) once its bytes have left reads this.
+    pub fn tx_idle(&self) -> bool {
+        self.tx.lock().expect("tx state never poisoned").is_idle()
+    }
+
     /// Bytes [`transmit`](Self::transmit) would accept right now without
     /// shedding. A caller that reads from a socket can read no more than
     /// this and leave the rest where the peer's flow control will see it.
