@@ -7,8 +7,12 @@
 // at the node's next slice through __embsim.slice(), as Chrome's own
 // SerialPort answers through an IPC round trip to the browser process. The
 // rules are Chrome's (third_party/blink/renderer/modules/serial/): the
-// messages, which call rejects with what, when a stream is released, and
-// what a disconnect does.
+// messages, which call rejects with what, when a stream is released, what
+// a disconnect does (bytes already in the port's pipe are still read), and
+// that a write resolves once its last byte is in the port's buffer. Each
+// slice it tells the node the document's clock, whether the page is
+// hidden, and whether the port's readable went to a worker; its hello says
+// whether the document had run scripts before the shim was installed.
 (() => {
   'use strict';
   // The top frame's document only: a frame's Web Serial is its own (and
@@ -24,6 +28,12 @@
     ? crypto.randomUUID()
     : String(Math.random()).slice(2) + String(performance.timeOrigin);
   const origin = String(location.origin);
+  const href = String(location.href);
+  // Installed in a document that has run scripts already: the page was
+  // not held from birth (a page made with a URL, or one open before the
+  // node attached), and its scripts saw Chrome's own Web Serial.
+  const blank = href === 'about:blank' || href === 'about:srcdoc';
+  const late = !blank && (document.readyState !== 'loading' || document.scripts.length > 0);
 
   // Chrome's messages (serial_port.cc, serial.cc, the streams).
   const kPortClosed = 'The port is closed.';
@@ -42,7 +52,7 @@
   // prompt, and the writer's window.
   let gen = -1;
   let plugged = false;
-  let granted = false;
+  let granted = false; // as of the last slice
   let windowBytes = 255;
 
   // Requests answered at the next slice.
@@ -84,15 +94,33 @@
     return u;
   };
 
-  // Read calls made on readers of a port's readable in this realm: the
-  // node's drain barrier counts them (a dedicated worker reports its own
-  // through its own session).
-  let pageReads = 0;
-  const counted = (read) => function (...a) {
-    pageReads++;
-    send({ k: 'read', doc, n: pageReads });
-    return read.apply(this, a);
+  // A port's readable this document transferred to another realm (a
+  // dedicated worker): the node's drain barrier waits for that worker to
+  // read what it is handed, which Chrome's clock does not wait for. A
+  // consumer in this realm takes its bytes within the slice's evaluate.
+  const portStreams = new WeakSet();
+  const transferred = new WeakSet();
+  const noteTransfer = (args) => {
+    for (const a of args) {
+      const list = Array.isArray(a) ? a
+        : (a && typeof a === 'object' && Array.isArray(a.transfer)) ? a.transfer : null;
+      if (!list) continue;
+      for (const x of list) if (portStreams.has(x)) transferred.add(x);
+    }
   };
+  for (const C of [globalThis.Worker, globalThis.MessagePort]) {
+    if (typeof C !== 'function' || typeof C.prototype.postMessage !== 'function') continue;
+    const post = C.prototype.postMessage;
+    Object.defineProperty(C.prototype, 'postMessage', {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: function postMessage(...a) {
+        noteTransfer(a.slice(1));
+        return post.apply(this, a);
+      },
+    });
+  }
 
   // An EventTarget whose on<event> attributes are listeners, as an IDL
   // event handler attribute is.
@@ -192,6 +220,10 @@
         controller: null,
         pull: null,
         closed: false,
+        // The device went away with bytes still in the pipe: they are read
+        // first, then the stream errors with this (Chrome's
+        // SignalErrorOnClose).
+        lost: null,
         chunks: 0,
         take(n) {
           const out = new Uint8Array(n);
@@ -207,21 +239,34 @@
           source.length -= n;
           return out;
         },
-        // Hand a waiting read what the pipe holds, at most a pipe's worth.
+        // Hand a waiting read what the pipe holds, at most a pipe's worth;
+        // once a lost device's pipe is empty, error the stream.
         pump() {
-          if (!source.pull || source.length === 0 || source.closed) return;
-          const resolve = source.pull;
-          source.pull = null;
-          const byob = source.controller.byobRequest;
-          if (byob) {
-            const n = Math.min(byob.view.byteLength, source.length, bufferSize);
-            new Uint8Array(byob.view.buffer, byob.view.byteOffset, n).set(source.take(n));
-            byob.respond(n);
-          } else {
-            source.controller.enqueue(source.take(Math.min(source.length, bufferSize)));
+          if (!source.pull || source.closed) return;
+          let delivered = false;
+          if (source.length > 0) {
+            delivered = true;
+            const byob = source.controller.byobRequest;
+            if (byob) {
+              const n = Math.min(byob.view.byteLength, source.length, bufferSize);
+              new Uint8Array(byob.view.buffer, byob.view.byteOffset, n).set(source.take(n));
+              byob.respond(n);
+            } else {
+              source.controller.enqueue(source.take(Math.min(source.length, bufferSize)));
+            }
+            source.chunks++;
           }
-          source.chunks++;
-          resolve();
+          if (source.length === 0 && source.lost) {
+            const error = source.lost;
+            source.lost = null;
+            source.closed = true;
+            try { source.controller.error(error); } catch (_) { /* already closed */ }
+          }
+          if (delivered || source.closed) {
+            const resolve = source.pull;
+            source.pull = null;
+            resolve();
+          }
         },
         // The node's bytes for this slice: how many reads they take.
         push(bytes) {
@@ -232,10 +277,16 @@
           source.pump();
           return reads;
         },
+        // The device went away: what the pipe holds is still read, then
+        // the stream errors.
         lose(error) {
+          if (source.closed) return;
+          if (source.length > 0) {
+            source.lost = error;
+            source.pump();
+            return;
+          }
           source.closed = true;
-          source.pipe = [];
-          source.length = 0;
           try { source.controller.error(error); } catch (_) { /* already closed */ }
           if (source.pull) { const r = source.pull; source.pull = null; r(); }
         },
@@ -261,24 +312,7 @@
           return request('flush', { dir: 'rx' }, port).then(() => port.#sourceClosed());
         },
       });
-      // Reads on this stream's readers in this realm, counted for the
-      // drain barrier.
-      const getReader = stream.getReader;
-      stream.getReader = function (...a) {
-        const reader = getReader.apply(this, a);
-        reader.read = counted(reader.read);
-        return reader;
-      };
-      const values = stream.values;
-      if (typeof values === 'function') {
-        const iterate = function (...a) {
-          const it = values.apply(this, a);
-          it.next = counted(it.next);
-          return it;
-        };
-        stream.values = iterate;
-        stream[Symbol.asyncIterator] = iterate;
-      }
+      portStreams.add(stream);
       this.#readable = stream;
       this.#source = source;
       send({ k: 'reading', doc });
@@ -291,14 +325,26 @@
       const port = this;
       const sink = {
         controller: null,
-        waiting: null, // a write the node's window has not taken yet
-        unsent: 0,     // bytes sent since the node last said its backlog
+        // The write in progress: what of its chunk the node's window has
+        // not taken yet.
+        waiting: null,
+        unsent: 0, // bytes sent since the node last said its backlog
         backlog: 0,
         closed: false,
-        // Resolve the waiting write once the line's queue has room.
-        wake() {
-          if (sink.waiting && sink.backlog + sink.unsent <= windowBytes) {
-            const w = sink.waiting;
+        // Send what the window has room for; resolve the write once its
+        // last byte is in, as Chrome resolves a write once its chunk is in
+        // the port's data pipe.
+        feed() {
+          const w = sink.waiting;
+          if (!w) return;
+          const room = windowBytes - (sink.backlog + sink.unsent);
+          if (room > 0) {
+            const part = w.rest.subarray(0, room);
+            w.rest = w.rest.subarray(part.length);
+            send({ k: 'tx', doc, b: b64(part) });
+            sink.unsent += part.length;
+          }
+          if (w.rest.length === 0) {
             sink.waiting = null;
             w.resolve();
           }
@@ -331,10 +377,13 @@
           else if (ArrayBuffer.isView(chunk)) bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
           else throw new TypeError("Failed to execute 'write' on 'UnderlyingSinkBase': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
           if (bytes.length === 0 || sink.closed) return undefined;
-          send({ k: 'tx', doc, b: b64(bytes) });
-          sink.unsent += bytes.length;
-          if (sink.backlog + sink.unsent <= windowBytes) return undefined;
-          return new Promise((resolve, reject) => { sink.waiting = { resolve, reject }; });
+          // Copied: the caller may reuse its buffer once the write resolves,
+          // and the rest is sent at later slices.
+          const rest = bytes.slice();
+          return new Promise((resolve, reject) => {
+            sink.waiting = { rest, resolve, reject };
+            sink.feed();
+          });
         },
         close() {
           sink.closed = true;
@@ -407,8 +456,14 @@
       return promise;
     }
 
+    // The origin gives the port up; an open port is closed, as Chrome
+    // closes an origin's connections when its permission goes (a port the
+    // policy grants cannot be given up).
     forget() {
-      return request('forget', { gen: this.#gen, origin }, this).then(() => undefined);
+      return request('forget', { gen: this.#gen, origin }, this).then((v) => {
+        if (v && v.closed) this._lost();
+        return undefined;
+      });
     }
 
     // Chrome's AbortClose: the port stays open, the close never resolves.
@@ -450,14 +505,14 @@
       if (this.#sink) {
         this.#sink.backlog = backlog;
         this.#sink.unsent = 0;
-        this.#sink.wake();
+        this.#sink.feed();
       }
       return reads;
     }
 
     _reading() { return this.#source !== null && !this.#source.closed; }
 
-    _locked() { return this.#readable !== null && this.#readable.locked; }
+    _transferred() { return this.#readable !== null && transferred.has(this.#readable); }
 
     // The device went away (Chrome's OnConnectionError).
     _lost() {
@@ -604,13 +659,16 @@
       try {
         const wasGen = gen;
         const wasPlugged = plugged;
+        const wasGranted = granted;
         gen = a.gen;
         plugged = a.plugged;
         granted = a.granted;
         windowBytes = a.window;
         for (const r of a.replies) settle(r);
+        // A port the origin may use fires disconnect whether or not the
+        // page has asked for it yet (Chrome's GetOrCreatePort).
         if (wasPlugged && (!plugged || gen !== wasGen)) {
-          const old = portsByGen.get(wasGen);
+          const old = portsByGen.get(wasGen) || (wasGranted ? portFor(wasGen) : null);
           if (old) {
             old._lost();
             fire(old, 'disconnect');
@@ -622,15 +680,21 @@
         let reads = 0;
         if (openPort) reads = openPort._slice(a.rx ? unb64(a.rx) : null, a.backlog);
         return {
-          t: performance.timeOrigin + performance.now(),
+          t: performance.now(),
           doc,
+          iso: !!globalThis.crossOriginIsolated,
+          hidden: document.visibilityState === 'hidden',
           reading: !!(openPort && openPort._reading()),
-          locked: !!(openPort && openPort._locked()),
+          transferred: !!(openPort && openPort._transferred()),
           reads,
-          pageReads,
         };
       } catch (e) {
-        return { t: performance.timeOrigin + performance.now(), doc, error: String(e && e.stack || e) };
+        return {
+          t: performance.now(),
+          doc,
+          iso: !!globalThis.crossOriginIsolated,
+          error: String(e && e.stack || e),
+        };
       }
     },
     // Pull the cable or put it back, at the node's next slice.
@@ -643,5 +707,5 @@
     get plugged() { return plugged; },
   };
   Object.defineProperty(globalThis, '__embsim', { configurable: false, enumerable: false, writable: false, value: Object.freeze(embsim) });
-  send({ k: 'hello', doc, origin });
+  send({ k: 'hello', doc, origin, href, late });
 })();

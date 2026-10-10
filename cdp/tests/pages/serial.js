@@ -77,6 +77,42 @@ window.t = {
     window.pendingRead = reader.read().then(() => 'resolved', caught);
     return idOf(port);
   },
+  // A port open, its reader taken, nothing read yet: the board's bytes
+  // wait in the port's pipe.
+  async openAndHold() {
+    const [port] = await navigator.serial.getPorts();
+    ports.push(port);
+    await port.open({ baudRate: BAUD });
+    window.heldReader = port.readable.getReader();
+    return idOf(port);
+  },
+  // Read until the stream ends or errors: the bytes, then how it ended.
+  async readAll() {
+    const bytes = [];
+    for (;;) {
+      let r;
+      try {
+        r = await window.heldReader.read();
+      } catch (e) {
+        return { bytes, error: caught(e) };
+      }
+      if (r.done) return { bytes, done: true };
+      bytes.push(...r.value);
+    }
+  },
+  // One write of `n` bytes, and the page's clock when it began and when it
+  // resolved.
+  async bigWrite(n) {
+    const [port] = await navigator.serial.getPorts();
+    ports.push(port);
+    await port.open({ baudRate: BAUD });
+    const writer = port.writable.getWriter();
+    const data = new Uint8Array(n);
+    for (let i = 0; i < n; i++) data[i] = (i * 31 + 7) & 0xff;
+    const began = performance.now();
+    await writer.write(data);
+    return { began, resolved: performance.now() };
+  },
   async afterReplug() {
     const read = await window.pendingRead;
     const a = ports[ports.length - 1];

@@ -17,17 +17,18 @@ use embsim_board::{
 use embsim_core::virtual_clock;
 
 use crate::base64;
-use crate::browser::{Browse, Browser, Drained, Granted};
+use crate::browser::{Browse, Browser, Drained, Granted, PageTarget};
+use crate::devtools::CdpError;
 
 /// The default quantum: how far the board's clock runs between two slices.
 ///
 /// The quantum is the latency a byte can wait before the page may react to
 /// it, and the most the two clocks are apart, so shorter is better until a
-/// slice's round trips dominate. Measured on an Apple M2 with Chrome 153
-/// (hc_design, the shipped MaD app, load average 17–24): a grant and the
-/// clock read cost 0.42 + 0.29 ms of host time, about 0.72 ms a slice
-/// (median), 1.1 ms (90th percentile). One millisecond is the USB
-/// full-speed frame period, the latency a USB serial adapter has anyway.
+/// slice's round trips dominate. A grant and the clock read cost about
+/// 0.72 ms of host time a slice (median) and 1.1 ms (90th percentile) with
+/// the shipped MaD app on an Apple M2 (`NODES.md` §15, evidence E1). One
+/// millisecond is the USB full-speed frame period, the latency a USB serial
+/// adapter has anyway.
 pub const DEFAULT_QUANTUM: Duration = Duration::from_millis(1);
 
 /// The longest quantum the node accepts: a page lags the board by up to a
@@ -38,29 +39,33 @@ pub const MAX_QUANTUM: Duration = Duration::from_secs(1);
 /// How long one grant may hold before the run fails as stuck, by default.
 /// Chrome holds a `pauseIfNetworkFetchesPending` budget while a fetch is in
 /// flight and while a task runs (a 1.5 s fetch held a 1 ms grant for 1.5 s,
-/// hc_antiCdp), so the bound is seconds, not a quantum.
+/// `NODES.md` §15, evidence E6), so the bound is seconds, not a quantum.
 pub const DEFAULT_STUCK_AFTER: Duration = Duration::from_secs(30);
 
-/// How long the drain barrier waits for a page's consumer to come back for
-/// more before it lets the slice go on. It waits only while a reader holds
-/// the port's stream; a consumer that reads in a way the probe does not see
-/// (`pipeTo`, a transform stream) is let go after [`DRAIN_STRIKES`] waits
-/// in a row that ran out.
+/// How long the drain barrier waits for a worker that owns the port's
+/// stream to come back for more, by default, before it lets the slice go
+/// on. A worker that reads in a way the probe does not see (`pipeTo`, a
+/// transform stream) is let go after [`DRAIN_STRIKES`] waits in a row that
+/// ran out.
 pub const DRAIN_BOUND: Duration = Duration::from_secs(1);
 
 /// Barrier waits in a row that run out before the barrier is turned off for
 /// that page, and the report says so.
 pub const DRAIN_STRIKES: u32 = 3;
 
-/// Bytes held for a page that is not reading yet, or for the line. A
-/// megabyte is five seconds of a 2 Mbaud line; past it the oldest are shed,
-/// counted.
+/// Bytes held for a page that is not reading yet, or for the line, at
+/// least. A megabyte is five seconds of a 2 Mbaud line; past it (or past
+/// two writer windows, whichever is more) the oldest are shed, counted.
 const QUEUE_MAX: usize = 1 << 20;
 
-/// A page clock that goes back, or forward by this much more than it was
-/// granted in one slice, has a new origin (a navigation to a new renderer
-/// process): the node re-anchors its books there and counts it.
-const DISCONTINUITY_MS: f64 = 1_000.0;
+/// A clock's resolution, in ms: Chrome clamps `performance.now()` to 5 µs
+/// in a cross-origin-isolated document and to 100 µs in any other.
+const ISOLATED_RESOLUTION_MS: f64 = 0.005;
+const RESOLUTION_MS: f64 = 0.1;
+
+/// How long the node watches for a Chrome it launched to exit, once its
+/// socket failed, before it says which.
+const EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// The serial port's identity on a USB bus, as Chrome's `getInfo()` reports
 /// it.
@@ -73,17 +78,25 @@ pub struct UsbIds {
 }
 
 /// What the node is set to: how it reaches Chrome and how it meters it.
+/// Made with [`Settings::new`]; [`CdpNode::new`] refuses what cannot run.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Settings {
     /// Launch Chrome or attach to one.
     pub browse: Browse,
-    /// The quantum.
+    /// The quantum: more than zero, at most [`MAX_QUANTUM`].
     pub quantum: Duration,
-    /// Fail the run once a page leads the board by more than this.
+    /// Fail the run once a page leads the board by more than this (more
+    /// than zero).
     pub max_lead: Option<Duration>,
-    /// How long a grant may hold before the run fails as stuck.
+    /// How long a grant, or a page's side of a slice, may hold before the
+    /// run fails as stuck (more than zero).
     pub stuck_after: Duration,
-    /// A page to open in the first tab, once it is held.
+    /// How long the drain barrier waits for a worker to come back for more
+    /// (more than zero).
+    pub drain_bound: Duration,
+    /// A page to open once it is held: in a launched Chrome's first tab, or
+    /// in a new window of a browser the node attached to.
     pub url: Option<String>,
     /// The port's USB identity.
     pub usb: UsbIds,
@@ -100,12 +113,25 @@ impl Settings {
             quantum: DEFAULT_QUANTUM,
             max_lead: None,
             stuck_after: DEFAULT_STUCK_AFTER,
+            drain_bound: DRAIN_BOUND,
             url: None,
             usb: UsbIds::default(),
             granted: false,
         }
     }
 }
+
+/// Why [`CdpNode::new`] refused its settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsError(String);
+
+impl fmt::Display for SettingsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SettingsError {}
 
 /// Host time per slice, in 10 µs buckets to 100 ms.
 const BUCKET_NS: u64 = 10_000;
@@ -122,6 +148,7 @@ pub struct NodeStats {
     peak_lead_ns: AtomicU64,
     peak_overrun_ns: AtomicU64,
     reanchored: AtomicU64,
+    shared: AtomicU64,
     stuck: AtomicU64,
     from_page: AtomicU64,
     to_page: AtomicU64,
@@ -132,11 +159,14 @@ pub struct NodeStats {
     framing_errors: AtomicU64,
     mismatched_opens: AtomicU64,
     mismatched_bytes: AtomicU64,
+    signals: AtomicU64,
+    flow_control_opens: AtomicU64,
     drain_waits: AtomicU64,
     drain_timeouts: AtomicU64,
     drain_off: AtomicU64,
     unplugs: AtomicU64,
     plugs: AtomicU64,
+    late_at_attach: AtomicU64,
     booted: AtomicBool,
     boot_wall_ns: AtomicU64,
     boot_at_ns: AtomicU64,
@@ -154,7 +184,10 @@ pub(crate) struct Said {
     pub workers: u64,
     pub workers_unmetered: u64,
     pub workers_unprobed: u64,
+    pub workers_serial: u64,
     pub mismatch: Option<String>,
+    pub signals: Option<String>,
+    pub flow_control: Option<String>,
 }
 
 impl Default for NodeStats {
@@ -169,6 +202,7 @@ impl Default for NodeStats {
             peak_lead_ns: AtomicU64::new(0),
             peak_overrun_ns: AtomicU64::new(0),
             reanchored: AtomicU64::new(0),
+            shared: AtomicU64::new(0),
             stuck: AtomicU64::new(0),
             from_page: AtomicU64::new(0),
             to_page: AtomicU64::new(0),
@@ -179,11 +213,14 @@ impl Default for NodeStats {
             framing_errors: AtomicU64::new(0),
             mismatched_opens: AtomicU64::new(0),
             mismatched_bytes: AtomicU64::new(0),
+            signals: AtomicU64::new(0),
+            flow_control_opens: AtomicU64::new(0),
             drain_waits: AtomicU64::new(0),
             drain_timeouts: AtomicU64::new(0),
             drain_off: AtomicU64::new(0),
             unplugs: AtomicU64::new(0),
             plugs: AtomicU64::new(0),
+            late_at_attach: AtomicU64::new(0),
             booted: AtomicBool::new(false),
             boot_wall_ns: AtomicU64::new(0),
             boot_at_ns: AtomicU64::new(0),
@@ -205,6 +242,8 @@ impl fmt::Debug for NodeStats {
             .field("lived_ns", &self.lived_ns())
             .field("peak_lead_ns", &self.peak_lead_ns())
             .field("peak_overrun_ns", &self.peak_overrun_ns())
+            .field("reanchored", &self.reanchored())
+            .field("shared", &self.shared())
             .field("from_page", &self.from_page())
             .field("to_page", &self.to_page())
             .field("shed", &self.shed())
@@ -241,19 +280,24 @@ impl NodeStats {
         /// The board's time since the first page was booked, at the last
         /// slice, in nanoseconds.
         board_ns,
-        /// What that page's own clock says it lived over the same span.
+        /// What that page lived over the same span, booked from the time
+        /// it was granted and its clock's jumps past it.
         lived_ns,
         /// The furthest a page's clock has been ahead of the board's at a
         /// slice, in nanoseconds. Chrome moves a page's clock outside a
-        /// budget at a worker's birth and at storage calls (hc_antiCdp);
-        /// the node pays a lead back by skipping grants.
+        /// budget at a worker's birth and at storage calls (`NODES.md` §15,
+        /// evidence E5); the node pays a lead back by skipping grants.
         peak_lead_ns,
         /// The most a page's clock passed its budget in one slice, in
-        /// nanoseconds.
+        /// nanoseconds, beyond the clock's resolution.
         peak_overrun_ns,
-        /// Times a page's clock jumped (backwards, or more than a second
-        /// past its budget) and the books were re-anchored.
+        /// Times a page's books were set level with the board again: at
+        /// each new document (a navigation, a reload), and wherever a
+        /// page's clock went back.
         reanchored,
+        /// Slices in which pages that share one clock (a page and a window
+        /// it opened, in one renderer) were granted once between them.
+        shared,
         /// Grants that did not expire within the bound (the run fails at
         /// the first).
         stuck,
@@ -281,8 +325,14 @@ impl NodeStats {
         mismatched_opens,
         /// Bytes shed because of such an open (also in [`Self::shed`]).
         mismatched_bytes,
-        /// Slices that waited for a page's consumer to read what it was
-        /// handed before the next grant.
+        /// `setSignals` calls that asserted DTR, RTS or a break, which no
+        /// pin of the line carries.
+        signals,
+        /// Opens that asked for hardware (RTS/CTS) flow control, which no
+        /// pin of the line carries.
+        flow_control_opens,
+        /// Slices that waited for a worker that owns the port's stream to
+        /// read what it was handed before the next grant.
         drain_waits,
         /// Of those, waits that ran out.
         drain_timeouts,
@@ -292,6 +342,9 @@ impl NodeStats {
         unplugs,
         /// Cable re-inserts.
         plugs,
+        /// Documents already open when the node reached the browser, whose
+        /// scripts ran before the shim was installed in them.
+        late_at_attach,
     }
 
     /// How a page's clock stands against the board's at the last slice,
@@ -343,6 +396,30 @@ impl NodeStats {
             .lock()
             .expect("the failure is never poisoned")
             .clone()
+    }
+
+    /// Pages the node has held so far.
+    pub fn pages_held(&self) -> u64 {
+        self.said().pages
+    }
+
+    /// Dedicated workers the node has held so far.
+    pub fn workers_held(&self) -> u64 {
+        self.said().workers
+    }
+
+    /// Dedicated workers that asked for their own `navigator.serial`,
+    /// which is Chrome's: the board's port is the page's.
+    pub fn workers_with_serial(&self) -> u64 {
+        self.said().workers_serial
+    }
+
+    /// The browser's DevTools HTTP endpoint (`http://127.0.0.1:PORT`), once
+    /// the node has reached it: where a harness connects
+    /// (`connectOverCDP`).
+    pub fn devtools_endpoint(&self) -> Option<String> {
+        let said = self.said();
+        (!said.endpoint.is_empty()).then_some(said.endpoint)
     }
 
     pub(crate) fn said(&self) -> Said {
@@ -415,21 +492,23 @@ impl LinkControl {
 ///    `waitForDebuggerOnStart`): a page's clock paused, the binding and the
 ///    Web Serial shim in before its first script; a worker on the page's
 ///    clock (`advance` with a budget that never runs out).
-/// 2. Each page is granted what it is owed — the board's time since the
-///    page was first booked, less what the page's own clock says it lived
-///    — as a `pauseIfNetworkFetchesPending` budget, and the node waits for
-///    `virtualTimeBudgetExpired`; a grant that does not expire within
-///    [`Settings::stuck_after`] fails the run, saying why.
+/// 2. Each clock is granted what its pages are owed — the board's time
+///    since a page's document was first booked, less what the page has
+///    lived since — as a `pauseIfNetworkFetchesPending` budget, and the
+///    node waits for `virtualTimeBudgetExpired`; pages that share one
+///    clock (one renderer's main thread) are granted once between them. A
+///    grant that does not expire within [`Settings::stuck_after`] fails
+///    the run, saying why.
 /// 3. What the page sent during the grant goes onto the line at this
 ///    instant; what it asked of the port is answered.
 /// 4. One `Runtime.evaluate` hands the page the board's bytes and the
-///    answers, and reads its clock, which the node books from: a page
-///    ahead of the board is paid back by skipping its grants, and a lead
-///    past [`Settings::max_lead`] fails the run.
+///    answers, and reads its clock. A page lives exactly what it is
+///    granted, unless its clock passed the budget by more than its
+///    resolution: then that lead is booked, paid back by skipping its
+///    grants, and a lead past [`Settings::max_lead`] fails the run.
 /// 5. The drain barrier: when bytes were handed to a page whose port's
-///    stream is held, the node waits until the page's consumer — in the
-///    page, or in a dedicated worker the stream was transferred to — has
-///    called `read()` again, before the next grant.
+///    stream was transferred to a dedicated worker, the node waits until
+///    the worker has called `read()` again, before the next grant.
 /// 6. The next wake is armed a quantum on.
 ///
 /// JavaScript runs in no virtual time; the page's clock advances only in
@@ -458,22 +537,39 @@ impl fmt::Debug for CdpNode {
 }
 
 impl CdpNode {
-    /// A node whose line runs 8N1 at `baud_hz`, set as `settings` says.
-    pub fn new(settings: Settings, baud_hz: u32) -> Self {
-        let quantum = settings.quantum.clamp(Duration::from_nanos(1), MAX_QUANTUM);
-        Self {
+    /// A node whose line runs 8N1 at `baud_hz`, set as `settings` says;
+    /// refused, saying why, when a setting cannot run: a zero rate, a
+    /// quantum of zero or past [`MAX_QUANTUM`], or a zero bound.
+    pub fn new(settings: Settings, baud_hz: u32) -> Result<Self, SettingsError> {
+        let refuse = |why: &str| Err(SettingsError(why.to_string()));
+        if baud_hz == 0 {
+            return refuse("the line's rate is 0 baud; a line has a rate");
+        }
+        if settings.quantum.is_zero() || settings.quantum > MAX_QUANTUM {
+            return Err(SettingsError(format!(
+                "the quantum is {:?}; it is more than 0 and at most {:?}",
+                settings.quantum, MAX_QUANTUM
+            )));
+        }
+        if settings.max_lead.is_some_and(|lead| lead.is_zero()) {
+            return refuse("max_lead is 0; Chrome moves a clock outside its budget now and then");
+        }
+        if settings.stuck_after.is_zero() {
+            return refuse("stuck_after is 0; a grant takes some host time");
+        }
+        if settings.drain_bound.is_zero() {
+            return refuse("drain_bound is 0; a worker takes some host time to read");
+        }
+        Ok(Self {
             framing: UartFraming::new_8n1(baud_hz),
             baud_hz,
-            settings: Settings {
-                quantum,
-                ..settings
-            },
+            settings,
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(NodeStats::default()),
             ops: Arc::new(Mutex::new(VecDeque::new())),
             meter: None,
             started: false,
-        }
+        })
     }
 
     /// The node's counters, readable from any thread.
@@ -598,7 +694,7 @@ struct RxSide {
 /// Why the port stopped being held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Released {
-    /// The page closed it, or its document went.
+    /// The page closed it, or its document went, or it forgot the port.
     Closed,
     /// The cable was pulled.
     Unplugged,
@@ -614,15 +710,41 @@ struct Owner {
     reading: bool,
 }
 
-/// One page's books: its clock against the board's.
-#[derive(Debug, Default, Clone, Copy)]
+/// One page's books: its clock against the board's, for one document.
+#[derive(Debug, Default, Clone)]
 struct Books {
-    /// The board instant and the page's clock (ms) it was first booked at.
-    anchor: Option<(u64, f64)>,
-    /// What the page has lived since its anchor, by its clock.
+    /// The document they are kept for: the shim's id, or the clock's
+    /// origin in a document with no shim.
+    doc: Option<String>,
+    /// The board instant the page was first booked at.
+    anchor_ns: Option<u64>,
+    /// The page's clock (its document's `performance.now()`, ms) at the
+    /// last read.
+    last_ms: f64,
+    /// What the page has lived since its anchor: the time it was granted,
+    /// and its clock's jumps past a budget.
     lived_ns: u64,
-    /// The budget granted this slice, in nanoseconds.
+    /// The budget its clock was granted this slice, in nanoseconds.
     granted_ns: u64,
+}
+
+impl Books {
+    /// What the page is owed at `now_ns`: positive, it is behind.
+    fn owed(&self, now_ns: u64) -> Option<i64> {
+        self.anchor_ns
+            .map(|anchor| now_ns.saturating_sub(anchor) as i64 - self.lived_ns as i64)
+    }
+}
+
+/// A page clock read at a slice.
+#[derive(Debug, Clone)]
+struct Reading {
+    /// `performance.now()`, ms.
+    t_ms: f64,
+    /// The document it is read in.
+    doc: String,
+    /// The clock's resolution, ms.
+    resolution_ms: f64,
 }
 
 /// One page's barrier.
@@ -678,6 +800,10 @@ fn refused(id: u64, name: &str, message: &str) -> Value {
 
 const OPEN_ERROR: &str = "Failed to open serial port.";
 const NOT_SELECTED: &str = "No port selected by the user.";
+
+/// Why a task that never ends holds a page, as a failure says it.
+const NEVER_ENDS: &str = "a task that never ends holds it (a loop that waits on the page's own \
+                          clock never ends, since the clock does not move while a task runs)";
 
 impl Meter {
     fn arm_first(&self, now_ns: u64) {
@@ -775,25 +901,14 @@ impl Meter {
             if let Err(e) = browser.drain_socket() {
                 return Err(self.gone(browser, e));
             }
-        }
-
-        // 1. Each page is granted what it is owed.
-        let sessions: Vec<String> = browser_of(state).pages.keys().cloned().collect();
-        let mut budgets = Vec::new();
-        for session in &sessions {
-            let books = state.books.entry(session.clone()).or_default();
-            books.granted_ns = 0;
-            let Some((anchor_ns, _)) = books.anchor else {
-                continue;
-            };
-            let owed = now_ns.saturating_sub(anchor_ns) as i64 - books.lived_ns as i64;
-            if owed > 0 {
-                books.granted_ns = owed as u64;
-                budgets.push((session.clone(), owed as f64 / 1e6));
-            } else {
-                self.stats.add(&self.stats.skipped, 1);
+            if let Some(why) = browser.navigation_failure() {
+                return Err(why);
             }
         }
+        crashed(browser_of(state))?;
+
+        // 1. Each clock is granted what its pages are owed.
+        let budgets = self.budgets(state, now_ns);
         if !budgets.is_empty() {
             let browser = state.browser.as_mut().expect("booted above");
             let granted = match browser.grant(&budgets, self.settings.stuck_after) {
@@ -802,27 +917,14 @@ impl Meter {
             };
             if let Granted::Stuck { session, budget_ms } = granted {
                 self.stats.add(&self.stats.stuck, 1);
-                return Err(format!(
-                    "a grant stuck: the page{} was granted {budget_ms:.3} ms of virtual time and \
-                     its budget did not expire within {:.1} s of host time; Chrome holds a \
-                     budget while a network fetch is in flight and while a task runs, so a \
-                     fetch that never completes or a task that never ends holds it",
-                    page_url(browser, &session),
-                    self.settings.stuck_after.as_secs_f64()
+                return Err(stuck(
+                    browser.pages.get(&session),
+                    budget_ms,
+                    self.settings.stuck_after,
                 ));
             }
-            for (session, _) in &budgets {
-                if let Some(books) = state.books.get(session) {
-                    self.stats.add(&self.stats.granted_ns, books.granted_ns);
-                }
-            }
         }
-        if let Some(page) = browser_of(state).pages.values().find(|page| page.crashed) {
-            return Err(format!(
-                "a page crashed{}",
-                page_url_of(page.origin.as_deref())
-            ));
-        }
+        crashed(browser_of(state))?;
 
         // 2. What the pages said, and the cable, at this instant.
         let gone = std::mem::take(&mut state.browser.as_mut().expect("booted above").gone);
@@ -848,7 +950,7 @@ impl Meter {
         }
         for (session, inbox) in inboxes {
             for message in inbox {
-                self.take(state, &session, message);
+                self.take(state, &session, message)?;
             }
         }
 
@@ -879,7 +981,55 @@ impl Meter {
         said.workers = browser.workers_seen;
         said.workers_unmetered = browser.workers_unmetered;
         said.workers_unprobed = browser.workers_unprobed;
+        said.workers_serial = browser.workers_serial;
         Ok(())
+    }
+
+    /// Each clock's budget this slice, in ms, set on the page that takes
+    /// it; every page's `granted_ns` set to its clock's.
+    ///
+    /// Pages whose main thread is one renderer's share one virtual clock
+    /// (Chrome reports one `virtualTimeTicksBase` for them): a budget to
+    /// any of them advances them all, and two budgets advance them twice.
+    /// So a clock is granted once, what its most-owed page is owed, through
+    /// each of its pages in turn (a page that is never granted keeps its
+    /// next document's load waiting).
+    fn budgets(&self, state: &mut State, now_ns: u64) -> Vec<(String, f64)> {
+        let mut clocks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for page in browser_of(state).pages.values() {
+            let key = match page.clock {
+                Some(clock) => format!("clock {clock}"),
+                None => format!("page {}", page.session),
+            };
+            clocks.entry(key).or_default().push(page.session.clone());
+        }
+        let turn = self.stats.slices() as usize;
+        let mut budgets = Vec::new();
+        for pages in clocks.values() {
+            let owed = pages
+                .iter()
+                .filter_map(|session| state.books.get(session).and_then(|b| b.owed(now_ns)))
+                .max();
+            for session in pages {
+                state.books.entry(session.clone()).or_default().granted_ns = 0;
+            }
+            let Some(owed) = owed else {
+                continue;
+            };
+            if owed <= 0 {
+                self.stats.add(&self.stats.skipped, 1);
+                continue;
+            }
+            if pages.len() > 1 {
+                self.stats.add(&self.stats.shared, 1);
+            }
+            for session in pages {
+                state.books.entry(session.clone()).or_default().granted_ns = owed as u64;
+            }
+            self.stats.add(&self.stats.granted_ns, owed as u64);
+            budgets.push((pages[turn % pages.len()].clone(), owed as f64 / 1e6));
+        }
+        budgets
     }
 
     /// Reach Chrome, the board held at `now_ns`.
@@ -893,14 +1043,18 @@ impl Meter {
         let mut browser = Browser::boot(&self.settings.browse, shim)
             .map_err(|why| format!("Chrome could not be reached: {why}"))?;
         if let Some(url) = &self.settings.url {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while browser.pages.is_empty() && Instant::now() < deadline {
-                browser
-                    .pump(Instant::now() + Duration::from_millis(20))
-                    .map_err(|e| self.gone(&browser, e))?;
+            let launched = matches!(self.settings.browse, Browse::Launch(_));
+            if launched {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while browser.pages.is_empty() && Instant::now() < deadline {
+                    browser
+                        .pump(Instant::now() + Duration::from_millis(20))
+                        .map_err(|e| self.gone(&browser, e))?;
+                }
             }
-            browser.open(url)?;
+            browser.open(url, launched)?;
         }
+        browser.booted();
         self.stats
             .boot_wall_ns
             .store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -915,18 +1069,34 @@ impl Meter {
             took = ?started.elapsed(),
             at_ns = now_ns,
             version = %browser.version,
+            endpoint = %browser.endpoint,
             "chrome-cdp: Chrome reached on host time; the board's clock meters it from here"
         );
         Ok(browser)
     }
 
     /// Why a DevTools failure stops the node: what Chrome did, if it was
-    /// ours and exited.
-    fn gone(&self, browser: &Browser, e: crate::devtools::CdpError) -> String {
-        let exited = browser
-            .process
-            .as_ref()
-            .is_some_and(|process| process.leader_exited());
+    /// ours and exited. A socket that failed is watched a moment for the
+    /// process's exit, which it can precede.
+    fn gone(&self, browser: &Browser, e: CdpError) -> String {
+        let socket_failed = matches!(e, CdpError::Io(_) | CdpError::Closed);
+        let exited = browser.process.as_ref().is_some_and(|process| {
+            let until = Instant::now()
+                + if socket_failed {
+                    EXIT_GRACE
+                } else {
+                    Duration::ZERO
+                };
+            loop {
+                if process.leader_exited() {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
         if exited {
             format!("Chrome exited mid-run ({e})")
         } else {
@@ -973,13 +1143,13 @@ impl Meter {
     }
 
     /// One thing a page said through its binding.
-    fn take(&self, state: &mut State, session: &str, message: Value) {
+    fn take(&self, state: &mut State, session: &str, message: Value) -> Result<(), String> {
         let doc = message["doc"].as_str().unwrap_or_default().to_string();
-        let current = state
+        let (current, at_boot) = state
             .browser
             .as_ref()
             .and_then(|b| b.pages.get(session))
-            .and_then(|page| page.doc.clone());
+            .map_or((None, false), |page| (page.doc.clone(), page.at_boot));
         match message["k"].as_str() {
             Some("hello") => {
                 // A new document: a port the old one held is closed with it.
@@ -993,6 +1163,20 @@ impl Meter {
                 state.replies.remove(session);
                 state.barriers.remove(session);
                 state.drains.retain(|(page, _, _)| page != session);
+                if message["late"] == true {
+                    let href = message["href"].as_str().unwrap_or_default();
+                    if at_boot {
+                        self.stats.add(&self.stats.late_at_attach, 1);
+                    } else {
+                        return Err(format!(
+                            "a page at {href} ran its own scripts before the node held it: \
+                             Chrome does not hold a page made with a URL (Target.createTarget \
+                             with a url, /json/new), so its first document lived on host time \
+                             with Chrome's own Web Serial; make the page at about:blank and \
+                             navigate it, as Playwright's newPage and goto do"
+                        ));
+                    }
+                }
             }
             Some("link") => match message["op"].as_str() {
                 Some("unplug") => self.link(state, LinkOp::Unplug),
@@ -1022,9 +1206,10 @@ impl Meter {
                 match &state.owner {
                     Some(owner) if owner.page == session && owner.doc == doc && state.plugged => {
                         if owner.matches_line {
+                            let bound = QUEUE_MAX.max(2 * self.window(owner) as usize);
                             state.tx.extend(bytes);
-                            if state.tx.len() > QUEUE_MAX {
-                                let excess = state.tx.len() - QUEUE_MAX;
+                            if state.tx.len() > bound {
+                                let excess = state.tx.len() - bound;
                                 state.tx.drain(..excess);
                                 self.stats.add(&self.stats.shed, excess as u64);
                             }
@@ -1048,6 +1233,16 @@ impl Meter {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// The writer's window for the port's owner: how many bytes may wait
+    /// for the line before a write waits — the port's `bufferSize`, or two
+    /// quanta of the line's bytes when that is more, so a page writing at
+    /// the line's rate keeps it busy across a slice's round trip.
+    fn window(&self, owner: &Owner) -> u64 {
+        let per_quantum = self.baud_hz as u64 * self.quantum_ns / 1_000_000_000 / 10;
+        owner.buffer_size.max(2 * per_quantum)
     }
 
     /// Answer a request, or `None` while it waits (a drain).
@@ -1117,6 +1312,19 @@ impl Meter {
                         tracing::error!("chrome-cdp: {said}");
                         self.stats.said.lock().expect("never poisoned").mismatch = Some(said);
                     }
+                    if m["flowControl"] == "hardware" {
+                        self.stats.add(&self.stats.flow_control_opens, 1);
+                        let said = "a page opened the port with hardware flow control: the \
+                                    line has no RTS or CTS pin, so nothing paces its bytes"
+                            .to_string();
+                        tracing::warn!("chrome-cdp: {said}");
+                        self.stats
+                            .said
+                            .lock()
+                            .expect("never poisoned")
+                            .flow_control
+                            .get_or_insert(said);
+                    }
                     state.owner = Some(Owner {
                         page: session.to_string(),
                         doc: doc.to_string(),
@@ -1165,7 +1373,33 @@ impl Meter {
                 }
                 ok(id, Value::Null)
             }
-            "setSignals" => ok(id, Value::Null),
+            "setSignals" => {
+                let asserted: Vec<&str> = [
+                    ("dataTerminalReady", "DTR"),
+                    ("requestToSend", "RTS"),
+                    ("break", "a break"),
+                ]
+                .into_iter()
+                .filter(|(key, _)| m["signals"][key] == true)
+                .map(|(_, name)| name)
+                .collect();
+                if !asserted.is_empty() {
+                    self.stats.add(&self.stats.signals, 1);
+                    let said = format!(
+                        "a page asserted {} (setSignals): the line has no modem-control pins, \
+                         so nothing on the board saw it",
+                        asserted.join(" and ")
+                    );
+                    tracing::warn!("chrome-cdp: {said}");
+                    self.stats
+                        .said
+                        .lock()
+                        .expect("never poisoned")
+                        .signals
+                        .get_or_insert(said);
+                }
+                ok(id, Value::Null)
+            }
             "getSignals" => ok(
                 id,
                 // No pin carries DCD, CTS, RI or DSR: an adapter's inputs
@@ -1178,8 +1412,18 @@ impl Meter {
                 }),
             ),
             "forget" => {
-                state.granted.remove(&origin);
-                ok(id, Value::Null)
+                // A permission the policy grants cannot be revoked, and the
+                // port stays; otherwise the origin loses the port, and an
+                // open one is closed, as Chrome closes an origin's
+                // connections when its permission goes.
+                let closed = !self.settings.granted && holds;
+                if !self.settings.granted {
+                    state.granted.remove(&origin);
+                }
+                if closed {
+                    self.release(state, Released::Closed);
+                }
+                ok(id, json!({ "closed": closed }))
             }
             other => refused(
                 id,
@@ -1245,10 +1489,7 @@ impl Meter {
             _ => Vec::new(),
         };
         let backlog = state.tx.len() + self.capacity.saturating_sub(self.line.bridge().tx_room());
-        let window = owner.as_ref().map_or(255, |o| {
-            let per_quantum = self.baud_hz as u64 * self.quantum_ns / 1_000_000_000 / 10;
-            o.buffer_size.max(2 * per_quantum)
-        });
+        let window = owner.as_ref().map_or(255, |o| self.window(o));
         let granted = self.settings.granted
             || origin
                 .as_ref()
@@ -1264,8 +1505,14 @@ impl Meter {
         });
         let browser = state.browser.as_mut().expect("booted above");
         let base = browser.reads(session);
-        let answer = match browser.slice(session, &arg) {
+        let answer = match browser.slice(session, &arg, self.settings.stuck_after) {
             Ok(answer) => answer,
+            Err(CdpError::Timeout { after, .. }) => {
+                // What the page said meanwhile (a dialog it opened) names
+                // why it did not return.
+                let _ = browser.drain_socket();
+                return Err(unanswered(browser.pages.get(session), after));
+            }
             Err(e) => return Err(self.gone(browser, e)),
         };
         let Some(answer) = answer else {
@@ -1290,9 +1537,12 @@ impl Meter {
         if let Some(error) = answer["error"].as_str() {
             tracing::error!(%error, "chrome-cdp: the page's shim failed a slice");
         }
+        if let Some(page) = browser.pages.get_mut(session) {
+            page.hidden = answer["hidden"] == true;
+        }
         self.stats.add(&self.stats.to_page, rx_bytes.len() as u64);
-        if let Some(t) = answer["t"].as_f64() {
-            self.book(state, session, t, now_ns)?;
+        if let Some(reading) = reading_of(&answer) {
+            self.book(state, session, reading, now_ns)?;
         }
         if let Some(owner) = state
             .owner
@@ -1301,18 +1551,20 @@ impl Meter {
         {
             owner.reading = answer["reading"].as_bool().unwrap_or(owner.reading);
         }
-        // The barrier: the bytes taken, and the consumer back for more.
+        // The barrier: armed when the port's stream was transferred to a
+        // worker, whose read of the bytes Chrome's clock does not wait for.
         let reads = answer["reads"].as_u64().unwrap_or(0);
-        let locked = answer["locked"].as_bool().unwrap_or(false);
+        let transferred = answer["transferred"].as_bool().unwrap_or(false);
         let barrier = state.barriers.entry(session.to_string()).or_default();
-        if !rx_bytes.is_empty() && locked && reads > 0 && !barrier.off {
+        if !rx_bytes.is_empty() && transferred && reads > 0 && !barrier.off {
             let doc = doc.unwrap_or_default();
             self.stats.add(&self.stats.drain_waits, 1);
             let browser = state.browser.as_mut().expect("booted above");
-            let drained = match browser.drain(session, &doc, base + reads, DRAIN_BOUND) {
-                Ok(drained) => drained,
-                Err(e) => return Err(self.gone(browser, e)),
-            };
+            let drained =
+                match browser.drain(session, &doc, base + reads, self.settings.drain_bound) {
+                    Ok(drained) => drained,
+                    Err(e) => return Err(self.gone(browser, e)),
+                };
             let barrier = state.barriers.entry(session.to_string()).or_default();
             match drained {
                 Drained::Met | Drained::Released => barrier.misses = 0,
@@ -1323,9 +1575,10 @@ impl Meter {
                         barrier.off = true;
                         self.stats.add(&self.stats.drain_off, 1);
                         tracing::warn!(
-                            "chrome-cdp: a page's consumer did not come back for more in {} \
-                             waits in a row; the drain barrier is off for that page (it reads \
-                             the port in a way the probe does not see: pipeTo, a transform)",
+                            "chrome-cdp: a worker that owns the port's stream did not come back \
+                             for more in {} waits in a row; the drain barrier is off for that \
+                             page (the worker reads the port in a way the probe does not see: \
+                             pipeTo, a transform)",
                             DRAIN_STRIKES
                         );
                     }
@@ -1335,41 +1588,65 @@ impl Meter {
         Ok(true)
     }
 
-    /// Book a page's clock reading `t_ms` at board instant `now_ns`.
-    fn book(&self, state: &mut State, session: &str, t_ms: f64, now_ns: u64) -> Result<(), String> {
+    /// Book a page's clock `reading` at board instant `now_ns`.
+    ///
+    /// A page lives exactly what its clock was granted: Chrome's virtual
+    /// time advances by the budget, and the clock the page reads is that
+    /// time clamped to its resolution, with a fuzz below it, so two
+    /// readings differ by up to twice the resolution more or less than the
+    /// time between them. So the books take the grant, and the reading only
+    /// past it by more than three times the resolution — a jump Chrome made
+    /// outside the budget, a lead. A new
+    /// document starts level with the board: its clock has an origin of
+    /// its own, and a navigation into a new renderer starts it anywhere.
+    fn book(
+        &self,
+        state: &mut State,
+        session: &str,
+        reading: Reading,
+        now_ns: u64,
+    ) -> Result<(), String> {
         let first = state
             .books
             .iter()
-            .filter_map(|(s, b)| b.anchor.map(|(at, _)| (at, s.clone())))
+            .filter_map(|(s, b)| b.anchor_ns.map(|at| (at, s.clone())))
             .min()
             .map(|(_, s)| s);
         let books = state.books.entry(session.to_string()).or_default();
-        let Some((anchor_ns, anchor_ms)) = books.anchor else {
-            books.anchor = Some((now_ns, t_ms));
+        let Some(anchor_ns) = books.anchor_ns else {
+            books.anchor_ns = Some(now_ns);
             books.lived_ns = 0;
+            books.last_ms = reading.t_ms;
+            books.doc = Some(reading.doc);
             return Ok(());
         };
-        let before = books.lived_ns;
-        let lived_ms = t_ms - anchor_ms;
-        let advanced_ms = lived_ms - before as f64 / 1e6;
-        let granted_ms = books.granted_ns as f64 / 1e6;
-        if advanced_ms < 0.0 || advanced_ms > granted_ms + DISCONTINUITY_MS {
-            // A new origin for the page's clock: book it level with the
+        let board = now_ns.saturating_sub(anchor_ns);
+        let tolerance = 3.0 * reading.resolution_ms;
+        let advanced_ms = reading.t_ms - books.last_ms;
+        let new_doc = books.doc.as_deref() != Some(reading.doc.as_str());
+        if new_doc || advanced_ms < -tolerance {
+            // A new document, or a clock that went back: level with the
             // board from here.
             self.stats.add(&self.stats.reanchored, 1);
-            let board = now_ns.saturating_sub(anchor_ns);
-            books.anchor = Some((anchor_ns, t_ms - board as f64 / 1e6));
             books.lived_ns = board;
+            books.last_ms = reading.t_ms;
+            books.doc = Some(reading.doc);
             return Ok(());
         }
-        books.lived_ns = (lived_ms * 1e6).round().max(0.0) as u64;
-        let overrun = (advanced_ms - granted_ms) * 1e6;
-        if overrun > 0.0 {
+        let granted_ms = books.granted_ns as f64 / 1e6;
+        let excess_ms = advanced_ms - granted_ms;
+        books.lived_ns += if excess_ms > tolerance {
+            let excess = (excess_ms * 1e6).round() as u64;
             self.stats
                 .peak_overrun_ns
-                .fetch_max(overrun.round() as u64, Ordering::Relaxed);
-        }
-        let board = now_ns.saturating_sub(anchor_ns);
+                .fetch_max(excess, Ordering::Relaxed);
+            books.granted_ns + excess
+        } else if excess_ms < -tolerance {
+            (advanced_ms.max(0.0) * 1e6).round() as u64
+        } else {
+            books.granted_ns
+        };
+        books.last_ms = reading.t_ms;
         let lead = books.lived_ns as i64 - board as i64;
         if first.as_deref().is_none_or(|s| s == session) {
             self.stats.board_ns.store(board, Ordering::Relaxed);
@@ -1397,23 +1674,89 @@ impl Meter {
     }
 }
 
-/// The browser, once booted.
-fn browser_of(state: &State) -> &Browser {
-    state.browser.as_ref().expect("booted at the first slice")
+/// A page's clock as its slice answer reads it: the shim's document and
+/// whether it is cross-origin isolated, or, in a document with no shim,
+/// the clock's origin.
+fn reading_of(answer: &Value) -> Option<Reading> {
+    let t_ms = answer["t"].as_f64()?;
+    let (doc, isolated) = match answer["doc"].as_str() {
+        Some(doc) => (doc.to_string(), answer["iso"] == true),
+        None => (
+            format!("origin {}", answer["o"].as_f64().unwrap_or_default()),
+            false,
+        ),
+    };
+    Some(Reading {
+        t_ms,
+        doc,
+        resolution_ms: if isolated {
+            ISOLATED_RESOLUTION_MS
+        } else {
+            RESOLUTION_MS
+        },
+    })
 }
 
-/// `" at http://…"`, the page's origin as an error names it.
-fn page_url(browser: &Browser, session: &str) -> String {
-    page_url_of(
-        browser
-            .pages
-            .get(session)
-            .and_then(|page| page.origin.as_deref()),
+/// A page that crashed stops the run, before a grant waits on it.
+fn crashed(browser: &Browser) -> Result<(), String> {
+    match browser.pages.values().find(|page| page.crashed) {
+        Some(page) => Err(format!(
+            "a page crashed{}: its renderer process went away mid-run",
+            page.at()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Why a page holds a grant or a slice: a dialog nobody answered, or a
+/// task that never ends.
+fn holding(page: Option<&PageTarget>) -> String {
+    match page.and_then(|page| page.dialog.as_ref()) {
+        Some(dialog) => format!(
+            "it shows a {} dialog ({:?}) that nobody answered; a harness answers a page's \
+             dialogs (Playwright dismisses them unless a test handles them)",
+            dialog.kind, dialog.message
+        ),
+        None => NEVER_ENDS.to_string(),
+    }
+}
+
+/// A grant that did not expire, as the failure says it.
+fn stuck(page: Option<&PageTarget>, budget_ms: f64, after: Duration) -> String {
+    let why = if page.is_some_and(|page| page.dialog.is_some()) {
+        holding(page)
+    } else {
+        format!(
+            "Chrome holds a budget while a network fetch is in flight and while a task runs: a \
+             fetch that never completes, or {NEVER_ENDS}"
+        )
+    };
+    format!(
+        "a grant stuck: the page{} was granted {budget_ms:.3} ms of virtual time and its budget \
+         did not expire within {:.1} s of host time{}; {why}",
+        page.map(PageTarget::at).unwrap_or_default(),
+        after.as_secs_f64(),
+        if page.is_some_and(|page| page.hidden) {
+            " (the page is hidden, a background tab)"
+        } else {
+            ""
+        },
     )
 }
 
-fn page_url_of(origin: Option<&str>) -> String {
-    origin.map(|o| format!(" at {o}")).unwrap_or_default()
+/// A page's side of a slice that did not return, as the failure says it.
+fn unanswered(page: Option<&PageTarget>, after: Duration) -> String {
+    format!(
+        "the main thread of the page{} did not return within {:.1} s of host time; {}",
+        page.map(PageTarget::at).unwrap_or_default(),
+        after.as_secs_f64(),
+        holding(page)
+    )
+}
+
+/// The browser, once booted.
+fn browser_of(state: &State) -> &Browser {
+    state.browser.as_ref().expect("booted at the first slice")
 }
 
 /// A span as a report prints it: `1.250 ms`.

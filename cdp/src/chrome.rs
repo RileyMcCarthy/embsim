@@ -46,18 +46,12 @@ pub fn on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// A TCP port free on the loopback interface now: the kernel's choice for
-/// port 0, released at once for Chrome to take.
-pub fn free_port() -> io::Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
-}
-
 /// What a launch starts.
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
     /// The Chrome binary.
     pub binary: PathBuf,
-    /// The DevTools port it listens on.
+    /// The DevTools port it listens on; 0 to let Chrome pick a free one.
     pub port: u16,
     /// `--headless=new`.
     pub headless: bool,
@@ -69,7 +63,10 @@ pub struct LaunchSpec {
 pub struct ChromeProcess {
     child: Child,
     profile: PathBuf,
+    /// The port its DevTools listen on, once read.
     port: u16,
+    /// Its browser target's WebSocket path (`/devtools/browser/…`).
+    ws_path: String,
 }
 
 /// Each launch's profile gets a number of its own within the process.
@@ -83,6 +80,16 @@ impl ChromeProcess {
     /// background renderer's timers, the macOS keychain), the ones
     /// Playwright passes for the same reason.
     pub fn launch(spec: &LaunchSpec) -> io::Result<Self> {
+        if spec.port != 0 && TcpListener::bind(("127.0.0.1", spec.port)).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "port {} on 127.0.0.1 is taken (by another debuggable Chrome?); leave \
+                     devtools_port out and Chrome picks a free one",
+                    spec.port
+                ),
+            ));
+        }
         let profile = std::env::temp_dir().join(format!(
             "embsim-cdp-{}-{}",
             std::process::id(),
@@ -101,6 +108,7 @@ impl ChromeProcess {
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
                 "--disable-component-update",
+                "--disable-component-extensions-with-background-pages",
                 "--disable-default-apps",
                 "--disable-sync",
                 "--disable-features=Translate,MediaRouter,OptimizationHints",
@@ -124,16 +132,67 @@ impl ChromeProcess {
                 format!("could not start {}: {e}", spec.binary.display()),
             )
         })?;
-        Ok(Self {
+        let mut process = Self {
             child,
             profile,
-            port: spec.port,
-        })
+            port: 0,
+            ws_path: String::new(),
+        };
+        process.await_devtools(spec)?;
+        Ok(process)
+    }
+
+    /// Wait until Chrome has opened DevTools, and read where: Chrome writes
+    /// the port it listens on and its browser target's path to
+    /// `DevToolsActivePort` in its profile, so the node reaches this Chrome
+    /// and no other, whatever else listens nearby.
+    fn await_devtools(&mut self, spec: &LaunchSpec) -> io::Result<()> {
+        let file = self.profile.join("DevToolsActivePort");
+        let deadline = Instant::now() + LAUNCH_TIMEOUT;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let mut lines = text.lines();
+                if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
+                    if let Ok(port) = port.trim().parse::<u16>() {
+                        self.port = port;
+                        self.ws_path = path.trim().to_string();
+                        return Ok(());
+                    }
+                }
+            }
+            if self.leader_exited() {
+                return Err(io::Error::other(format!(
+                    "{} exited before it opened DevTools",
+                    spec.binary.display()
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{} did not open DevTools within {:.0} s{}",
+                        spec.binary.display(),
+                        LAUNCH_TIMEOUT.as_secs_f64(),
+                        if spec.port == 0 {
+                            String::new()
+                        } else {
+                            format!(" (is port {} taken?)", spec.port)
+                        }
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The DevTools HTTP endpoint, `http://127.0.0.1:PORT`.
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The browser target's WebSocket, `ws://127.0.0.1:PORT/devtools/browser/…`.
+    pub fn ws_url(&self) -> String {
+        format!("ws://127.0.0.1:{}{}", self.port, self.ws_path)
     }
 
     /// Whether the browser process has exited, leaving it unreaped.

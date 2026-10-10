@@ -1,0 +1,53 @@
+# The host's Chrome on a serial line (README.md beside this file).
+#
+# A page in the host's Chrome writes "ping" to its Web Serial port every
+# 100 ms of its own clock; the port is a chrome-cdp component's line, wired
+# to a host-serial component's on one 3.3 V rail, so a program on the host
+# can read the pings from the PTY. The page lives the board's time: a run
+# of one second of board time hears nine pings, however long it takes on
+# the host.
+#
+#   embsim check project.toml
+#   embsim run project.toml --for 1s
+
+[[component]]
+name = "PC"
+kind = "chrome-cdp"
+[component.options]
+baud = 115200
+# The page, a file beside this one; Chrome opens it once it is held.
+url = "ping.html"
+# The scenario's policy: the page may use the port without a prompt.
+granted = true
+
+[[component]]
+name = "HOST"
+kind = "host-serial"
+[component.options]
+baud = 115200
+
+[[wire]]
+from = "PC.TX"
+to = "HOST.RX"
+
+[[wire]]
+from = "HOST.TX"
+to = "PC.RX"
+
+[[wire]]
+from = "BENCH.3V3"
+to = "PC.VIO"
+volts = 3.3
+
+[[wire]]
+from = "BENCH.3V3"
+to = "HOST.VIO"
+
+[[wire]]
+from = "BENCH.GND"
+to = "PC.GND"
+volts = 0.0
+
+[[wire]]
+from = "BENCH.GND"
+to = "HOST.GND"

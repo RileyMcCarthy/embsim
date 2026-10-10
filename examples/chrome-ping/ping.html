@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>ping</title></head>
+<body>
+<p id="state">connecting</p>
+<script>
+// Writes "ping\n" to the board every 100 ms of the page's own clock, from
+// the moment its port is open: the port the scenario grants this page
+// (chrome-cdp's `granted = true`), opened at the line's rate.
+(async () => {
+  const state = document.getElementById('state');
+  const [port] = await navigator.serial.getPorts();
+  if (!port) {
+    state.textContent = 'no port';
+    return;
+  }
+  await port.open({ baudRate: 115200 });
+  const writer = port.writable.getWriter();
+  const ping = new TextEncoder().encode('ping\n');
+  let sent = 0;
+  setInterval(() => {
+    writer.write(ping);
+    sent += 1;
+    state.textContent = `${sent} pings`;
+  }, 100);
+  state.textContent = 'open';
+})();
+</script>
+</body></html>

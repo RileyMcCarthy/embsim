@@ -5,18 +5,21 @@
 //! same socket with that page's or worker's session id. Commands are numbered;
 //! a reply is matched to its command by number, and an event that arrives
 //! while a reply is awaited is kept, in order, for [`DevTools::next_event`].
-//! Nothing here runs a thread: the node reads the socket only inside its own
-//! slices, on the engine's thread, so what Chrome says between slices waits
-//! in the socket until the next one.
+//! A command sent to a session that goes away — its target closed, detached
+//! or crashed — is answered [`CdpError::Gone`] as soon as the client reads
+//! that, so nothing waits for an answer that cannot come. Nothing here runs
+//! a thread: the node reads the socket only inside its own slices, on the
+//! engine's thread, so what Chrome says between slices waits in the socket
+//! until the next one.
 //!
 //! Also used by tests and harnesses that drive a page the node holds, as
 //! Playwright's `connectOverCDP` would: [`browser_ws_url`] finds the
 //! browser's socket from its DevTools HTTP endpoint.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -34,15 +37,29 @@ pub enum CdpError {
         /// The browser's message.
         message: String,
     },
+    /// The command's session went away (its target closed, detached or
+    /// crashed) before the command was answered.
+    Gone {
+        /// The command's method.
+        method: String,
+    },
     /// No answer before the deadline.
     Timeout {
         /// What was awaited.
         what: String,
-        /// How long it was awaited, in host time.
+        /// How long it was awaited, in host time, from when it was sent.
         after: Duration,
     },
     /// The socket closed.
     Closed,
+}
+
+impl CdpError {
+    /// Whether the command failed only because its target refused it or
+    /// went away: the connection itself is sound.
+    pub fn is_target_gone(&self) -> bool {
+        matches!(self, CdpError::Protocol { .. } | CdpError::Gone { .. })
+    }
 }
 
 impl fmt::Display for CdpError {
@@ -51,6 +68,9 @@ impl fmt::Display for CdpError {
             CdpError::Io(e) => write!(f, "the DevTools socket failed: {e}"),
             CdpError::Protocol { method, message } => {
                 write!(f, "Chrome refused {method}: {message}")
+            }
+            CdpError::Gone { method } => {
+                write!(f, "the target went away before Chrome answered {method}")
             }
             CdpError::Timeout { what, after } => write!(
                 f,
@@ -93,7 +113,20 @@ pub struct Event {
 }
 
 /// A command's answer, kept until it is asked for.
-type Answer = Result<Value, (String, String)>;
+#[derive(Debug)]
+enum Answer {
+    Result(Value),
+    Refused(String),
+    Gone,
+}
+
+/// A command sent and not yet taken.
+#[derive(Debug)]
+struct Pending {
+    method: String,
+    session: Option<String>,
+    sent: Instant,
+}
 
 /// One DevTools connection.
 pub struct DevTools {
@@ -104,9 +137,12 @@ pub struct DevTools {
     /// Answers read before they were asked for, by command number.
     answers: HashMap<u64, Answer>,
     /// Commands whose answer nobody will ask for: dropped on arrival.
-    forgotten: std::collections::HashSet<u64>,
-    /// The method of each command still unanswered, for its error.
-    methods: HashMap<u64, String>,
+    forgotten: HashSet<u64>,
+    /// Each command not yet taken: its method, session and send time.
+    pending: HashMap<u64, Pending>,
+    /// Sessions that went away: a command sent to one is answered
+    /// [`CdpError::Gone`] at once.
+    gone: HashSet<String>,
 }
 
 impl fmt::Debug for DevTools {
@@ -114,8 +150,25 @@ impl fmt::Debug for DevTools {
         f.debug_struct("DevTools")
             .field("next_id", &self.next_id)
             .field("queued_events", &self.events.len())
+            .field("pending", &self.pending.len())
             .finish_non_exhaustive()
     }
+}
+
+/// A connection to the first of `host`'s addresses (`HOST:PORT`) that
+/// takes one, in the resolver's order: `localhost` resolves to `::1` before
+/// `127.0.0.1` on some hosts, and Chrome's DevTools listens on the second
+/// only.
+fn connect_any(host: &str, timeout: Duration) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = host.to_socket_addrs()?.collect();
+    let mut last = io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"));
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 impl DevTools {
@@ -128,10 +181,7 @@ impl DevTools {
             ))
         })?;
         let host = rest.split('/').next().unwrap_or(rest);
-        let addr = host.to_socket_addrs()?.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}"))
-        })?;
-        let stream = TcpStream::connect_timeout(&addr, timeout)?;
+        let stream = connect_any(host, timeout)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -145,12 +195,15 @@ impl DevTools {
             next_id: 1,
             events: VecDeque::new(),
             answers: HashMap::new(),
-            forgotten: Default::default(),
-            methods: HashMap::new(),
+            forgotten: HashSet::new(),
+            pending: HashMap::new(),
+            gone: HashSet::new(),
         })
     }
 
-    /// Send a command and return its number; [`Self::wait`] takes its answer.
+    /// Send a command and return its number; [`Self::wait`] takes its
+    /// answer. A command to a session that has gone away is not sent, and
+    /// is answered [`CdpError::Gone`].
     pub fn send(
         &mut self,
         session: Option<&str>,
@@ -159,11 +212,22 @@ impl DevTools {
     ) -> Result<u64, CdpError> {
         let id = self.next_id;
         self.next_id += 1;
+        self.pending.insert(
+            id,
+            Pending {
+                method: method.to_string(),
+                session: session.map(str::to_string),
+                sent: Instant::now(),
+            },
+        );
+        if session.is_some_and(|s| self.gone.contains(s)) {
+            self.answers.insert(id, Answer::Gone);
+            return Ok(id);
+        }
         let mut message = json!({ "id": id, "method": method, "params": params });
         if let Some(session) = session {
             message["sessionId"] = Value::String(session.to_string());
         }
-        self.methods.insert(id, method.to_string());
         self.socket
             .send(Message::text(message.to_string()))
             .map_err(ws_error)?;
@@ -179,32 +243,43 @@ impl DevTools {
         params: Value,
     ) -> Result<(), CdpError> {
         let id = self.send(session, method, params)?;
-        if self.answers.remove(&id).is_none() {
+        if self.answers.remove(&id).is_some() {
+            self.pending.remove(&id);
+        } else {
             self.forgotten.insert(id);
         }
         Ok(())
     }
 
+    /// Command `id`'s answer, if it has come (or never will), without
+    /// reading the socket.
+    pub fn try_take(&mut self, id: u64) -> Option<Result<Value, CdpError>> {
+        let answer = self.answers.remove(&id)?;
+        let method = self
+            .pending
+            .remove(&id)
+            .map(|p| p.method)
+            .unwrap_or_default();
+        Some(match answer {
+            Answer::Result(value) => Ok(value),
+            Answer::Refused(message) => Err(CdpError::Protocol { method, message }),
+            Answer::Gone => Err(CdpError::Gone { method }),
+        })
+    }
+
     /// Wait for command `id`'s answer until `deadline`, keeping the events
     /// that arrive meanwhile.
     pub fn wait(&mut self, id: u64, deadline: Instant) -> Result<Value, CdpError> {
-        let started = Instant::now();
         loop {
-            if let Some(answer) = self.answers.remove(&id) {
-                let method = self.methods.remove(&id).unwrap_or_default();
-                return answer.map_err(|(_, message)| CdpError::Protocol { method, message });
+            if let Some(answer) = self.try_take(id) {
+                return answer;
             }
             if !self.read_one(deadline)? {
-                return Err(CdpError::Timeout {
-                    what: format!(
-                        "{} (command {id})",
-                        self.methods
-                            .get(&id)
-                            .map(String::as_str)
-                            .unwrap_or("a command")
-                    ),
-                    after: started.elapsed(),
-                });
+                let (what, after) = match self.pending.get(&id) {
+                    Some(p) => (format!("{} (command {id})", p.method), p.sent.elapsed()),
+                    None => (format!("command {id}"), Duration::ZERO),
+                };
+                return Err(CdpError::Timeout { what, after });
             }
         }
     }
@@ -221,10 +296,33 @@ impl DevTools {
         self.wait(id, Instant::now() + timeout)
     }
 
-    /// Whether command `id` has been answered yet (its answer stays for
-    /// [`Self::wait`]).
+    /// Whether command `id` has been answered yet, or never will be (its
+    /// answer stays for [`Self::wait`]).
     pub fn answered(&self, id: u64) -> bool {
         self.answers.contains_key(&id)
+    }
+
+    /// Mark `session` gone: every command still waiting on it is answered
+    /// [`CdpError::Gone`], and so is every command sent to it from now on.
+    pub fn session_gone(&mut self, session: &str) {
+        if !self.gone.insert(session.to_string()) {
+            return;
+        }
+        let ids: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(id, p)| {
+                p.session.as_deref() == Some(session) && !self.answers.contains_key(id)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            if self.forgotten.remove(&id) {
+                self.pending.remove(&id);
+            } else {
+                self.answers.insert(id, Answer::Gone);
+            }
+        }
     }
 
     /// The next event, read until `deadline`; `None` once it passes with
@@ -296,7 +394,9 @@ impl DevTools {
         }
     }
 
-    /// File one message: an answer by its number, or an event.
+    /// File one message: an answer by its number, or an event. An event
+    /// that says a session went away answers that session's commands at
+    /// once, before anyone pops it.
     fn take(&mut self, text: &str) -> Result<(), CdpError> {
         let message: Value = serde_json::from_str(text).map_err(|e| {
             CdpError::Io(io::Error::new(
@@ -306,21 +406,21 @@ impl DevTools {
         })?;
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
             if self.forgotten.remove(&id) {
-                self.methods.remove(&id);
+                self.pending.remove(&id);
                 return Ok(());
             }
             let answer = match message.get("error") {
-                Some(error) => Err((
-                    error.get("code").map(|c| c.to_string()).unwrap_or_default(),
+                Some(error) => Answer::Refused(
                     error
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("an error with no message")
                         .to_string(),
-                )),
-                None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+                ),
+                None => Answer::Result(message.get("result").cloned().unwrap_or(Value::Null)),
             };
-            self.answers.insert(id, answer);
+            // A command answered as gone keeps that answer.
+            self.answers.entry(id).or_insert(answer);
             return Ok(());
         }
         let method = message
@@ -328,13 +428,28 @@ impl DevTools {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let session = message
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        match method.as_str() {
+            "Target.detachedFromTarget" => {
+                if let Some(gone) = params.get("sessionId").and_then(Value::as_str) {
+                    self.session_gone(gone);
+                }
+            }
+            "Inspector.detached" | "Inspector.targetCrashed" => {
+                if let Some(gone) = session.as_deref() {
+                    self.session_gone(gone);
+                }
+            }
+            _ => {}
+        }
         self.events.push_back(Event {
-            session: message
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            session,
             method,
-            params: message.get("params").cloned().unwrap_or(Value::Null),
+            params,
         });
         Ok(())
     }
@@ -387,11 +502,7 @@ pub fn browser_ws_url(endpoint: &str, timeout: Duration) -> io::Result<String> {
 
 /// `GET /json/version` over a plain socket, the body returned.
 fn get_json_version(host: &str) -> io::Result<String> {
-    let addr = host
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))?;
+    let mut stream = connect_any(host, Duration::from_millis(500))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     write!(
         stream,

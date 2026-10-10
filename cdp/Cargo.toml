@@ -23,7 +23,7 @@ libc.workspace = true
 # DevTools is JSON over a WebSocket.
 serde_json.workspace = true
 # The WebSocket, synchronous, client side, no TLS (DevTools is on loopback).
-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tungstenite = { workspace = true, features = ["handshake"] }
 # The kind's true/false options, read as the project file wrote them.
 toml.workspace = true
 tracing.workspace = true

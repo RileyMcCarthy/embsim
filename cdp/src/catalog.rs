@@ -20,12 +20,12 @@
 //! (`TX`, `RX`, `VIO`, `GND`, as `host-serial` has them), Web Serial in
 //! every page of the host's Chrome on the far side, every page's clock
 //! metered by the board's a quantum at a time. Building the project checks
-//! what can be checked without starting anything — the Chrome binary — and
-//! Chrome is launched (or attached to) at the node's first slice, a quantum
-//! after the run starts, with the board's clock held there while it does;
-//! so `embsim check` starts nothing. A grant that sticks, a lead past
-//! `max_lead`, or a Chrome that goes away stops the run
-//! ([`Report::failure`]).
+//! what can be checked without starting anything — the Chrome binary, the
+//! page to open — and Chrome is launched (or attached to) at the node's
+//! first slice, a quantum after the run starts, with the board's clock held
+//! there while it does; so `embsim check` starts nothing. A grant that
+//! sticks, a lead past `max_lead`, a page that crashes, or a Chrome that
+//! goes away stops the run ([`Report::failure`]).
 //!
 //! ```toml
 //! [[component]]
@@ -35,10 +35,10 @@
 //! baud = 2000000
 //! usb_vendor_id = 0x0403
 //! usb_product_id = 0x6001
-//! devtools_port = 9222
+//! url = "http://127.0.0.1:5174/"
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +46,7 @@ use embsim_board::report::instant;
 use embsim_board::{Catalog, Component, ComponentRequest, KindInfo, ProjectError, Report};
 use embsim_boards::catalog::CatalogSet;
 
-use crate::chrome::{find_chrome, free_port, on_path, LaunchSpec};
+use crate::chrome::{find_chrome, on_path, LaunchSpec};
 use crate::node::span;
 use crate::{
     Browse, CdpNode, NodeStats, Settings, UsbIds, DEFAULT_QUANTUM, DEFAULT_STUCK_AFTER, MAX_QUANTUM,
@@ -164,13 +164,29 @@ fn chrome_cdp(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proje
         vendor: usb_id(&mut options, "usb_vendor_id")?,
         product: usb_id(&mut options, "usb_product_id")?,
     };
-    let granted = boolean(&mut options, "granted")?.unwrap_or(false);
+    let granted = options.boolean("granted")?.unwrap_or(false);
     let url = options.string("url")?;
     let attach = options.string("attach")?;
     let chrome = options.string("chrome")?;
     let port = options.integer("devtools_port")?;
-    let headless = boolean(&mut options, "headless")?;
+    let headless = options.boolean("headless")?;
     options.finish()?;
+    let url = url
+        .map(|url| page_url(&url, dir).map_err(error))
+        .transpose()?;
+    let port = port
+        .map(|port| {
+            u16::try_from(port)
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| {
+                    error(format!(
+                        "options.devtools_port = {port} is not a TCP port (1 to 65535); leave it \
+                         out and Chrome picks a free one"
+                    ))
+                })
+        })
+        .transpose()?;
 
     let browse = match attach {
         Some(endpoint) => {
@@ -212,42 +228,34 @@ fn chrome_cdp(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proje
                     }
                 )));
             }
-            let port = match port {
-                None => free_port()
-                    .map_err(|e| error(format!("cannot find a free port for DevTools: {e}")))?,
-                Some(port) => u16::try_from(port)
-                    .ok()
-                    .filter(|port| *port > 0)
-                    .ok_or_else(|| {
-                        error(format!("options.devtools_port = {port} is not a TCP port"))
-                    })?,
-            };
             Browse::Launch(LaunchSpec {
                 binary,
-                port,
+                port: port.unwrap_or(0),
                 headless: headless.unwrap_or(true),
             })
         }
     };
     let what = match &browse {
         Browse::Launch(spec) => format!(
-            "Chrome {}{}, DevTools at http://127.0.0.1:{}",
+            "Chrome {}{}, DevTools {}",
             spec.binary.display(),
             if spec.headless { " (headless)" } else { "" },
-            spec.port
+            if spec.port == 0 {
+                "on a port it picks".to_string()
+            } else {
+                format!("at http://127.0.0.1:{}", spec.port)
+            }
         ),
         Browse::Attach(endpoint) => format!("the Chrome at {endpoint}"),
     };
-    let settings = Settings {
-        browse,
-        quantum: Duration::from_nanos(quantum_ns),
-        max_lead: max_lead.map(Duration::from_nanos),
-        stuck_after: Duration::from_nanos(stuck_after),
-        url,
-        usb,
-        granted,
-    };
-    let node = CdpNode::new(settings, baud);
+    let mut settings = Settings::new(browse);
+    settings.quantum = Duration::from_nanos(quantum_ns);
+    settings.max_lead = max_lead.map(Duration::from_nanos);
+    settings.stuck_after = Duration::from_nanos(stuck_after);
+    settings.url = url;
+    settings.usb = usb;
+    settings.granted = granted;
+    let node = CdpNode::new(settings, baud).map_err(|why| error(why.to_string()))?;
     reports.add(CdpReport {
         subject: spec.name.clone(),
         what,
@@ -259,19 +267,46 @@ fn chrome_cdp(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proje
     Ok(Box::new(node))
 }
 
-/// A `true`/`false` option.
-fn boolean(
-    options: &mut embsim_board::PartOptions,
-    name: &'static str,
-) -> Result<Option<bool>, ProjectError> {
-    match options.value(name) {
-        None => Ok(None),
-        Some(toml::Value::Boolean(value)) => Ok(Some(value)),
-        Some(other) => Err(options.error(format!(
-            "options.{name} is true or false; {other} is a {}",
-            other.type_str()
-        ))),
+/// The schemes `url` may name as written.
+const SCHEMES: [&str; 5] = ["http://", "https://", "file://", "about:", "data:"];
+
+/// The page `url` names: a URL as written, or a file next to the project
+/// as a `file://` URL.
+fn page_url(url: &str, dir: &Path) -> Result<String, String> {
+    let named = |scheme: &&str| {
+        url.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    if SCHEMES.iter().any(named) {
+        return Ok(url.to_string());
     }
+    let path = dir.join(url);
+    if !path.is_file() {
+        return Err(format!(
+            "options.url = {url:?} is a page to open: a URL (http://, https://, file://, about:, \
+             data:) or a file next to the project, and {} is not a file",
+            path.display()
+        ));
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("options.url = {url:?}: {e}"))?;
+    Ok(file_url(&path))
+}
+
+/// `path` as a `file://` URL, the bytes a URL path cannot hold
+/// percent-encoded.
+fn file_url(path: &Path) -> String {
+    let mut out = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// What a report has said so far.
@@ -280,8 +315,11 @@ struct Said {
     start: bool,
     boot: bool,
     mismatch: bool,
+    signals: bool,
+    flow_control: bool,
     drain_off: bool,
     unmetered: bool,
+    worker_serial: bool,
 }
 
 /// What a `chrome-cdp` says in a run: what it launches at the first look,
@@ -326,16 +364,30 @@ impl Report for CdpReport {
             }
         }
         let said = self.stats.said();
-        if let Some(mismatch) = said.mismatch {
-            if !std::mem::replace(&mut self.said.mismatch, true) {
-                lines.push(mismatch);
+        for (line, told) in [
+            (said.mismatch, &mut self.said.mismatch),
+            (said.signals, &mut self.said.signals),
+            (said.flow_control, &mut self.said.flow_control),
+        ] {
+            if let Some(line) = line {
+                if !std::mem::replace(told, true) {
+                    lines.push(line);
+                }
             }
         }
         if self.stats.drain_off() > 0 && !std::mem::replace(&mut self.said.drain_off, true) {
             lines.push(
-                "a page's consumer did not come back for more after its bytes in several waits \
-                 in a row: the drain barrier is off for it, so a busy consumer may take the \
-                 board's bytes a slice late"
+                "a worker that owns the port's stream did not come back for more after its \
+                 bytes in several waits in a row: the drain barrier is off for its page, so a \
+                 busy worker may take the board's bytes a slice late"
+                    .to_string(),
+            );
+        }
+        if said.workers_serial > 0 && !std::mem::replace(&mut self.said.worker_serial, true) {
+            lines.push(
+                "a dedicated worker asked for its own navigator.serial, which is Chrome's: the \
+                 board's line is the page's port, opened on the page's main thread and its \
+                 streams transferred to the worker"
                     .to_string(),
             );
         }
@@ -439,10 +491,51 @@ impl Report for CdpReport {
         }
         if stats.reanchored() > 0 {
             lines.push(format!(
-                "a page's clock jumped {} time{} (a navigation to a new renderer process): the \
-                 books were re-anchored there",
+                "a page's books were set level with the board {} time{}: at each new document \
+                 (a navigation, a reload), and wherever a page's clock went back",
                 stats.reanchored(),
                 if stats.reanchored() == 1 { "" } else { "s" }
+            ));
+        }
+        if stats.shared() > 0 {
+            lines.push(format!(
+                "pages that share one clock (a page and a window it opened, in one renderer) \
+                 were granted once between them in {} slice{}",
+                stats.shared(),
+                if stats.shared() == 1 { "" } else { "s" }
+            ));
+        }
+        if stats.signals() > 0 {
+            lines.push(format!(
+                "{} setSignals call{} asserted DTR, RTS or a break, which no pin of the line \
+                 carries",
+                stats.signals(),
+                if stats.signals() == 1 { "" } else { "s" }
+            ));
+        }
+        if stats.flow_control_opens() > 0 {
+            lines.push(format!(
+                "{} open{} asked for hardware flow control, which no pin of the line carries",
+                stats.flow_control_opens(),
+                if stats.flow_control_opens() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        if stats.late_at_attach() > 0 {
+            lines.push(format!(
+                "{} document{} open before the node reached Chrome had run {} scripts before the \
+                 shim was installed; reload a page to put it on the board's line and time from \
+                 its first script",
+                stats.late_at_attach(),
+                if stats.late_at_attach() == 1 { "" } else { "s" },
+                if stats.late_at_attach() == 1 {
+                    "its"
+                } else {
+                    "their"
+                }
             ));
         }
         if let Some(failure) = stats.failure() {

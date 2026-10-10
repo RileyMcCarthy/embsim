@@ -20,18 +20,27 @@
 //! - **Held from birth.** Every page and every dedicated worker attaches
 //!   paused (`Target.setAutoAttach` with `waitForDebuggerOnStart`). A page's
 //!   virtual time is paused, the node's binding and its Web Serial shim are
-//!   installed before its first script, and its workers attach the same
-//!   way; a dedicated worker follows the page's clock (`advance` with a
-//!   budget that never runs out). Service workers and shared workers run
+//!   installed before its first script, and its workers — and the workers
+//!   they start — attach the same way; a dedicated worker follows the
+//!   page's clock (`advance` with a budget that never runs out). Chrome
+//!   holds a page made at about:blank (Playwright's `newPage`, a window a
+//!   page opens) but not one it makes with a URL (`Target.createTarget`
+//!   with a url, `/json/new`): such a page's scripts run before the shim,
+//!   and the run stops saying so. Service workers and shared workers run
 //!   unmetered.
 //! - **Metered by slices.** Every quantum of board time the node is woken
-//!   on the engine's thread and grants each page what it is owed — the
-//!   board's time since the page was first booked, less what the page's own
-//!   clock says it lived — and waits for the budget to expire. JavaScript
-//!   runs in no virtual time; timers, `Date.now()`, `performance.now()` and
-//!   a WASM module's imported clock advance only in grants. A page whose
-//!   clock got ahead (Chrome moves it outside a budget at a worker's birth
-//!   and at storage calls) is paid back by skipping its grants.
+//!   on the engine's thread and grants each page's clock what the page is
+//!   owed — the board's time since its document was first booked, less
+//!   what it has lived since — and waits for the budget to expire. A page
+//!   lives exactly what it is granted; a jump of its clock past a budget
+//!   (Chrome moves it at a worker's birth and at storage calls) is a lead,
+//!   paid back by skipping the page's grants. Pages whose main thread is
+//!   one renderer's (a page and a window it opened) share one clock and
+//!   are granted once between them; a hidden page (a background tab),
+//!   whose answers Chrome holds back, is poked until it gives them.
+//!   JavaScript runs in no virtual time; timers, `Date.now()`,
+//!   `performance.now()` and a WASM module's imported clock advance only in
+//!   grants.
 //! - **The port is the node's.** The shim ([`SHIM`]) replaces
 //!   `navigator.serial` with a port whose far end is this line, by Chrome's
 //!   own rules: the messages, a `close()` refused while a stream is
@@ -42,9 +51,10 @@
 //!   `Runtime.evaluate` a slice, so they land at the board's instants.
 //! - **The drain barrier.** A dedicated worker that owns the port's
 //!   transferred stream is told the board's bytes by a message, which
-//!   Chrome's clock does not wait for. So after handing bytes over, the
-//!   node waits until the consumer has called `read()` again — a probe in
-//!   each realm reports read calls — before the next grant.
+//!   Chrome's clock does not wait for. So after handing bytes to a page
+//!   whose port's readable it transferred, the node waits until the worker
+//!   has called `read()` again on a stream it was sent — a probe in each
+//!   worker reports such reads — before the next grant.
 //!
 //! # In a project
 //!
@@ -59,7 +69,11 @@
 //! run with a host PTY is (`DETERMINISM.md`). Animation frames, resize and
 //! intersection observers barely run under virtual time; the OS's serial
 //! driver, Chrome's real Web Serial and a USB adapter are not in the byte
-//! path. A fresh browser context per scenario is the harness's job.
+//! path. The port is the page's: a worker's own `navigator.serial` is
+//! Chrome's, and an app that opens its port in a worker sees none (the
+//! report says when a worker asks). The line has no modem-control pins:
+//! DTR, RTS, a break and hardware flow control reach nothing, and the report
+//! counts them. A fresh browser context per scenario is the harness's job.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -71,9 +85,9 @@ pub mod devtools;
 mod node;
 
 pub use browser::Browse;
-pub use chrome::{find_chrome, free_port, LaunchSpec};
+pub use chrome::{find_chrome, LaunchSpec};
 pub use node::{
-    CdpNode, LinkControl, LinkOp, NodeStats, Settings, UsbIds, DEFAULT_QUANTUM,
+    CdpNode, LinkControl, LinkOp, NodeStats, Settings, SettingsError, UsbIds, DEFAULT_QUANTUM,
     DEFAULT_STUCK_AFTER, DRAIN_BOUND, DRAIN_STRIKES, MAX_QUANTUM,
 };
 

@@ -16,7 +16,7 @@ use embsim_board::{
     AttachError, Component, ComponentNetIo, EndpointRef, Finding, Harness, HostRailLine, PinDecl,
     System, SystemHandle, HOST_RAIL_PINS,
 };
-use embsim_cdp::devtools::{browser_ws_url, DevTools};
+use embsim_cdp::devtools::{browser_ws_url, CdpError, DevTools};
 use embsim_cdp::CdpNode;
 use embsim_core::virtual_clock::{self, Actor, ClockMode};
 use serde_json::{json, Value};
@@ -393,20 +393,181 @@ impl PageClient {
 
     /// Evaluate `expression` in the page's main world; its value.
     pub fn eval(&mut self, expression: &str) -> Value {
-        let answer = self
-            .devtools
+        self.try_eval(expression)
+            .unwrap_or_else(|why| panic!("{expression}: {why}"))
+    }
+
+    /// Evaluate `expression` in the page's main world: its value, or why
+    /// not (it threw, or the page did not answer).
+    pub fn try_eval(&mut self, expression: &str) -> Result<Value, String> {
+        let session = self.session.clone();
+        eval_on(&mut self.devtools, &session, expression, false)
+    }
+
+    /// Evaluate `expression` as a user's gesture would run it (transient
+    /// activation, as a click gives).
+    pub fn eval_gesture(&mut self, expression: &str) -> Value {
+        let session = self.session.clone();
+        eval_on(&mut self.devtools, &session, expression, true)
+            .unwrap_or_else(|why| panic!("{expression}: {why}"))
+    }
+
+    /// Send `method` on the page's own session.
+    pub fn call(&mut self, method: &str, params: Value) -> Result<Value, CdpError> {
+        let session = self.session.clone();
+        self.devtools
+            .call(Some(&session), method, params, Duration::from_secs(30))
+    }
+
+    /// Send `method` to the browser.
+    pub fn browser_call(&mut self, method: &str, params: Value) -> Result<Value, CdpError> {
+        self.devtools
+            .call(None, method, params, Duration::from_secs(30))
+    }
+
+    /// Send `method` on the page's session without waiting for an answer
+    /// (one that may never come, as a crash's).
+    pub fn send(&mut self, method: &str, params: Value) {
+        let session = self.session.clone();
+        self.devtools
+            .send_and_forget(Some(&session), method, params)
+            .expect("the command is sent");
+    }
+}
+
+/// Evaluate in `session`'s page, poking it while it is quiet: a hidden
+/// page (a background tab) holds back its answer until it next hears from
+/// the client, as the node pokes its pages.
+fn eval_on(
+    devtools: &mut DevTools,
+    session: &str,
+    expression: &str,
+    gesture: bool,
+) -> Result<Value, String> {
+    let id = devtools
+        .send(
+            Some(session),
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true, "userGesture": gesture }),
+        )
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut poke_at = Instant::now() + Duration::from_millis(20);
+    let answer = loop {
+        if let Some(answer) = devtools.try_take(id) {
+            break answer.map_err(|e| e.to_string())?;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!("no answer in 30 s to {expression}"));
+        }
+        if now >= poke_at {
+            devtools
+                .send_and_forget(
+                    Some(session),
+                    "Runtime.evaluate",
+                    json!({ "expression": "0", "silent": true }),
+                )
+                .map_err(|e| e.to_string())?;
+            poke_at = now + Duration::from_millis(20);
+        }
+        devtools
+            .read_message(deadline.min(poke_at))
+            .map_err(|e| e.to_string())?;
+        while devtools.pop_event().is_some() {}
+    };
+    if answer.get("exceptionDetails").is_some() {
+        return Err(format!("threw: {answer}"));
+    }
+    Ok(answer["result"]["value"].clone())
+}
+
+/// A harness's own DevTools client, as Playwright's `connectOverCDP` is:
+/// it makes browser contexts and pages, navigates them, evaluates in them
+/// and closes them, beside the node's connection.
+pub struct Driver {
+    devtools: DevTools,
+}
+
+impl Driver {
+    /// Connect to the browser whose DevTools HTTP endpoint is `endpoint`.
+    pub fn connect(endpoint: &str) -> Self {
+        let ws = browser_ws_url(endpoint, Duration::from_secs(30)).expect("DevTools answers");
+        Self {
+            devtools: DevTools::connect(&ws, Duration::from_secs(30)).expect("connects"),
+        }
+    }
+
+    /// Send `method` on `session` (the browser's, for `None`).
+    pub fn call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, CdpError> {
+        self.devtools
+            .call(session, method, params, Duration::from_secs(30))
+    }
+
+    /// A fresh browser context, as `browser.newContext()` makes one.
+    pub fn new_context(&mut self) -> String {
+        let made = self
+            .call(None, "Target.createBrowserContext", json!({}))
+            .expect("a browser context");
+        made["browserContextId"]
+            .as_str()
+            .expect("an id")
+            .to_string()
+    }
+
+    /// A page made with `params` (`Target.createTarget`), and this
+    /// client's session on it: `(target, session)`.
+    pub fn new_page(&mut self, params: Value) -> (String, String) {
+        let made = self
+            .call(None, "Target.createTarget", params)
+            .expect("a page");
+        let target = made["targetId"].as_str().expect("an id").to_string();
+        let attached = self
             .call(
-                Some(&self.session),
-                "Runtime.evaluate",
-                json!({ "expression": expression, "returnByValue": true }),
-                Duration::from_secs(30),
+                None,
+                "Target.attachToTarget",
+                json!({ "targetId": target, "flatten": true }),
             )
-            .expect("evaluates");
-        assert!(
-            answer.get("exceptionDetails").is_none(),
-            "{expression} threw: {answer}"
-        );
-        answer["result"]["value"].clone()
+            .expect("attaches");
+        let session = attached["sessionId"]
+            .as_str()
+            .expect("a session")
+            .to_string();
+        (target, session)
+    }
+
+    /// Navigate `session`'s page to `url`, without waiting for it to load
+    /// (its load is on the board's time).
+    pub fn navigate(&mut self, session: &str, url: &str) {
+        self.devtools
+            .send_and_forget(Some(session), "Page.navigate", json!({ "url": url }))
+            .expect("the navigation is sent");
+    }
+
+    /// Evaluate `expression` in `session`'s page: its value, or why not.
+    pub fn try_eval(&mut self, session: &str, expression: &str) -> Result<Value, String> {
+        eval_on(&mut self.devtools, session, expression, false)
+    }
+
+    /// Evaluate `expression` in `session`'s page.
+    pub fn eval(&mut self, session: &str, expression: &str) -> Value {
+        self.try_eval(session, expression)
+            .unwrap_or_else(|why| panic!("{expression}: {why}"))
+    }
+
+    /// Close a browser context and every page in it.
+    pub fn dispose_context(&mut self, context: &str) {
+        self.call(
+            None,
+            "Target.disposeBrowserContext",
+            json!({ "browserContextId": context }),
+        )
+        .expect("the context is disposed");
     }
 }
 
