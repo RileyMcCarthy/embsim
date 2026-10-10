@@ -716,17 +716,23 @@ launched, a fresh context per scenario, and changes with it:
   `this.sink?.(events)` (`DeviceSession.worker.ts`) into `n.call(this, e)`,
   which on a Comlink proxy asks to clone the session object and throws a
   `DataCloneError` nothing reports, so no device event reaches the UI; the
-  dev server hides it.
+  dev server hides it. The app is fixed in this step: the sink is called
+  without `.call`, so nothing asks the proxy to clone the session.
 - Two scenarios join: Disconnect then Connect, and flashing while
   connected. Chrome refuses `close()` while a stream of the port is still
   locked and keeps the port open until the stream lets go; the shim must
-  do the same, which today's fake does not.
+  do the same, which today's fake does not. Under a shim that does, the
+  app's own teardown failed 40 times of 40, so the app is fixed in this
+  step too: the main thread waits until the port's streams are released
+  before it calls `close()`, and before it opens the port again.
 
 *Files:* `SIL/MaDSim/Cargo.toml` (the crate E4 ships), `SIL/MaDSim/src/main.rs`
 (the node on the host pins, the two power wires, the DevTools port
 printed), `Software/Control/e2e/fixtures.mjs` and `run-all.mjs`,
-`SIL/makefile`, `.github/workflows/e2e-nightly.yml` (the nightly on this
-route). *Done when:* the e2e passes on the bump, the three link-drop
+`Software/Control/src/device/DeviceSession.worker.ts` (the sink call),
+`Software/Control/src/device/session.ts` (the wait before `close()` and
+the next `open()`), `SIL/makefile`, `.github/workflows/e2e-nightly.yml`
+(the nightly on this route). *Done when:* the e2e passes on the bump, the three link-drop
 scenarios (B5, M11's two) and the two new ones among them. Steps 10 and 11
 retire this route.
 
@@ -946,7 +952,11 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   follows the rule: step 1b puts the e2e, the nightly and a playground on
   `mad-emulator` with a `chrome-cdp` host once E4 ships, and steps 10 and 11
   move them onto the `-cosim` files. Chrome's own Web Serial and the OS's
-  serial driver are not in that path; MaD tests them on the machine.
+  serial driver are not in that path. On the machine they have so far been
+  exercised only by hand: the hardware harness,
+  `e2e/hw-read-save-config.mjs`, uses the same fake `navigator.serial`
+  over node-serialport. Moving it onto Chrome's real Web Serial, granted
+  ahead by Chrome policy, is MaD's to do (`NODES.md` §18, "Open").
 - **The loop supply.** `loop_volts = 24.0` is the isolation test's bench
   figure. Does the real machine source its switch loops from a supply of
   its own, or from the carrier's `5V_IO`/`GND_IO` (`J5`–`J8`)?
