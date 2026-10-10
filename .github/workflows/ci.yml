@@ -357,6 +357,36 @@ jobs:
       - name: Boot the P2 from a project with embsim run
         run: cargo test -p embsim-cli --test cli -- --include-ignored --nocapture
 
+  # The host's Chrome metered by the board's clock (embsim-cdp, NODES.md
+  # §15): the node against the runner's own google-chrome, headless, its
+  # pages (cdp/tests/pages) served by the test. The cases are #[ignore]d in
+  # the test job, so this is the one job that launches Chrome for them: the
+  # worker canary (a dedicated worker's 4 ms timer ticks 100 times in 400
+  # grants of 1 ms), the clocks, bytes round trip through the port shim,
+  # Chrome's close-while-locked and replug rules, and a page shaped like
+  # MaD Control against a stand-in board. What they assert is virtual time
+  # and bytes; host time per slice is printed, never asserted.
+  chrome-cdp:
+    name: chrome-cdp
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Ubuntu 24.04 restricts unprivileged user namespaces, which Chrome's
+      # sandbox uses.
+      - name: Let Chrome's sandbox make its namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Which Chrome
+        run: google-chrome --version
+      - name: The node against real Chrome
+        env:
+          CHROME: /usr/bin/google-chrome
+        run: >-
+          cargo test -p embsim-cdp --test real_chrome --
+          --ignored --nocapture --test-threads 1
+
   # A project's own catalog crates (PROJECTS.md §10, "The runner"): the
   # `embsim` binary writes a runner beside examples/custom-project, builds
   # it with Cargo in the release profile and runs the project through it; a
@@ -386,6 +416,7 @@ jobs:
       - supply-chain
       - msrv
       - p2-qemu-boot
+      - chrome-cdp
       - project-runner
     if: ${{ always() }}
     runs-on: ubuntu-latest
