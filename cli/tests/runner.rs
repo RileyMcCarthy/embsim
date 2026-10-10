@@ -1843,7 +1843,7 @@ fn target_dir() -> PathBuf {
 /// blinker's pad high at the module's START instant (5.5 ms), each rising
 /// edge reaching the counter the buffer's 12 ns later, one a millisecond.
 const EXAMPLE_RUN: [&str; 9] = [
-    "catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog",
+    "catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, custom-project-catalog",
     "EC32.U100: blinker: P0 high at 5.500000 ms, flipping every 0.500000 ms",
     "COUNTER: rising edge 1 on IN at 5.500012 ms",
     "COUNTER: rising edge 5 on IN at 9.500012 ms",
@@ -1998,7 +1998,7 @@ fn a_started_crate_builds_into_a_runner_and_runs_its_kinds() {
     assert_says(
         &stdout(&run),
         &[
-            "catalogs: embsim-boards, embsim-p2-qemu, sim-catalog",
+            "catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, sim-catalog",
             "BRD.U1: pin 1 read 2.5 V from 0.500000 ms",
             "SRC: drove OUT at 2.5 V behind 100 Ω from 0.500000 ms",
         ],
@@ -2076,7 +2076,7 @@ fn the_projects_own_runner_builds_in_its_workspace_and_runs() {
     assert_says(
         &stdout(&run),
         &[
-            "catalogs: embsim-boards, embsim-p2-qemu, sim-catalog",
+            "catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, sim-catalog",
             "runner crate sim-runner 0.1.0: ",
             "catalog crate sim-catalog 0.1.0: ",
             "BRD.U1: pin 1 read 2.5 V from 0.500000 ms",

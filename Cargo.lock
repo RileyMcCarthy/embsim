@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "embsim-cdp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "embsim-board",
  "embsim-boards",
@@ -344,6 +344,7 @@ dependencies = [
  "clap",
  "embsim-board",
  "embsim-boards",
+ "embsim-cdp",
  "embsim-core",
  "embsim-models",
  "embsim-p2-qemu",

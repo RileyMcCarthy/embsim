@@ -440,7 +440,7 @@ embsim run ds2.toml --for 5ms --net DS2.+3V3 --net DS2.VDDA --net DS2.~RESET
 
 ```text
 project ds2.toml
-  catalogs: embsim-boards, embsim-p2-qemu
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp
   …
 running for 5.000000 ms of virtual time
 findings at build, before any wake (11):
@@ -1394,7 +1394,7 @@ embsim: building the runner for rig.toml (sim-catalog, embsim at /home/me/embsim
 …
 embsim: wrote ./embsim.lock: the versions this runner was built from. Commit it: from now on the runner builds --locked against it, the same on every machine
 project rig.toml
-  catalogs: embsim-boards, embsim-p2-qemu, sim-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, sim-catalog
   embsim 0.3.0, git rev a47bf442f5a5, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate sim-catalog 0.1.0: /home/me/embsim/rig/sim/catalog, in the git repository at rev a47bf442f5a5, but no commit holds its files
@@ -1594,7 +1594,7 @@ An unknown kind is refused as before, listing every kind the set holds.
 
 ```text
 project project.toml
-  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, custom-project-catalog
 ```
 
 ### The `[catalog]` table
@@ -2458,7 +2458,7 @@ result can be traced to what produced it (`DESIGN.md` rule 9):
 
 ```text
 project project.toml
-  catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog
+  catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, custom-project-catalog
   embsim 0.3.0, git rev 4f0c2a1b3d5e, from /home/me/embsim
   built by rustc 1.96.1 (31fca3adb 2026-06-26), host aarch64-apple-darwin, LLVM 22.1.2, for aarch64-apple-darwin, profile release (opt-level 3)
   catalog crate custom-project-catalog 0.1.0: /home/me/embsim/examples/custom-project/catalog, git rev 4f0c2a1b3d5e
