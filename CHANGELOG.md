@@ -48,6 +48,14 @@ the one before it promised, and says so here under **Breaking**.
   §10, "Its lock file is the project's"). `examples/custom-project`'s is
   refreshed.
 
+### Fixed
+
+- A virtual-clock actor that exits while another is still parked, after
+  the last time authority was released, advances that parked actor so it
+  resumes. `embsim check` on a board with an ADS122U04 depends on this:
+  the converter's protocol thread leaves when its pipe closes, and a
+  second thread parked on the clock has to be released by that exit.
+
 ## [0.3.0] - 2026-10-09
 
 What a project like MaD needs from embsim to move onto a project file,
