@@ -1,6 +1,6 @@
 # Board engine design (`embsim-board`)
 
-**Status:** design accepted, not yet implemented (2026-07-11, revised after adversarial review)
+**Status:** implemented. Phases 0–5 are on main; the plan and its history are in [`NODES.md`](NODES.md) §12. This document is the engine's contract.
 
 `embsim-board` turns embsim from a firmware-centric emulator ("firmware in the
 middle, models hand-wired around it") into a **component-centric system
@@ -17,7 +17,7 @@ the decision record for why this is netlist-structural rather than SPICE.
 ## Crate layout
 
 ```
-board/                    # new workspace member: embsim-board
+board/                    # embsim-board
 ├── src/netlist.rs        # KiCad s-expression netlist parser → ComponentDecl/NetDecl graph
 ├── src/component.rs      # Component trait, PinDecl, PinRole, Drive, ComponentNetIo
 ├── src/registry.rs       # PartRegistry: identity → constructor; auto-classification tiers

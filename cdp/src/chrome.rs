@@ -128,8 +128,179 @@ fn linux_launch_args() -> &'static [&'static str] {
     &["--no-sandbox"]
 }
 
+/// Put `command`'s child in its own process group.
+///
+/// On Linux the child is a supervisor, and Chrome is that supervisor's
+/// child in the same group. The kernel delivers SIGTERM to the supervisor
+/// when this process dies (`PR_SET_PDEATHSIG`), including a SIGKILL, which
+/// never runs [`ChromeProcess`]'s Drop. The supervisor then kills the group
+/// and removes `profile`. It ignores that SIGTERM while this process is
+/// still alive, so Drop's signal reaches Chrome and the grace still applies.
+///
+/// macOS has no parent-death signal. The child is Chrome, and Drop is what
+/// stops the group. A SIGKILL of this process there can leave Chrome.
+#[doc(hidden)]
+pub fn arm_parent_death(command: &mut Command, profile: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // A path with an interior NUL cannot be handed to `rm`. Fall back to
+        // the group Drop already signals; nothing in the temp dir has a NUL.
+        match std::ffi::CString::new(profile.as_os_str().as_bytes()) {
+            Ok(profile) => {
+                // SAFETY: `pre_exec` runs in the child, after `Command`'s fork
+                // and before exec, with this thread the only one. The closure
+                // forks once more: its child returns and is exec'd as Chrome,
+                // and this process becomes the supervisor.
+                unsafe {
+                    command.pre_exec(move || supervise(profile.as_ptr()));
+                }
+            }
+            Err(_) => {
+                command.process_group(0);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = profile;
+        command.process_group(0);
+    }
+}
+
+/// Kill `chrome` and this process group, and remove `profile`.
+///
+/// `profile` is a NUL-terminated path. The remover is a `/bin/rm` in its own
+/// group, so the `SIGKILL` below does not reach it. Only async-signal-safe
+/// calls: this runs in a process forked from a multi-threaded parent.
+#[cfg(target_os = "linux")]
+fn reap_group(profile: *const libc::c_char, chrome: libc::pid_t) -> ! {
+    unsafe {
+        if !profile.is_null() {
+            let cleaner = libc::fork();
+            if cleaner == 0 {
+                libc::setpgid(0, 0);
+                let rm = c"/bin/rm".as_ptr();
+                let flag = c"-rf".as_ptr();
+                let argv = [rm, flag, profile, std::ptr::null()];
+                libc::execv(rm, argv.as_ptr());
+                libc::_exit(127);
+            }
+            if cleaner > 0 {
+                libc::setpgid(cleaner, cleaner);
+            }
+        }
+        if chrome > 0 {
+            libc::kill(chrome, libc::SIGKILL);
+            // Chrome may have called `setsid` and become its own group leader.
+            libc::kill(-chrome, libc::SIGKILL);
+        }
+        libc::kill(0, libc::SIGKILL);
+        libc::_exit(0);
+    }
+}
+
+/// Drop the file descriptors `Command` keeps open across exec.
+///
+/// The grandchild execs Chrome and closes its copies (`CLOEXEC`). This
+/// process does not exec, so it has to close them itself or `spawn` waits
+/// forever on the exec-error pipe. stderr (fd 2) stays open: it is Chrome's
+/// DevTools log, and this process holding the write end must not outlive the
+/// supervisor.
+#[cfg(target_os = "linux")]
+fn close_inherited_fds() {
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 3u32, libc::c_uint::MAX, 0u32) < 0 {
+            let mut fd = 3;
+            while fd < 1024 {
+                libc::close(fd);
+                fd += 1;
+            }
+        }
+    }
+}
+
+/// Run in the child. The forked grandchild returns `Ok` and is exec'd as
+/// the command. This process never returns.
+#[cfg(target_os = "linux")]
+fn supervise(profile: *const libc::c_char) -> io::Result<()> {
+    // SAFETY: called from `pre_exec`, single-threaded, and every call below
+    // is async-signal-safe. `io::Error::last_os_error` runs only on the
+    // failure returns, which `Command` turns into a failed spawn.
+    unsafe {
+        if libc::setpgid(0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let parent = libc::getppid();
+        if libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGTERM as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // The parent died between the fork and the prctl.
+        if libc::getppid() != parent {
+            reap_group(profile, 0);
+        }
+        // SIGTERM is either that death signal or Drop signalling the group.
+        // Ignoring it here keeps Drop's grace on Chrome; a changed ppid is
+        // what distinguishes the death. The grandchild puts SIGTERM back.
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        let chrome = libc::fork();
+        if chrome < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if chrome == 0 {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            let supervisor = libc::getppid();
+            // If this process later leaves the group (`setsid`), it still
+            // dies when the supervisor does.
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != supervisor {
+                libc::raise(libc::SIGKILL);
+            }
+            // Stay in the supervisor's group, so Drop's `kill(-supervisor)`
+            // reaches Chrome. The supervisor is the group leader.
+            if libc::setpgid(0, supervisor) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        close_inherited_fds();
+        loop {
+            if libc::getppid() != parent {
+                reap_group(profile, chrome);
+            }
+            let mut status = 0;
+            let waited = libc::waitpid(chrome, &mut status, libc::WNOHANG);
+            if waited == chrome {
+                libc::_exit(0);
+            }
+            libc::nanosleep(
+                &libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 200_000_000,
+                },
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
 impl ChromeProcess {
-    /// Start Chrome as `spec` says, on `about:blank`, in a fresh profile.
     ///
     /// The arguments keep Chrome from doing work of its own a run did not
     /// ask for (first-run pages, background networking, throttling a
@@ -182,9 +353,12 @@ impl ChromeProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // Read for where its DevTools listen (`await_devtools`).
-            .stderr(Stdio::piped())
-            // A group of its own, so stopping it stops its renderers too.
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // Its own process group, so stopping it stops its renderers. On
+        // Linux the child is a supervisor that holds that group: a SIGKILL
+        // of this process, which never runs Drop, signals the supervisor
+        // and it kills the group.
+        arm_parent_death(&mut command, &profile);
         let mut child = command.spawn().map_err(|e| {
             let _ = std::fs::remove_dir_all(&profile);
             io::Error::new(
@@ -388,7 +562,8 @@ impl Drop for ChromeProcess {
     fn drop(&mut self) {
         let group = -(self.child.id() as i32);
         // SAFETY: kill(2) with a negative pid signals the process group this
-        // launch made (`process_group(0)`); no memory is touched.
+        // launch made. On Linux the child is the group's supervisor; on
+        // macOS it is Chrome. No memory is touched.
         unsafe {
             libc::kill(group, libc::SIGTERM);
         }

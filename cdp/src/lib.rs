@@ -85,7 +85,7 @@ pub mod devtools;
 mod node;
 
 pub use browser::Browse;
-pub use chrome::{find_chrome, LaunchSpec};
+pub use chrome::{arm_parent_death, find_chrome, LaunchSpec};
 pub use node::{
     CdpNode, LinkControl, LinkOp, NodeStats, Settings, SettingsError, UsbIds, DEFAULT_QUANTUM,
     DEFAULT_STUCK_AFTER, DRAIN_BOUND, DRAIN_STRIKES, MAX_QUANTUM,

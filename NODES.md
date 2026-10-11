@@ -1042,11 +1042,11 @@ The record this branch first wrote rejected CDP virtual time because "it covers 
 
 **Open.**
 
-- The `chrome-cdp` job's first run on Linux: headless Chrome on `ubuntu-latest`, its cost per slice and whether any grant sticks there. Not run yet; its sandbox `sysctl` step is a guess.
+- ~~The `chrome-cdp` job's first run on Linux.~~ *Done.* `ubuntu-latest` runs it in the required gate: 18 of 18, including a crashed page, on Chrome 154 (run 38096916595, 65.89 s). Linux Chrome starts with `--no-sandbox`. The job's user-namespace `sysctl` is the configuration that run used.
 - Chrome versions other than 153: worker metering rests on an undocumented use of `Emulation` on worker sessions (`Schema.getDomains` does not list it there), and hidden pages on Chrome holding back what they say until poked. Pin the Chrome a gate runs, and run the canary on each one pinned.
 - MaD's e2e on the kind: `connectOverCDP` with a fresh context per scenario, the production bundle served from the host (its `DataCloneError` in the worker's event sink shows only there), `installFakeSerial` gone, waits in page time, a `press()` that hit-tests before a forced click, link drops through `__embsim.link`, and the two scenarios E8 asks for (Disconnect then Connect, flashing while connected), which the shim's close rule makes fail on today's app.
 - A one-minute check on real hardware that Chrome's own port says "The port is already open." after a close refused while locked, so the shim's rules are seen to predict Chrome's; and what Chrome's page sees when `forget()` closes an open port (inferred here as a lost device).
 - An app that opens its port in a dedicated worker sees none: a worker-side shim would carry its bytes over the worker's session.
-- A Chrome the node launched survives a SIGKILL of embsim; `embsim run`'s handlers stop it on SIGINT and SIGTERM.
+- ~~A Chrome the node launched survives a SIGKILL of embsim.~~ *Done on Linux.* The child is a supervisor in its own group. `PR_SET_PDEATHSIG` delivers SIGTERM when embsim dies, including under SIGKILL, and the supervisor kills the group and removes the profile (`cdp/src/bin/parent_death_probe.rs`, `cdp/src/chrome.rs` `arm_parent_death`). `embsim run` already ends on the first SIGINT or SIGTERM (`cli/src/signals.rs`), and Drop then stops the group. macOS has no parent-death signal, so a SIGKILL there can leave Chrome.
 - A hidden page costs host time a slice (E11); a harness that keeps one window per page avoids it.
 - A worker that reads the port's stream through `pipeTo` or a transform is not seen by the probe; the barrier turns off for its page after three waits that ran out.
