@@ -91,7 +91,7 @@ fn the_blinking_pad_reaches_the_counter_through_the_buffer_once_a_period() {
     let (code, out, err) = runner(&["check", PROJECT]);
     assert_eq!(code, ExitCode::SUCCESS, "{err}\n{out}");
     assert!(
-        out.contains("catalogs: embsim-boards, embsim-p2-qemu, custom-project-catalog"),
+        out.contains("catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, custom-project-catalog"),
         "{out}"
     );
 

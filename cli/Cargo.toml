@@ -27,6 +27,9 @@ embsim-boards = { path = "../boards" }
 embsim-core = { path = "../core" }
 # QEMU as a P2 core, in a `qemu-system-p2` of its own (`embsim qemu`).
 embsim-p2-qemu = { path = "../p2-qemu" }
+# The host's Chrome, its pages metered by the board's clock over DevTools:
+# the `chrome-cdp` bench component kind.
+embsim-cdp = { path = "../cdp" }
 clap.workspace = true
 # `run`'s SIGINT/SIGTERM handler: the first signal ends the run with its
 # summary.

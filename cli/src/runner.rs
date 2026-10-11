@@ -100,12 +100,13 @@ const CLI: &str = "embsim-cli";
 /// embsim's own crates a catalog crate or a runner may depend on, each a
 /// directory of an embsim checkout's root named after it: every one a
 /// runner links must come from one embsim.
-const EMBSIM_CRATES: [&str; 6] = [
+const EMBSIM_CRATES: [&str; 7] = [
     "embsim-core",
     "embsim-board",
     "embsim-boards",
     "embsim-models",
     "embsim-p2-qemu",
+    "embsim-cdp",
     "embsim-cli",
 ];
 

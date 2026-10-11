@@ -322,12 +322,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "embsim-cdp"
+version = "0.3.0"
+dependencies = [
+ "embsim-board",
+ "embsim-boards",
+ "embsim-core",
+ "libc",
+ "rstest",
+ "serde_json",
+ "toml",
+ "tracing",
+ "tungstenite",
+ "vibes-behaviour",
+]
+
+[[package]]
 name = "embsim-cli"
 version = "0.3.0"
 dependencies = [
  "clap",
  "embsim-board",
  "embsim-boards",
+ "embsim-cdp",
  "embsim-core",
  "embsim-models",
  "embsim-p2-qemu",

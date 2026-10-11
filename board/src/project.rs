@@ -472,6 +472,18 @@ impl PartOptions {
         }
     }
 
+    /// Take the `true`/`false` option `name`, if it is given.
+    pub fn boolean(&mut self, name: &'static str) -> Result<Option<bool>, ProjectError> {
+        match self.value(name) {
+            None => Ok(None),
+            Some(toml::Value::Boolean(value)) => Ok(Some(value)),
+            Some(other) => Err(self.error(format!(
+                "options.{name} is true or false; {other} is a {}",
+                other.type_str()
+            ))),
+        }
+    }
+
     /// Take the option `name`, a time written as `embsim run --for` takes
     /// it (`"1.5ms"`, [`parse_duration`]), in nanoseconds, if it is given.
     pub fn duration(&mut self, name: &'static str) -> Result<Option<u64>, ProjectError> {
@@ -2401,5 +2413,17 @@ mod tests {
         let table: toml::Table = toml::from_str("poles = [[\"1\", \"2\"], [\"3\"]]\n").unwrap();
         let mut options = PartOptions::new("ctx", table);
         assert!(options.pairs("poles").is_err());
+
+        let table: toml::Table = toml::from_str("granted = true\nheadless = \"no\"\n").unwrap();
+        let mut options = PartOptions::new("ctx", table);
+        assert_eq!(options.boolean("granted").unwrap(), Some(true));
+        assert_eq!(options.boolean("absent").unwrap(), None);
+        let err = options
+            .boolean("headless")
+            .expect_err("a string is not true or false");
+        assert_eq!(
+            err.to_string(),
+            "ctx: options.headless is true or false; \"no\" is a string"
+        );
     }
 }

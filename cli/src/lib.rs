@@ -337,12 +337,19 @@ impl Command {
 
 /// The catalogs the `embsim` command ships: the standard catalog
 /// (`embsim_boards::catalog::StandardCatalog`, its `held-in-reset` core
-/// with it) and QEMU as a P2 core (`embsim_p2_qemu::catalog`). A project's
-/// own catalogs join this set.
+/// with it), QEMU as a P2 core (`embsim_p2_qemu::catalog`), and the host's
+/// Chrome metered by the board's clock, the `chrome-cdp` bench component
+/// (`embsim_cdp::catalog`). The two that start processes are catalogs of
+/// their own, so the standard catalog stays process-free. A project's own
+/// catalogs join this set.
 pub fn shipped() -> CatalogSet {
     let mut set = CatalogSet::new();
     embsim_p2_qemu::catalog::register(&mut set).expect(
         "QEMU's core is spelled as a kind is, and the set holds no other catalog by its name",
+    );
+    embsim_cdp::catalog::register(&mut set).expect(
+        "the chrome-cdp kind is spelled as kinds are, and the set holds no other catalog by its \
+         name",
     );
     set
 }

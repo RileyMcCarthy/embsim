@@ -1,0 +1,10 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>ticks</title></head>
+<body>
+<script>
+// Whether the node's shim was in before this, the page's first script.
+window.firstSawShim = typeof window.__embsim === 'object' && typeof navigator.serial === 'object';
+window.firstNow = performance.now();
+</script>
+<script src="ticks.js"></script>
+</body></html>

@@ -233,7 +233,7 @@ fn a_project_naming_a_catalogs_assembly_kind_checks_and_runs() {
     let (code, out, err) = embsim(&set, &["check", project]);
     assert_eq!(code, ExitCode::SUCCESS, "{err}\n{out}");
     assert!(
-        out.contains("catalogs: embsim-boards, embsim-p2-qemu, assembly-test-catalog"),
+        out.contains("catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp, assembly-test-catalog"),
         "{out}"
     );
     assert!(out.contains("ok:"), "{out}");

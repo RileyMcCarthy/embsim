@@ -396,11 +396,16 @@ builds, among them the example's test, the started crate's test
 --ignored`, which builds real runners with Cargo; the `p2-qemu-boot` job
 installs `qemu-system-p2` with `embsim qemu install` and runs `cargo test
 -p embsim-p2-qemu` and `cargo test -p embsim-cli --test cli` with
-`--include-ignored`, where `run` boots the P2 off the module's flash. The
-behaviour ledger's suite (`vibes.suite.json`) runs `embsim-board`,
-`embsim-boards`, `embsim-cli`, `embsim-p2-qemu` and `custom-project-catalog`,
-so the runner builds and the QEMU boots declare no behaviours: the ledger's
-run builds no runner and installs no QEMU. What runs without them (the
+`--include-ignored`, where `run` boots the P2 off the module's flash; the
+`chrome-cdp` job runs `cargo test -p embsim-cdp --test real_chrome --
+--ignored` against the runner's `google-chrome`, among them
+`examples/chrome-ping` run as a project (the test job runs the node's
+stand-in suite, `loopback.rs`, with no Chrome). The behaviour
+ledger's suite (`vibes.suite.json`) runs `embsim-board`, `embsim-boards`,
+`embsim-cli`, `embsim-p2-qemu`, `embsim-cdp` and `custom-project-catalog`,
+so the runner builds, the QEMU boots and the real-Chrome cases declare no
+behaviours: the ledger's run builds no runner, installs no QEMU and
+launches no Chrome. What runs without them (the
 stand-in program, the refusals) declares its behaviours.
 
 **A project's own catalog** is tested the way the example's is, in the
