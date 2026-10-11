@@ -35,9 +35,9 @@
 //! where the net decided *reachability* and the payload never became a level —
 //! so a command could not be corrupted by a driver fighting it, and the chip's
 //! answer could not break on a wire that was also being driven by something
-//! else. On the DS2Addon, where `~RESET` ships on a one-pin net and the fix is
-//! a bodge wire, that distinction is the difference between modelling the
-//! bench and modelling a tidier board than the one that exists.
+//! else. On the DS2 add-on fixture, `R10` pulls `~RESET` up to `+3V3`. A
+//! system that lifts that pull-up leaves the reset pin floating, and the
+//! chip's answer depends on the level the net actually carries.
 //!
 //! It also lets the gate be **electrical**: an unpowered or held-in-reset chip
 //! releases TX to high-Z ([`SerialLevelBridge::set_output_enabled`]) instead of
@@ -55,11 +55,10 @@
 //!   "AVDD unstrapped" failure made live.
 //! - **`~RESET` is active low**; held low the interface never answers, and a
 //!   *floating* digital input is out of spec (SBAS752B, unused-inputs
-//!   guidance) — the DS2Addon PCB ships `~RESET` on a one-pin net, so a
-//!   system description without the reset bodge (`pin_short` to a rail, or a
-//!   board rev with the R10 pull-up) gets exactly the bench symptom: perfect
-//!   commands in, silence out. The engine reports the floating sense; the
-//!   adapter chooses the datasheet behavior (silence).
+//!   guidance). The DS2 fixture's `R10` holds `~RESET` at the digital
+//!   supply. Lifting that pull-up leaves the pin floating: perfect commands
+//!   in, silence out. The engine reports the floating sense; the adapter
+//!   follows the datasheet and stays silent.
 //! - The high projection of `~RESET` uses **V_IH = 0.7 · DVDD** (§6.5
 //!   Electrical Characteristics, Digital Inputs/Outputs),
 //!   against the solved DVDD rail voltage when the engine publishes one.
@@ -246,8 +245,8 @@ impl Gate {
 
     /// True when the chip is electrically alive: both supplies up (power-on
     /// reset requires BOTH AVDD and DVDD — SBAS752B) and `~RESET` high.
-    /// Anything else — a floating one-pin reset net, an unstrapped analog
-    /// domain, a rail fight — is the bench-observed silent chip.
+    /// Anything else — a floating reset, an unstrapped analog domain, a rail
+    /// fight — leaves the chip silent.
     fn alive(&self) -> bool {
         let inputs = *self.inputs.lock().unwrap();
         supply_ok(inputs.dvdd) && supply_ok(inputs.avdd) && inputs.reset_level == Some(Level::High)
@@ -461,11 +460,13 @@ impl Drop for Ads122u04Component {
         // Stop the UART bridge before the FDs go: a wake callback the engine
         // has not yet dropped must be inert, not driving a dead pin.
         self.shutdown.store(true, Ordering::Relaxed);
-        // Dropping `firmware_fd` closes the pipe end once the engine has
-        // dropped its wake callback (SystemHandle joins the engine *before* it
-        // drops components — the documented drop order). The model's protocol
-        // thread then reads EOF and ends, exactly as in the hand-wired setup,
-        // taking its clock actor with it.
+        // Dropping `firmware_fd` closes this component's pipe end. The
+        // engine's wake callback holds its own clone, so the protocol thread
+        // reads EOF once that callback drops with the engine. Components drop
+        // first, while the engine is still serving; this `Drop` does not join
+        // the protocol thread. The last time authority, released when the
+        // engine handle drops, wakes a protocol thread still parked on the
+        // virtual clock so it can observe the closed pipe and exit.
         debug!("ADS122U04 component shut down");
     }
 }

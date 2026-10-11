@@ -22,7 +22,7 @@ fn ds2_addon_fixture_is_a_kicad_sexpr_netlist_export() {
     // Known landmarks of the DS2Addon board.
     assert!(DS2_ADDON.contains("(part \"ADS122U04"));
     assert!(DS2_ADDON.contains("(name \"AIN0\")"));
-    assert_eq!(DS2_ADDON.matches("(comp (ref ").count(), 31);
+    assert_eq!(DS2_ADDON.matches("(comp (ref ").count(), 32);
     assert_eq!(DS2_ADDON.matches("(net (code ").count(), 25);
 }
 

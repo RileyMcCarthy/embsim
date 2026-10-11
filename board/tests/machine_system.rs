@@ -20,7 +20,7 @@
 //!               │     │     │     └── END_U / END_L   embsim-models
 //!               │     │     └──────── ENC             embsim-models
 //!               │     └────────────── MOTOR           embsim-models
-//!               └──────────────────── DS2Addon        ds2_addon.net  31 comps
+//!               └──────────────────── DS2Addon        ds2_addon.net  32 comps
 //!                                      U1 = ADS122U04 (live model)
 //! ```
 //!
@@ -97,9 +97,8 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 // ============================================================
 
 /// The scenario every assembly shares: the encoder's ground/enable jumpers
-/// closed, the DS2 add-on's input jumpers closed, and the reset bodge the
-/// DS2 board needs (its `~RESET` net has exactly one pin — the July 2026
-/// bench bug, still true of the netlist). Both boards' reverse-polarity
+/// closed and the DS2 add-on's input jumpers closed. `R10` holds the
+/// add-on's `~RESET` at the digital supply. Both boards' reverse-polarity
 /// pass FETs are elements the solve turns on from the bench supplies
 /// (`NODES.md` §8 phase 3); nothing here says they conduct.
 fn machine_scenario() -> Scenario {
@@ -107,7 +106,6 @@ fn machine_scenario() -> Scenario {
     scenario
         .jumper(&format!("{DS2}.JP1"), JumperState::Closed)
         .jumper(&format!("{DS2}.JP2"), JumperState::Closed)
-        .pin_short(&format!("{DS2}.U1.3"), &format!("{DS2}.U1.13"))
 }
 
 /// Every harness: the module in its socket, the force-gauge cable, the machine
@@ -383,11 +381,12 @@ fn every_declared_finger_is_one_node_across_the_socket() {
     assert_eq!(state_of(&system, "EC32MB.P2_IO2"), NetState::Floating);
     assert_eq!(state_of(&system, "EdgeBoard.P2"), NetState::Floating);
     // EdgeBoard → module: the force isolator's MCU-side output lands on
-    // P0 — one node across the socket. In the build snapshot the isolator
-    // drives nothing: its isolated side runs from the force domain, the
-    // Edge board's `IC4`, 750 µs from its input, and a repeater with one
-    // side dark releases; the byte exchange below is where the drive is
-    // seen, once the domain has risen.
+    // P0 — one node across the socket. In the build snapshot the force
+    // domain (`IC4`) has not risen, so `IC5`'s input side is down while its
+    // output side is up. `ISO6731` has no F suffix, so that row of the
+    // function table is the default high (TI SLLSFJ6G §9.4 Table 9-2,
+    // `VCCI` PD / `VCCO` PU) — the same row the unconnected Pi-side
+    // isolator asserts below.
     assert!(
         system.names_are_merged("EdgeBoard.P0", "EC32MB.P2_IO0"),
         "the isolator's output and the P2's force-gauge RX pin are one node"
@@ -397,8 +396,11 @@ fn every_declared_finger_is_one_node_across_the_socket() {
         state_of(&system, "EC32MB.P2_IO0")
     );
     assert!(
-        matches!(state_of(&system, "EC32MB.P2_IO0"), NetState::Floating),
-        "before the force domain rises the isolator releases its output; got {:?}",
+        matches!(
+            state_of(&system, "EC32MB.P2_IO0"),
+            NetState::Driven(Level::High)
+        ),
+        "with the input side down and the output side up, ISO6731 rests at its default high; got {:?}",
         state_of(&system, "EC32MB.P2_IO0")
     );
 }

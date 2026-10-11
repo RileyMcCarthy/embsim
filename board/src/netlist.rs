@@ -628,7 +628,7 @@ mod tests {
         let input = include_str!("../tests/fixtures/ds2_addon.net");
         let parsed = parse(input).expect("fixture parses");
         assert_eq!(parsed.version, "E");
-        assert_eq!(parsed.components.len(), 31);
+        assert_eq!(parsed.components.len(), 32);
 
         let u1 = parsed
             .components
@@ -650,9 +650,15 @@ mod tests {
             .iter()
             .find(|n| normalize_pin_name(&n.name) == "~RESET")
             .expect("~{RESET} net present");
-        assert_eq!(reset.nodes.len(), 1, "the floating-reset net has one pin");
-        assert_eq!(reset.nodes[0].reference, "U1");
-        assert_eq!(reset.nodes[0].pin, "3");
+        assert_eq!(reset.nodes.len(), 2, "R10 pulls ~RESET up to +3V3");
+        assert!(reset
+            .nodes
+            .iter()
+            .any(|node| node.reference == "U1" && node.pin == "3"));
+        assert!(reset
+            .nodes
+            .iter()
+            .any(|node| node.reference == "R10" && node.pin == "2"));
     }
 
     #[rstest]

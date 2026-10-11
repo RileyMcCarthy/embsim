@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use embsim_board::uart::{UartDecoder, UartFraming};
 use embsim_board::{
-    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand, EventLog,
-    Harness, PartRegistry, PinDecl, PinHandle, Scenario, SerialLevelBridge, System, SystemHandle,
-    TheveninDrive,
+    jesd8c01_lvcmos_thresholds, AttachError, Board, Component, ComponentNetIo, DeadBand,
+    EdgeFaultKind, EventLog, Harness, PartRegistry, PinDecl, PinHandle, Scenario,
+    SerialLevelBridge, System, SystemHandle, TheveninDrive,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 
@@ -530,6 +530,7 @@ const CASES: &[&str] = &[
     "net_stuck_shared_node",
     "serial_levels",
     "wake_ladder",
+    "edge_fault_float",
 ];
 
 /// Run one named case once and return its engine event log. The clock must
@@ -546,6 +547,11 @@ fn run_case(name: &str) -> EventLog {
             stream_scenario(Scenario::default(), &payload, payload.len())
         }
         "wake_ladder" => wake_ladder_scenario(),
+        // Pin DRV.A floats for its own edges 2 and 3 (0-indexed). DRV.B's
+        // drives are on another pin, so they never count toward the window.
+        "edge_fault_float" => {
+            analog_scenario(Scenario::default().edge_fault("DRV.A", EdgeFaultKind::Float, 2, 2))
+        }
         other => panic!("unknown determinism case {other:?}"),
     }
 }
@@ -690,6 +696,7 @@ fn free_running_matrix(case: &str) {
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
+#[case::edge_fault_float("edge_fault_float")]
 fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
     let _suite = suite_lock();
     stepped_matrix(case);
@@ -703,6 +710,7 @@ fn stepped_logs_are_identical_across_runs(#[case] case: &str) {
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
+#[case::edge_fault_float("edge_fault_float")]
 fn paced_order_is_reproducible(#[case] case: &str) {
     let _suite = suite_lock();
     free_running_matrix(case);
@@ -786,6 +794,7 @@ fn golden_path(case: &str) -> std::path::PathBuf {
 #[case::net_stuck("net_stuck_shared_node")]
 #[case::serial_levels("serial_levels")]
 #[case::wake_ladder("wake_ladder")]
+#[case::edge_fault_float("edge_fault_float")]
 fn stepped_logs_match_their_golden_trace(#[case] case: &str) {
     let _suite = suite_lock();
     let actual = {

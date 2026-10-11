@@ -17,9 +17,11 @@
 //!    real behavior, because the motion path is the one place where "the wire
 //!    is connected" is not the interesting claim. Their tests drive the real
 //!    netlist's nets and read the real netlist's nets.
-//! 4. **The force-gauge UART crosses the isolation barrier as a byte route.**
-//!    The isolator is a stream hop, not an opaque break — which is what lets
-//!    `machine_system.rs` route a byte from the P2 to the ADC.
+//! 4. **The force-gauge UART crosses the isolation barrier as levels.**
+//!    IC5 (`ISO6731DWR`) is a level repeater from
+//!    `embsim_models::isolation::iso67xx`: each channel senses its input and
+//!    drives its output, from the P2 socket through the isolator to
+//!    connector J9.
 //!
 //! # Source
 //!
@@ -64,9 +66,10 @@ use embsim_board::{
     System, SystemHandle,
 };
 use embsim_core::virtual_clock::{self, Actor, ClockMode};
+use embsim_models::isolation::iso67xx::{Config, Iso67xx};
 use embsim_models::logic_gate::LVC1G14_T_PD_NS;
 use embsim_models::rail::UCC12040_RISE_NS;
-use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep, iso6731_pins};
+use machine_parts::{bench_rails, edge_board, encoder_jumpers_closed, ep};
 
 /// Registered component count: the instances of the active part types
 /// that are components (the reset button is a switch; the polarity FET,
@@ -236,7 +239,7 @@ fn the_edgeboard_builds_with_every_part_classified() {
     for reference in [
         "U24",  // AM26LS31CD  — RS-422 driver (modeled)
         "U25",  // AM26LV32xD  — RS-422 receiver (modeled)
-        "IC5",  // ISO6731DWR  — force-gauge UART isolator (modeled)
+        "IC5",  // ISO6731DWR  — iso67xx, force-gauge isolator
         "IC1",  // ISO6742DWR  — isolator family model
         "IC3",  // UCC12040DVER
         "IC14", // ISO6741DWR  — isolator family model, STEP as a rate
@@ -584,7 +587,9 @@ fn the_force_gauge_uart_crosses_the_isolator_between_socket_and_connector() {
 /// have to: the UART is on the net as levels, so an isolator is an isolator.
 #[rstest]
 fn every_isolator_channel_is_a_plain_level_repeater() {
-    let pins = iso6731_pins();
+    let iso =
+        Iso67xx::new(Config::from_part_name("ISO6731DWR").expect("ISO6731DWR")).expect("config");
+    let pins = iso.pins();
     let pin = |number: &str| {
         pins.iter()
             .find(|p| p.number == number)

@@ -992,9 +992,9 @@ force path + gantry):
   papered over with tolerance windows. A bench bug reproduced by patience.
 - **T1 (D1 + D2).** The bench-bug suite becomes *exactly* repeatable: the
   floating `~RESET` case, the crossed-TX/RX harness, the unstrapped AVDD case,
-  level-era serial/line faults (see draft PR #48 / issue #44 for
-  `Scenario::edge_fault`; the deleted `stream_drop` byte-loss knob is not
-  coming back), and the force-path sample cadence all produce
+  level-era serial/line faults (`Scenario::edge_fault`, the `edge_fault_float`
+  determinism case; the deleted `stream_drop` byte-loss knob stays
+  historical), and the force-path sample cadence all produce
   identical event traces run to run and machine to machine. Golden traces make
   wire-behavior changes a diff. Wall-clock tolerance windows come out of the
   tests. CI stops needing single-worker execution *for timing reasons* (the

@@ -166,8 +166,8 @@ embsim survey ds2_addon.net
 ```
 
 ```text
-ds2_addon.net: 31 parts
-  30 populated by the catalog
+ds2_addon.net: 32 parts
+  31 populated by the catalog
   1 need a model
   0 placed with a pin table the netlist does not use
   0 refused
@@ -177,7 +177,7 @@ populated by class (the symbol or reference designator says what it is):
   capacitor     12  C1 C2 C3 C4 C5 C6 C7 C8 C9 C10 C11 C12
   connector      5  J1 J2 J3 J4 J5
   jumper         4  JP1 JP2 JP3 JP4
-  resistor       9  R1 R2 R3 R4 R5 R6 R7 R8 R9
+  resistor      10  R1 R2 R3 R4 R5 R6 R7 R8 R9 R10
 
 need a model:
   U1  part "ADS122U04"  value "ADS122U04"
@@ -245,7 +245,7 @@ embsim new ds2_addon.net --name DS2 -o ds2.toml
 
 ```text
 wrote ds2.toml
-  board DS2: 31 parts, 30 populated by the catalog, 0 pin tables chosen
+  board DS2: 32 parts, 31 populated by the catalog, 0 pin tables chosen
   1 model stub to fill in, for 1 part that need a model
   5 connectors to wire; then `embsim check ds2.toml`
 ```
@@ -300,9 +300,9 @@ embsim check ds2.toml
 
 ```text
 project ds2.toml
-  board DS2 (netlist): 31 parts: 30 classified, 1 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
+  board DS2 (netlist): 32 parts: 31 classified, 1 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
 error: board DS2 is not ready to build:
-31 parts: 30 classified, 1 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
+32 parts: 31 classified, 1 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
 needs a model:
   U1  part "ADS122U04"  value "ADS122U04"  (16 pins)
 connectors:
@@ -411,27 +411,25 @@ embsim check ds2.toml
 
 ```text
 project ds2.toml
-  board DS2 (netlist): 31 parts: 31 classified, 0 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
+  board DS2 (netlist): 32 parts: 32 classified, 0 need a model, 0 with pins the netlist does not have, 0 refused, 5 connectors
   1 board, 0 bench components, 4 wires, 0 mates
-build findings (11), the system before its first wake:
+build findings (10), the system before its first wake:
   no source reaches DS2.GPIO1, which a digital input reads
   no source reaches DS2.GPIO0, which a digital input reads
-  no source reaches DS2.~RESET, which a digital input reads
   …
   no source reaches DS2.AIN0, which an analog input reads
 ok: ds2.toml builds
 ```
 
-`check` loads the project, surveys each board, builds the system and starts
-it with virtual time held. Every part is attached and every attach-time
-drive resolved, but no wake has fired. `check` prints what the build found
-and exits 0. Any refusal makes it exit 1, with the text that says what to
-fix. The findings are the netlist's own. Among them:
+`check` loads the project, surveys each board, and reports the findings
+`System::build` settles: the build fixed point and the build lints. It
+prints that set and exits 0. Any refusal makes it exit 1, with the text
+that says what to fix. The findings are the netlist's own. Among them:
 
 - `GPIO0` and `GPIO1` come out on `J3`, which nothing is wired to here.
-- The converter's `~RESET` is on a net no other pin shares. The add-on's own
-  tests hold that as a finding about the board
-  (`boards/tests/ds2_project.rs`).
+- `R10` pulls the converter's `~RESET` up to `+3V3`, so that net is sourced.
+  Lifting `R10`'s reset-side pin is what leaves `~RESET` floating
+  (`board/tests/ds2_regressions.rs`).
 
 ### Step 6: `embsim run`
 
@@ -444,17 +442,17 @@ project ds2.toml
   catalogs: embsim-boards, embsim-p2-qemu, embsim-cdp
   …
 running for 5.000000 ms of virtual time
-findings at build, before any wake (11):
+findings at build, before any wake (10):
   no source reaches DS2.GPIO1, which a digital input reads
   …
 ran 5.000000 ms of virtual time in 0.001 s
 net DS2.+3V3: Analog(3.3)
 net DS2.VDDA: Analog(3.3)
-net DS2.~RESET: Floating
-findings: 11 (11 at build, 0 while running)
+net DS2.~RESET: Pulled(High, 10000.0)
+findings: 10 (10 at build, 0 while running)
 at 5.000000 ms, each finding's net read again:
   no longer true (0):
-  still true (11):
+  still true (10):
     no source reaches DS2.GPIO1, which a digital input reads
     …
   about the board as built and wired (0):

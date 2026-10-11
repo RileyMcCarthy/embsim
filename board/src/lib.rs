@@ -121,7 +121,8 @@ pub use survey::{
     UnmodelledPart,
 };
 pub use system::{
-    BuiltSystem, DnpState, EndpointKind, EndpointRef, Fault, Harness, HarnessConnection,
-    HarnessError, Scenario, System, SystemError, SystemHandle, BUILD_FIXED_POINT_BOUND,
+    BuiltSystem, DnpState, EdgeFaultKind, EndpointKind, EndpointRef, Fault, Harness,
+    HarnessConnection, HarnessError, Scenario, System, SystemError, SystemHandle,
+    BUILD_FIXED_POINT_BOUND,
 };
 pub use uart::{FramingError, UartDecoder, UartEncoder, UartFraming};

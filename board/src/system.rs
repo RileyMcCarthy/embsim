@@ -209,6 +209,23 @@ pub enum DnpState {
     Absent,
 }
 
+/// Level-domain effect an [`Fault::EdgeFault`] forces while its window is open.
+///
+/// The injector acts on the wire: it floats a pin, sticks a net, or adds a
+/// contending source, for a chosen stretch of drive edges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EdgeFaultKind {
+    /// Suppress the target pin's drive. The net floats unless another source
+    /// still reaches it.
+    Float,
+    /// Force an ideal source at `volts` on the target's net and suppress the
+    /// target pin's own drive.
+    Stuck(Volts),
+    /// Inject an ideal source at `volts` beside the live drivers, so
+    /// disagreeing levels read as contention.
+    Contention(Volts),
+}
+
 /// One injected fault, defined in terms of graph primitives the netlist
 /// actually has.
 #[derive(Debug, Clone, PartialEq)]
@@ -232,6 +249,24 @@ pub enum Fault {
         net: String,
         /// Rail voltage of the injected source.
         volts: Volts,
+    },
+    /// Timed level-domain fault on a named pin or net. The window opens for
+    /// `edge_count` matching drive edges after `after_edges` of them have
+    /// passed. A pin target counts that pin's drives. A net target counts
+    /// every drive on the net. `after_edges == 0` also covers the idle state
+    /// before the first matching drive, for [`EdgeFaultKind::Stuck`] and
+    /// [`EdgeFaultKind::Contention`].
+    EdgeFault {
+        /// Dotted pin (`"Board.Ref.Pin"`, or `"Bench.Pin"`) or net
+        /// (`"Board.NETNAME"`). A name that is both a pin and a net selects
+        /// the pin.
+        target: String,
+        /// What the injector forces while the window is open.
+        kind: EdgeFaultKind,
+        /// Matching drive edges to skip before the window opens.
+        after_edges: u64,
+        /// Matching drive edges the window stays open for.
+        edge_count: u64,
     },
 }
 
@@ -290,6 +325,27 @@ impl Scenario {
         self.faults.push(Fault::NetStuck {
             net: net.to_string(),
             volts,
+        });
+        self
+    }
+
+    /// Inject a timed level-domain fault on a named pin or net.
+    ///
+    /// `after_edges` matching drive edges pass first. The next `edge_count`
+    /// matching drives are the window. A pin target counts that pin. A net
+    /// target counts every drive on the net. See [`Fault::EdgeFault`].
+    pub fn edge_fault(
+        mut self,
+        target: &str,
+        kind: EdgeFaultKind,
+        after_edges: u64,
+        edge_count: u64,
+    ) -> Self {
+        self.faults.push(Fault::EdgeFault {
+            target: target.to_string(),
+            kind,
+            after_edges,
+            edge_count,
         });
         self
     }
@@ -970,15 +1026,13 @@ impl System {
                         error,
                     },
                 };
-                // The same drop order SystemHandle documents as
-                // load-bearing must hold on this path too: components
-                // (including the failing one — it may have registered
-                // callbacks or spawned protocol threads before erroring)
-                // must never be dropped while the engine thread is still
-                // delivering callbacks. Shut the engine down first.
+                // Components drop while the engine is still serving
+                // commands, the same order [`SystemHandle`]'s drop uses.
+                // A component can drive on the way out, and a pump joins
+                // before the last time authority is released.
                 attached.push((prepared.reference, prepared.component));
-                drop(engine);
                 drop(attached);
+                drop(engine);
                 return Err(error);
             }
             attached.push((prepared.reference, prepared.component));
@@ -1235,6 +1289,8 @@ impl System {
         }
 
         // -- scenario: fault algebra ---------------------------------------
+        // Edge faults name drive endpoints, which are registered below.
+        let mut pending_edge_faults: Vec<Fault> = Vec::new();
         for fault in self.scenario.faults().to_vec() {
             match fault {
                 Fault::PinDetach { endpoint } => {
@@ -1254,6 +1310,7 @@ impl System {
                     let idx = self.named_net(&net, &nets)?;
                     stuck_sources.push((idx, volts));
                 }
+                edge @ Fault::EdgeFault { .. } => pending_edge_faults.push(edge),
             }
         }
 
@@ -1336,6 +1393,10 @@ impl System {
         }
 
         let mut endpoints: HashMap<(usize, PinRef), EndpointId> = HashMap::new();
+        // `"Board.Ref.Pin"` and `"Bench.Pin"` (number and alias) to the drive
+        // slot, if the pin has one, and the net. A pin name wins over a net
+        // of the same spelling when an edge fault is resolved.
+        let mut pin_targets: HashMap<String, (Option<EndpointId>, usize)> = HashMap::new();
         // The elements each pin terminates, as `(element index, sign)`, and
         // the paths of every element and current port (`CurrentPaths`).
         let mut branch_terms: HashMap<(usize, PinRef), Vec<(usize, f64)>> = HashMap::new();
@@ -1460,9 +1521,17 @@ impl System {
                             let Some(&net) = net_of_pin.get(&key) else {
                                 continue;
                             };
-                            if let Some(endpoint) =
-                                add_pin_descriptor(&mut resolver, net, pin, &key.1)
-                            {
+                            let endpoint = add_pin_descriptor(&mut resolver, net, pin, &key.1);
+                            pin_targets.insert(
+                                format!("{bname}.{}.{}", record.reference, pin.number),
+                                (endpoint, net),
+                            );
+                            if let Some(name) = pin.name.filter(|name| *name != pin.number) {
+                                pin_targets
+                                    .entry(format!("{bname}.{}.{}", record.reference, name))
+                                    .or_insert((endpoint, net));
+                            }
+                            if let Some(endpoint) = endpoint {
                                 endpoints.insert(key, endpoint);
                             }
                         }
@@ -1634,6 +1703,12 @@ impl System {
             for (pin, &net) in pins.iter().zip(pin_nets) {
                 let pin_ref = PinRef::new(bench.name.clone(), pin.number);
                 let endpoint = add_pin_descriptor(&mut resolver, net, pin, &pin_ref);
+                pin_targets.insert(format!("{}.{}", bench.name, pin.number), (endpoint, net));
+                if let Some(name) = pin.name.filter(|name| *name != pin.number) {
+                    pin_targets
+                        .entry(format!("{}.{}", bench.name, name))
+                        .or_insert((endpoint, net));
+                }
                 eps.push(endpoint);
             }
             bench_endpoints.push(eps);
@@ -1693,6 +1768,29 @@ impl System {
                 }
             }
             bench_terms.push(terms);
+        }
+
+        for fault in pending_edge_faults {
+            let Fault::EdgeFault {
+                target,
+                kind,
+                after_edges,
+                edge_count,
+            } = fault
+            else {
+                unreachable!("pending_edge_faults holds only EdgeFault");
+            };
+            let (endpoint, net) = match pin_targets.get(&target) {
+                Some(found) => *found,
+                None => (None, self.named_net(&target, &nets)?),
+            };
+            resolver.add_edge_fault(crate::engine::EdgeFaultSpec {
+                endpoint,
+                net,
+                kind,
+                after_edges,
+                edge_count,
+            });
         }
 
         // -- prepare registered components for attach ------------------------
@@ -2395,17 +2493,28 @@ impl BuiltSystem {
 /// A running live system: the net-engine thread plus the attached
 /// components, created by [`System::start`].
 ///
-/// Dropping the handle shuts the engine down first (shutdown message +
-/// join — in-flight sense/wake callbacks complete, and joining cannot
-/// deadlock because callbacks run with no engine lock held), then drops the
-/// components.
+/// Dropping the handle drops the components first, while the engine is
+/// still serving commands, and then joins the engine. A component can
+/// drive on the way out, and a pump it joins can finish before the last
+/// time authority is released. The authority-drop wake in the virtual
+/// clock remains, for a pump that is still parked when the engine goes.
 pub struct SystemHandle {
-    // Field order is load-bearing: the engine joins before components drop.
     engine: EngineHandle,
     net_names: Vec<String>,
     components: Vec<(String, Box<dyn Component>)>,
     /// The elements and current ports, by path.
     paths: CurrentPaths,
+}
+
+impl Drop for SystemHandle {
+    fn drop(&mut self) {
+        let components = std::mem::take(&mut self.components);
+        drop(components);
+        debug_assert!(
+            self.engine.is_alive(),
+            "components drop while the engine is still serving commands"
+        );
+    }
 }
 
 impl fmt::Debug for SystemHandle {
@@ -2659,6 +2768,7 @@ mod tests {
             .pin_detach("DS2Addon.U1.3")
             .pin_short("DS2Addon.A0", "DS2Addon.A1")
             .net_stuck("DS2Addon.AIN0", 3.3)
+            .edge_fault("DS2Addon.U1.2", EdgeFaultKind::Float, 11, 10)
             .value_override("DS2Addon.R5", "4k7")
             .dnp_override("DS2Addon.C7", DnpState::Populated);
 
@@ -2666,7 +2776,7 @@ mod tests {
             scenario.jumpers(),
             &[("DS2Addon.JP1".to_string(), JumperState::Closed)]
         );
-        assert_eq!(scenario.faults().len(), 3);
+        assert_eq!(scenario.faults().len(), 4);
         assert_eq!(
             scenario.faults()[0],
             Fault::PinDetach {

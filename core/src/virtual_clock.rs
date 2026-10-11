@@ -419,43 +419,47 @@ impl Drop for TimeAuthority {
         if previous != 1 {
             return; // a nested hold remains; someone is still advancing time
         }
-        // Last authority released — wake whoever is parked so they can idle-jump
-        // again.
+        // Last authority released. A waiter that parked while an authority
+        // was held does not idle-jump, and sleeps on `ADVANCED` until
+        // something calls [`advance_to`]. With the authority gone, that
+        // something is [`wake_parked_if_drained`] when every actor is
+        // already parked. An actor that is still runnable parks and jumps
+        // itself — or, if it exits with no park, its [`Actor`] drop does,
+        // through the same function. One nudge is enough: a waiter woken
+        // here returns, and the next time it parks it takes the
+        // no-authority branch.
         //
-        // [`park_until_virtual`] decides whether to idle-jump ON THE WAY IN: with
-        // an authority held it does not, and then sleeps on `ADVANCED` until
-        // someone calls [`advance_to`]. When the authority itself goes away, that
-        // someone no longer exists, and nothing re-evaluates the decision — so
-        // every actor that was parked at that moment sleeps forever.
-        //
-        // This went unnoticed while the only actors parked at shutdown were
-        // detached threads nobody joined. It becomes a hang the moment a joined
-        // thread parks on the virtual clock — which is exactly what the MCU
-        // serial pump now does, and `SystemHandle` joins the engine (releasing
-        // this authority) BEFORE it drops the components that join their pumps.
-        //
-        // One nudge is enough to become self-sustaining: a waiter woken here
-        // returns, and the next time it parks it takes the no-authority branch
-        // and idle-jumps under its own power.
-        // `waits` is keyed in NANOSECONDS — advance with the ns entry point.
-        // `advance_to` takes microseconds and would scale this by 1000.
-        let idle_to_ns = {
-            let sched = lock_sched();
-            if sched.running == 0 {
-                sched
-                    .waits
-                    .keys()
-                    .next()
-                    .map(|&(deadline_ns, _)| deadline_ns)
-            } else {
-                // Someone is still runnable; it will park shortly and idle-jump
-                // itself, since the authority is already gone.
-                None
-            }
-        };
-        if let Some(deadline_ns) = idle_to_ns {
-            let _ = advance_to_ns(deadline_ns);
+        // `waits` is keyed in nanoseconds. [`advance_to`] takes microseconds
+        // and would scale the deadline by 1000.
+        wake_parked_if_drained();
+    }
+}
+
+/// Advance to the earliest parked deadline when nobody else will.
+///
+/// [`park_until_virtual`] idle-jumps on the way in only when every actor is
+/// already parked and no [`TimeAuthority`] is held. The last authority's
+/// drop does the same, and skips the jump while any actor is still
+/// runnable, because that actor would park and jump itself. A thread that
+/// exits reaches no such park: the converter protocol loop returns as soon
+/// as its pipe reads end of file, and drops its actor still marked
+/// runnable. That drop is the remaining path into here, so a waiter the
+/// authority left parked is advanced when the last runnable actor leaves.
+fn wake_parked_if_drained() {
+    let idle_to_ns = {
+        let sched = lock_sched();
+        if sched.running == 0 && !has_time_authority() {
+            sched
+                .waits
+                .keys()
+                .next()
+                .map(|&(deadline_ns, _)| deadline_ns)
+        } else {
+            None
         }
+    };
+    if let Some(deadline_ns) = idle_to_ns {
+        let _ = advance_to_ns(deadline_ns);
     }
 }
 
@@ -604,7 +608,13 @@ impl Drop for Actor {
             sched.running == 0
         };
         if quiescent {
-            QUIESCENT.notify_all();
+            // Jump before telling a scheduler the barrier is clear. The jump
+            // marks a released waiter runnable again, and a scheduler that
+            // observed `running == 0` in between would step past it.
+            wake_parked_if_drained();
+            if scheduler_state().running == 0 {
+                QUIESCENT.notify_all();
+            }
         }
     }
 }
@@ -1081,6 +1091,99 @@ mod tests {
              to idle-jump under its own power, or it sleeps forever"
         );
         parked.join().expect("parked thread joins");
+    }
+
+    /// A runnable actor that exits, after the last authority was released
+    /// while it was still runnable, advances an actor that stayed parked.
+    ///
+    /// The authority drop jumps only when the runnable count is already
+    /// zero. The converter's protocol thread is the case this covers: its
+    /// pipe is already closed, so it reads end of file and leaves without
+    /// parking, and a second protocol thread is still parked on the clock.
+    #[rstest]
+    fn exiting_actor_wakes_waiter_left_parked() {
+        let _g = lock_or_recover();
+        init(0.0, 1_000_000);
+        assert_eq!(
+            registered_actors(),
+            0,
+            "a previous test left actors registered: {:?}",
+            registered_actor_names()
+        );
+
+        let authority = take_time_authority();
+        let woke = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&woke);
+        let parked = std::thread::spawn(move || {
+            let _actor = register_actor("parked-across-exit");
+            wait_virtual_us(1_000_000);
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let registered = registered_actor_names()
+                .iter()
+                .any(|name| name == "parked-across-exit");
+            if registered && scheduler_state().running == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parked thread never registered and parked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let go = std::sync::Arc::clone(&release);
+        let exiting = std::thread::spawn(move || {
+            let _actor = register_actor("exits-without-parking");
+            while !go.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let names = registered_actor_names();
+            let both = names.iter().any(|name| name == "parked-across-exit")
+                && names.iter().any(|name| name == "exits-without-parking");
+            if both && scheduler_state().running == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "exiting thread never registered as the one runnable actor: {names:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(authority);
+        std::thread::sleep(Duration::from_millis(50));
+        let stayed_parked = !woke.load(Ordering::SeqCst);
+        release.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !woke.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let woke_in_time = woke.load(Ordering::SeqCst);
+        // Join the exiting thread even when the waiter never woke, so a
+        // failure does not leave it spinning into the next test. The waiter
+        // is joined only after it has returned: joining a thread still
+        // parked on the clock would hang the failure.
+        exiting.join().expect("exiting thread joins");
+        assert!(
+            stayed_parked,
+            "releasing the authority while an actor is still runnable must leave the parked waiter asleep"
+        );
+        assert!(
+            woke_in_time,
+            "the parked waiter must resume once the last runnable actor exits"
+        );
+        parked.join().expect("parked thread joins");
+        assert_eq!(registered_actors(), 0);
     }
 
     /// `virtual_to_wall_us(0)` is always 0 regardless of scale (no wait → no
