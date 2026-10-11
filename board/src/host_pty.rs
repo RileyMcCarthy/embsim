@@ -29,7 +29,7 @@
 //! race. The host's bytes wait in the PTY instead.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -351,20 +351,34 @@ impl Component for HostPty {
             (bridge, Arc::new(AtomicBool::new(true)))
         };
 
-        let master: RawFd = self.pty.master.as_raw_fd();
+        // A duplicate of the master. The component drops before the engine,
+        // which closes the `Pty`'s own descriptor. The callbacks and the pump
+        // hold this duplicate until the engine drops the callbacks and the
+        // pump has joined, so a drive delivered on the way out still writes
+        // a live descriptor.
+        let master =
+            Arc::new(
+                self.pty
+                    .master
+                    .try_clone()
+                    .map_err(|error| AttachError::Failed {
+                        message: format!("host PTY: cannot duplicate the master: {error}"),
+                    })?,
+            );
         let counters = Arc::clone(&self.counters);
 
         // Net → host: whatever the wire spells goes out the PTY.
         {
             let (bridge, shutdown) = (Arc::clone(&bridge), Arc::clone(&self.shutdown));
             let (outbound, counters) = (Arc::clone(&self.outbound), Arc::clone(&counters));
+            let master = Arc::clone(&master);
             let rx = io.pin("RX")?;
             io.on_sense("RX", move |sense| {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 deliver(
-                    master,
+                    &master,
                     &outbound,
                     &counters,
                     bridge.receive_sense(&rx, &sense),
@@ -374,11 +388,12 @@ impl Component for HostPty {
         {
             let (bridge, shutdown) = (Arc::clone(&bridge), Arc::clone(&self.shutdown));
             let (outbound, counters) = (Arc::clone(&self.outbound), Arc::clone(&counters));
+            let master = Arc::clone(&master);
             io.on_wake_ns(move |now_ns| {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                deliver(master, &outbound, &counters, bridge.service(now_ns));
+                deliver(&master, &outbound, &counters, bridge.service(now_ns));
             });
         }
 
@@ -392,7 +407,7 @@ impl Component for HostPty {
                 let (outbound, counters) = (Arc::clone(&self.outbound), counters);
                 move || {
                     pump_loop(
-                        master,
+                        &master,
                         &bridge,
                         &rail_known,
                         &shutdown,
@@ -429,7 +444,7 @@ impl Drop for HostPty {
 ///
 /// So bytes queue, and the pump thread drains what the PTY would not take.
 fn deliver(
-    master: RawFd,
+    master: &OwnedFd,
     outbound: &Mutex<VecDeque<u8>>,
     counters: &HostPtyCounters,
     frames: Vec<Result<u8, FramingError>>,
@@ -451,15 +466,13 @@ fn deliver(
 ///
 /// Returns having written nothing if the master is full; that is the normal
 /// case under load, not an error.
-fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, counters: &HostPtyCounters) {
+fn drain_outbound(master: &OwnedFd, queue: &mut VecDeque<u8>, counters: &HostPtyCounters) {
     while !queue.is_empty() {
         let take = queue.len().min(PUMP_WRITE_CHUNK);
         let chunk: Vec<u8> = queue.iter().take(take).copied().collect();
-        // SAFETY: the master descriptor is owned by the `HostPty` that
-        // installed this callback, and the engine is joined before the
-        // component drops (`SystemHandle`'s documented order).
-        let fd = unsafe { BorrowedFd::borrow_raw(master) };
-        match nix::unistd::write(fd, &chunk) {
+        // `master` is the duplicate `attach` handed this callback. It stays
+        // open until the callback itself drops, which is after the component.
+        match nix::unistd::write(master, &chunk) {
             Ok(0) => break,
             Ok(written) => {
                 queue.drain(..written);
@@ -490,7 +503,7 @@ fn drain_outbound(master: RawFd, queue: &mut VecDeque<u8>, counters: &HostPtyCou
 /// Read whatever the host wrote and frame it onto the wire, once
 /// `rail_known` says the bridge knows whether it is powered.
 fn pump_loop(
-    master: RawFd,
+    master: &OwnedFd,
     bridge: &SerialLevelBridge,
     rail_known: &AtomicBool,
     shutdown: &AtomicBool,
@@ -526,7 +539,7 @@ fn pump_loop(
             events |= libc::POLLOUT;
         }
         let mut pollfd = libc::pollfd {
-            fd: master,
+            fd: master.as_raw_fd(),
             events,
             revents: 0,
         };
@@ -543,16 +556,16 @@ fn pump_loop(
         if rc == 0 || room == 0 || pollfd.revents & libc::POLLIN == 0 {
             continue; // timeout, a full wire queue, or nothing to read
         }
-        // SAFETY: the master stays open until the owning component joins this
-        // thread in `Drop`.
-        let fd = unsafe { BorrowedFd::borrow_raw(master) };
+        // `master` is the pump's duplicate, open for as long as this thread
+        // runs. `HostPty::drop` joins the pump before the `Pty` descriptor
+        // closes; this duplicate outlives that join.
         loop {
             let room = wire_room();
             if room == 0 {
                 break;
             }
             let cap = room.min(PUMP_READ_CHUNK);
-            match nix::unistd::read(fd, &mut buf[..cap]) {
+            match nix::unistd::read(master, &mut buf[..cap]) {
                 Ok(0) => break, // no host attached yet; poll again
                 Ok(n) => {
                     let shed = bridge.transmit(&buf[..n]);

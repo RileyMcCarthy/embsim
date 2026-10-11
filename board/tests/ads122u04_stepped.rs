@@ -20,12 +20,42 @@
 //! system drops the part, and the clock is stepped before it exists.
 
 use rstest::rstest;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use embsim_board::{EndpointRef, Harness, System};
 use embsim_core::virtual_clock::{self, ClockMode};
-use embsim_models::ads122u04::Config;
+use embsim_models::ads122u04::{Ads122u04, Config};
 use embsim_models::ads122u04_component::{ads122u04_framing, Ads122u04Component};
+use vibes_behaviour::{behaviour, expect, Test};
+
+/// The virtual clock is process-global. The two cases in this binary each
+/// construct a converter, so they take the clock one at a time.
+static CLOCK_LOCK: Mutex<()> = Mutex::new(());
+
+fn clock_lock() -> MutexGuard<'static, ()> {
+    CLOCK_LOCK.lock().unwrap_or_else(|poisoned| {
+        CLOCK_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// After the firmware end of the pipe is closed, the protocol thread leaves
+/// the clock. Wait for that before the next case re-anchors it.
+fn wait_for_protocol_thread() {
+    let started = Instant::now();
+    while virtual_clock::registered_actor_names()
+        .iter()
+        .any(|name| name == "ads122u04-protocol")
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "converter protocol thread still registered: {:?}",
+            virtual_clock::registered_actor_names()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 mod uart_probe;
 use uart_probe::{ProbeHandle, UartProbe};
@@ -79,6 +109,7 @@ fn code_from_le3(bytes: &[u8]) -> i32 {
 /// time, so completion is itself the assertion.
 #[rstest]
 fn rdata_round_trip_completes_under_a_stepped_clock() {
+    let _clock = clock_lock();
     // Stepped mode first, before any ADS component (and therefore any actor)
     // exists — see the module docs.
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
@@ -156,4 +187,29 @@ fn rdata_round_trip_completes_under_a_stepped_clock() {
         "the engine must survive a stepped round trip"
     );
     system.shutdown();
+    wait_for_protocol_thread();
+}
+
+/// A stepped clock held by a time authority stays at its origin while the
+/// converter model is constructed.
+#[rstest]
+fn the_virtual_clock_stays_at_its_origin_while_the_converter_model_is_constructed() {
+    behaviour!(Test {
+        id: "ads122u04.protocol-holds-time",
+        covers: Some("models/src/ads122u04.rs#protocol_loop"),
+        given: "a stepped clock held by a time authority while the converter model is \
+                constructed",
+    });
+    expect!("origin-stays", "the virtual clock stays at its origin");
+    let _clock = clock_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let authority = virtual_clock::take_time_authority();
+    let (_model, firmware_fd) = Ads122u04::new(Config::default());
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(virtual_clock::virtual_ns(), 0);
+    drop(authority);
+    // SAFETY: `firmware_fd` is the pipe end `Ads122u04::new` returned, and
+    // this is the one close. The protocol thread then sees the end of file.
+    assert_eq!(unsafe { libc::close(firmware_fd) }, 0);
+    wait_for_protocol_thread();
 }

@@ -301,6 +301,7 @@ fn supervise(profile: *const libc::c_char) -> io::Result<()> {
 }
 
 impl ChromeProcess {
+    /// Start Chrome as `spec` says, on `about:blank`, in a fresh profile.
     ///
     /// The arguments keep Chrome from doing work of its own a run did not
     /// ask for (first-run pages, background networking, throttling a

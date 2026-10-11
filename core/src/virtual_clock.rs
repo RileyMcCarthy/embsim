@@ -431,8 +431,10 @@ impl Drop for TimeAuthority {
         // This went unnoticed while the only actors parked at shutdown were
         // detached threads nobody joined. It becomes a hang the moment a joined
         // thread parks on the virtual clock — which is exactly what the MCU
-        // serial pump now does, and `SystemHandle` joins the engine (releasing
-        // this authority) BEFORE it drops the components that join their pumps.
+        // serial pump now does. `SystemHandle` drops components, which join
+        // their pumps, before it joins the engine and releases this
+        // authority. The wake stays so a pump still parked at the release
+        // is not left asleep.
         //
         // One nudge is enough to become self-sustaining: a waiter woken here
         // returns, and the next time it parks it takes the no-authority branch

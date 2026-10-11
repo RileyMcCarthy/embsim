@@ -1,18 +1,23 @@
 //! A project built and started: `embsim check` and `embsim run`.
 //!
 //! Both load the project, survey each board with the registry it builds
-//! with, and build the system through the catalog set. `check` starts it
-//! with virtual time held — every part attached, every attach-time drive
-//! resolved, no wake fired: the state `System::build` analyzes — reads what
-//! the build found, and stops. `run` releases time and runs, until its
-//! duration, an interrupt, or the first look at which a part's report says
-//! it failed (`Report::failure`): then it prints its summary and returns
-//! the failure as its error, so the command exits non-zero.
+//! with, and build the system through the catalog set. `check` reports the
+//! settled build fixed point plus the build lints and does not start the
+//! live engine. The live engine's first resolve is the system before
+//! components have idled it, and the live engine does not re-derive the
+//! build lints. `run` starts the live engine with virtual time held,
+//! releases time, and runs until its duration, an interrupt, or the first
+//! look at which a part's report says it failed (`Report::failure`): then
+//! it prints its summary and returns the failure as its error, so the
+//! command exits non-zero.
 //!
-//! The clock is stepped (`TESTING.md` rule 9): this thread is a registered
-//! virtual-clock actor, and the engine advances only while it is parked in
-//! a virtual wait, so a run for a duration ends at exactly that virtual
-//! instant and reads the system at rest there, the same on every machine.
+//! The clock is stepped (`TESTING.md` rule 9). A time authority is held
+//! from before the project is instantiated until `run`'s live engine holds
+//! one of its own, and on `check` until the build has dropped its parts.
+//! On `run` this thread then registers as a virtual-clock actor, and the
+//! engine advances only while it is parked in a virtual wait, so a run for
+//! a duration ends at exactly that virtual instant and reads the system at
+//! rest there, the same on every machine.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -222,11 +227,18 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-/// Start the stepped clock at zero. Before anything is built: a model can
-/// start a thread that joins the clock as an actor when it is constructed
-/// (the ADS122U04's protocol pump), and it joins the clock this run keeps.
-fn start_clock() {
+/// Start the stepped clock at zero and take a time authority.
+///
+/// Before anything is built: a model can start a thread that joins the
+/// clock as an actor when it is constructed (the ADS122U04's protocol
+/// pump). The caller holds the authority across that construction. `run`
+/// drops it once [`start_held`] has returned — the live engine has taken
+/// its own authority by then, so the refcount stays above zero. `check`
+/// drops it once [`System::build`] has dropped the parts, so the parked
+/// thread can see its pipe close. An error drops it by scope.
+fn start_clock() -> virtual_clock::TimeAuthority {
     virtual_clock::init_mode(ClockMode::Stepped, CYCLE_HZ);
+    virtual_clock::take_time_authority()
 }
 
 /// Start `system` with virtual time held.
@@ -244,11 +256,13 @@ pub fn check(
     provenance: &[String],
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    start_clock();
+    let hold = start_clock();
     let reports = Reports::new();
     let (system, _) = build(set, path, &[], provenance, &reports, out)?;
-    let handle = start_held(path, system)?;
-    let findings = handle.findings();
+    let built = system
+        .build()
+        .map_err(|err| format!("{}: the system does not build: {err}", path.display()))?;
+    let findings = built.diagnostics().findings();
     if findings.is_empty() {
         say!(out, "build findings: none");
     } else {
@@ -257,11 +271,14 @@ pub fn check(
             "build findings ({}), the system before its first wake:",
             findings.len()
         );
-        for finding in &findings {
+        for finding in findings {
             say!(out, "  {finding}");
         }
     }
-    handle.shutdown();
+    // The build dropped the parts and closed the converter's pipe, and left
+    // the protocol thread running. Dropping the hold lets that thread wake,
+    // see the closed pipe, and exit.
+    drop(hold);
     say!(out, "ok: {} builds", path.display());
     Ok(())
 }
@@ -345,10 +362,14 @@ pub fn run(
     options: &RunOptions,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    start_clock();
+    let hold = start_clock();
     let reports = Reports::new();
     let (system, pin_nets) = build(set, path, &options.ptys, &options.provenance, &reports, out)?;
     let handle = start_held(path, system)?;
+    // `EngineHandle::spawn` took a time authority before it returned.
+    // Dropping this hold leaves that one in place, so the refcount stays
+    // above zero and a parked protocol thread waits.
+    drop(hold);
     for net in &options.nets {
         if handle.net_state(net).is_none() {
             handle.shutdown();
@@ -491,10 +512,95 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use embsim_board::parse_duration;
     use rstest::rstest;
+    use vibes_behaviour::{behaviour, expect, Test};
 
     use super::*;
+
+    /// Finding lines `check` prints under its build-findings header.
+    fn findings_check_prints(text: &str) -> Vec<String> {
+        let mut lines = text.lines();
+        let header = lines
+            .find(|line| *line == "build findings: none" || line.starts_with("build findings ("));
+        match header {
+            Some("build findings: none") => Vec::new(),
+            Some(_) => lines
+                .take_while(|line| !line.starts_with("ok:"))
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect(),
+            None => panic!("check's output is missing its build-findings header:\n{text}"),
+        }
+    }
+
+    /// Wall-time wait until a converter protocol thread has left the clock.
+    /// Both `check` and a second build can leave one, and the clock is
+    /// process-global for every unit test in this crate.
+    fn wait_for_protocol_threads() {
+        let started = Instant::now();
+        loop {
+            let live = virtual_clock::registered_actor_names()
+                .iter()
+                .any(|name| name == "ads122u04-protocol");
+            if !live && started.elapsed() >= Duration::from_millis(40) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "converter protocol thread still registered: {:?}",
+                virtual_clock::registered_actor_names()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[rstest]
+    fn check_lists_the_findings_the_build_reports() {
+        behaviour!(Test {
+            id: "cli.check-matches-build",
+            covers: Some("cli/src/live.rs#check"),
+            given: "the force-gauge add-on project",
+        });
+        expect!(
+            "same-findings",
+            "the check command lists the findings the build analysis reports for that project"
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the CLI crate sits in the workspace")
+            .join("boards/projects/ds2-addon.toml");
+        let set = crate::shipped();
+        // One authority across both constructions: each starts a converter
+        // protocol thread at instantiate, and the thread parks while the
+        // authority is held.
+        let hold = virtual_clock::take_time_authority();
+        let mut out = Vec::new();
+        check(&set, &path, &[], &mut out).expect("the project checks");
+        let reports = Reports::new();
+        let built = Project::load(&path)
+            .expect("the project loads")
+            .instantiate_with(&set, &reports)
+            .expect("the project instantiates")
+            .build()
+            .expect("the system builds");
+        let text = String::from_utf8(out).expect("check writes utf-8");
+        let mut printed = findings_check_prints(&text);
+        let mut reported: Vec<String> = built
+            .diagnostics()
+            .findings()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        printed.sort();
+        reported.sort();
+        assert_eq!(printed, reported);
+        drop(built);
+        drop(hold);
+        wait_for_protocol_threads();
+    }
 
     #[rstest]
     #[case::milliseconds("20ms", 20_000_000)]

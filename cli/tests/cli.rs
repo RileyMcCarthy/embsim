@@ -524,7 +524,7 @@ fn a_check_prints_the_builds_findings_in_plain_words() {
     assert_says(
         &text,
         &[
-            "build findings (11), the system before its first wake:\nno source reaches \
+            "build findings (10), the system before its first wake:\nno source reaches \
              DS2Addon.GPIO1, which a digital input reads\n",
             "\nno source reaches DS2Addon.AIN0, which an analog input reads\n",
             "ok: ",

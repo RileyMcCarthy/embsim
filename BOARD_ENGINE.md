@@ -359,7 +359,7 @@ alone). Then, per node:
   datasheet behavior (silent chip for a floating `~RESET`, noise policy for a
   floating ADC input). The engine never invents a value silently.
 - A **full resolution pass runs at `System::build()`**, so never-driven nets
-  (the one-pin `~RESET` net) are reported `Floating` to their sensing
+  are reported `Floating` to their sensing
   components immediately, before any traffic. The build then runs to a
   **bounded fixed point**: the drives components issue in response to the
   states they are delivered are replayed and the changed states delivered
@@ -472,10 +472,11 @@ roles, routing pass and delivery; they are gone.
   `SerialLevelBridge` clocks start/data/stop bits onto the net; the peer
   decodes levels back to bytes. Contention, floating lines, and series
   resistors are therefore ordinary net effects.
-- Scenario byte-drop on a *route* (`stream_drop`) was deleted with the byte
-  route. Level-domain fault injection for the serial era is
-  [`Scenario::edge_fault`](https://github.com/RileyMcCarthy/embsim/pull/48)
-  (draft; issue #44) — do not invent a byte-pipe injector here.
+- `Scenario::edge_fault` injects a level-domain fault for a window of drive
+  edges: float a pin, stick it, or contend with an ideal source. A pin
+  target counts that pin's drives. A net target counts every drive on the
+  net. The log records the drive the component asked for. The byte-route
+  `stream_drop` knob was deleted with the byte route.
 
 ### Netlist ingestion
 
@@ -584,8 +585,14 @@ actually has (an N-pin net has no "where" for a generic open):
 - `net_stuck(net, rail)` — add a Thevenin source to a net;
 - `value_override("Board.R5", "4k7")`, `dnp_override("Board.C7", Populated)` —
   scenario-time BOM changes;
-- Level-domain serial/line faults: see draft PR #48 / issue #44
-  (`Scenario::edge_fault`) once merged — not a byte-route `stream_drop`.
+- `edge_fault(target, kind, after_edges, edge_count)` — a timed level-domain
+  fault. `target` is a pin (`Board.Ref.Pin` or `Bench.Pin`) or a net
+  (`Board.NETNAME`); a name that is both selects the pin. The window opens
+  for `edge_count` matching drives after `after_edges` of them. Float
+  suppresses the counted drives. Stuck suppresses them and holds the net
+  from an ideal source. Contention leaves the drivers and adds the ideal
+  source beside them. `after_edges == 0` also covers the idle state for
+  stuck and contention.
 
 Harness endpoints are `Board.Connector.Pin` references; bare MCU-pin endpoints
 (`P2EVAL.P0`) are allowed for bench rigs that aren't a designed PCB —

@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use embsim_board::{Finding, NetState, Project, SenseKind};
+use embsim_board::{Finding, Level, NetState, Project, SenseKind};
 use embsim_boards::catalog::StandardCatalog;
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::ads122u04_component::PUMP_POLL_VIRTUAL_US;
@@ -58,10 +58,8 @@ fn the_ds2_project_powers_the_adc_from_its_bench_supplies() {
          nothing, and no regulator is reported down"
     );
     expect!(
-        "floating-reset-found",
-        "the converter's reset input is reported floating",
-        "the board leaves the converter's active-low reset on a net no other pin shares, as \
-         the add-on's own build tests find"
+        "reset-pulled-high",
+        "the converter's reset input is held high by its pull-up to the digital supply"
     );
     // Stepped before the project builds the converter, whose protocol
     // thread joins the clock the moment it exists.
@@ -110,11 +108,19 @@ fn the_ds2_project_powers_the_adc_from_its_bench_supplies() {
         .collect();
     assert_eq!(lints, Vec::<&Finding>::new());
     assert!(
-        findings.contains(&Finding::FloatingSense {
+        !findings.contains(&Finding::FloatingSense {
             net: "DS2Addon.~RESET".to_string(),
             kind: SenseKind::Digital,
         }),
-        "the one-pin reset net is reported floating; got {findings:?}"
+        "R10 holds ~RESET; got {findings:?}"
+    );
+    assert!(
+        matches!(
+            system.net_state("DS2Addon.~RESET"),
+            Some(NetState::Pulled(Level::High, _))
+        ),
+        "reset reads pulled high, got {:?}",
+        system.net_state("DS2Addon.~RESET")
     );
     let stalled: Vec<&Finding> = findings
         .iter()

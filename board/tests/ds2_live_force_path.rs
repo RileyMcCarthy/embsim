@@ -4,12 +4,11 @@
 //! sources through the closed JP1/JP2 jumpers into the AIN senses, an RDATA
 //! exchange through the 47 Ω-collapsed UART link, and the power/reset gate.
 //!
-//! Two scenarios bracket the July 2026 bench truth:
-//! - with the reset bodge (`pin_short` U1.3 → U1.13, the bench fix), the
-//!   chip answers RDATA with the conversion for the driven differential;
-//! - without it, the stock netlist's one-pin `~RESET` net leaves the chip
-//!   **silent** — perfect commands in, nothing out — with the engine's
-//!   `FloatingSense` finding naming the cause. The bench bug, live.
+//! Two scenarios bracket the reset pin:
+//! - with `R10` fitted, the chip answers RDATA with the conversion for the
+//!   driven differential;
+//! - with `R10`'s reset pad lifted, `~RESET` floats, the engine reports
+//!   `FloatingSense`, and the chip stays silent.
 
 use rstest::rstest;
 use std::sync::{Mutex, MutexGuard};
@@ -124,9 +123,9 @@ fn fake_host(handle: ProbeHandle) -> UartProbe {
 /// Start the live system: the real DS2Addon netlist with the LIVE
 /// ADS122U04 component, the powered bench harness (both supply straps),
 /// two bridge sources at 1.65 V ± `diff_volts`/2 into J2.3/J2.4, the input
-/// jumpers closed, and — when `reset_bodge` — the bench fix (`pin_short`
-/// U1.3 → U1.13) that ties `~RESET` to the DVDD rail.
-fn ds2_live_system(reset_bodge: bool, diff_volts: f64, host: &ProbeHandle) -> SystemHandle {
+/// jumpers closed. `lift_pullup` detaches `R10`'s reset pad so `~RESET`
+/// is the converter pin alone.
+fn ds2_live_system(lift_pullup: bool, diff_volts: f64, host: &ProbeHandle) -> SystemHandle {
     let mut registry = PartRegistry::new();
     {
         let host = host.clone();
@@ -166,8 +165,8 @@ fn ds2_live_system(reset_bodge: bool, diff_volts: f64, host: &ProbeHandle) -> Sy
     let mut scenario = Scenario::default()
         .jumper("DS2Addon.JP1", JumperState::Closed)
         .jumper("DS2Addon.JP2", JumperState::Closed);
-    if reset_bodge {
-        scenario = scenario.pin_short("DS2Addon.U1.3", "DS2Addon.U1.13");
+    if lift_pullup {
+        scenario = scenario.pin_detach("DS2Addon.R10.2");
     }
 
     System::new()
@@ -188,10 +187,10 @@ fn analog_volts(system: &SystemHandle, net: &str) -> f64 {
 }
 
 // ============================================================
-// (a) RDATA round trip with the reset bodge
+// (a) RDATA round trip with R10 fitted
 // ============================================================
 
-/// With the bodge in place the chip is alive: SYNC + RDATA (0x55 0x10,
+/// With the reset pull-up fitted the chip is alive: SYNC + RDATA (0x55 0x10,
 /// SBAS752B §8.5.3.4) into the ADS RX stream endpoint answers with the
 /// 3-byte conversion for the MNA-solved bridge differential — the whole
 /// force path (bridge sources → jumpers → AIN senses → the model's pins →
@@ -203,7 +202,7 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
 
     let host = ProbeHandle::new();
     // 256 mV differential: 1.778 V / 1.522 V at the bridge terminals.
-    let system = ds2_live_system(true, 0.256, &host);
+    let system = ds2_live_system(false, 0.256, &host);
 
     // Straight harness: no two drivers fighting on a line, engine healthy.
     assert!(
@@ -214,13 +213,13 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
         "straight harness must route cleanly; got {:?}",
         system.findings()
     );
-    // The bodge sources ~RESET: the bench finding must NOT fire.
+    // R10 holds ~RESET high.
     assert!(
         !system.findings().contains(&Finding::FloatingSense {
             net: "DS2Addon.~RESET".to_string(),
             kind: SenseKind::Digital,
         }),
-        "bodged reset must not float; got {:?}",
+        "the pull-up must hold reset; got {:?}",
         system.findings()
     );
 
@@ -265,21 +264,19 @@ fn rdata_returns_the_conversion_for_the_driven_bridge_differential() {
 }
 
 // ============================================================
-// (b) Without the reset bodge: the silent chip, live
+// (b) Pull-up lifted: the silent chip, live
 // ============================================================
 
-/// The stock netlist leaves `~RESET` on a one-pin net. Without the bodge the
-/// engine reports the floating sense at start, and the LIVE chip exhibits
-/// the exact bench symptom: the command stream is delivered, the chip never
-/// answers. (Two boards were condemned on the bench before a multimeter
-/// found this; here it is one assertion.)
+/// Lifting `R10`'s reset pad leaves `~RESET` on the converter pin alone.
+/// The engine reports the floating sense at start, and the live chip stays
+/// silent: the command stream is delivered and the chip never answers.
 #[rstest]
-fn without_the_reset_bodge_the_chip_stays_silent() {
+fn with_the_reset_pullup_lifted_the_chip_stays_silent() {
     let _g = lock_clock();
     virtual_clock::init(50.0, 1_000_000);
 
     let host = ProbeHandle::new();
-    let system = ds2_live_system(false, 0.256, &host);
+    let system = ds2_live_system(true, 0.256, &host);
 
     // The engine names the cause before any traffic.
     assert!(
@@ -287,7 +284,7 @@ fn without_the_reset_bodge_the_chip_stays_silent() {
             net: "DS2Addon.~RESET".to_string(),
             kind: SenseKind::Digital,
         }),
-        "the one-pin ~RESET net must surface as a floating sense; got {:?}",
+        "a lifted pull-up must leave ~RESET floating; got {:?}",
         system.findings()
     );
 

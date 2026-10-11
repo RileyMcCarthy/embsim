@@ -157,11 +157,12 @@ const EDGE: Census = Census {
     pwl: 33,
 };
 
-/// The DS2 force-gauge add-on from `fixtures/ds2_addon.net`. 31 netlist
+/// The DS2 force-gauge add-on from `fixtures/ds2_addon.net`. 32 netlist
 /// parts: the ADS122U04 is the one registered part and it is a model; the
-/// rest classify in the auto tier.
+/// rest classify in the auto tier. `R10` joins `~RESET` to `+3V3`, so the
+/// reset net is a member of the supply's cluster.
 const DS2: Census = Census {
-    clusters: 22,
+    clusters: 21,
     largest_cluster_roots: 2,
     stub_count: 0,
     mechanical: &[],

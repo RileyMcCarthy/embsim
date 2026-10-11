@@ -1,14 +1,13 @@
 //! The phase-1 findings gate: the July 2026 DS2Addon bench bring-up bugs,
-//! reproduced as build-time findings against the real board netlist.
+//! reproduced as build-time findings against the board netlist.
 //!
-//! Each test uses `tests/fixtures/ds2_addon.net` — the actual
-//! `kicad-cli sch export netlist` of the board that was debugged on the
-//! bench — so these regressions hold the engine to the same truth the
-//! hardware exhibited.
+//! Each test uses `tests/fixtures/ds2_addon.net`. `R10` (10 kΩ) pulls
+//! `~RESET` up to `+3V3`. Lifting that pull-up (`pin_detach` on `R10.2`)
+//! is the floating-reset bench bug. An unstrapped AVDD is the other.
 
 use embsim_board::{
     AttachError, Board, Component, ComponentNetIo, Diagnostics, DnpState, EndpointRef, Finding,
-    Harness, JumperState, NetState, PartRegistry, PinDecl, Scenario, SenseKind, System,
+    Harness, JumperState, Level, NetState, PartRegistry, PinDecl, Scenario, SenseKind, System,
 };
 use embsim_models::ads122u04_component::ADS122U04_PINS;
 use rstest::rstest;
@@ -74,15 +73,27 @@ fn floating(diags: &Diagnostics, net: &str, kind: SenseKind) -> bool {
 }
 
 // ============================================================
-// Regression 1: floating ~RESET (net has exactly one pin)
+// Regression 1: ~RESET pulled up by R10
 // ============================================================
 
-/// Bench bug: the board leaves the ADS122U04's active-low reset floating
-/// (the `~{RESET}` net contains only U1 pin 3). Two chips appeared dead for
-/// days before a multimeter found it. The engine must report it at build,
-/// before any traffic.
+/// `R10` ties the converter's active-low reset to the digital supply. On a
+/// powered bench the reset net reads high, and lifting `R10`'s reset pad
+/// leaves the one remaining pin floating.
 #[rstest]
-fn floating_reset_is_reported_at_build() {
+fn the_reset_pullup_holds_reset_high() {
+    behaviour!(Test {
+        id: "ds2.reset-pullup-holds-high",
+        covers: Some("board/tests/fixtures/ds2_addon.net"),
+        given: "the force-gauge add-on on a powered bench, its reset pull-up fitted",
+    });
+    expect!(
+        "reset-high",
+        "the converter's reset input reads high through the pull-up"
+    );
+    expect!(
+        "lifted-pullup-floats",
+        "with the pull-up's reset pad lifted, the reset input reads as floating"
+    );
     let system = System::new()
         .board("DS2Addon", ds2_board())
         .harness(powered_bench_harness())
@@ -91,14 +102,35 @@ fn floating_reset_is_reported_at_build() {
 
     let diags = system.diagnostics();
     assert!(
-        floating(diags, "DS2Addon.~RESET", SenseKind::Digital),
-        "the one-pin ~RESET net must surface as a floating digital sense; got {:?}",
+        !floating(diags, "DS2Addon.~RESET", SenseKind::Digital),
+        "R10 must hold ~RESET; got {:?}",
         diags.findings()
     );
+    let reset = system
+        .nets()
+        .iter()
+        .find(|net| net.name == "DS2Addon.~RESET")
+        .expect("~RESET");
+    assert!(
+        matches!(reset.state, NetState::Pulled(Level::High, _)),
+        "reset should read pulled high, got {:?}",
+        reset.state
+    );
 
-    // Powered rails must NOT be floating: the finding is specific.
     assert!(!floating(diags, "DS2Addon.+3V3", SenseKind::Digital));
     assert!(!floating(diags, "DS2Addon.VDDA", SenseKind::Analog));
+
+    let lifted = System::new()
+        .board("DS2Addon", ds2_board())
+        .harness(powered_bench_harness())
+        .scenario(Scenario::default().pin_detach("DS2Addon.R10.2"))
+        .build()
+        .expect("system builds");
+    assert!(
+        floating(lifted.diagnostics(), "DS2Addon.~RESET", SenseKind::Digital),
+        "a lifted pull-up leaves ~RESET floating; got {:?}",
+        lifted.diagnostics().findings()
+    );
 }
 
 // ============================================================
@@ -234,19 +266,18 @@ fn open_input_jumpers_float_the_adc_inputs() {
 }
 
 // ============================================================
-// Fault algebra: pin_short models the reset bodge wire
+// Fault algebra: pin_short and net_stuck source a lifted reset
 // ============================================================
 
-/// The bench fix for the floating reset was a bodge wire from the reset pad
-/// to the 3.3 V rail. `pin_short` is exactly that fault-algebra primitive:
-/// union the two pins' nets. With the bodge applied, the floating finding
-/// must disappear; `net_stuck` (an injected ideal source) must clear it too.
+/// With `R10` lifted, `~RESET` is the converter pin alone. A short from that
+/// pin to DVDD, or an ideal source on the net, sources it again.
 #[rstest]
-fn pin_short_and_net_stuck_model_the_reset_bodge() {
-    // Baseline: floating (regression 1).
+fn pin_short_and_net_stuck_source_a_lifted_reset() {
+    let lifted = Scenario::default().pin_detach("DS2Addon.R10.2");
     let system = System::new()
         .board("DS2Addon", ds2_board())
         .harness(powered_bench_harness())
+        .scenario(lifted.clone())
         .build()
         .expect("system builds");
     assert!(floating(
@@ -255,25 +286,22 @@ fn pin_short_and_net_stuck_model_the_reset_bodge() {
         SenseKind::Digital
     ));
 
-    // Bodge wire: short U1.3 (~RESET) to U1.13 (DVDD, on the powered +3V3
-    // net) — the finding clears.
     let system = System::new()
         .board("DS2Addon", ds2_board())
         .harness(powered_bench_harness())
-        .scenario(Scenario::default().pin_short("DS2Addon.U1.3", "DS2Addon.U1.13"))
+        .scenario(lifted.clone().pin_short("DS2Addon.U1.3", "DS2Addon.U1.13"))
         .build()
         .expect("system builds");
     assert!(
         !floating(system.diagnostics(), "DS2Addon.~RESET", SenseKind::Digital),
-        "the pin_short bodge must source the reset net; got {:?}",
+        "shorting reset to DVDD must source it; got {:?}",
         system.diagnostics().findings()
     );
 
-    // Equivalent via net_stuck (an injected rail source on the net).
     let system = System::new()
         .board("DS2Addon", ds2_board())
         .harness(powered_bench_harness())
-        .scenario(Scenario::default().net_stuck("DS2Addon.~RESET", 3.3))
+        .scenario(lifted.net_stuck("DS2Addon.~RESET", 3.3))
         .build()
         .expect("system builds");
     assert!(!floating(

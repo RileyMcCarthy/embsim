@@ -132,6 +132,7 @@ use crate::net::{
     TheveninDrive, Volts, COUPLED_REACH_OHMS, COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO,
     LOGIC_THRESHOLD_VOLTS, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
+use crate::system::EdgeFaultKind;
 
 // ============================================================
 // Constants
@@ -798,6 +799,75 @@ impl TerminalDrive {
     }
 }
 
+/// A timed level-domain fault, as assembly records it
+/// ([`Resolver::add_edge_fault`]). The live window — how many matching
+/// drives have been seen, and the stuck terminal a [`EdgeFaultKind::Stuck`]
+/// or [`EdgeFaultKind::Contention`] preallocates — lives on the engine
+/// thread once [`EngineHandle::spawn`] takes the list.
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeFaultSpec {
+    /// The pin whose drives this fault counts. `None` counts every drive
+    /// published on [`Self::net`].
+    pub(crate) endpoint: Option<EndpointId>,
+    /// The net a stuck or contending source holds, and the net a net-target
+    /// float clears.
+    pub(crate) net: usize,
+    /// What the injector forces while the window is open.
+    pub(crate) kind: EdgeFaultKind,
+    /// Matching drive edges that pass before the window opens.
+    pub(crate) after_edges: u64,
+    /// Matching drive edges the window stays open for.
+    pub(crate) edge_count: u64,
+}
+
+/// One [`EdgeFaultSpec`] installed on the resolver, with the stuck terminal
+/// it owns and the matching drives seen so far.
+#[derive(Debug, Clone)]
+struct LiveEdgeFault {
+    endpoint: Option<EndpointId>,
+    net: usize,
+    kind: EdgeFaultKind,
+    after_edges: u64,
+    edge_count: u64,
+    /// `None` for [`EdgeFaultKind::Float`]. A stuck or contending fault owns
+    /// a terminal that stays [`TerminalDrive::Released`] outside its window,
+    /// so membership is fixed at registration and the voltage moves with the
+    /// window.
+    terminal: Option<TerminalId>,
+    /// Matching drives observed. The window is open while this is in
+    /// `[after_edges, after_edges + edge_count)`.
+    seen: u64,
+}
+
+impl LiveEdgeFault {
+    /// The window covers the drive about to be applied: `seen` has not yet
+    /// counted it.
+    fn window_open(&self) -> bool {
+        let end = self.after_edges.saturating_add(self.edge_count);
+        self.seen >= self.after_edges && self.seen < end
+    }
+
+    /// A pin target counts that pin. A net target counts every drive on its net.
+    fn counts(&self, endpoint: EndpointId, net: usize) -> bool {
+        match self.endpoint {
+            Some(target) => target == endpoint,
+            None => self.net == net,
+        }
+    }
+
+    /// Float and stuck hide the drives they count. Contention leaves every
+    /// driver in place and adds its source beside them.
+    fn suppresses(&self, endpoint: EndpointId, net: usize) -> bool {
+        if !self.window_open() {
+            return false;
+        }
+        match self.kind {
+            EdgeFaultKind::Contention(_) => false,
+            EdgeFaultKind::Float | EdgeFaultKind::Stuck(_) => self.counts(endpoint, net),
+        }
+    }
+}
+
 /// One declared terminal source: the net it is declared on and what it
 /// holds. A `PowerOut` pin's source is written through its drive slot
 /// ([`DriveSlot::terminal`] points at it); a harness supply's and a
@@ -1043,8 +1113,15 @@ pub(crate) struct Resolver {
     power_sources: Vec<TerminalSource>,
     /// The `net_stuck` faults, in declaration order ([`TerminalId::Stuck`]).
     /// The canonical order of the terminal sources is these after the
-    /// power sources.
+    /// power sources. A timed stuck or contending fault
+    /// ([`Resolver::add_edge_fault`]) is one of these too, held released
+    /// until its window opens.
     stuck_sources: Vec<TerminalSource>,
+    /// Timed level faults. [`EngineHandle::spawn`] takes them onto the
+    /// engine thread. The build path leaves the list here, so a build never
+    /// opens a window; a stuck or contending fault has already declared its
+    /// terminal above.
+    edge_faults: Vec<LiveEdgeFault>,
     digital_senses: Vec<usize>,
     analog_senses: Vec<usize>,
     /// Current instruments' nets ([`ReadKind::Instrument`]): each
@@ -1388,6 +1465,7 @@ impl Resolver {
             element_currents: Vec::new(),
             power_sources: Vec::new(),
             stuck_sources: Vec::new(),
+            edge_faults: Vec::new(),
             digital_senses: Vec::new(),
             analog_senses: Vec::new(),
             current_instruments: Vec::new(),
@@ -1842,6 +1920,44 @@ impl Resolver {
         TerminalId::Stuck(self.stuck_sources.len() - 1)
     }
 
+    /// Declare a stuck terminal that sources nothing until a window sets it.
+    /// Membership is fixed here: a released terminal is still a cluster
+    /// boundary, and a bench strap on the same net sources it without a fight.
+    fn add_released_stuck_source(&mut self, net: usize) -> TerminalId {
+        self.topology_version += 1;
+        self.stuck_sources.push(TerminalSource {
+            net,
+            drive: TerminalDrive::Released,
+        });
+        TerminalId::Stuck(self.stuck_sources.len() - 1)
+    }
+
+    /// Install a timed level fault. A stuck or contending fault preallocates
+    /// its terminal released; a float adds no source, so the topology is
+    /// unchanged. The build path keeps the spec and never opens the window.
+    pub(crate) fn add_edge_fault(&mut self, spec: EdgeFaultSpec) {
+        let terminal = match spec.kind {
+            EdgeFaultKind::Float => None,
+            EdgeFaultKind::Stuck(_) | EdgeFaultKind::Contention(_) => {
+                Some(self.add_released_stuck_source(spec.net))
+            }
+        };
+        self.edge_faults.push(LiveEdgeFault {
+            endpoint: spec.endpoint,
+            net: spec.net,
+            kind: spec.kind,
+            after_edges: spec.after_edges,
+            edge_count: spec.edge_count,
+            terminal,
+            seen: 0,
+        });
+    }
+
+    /// Hand the timed faults to the engine thread. Empty on a board with none.
+    fn take_edge_faults(&mut self) -> Vec<LiveEdgeFault> {
+        std::mem::take(&mut self.edge_faults)
+    }
+
     /// Register a `PowerOut` pin: its net is a declared terminal from
     /// build on (membership is fixed at build, `NODES.md` §2 rule 3), held
     /// at `idle` until the part publishes, and the returned slot is how
@@ -1880,12 +1996,11 @@ impl Resolver {
         EndpointId(self.slots.len() - 1)
     }
 
-    /// Change what a declared terminal source holds its net at — the
-    /// oracle's entry today, and the harness's the day a scenario re-sets
-    /// a supply live; a `PowerOut` pin's part goes through its slot
-    /// ([`Self::set_drive`]). Returns whether it changed; a change dirties
-    /// the terminal's cluster and its fan-out.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Change what a declared terminal source holds its net at — a timed
+    /// stuck or contending fault's window, and a harness supply the day a
+    /// scenario re-sets one live. A `PowerOut` pin's part goes through its
+    /// slot ([`Self::set_drive`]). Returns whether it changed; a change
+    /// dirties the terminal's cluster and its fan-out.
     pub(crate) fn set_terminal(&mut self, id: TerminalId, drive: TerminalDrive) -> bool {
         if self.terminal_source(id).drive == drive {
             return false;
@@ -4781,6 +4896,9 @@ fn min_path_ohms(
 enum TimerTarget {
     /// A component wakeup (`schedule_at` / `schedule_every`).
     Wake(ComponentId),
+    /// A finite [`Drive::Periodic`] has reached its ceiling. One-shot: the
+    /// engine publishes the held segment at that instant.
+    TrainDone(EndpointId),
 }
 
 /// The subscriber a wake's [`Finding::CallbackPanic`] names — `component
@@ -4959,6 +5077,8 @@ struct EngineCore {
     topology_observers: Vec<TopologyCallback>,
     topology_epoch: u64,
     wheel: BinaryHeap<Reverse<TimerEntry>>,
+    /// Timed level faults taken from the resolver at spawn. Walked by index.
+    edge_faults: Vec<LiveEdgeFault>,
     /// `(component, deadline)` of every wake entry on the wheel that has not
     /// fired yet. A wake carries only its instant, so two entries for the
     /// same component at the same instant are one wake delivered twice --
@@ -5285,6 +5405,13 @@ impl EngineCore {
 
     /// Apply the drive whose turn it is — `seq` is the next in sequence —
     /// and resolve what it changed.
+    ///
+    /// The log records the drive the component asked for. A level fault
+    /// whose window is open may publish a different one: float and stuck
+    /// hide the drives they count, contention leaves them. The window is
+    /// read before the drive counts, the terminals are synced to that
+    /// window, the drive counts, and the terminals are synced again so a
+    /// window that just closed releases its source on this same edge.
     fn apply_drive(&mut self, seq: u64, endpoint: EndpointId, drive: Option<Drive>) {
         debug_assert_eq!(seq, self.next_drive_seq, "drives apply in sequence");
         self.next_drive_seq += 1;
@@ -5293,8 +5420,114 @@ impl EngineCore {
             endpoint,
             drive,
         });
-        if self.resolver.set_drive(endpoint, drive) {
+        let net = self.resolver.slots.get(endpoint.0).map(|slot| slot.net);
+        let suppress = net.is_some_and(|net| self.endpoint_suppressed(endpoint, net));
+        let effective = if suppress { None } else { drive };
+        let mut dirty = false;
+        if let Some(net) = net {
+            if !self.edge_faults.is_empty() {
+                dirty |= self.release_suppressed_endpoints(net);
+            }
+        }
+        dirty |= self.resolver.set_drive(endpoint, effective);
+        let synced = self.sync_edge_terminals();
+        if dirty || synced {
             self.resolve_and_publish_dirty();
+        }
+        if let Some(net) = net {
+            self.tick_edge_faults(endpoint, net);
+        }
+        if self.sync_edge_terminals() {
+            self.resolve_and_publish_dirty();
+        }
+        self.arm_finite_train(endpoint);
+    }
+
+    /// An open float or stuck window covers this endpoint.
+    fn endpoint_suppressed(&self, endpoint: EndpointId, net: usize) -> bool {
+        self.edge_faults
+            .iter()
+            .any(|fault| fault.suppresses(endpoint, net))
+    }
+
+    /// Release every non-terminal endpoint on `net` that an open window
+    /// covers. A net-target float or stuck clears the whole net for the
+    /// window; the drives come back when their pins publish again.
+    fn release_suppressed_endpoints(&mut self, net: usize) -> bool {
+        let targets: Vec<EndpointId> = self
+            .resolver
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.net == net && !slot.port && slot.terminal.is_none())
+            .map(|(index, _)| EndpointId(index))
+            .filter(|&endpoint| self.endpoint_suppressed(endpoint, net))
+            .collect();
+        let mut dirty = false;
+        for endpoint in targets {
+            dirty |= self.resolver.set_drive(endpoint, None);
+        }
+        dirty
+    }
+
+    /// Hold each stuck or contending terminal at its window's voltage, and
+    /// release it outside the window. A float has no terminal.
+    fn sync_edge_terminals(&mut self) -> bool {
+        let mut dirty = false;
+        for index in 0..self.edge_faults.len() {
+            let fault = &self.edge_faults[index];
+            let Some(terminal) = fault.terminal else {
+                continue;
+            };
+            let drive = if fault.window_open() {
+                match fault.kind {
+                    EdgeFaultKind::Stuck(volts) | EdgeFaultKind::Contention(volts) => {
+                        TerminalDrive::Volts(volts)
+                    }
+                    EdgeFaultKind::Float => TerminalDrive::Released,
+                }
+            } else {
+                TerminalDrive::Released
+            };
+            dirty |= self.resolver.set_terminal(terminal, drive);
+        }
+        dirty
+    }
+
+    /// Count this drive against every fault it matches.
+    fn tick_edge_faults(&mut self, endpoint: EndpointId, net: usize) {
+        for fault in &mut self.edge_faults {
+            if fault.counts(endpoint, net) {
+                fault.seen = fault.seen.saturating_add(1);
+            }
+        }
+    }
+
+    /// Arm the one-shot that publishes a held segment when this endpoint's
+    /// finite train reaches its ceiling. A train with no ceiling, or one
+    /// already held, arms nothing.
+    fn arm_finite_train(&mut self, endpoint: EndpointId) {
+        let Some(at) = self
+            .resolver
+            .slots
+            .get(endpoint.0)
+            .and_then(|slot| match slot.drive {
+                Some(Drive::Periodic { segment, .. }) => segment.completes_at(),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        self.arm(at, TimerTarget::TrainDone(endpoint), None);
+    }
+
+    /// Arm a completion for every finite train already in the slot table.
+    /// Attach-time trains complete this way: their drive was published
+    /// before the wheel existed.
+    fn arm_finite_trains(&mut self) {
+        let count = self.resolver.slots.len();
+        for index in 0..count {
+            self.arm_finite_train(EndpointId(index));
         }
     }
 
@@ -5401,6 +5634,35 @@ impl EngineCore {
                         self.arm(next, head.target, Some(period));
                     }
                 }
+                TimerTarget::TrainDone(endpoint) => {
+                    // Stale when the segment was replaced, or already held:
+                    // `completes_at` is the deadline only for the segment
+                    // this entry was armed from.
+                    let held = self.resolver.slots.get(endpoint.0).and_then(|slot| {
+                        let Drive::Periodic { hi, lo, segment } = slot.drive? else {
+                            return None;
+                        };
+                        if segment.completes_at() != Some(head.deadline_ns) {
+                            return None;
+                        }
+                        let total = segment.total?;
+                        Some(Drive::Periodic {
+                            hi,
+                            lo,
+                            segment: PeriodicSchedule {
+                                emitted: total,
+                                freq_hz: 0,
+                                total: Some(total),
+                                since_ns: head.deadline_ns,
+                            },
+                        })
+                    });
+                    if let Some(held) = held {
+                        if self.resolver.set_drive(endpoint, Some(held)) {
+                            self.resolve_and_publish_dirty();
+                        }
+                    }
+                }
             }
         }
         fired
@@ -5411,10 +5673,13 @@ impl EngineCore {
         // One wake per component per instant (see `armed_wakes`). A periodic
         // entry is always pushed: it carries the period the chain continues
         // on, which a one-shot already armed at the same instant does not.
-        let TimerTarget::Wake(component) = target;
-        let fresh = self.armed_wakes.insert((component.0, deadline_ns));
-        if !fresh && period_ns.is_none() {
-            return;
+        // A train completion is always pushed: it carries no wake key, and a
+        // later segment makes the earlier entry stale when it fires.
+        if let TimerTarget::Wake(component) = target {
+            let fresh = self.armed_wakes.insert((component.0, deadline_ns));
+            if !fresh && period_ns.is_none() {
+                return;
+            }
         }
         let seq = self.timer_seq;
         self.timer_seq += 1;
@@ -5853,7 +6118,7 @@ impl EngineHandle {
     /// # Panics
     /// Panics if the OS refuses to spawn the engine thread.
     pub(crate) fn spawn(
-        resolver: Resolver,
+        mut resolver: Resolver,
         nets: Vec<Net>,
         solver: Box<dyn ClusterSolver>,
         event_log: EventLog,
@@ -5868,6 +6133,7 @@ impl EngineHandle {
         let (tx, rx) = mpsc::channel();
         let (control_tx, control_rx) = mpsc::channel();
         let escalated_solves = resolver.escalation_counter();
+        let edge_faults = resolver.take_edge_faults();
 
         let mut core = EngineCore {
             resolver,
@@ -5889,6 +6155,7 @@ impl EngineHandle {
             topology_observers: Vec::new(),
             topology_epoch: 0,
             wheel: BinaryHeap::new(),
+            edge_faults,
             armed_wakes: WakeKeys::default(),
             timer_seq: 0,
             pending_drives: BTreeMap::new(),
@@ -5902,10 +6169,16 @@ impl EngineHandle {
             event_log: event_log.clone(),
             limit_watches: Vec::new(),
         };
+        // A window already open (`after_edges == 0`) sources its terminal
+        // through the initial pass. Nothing has been driven yet, so the
+        // window does not count an edge here. A float adds no source.
+        core.sync_edge_terminals();
         core.resolve_and_publish();
         // Pulse routes are derived from net resolution, never installed beside
         // it: the routing pass runs against the just-resolved nets.
         core.publish_topology_epoch();
+        // Finite trains already in the slot table complete on the wheel.
+        core.arm_finite_trains();
 
         let time_authority = virtual_clock::take_time_authority();
 
@@ -7199,6 +7472,160 @@ mod tests {
         );
         // Stepped time advances *to* each deadline, so the stamps are exact.
         assert_eq!(*log.lock().unwrap(), deadlines);
+    }
+
+    /// A finite train already in the slot table rests once its count reaches
+    /// the ceiling: the engine publishes the held segment at that instant.
+    #[rstest]
+    fn a_finite_train_rests_when_its_count_reaches_the_ceiling() {
+        behaviour!(Test {
+            id: "engine.finite-train-rests-at-ceiling",
+            covers: Some("board/src/engine.rs#EngineCore::fire_due_timers"),
+            given: "a pin already driving a finite train of 4 pulses at 1000 hertz, \
+                    high port 3.3 volts and low port 0 volts, with virtual time \
+                    held until the engine is released",
+        });
+        expect!(
+            "rests-at-ceiling",
+            "after the train finishes, the net rests at 0 volts with the count held at 4",
+            "reaching the ceiling publishes the hold, so a level receiver reads \
+             the resting level and a consumer folds the final count",
+        );
+        let _clock = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let segment = PeriodicSchedule {
+            emitted: 0,
+            freq_hz: 1_000,
+            total: Some(4),
+            since_ns: 0,
+        };
+        let mut resolver = Resolver::new(1, Dsu::new(1));
+        resolver.add_endpoint_with(
+            0,
+            PinRef::new("U1", "STEP"),
+            Some(Drive::Periodic {
+                hi: high(),
+                lo: low(),
+                segment,
+            }),
+        );
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
+        handle.release_time();
+        assert!(
+            wait_for(
+                || {
+                    let rested = matches!(
+                        handle.net_state(NetId(0)),
+                        Some(NetState::Periodic { segment, .. })
+                            if segment.freq_hz == 0 && segment.emitted == 4
+                    );
+                    rested && handle.link().volts.dc(0) == Some(0.0)
+                },
+                Duration::from_secs(5),
+            ),
+            "finite train must rest at its ceiling; state {:?} volts {:?}",
+            handle.net_state(NetId(0)),
+            handle.link().volts.load(0),
+        );
+    }
+
+    /// A pin-target float hides that pin's own drives for the window and
+    /// leaves the requested drives in the log.
+    #[rstest]
+    fn an_edge_fault_float_hides_the_named_pins_drives() {
+        behaviour!(Test {
+            id: "engine.edge-fault-float-window",
+            covers: Some("board/src/engine.rs#EngineCore::apply_drive"),
+            given: "one pin whose second and third drives are inside a float window",
+        });
+        expect!(
+            "named-pin-edges-float",
+            "the log records all six requested drives, and the net floats across \
+             the window, then follows the drives that come after it",
+        );
+        let _clock = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let mut resolver = Resolver::new(1, Dsu::new(1));
+        let endpoint = resolver.add_endpoint_with(0, PinRef::new("DRV", "A"), None);
+        resolver.add_edge_fault(super::EdgeFaultSpec {
+            endpoint: Some(endpoint),
+            net: 0,
+            kind: super::EdgeFaultKind::Float,
+            after_edges: 2,
+            edge_count: 2,
+        });
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::enabled(),
+            None,
+        );
+        let seen = sense_log(&handle, NetId(0));
+        handle.release_time();
+        let script = [3.3, 3.2, 3.1, 3.0, 2.9, 2.8];
+        for volts in script {
+            let seq = handle.link().next_drive_seq();
+            assert!(handle.link().send(Command::Drive {
+                seq,
+                endpoint,
+                drive: Some(Drive::Thevenin(TheveninDrive {
+                    volts,
+                    impedance: 25.0,
+                })),
+            }));
+        }
+        let events = handle.event_log();
+        assert!(
+            wait_for(
+                || {
+                    events
+                        .records()
+                        .iter()
+                        .filter(|record| {
+                            matches!(record.event, super::EngineEvent::DriveApplied { .. })
+                        })
+                        .count()
+                        >= script.len()
+                },
+                Duration::from_secs(5),
+            ),
+            "the engine must apply every scripted drive",
+        );
+        let applied: Vec<f64> = events
+            .records()
+            .iter()
+            .filter_map(|record| match record.event {
+                super::EngineEvent::DriveApplied {
+                    drive: Some(Drive::Thevenin(port)),
+                    ..
+                } => Some(port.volts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, script);
+        assert!(
+            wait_for(
+                || {
+                    let states = seen.lock().unwrap();
+                    let floated = states.windows(3).any(|window| {
+                        matches!(window[0], NetState::Driven(_))
+                            && matches!(window[1], NetState::Floating)
+                            && matches!(window[2], NetState::Driven(_))
+                    });
+                    floated && matches!(states.last(), Some(NetState::Driven(Level::High)))
+                },
+                Duration::from_secs(5),
+            ),
+            "the window must float the net between driven readings; saw {:?}",
+            seen.lock().unwrap(),
+        );
     }
 
     /// Re-requesting a deadline already armed for the same component is a

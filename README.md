@@ -342,10 +342,10 @@ embsim run board.toml --for 20ms --net BOARD.VCC
   number names it),
   and every connector's pins as the endpoints a `[[wire]]` names. Uncomment
   the stubs, choose the kinds, wire the connectors.
-- **`check`** loads, surveys and builds the system and starts it with virtual
-  time held: every part attached, nothing yet run. It prints each board's
-  survey line and what the build found, and exits non-zero with the reason —
-  the survey, for a board with a part still unmodelled — on any refusal.
+- **`check`** loads, surveys and builds the system. It prints each board's
+  survey line and the findings that build reports, and exits non-zero with
+  the reason — the survey, for a board with a part still unmodelled — on any
+  refusal.
 - **`run`** starts the system on a stepped clock and runs it for `--for` of
   virtual time, or until interrupted (Ctrl-C), printing the build's
   findings, then findings and what the parts report (a P2's start and
