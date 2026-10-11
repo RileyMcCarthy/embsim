@@ -180,8 +180,8 @@ fn reap_group(profile: *const libc::c_char, chrome: libc::pid_t) -> ! {
             let cleaner = libc::fork();
             if cleaner == 0 {
                 libc::setpgid(0, 0);
-                let rm = b"/bin/rm\0".as_ptr().cast();
-                let flag = b"-rf\0".as_ptr().cast();
+                let rm = c"/bin/rm".as_ptr();
+                let flag = c"-rf".as_ptr();
                 let argv = [rm, flag, profile, std::ptr::null()];
                 libc::execv(rm, argv.as_ptr());
                 libc::_exit(127);
