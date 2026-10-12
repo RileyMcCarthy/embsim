@@ -6,6 +6,8 @@ the one before it promised, and says so here under **Breaking**.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-12
+
 ### Added
 
 - **`chrome-cdp`, the host's Chrome on the board** (`embsim-cdp`, in the
@@ -338,6 +340,7 @@ project's firmware C against Rust implementations of its HAL, with
 emulated peripherals, device models and a virtual clock, extracted from
 the MaD tensile tester.
 
+[0.4.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/RileyMcCarthy/embsim/releases/tag/v0.1.0
