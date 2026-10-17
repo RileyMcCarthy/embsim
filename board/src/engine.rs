@@ -7628,6 +7628,191 @@ mod tests {
         );
     }
 
+    /// Spawns one pin `DRV.A` on net 0 with `kind` installed over the
+    /// window, drives `script` through it, and returns the requested volts
+    /// the event log recorded and every state the net's sense saw.
+    fn run_edge_fault_script(
+        kind: super::EdgeFaultKind,
+        after_edges: u64,
+        edge_count: u64,
+        script: &[f64],
+    ) -> (Vec<f64>, Arc<StdMutex<Vec<NetState>>>, EngineHandle) {
+        let mut resolver = Resolver::new(1, Dsu::new(1));
+        let endpoint = resolver.add_endpoint_with(0, PinRef::new("DRV", "A"), None);
+        resolver.add_edge_fault(super::EdgeFaultSpec {
+            endpoint: Some(endpoint),
+            net: 0,
+            kind,
+            after_edges,
+            edge_count,
+        });
+        let handle = EngineHandle::spawn(
+            resolver,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::enabled(),
+            None,
+        );
+        let seen = sense_log(&handle, NetId(0));
+        handle.release_time();
+        for &volts in script {
+            let seq = handle.link().next_drive_seq();
+            assert!(handle.link().send(Command::Drive {
+                seq,
+                endpoint,
+                drive: Some(Drive::Thevenin(TheveninDrive {
+                    volts,
+                    impedance: 25.0,
+                })),
+            }));
+        }
+        let events = handle.event_log();
+        let count_applied = || {
+            events
+                .records()
+                .iter()
+                .filter(|record| matches!(record.event, super::EngineEvent::DriveApplied { .. }))
+                .count()
+        };
+        assert!(
+            wait_for(|| count_applied() >= script.len(), Duration::from_secs(5)),
+            "the engine must apply every scripted drive",
+        );
+        let applied: Vec<f64> = events
+            .records()
+            .iter()
+            .filter_map(|record| match record.event {
+                super::EngineEvent::DriveApplied {
+                    drive: Some(Drive::Thevenin(port)),
+                    ..
+                } => Some(port.volts),
+                _ => None,
+            })
+            .collect();
+        (applied, seen, handle)
+    }
+
+    /// A pin-target stuck window hides that pin's drives and holds the net at
+    /// the stuck volts instead; the requested drives stay in the log.
+    #[rstest]
+    fn an_edge_fault_stuck_holds_the_net_over_the_named_pins_drives() {
+        behaviour!(Test {
+            id: "engine.edge-fault-stuck-window",
+            covers: Some("board/src/engine.rs#EngineCore::sync_edge_terminals"),
+            given: "one pin driven high six times, whose second and third drives are inside a window stuck at 0 V",
+        });
+        expect!(
+            "named-pin-edges-stuck",
+            "the log records all six requested drives, and the net sits at 0 V \
+             in the window, then follows the high drives that come after it",
+        );
+        let _clock = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let script = [3.3, 3.2, 3.1, 3.0, 2.9, 2.8];
+        let (applied, seen, _handle) =
+            run_edge_fault_script(super::EdgeFaultKind::Stuck(0.0), 2, 2, &script);
+        assert_eq!(applied, script);
+        assert!(
+            wait_for(
+                || {
+                    let states = seen.lock().unwrap();
+                    // The stuck reading sits between driven-high readings. The
+                    // last covered drive stays hidden once the window closes,
+                    // so the net may float until the next drive arrives.
+                    let stuck = states
+                        .iter()
+                        .position(|state| *state == NetState::Analog(0.0))
+                        .is_some_and(|at| {
+                            states[..at].contains(&NetState::Driven(Level::High))
+                                && states[at..].contains(&NetState::Driven(Level::High))
+                        });
+                    stuck && matches!(states.last(), Some(NetState::Driven(Level::High)))
+                },
+                Duration::from_secs(5),
+            ),
+            "the window must hold the net low between high readings; saw {:?}",
+            seen.lock().unwrap(),
+        );
+    }
+
+    /// A stuck window that opens at the first edge holds the net before any
+    /// drive, where a float would leave it floating.
+    #[rstest]
+    fn an_edge_fault_stuck_from_edge_zero_holds_the_idle_net() {
+        behaviour!(Test {
+            id: "engine.edge-fault-stuck-idle",
+            covers: Some("board/src/engine.rs#EngineCore::sync_edge_terminals"),
+            given: "one pin with a window stuck at 3.3 V from its first drive edge, then driven low three times",
+        });
+        expect!(
+            "idle-net-held",
+            "the net sits at 3.3 V \
+             before the pin first drives, then follows the third, low, drive once the window closes",
+        );
+        let _clock = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let script = [0.0, 0.1, 0.2];
+        let (applied, seen, _handle) =
+            run_edge_fault_script(super::EdgeFaultKind::Stuck(3.3), 0, 2, &script);
+        assert_eq!(applied, script);
+        assert!(
+            wait_for(
+                || {
+                    let states = seen.lock().unwrap();
+                    states.first() == Some(&NetState::Analog(3.3))
+                        && matches!(states.last(), Some(NetState::Driven(Level::Low)))
+                },
+                Duration::from_secs(5),
+            ),
+            "the idle net must sit at the stuck volts, then go low; saw {:?}",
+            seen.lock().unwrap(),
+        );
+    }
+
+    /// A contention window leaves the pin's own drive applied and adds the
+    /// ideal source beside it, and the ideal source wins the fight while the window is open.
+    #[rstest]
+    fn an_edge_fault_contention_fights_the_named_pins_drive() {
+        behaviour!(Test {
+            id: "engine.edge-fault-contention-window",
+            covers: Some("board/src/engine.rs#LiveEdgeFault::suppresses"),
+            given: "one pin driven high six times, whose second and third drives are inside a window contending at 0 V",
+        });
+        expect!(
+            "named-pin-edges-contend",
+            "the log records all six requested drives, and the net sits at \
+             the ideal source's 0 V in the window, then follows the high drives once it clears",
+        );
+        let _clock = lock_clock();
+        virtual_clock::init(0.0, 1_000_000);
+        let script = [3.3, 3.2, 3.1, 3.0, 2.9, 2.8];
+        let (applied, seen, _handle) =
+            run_edge_fault_script(super::EdgeFaultKind::Contention(0.0), 2, 2, &script);
+        assert_eq!(applied, script);
+        assert!(
+            wait_for(
+                || {
+                    let states = seen.lock().unwrap();
+                    let fought = states.windows(3).any(|window| {
+                        matches!(window[0], NetState::Driven(Level::High))
+                            && window[1] == NetState::Analog(0.0)
+                            && matches!(window[2], NetState::Driven(Level::High))
+                    });
+                    // Contention hides no drive, so once driven the net
+                    // never floats.
+                    let first = states
+                        .iter()
+                        .position(|state| matches!(state, NetState::Driven(_)));
+                    let held = first.is_some_and(|at| !states[at..].contains(&NetState::Floating));
+                    fought && held && matches!(states.last(), Some(NetState::Driven(Level::High)))
+                },
+                Duration::from_secs(5),
+            ),
+            "the window must sit at the ideal source's volts between high readings; saw {:?}",
+            seen.lock().unwrap(),
+        );
+    }
+
     /// Re-requesting a deadline already armed for the same component is a
     /// no-op: the wake is delivered once, not once per request. A callback
     /// that re-arms its next edge on every wake would otherwise fire once
