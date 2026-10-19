@@ -7630,7 +7630,8 @@ mod tests {
 
     /// Spawns one pin `DRV.A` on net 0 with `kind` installed over the
     /// window, drives `script` through it, and returns the requested volts
-    /// the event log recorded and every state the net's sense saw.
+    /// the event log recorded and every state the net's sense saw. The
+    /// returned handle keeps the engine alive: it must outlive the assertions.
     fn run_edge_fault_script(
         kind: super::EdgeFaultKind,
         after_edges: u64,
