@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use embsim_board::{
     jesd8c01_lvcmos_thresholds, AttachError, Board, BoardError, Clamp, ClampRail, Component,
-    ComponentNetIo, DeadBand, EndpointRef, Harness, InputPort, Level, NetState, PartRegistry,
-    PinDecl, PinLimits, Scenario, System, SystemError, TheveninDrive, Thresholds,
+    ComponentNetIo, DeadBand, DifferentialPair, EndpointRef, Harness, InputPort, Level, NetState,
+    PartRegistry, PinDecl, PinLimits, Scenario, System, SystemError, TheveninDrive, Thresholds,
 };
 use embsim_boards::p2::P2_PAD_THRESHOLDS;
 use embsim_core::virtual_clock::{self, ClockMode};
@@ -411,6 +411,53 @@ fn limits_the_engine_cannot_check_are_refused(
         ),
         "{error:?}"
     );
+}
+
+/// A differential pair the engine could not watch — its inverting input
+/// not one of the part's pins, or the pin itself, or a band that is not a
+/// positive figure — is refused; the refusal names the pin that is wrong.
+#[rstest]
+#[case::inverting_undeclared("9", 0.2, "9")]
+#[case::inverting_itself("1", 0.2, "1 (its own pair)")]
+#[case::band_zero("2", 0.0, "1")]
+#[case::band_not_a_number("2", f64::NAN, "1")]
+fn a_pair_the_engine_cannot_watch_is_refused(
+    #[case] inverting: &'static str,
+    #[case] band: f64,
+    #[case] named: &str,
+    #[values(Route::Netlist, Route::Bench)] route: Route,
+) {
+    behaviour!(Test {
+        id: "pin.pair-is-two-inputs-and-a-band",
+        covers: Some("board/src/component.rs#validate_declarations"),
+        given: "a part whose input declares a differential pair against a pin it does not \
+                have, against itself, or with a band of zero or of no number, as a netlist \
+                part or a bench component",
+    });
+    expect!(
+        "declaration-refused",
+        "the build fails naming the part and the pin that is wrong",
+        "a pair is two of the part's own inputs and a positive band their difference is \
+         compared against"
+    );
+    let _guard = stepped();
+    let pair = DifferentialPair {
+        inverting,
+        band,
+        fail_safe: Level::High,
+    };
+    let error = refused(
+        vec![PinDecl::analog("1").with_pair(pair), PinDecl::analog("2")],
+        route,
+    );
+    let refused_here = match &error {
+        BoardError::PinFacadeMismatch { reference, pin }
+        | BoardError::InvalidDeclaration { reference, pin, .. } => {
+            reference == "U1" && pin == named
+        }
+        _ => false,
+    };
+    assert!(refused_here, "{error:?}");
 }
 
 /// Thresholds declared against a supply are fractions of it; figures that

@@ -29,7 +29,8 @@ schematic before `U25`'s part number is corrected does not, section 2),
 since E2 the add-on's converter is configured by the firmware's own
 register writes, since E3 the machine's parts are one component, an
 `embsim_board::Assembly`, and since E6 the encoder presents the pairs
-`U25` reads; since E4 the host the board's clock meters is the
+`U25` reads, since E8 as one of its output stages beside the open
+collector the real machine's encoder has; since E4 the host the board's clock meters is the
 `chrome-cdp` kind (`NODES.md` §19), in no release yet. Revised 2026-10-09:
 E4's first answer, Chrome in a VM, was built and withdrawn for Chrome on
 the host metered over DevTools (`NODES.md` §18), and section 1's files,
@@ -97,6 +98,7 @@ project crate does not fork a model.
 | E4 | `chrome-cdp`, the host the board's clock meters. *Built 2026-10-09, in no release yet* (`NODES.md` §19; the kind's contract is `PROJECTS.md` §5, `chrome-cdp`, and [`examples/chrome-ping`](examples/chrome-ping) is a project with one): a bench kind in the `embsim` command's set (`embsim_cdp::catalog`; `embsim_cdp::CdpNode` from Rust) on `host-serial`'s four pins, `TX`, `RX`, `VIO` and `GND`, driven and read the same way, so a project swaps one for the other without touching a wire. At its first slice, the board held there, it launches the host's Chrome (or attaches to one) and holds every page and dedicated worker from birth. Each quantum (1 ms) it grants each page's clock what the page is owed with `Emulation.setVirtualTimePolicy`, puts what the page wrote on the line, and in one evaluation hands the page the board's bytes and reads its clock, all over one DevTools connection, so no second channel races the grants; when a worker owns the port's transferred stream, the next grant waits until it has read what it was handed. The page's `navigator.serial` is a shim the node owns, by Chrome's rules (a `close()` refused while a stream is locked, a replug that hands out a new `SerialPort`): the host's half of the line, the port, its USB ids, `connect` and `disconnect`, an unplug and a replug (`__embsim.link`), so MaD's e2e installs no serial fake of its own. The first answer, the `qemu-vm` and `chrome-vm` kinds, was built and withdrawn (§18) | the user's rule (§18): the ISS runs with the app in a Chrome whose clock the board's meters, and with no host that keeps wall time. Unmetered, the app's 2000 ms response timeout fired at 200 ms of the board's time; metered, at 2000 | 1b, 10, 11 |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
 | E6 | complementary outputs on `embsim_models::machine::QuadratureEncoder`. *Built 2026-10-09* (`NODES.md` §17): `Config::with_complements()` declares `A-`, `B-` and, with an index, `Z-`, each driven to the inverse of its leg in the same publish; `board/tests/edge_encoder_pairs.rs` counts the quadrature at `P9`/`P10` through `U25` with `JP2`, `JP3` and `JP5` open | the carrier's `J20` takes an RS-422 encoder and `U25` reads differences: a single-ended encoder on `A+`/`B+` with `JP2`/`JP3` grounding `A−`/`B−` gives no differential for its low, which `U25` reads as its fail-safe high (SLLS202H §8.4.1), so `P9` and `P10` never move (section 6, "The encoder through `U25`") | 8 (the machine's pins), 9 (the encoder case) |
+| E8 | the encoder's output stage, and a differential pair read inside its band reported. *Built 2026-10-18, in no release yet* (`NODES.md` §20): `quadrature_encoder::OutputStage` on `Config::output` — `PushPull` (the default), `Rs422` (`with_complements()`), `NpnOpenCollector` (each output sinks to the encoder's ground while low and is released while high, no pull-up of its own) — named for a kind's option by `OutputStage::NAMES` (`push-pull`, `rs422`, `npn-open-collector`); `PinDecl::with_pair` and `Finding::PairInBand`, which the `am26lv32` declares on its four pairs: a pair that spends time inside ±200 mV with a common-mode voltage applied is reported once, naming the pair and the fail-safe high its output took. `board/tests/edge_encoder_pairs.rs` runs the open collector on `edge-ec32-ds2.toml` with `JP2`/`JP3` closed: `P9` and `P10` never move, and the run names `U25`'s pairs `2`/`1` and `6`/`7` | the machine's encoder is an NPN open collector (section 6, "The encoder through `U25`"); the user's decision is `mad-machine`'s `encoder_output` option, `rs422` by default so the e2e keeps counting, `npn-open-collector` for the real encoder, whose stuck `P9`/`P10` the finding explains | 8 (the machine's pins and option) |
 | E7 | *not blocking:* a control surface for `run`, such as `--control <port>` serving `embsim-ui`'s actions, a host kind registering `<NAME>/link/unplug` and `<NAME>/link/plug` | three of the e2e's scenarios (B5's reconnect, M11's idle drop and its mid-test drop) pull the host's cable. A `chrome-cdp` takes that from the page, on its own binding, so they wait on nothing; a project whose host is a `host-serial` has no way to pull it | none |
 
 ## 3. The catalog crate, `SIL/mad-catalog`
@@ -320,7 +322,7 @@ with the supply and the contact inside it; the carrier's `5V_IO` makes
 |---|---|
 | `STEP`, `DIR`, `ENA` | the servo drive's inputs (`embsim_models::machine::StepperMotor`, `DIR` low forward, enable active low), read against `DRIVE_GND` |
 | `DRIVE_GND` | the drive's input return, the carrier's `EN_GND` (`J21.8` and `J21.9`) |
-| `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-` | the encoder's pairs (`QuadratureEncoder` with its complements, E6, as many counts per millimetre as steps; each `-` the inverse of its `+`), against `ENC_GND`: what an RS-422 encoder presents on `J20`, and what `U25` reads |
+| `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-` | the encoder's pairs (`QuadratureEncoder` with its complements, E6, as many counts per millimetre as steps; each `-` the inverse of its `+`), against `ENC_GND`: what an RS-422 encoder presents on `J20`, and what `U25` reads. With `encoder_output = "npn-open-collector"`, `ENC_A+` and `ENC_B+` alone, open collectors with no index (E8) |
 | `ENC_GND` | the encoder's return, `EN_GND` (`J20.5`) |
 | `UPPER±`, `LOWER±`, `DOOR±`, `ESD_U±`, `ESD_L±`, `ESD_A±` | each switch as the sourced loop the carrier reads: `+` the machine's loop supply behind a normally closed contact while the contact is closed, released while it is open; `-` that supply's return. The carrier's loops are a current regulator and an opto LED between `+` and `-` (`IC9` and `U6` for the upper end switch), and power nothing themselves |
 | `E+`, `E-` | the load cell's excitation, sensed: the bridge reads its excitation off the add-on |
@@ -330,6 +332,7 @@ with the supply and the contact inside it; the carrier's `5V_IO` makes
 |---|---|
 | `sample` | the sample in the grips, one the crate carries with its provenance: `sil-linear-reference` (the `MaterialProperties` named `SIL-Linear-Reference` in `run_iss`, `MaDSim/src/main.rs`) |
 | `loop_volts` | required: the machine's switch-loop supply. A bench figure, so the file names it (`DESIGN.md` rule 6) |
+| `encoder_output` | the encoder's output stage (E8, `OutputStage::NAMES`): `rs422` (the default), each channel and the index a pair, what `J20` and `U25` are designed for; or `npn-open-collector`, the machine's real encoder (section 6, "The encoder through `U25`"), `A` and `B` open collectors on the `+` legs, which on today's carrier read high at `P9` and `P10` and are reported (`PairInBand`) |
 
 What moves into it, and from where:
 
@@ -625,7 +628,9 @@ state = "closed"
 
 # JP2, JP3 and JP5 (A_GND, B_GND, ZI_GND) stay open: they ground A-, B-
 # and ZI- for a single-ended encoder, and the machine's encoder drives
-# both legs of each pair (E6).
+# both legs of each pair (E6, encoder_output = "rs422"). A file with
+# encoder_output = "npn-open-collector" closes JP2 and JP3 and wires only
+# ENC_A+, ENC_B+ and ENC_GND: P9 and P10 then stay high (section 6).
 
 [[jumper]]               # Z_GND: Z-, U25's active-low enable, to EN_GND
 part = "EDGE.JP4"
@@ -875,7 +880,9 @@ report carries the firmware's boot console (skipped, saying why, when the
   steps and `DIR` between them (four rising edges with `DIR` low, then
   four with it high), and the encoder's quadrature on `ENC_A+`/`ENC_B+`
   counts one a step, up and then back down (the drive's convention, `DIR`
-  low forward), each `-` leg the inverse of its `+` at every step (E6).
+  low forward), each `-` leg the inverse of its `+` at every step (E6);
+  with `encoder_output = "npn-open-collector"`, `ENC_A+`/`ENC_B+` sink at
+  each low and are released at each high (E8).
 - **Travel as a rate.** A component of the test's own drives `STEP` with
   `embsim_board::Drive::Periodic`, a `PeriodicSchedule` at a fixed rate,
   the path `embsim_models::machine::StepperMotor` takes for a step train;
@@ -1007,21 +1014,45 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   low. On the same side, `OUTA` drives the Pi's receive line (`RPI_TX`) at
   5 V, above a Pi's 3.3 V GPIO. Both are findings about the board;
   supplying `IC2`'s Pi side from the Pi's 3.3 V would clear both.
-- **The encoder through `U25`.** `J20` takes an RS-422 encoder (`A±`,
-  `B±`, `ZI±`), and `U25`, an AM26LV32, reads each pair's difference
-  against ±200 mV. A single-ended encoder on `A+` and `B+` with `JP2` and
-  `JP3` closed, `A−` and `B−` at `EN_GND`, gives a full differential for
-  its high and none for its low, `A+` and `A−` both at ground: SLLS202H's
-  Table 8-1 gives that input no level ("?", the fail-safe not guaranteed
-  with a common-mode voltage applied, §8.4.1), and embsim's `am26lv32`
-  reads it as the fail-safe's high. So `1Y` and `2Y` stay high, and `P9`
-  and `P10` with them, at every count (`board/tests/edge_encoder_pairs.rs`,
-  the single-ended case). Section 4 wires the pairs instead, `mad-machine`
-  driving both legs of each channel (E6) with `JP2`, `JP3` and `JP5` open,
-  which the same test counts at `P9` and `P10`. If the real machine's
-  encoder is single-ended, the carrier wants each `−` leg held between its
-  output's two levels, not at ground; which encoder the machine has is
-  MaD's to say before step 8 settles the machine's pins.
+- **The encoder through `U25` — answered (2026-10-18/19).** The machine's
+  encoder is a Taiss 600 P/R incremental optical encoder (Amazon
+  B07MX1SYXB, the user's): A and B as quadrature, an "NPN open collector
+  output", a 5–24 V supply, white `A`, green `B`, red `+`, black 0 V, no
+  complements and no index; its listing warns that A and B must not be
+  tied straight to the supply (read: the listing, as the user relayed it).
+  `J20` takes an RS-422 encoder (`A±`, `B±`, `ZI±`) and has no supply pin
+  (its pins: `A+`, `A-`, `B+`, `B-`, `EN_GND`, `SHIELD`, `Z+`, `Z-`,
+  `ZI+`, `ZI-`); `A+` runs `J20.1` to `U25.2` with no pull-up, and `A-`
+  `J20.2` to `JP2.1`, `JP2.2` being `EN_GND` (the same for `B` on `JP3`;
+  read: `board/tests/fixtures/mad_edge.net`). `U25`, an AM26LV32, reads each
+  pair's difference against ±200 mV. With `JP2` and `JP3` closed, a released
+  output rests at `U25`'s own 0.83 V input bias, a valid high against the
+  grounded `-` leg; a sinking one leaves the pair no difference, SLLS202H
+  Table 8-1's "?" with a common-mode voltage applied (§8.4.1), which
+  embsim's `am26lv32` reads as its fail-safe high. So `1Y` and `2Y` stay
+  high, and `P9` and `P10` with them, at every count, and the run reports
+  `U25`'s pairs `2`/`1` and `6`/`7` (`PairInBand`, E8;
+  `board/tests/edge_encoder_pairs.rs`, the open-collector case — inferred
+  from the datasheet and embsim's model, not yet checked on the real
+  machine). The user's decision: the encoder's output stage is
+  `mad-machine`'s `encoder_output` option, `rs422` by default (both legs
+  driven, what `J20` and `U25` are designed for, so the e2e keeps
+  counting), and `npn-open-collector` for the real encoder, which on
+  today's carrier shows `P9`/`P10` stuck with the finding saying why.
+  To read this encoder the carrier would need a pull-up on each `+` leg to
+  the encoder's supply and each `-` leg held between the output's two
+  levels — `board/tests/encoder_output_stages.rs` counts an open collector
+  through an AM26LV32 with 4.7 kΩ to 5 V and each `-` leg at 2.5 V from two
+  10 kΩ — or the machine would need an encoder with line-driver outputs.
+  The pull-up's rail must keep `U25`'s inputs inside their ratings:
+  SLLS202H §6.3 recommends −0.3 V to 5.5 V common mode and ±5.8 V across a
+  pair, and §6.1's absolute maximum is −4 V to 8 V on an input and ±12 V
+  across a pair (read: SLLS202H p. 4). The encoder on 5 V keeps them; from
+  its 12 V or 24 V a 4.7 kΩ pull-up straight to the supply would hold a
+  released `+` leg near 8.9 V or 17.5 V against `U25`'s 12 kΩ typical
+  input (inferred), past 8 V, so each leg would need a divider or a clamp.
+  embsim's `am26lv32` checks neither range (its *Not modelled*).
+  The encoder's supply has no pin on `J20` either.
 - **The drive's ready output.** `mad-machine` has no pin for the servo
   drive's ready line, `SC_SRDY` (`J21.6`, the firmware's `SERVO_RDY` on
   `P5`); `mad-emulator` holds `P5` at its inactive level with a bench pull

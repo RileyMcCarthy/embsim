@@ -62,7 +62,8 @@ use std::sync::{Arc, Mutex};
 use embsim_core::virtual_clock;
 
 use crate::component::{
-    AttachError, Branch, Component, ComponentNetIo, PinDecl, WakeGate, WakeHandler,
+    AttachError, Branch, Component, ComponentNetIo, DifferentialPair, PinDecl, WakeGate,
+    WakeHandler,
 };
 
 /// A member's wake handler as the assembly holds it: called with no lock of
@@ -224,7 +225,8 @@ impl Assembly {
     /// declares is named once, and every assembly pin is one member's.
     ///
     /// The member's declarations are kept as it made them, the pins they
-    /// name (a reference, a supply, a branch's ends) renamed with them.
+    /// name (a reference, a supply, a pair's inverting input, a branch's
+    /// ends) renamed with them.
     /// Members attach, start and are woken at a shared instant in the order
     /// they were added.
     ///
@@ -300,6 +302,12 @@ impl Assembly {
             pin.name = None;
             pin.reference = pin.reference.map(rename).transpose()?;
             pin.supply = pin.supply.map(rename).transpose()?;
+            pin.pair = pin
+                .pair
+                .map(|pair| {
+                    rename(pair.inverting).map(|inverting| DifferentialPair { inverting, ..pair })
+                })
+                .transpose()?;
             renamed.push(pin);
         }
         let mut branches = Vec::with_capacity(component.branches().len());
@@ -717,6 +725,29 @@ mod tests {
                 ..diode
             }]
         );
+    }
+
+    /// A member's differential pair names its inverting input by the
+    /// assembly's name for it, as a reference does.
+    #[rstest]
+    fn a_members_pair_follows_its_pins_onto_the_assembly() {
+        let pair = DifferentialPair {
+            inverting: "2",
+            band: 0.2,
+            fail_safe: crate::net::Level::High,
+        };
+        let receiver = Declares::new(&[PinDecl::analog("1").with_pair(pair), PinDecl::analog("2")]);
+        let assembly = Assembly::new()
+            .member("RX", receiver, &[("1", "RX+"), ("2", "RX-")])
+            .expect("the receiver joins");
+        assert_eq!(
+            assembly.pins()[0].pair,
+            Some(DifferentialPair {
+                inverting: "RX-",
+                ..pair
+            })
+        );
+        assert_eq!(assembly.pins()[1].pair, None);
     }
 
     #[rstest]

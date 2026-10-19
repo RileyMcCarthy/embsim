@@ -662,6 +662,40 @@ pub struct PinLimits {
     pub note: &'static str,
 }
 
+/// A differential input pair a part declares on its non-inverting input
+/// (`NODES.md` §20, beside the pin's other static facts on [`PinDecl`]):
+/// the inverting input it is read against, the band its datasheet
+/// guarantees no level inside, and the level the part's own model gives a
+/// pair it reads there — its fail-safe. The part declares them and the
+/// **engine** watches the pair: a pair that spends time with its difference
+/// inside the band while a source other than the part's own input ports
+/// reaches either input — a driver, a ground, a rail, another part's port:
+/// a common-mode voltage applied — raises [`crate::Finding::PairInBand`]
+/// once, at [`crate::System::build`] over the settled snapshot or live
+/// when the engine's clock moves on with the pair still there, naming the
+/// pair and the fail-safe level its output took. A pair only the part's
+/// own ports reach — open, shorted, or across a terminator with its driver
+/// off — rests at their bias, which is the part's fail-safe's to decide,
+/// and raises nothing. A pair whose difference sits in the band only at
+/// one instant (two legs published at once, applied one after the other)
+/// spends no time there and raises nothing. A pair with an input that
+/// names no voltage (a floating node, a clock) is not measured.
+///
+/// The build refuses a pair whose inverting input is not a declared pin
+/// of the part or is the pin itself, and a band that is not finite and
+/// positive ([`crate::BoardError::InvalidDeclaration`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DifferentialPair {
+    /// The pair's inverting input (number or alias).
+    pub inverting: &'static str,
+    /// The band's half-width, volts: a difference (non-inverting minus
+    /// inverting) at or above `+band` reads high and one at or below
+    /// `-band` reads low; between them the datasheet guarantees neither.
+    pub band: Volts,
+    /// The level the part's output takes for a pair inside the band.
+    pub fail_safe: Level,
+}
+
 /// The idle a push-pull output presents until its component drives it:
 /// high, at the crate's logic rail behind the push-pull impedance —
 /// [`crate::net::digital_drive`]`(High)`, as a constant a constructor can
@@ -687,7 +721,7 @@ const UNMODELLED_RAIL: TheveninDrive = TheveninDrive {
 /// engine never asks for again — IBIS's decomposition. The set returned by
 /// [`Component::pins`] must cover the component's netlist pins exactly —
 /// build validates both directions — and every pin a declaration names
-/// (a reference, a supply) must be one of them.
+/// (a reference, a supply, a pair's inverting input) must be one of them.
 ///
 /// Build a declaration from one of the eight constructors —
 /// [`digital_in`](Self::digital_in), [`digital_out`](Self::digital_out),
@@ -736,6 +770,9 @@ pub struct PinDecl {
     /// The pin's declared operating limits, which the engine checks
     /// against its solved net (see [`PinLimits`]).
     pub limits: Option<PinLimits>,
+    /// The differential pair the pin is the non-inverting input of, which
+    /// the engine watches (see [`DifferentialPair`]).
+    pub pair: Option<DifferentialPair>,
     /// Whether the pin can source current onto its net — drive it high. A
     /// pin that can sink and not source is open-drain.
     pub can_source: bool,
@@ -759,6 +796,7 @@ impl PinDecl {
             reference: None,
             supply: None,
             limits: None,
+            pair: None,
             can_source: false,
             can_sink: false,
         }
@@ -900,6 +938,13 @@ impl PinDecl {
         self
     }
 
+    /// The same pin as the non-inverting input of a differential pair,
+    /// which the engine watches ([`DifferentialPair`]).
+    pub const fn with_pair(mut self, pair: DifferentialPair) -> Self {
+        self.pair = Some(pair);
+        self
+    }
+
     /// The same pin with a capacitance to its reference, picofarads
     /// (declared; armed in phase 6).
     pub const fn with_capacitance_pf(mut self, picofarads: f64) -> Self {
@@ -958,11 +1003,12 @@ impl PinDecl {
 }
 
 /// Validate one component's declarations against themselves: every pin a
-/// declaration names (a reference, a supply) is a declared pin and not the
-/// pin itself; thresholds are fractions on a pin that names a supply and
-/// volts on one that names none; a clamp's rail is declared; an idle drive
-/// sits on a pin with a slot; declared limits are finite and ordered. The
-/// first violation, in declaration order.
+/// declaration names (a reference, a supply, a pair's inverting input) is
+/// a declared pin and not the pin itself; thresholds are fractions on a pin
+/// that names a supply and volts on one that names none; a clamp's rail is
+/// declared; an idle drive sits on a pin with a slot; declared limits are
+/// finite and ordered; a pair's band is finite and positive. The first
+/// violation, in declaration order.
 pub(crate) fn validate_declarations(pins: &[PinDecl]) -> Result<(), DeclarationError> {
     for pin in pins {
         if matches!(pin.role, PinRole::PowerIn | PinRole::Passive) && pin.idle.is_some() {
@@ -970,7 +1016,15 @@ pub(crate) fn validate_declarations(pins: &[PinDecl]) -> Result<(), DeclarationE
                 pin: pin.number.to_string(),
             });
         }
-        for named in [pin.reference, pin.supply].into_iter().flatten() {
+        let named = [
+            (pin.reference, "its own reference"),
+            (pin.supply, "its own reference"),
+            (pin.pair.map(|pair| pair.inverting), "its own pair"),
+        ];
+        for (named, itself) in named
+            .into_iter()
+            .filter_map(|(named, itself)| Some((named?, itself)))
+        {
             if !pins.iter().any(|p| p.answers_to(named)) {
                 return Err(DeclarationError::UndeclaredPin {
                     pin: named.to_string(),
@@ -978,7 +1032,7 @@ pub(crate) fn validate_declarations(pins: &[PinDecl]) -> Result<(), DeclarationE
             }
             if pin.answers_to(named) {
                 return Err(DeclarationError::UndeclaredPin {
-                    pin: format!("{named} (its own reference)"),
+                    pin: format!("{named} ({itself})"),
                 });
             }
         }
@@ -1040,6 +1094,14 @@ pub(crate) fn validate_declarations(pins: &[PinDecl]) -> Result<(), DeclarationE
                     pin: pin.number.to_string(),
                     reason: "operating limits must be finite volts, a recommended minimum at or \
                              below its maximum, and an absolute maximum at or above the range",
+                });
+            }
+        }
+        if let Some(pair) = pin.pair {
+            if !(pair.band.is_finite() && pair.band > 0.0) {
+                return Err(DeclarationError::Invalid {
+                    pin: pin.number.to_string(),
+                    reason: "a differential pair's band must be finite, positive volts",
                 });
             }
         }

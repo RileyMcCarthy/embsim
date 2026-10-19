@@ -110,6 +110,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -132,6 +133,7 @@ use crate::net::{
     TheveninDrive, Volts, COUPLED_REACH_OHMS, COUPLING_REACTANCE_RATIO, ESCALATION_IMPEDANCE_RATIO,
     LOGIC_THRESHOLD_VOLTS, V_IH, V_IL, WEAK_DRIVE_OHMS,
 };
+use crate::pairs::PairWatch;
 use crate::system::EdgeFaultKind;
 
 // ============================================================
@@ -340,6 +342,17 @@ pub(crate) enum Command {
     WatchLimits {
         /// One per declaring pin, in part then pin declaration order.
         watches: Vec<LimitWatch>,
+    },
+    /// Watch the differential pairs the parts declared on their inputs
+    /// ([`crate::DifferentialPair`]): each watch is observed at once,
+    /// against the nets as they stand, and again after every pass that
+    /// moves either input's net or their reference; one left inside its
+    /// band is judged when the engine's clock next moves on
+    /// ([`EngineCore::judge_pairs`]). Sent once by `System::start`, before
+    /// any component attaches.
+    WatchPairs {
+        /// One per declared pair, in part then pin declaration order.
+        watches: Vec<PairWatch>,
     },
     /// Stop the engine loop; pending drives and timers are discarded.
     Shutdown,
@@ -2219,6 +2232,74 @@ impl Resolver {
                 .map(|(&position, _)| topology.terminals[position].root),
         );
         reached
+    }
+
+    /// How many drive slots the table holds: the index the next slot a pin
+    /// registers takes. The build reads it around a part's pins to name the
+    /// part's own slots ([`crate::pairs::PairWatch`]).
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether a source other than the input ports among the slots `own`
+    /// reaches the net `net` through a resistive path, as it stands — rule
+    /// 2's reach, a declared terminal ending every path: a Thevenin or
+    /// periodic drive on any other slot (another part's port included), or
+    /// a terminal that holds a voltage or an unmodelled rail. A released
+    /// slot, a current injection (no reachability, `NODES.md` §10) and a
+    /// released terminal source nothing. The pair watch asks it of a pair
+    /// that has spent time inside its band ([`crate::pairs::PairWatch`]):
+    /// a pair only its own part's ports reach rests at their bias.
+    pub(crate) fn reached_beyond(
+        &mut self,
+        net_count: usize,
+        net: usize,
+        own: &Range<usize>,
+    ) -> bool {
+        self.ensure_topology(net_count);
+        let topology = self.topology.as_ref().expect("ensure_topology built it");
+        let Some(&root) = topology.root_of.get(net) else {
+            return false;
+        };
+        let holds = |position: usize| {
+            self.terminal_states
+                .get(position)
+                .is_some_and(|state| state.drive != TerminalDrive::Released)
+        };
+        let c = &topology.clusters[topology.cluster_index[root]];
+        if c.terminal.is_some_and(holds) {
+            return true;
+        }
+        let Some(pr) = c.roots.iter().position(|&r| r == root) else {
+            return false;
+        };
+        let columns = c.columns();
+        let row = &c.dist[pr * columns..(pr + 1) * columns];
+        let reached_terminal = c
+            .boundary
+            .iter()
+            .zip(&row[c.roots.len()..])
+            .any(|(&position, d)| d.is_finite() && holds(position));
+        if reached_terminal {
+            return true;
+        }
+        c.slots.iter().any(|&si| {
+            let slot = &self.slots[si];
+            if slot.port && own.contains(&si) {
+                return false;
+            }
+            if !matches!(
+                slot.drive,
+                Some(Drive::Thevenin(_)) | Some(Drive::Periodic { .. })
+            ) {
+                return false;
+            }
+            let slot_root = topology.root_of[slot.net];
+            c.roots
+                .iter()
+                .position(|&r| r == slot_root)
+                .is_some_and(|position| row[position].is_finite())
+        })
     }
 
     /// Register a power sense pin (`PowerNetUnsourced` findings).
@@ -5133,6 +5214,16 @@ struct EngineCore {
     /// The declared pin limits the engine checks ([`Command::WatchLimits`]),
     /// in the order they were handed over.
     limit_watches: Vec<LimitWatch>,
+    /// The declared differential pairs the engine watches
+    /// ([`Command::WatchPairs`]), in the order they were handed over.
+    pair_watches: Vec<PairWatch>,
+    /// `(net, watch)` for each net a pair watch reads — its two inputs and
+    /// its reference — ascending, so a pass finds the watches its moves
+    /// touch by search, not by walking every watch.
+    pair_nets: Vec<(usize, usize)>,
+    /// Whether a pair watch holds an observation inside its band that the
+    /// next advance of the clock judges ([`EngineCore::judge_pairs`]).
+    pairs_pending: bool,
 }
 
 impl EngineCore {
@@ -5165,6 +5256,75 @@ impl EngineCore {
                 self.report_finding(finding);
             }
         }
+    }
+
+    /// Observe the declared pairs a pass may have moved ([`PairWatch`]):
+    /// each watch one of whose nets is among `moves`, found by search in
+    /// [`Self::pair_nets`]. An observation inside the band waits for the
+    /// clock to move on ([`Self::judge_pairs`]). Nothing to walk when no
+    /// part declared a pair.
+    fn check_pairs(&mut self, moves: &[(usize, NetMove)]) {
+        if self.pair_nets.is_empty() || moves.is_empty() {
+            return;
+        }
+        for &(net, _) in moves {
+            let start = self.pair_nets.partition_point(|&(n, _)| n < net);
+            for at in start..self.pair_nets.len() {
+                let (n, watch) = self.pair_nets[at];
+                if n != net {
+                    break;
+                }
+                let watch = &mut self.pair_watches[watch];
+                watch.observe(&self.nets);
+                self.pairs_pending |= watch.is_pending();
+            }
+        }
+    }
+
+    /// Judge every pair watch whose last observation was inside its band:
+    /// called as the engine's clock is about to move on, so the pair has
+    /// spent time there — two legs published at one instant and applied
+    /// one after the other pass through the band and out of it before
+    /// this runs. A pair a source other than its part's own input ports
+    /// reaches is reported, once ([`Finding::PairInBand`]). Nothing to do
+    /// while no observation waits. Only here: an observation the clock
+    /// never moves on from is never judged (`crate::pairs`).
+    fn judge_pairs(&mut self) {
+        if !self.pairs_pending {
+            return;
+        }
+        self.pairs_pending = false;
+        let net_count = self.nets.len();
+        for index in 0..self.pair_watches.len() {
+            if !self.pair_watches[index].is_pending() {
+                continue;
+            }
+            let own = self.pair_watches[index].own();
+            let applied = self.pair_watches[index]
+                .nets()
+                .into_iter()
+                .any(|net| self.resolver.reached_beyond(net_count, net, &own));
+            if let Some(finding) = self.pair_watches[index].judge(applied) {
+                self.report_finding(finding);
+            }
+        }
+    }
+
+    /// Take the declared pairs to watch ([`Command::WatchPairs`]): each is
+    /// indexed by the nets it reads and observed against the nets as they
+    /// stand.
+    fn watch_pairs(&mut self, watches: Vec<PairWatch>) {
+        for mut watch in watches {
+            let index = self.pair_watches.len();
+            for net in watch.nets().into_iter().chain(watch.reference()) {
+                self.pair_nets.push((net, index));
+            }
+            watch.observe(&self.nets);
+            self.pairs_pending |= watch.is_pending();
+            self.pair_watches.push(watch);
+        }
+        self.pair_nets.sort_unstable();
+        self.pair_nets.dedup();
     }
 
     /// Invoke a component-provided callback with panic containment: a panic
@@ -5250,6 +5410,7 @@ impl EngineCore {
         }));
         self.old = old;
         self.check_limits(&moves);
+        self.check_pairs(&moves);
         self.deliver_senses(&moves);
         self.moves = moves;
         if currents_published {
@@ -5579,6 +5740,7 @@ impl EngineCore {
         self.scope = scope;
         self.old = old;
         self.check_limits(&moves);
+        self.check_pairs(&moves);
         self.deliver_senses(&moves);
         self.moves = moves;
         if currents_published {
@@ -5828,6 +5990,7 @@ impl EngineCore {
                     self.limit_watches.push(watch);
                 }
             }
+            Command::WatchPairs { watches } => self.watch_pairs(watches),
             Command::Shutdown => return true,
         }
         false
@@ -5974,6 +6137,9 @@ impl EngineCore {
         };
         match next {
             Some(deadline) if deadline > now => {
+                // The clock moves on: a pair still inside its band has
+                // spent time there.
+                self.judge_pairs();
                 if let Err(error) = virtual_clock::advance_to_ns(deadline) {
                     // Unreachable while this engine is the only scheduler:
                     // `next_virtual_deadline` is >= now by construction and the
@@ -6168,6 +6334,9 @@ impl EngineHandle {
             stepped_gap_logged: None,
             event_log: event_log.clone(),
             limit_watches: Vec::new(),
+            pair_watches: Vec::new(),
+            pair_nets: Vec::new(),
+            pairs_pending: false,
         };
         // A window already open (`after_edges == 0`) sources its terminal
         // through the initial pass. Nothing has been driven yet, so the
@@ -6220,6 +6389,15 @@ impl EngineHandle {
     pub(crate) fn watch_limits(&self, watches: Vec<LimitWatch>) {
         if !watches.is_empty() {
             self.link.send(Command::WatchLimits { watches });
+        }
+    }
+
+    /// Hand the engine the declared differential pairs to watch
+    /// ([`Command::WatchPairs`]). Called once by `System::start`, before
+    /// any component attaches.
+    pub(crate) fn watch_pairs(&self, watches: Vec<PairWatch>) {
+        if !watches.is_empty() {
+            self.link.send(Command::WatchPairs { watches });
         }
     }
 
