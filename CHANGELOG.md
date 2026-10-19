@@ -6,6 +6,44 @@ the one before it promised, and says so here under **Breaking**.
 
 ## [Unreleased]
 
+### Breaking
+
+- `machine::quadrature_encoder::Config` has no `complements` field: an
+  `output` field (`OutputStage`, below) says what drives the outputs.
+  `Config::with_complements()` still makes the RS-422 line driver; a struct
+  literal that named `complements: true` names `output:
+  OutputStage::Rs422`, or ends `..Config::new(counts_per_mm)`.
+- `Finding` has a new variant, `PairInBand` (below), and `PinDecl` a new
+  field, `pair`: an exhaustive `match` over findings needs an arm for it,
+  and a `PinDecl` written as a struct literal names it (`pair: None`) — the
+  constructors and `with_*` builders set it.
+
+### Added
+
+- **The encoder's output stage** (`quadrature_encoder::OutputStage`,
+  `Config::with_output`, [`NODES.md`](NODES.md) §20): `PushPull` (the
+  default, as before), `Rs422` (the line driver `with_complements()`
+  makes) and `NpnOpenCollector`, whose `A`, `B` (and `Z`) sink to the
+  encoder's ground behind `drive_impedance_ohms` while their phase is low
+  and are released while it is high, with no pull-up of their own: an
+  encoder like MaD's, whose high is whatever the board pulls it to. A kind
+  exposes the stage as an option by `OutputStage::NAMES` (`push-pull`,
+  `rs422`, `npn-open-collector`). A step train carried as a rate counts
+  through every stage.
+- **A differential pair read inside its band is reported.**
+  `PinDecl::with_pair(DifferentialPair { inverting, band, fail_safe })`
+  declares a pair on its non-inverting input, and the engine watches it:
+  a pair that spends time with its difference inside the band while a
+  source other than the part's own input ports reaches it (a common-mode
+  voltage applied) raises `Finding::PairInBand` once, at build or live when
+  the engine's clock moves on, naming the pair, the difference, the common
+  mode and the fail-safe level the part's output took. An open, shorted or
+  terminated pair, which only the part's own ports reach, and a pair whose
+  two legs change at one instant raise nothing. The `am26lv32` declares its
+  four pairs (SLLS202H Table 8-1, §8.4.1): a single-ended encoder on the
+  Edge carrier's `J20` with its `-` legs grounded is reported on `U25`'s
+  pairs, the fail-safe high its outputs keep.
+
 ## [0.4.0] - 2026-10-12
 
 ### Added

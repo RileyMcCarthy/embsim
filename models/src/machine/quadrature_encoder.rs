@@ -49,33 +49,63 @@
 //! 4 microsteps × 2048 steps/rev = 8192 counts/mm, `STEPS_PER_MM` in
 //! `SIL/MaDSim/src/wiring.rs`).
 //!
-//! ## Electrical reality of the reference machine
+//! ## The output stage
 //!
-//! A real machine encoder does **not** present logic-level A/B. MaD's encoder
-//! drives RS-422 differential pairs `A±`, `B±`, `Z±`, which the EdgeBoard
-//! receives with an AM26LV32 quad differential line receiver (U25) before they
-//! reach the P2 as the single-ended `ENC_A`, `ENC_B`, `ENC_Z` — see
-//! `Hardware/EdgeBoard/KiCad/MaD_Edge_Sheet3.kicad_sch` (the complementary
-//! AM26LS31 driver U24 on the same sheet handles the outbound step/direction
-//! pairs). By default **this component is the logic-level side of that
-//! receiver**: one output per channel, so a system description wires
-//! `ENCODER.A` to whatever net carries `ENC_A`.
+//! What drives each output is the encoder's output stage
+//! ([`Config::output`], [`OutputStage`]; `NODES.md` §20). Its two numbers
+//! are the configuration's, [`Config::high_volts`] and
+//! [`Config::drive_impedance_ohms`], whose defaults are embsim's stated bench
+//! defaults (3.3 V and 25 Ω, [`DEFAULT_HIGH_VOLTS`] and
+//! `embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE`): no encoder datasheet
+//! is behind them, and a machine whose encoder names its own sets them.
 //!
-//! [`Config::with_complements`] makes it the encoder MaD's machine has: each
-//! channel a pair, `A` and `A-`, `B` and `B-`, and `Z` and `Z-` with an
-//! index, the `-` leg driven as the inverse of its leg in the same publish,
-//! as an RS-422 line driver presents it. The board's receiver then reads
-//! the pair as the datasheet does — a valid differential either way. A
-//! single-ended output on `A+` with `A-` held at the encoder's ground gives
-//! the receiver no differential for its low, which an AM26LV32 reads as its
-//! fail-safe high (TI SLLS202H §8.4.1, Table 8-1; `embsim_models::am26lv32`),
-//! so on the Edge board's `U25` only the pair counts.
+//! - [`OutputStage::PushPull`] (the default): one output per channel, `A`,
+//!   `B` and with an index `Z`, driven to `high_volts` or 0 V behind
+//!   `drive_impedance_ohms`. This is the logic-level side of a receiver: a
+//!   system description wires `ENCODER.A` to whatever net carries the
+//!   encoder's `A` at logic level.
+//! - [`OutputStage::Rs422`] ([`Config::with_complements`]): an RS-422 line
+//!   driver, each channel a pair, `A` and `A-`, `B` and `B-`, and `Z` and
+//!   `Z-` with an index, the `-` leg driven as the inverse of its leg in the
+//!   same publish, each push-pull at the same rail and impedance. A
+//!   differential receiver reads the pair as a valid difference either way.
+//! - [`OutputStage::NpnOpenCollector`]: an NPN open collector per channel,
+//!   as MaD's machine's encoder presents them (a Taiss 600 P/R optical
+//!   encoder: "NPN open collector output", A and B, no complements, no
+//!   index, a 5–24 V supply). While its phase is low the transistor sinks
+//!   the output to the encoder's ground, 0 V behind `drive_impedance_ohms`;
+//!   while it is high the transistor is off and the output is released, so
+//!   its high is whatever the board pulls it to. The stage has no pull-up
+//!   of its own (none is named by the Taiss listing, which says the outputs
+//!   must not be tied straight to the supply): with none on the board, a
+//!   released output floats, and the build's
+//!   `embsim_board::Finding::OpenDrainWithoutPullUp` names it.
+//!
+//! ## The encoder through a differential receiver
+//!
+//! MaD's Edge carrier receives the encoder on `J20` with an AM26LV32 quad
+//! differential line receiver (`U25`, `embsim_models::am26lv32`) before it
+//! reaches the P2 — see `Hardware/EdgeBoard/KiCad/MaD_Edge_Sheet3.kicad_sch`
+//! (the AM26LS31 driver `U24` on the same sheet handles the outbound
+//! step/direction pairs). The receiver reads each pair's difference against
+//! ±200 mV (TI SLLS202H §6.5). The line driver's pairs read as the encoder's
+//! levels. A single-ended output — push-pull or open collector — on `A+`
+//! with `A-` at the encoder's ground gives the pair no difference for its
+//! low: Table 8-1's "?" with a common-mode voltage applied, which the
+//! receiver's model reads as its fail-safe high (§8.4.1) and the engine
+//! reports as `embsim_board::Finding::PairInBand`. On today's Edge board an
+//! open-collector encoder's `P9` and `P10` therefore stay high at every
+//! count; a pull-up on each `+` to the encoder's supply and each `-` held
+//! between the output's two levels would read it.
 //!
 //! ## Not modeled
 //!
-//! - **The driver behind a pair**: the legs are the configured push-pull
-//!   outputs, `0 V` and [`Config::high_volts`]; no common-mode offset, no
-//!   single-ended-leg fault.
+//! - **The driver behind an output** beyond the stage: the levels are
+//!   `0 V` and [`Config::high_volts`] behind one impedance; no common-mode
+//!   offset, no single-ended-leg fault, no saturation voltage or sink
+//!   current limit on the open collector, no leakage while it is off.
+//! - **The encoder's supply.** The model has no supply pin: its outputs
+//!   drive and sink whatever the board does to the encoder's power.
 //! - **Quadrature error**: no phase error between channels, no duty-cycle
 //!   error, no jitter, no line-count tolerance. Every transition is exactly one
 //!   count wide.
@@ -99,7 +129,8 @@ use std::sync::{Arc, Mutex};
 
 use embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE;
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, Level, Ohms, PinDecl, PinHandle, TheveninDrive, Volts,
+    AttachError, Component, ComponentNetIo, Drive, Level, Ohms, PinDecl, PinHandle, TheveninDrive,
+    Volts,
 };
 use embsim_core::event::Observers;
 
@@ -123,6 +154,70 @@ pub enum ChannelOrder {
     ALeadsB,
     /// B leads A as the count increases (a reversed shaft or swapped pair).
     BLeadsA,
+}
+
+/// What drives each of the encoder's outputs (see the module docs, "The
+/// output stage").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputStage {
+    /// One push-pull output per channel: [`Config::high_volts`] or 0 V
+    /// behind [`Config::drive_impedance_ohms`].
+    #[default]
+    PushPull,
+    /// An RS-422 line driver: each channel a pair, its `-` leg driven to
+    /// the inverse of its leg in the same publish, each push-pull at the
+    /// same rail and impedance.
+    Rs422,
+    /// An NPN open collector per channel: sinking to 0 V behind
+    /// [`Config::drive_impedance_ohms`] while the phase is low, released
+    /// while it is high. No pull-up of its own.
+    NpnOpenCollector,
+}
+
+impl OutputStage {
+    /// Every stage, in the order [`Self::NAMES`] names them.
+    pub const ALL: [Self; 3] = [Self::PushPull, Self::Rs422, Self::NpnOpenCollector];
+
+    /// The stages' names, as a kind's option takes them
+    /// (`embsim_board::PartOptions::choice`): `push-pull`, `rs422`,
+    /// `npn-open-collector`.
+    pub const NAMES: [&'static str; 3] = ["push-pull", "rs422", "npn-open-collector"];
+
+    /// The stage's name ([`Self::NAMES`]).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PushPull => Self::NAMES[0],
+            Self::Rs422 => Self::NAMES[1],
+            Self::NpnOpenCollector => Self::NAMES[2],
+        }
+    }
+
+    /// The stage a name names ([`Self::NAMES`]), or `None`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|stage| stage.name() == name)
+    }
+
+    /// Whether each channel has a `-` leg.
+    pub const fn has_complements(self) -> bool {
+        matches!(self, Self::Rs422)
+    }
+
+    /// The drive one output presents for `level`, from `rail` behind
+    /// `impedance`: a push-pull port either way, or for the open collector
+    /// a sink to 0 V while low and released (`None`) while high.
+    pub const fn port(self, level: Level, rail: Volts, impedance: Ohms) -> Option<TheveninDrive> {
+        match (self, level) {
+            (Self::NpnOpenCollector, Level::High) => None,
+            (_, Level::High) => Some(TheveninDrive {
+                volts: rail,
+                impedance,
+            }),
+            (_, Level::Low) => Some(TheveninDrive {
+                volts: 0.0,
+                impedance,
+            }),
+        }
+    }
 }
 
 /// Optional once-per-revolution index (`Z`) channel. Declaring it adds a `Z`
@@ -149,19 +244,18 @@ pub struct Config {
     pub order: ChannelOrder,
     /// Index channel, or `None` for a plain A/B encoder.
     pub index: Option<IndexConfig>,
-    /// Open-circuit voltage driven for a logic high
-    /// ([`DEFAULT_HIGH_VOLTS`]).
+    /// Open-circuit voltage a push-pull output drives for a logic high
+    /// ([`DEFAULT_HIGH_VOLTS`]); the open collector drives no high.
     pub high_volts: Volts,
-    /// Thevenin source impedance of the output drivers
+    /// Thevenin impedance of the outputs: a push-pull driver's at both
+    /// levels, the open collector's sink while it is low
     /// (`embsim_board::net::DEFAULT_PUSH_PULL_IMPEDANCE`).
     pub drive_impedance_ohms: Ohms,
     /// Transitions one position update may emit before snapping
     /// ([`DEFAULT_MAX_COUNTS_PER_UPDATE`]).
     pub max_counts_per_update: u32,
-    /// Whether each channel is a complementary pair: `A-`, `B-` (and `Z-`
-    /// with an index) declared beside `A`, `B` (and `Z`), each driven as the
-    /// inverse of its leg ([`Config::with_complements`]).
-    pub complements: bool,
+    /// What drives each output ([`OutputStage`], push-pull by default).
+    pub output: OutputStage,
 }
 
 impl Config {
@@ -175,8 +269,14 @@ impl Config {
             high_volts: DEFAULT_HIGH_VOLTS,
             drive_impedance_ohms: DEFAULT_PUSH_PULL_IMPEDANCE,
             max_counts_per_update: DEFAULT_MAX_COUNTS_PER_UPDATE,
-            complements: false,
+            output: OutputStage::PushPull,
         }
+    }
+
+    /// Drive the outputs through `stage`.
+    pub fn with_output(mut self, stage: OutputStage) -> Self {
+        self.output = stage;
+        self
     }
 
     /// Add an index channel (and its `Z` pin).
@@ -186,13 +286,12 @@ impl Config {
     }
 
     /// Make every channel a complementary pair, as an RS-422 encoder's line
-    /// driver presents it: `A-`, `B-` (and `Z-` with an index) are declared
-    /// after the single-ended pins, each driven to the inverse of its leg's
-    /// level in the same publish, so the pair's differential is
-    /// `±high_volts` and never zero once attached.
-    pub fn with_complements(mut self) -> Self {
-        self.complements = true;
-        self
+    /// driver presents it ([`OutputStage::Rs422`]): `A-`, `B-` (and `Z-`
+    /// with an index) are declared after the single-ended pins, each driven
+    /// to the inverse of its leg's level in the same publish, so the pair's
+    /// differential is `±high_volts` once attached.
+    pub fn with_complements(self) -> Self {
+        self.with_output(OutputStage::Rs422)
     }
 
     /// Reject a configuration that cannot describe an encoder.
@@ -225,10 +324,16 @@ impl Config {
 // Pin facade
 // ============================================================
 
-/// One declared output channel: push-pull, idling high behind the
-/// configured impedance until the encoder drives it.
-fn output(number: &'static str, impedance: Ohms) -> PinDecl {
-    PinDecl::digital_out(number).with_impedance(impedance)
+/// One declared output channel through `stage`: push-pull, idling high
+/// behind the configured impedance until the encoder drives it, or an open
+/// collector, which sinks, cannot source and rests released.
+fn output(number: &'static str, stage: OutputStage, impedance: Ohms) -> PinDecl {
+    match stage {
+        OutputStage::NpnOpenCollector => PinDecl::digital_out(number).sink_only(),
+        OutputStage::PushPull | OutputStage::Rs422 => {
+            PinDecl::digital_out(number).with_impedance(impedance)
+        }
+    }
 }
 
 // ============================================================
@@ -244,8 +349,8 @@ struct Wire {
     a: Option<PinHandle>,
     b: Option<PinHandle>,
     z: Option<PinHandle>,
-    /// The complementary legs, `None` until attach or without
-    /// [`Config::complements`].
+    /// The complementary legs, `None` until attach or for a stage without
+    /// them ([`OutputStage::has_complements`]).
     a_n: Option<PinHandle>,
     b_n: Option<PinHandle>,
     z_n: Option<PinHandle>,
@@ -302,23 +407,25 @@ impl EncoderCore {
         }
     }
 
-    /// Drive one pin to a level (a push-pull Thevenin source at the configured
-    /// rail and impedance).
+    /// Drive one pin to a level through the output stage: a Thevenin port
+    /// at the configured rail and impedance, or the open collector released
+    /// for a high ([`OutputStage::port`]).
     fn drive(&self, handle: &Option<PinHandle>, level: Level) {
         let Some(handle) = handle else {
             return;
         };
-        handle.set_drive(Some(TheveninDrive {
-            volts: match level {
-                Level::High => self.config.high_volts,
-                Level::Low => 0.0,
-            },
-            impedance: self.config.drive_impedance_ohms,
-        }));
+        let config = &self.config;
+        match config
+            .output
+            .port(level, config.high_volts, config.drive_impedance_ohms)
+        {
+            Some(port) => handle.drive(Drive::Thevenin(port)),
+            None => handle.release(),
+        }
     }
 
-    /// Drive a channel: its leg to `level` and, with
-    /// [`Config::complements`], its complement to the inverse, together.
+    /// Drive a channel: its leg to `level` and, with complements
+    /// ([`OutputStage::Rs422`]), its complement to the inverse, together.
     fn drive_pair(&self, leg: &Option<PinHandle>, complement: &Option<PinHandle>, level: Level) {
         self.drive(leg, level);
         self.drive(complement, invert(level));
@@ -326,7 +433,7 @@ impl EncoderCore {
 
     /// Publish the current count's levels, enqueueing only the channels that
     /// actually changed. `force` re-drives everything (used at attach, where
-    /// the engine has assigned each output its default idle drive).
+    /// the engine has assigned each output its declared idle).
     fn publish(&self, wire: &mut Wire, force: bool) {
         let (a, b) = self.phase(wire.count);
         let z = self.index_level(wire.count);
@@ -460,7 +567,8 @@ impl EncoderInput {
 ///
 /// Its pins are outputs: `A`, `B`, and — only when an [`IndexConfig`] is
 /// configured — `Z`; with [`Config::with_complements`], `A-`, `B-` (and
-/// `Z-`) after them. Attach drives the initial phase, so the count and the
+/// `Z-`) after them. Each is driven through the configured
+/// [`OutputStage`]. Attach drives the initial phase, so the count and the
 /// nets agree before any traffic.
 #[derive(Debug)]
 pub struct QuadratureEncoder {
@@ -472,22 +580,23 @@ impl QuadratureEncoder {
     /// Create an encoder from a validated configuration.
     pub fn new(config: Config) -> Result<Self, MachineConfigError> {
         config.validate()?;
-        let impedance = config.drive_impedance_ohms;
-        let mut pins = vec![output("A", impedance), output("B", impedance)];
+        let (stage, impedance) = (config.output, config.drive_impedance_ohms);
+        let channel = |number| output(number, stage, impedance);
+        let mut pins = vec![channel("A"), channel("B")];
         if config.index.is_some() {
-            pins.push(output("Z", impedance));
+            pins.push(channel("Z"));
         }
-        if config.complements {
-            pins.push(output("A-", impedance));
-            pins.push(output("B-", impedance));
+        if stage.has_complements() {
+            pins.push(channel("A-"));
+            pins.push(channel("B-"));
             if config.index.is_some() {
-                pins.push(output("Z-", impedance));
+                pins.push(channel("Z-"));
             }
         }
         tracing::info!(
             counts_per_mm = config.counts_per_mm,
             index = config.index.is_some(),
-            complements = config.complements,
+            output = stage.name(),
             "quadrature_encoder: init"
         );
         Ok(Self {
@@ -535,16 +644,17 @@ impl Component for QuadratureEncoder {
         if self.core.config.index.is_some() {
             wire.z = Some(io.pin("Z")?);
         }
-        if self.core.config.complements {
+        if self.core.config.output.has_complements() {
             wire.a_n = Some(io.pin("A-")?);
             wire.b_n = Some(io.pin("B-")?);
             if self.core.config.index.is_some() {
                 wire.z_n = Some(io.pin("Z-")?);
             }
         }
-        // Force the initial phase: every channel is declared push-pull and
-        // idles high from assembly, which is not the encoder's count-0
-        // state, so all channels are re-driven here rather than diffed.
+        // Force the initial phase: a push-pull channel idles high from
+        // assembly and an open collector released, neither of which is the
+        // encoder's count-0 state, so all channels are re-driven here
+        // rather than diffed.
         self.core.publish(&mut wire, true);
         Ok(())
     }
@@ -823,6 +933,71 @@ mod tests {
             assert!(decl.drives());
             assert_eq!(decl.idle.map(|idle| idle.impedance), Some(47.0));
         }
+    }
+
+    /// The open collector declares the same channels as the push-pull
+    /// stage, each a sink that cannot source and rests released; it has no
+    /// `-` legs.
+    #[rstest]
+    fn open_collector_channels_sink_and_rest_released() {
+        let enc = encoder(
+            Config::new(1.0)
+                .with_index(IndexConfig {
+                    counts_per_revolution: 4,
+                    width_counts: 1,
+                    active_level: Level::High,
+                })
+                .with_output(OutputStage::NpnOpenCollector),
+        );
+        assert_eq!(
+            enc.pins().iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec!["A", "B", "Z"]
+        );
+        for decl in enc.pins() {
+            assert!(decl.can_sink && !decl.can_source, "{}", decl.number);
+            assert_eq!(decl.idle, None, "{}", decl.number);
+        }
+    }
+
+    /// Each stage's port for each level: push-pull and the line driver at
+    /// the rail or 0 V behind the impedance; the open collector a sink at
+    /// 0 V behind it, and released for a high.
+    #[rstest]
+    #[case::push_pull(OutputStage::PushPull, Some(5.0))]
+    #[case::rs422(OutputStage::Rs422, Some(5.0))]
+    #[case::open_collector(OutputStage::NpnOpenCollector, None)]
+    fn each_stage_presents_its_port_at_both_levels(
+        #[case] stage: OutputStage,
+        #[case] high: Option<Volts>,
+    ) {
+        let low = stage.port(Level::Low, 5.0, 47.0);
+        assert_eq!(
+            low,
+            Some(TheveninDrive {
+                volts: 0.0,
+                impedance: 47.0
+            })
+        );
+        let expected = high.map(|volts| TheveninDrive {
+            volts,
+            impedance: 47.0,
+        });
+        assert_eq!(stage.port(Level::High, 5.0, 47.0), expected);
+    }
+
+    /// A stage's name, as a kind's option takes it, names that stage, and
+    /// `with_complements` is the line driver.
+    #[rstest]
+    fn stages_answer_to_their_names() {
+        for stage in OutputStage::ALL {
+            assert_eq!(OutputStage::from_name(stage.name()), Some(stage));
+        }
+        assert_eq!(OutputStage::from_name("open-drain"), None);
+        assert_eq!(OutputStage::default(), OutputStage::PushPull);
+        assert_eq!(
+            Config::new(1.0).with_complements().output,
+            OutputStage::Rs422
+        );
     }
 
     // ========================================================

@@ -131,6 +131,8 @@ pub struct PinDecl {
     pub supply: Option<&'static str>,  // the pin its relative thresholds scale with
     pub limits: Option<PinLimits>,     // { recommended: (min, max), absolute_max, note }:
                                        //   checked by the engine against the solved net
+    pub pair: Option<DifferentialPair>,// { inverting, band, fail_safe }: the pin is a pair's
+                                       //   non-inverting input, watched by the engine
     pub can_source: bool,              // drives high
     pub can_sink: bool,                // drives low; neither = an input
 }
@@ -148,6 +150,20 @@ above its recommended maximum raises `Finding::PinAboveRecommended` once per
 excursion, at the first voltage above it; the part keeps running, and what
 it does out of range is its model's. Only the top is checked: every supply
 passes under its minimum as it rises and falls.
+
+A **differential pair** is declared on its non-inverting input
+(`with_pair(DifferentialPair { inverting, band, fail_safe })`, `NODES.md`
+§20): the inverting input it is read against, the band its datasheet gives
+no level inside, and the level the part's model gives a pair there. The
+engine watches it, never the part: `System::build` over its settled
+snapshot, and the live engine after every pass that moves either input or
+their reference, holding an observation inside the band until its clock
+next moves on. A pair that spends time inside its band while a source other
+than the part's own input ports reaches it (a common-mode voltage applied)
+raises `Finding::PairInBand` once, naming the pair and the fail-safe its
+output took; a pair only its own ports reach (open, shorted, terminated)
+rests at their bias and raises nothing, and one that passes through the
+band at one instant (two legs published together) spends no time there.
 
 There are no pin kinds (`NODES.md` §11 and §12 item 5): what a
 pin reads and drives follows from its role and its declarations. A pin is
@@ -678,7 +694,10 @@ board only through a connector — raises nothing). Beside them the build
 observes the declared pin limits over the same snapshot, and the live
 engine keeps observing them: `PinAboveRecommended` (a pin above the
 recommended range its part declares, against its reference, once per
-excursion).
+excursion); and the declared differential pairs the same way:
+`PairInBand` (a pair that spends time inside the band its part declares
+while a source other than the part's own input ports reaches it, once per
+pair, live when the engine's clock moves on).
 
 ## Testing conventions
 
