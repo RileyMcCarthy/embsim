@@ -204,7 +204,8 @@ fn drive_and_settle(pin: &PinHandle, level: Level) {
 
 fn sense_bit(pin: &PinHandle) -> bool {
     // A pull-up would decide a released line; here the flash drives DO
-    // whenever it is selected, so a missing level means the handshake failed.
+    // whenever it is selected and shifting data out, which is when this is
+    // called, so a missing level means the handshake failed.
     level_of(pin.net_report()) == Some(Level::High)
 }
 
@@ -652,8 +653,10 @@ fn the_boot_roms_read_frame_streams_the_image_from_zero() {
 
 /// A deselected part's data-out is at high impedance (W25Q128JV §4.1 "Chip
 /// Select (/CS)", p.9): on a bench with no pull-up the line floats until the
-/// master selects the part, carries the part's bit while it is selected, and
-/// floats again when the master deselects it.
+/// master selects the part and asks it for something, carries the part's bit
+/// while it answers, and floats again when the master deselects it. That DO
+/// also floats while the part is selected and has nothing to say is
+/// `shared_spi_bus.rs`'s, read at settled instants on the stepped clock.
 #[test]
 fn the_data_line_floats_while_the_part_is_deselected() {
     let (_system, handles) = bench(SpiNorFlash::with_image(vec![0xA5; 64]));
@@ -670,9 +673,14 @@ fn the_data_line_floats_while_the_part_is_deselected() {
 
     drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
     drive_and_settle(pins.cs.as_ref().unwrap(), Level::Low);
+    // Read Status Register-1, then one pulse: the part presents the
+    // register's first bit.
+    send(&pins, 0x05);
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::High);
+    drive_and_settle(pins.clk.as_ref().unwrap(), Level::Low);
     assert!(
         matches!(dout.net_report(), NetState::Driven(_)),
-        "selected, the part presents its bit on DO: {:?}",
+        "selected and answering, the part presents its bit on DO: {:?}",
         dout.net_report()
     );
 

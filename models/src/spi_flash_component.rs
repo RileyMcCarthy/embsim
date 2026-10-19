@@ -284,22 +284,23 @@ impl FlashView {
     }
 }
 
-/// Publish the device's current data-out level while it is selected, or
-/// release the line: a deselected part's DO is at high impedance
-/// (W25Q128JV §4.1 "Chip Select (/CS)", p.9), so whatever else is on the
-/// net — a pull-up, another device the bus is shared with — decides it.
+/// Publish the device's current data-out level while it drives DO, or
+/// release the line: DO is at high impedance while the part is deselected
+/// and, selected, until it has data, status or an ID to shift out
+/// ([`SpiNorFlash::drives_do`]), so whatever else is on the net — a
+/// pull-up, another device the bus is shared with — decides it.
 fn publish_do(shared: &Mutex<Shared>, data_out: &PinHandle) {
     let guard = shared.lock().expect("flash mutex");
-    let drive = if guard.flash.present() && guard.flash.selected() {
+    let drive = if guard.flash.present() && guard.flash.drives_do() {
         Some(digital_drive(if guard.flash.miso() {
             Level::High
         } else {
             Level::Low
         }))
     } else {
-        // Deselected, or no array fitted: never drive. With no array a
-        // pull-up decides and a master reads all-ones and concludes there
-        // is no device.
+        // Deselected, nothing to shift out, or no array fitted: never
+        // drive. With no array a pull-up decides and a master reads
+        // all-ones and concludes there is no device.
         None
     };
     drop(guard);

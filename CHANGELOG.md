@@ -53,6 +53,19 @@ the one before it promised, and says so here under **Breaking**.
   on its pin, naming the 8 V. The −0.3 V floor and the ±5.8 V / ±12 V
   differential ratings are not checked.
 
+### Fixed
+
+- **The W25Q128JV drives DO only while it shifts data, status or an ID
+  out** (`SpiNorFlash::drives_do`, new): selected, DO stays at high
+  impedance through the instruction and any address, and for an
+  instruction that outputs nothing. It drove DO for as long as it was
+  selected, which on a P2-EC32MB with its flash select switch closed held
+  `P58` high through every low half of the card's clock (the card's clock
+  is the flash's `/CS` there, and the flash's DO is the card's MISO), so a
+  host that sampled MISO before each rising edge read `$FF` for every byte
+  the card sent and the card never initialised. `SpiNorFlash::miso` reads the line released while the part
+  is not driving it.
+
 ## [0.4.0] - 2026-10-12
 
 ### Added
