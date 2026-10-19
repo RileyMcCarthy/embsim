@@ -594,6 +594,18 @@ fn pairs_reported(findings: &[Finding]) -> Vec<(String, String, String, Level)> 
         .collect()
 }
 
+/// The pins the run reported above their declared recommended range
+/// (`Finding::PinAboveRecommended`), as `(part, pin)`.
+fn limits_reported(findings: &[Finding]) -> Vec<(String, String)> {
+    findings
+        .iter()
+        .filter_map(|finding| match finding {
+            Finding::PinAboveRecommended { part, pin, .. } => Some((part.clone(), pin.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Walk an open-collector encoder on the receiver board one count at a
 /// time through `walk`, asserting `Y1` and `Y2` at every count with
 /// `expected`; the findings the run made.
@@ -692,12 +704,23 @@ fn with_pull_ups_and_biased_minus_legs_an_am26lv32_counts_an_open_collector_enco
         "nothing-reported",
         "no pair is reported as read inside its band"
     );
+    expect!(
+        "inputs-in-range",
+        "no pin is reported above its recommended range",
+        "a released output pulled up to 5 volts against the receiver's 12 kilohm input rests \
+         near 3.8 volts, inside the minus 0.3 to 5.5 volt input range SLLS202H recommends"
+    );
     let _lock = suite_lock();
     let findings = walk_open_collector(Pairs::PulledAndBiased, &[9, -2], quadrature);
     assert!(
         pairs_reported(&findings).is_empty(),
         "{:?}",
         pairs_reported(&findings)
+    );
+    assert!(
+        limits_reported(&findings).is_empty(),
+        "{:?}",
+        limits_reported(&findings)
     );
 }
 

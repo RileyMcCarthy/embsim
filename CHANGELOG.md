@@ -45,6 +45,13 @@ the one before it promised, and says so here under **Breaking**.
   four pairs (SLLS202H Table 8-1, §8.4.1): a single-ended encoder on the
   Edge carrier's `J20` with its `-` legs grounded is reported on `U25`'s
   pairs, the fail-safe high its outputs keep.
+- **The `am26lv32`'s input range is checked.** Each `A` and `B` input
+  declares SLLS202H's −0.3 V to 5.5 V common-mode input range (§6.3) and
+  8 V absolute maximum (§6.1) against `GND`, `AM26LV32_INPUT_LIMITS`, so an
+  input above 5.5 V — an open-collector encoder's leg pulled up to 12 V
+  through 4.7 kΩ rests near 8.9 V — raises `Finding::PinAboveRecommended`
+  on its pin, naming the 8 V. The −0.3 V floor and the ±5.8 V / ±12 V
+  differential ratings are not checked.
 
 ## [0.4.0] - 2026-10-12
 
