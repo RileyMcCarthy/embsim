@@ -4,8 +4,8 @@
 //! with the PSRAM) with a command state machine and a backing image. It
 //! knows nothing about which MCU is driving it, which pins it sits on, or
 //! whether those pins are bit-banged by software or clocked by a peripheral:
-//! the whole surface is [`SpiNorFlash::set_selected`], [`SpiNorFlash::clock`]
-//! and [`SpiNorFlash::miso`]. Anything that can produce a chip select, a
+//! the whole surface is [`SpiNorFlash::set_selected`], [`SpiNorFlash::clock`],
+//! [`SpiNorFlash::miso`] and [`SpiNorFlash::drives_do`]. Anything that can produce a chip select, a
 //! clock edge and a data bit can talk to it, which is what makes it reusable
 //! across boards and MCUs.
 //!
@@ -16,7 +16,9 @@
 //!
 //! The output bit is **stable on MISO throughout the clock pulse**: presented
 //! at select, and again on each rising edge before the position advances. MOSI
-//! is sampled on the rising edge.
+//! is sampled on the rising edge. The line carries the bit only while the part
+//! has data, status or an ID to shift out ([`SpiNorFlash::drives_do`]); until
+//! then, selected or not, DO is at high impedance.
 //!
 //! That is not a stylistic choice. A bit-banging master reads the data line
 //! after driving the clock, and on a Propeller 2 the pin input registers a beat
@@ -126,6 +128,16 @@ enum Phase {
     },
 }
 
+impl Phase {
+    /// Whether the part shifts a byte out on DO in this phase: the data of a
+    /// read, the status register, the JEDEC ID. In every other phase the
+    /// master is shifting an instruction, an address or data in, and DO is
+    /// at high impedance ([`SpiNorFlash::drives_do`]).
+    const fn outputs(self) -> bool {
+        matches!(self, Self::Reading | Self::Status | Self::Jedec)
+    }
+}
+
 /// A serial NOR flash chip.
 #[derive(Debug, Default)]
 pub struct SpiNorFlash {
@@ -138,6 +150,13 @@ pub struct SpiNorFlash {
     /// the bit on MISO.
     shift: ByteShifter,
     phase: Phase,
+    /// The byte loaded to shift out next is output (data, status, ID)
+    /// rather than the filler the shifter carries while the master is
+    /// still shifting in.
+    loaded_is_output: bool,
+    /// The bit on MISO is one of those output bytes': the part is driving
+    /// DO. Cleared by every select and deselect.
+    driving: bool,
     addr_acc: u32,
     read_addr: u32,
     /// Write-enable latch. Set by `$06`, cleared by `$04` and by completing a
@@ -214,14 +233,12 @@ impl SpiNorFlash {
     }
 
     /// The bit currently on the data-out line, DO (IO1) — pin 2 of the SOIC-8
-    /// (§3.3, p.5) — while the part is selected. Deselected, the pin is at
-    /// high impedance (§4.1 "Chip Select (/CS)", p.9: "When /CS is high the
-    /// device is deselected and the Serial Data Output … pins are at high
-    /// impedance"); a caller with no net to read reads the line as the high
-    /// a pull-up would give, and a board adapter releases the pin instead —
-    /// see [`SpiNorFlash::selected`].
+    /// (§3.3, p.5) — while the part drives it ([`SpiNorFlash::drives_do`]).
+    /// Otherwise the pin is at high impedance; a caller with no net to read
+    /// reads the line as the high a pull-up would give, and a board adapter
+    /// releases the pin instead.
     pub fn miso(&self) -> bool {
-        if !self.selected {
+        if !self.drives_do() {
             return true; // a released line idles high on its pull-up
         }
         self.shift.dout()
@@ -231,6 +248,38 @@ impl SpiNorFlash {
     /// high impedance (§4.1, p.9) and a board adapter drives nothing.
     pub fn selected(&self) -> bool {
         self.selected
+    }
+
+    /// Whether the part drives DO: selected, and shifting out the data of a
+    /// read, the status register or the JEDEC ID. Deselected, DO is at high
+    /// impedance (§4.1 "Chip Select (/CS)", p.9: "When /CS is high the
+    /// device is deselected and the Serial Data Output … pins are at high
+    /// impedance"). Selected, it stays so while the master shifts the
+    /// instruction and any address in: "Standard SPI also uses the
+    /// unidirectional DO (output) to read data or status from the device"
+    /// (§4.2 "Serial Data Input, Output and IOs (DI, DO and IO0, IO1, IO2,
+    /// IO3)", p.9). A Read Data shifts its first byte out once the 24-bit
+    /// address is in, and Figure 14 draws DO at high impedance through the
+    /// instruction and the address (§8.2.6 "Read Data (03h)", p.28); Figure
+    /// 8a draws it so through a Read Status Register's instruction (§8.2.4,
+    /// p.25). An instruction this model does not implement, a write, a
+    /// program and an erase never drive it (Figure 7, Write Disable, p.25:
+    /// DO at high impedance throughout).
+    ///
+    /// DO starts driving on the edge that presents the first output bit,
+    /// which this model presents on the rising edge (module docs), half a
+    /// clock after the part's own falling edge. A master that reads the line
+    /// after that edge reads the bit; one that reads it before reads the
+    /// line released.
+    ///
+    /// Which matters on a shared bus. On a P2-EC32MB the flash's `/CS` is
+    /// the card's clock and the flash's DO is the card's MISO, so with the
+    /// flash select switch closed every card clock pulse selects the flash
+    /// with no flash clock edge. Silicon leaves DO to the card; a part that
+    /// drove DO whenever it was selected would fight the card on every
+    /// pulse.
+    pub fn drives_do(&self) -> bool {
+        self.selected && self.driving
     }
 
     /// Chip select changed. `selected` is the ASSERTED sense — the caller
@@ -255,6 +304,8 @@ impl SpiNorFlash {
         self.jedec_idx = 0;
         self.phase = Phase::Command;
         let first = self.next_out();
+        self.loaded_is_output = self.phase.outputs();
+        self.driving = false;
         self.shift.begin(first);
     }
 
@@ -270,9 +321,12 @@ impl SpiNorFlash {
             self.shift.track_clock(high);
             return;
         }
+        // The bit this edge presents is from the byte loaded before it.
+        let presenting_output = self.loaded_is_output;
         let Some(edge) = self.shift.clock(high, mosi) else {
             return; // a repeated level, or the falling edge: nothing
         };
+        self.driving = presenting_output;
         // Input: a byte assembled on this edge is decoded before the next
         // out byte is chosen, so the phase it selects is the one that
         // answers.
@@ -284,6 +338,7 @@ impl SpiNorFlash {
                 self.served.push(served);
             }
             let next = self.next_out();
+            self.loaded_is_output = self.phase.outputs();
             self.shift.load_out(next);
         }
     }
@@ -698,5 +753,91 @@ mod tests {
         }
         assert_eq!(a.commands, vec![0x9F]);
         assert_eq!(b.commands, a.commands, "duplicate levels changed nothing");
+    }
+
+    /// Clock one pulse and say whether the part drove DO after its rising
+    /// edge, and with what.
+    fn pulse_drive(flash: &mut SpiNorFlash, din: bool) -> Option<bool> {
+        flash.clock(true, din);
+        let driven = flash.drives_do().then(|| flash.miso());
+        flash.clock(false, din);
+        driven
+    }
+
+    #[test]
+    fn a_read_drives_do_from_its_first_data_bit_and_not_before() {
+        let mut flash = SpiNorFlash::with_image(vec![0x5A; 16]);
+        flash.set_selected(true);
+        assert!(!flash.drives_do(), "selected, nothing to say yet");
+        // The instruction and its 24-bit address: 32 pulses, DO released on
+        // every one.
+        for byte in [0x03u8, 0x00, 0x00, 0x00] {
+            for i in (0..8).rev() {
+                assert_eq!(
+                    pulse_drive(&mut flash, (byte >> i) & 1 != 0),
+                    None,
+                    "DO is released while the master shifts {byte:#04x} in"
+                );
+            }
+        }
+        // The first data bit is driven on the next edge, MSB first.
+        let mut got = 0u8;
+        for _ in 0..8 {
+            let bit = pulse_drive(&mut flash, true).expect("driven while shifting data out");
+            got = (got << 1) | u8::from(bit);
+        }
+        assert_eq!(got, 0x5A, "the addressed byte");
+        flash.set_selected(false);
+        assert!(!flash.drives_do(), "deselected: released");
+    }
+
+    #[test]
+    fn a_status_read_drives_do_once_its_instruction_is_in() {
+        let mut flash = SpiNorFlash::blank(16);
+        flash.set_selected(true);
+        for i in (0..8).rev() {
+            assert_eq!(pulse_drive(&mut flash, (0x05u8 >> i) & 1 != 0), None);
+        }
+        let status: Vec<Option<bool>> = (0..8).map(|_| pulse_drive(&mut flash, true)).collect();
+        assert_eq!(status, vec![Some(false); 8], "status 00h, every bit driven");
+    }
+
+    #[test]
+    fn a_part_selected_and_never_clocked_never_drives_do() {
+        // A P2-EC32MB with its flash select switch closed: the card's clock
+        // is the flash's `/CS`, so every card clock pulse selects the flash,
+        // and the flash's own clock does not move.
+        let mut flash = SpiNorFlash::with_image(vec![0x00; 16]);
+        for _ in 0..64 {
+            flash.set_selected(true);
+            assert!(!flash.drives_do(), "selected with no clock edge: released");
+            flash.set_selected(false);
+        }
+        assert!(flash.commands.is_empty(), "and it decoded nothing");
+    }
+
+    #[test]
+    fn writes_and_instructions_with_no_output_never_drive_do() {
+        let mut flash = SpiNorFlash::blank(512);
+        for frame in [
+            &[0x06u8][..],                         // Write Enable
+            &[0x02, 0x00, 0x00, 0x00, 0x11, 0x22], // Page Program
+            &[0x20, 0x00, 0x00, 0x00],             // Sector Erase
+            &[0x66],                               // Enable Reset
+            &[0x99],                               // Reset Device
+            &[0xFF, 0xFF],                         // no instruction
+        ] {
+            flash.set_selected(true);
+            for &byte in frame {
+                for i in (0..8).rev() {
+                    assert_eq!(
+                        pulse_drive(&mut flash, (byte >> i) & 1 != 0),
+                        None,
+                        "DO is released through {frame:02x?}"
+                    );
+                }
+            }
+            flash.set_selected(false);
+        }
     }
 }
