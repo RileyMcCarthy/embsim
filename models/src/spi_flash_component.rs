@@ -11,7 +11,7 @@
 //!  ~CS  on_sense ──active low──► set_selected(!high) ──► phase reset
 //!  DI   on_sense ─────────────► remembered, sampled at the next clock edge
 //!  CLK  on_sense ─────────────► clock(high, di) ──────► shift / consume
-//!  DO   ◄── digital_drive(miso()) while selected, released while not
+//!  DO   ◄── digital_drive(miso()) while drives_do(), released otherwise
 //!           ◄── after every ~CS or CLK sense
 //! ```
 //!
