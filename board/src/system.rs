@@ -222,8 +222,11 @@ pub enum EdgeFaultKind {
     /// Force an ideal source at `volts` on the target's net and suppress the
     /// target pin's own drive.
     Stuck(Volts),
-    /// Inject an ideal source at `volts` beside the live drivers, so
-    /// disagreeing levels read as contention.
+    /// Inject an ideal source at `volts` beside the live drivers, which
+    /// stay applied. The ideal source wins outright: while the window is
+    /// open the net reads the source's `volts`, not
+    /// [`crate::NetState::Contention`], and a live driver that loses to it
+    /// is reported as a [`Finding::Contention`].
     Contention(Volts),
 }
 
