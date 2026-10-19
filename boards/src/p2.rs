@@ -129,8 +129,8 @@
 //! A pad is a Thevenin source at the strength the guest configured. The
 //! `WRPIN` word's pin-configuration field `%PPPPPPPPPPPPP` (bits 20:8)
 //! is, in its logic modes, `%0000_CIO_HHH_LLL`: `HHH` (bits 13:11) is the
-//! drive while `OUT` = 1 and `LLL` (bits 10:8) the drive while `OUT` = 0,
-//! each one of
+//! drive while the pad's output is high and `LLL` (bits 10:8) the drive
+//! while it is low, each one of
 //!
 //! | field | mode | here |
 //! |---|---|---|
@@ -149,6 +149,18 @@
 //! (fast, 1.5k, 15k, 150k, 1mA, 100uA, 10uA, float). The three resistive
 //! modes are the resistances the document names; the fast mode is fitted
 //! to the datasheet's output table ([`P2_FAST_OHMS`]).
+//!
+//! `O` (bit 14, [`P_INVERT_OUTPUT`]) inverts the output: the pad drives
+//! `!OUT`, and the field that applies is the one for the level the pad
+//! drives — a word with a 15 kΩ `HHH`, a floating `LLL` and `O` set is a
+//! 15 kΩ pull-up while `OUT` = 0 and released while `OUT` = 1
+//! ([`pad_output_level`]). `I` (bit 15, [`P_INVERT_IN`]) inverts the
+//! input: the pad's `IN` reads the inverse of the level on its net
+//! ([`pad_input_level`]). The package delivers a pad's net level
+//! ([`P2Pads::on_pad_sense`]); the core makes `IN` from it, so `I` is the
+//! core's to apply, through that decode. Both bits are read in the
+//! `%0000` logic modes only, the modes whose `HHH`/`LLL` the package
+//! decodes ([`pad_modes`]).
 //!
 //! The current-source modes are **not** mapped: they reach a core as
 //! [`PadDrive::CurrentSource`], an unimplemented path the core logs once,
@@ -333,11 +345,18 @@ pub const P2_PULL_15K_OHMS: Ohms = 15_000.0;
 /// The `%011` drive mode: 150 kΩ (Silicon Doc, pin configuration table).
 pub const P2_PULL_150K_OHMS: Ohms = 150_000.0;
 
-/// Bit position of the `HHH` field (the drive while `OUT` = 1) in a
-/// `WRPIN` word: bits 13:11.
+/// Bit position of the `HHH` field (the drive while the pad's output is
+/// high) in a `WRPIN` word: bits 13:11.
 pub const P_HIGH_SHIFT: u32 = 11;
-/// Bit position of the `LLL` field (the drive while `OUT` = 0): bits 10:8.
+/// Bit position of the `LLL` field (the drive while the pad's output is
+/// low): bits 10:8.
 pub const P_LOW_SHIFT: u32 = 8;
+/// The logic-mode word's `O` bit (bit 14), as the Spin2 compiler names it:
+/// the pad's output is the inverse of `OUT` ([`pad_output_level`]).
+pub const P_INVERT_OUTPUT: u32 = 1 << 14;
+/// The logic-mode word's `I` bit (bit 15), as the Spin2 compiler names it:
+/// the pad's `IN` is the inverse of its net's level ([`pad_input_level`]).
+pub const P_INVERT_IN: u32 = 1 << 15;
 /// The pin-configuration field's mode selector, bits 20:17: `%0000` is a
 /// logic mode (`%0000_CIO_HHH_LLL`); anything else is a DAC, ADC or
 /// comparator mode whose low bits mean something else.
@@ -439,7 +458,8 @@ impl PadMode {
     }
 }
 
-/// The `(OUT = 1, OUT = 0)` drive modes a `WRPIN` word configures.
+/// The `(high, low)` drive modes a `WRPIN` word configures: the drive
+/// while the pad's output is high, and while it is low.
 ///
 /// A word whose mode selector (bits 20:17) is not `%0000` is a DAC, ADC or
 /// comparator configuration whose low bits are not drive modes; a pad the
@@ -456,6 +476,29 @@ pub const fn pad_modes(cfg: u32) -> (PadMode, PadMode) {
     )
 }
 
+/// Whether a `WRPIN` word is a logic mode (`%0000_CIO_HHH_LLL`, mode
+/// selector `%0000`): the modes whose `O`, `I` and `HHH`/`LLL` fields the
+/// package decodes.
+const fn is_logic_mode(cfg: u32) -> bool {
+    cfg & P_MODE_SELECT_MASK == 0
+}
+
+/// The level pad's output drives for its `OUT` bit: `OUT`, inverted in a
+/// logic-mode word with `O` set ([`P_INVERT_OUTPUT`]). It selects the
+/// `HHH`/`LLL` field [`pad_drive`] applies, and it is what a pad driven
+/// strongly reads back as its own level.
+pub const fn pad_output_level(cfg: u32, out: bool) -> bool {
+    out ^ (is_logic_mode(cfg) && cfg & P_INVERT_OUTPUT != 0)
+}
+
+/// The `IN` bit a pad reports for the logic level its net presents
+/// (`true` high): the level, inverted in a logic-mode word with `I` set
+/// ([`P_INVERT_IN`]). The package delivers the level
+/// ([`P2Pads::on_pad_sense`]); a core applies this to make `IN`.
+pub const fn pad_input_level(cfg: u32, level: bool) -> bool {
+    level ^ (is_logic_mode(cfg) && cfg & P_INVERT_IN != 0)
+}
+
 /// What a pad the guest is driving presents to its net.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PadDrive {
@@ -470,19 +513,21 @@ pub enum PadDrive {
 }
 
 /// The drive a pad with `DIR` set presents, from its `WRPIN` word and its
-/// `OUT` bit: high at `high_volts` — the pad's bank supply, see
-/// [`BankSupplies::pad_drive`] — through the `HHH` mode's impedance, low
-/// at 0 V through the `LLL` mode's. A pad with `DIR` clear is
-/// [`PadDrive::Released`] whatever the word says.
+/// `OUT` bit: the pad's output is `OUT`, or its inverse when the word's
+/// `O` bit is set ([`pad_output_level`]); high, it sits at `high_volts` —
+/// the pad's bank supply, see [`BankSupplies::pad_drive`] — through the
+/// `HHH` mode's impedance, low at 0 V through the `LLL` mode's. A pad with
+/// `DIR` clear is [`PadDrive::Released`] whatever the word says.
 pub fn pad_drive(cfg: u32, dir: bool, out: bool, high_volts: Volts) -> PadDrive {
     if !dir {
         return PadDrive::Released;
     }
     let (high, low) = pad_modes(cfg);
-    let mode = if out { high } else { low };
+    let level = pad_output_level(cfg, out);
+    let mode = if level { high } else { low };
     match mode.ohms() {
         Some(impedance) => PadDrive::Thevenin(TheveninDrive {
-            volts: if out { high_volts } else { 0.0 },
+            volts: if level { high_volts } else { 0.0 },
             impedance,
         }),
         None if mode.is_current_source() => PadDrive::CurrentSource(mode),
@@ -830,7 +875,8 @@ impl BankSupplies {
     }
 
     /// The drive pad `pin` presents from its `WRPIN` word and its
-    /// `DIR`/`OUT` bits, high at its bank's supply ([`pad_drive`]). A pad
+    /// `DIR`/`OUT` bits, high at its bank's supply ([`pad_drive`], which
+    /// honours the word's [`P_INVERT_OUTPUT`]). A pad
     /// with `DIR` set in a bank whose supply names no voltage presents
     /// nothing, and the bank is reported once, by its supply pin.
     pub fn pad_drive(&self, pin: u8, cfg: u32, dir: bool, out: bool) -> PadDrive {
@@ -1989,6 +2035,13 @@ mod tests {
     #[case::current_100ua(P_HIGH_100UA, true, PadDrive::CurrentSource(PadMode::Current100uA))]
     #[case::current_10ua_low(P_LOW_10UA, false, PadDrive::CurrentSource(PadMode::Current10uA))]
     #[case::adc_mode_word_is_fast(0x0010_0000 | P_HIGH_15K, true, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: P2_FAST_OHMS }))]
+    #[case::inverted_fast_out_high_drives_low(P_HIGH_FAST | P_LOW_FAST | P_INVERT_OUTPUT, true, PadDrive::Thevenin(TheveninDrive { volts: 0.0, impedance: P2_FAST_OHMS }))]
+    #[case::inverted_fast_out_low_drives_high(P_HIGH_FAST | P_LOW_FAST | P_INVERT_OUTPUT, false, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: P2_FAST_OHMS }))]
+    #[case::inverted_pull_up_out_low(P_HIGH_15K | P_LOW_FLOAT | P_INVERT_OUTPUT, false, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 15_000.0 }))]
+    #[case::inverted_pull_up_out_high_is_released(P_HIGH_15K | P_LOW_FLOAT | P_INVERT_OUTPUT, true, PadDrive::Released)]
+    #[case::inverted_pulls_both_ways_out_low(P_HIGH_15K | P_LOW_15K | P_INVERT_OUTPUT, false, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 15_000.0 }))]
+    #[case::input_inversion_leaves_the_drive(P_HIGH_15K | P_LOW_FLOAT | P_INVERT_IN, true, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: 15_000.0 }))]
+    #[case::adc_mode_word_ignores_the_o_bit(0x0010_0000 | P_INVERT_OUTPUT, true, PadDrive::Thevenin(TheveninDrive { volts: 3.3, impedance: P2_FAST_OHMS }))]
     fn a_wrpin_word_is_the_pads_thevenin(
         #[case] cfg: u32,
         #[case] out: bool,
@@ -2102,8 +2155,28 @@ mod tests {
         assert!((fitted_ohms(&P2_FAST_SINK_POINTS) - 16.8981).abs() < 1e-4);
     }
 
+    /// `O` inverts the level a pad drives and `I` the level its `IN`
+    /// reads, each on its own and in the logic modes only.
+    #[test]
+    fn the_invert_bits_flip_the_output_and_the_input_in_a_logic_mode_word() {
+        for level in [false, true] {
+            assert_eq!(pad_output_level(0, level), level);
+            assert_eq!(pad_output_level(P_INVERT_OUTPUT, level), !level);
+            assert_eq!(pad_output_level(P_INVERT_IN, level), level);
+            assert_eq!(pad_input_level(0, level), level);
+            assert_eq!(pad_input_level(P_INVERT_IN, level), !level);
+            assert_eq!(pad_input_level(P_INVERT_OUTPUT, level), level);
+            // A DAC/ADC/comparator word's low bits are not `CIO`.
+            let adc = 0x0010_0000 | P_INVERT_OUTPUT | P_INVERT_IN;
+            assert_eq!(pad_output_level(adc, level), level);
+            assert_eq!(pad_input_level(adc, level), level);
+        }
+    }
+
     #[test]
     fn the_spin2_constants_land_in_their_fields() {
+        assert_eq!(P_INVERT_OUTPUT, 0x4000);
+        assert_eq!(P_INVERT_IN, 0x8000);
         assert_eq!(P_HIGH_15K, 0x1000);
         assert_eq!(P_HIGH_FLOAT, 0x3800);
         assert_eq!(P_LOW_15K, 0x200);

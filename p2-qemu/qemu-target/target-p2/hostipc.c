@@ -206,6 +206,11 @@ QEMU_BUILD_BUG_ON(sizeof(P2IpcStop) != 80);
 #define P_MODE_SELECT_MASK 0x001E0000u
 #define P_HIGH_SHIFT 11
 #define P_LOW_SHIFT 8
+/* A logic-mode word's O and I bits (embsim_boards::p2::P_INVERT_OUTPUT,
+ * P_INVERT_IN): the pad drives !OUT, and IN reads the inverse of the
+ * pad's level. Read in the %0000 logic modes only, as embsim reads them. */
+#define P_INVERT_OUTPUT 0x00004000u
+#define P_INVERT_IN     0x00008000u
 
 typedef struct {
     /* DIRx/OUTx are PER-COG registers and the pad sees the OR across all
@@ -216,6 +221,9 @@ typedef struct {
     uint32_t in_ext[2], strong[2];
     uint32_t banks_powered, banks_high;
     uint32_t mode[NUM_PINS], x[NUM_PINS];
+    /* The pads whose mode word inverts their output / their input, one bit
+     * per pad, kept with mode[] by ipc_wrpin. */
+    uint32_t inv_out[2], inv_in[2];
     bool in_flag[NUM_PINS];
     /* The drive key of what embsim last published on each pad. */
     uint8_t pub_key[NUM_PINS];
@@ -242,15 +250,23 @@ static inline unsigned bank_of(unsigned pin)
     return pin / 4;
 }
 
+/* The level each pad of a bank drives: OUT, inverted where the pad's mode
+ * word sets O (embsim_boards::p2::pad_output_level). */
+static inline uint32_t out_level(unsigned half)
+{
+    return ib.out[half] ^ ib.inv_out[half];
+}
+
 /*
  * What a pad presents, as a key that is equal for two states exactly when
  * embsim's drive (embsim_boards::p2::BankSupplies::pad_drive) is equal for
  * them: 0 is released (DIR clear, a bank whose supply names no voltage, the
  * float mode, or a current-source mode, which the package does not map);
- * anything else is 1 + the impedance field the OUT bit selects + 4 when the
- * pad drives a voltage above 0 V (OUT high in a bank whose supply is not
- * 0 V). The field's four values are four distinct impedances, and a pad
- * driving high in a 0 V bank presents 0 V, as its low does.
+ * anything else is 1 + the impedance field the pad's output level selects
+ * + 4 when the pad drives a voltage above 0 V (its level high in a bank
+ * whose supply is not 0 V). The level is OUT, inverted by the word's O bit.
+ * The field's four values are four distinct impedances, and a pad driving
+ * high in a 0 V bank presents 0 V, as its low does.
  */
 static uint8_t drive_key(unsigned pin)
 {
@@ -263,7 +279,7 @@ static uint8_t drive_key(unsigned pin)
     if (!(ib.dir[pin >> 5] & bit) || !((ib.banks_powered >> bank) & 1)) {
         return 0;
     }
-    out = (ib.out[pin >> 5] & bit) != 0;
+    out = (out_level(pin >> 5) & bit) != 0;
     cfg = ib.mode[pin];
     field = (cfg & P_MODE_SELECT_MASK) ? 0
           : (cfg >> (out ? P_HIGH_SHIFT : P_LOW_SHIFT)) & 7;
@@ -273,11 +289,15 @@ static uint8_t drive_key(unsigned pin)
     return 1 + field + ((out && ((ib.banks_high >> bank) & 1)) ? 4 : 0);
 }
 
-/* What a bank reads: the guest's own OUT where the published drive is
- * strong, the net everywhere else. */
+/* What a bank reads: the level the guest's own output drives where the
+ * published drive is strong, the net everywhere else, inverted where the
+ * pad's mode word sets I (embsim_boards::p2::pad_input_level). */
 static uint32_t sensed(unsigned half)
 {
-    return (ib.strong[half] & ib.out[half]) | (~ib.strong[half] & ib.in_ext[half]);
+    uint32_t level = (ib.strong[half] & out_level(half)) |
+                     (~ib.strong[half] & ib.in_ext[half]);
+
+    return level ^ ib.inv_in[half];
 }
 
 /* Recompute the ORed DIR/OUT and the pads whose key moved. Whether a change
@@ -374,6 +394,19 @@ static void ipc_wrpin(void *o, unsigned pin, uint32_t cfg)
         ib.mode_changed |= 1ull << p;
     }
     ib.mode[p] = cfg;
+    {
+        uint32_t bit = 1u << (p & 31);
+        bool logic = !(cfg & P_MODE_SELECT_MASK);
+
+        ib.inv_out[p >> 5] &= ~bit;
+        ib.inv_in[p >> 5] &= ~bit;
+        if (logic && (cfg & P_INVERT_OUTPUT)) {
+            ib.inv_out[p >> 5] |= bit;
+        }
+        if (logic && (cfg & P_INVERT_IN)) {
+            ib.inv_in[p >> 5] |= bit;
+        }
+    }
     ib.in_flag[p] = cfg != 0;
     if (ib.dir[p >> 5] & (1u << (p & 31))) {
         unsigned cog = current_cpu ? cpu_env(current_cpu)->cogid : 0;
