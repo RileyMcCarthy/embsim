@@ -31,7 +31,10 @@
 //!   [`AM26LV32_ENABLE_THRESHOLDS`].
 //! - **The fail-safe** — §8.4.1: an open input pair, a 100 Ω terminated
 //!   one whose driver is off, and a shorted one each put the output high
-//!   (Table 8-1's "Open, shorted, or terminated" row). Each input is a port
+//!   (Table 8-1's "Open, shorted, or terminated" row); the shorted
+//!   fail-safe holds only with no external common-mode voltage applied, a
+//!   shorted input biased anywhere from −0.3 V to 5.5 V able to put the
+//!   outputs in an unwanted state (§8.4.1, item 3). Each input is a port
 //!   of its own (`NODES.md` §10), the open fail-safe's mechanism: `r_I`
 //!   12 kΩ typical (§6.5, [`AM26LV32_INPUT_OHMS`]) to the input's
 //!   open-circuit voltage, 0.83 V on an A input and 0.70 V on a B input,
@@ -58,15 +61,31 @@
 //!   draws is not characterised there ([`AM26LV32_SUPPLY_NOTE`]). The Edge
 //!   board runs `U25` from `SC_5V`, so it is raised there.
 //!
+//! # The band, and what the engine says about it
+//!
+//! Each `A` input declares its pair ([`AM26LV32_PAIRS`],
+//! [`embsim_board::DifferentialPair`]): its `B`, the ±200 mV band, and the
+//! fail-safe high the model gives a pair inside it
+//! ([`AM26LV32_FAIL_SAFE`]). The engine watches the four pairs and raises
+//! [`embsim_board::Finding::PairInBand`] once for a pair that spends time
+//! inside the band while a source other than the part's own input ports
+//! reaches it — a driver, a ground, a rail: Table 8-1's "?" with a
+//! common-mode voltage applied, where §8.4.1 promises no level. An open,
+//! shorted or idle-terminated pair, which only the part's ports reach,
+//! rests at their bias and raises nothing: that is the fail-safe the
+//! datasheet guarantees. A single-ended encoder on `A` with `B` at its
+//! ground reads its every low this way.
+//!
 //! # Deliberate simplifications
 //!
 //! - **Inside the ±200 mV band the output is high.** Table 8-1 calls a
 //!   driven pair inside the band indeterminate; the fail-safe of §8.4.1
 //!   makes the open, shorted and idle-terminated pairs — every pair that
 //!   rests inside it with no driver fighting the bias — high, and the model
-//!   reads every in-band pair as that. An input with no voltage (a clock,
-//!   which names no operating voltage, or a node measured against a ground
-//!   nothing holds) is read the same way.
+//!   reads every in-band pair as that, the engine reporting the driven
+//!   ones (above). An input with no voltage (a clock, which names no
+//!   operating voltage, or a node measured against a ground nothing holds)
+//!   is read the same way, and is not measured.
 //! - **The ports are declarations**, stamped once and never republished
 //!   (`NODES.md` §10): they hold the flat-band figure whatever the supply,
 //!   so the ports' fall below `V_CC` 1.6 V (Figure 9-2) and their unknown
@@ -79,14 +98,16 @@
 //!   0 V there, as the line driver and the isolators assume.
 //! - **Not modelled**: propagation delay (`t_PLH`/`t_PHL` 20 ns max, §6.6)
 //!   and skew, the enable and disable times, the common-mode input range
-//!   (−0.3 V to 5.5 V, §6.3), the output current limit (±25 mA absolute,
-//!   §6.1), supply current, ESD and thermals.
+//!   (−0.3 V to 5.5 V, §6.3) and the differential one (±5.8 V, §6.3), the
+//!   inputs' absolute maximum (−4 V to 8 V on an input, ±12 V across a
+//!   pair, §6.1), the output current limit (±25 mA absolute, §6.1), supply
+//!   current, ESD and thermals.
 
 use std::sync::{Arc, Mutex};
 
 use embsim_board::{
-    AttachError, Component, ComponentNetIo, DeadBand, DigitalReceiver, Drive, InputPort, Level,
-    Ohms, PinDecl, PinHandle, PinLimits, TheveninDrive, Thresholds, Volts,
+    AttachError, Component, ComponentNetIo, DeadBand, DifferentialPair, DigitalReceiver, Drive,
+    InputPort, Level, Ohms, PinDecl, PinHandle, PinLimits, TheveninDrive, Thresholds, Volts,
 };
 
 // ============================================================
@@ -102,6 +123,14 @@ pub const AM26LV32_ENABLE_THRESHOLDS: Thresholds =
 /// The differential thresholds' magnitude: `V_IT+` max +0.2 V, `V_IT−` min
 /// −0.2 V (SLLS202H §6.5).
 pub const AM26LV32_VID_THRESHOLD_VOLTS: Volts = 0.200;
+
+/// The level the model gives a pair whose difference is inside the
+/// ±[`AM26LV32_VID_THRESHOLD_VOLTS`] band, or whose input names no
+/// voltage: high, the fail-safe's (SLLS202H §8.4.1, Table 8-1's "Open,
+/// shorted, or terminated" row). Guaranteed only with no external
+/// common-mode voltage applied; the pair declarations
+/// ([`AM26LV32_PAIRS`]) let the engine report the other in-band pairs.
+pub const AM26LV32_FAIL_SAFE: Level = Level::High;
 
 /// `r_I`, the input resistance: 12 kΩ typical (SLLS202H §6.5; 7 kΩ
 /// minimum). Each input's own port.
@@ -191,6 +220,26 @@ const fn input(number: &'static str, name: &'static str, port: InputPort) -> Pin
         .with_name(name)
 }
 
+/// A channel's pair as its `A` input declares it: read against
+/// `inverting`, no level guaranteed inside ±200 mV (SLLS202H §6.5, Table
+/// 8-1), the fail-safe high there ([`AM26LV32_FAIL_SAFE`]).
+const fn pair(inverting: &'static str) -> DifferentialPair {
+    DifferentialPair {
+        inverting,
+        band: AM26LV32_VID_THRESHOLD_VOLTS,
+        fail_safe: AM26LV32_FAIL_SAFE,
+    }
+}
+
+/// The four pairs, as the `A` inputs declare them: `1A`/`1B`, `2A`/`2B`,
+/// `3A`/`3B`, `4A`/`4B` (Table 5-1).
+pub const AM26LV32_PAIRS: [DifferentialPair; 4] = [pair("1"), pair("7"), pair("9"), pair("15")];
+
+/// An `A` input: a differential input declaring its pair.
+const fn a_input(number: &'static str, name: &'static str, pair: DifferentialPair) -> PinDecl {
+    input(number, name, AM26LV32_A_PORT).with_pair(pair)
+}
+
 /// An enable, reading its thresholds against `GND`.
 const fn enable(number: &'static str, name: &'static str) -> PinDecl {
     PinDecl::digital_in(number, AM26LV32_ENABLE_THRESHOLDS)
@@ -208,19 +257,19 @@ const fn output(number: &'static str, name: &'static str) -> PinDecl {
 /// `GND`.
 pub const AM26LV32_PINS: [PinDecl; 16] = [
     input("1", "1B", AM26LV32_B_PORT),
-    input("2", "1A", AM26LV32_A_PORT),
+    a_input("2", "1A", AM26LV32_PAIRS[0]),
     output("3", "1Y"),
     enable("4", "G"),
     output("5", "2Y"),
-    input("6", "2A", AM26LV32_A_PORT),
+    a_input("6", "2A", AM26LV32_PAIRS[1]),
     input("7", "2B", AM26LV32_B_PORT),
     PinDecl::power_in("8").with_name("GND"),
     input("9", "3B", AM26LV32_B_PORT),
-    input("10", "3A", AM26LV32_A_PORT),
+    a_input("10", "3A", AM26LV32_PAIRS[2]),
     output("11", "3Y"),
     enable("12", "~G"),
     output("13", "4Y"),
-    input("14", "4A", AM26LV32_A_PORT),
+    a_input("14", "4A", AM26LV32_PAIRS[3]),
     input("15", "4B", AM26LV32_B_PORT),
     PinDecl::power_in("16")
         .with_reference("8")
@@ -288,7 +337,8 @@ fn port(level: Level, vcc: Volts) -> TheveninDrive {
 fn channel_level((a, b): (Option<Volts>, Option<Volts>)) -> Level {
     match (a, b) {
         (Some(a), Some(b)) if a - b <= -AM26LV32_VID_THRESHOLD_VOLTS => Level::Low,
-        _ => Level::High,
+        (Some(a), Some(b)) if a - b >= AM26LV32_VID_THRESHOLD_VOLTS => Level::High,
+        _ => AM26LV32_FAIL_SAFE,
     }
 }
 
@@ -434,8 +484,8 @@ mod tests {
     }
 
     /// Every pin of the 16-pin table, once; every channel's pins are two
-    /// analog inputs with their own ports and an output that rests
-    /// released.
+    /// analog inputs with their own ports, the `A` declaring the pair, and
+    /// an output that rests released.
     #[rstest]
     fn the_pin_table_is_figure_5_1() {
         let numbers: Vec<&str> = AM26LV32_PINS.iter().map(|pin| pin.number).collect();
@@ -447,9 +497,16 @@ mod tests {
                 .find(|pin| pin.number == number)
                 .expect("a pin of the table")
         };
-        for (a, b, y) in AM26LV32_CHANNELS {
+        for ((a, b, y), declared) in AM26LV32_CHANNELS.into_iter().zip(AM26LV32_PAIRS) {
             assert_eq!(pin(a).input, Some(AM26LV32_A_PORT), "{a}");
             assert_eq!(pin(b).input, Some(AM26LV32_B_PORT), "{b}");
+            // Each A declares its own B, the ±200 mV band and the
+            // fail-safe high; a B declares none.
+            assert_eq!(pin(a).pair, Some(declared), "{a}");
+            assert_eq!(declared.inverting, b, "{a}");
+            assert_eq!(declared.band, 0.2);
+            assert_eq!(declared.fail_safe, Level::High);
+            assert_eq!(pin(b).pair, None, "{b}");
             for input in [a, b] {
                 assert!(pin(input).thresholds.is_none() && !pin(input).can_source);
             }

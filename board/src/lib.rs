@@ -66,6 +66,7 @@ pub mod kind;
 mod limits;
 pub mod net;
 pub mod netlist;
+mod pairs;
 pub mod project;
 pub mod registry;
 pub mod report;
@@ -84,9 +85,9 @@ pub use cluster::{
 };
 pub use component::{
     jesd8c01_lvcmos_thresholds, AttachError, Branch, Clamp, ClampRail, Component, ComponentNetIo,
-    DeadBand, DigitalReceiver, Drive, InputPort, PeriodicSchedule, PeriodicSense, PinDecl,
-    PinHandle, PinLimits, PinRole, PwlCurve, RegionTest, ResistorAt, Sense, Thresholds, WakeGate,
-    WakeHandler,
+    DeadBand, DifferentialPair, DigitalReceiver, Drive, InputPort, PeriodicSchedule, PeriodicSense,
+    PinDecl, PinHandle, PinLimits, PinRole, PwlCurve, RegionTest, ResistorAt, Sense, Thresholds,
+    WakeGate, WakeHandler,
 };
 pub use diagnostics::{
     CallbackKind, Diagnostics, Finding, PinMismatchDirection, RailDownReason, SenseKind,

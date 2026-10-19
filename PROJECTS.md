@@ -1178,7 +1178,10 @@ each by its part number, and the mates and wires are checked once the
 boards build. The receiver runs from the carrier's 5 V, above the 3.6 V
 its datasheet recommends: its supply pin declares that range, the engine
 checks it against the solved net, and the build and the run report it
-(`PinAboveRecommended`). `board/tests/edge_project.rs` builds the file and
+(`PinAboveRecommended`). Each of the receiver's `A` inputs declares its
+pair, and a pair driven inside its ±200 mV band — a single-ended encoder's
+low on `J20` with the `-` leg grounded — is reported once
+(`PairInBand`, `NODES.md` §20). `board/tests/edge_project.rs` builds the file and
 holds the mates to the hand-written harnesses the machine tests use (every
 finger and every cable pin joined as they join it, every empty socket
 contact and the shield open); `board/tests/edge_project_live.rs` runs it,
@@ -2472,9 +2475,42 @@ parts and the same closures are one component:
 | Member | What it is | Its pins, as the machine's |
 |---|---|---|
 | `DRIVE` | `StepperMotor`, 8192 steps a millimetre, `DIR` low forward, enable active low, no load loss (`BenchMachine::build`'s conventions) | `STEP`, `DIR`, `ENA`, measured against `DRIVE_GND`, a return the assembly declares |
-| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, with its index and its complements (`Config::with_complements`): each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-`, against `ENC_GND`, another. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high (`board/tests/edge_encoder_pairs.rs`) |
+| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, its output stage the kind's `encoder_output` option (below): by default `rs422`, with its index and its complements (`Config::with_complements`), each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it; or `npn-open-collector`, the real machine's encoder, `A` and `B` open collectors with no index | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-` (`rs422`) or `ENC_A+`, `ENC_B+` (`npn-open-collector`), against `ENC_GND`, another. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high and the run reports (`PairInBand`; `board/tests/edge_encoder_pairs.rs`) |
 | `UPPER`, `LOWER` | `EndSwitch`, closing at 100 mm (`TRAVEL_MM`) and at 0 mm | each contact's `COM` and `NO`: `NO` is the loop's `+` to the carrier, and the machine's loop supply reaches `COM` (`MIGRATING-MAD.md` §6, "The loop supply") |
 | `LOAD_CELL` | MaD's own: `LoadCellBridge` and `BridgeDrive` (`MaDSim/src/system_description.rs`) | `E+`, `E-` sensed, `S+`, `S-` driven |
+
+**The encoder's output stage** is an option of its configuration
+(`quadrature_encoder::Config::with_output`, `OutputStage`, `NODES.md` §20):
+`PushPull` (the default), `Rs422` (`with_complements()`) and
+`NpnOpenCollector`, whose outputs sink to the encoder's ground while low and
+are released while high, with no pull-up of their own. A kind that builds
+an encoder exposes it as an option by the stages' names,
+`OutputStage::NAMES` (`push-pull`, `rs422`, `npn-open-collector`), and
+the pins it renames follow the stage: only `Rs422` has `-` legs. MaD's
+`mad-machine` takes `encoder_output`, `rs422` by default:
+
+```rust,ignore
+let stage = options
+    .choice("encoder_output", &OutputStage::NAMES)?
+    .and_then(OutputStage::from_name)
+    .unwrap_or(OutputStage::Rs422);
+let config = quadrature_encoder::Config::new(STEPS_PER_MM).with_output(stage);
+// rs422: the index and its pairs; npn-open-collector: A and B, no index.
+```
+
+On the Edge carrier as it is, an `npn-open-collector` encoder reads high at
+`P9` and `P10` at every count, and the run says why (`PairInBand` on
+`U25`'s first two pairs): `J20`'s `+` legs have no pull-up, so a released
+output rests at `U25`'s own bias, and a sinking one leaves its pair, the
+`-` leg on `EN_GND` through `JP2`/`JP3`, no difference. Reading it needs a
+pull-up on each `+` to the encoder's supply and each `-` held between the
+output's two levels, or an encoder with line-driver outputs
+(`board/tests/encoder_output_stages.rs` counts one so). The pull-up's rail
+must keep `U25`'s inputs inside their ratings — SLLS202H §6.3: −0.3 V to
+5.5 V common mode, ±5.8 V across a pair; §6.1, absolute: −4 V to 8 V on an
+input, ±12 V across a pair — which the encoder on 5 V does and a pull-up
+straight to its 12 V or 24 V does not (each leg would need a divider or a
+clamp); the `am26lv32` model checks neither range.
 
 The gantry, the sample and the strain gauge have no pins: they are the
 link from the shaft to the load cell, MaD's code moved into the kind

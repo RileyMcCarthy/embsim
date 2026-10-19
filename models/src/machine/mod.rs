@@ -60,7 +60,9 @@ pub mod quadrature_encoder;
 pub mod stepper_motor;
 
 pub use end_switch::{ActuationSense, BounceConfig, EndSwitch, EndSwitchActuator};
-pub use quadrature_encoder::{ChannelOrder, EncoderInput, IndexConfig, QuadratureEncoder};
+pub use quadrature_encoder::{
+    ChannelOrder, EncoderInput, IndexConfig, OutputStage, QuadratureEncoder,
+};
 pub use stepper_motor::{MotorShaft, StepEdge, StepperMotor};
 
 use std::fmt;

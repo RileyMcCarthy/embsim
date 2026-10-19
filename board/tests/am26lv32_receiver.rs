@@ -23,7 +23,7 @@ use embsim_board::{
 };
 use embsim_boards::catalog::StandardCatalog;
 use embsim_core::virtual_clock::{self, ClockMode};
-use embsim_models::am26lv32::AM26LV32_SUPPLY_NOTE;
+use embsim_models::am26lv32::{AM26LV32_SUPPLY_NOTE, AM26LV32_VID_THRESHOLD_VOLTS};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
@@ -121,12 +121,26 @@ fn ep(endpoint: &str) -> EndpointRef {
 }
 
 fn system(loaded: bool, vcc: Volts, held: &[(&str, Volts)]) -> System {
+    system_shorted(loaded, vcc, held, &[])
+}
+
+/// [`system`], with the scenario also shorting each pair of `U1` pins in
+/// `shorts` (by number) to each other.
+fn system_shorted(
+    loaded: bool,
+    vcc: Volts,
+    held: &[(&str, Volts)],
+    shorts: &[(&str, &str)],
+) -> System {
     let parsed = netlist::parse(&netlist_text(loaded)).expect("the bench netlist parses");
     let board = Board::from_netlist(parsed, &StandardCatalog::base_registry())
         .expect("the catalog places the receiver by its number");
     let mut scenario = Scenario::default().net_stuck("B.GND", 0.0);
     for (net, volts) in held {
         scenario = scenario.net_stuck(&format!("B.{net}"), *volts);
+    }
+    for (a, b) in shorts {
+        scenario = scenario.pin_short(&format!("B.U1.{a}"), &format!("B.U1.{b}"));
     }
     System::new()
         .board("B", board)
@@ -143,12 +157,15 @@ fn run(
     held: &[(&str, Volts)],
     read: &[&str],
 ) -> (Vec<NetState>, Vec<Finding>) {
+    run_system(system(loaded, vcc, held), read)
+}
+
+/// Start `system`, settle it, and return each named net's state at rest,
+/// with the findings the run made.
+fn run_system(system: System, read: &[&str]) -> (Vec<NetState>, Vec<Finding>) {
     let _lock = suite_lock();
     virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
-    let system = system(loaded, vcc, held)
-        .hold_time()
-        .start()
-        .expect("the bench starts");
+    let system = system.hold_time().start().expect("the bench starts");
     let actor = virtual_clock::register_actor("am26lv32-receiver-case");
     system.release_time();
     virtual_clock::wait_virtual_ns(SETTLE_NS);
@@ -385,5 +402,96 @@ fn the_am26lv32s_declared_supply_range_is_checked_by_the_engine(
         } else {
             assert!(reported.is_empty(), "{path}: {findings:?}");
         }
+    }
+}
+
+fn pair_findings(findings: &[Finding]) -> Vec<&Finding> {
+    findings
+        .iter()
+        .filter(|finding| matches!(finding, Finding::PairInBand { .. }))
+        .collect()
+}
+
+/// Channel 1's pair inside the band with a common-mode voltage applied:
+/// the scenario holds `1A` 0.1 V above `1B`, at 1.05 V between them.
+const IN_BAND_HELD: [(&str, Volts); 4] = [("G", 3.3), ("NG", 3.3), ("1A", 1.1), ("1B", 1.0)];
+
+#[rstest]
+#[case::held_in_band(&IN_BAND_HELD, &[], true)]
+#[case::held_shorted(&[("G", 3.3), ("NG", 3.3), ("1A", 1.5), ("1B", 1.5)], &[], true)]
+#[case::open(&[("G", 3.3), ("NG", 3.3)], &[], false)]
+#[case::shorted_to_itself(&[("G", 3.3), ("NG", 3.3)], &[("2", "1")], false)]
+#[case::valid(&ENABLED_ONE_HIGH_TWO_LOW, &[], false)]
+fn the_engine_reports_an_am26lv32_pair_read_inside_its_band_with_a_common_mode_applied(
+    #[case] held: &[(&str, Volts)],
+    #[case] shorts: &[(&str, &str)],
+    #[case] reported: bool,
+) {
+    behaviour!(Test {
+        id: "am26lv32.pair-in-band-reported",
+        covers: Some("models/src/am26lv32.rs#AM26LV32_PAIRS"),
+        given: "an enabled AM26LV32 from the catalog, its first pair held 0.1 volts apart or \
+                at one voltage by the bench, shorted to itself, left open, or held a volt apart",
+    });
+    expect!(
+        "held-in-band-reported",
+        "a pair the bench holds inside the 0.2 volt band is reported once at build and once \
+         live, with its difference, common-mode voltage and fail-safe high",
+        "SLLS202H Table 8-1 gives a pair inside the band no level, and its fail-safe holds \
+         only with no external common-mode voltage applied (section 8.4.1)"
+    );
+    expect!(
+        "own-bias-silent",
+        "an open pair, a pair shorted to itself and a pair a volt apart are not reported",
+        "an open or shorted pair rests at the part's own input bias, the fail-safe the \
+         datasheet guarantees"
+    );
+    expect!(
+        "output-unchanged",
+        "channel 1's output reads high in every case",
+        "the model gives a pair inside the band its fail-safe high"
+    );
+    let built = {
+        let _lock = suite_lock();
+        system_shorted(false, 3.3, held, shorts)
+            .build()
+            .expect("the bench builds")
+    };
+    let (states, live) = run_system(system_shorted(false, 3.3, held, shorts), &["1Y"]);
+    assert_eq!(states[0], NetState::Driven(Level::High), "1Y");
+    for (path, findings) in [
+        ("build", built.diagnostics().findings().to_vec()),
+        ("live", live),
+    ] {
+        let found = pair_findings(&findings);
+        if !reported {
+            assert!(found.is_empty(), "{path}: {found:?}");
+            continue;
+        }
+        let [Finding::PairInBand {
+            part,
+            pin,
+            inverting,
+            volts,
+            common_mode,
+            band,
+            output,
+        }] = found.as_slice()
+        else {
+            panic!("{path}: one finding, not {found:?}");
+        };
+        let (a, b) = (held[2].1, held[3].1);
+        assert_eq!(
+            (part.as_str(), pin.as_str(), inverting.as_str()),
+            ("B.U1", "2", "1"),
+            "{path}"
+        );
+        assert!((volts - (a - b)).abs() < 1e-9, "{path}: {volts}");
+        assert!(
+            (common_mode - (a + b) / 2.0).abs() < 1e-9,
+            "{path}: {common_mode}"
+        );
+        assert_eq!(*band, AM26LV32_VID_THRESHOLD_VOLTS, "{path}");
+        assert_eq!(*output, Level::High, "{path}");
     }
 }

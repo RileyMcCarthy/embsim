@@ -9,12 +9,16 @@
 //! `U25` (an AM26LV32, TI SLLS202H) feeds the isolator `IC16`, whose outputs
 //! are `P9`, `P10` and `P11` on the module's fingers.
 //!
-//! The encoder is `embsim_models::machine::QuadratureEncoder`: with its
-//! complements, the pair MaD's machine presents, read by the receiver as a
-//! valid differential each way; without them, single-ended on the `+` legs
-//! with the jumpers closed, each low has no differential and reads as the
-//! receiver's fail-safe high (SLLS202H §8.4.1, Table 8-1), which is why
-//! `MIGRATING-MAD.md` §4 wires the pairs.
+//! The encoder is `embsim_models::machine::QuadratureEncoder`: as an RS-422
+//! line driver, the pairs MaD's machine file presents, read by the receiver
+//! as a valid differential each way; single-ended on the `+` legs with the
+//! jumpers closed — push-pull, or the NPN open collector the user's machine
+//! has (a Taiss 600 P/R optical encoder: A and B, no complements, no index)
+//! — each low has no differential, which the receiver reads as its
+//! fail-safe high (SLLS202H §8.4.1, Table 8-1) and the engine reports as
+//! read inside its band (`Finding::PairInBand`). That is why
+//! `MIGRATING-MAD.md` §4 wires the pairs, and §6 says what the board would
+//! need to read the open collector.
 //!
 //! Stepped (`TESTING.md` rule 9), its own binary: a suite lock, the clock
 //! stepped before the project builds the converter (its protocol thread
@@ -36,7 +40,7 @@ use embsim_boards::p2::P2_RESTART_DELAY_NS;
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::ads122u04_component::PUMP_POLL_VIRTUAL_US;
 use embsim_models::machine::quadrature_encoder::Config as EncoderConfig;
-use embsim_models::machine::{IndexConfig, QuadratureEncoder};
+use embsim_models::machine::{IndexConfig, OutputStage, QuadratureEncoder};
 use embsim_models::oscillator::TG2520SMN_START_UP_NS;
 use embsim_models::rail::AP62301_SOFT_START_NS;
 use rstest::rstest;
@@ -84,12 +88,17 @@ const INDEX: IndexConfig = IndexConfig {
 const WALK: [i64; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 8, 7, 0, -1, -9];
 
 /// How an encoder sits on `J20`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Wiring {
     /// Each channel a pair, `JP2`, `JP3` and `JP5` open.
     Pairs,
-    /// Each channel on its `+` leg, `JP2`, `JP3` and `JP5` closed.
+    /// Each channel push-pull on its `+` leg, `JP2`, `JP3` and `JP5`
+    /// closed.
     SingleEnded,
+    /// `A` and `B` NPN open collectors on their `+` legs and no index, as
+    /// the user's Taiss encoder is: `JP2` and `JP3` closed, `JP5` open,
+    /// nothing on `ZI±`.
+    OpenCollector,
 }
 
 /// A running Edge project with an encoder on `J20`.
@@ -116,32 +125,39 @@ impl Rig {
         ]
         .iter()
         .collect();
-        let mut config = EncoderConfig::new(1.0).with_index(INDEX);
-        if matches!(wiring, Wiring::Pairs) {
-            config = config.with_complements();
-        }
+        let config = match wiring {
+            Wiring::Pairs => EncoderConfig::new(1.0).with_index(INDEX).with_complements(),
+            Wiring::SingleEnded => EncoderConfig::new(1.0).with_index(INDEX),
+            Wiring::OpenCollector => {
+                EncoderConfig::new(1.0).with_output(OutputStage::NpnOpenCollector)
+            }
+        };
         let encoder = QuadratureEncoder::new(config).expect("a valid encoder");
         let input = encoder.input();
         let ep = |endpoint: &str| EndpointRef::parse(endpoint).expect("endpoint parses");
         let mut harness = Harness::new()
             .connect(ep("ENC.A"), ep("EDGE.J20.1"))
-            .connect(ep("ENC.B"), ep("EDGE.J20.3"))
-            .connect(ep("ENC.Z"), ep("EDGE.J20.9"));
+            .connect(ep("ENC.B"), ep("EDGE.J20.3"));
+        if wiring != Wiring::OpenCollector {
+            harness = harness.connect(ep("ENC.Z"), ep("EDGE.J20.9"));
+        }
         // `JP4` asserts `U25`'s active-low enable either way.
         let mut scenario = Scenario::default().jumper("EDGE.JP4", JumperState::Closed);
-        let legs = match wiring {
+        let (legs, index_leg) = match wiring {
             Wiring::Pairs => {
                 harness = harness
                     .connect(ep("ENC.A-"), ep("EDGE.J20.2"))
                     .connect(ep("ENC.B-"), ep("EDGE.J20.4"))
                     .connect(ep("ENC.Z-"), ep("EDGE.J20.10"));
-                JumperState::Open
+                (JumperState::Open, JumperState::Open)
             }
-            Wiring::SingleEnded => JumperState::Closed,
+            Wiring::SingleEnded => (JumperState::Closed, JumperState::Closed),
+            Wiring::OpenCollector => (JumperState::Closed, JumperState::Open),
         };
-        for jumper in ["EDGE.JP2", "EDGE.JP3", "EDGE.JP5"] {
+        for jumper in ["EDGE.JP2", "EDGE.JP3"] {
             scenario = scenario.jumper(jumper, legs);
         }
+        scenario = scenario.jumper("EDGE.JP5", index_leg);
         let system = Project::load(&path)
             .expect("the project loads")
             .instantiate(&StandardCatalog)
@@ -194,12 +210,12 @@ impl Rig {
         )
     }
 
-    fn finish(mut self) {
+    /// End the case; the findings the run made.
+    fn finish(mut self) -> Vec<Finding> {
         drop(self.actor.take());
-        let stalled: Vec<Finding> = self
-            .system
-            .findings()
-            .into_iter()
+        let findings = self.system.findings();
+        let stalled: Vec<&Finding> = findings
+            .iter()
             .filter(|finding| matches!(finding, Finding::QuiescenceTimeout { .. }))
             .collect();
         assert!(
@@ -216,7 +232,35 @@ impl Rig {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        findings
     }
+}
+
+/// `U25`'s pairs the run reported as read inside their band, as `(pin,
+/// inverting)`, each with the fail-safe high it took.
+fn u25_pairs_reported(findings: &[Finding]) -> Vec<(String, String)> {
+    findings
+        .iter()
+        .filter_map(|finding| match finding {
+            Finding::PairInBand {
+                part,
+                pin,
+                inverting,
+                output,
+                ..
+            } => {
+                assert_eq!(part, "EDGE.U25", "{finding}");
+                assert_eq!(*output, Level::High, "{finding}");
+                Some((pin.clone(), inverting.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `U25` pair by its inputs' numbers.
+fn pair(pin: &str, inverting: &str) -> (String, String) {
+    (pin.to_string(), inverting.to_string())
 }
 
 #[rstest]
@@ -241,6 +285,12 @@ fn an_rs422_encoders_pairs_count_at_the_modules_encoder_pins() {
         "index-on-p11",
         "the module's P11 reads the encoder's index, high at the count where it fires and low \
          elsewhere"
+    );
+    expect!(
+        "nothing-reported",
+        "no pair of the line receiver is reported as read inside its band",
+        "a pair's two legs change at one instant, so the receiver spends no time between \
+         them"
     );
     let mut rig = Rig::start(Wiring::Pairs);
     let encoder = rig.encoder.clone();
@@ -271,7 +321,8 @@ fn an_rs422_encoders_pairs_count_at_the_modules_encoder_pins() {
     assert_eq!(rig.pins().2, Level::Low);
     rig.walk_to(-8);
     assert_eq!(rig.pins().2, Level::High, "the index at count -8");
-    rig.finish();
+    let findings = rig.finish();
+    assert!(u25_pairs_reported(&findings).is_empty(), "{findings:?}");
 }
 
 #[rstest]
@@ -291,6 +342,11 @@ fn a_single_ended_encoder_reads_high_at_the_modules_encoder_pins() {
          answers an input with no valid level with its fail-safe high (SLLS202H section \
          8.4.1, Table 8-1)"
     );
+    expect!(
+        "pairs-reported",
+        "the run reports each of the line receiver's three wired pairs once as read inside \
+         its band, with the high its output took"
+    );
     let mut rig = Rig::start(Wiring::SingleEnded);
     let high = (Level::High, Level::High, Level::High);
     assert_eq!(rig.pins(), high, "at count 0, A and B low");
@@ -298,5 +354,55 @@ fn a_single_ended_encoder_reads_high_at_the_modules_encoder_pins() {
         rig.walk_to(count);
         assert_eq!(rig.pins(), high, "at count {count}");
     }
-    rig.finish();
+    let findings = rig.finish();
+    assert_eq!(
+        u25_pairs_reported(&findings),
+        [pair("2", "1"), pair("6", "7"), pair("10", "9")],
+        "{findings:?}"
+    );
+}
+
+#[rstest]
+fn an_open_collector_encoder_reads_high_at_the_modules_encoder_pins_and_is_reported() {
+    behaviour!(Test {
+        id: "edge.open-collector-encoder-fails-safe",
+        covers: Some("models/src/machine/quadrature_encoder.rs#OutputStage::NpnOpenCollector"),
+        given: "the MaD machine's three boards as a project, an encoder's NPN open-collector A \
+                and B on the positive legs of the carrier's encoder connector, its ground \
+                jumpers closed on the negative legs, walked through two quadrature cycles",
+    });
+    expect!(
+        "stuck-high",
+        "the module's P9 and P10 read high at every count",
+        "the carrier has no pull-up on the positive legs: a released output rests at the \
+         receiver's own input bias, a valid high against the grounded negative leg, and a \
+         sinking one leaves the pair no difference, which the AM26LV32 reads as its fail-safe \
+         high"
+    );
+    expect!(
+        "pairs-reported",
+        "the run reports the line receiver's A and B pairs once each as read inside the band \
+         with a common-mode voltage applied, their outputs high",
+        "SLLS202H guarantees no level for a pair inside 0.2 volts with an external \
+         common-mode voltage applied (Table 8-1, section 8.4.1)"
+    );
+    expect!(
+        "open-pairs-silent",
+        "the line receiver's index pair and its unused fourth pair are not reported",
+        "a pair nothing drives rests at the receiver's own bias, its guaranteed fail-safe"
+    );
+    let mut rig = Rig::start(Wiring::OpenCollector);
+    let high = (Level::High, Level::High);
+    let ab = |rig: &Rig| (rig.pins().0, rig.pins().1);
+    assert_eq!(ab(&rig), high, "at count 0, A and B low");
+    for count in 1..=9 {
+        rig.walk_to(count);
+        assert_eq!(ab(&rig), high, "at count {count}");
+    }
+    let findings = rig.finish();
+    assert_eq!(
+        u25_pairs_reported(&findings),
+        [pair("2", "1"), pair("6", "7")],
+        "{findings:?}"
+    );
 }

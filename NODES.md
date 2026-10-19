@@ -307,6 +307,7 @@ pub struct PinDecl {
     pub reference: Option<&'static str>, // the pin its voltages are measured against
     pub supply: Option<&'static str>,    // the pin its relative thresholds scale with
     pub limits: Option<PinLimits>,       // { recommended, absolute_max, note }: the engine checks them (PinAboveRecommended)
+    pub pair: Option<DifferentialPair>,  // { inverting, band, fail_safe }: the engine watches it (PairInBand, §20)
     pub can_source: bool,                // what a publish is checked against, and the open-drain lint;
     pub can_sink: bool,                  //   neither = an input (a sense)
 }
@@ -315,7 +316,7 @@ impl PinDecl {
     // analog(n) — a reader —, analog_source(n), power_in(n), power_out(n),
     // passive(n); with_idle / with_impedance / with_thresholds / with_reference /
     // with_supply / with_input / with_clamps / with_capacitance_pf / with_limits /
-    // sink_only.
+    // with_pair / sink_only.
 }
 
 /// A nonlinear element is a branch between two of the part's pins, with an
@@ -908,7 +909,7 @@ And: **no wall clock reaches a slice** — the parked vCPU thread parks before i
 
 **Open.**
 
-- An encoder whose legs are not complementary (an open-collector pair, a common-mode offset, a broken leg): a fault scenario would want one.
+- An encoder whose legs are not complementary (an open-collector pair, a common-mode offset, a broken leg): a fault scenario would want one. *The open collector is built, §20: an output stage of the configuration, not a fault; a common-mode offset and a broken leg stay open.*
 
 ## 18. Decision record: the host the board's clock meters, E4 withdrawn (2026-10-09)
 
@@ -1055,3 +1056,54 @@ The record this branch first wrote rejected CDP virtual time because "it covers 
 - ~~A Chrome the node launched survives a SIGKILL of embsim.~~ *Done on Linux.* The child is a supervisor in its own group. `PR_SET_PDEATHSIG` delivers SIGTERM when embsim dies, including under SIGKILL, and the supervisor kills the group and removes the profile (`cdp/src/bin/parent_death_probe.rs`, `cdp/src/chrome.rs` `arm_parent_death`). `embsim run` already ends on the first SIGINT or SIGTERM (`cli/src/signals.rs`), and Drop then stops the group. macOS has no parent-death signal, so a SIGKILL there can leave Chrome.
 - A hidden page costs host time a slice (E11); a harness that keeps one window per page avoids it.
 - A worker that reads the port's stream through `pipeTo` or a transform is not seen by the probe; the barrier turns off for its page after three waits that ran out.
+
+## 20. Decision record: the encoder's output stage, and a pair read inside its band (E8, 2026-10-18)
+
+*Built 2026-10-18 on `feat/encoder-output-stage`. The models are `embsim_models::machine::QuadratureEncoder` (`OutputStage`) and `embsim_models::am26lv32` (`AM26LV32_PAIRS`); the declaration and the check are `embsim_board::DifferentialPair`, `PinDecl::with_pair` and `Finding::PairInBand` (`board/src/pairs.rs`, `Resolver::reached_beyond`). It answers `MIGRATING-MAD.md` §2's E8. Decided by the user on 2026-10-18/19: the encoder's output stage is an option, the RS-422 line driver by default (what `J20` and `U25` are designed for, so the e2e keeps counting), the NPN open collector for the machine's real encoder, which on today's Edge board leaves `P9`/`P10` stuck, and a finding says why.*
+
+**What was wrong.**
+
+1. The machine's encoder is a Taiss 600 P/R incremental optical encoder (Amazon B07MX1SYXB): A and B, an NPN open collector each, a 5–24 V supply, no complements, no index (read: the listing, as the user relayed it). `QuadratureEncoder` had push-pull outputs, or a push-pull line driver (§17); neither is that encoder, whose high is whatever the board pulls it to.
+2. The `am26lv32` read every pair inside ±200 mV as its fail-safe high, and said nothing. SLLS202H guarantees that high for an open, shorted or idle-terminated pair (Table 8-1's last row, §8.4.1), and only with no external common-mode voltage applied: a shorted input biased anywhere from −0.3 V to 5.5 V can put the outputs in an unwanted state (§8.4.1, item 3); Table 8-1 gives a pair between −0.2 V and 0.2 V "?" (read: SLLS202H p. 11). A single-ended encoder on the Edge carrier's `J20`, `JP2`/`JP3` grounding the `-` legs, puts every low there, and the board read high with no word of why.
+
+**What was chosen.**
+
+1. **`quadrature_encoder::OutputStage`, on `Config::output`.** `PushPull` (the default, as before), `Rs422` (what `with_complements()` makes; `Config::complements` is gone, a field for one stage that could disagree with `output`), and `NpnOpenCollector`. The open collector declares `A`, `B` (and `Z` with an index) `sink_only()`, resting released; while its phase is low it publishes `Drive::Thevenin { 0 V, drive_impedance_ohms }`, while high it releases the pin, at the instant the count changes, as every stage publishes. It has no pull-up of its own: none is named. A kind exposes the stage by `OutputStage::NAMES` (`push-pull`, `rs422`, `npn-open-collector`).
+2. **A pair is declared on its non-inverting input**: `PinDecl::with_pair(DifferentialPair { inverting, band, fail_safe })`, renamed with the part by an `Assembly`, validated at build (the inverting pin declared and not the pin itself, the band finite and positive). The `am26lv32` declares its four, ±200 mV, fail-safe high (`AM26LV32_FAIL_SAFE`, which its own `channel_level` uses, so the declaration and the model say one thing).
+3. **The engine watches it, as it watches `PinLimits`** (§11, `board/src/limits.rs`): the part declares, the engine checks. `System::build` observes each pair over its settled snapshot; the live engine observes it on every pass that moves either input or their reference, found by search over the nets pairs read (`pair_nets`).
+4. **Common mode applied.** A pair inside its band is reported only when a source other than the part's own input ports reaches either input: a Thevenin or periodic drive on any other slot (another part's port included), or a terminal that holds a voltage or an unmodelled rail, through rule 2's resistive reach (`Resolver::reached_beyond`). A pair only the part's ports reach rests at their bias, the fail-safe the datasheet guarantees, and raises nothing: `U25`'s fourth pair is unconnected on the Edge board (read: `mad_edge.net`, `unconnected-(U25-4A-Pad14)`), and an open Edge board with no encoder raises nothing new.
+5. **Spends time.** An observation inside the band is held and judged as the engine's clock is about to advance; one that leaves the band before then is dropped. The line driver publishes a pair's two legs at one instant and the engine applies them one after the other, so between them the pair reads 0 V (measured: judging at the pass instead reported the line driver's pairs on a 102-step train, `encoder_output_stages.rs`'s `rs422` case failing on that mutation; restored). So a pair that enters its band at the run's last instant, or while the clock never moves again, is never judged, and the findings read then do not name it. Judging when the findings are read, from another thread at any point in an instant, would bring back the line driver's half-applied pair, and after shutdown nothing reads them.
+6. **Once per pair.** The first reading that spends time in the band with a common mode applied is reported — the difference, the common mode against the inputs' reference, the band, the fail-safe output — and the watch is then done.
+
+**DESIGN.md §5.**
+
+1. *Projection or closed form armed at an instant?* Yes: a subtraction on the passes that move a pair, a reachability walk over the pair's clusters at the instant the clock advances, nothing integrated. The open collector is a Thevenin sink or a release.
+2. *Every number named?* Yes: the band and the fail-safe are SLLS202H's (§6.5, §8.4.1); the open collector's sink impedance is the configuration's `drive_impedance_ohms`, by default embsim's stated 25 Ω bench default (`DEFAULT_PUSH_PULL_IMPEDANCE`), since the Taiss listing gives no saturation voltage or sink current; no pull-up and no supply is invented.
+3. *One interface?* Yes: one more static fact on `PinDecl`, as `limits` was, and a finding the engine raises; the encoder's drives are `Drive::Thevenin` and a release. No new message and no second channel; rule 2's list of declarations gains one, its shape unchanged.
+4. *Fast path free?* A board with no pair declared checks one empty list a pass. A board with pairs pays a search of `pair_nets` for each net a pass moves (`check_limits` already walks its watches the same way), a subtraction for a pair that moved, and the reachability walk only for a pair still in its band as the clock advances and not yet reported — a silent one, resting at its own bias, again each time its nets move (inferred from the code). On `edge_encoder_pairs.rs`'s three runs the live engine observed a pair 79, 14 and 11 times and walked 1, 4 and 4 times over 127, 54 and 54 clock advances (`rs422`, push-pull, open collector; measured with a temporary count, not kept); wall time was not compared, each run taking about 0.1 s. The ROM boot's board declares no pair.
+5. *One pipeline?* Yes: the same encoder model, an option of its configuration; the same receiver kind.
+6. *Observable, goldens unchanged?* The tests below; no golden includes a pair (the determinism goldens are byte-identical).
+
+**Alternatives.**
+
+- *The receiver reporting its own in-band read.* Not taken: a path to the findings bus beside the engine's, and the model cannot tell an open pair from a driven one from its two voltages without a test on the numbers (0.83 V and 0.70 V exactly), which a driven pair can meet. Reachability is the engine's fact.
+- *Report each excursion, as `PinAboveRecommended` does.* Not taken: an encoder's every low would be one, each voltage a new line.
+- *Report at the pass that sees the band.* Refused by measurement (5).
+- *A pull-up inside the open-collector stage.* Refused: nothing names one (`DESIGN.md` rule 6).
+- *Change the receiver's in-band output.* Not taken: Table 8-1 says "?", and the model keeps the fail-safe high it had; the finding is the report.
+
+**Proof.**
+
+- `board/tests/encoder_output_stages.rs`, stepped: each stage's levels and impedance at both phases against a probe's 10 kΩ to 1 V (5 V and 0 V behind 47 Ω; the line driver's `-` legs the inverse; the open collector 0 V behind 47 Ω, and the probe's own 1 V while high); the open collector into an inverter with and without 4.7 kΩ pull-ups (pulled high, or floating with the build's `OpenDrainWithoutPullUp` on `ENC.A` and `ENC.B`); into an AM26LV32 with its `-` inputs grounded, both outputs high at every count and pairs `2`/`1` and `6`/`7` reported once each, the open pairs silent; with the pull-ups to 5 V and the `-` inputs at 2.5 V from two 10 kΩ, the receiver reading the encoder's A and B at every count, forward and back through zero, nothing reported; and a 102-step train carried as a rate through every stage, the count 102, the receiver's outputs that count's levels, one change a count, nothing reported.
+- `board/tests/am26lv32_receiver.rs`: a pair the bench holds 0.1 V apart, or at one voltage, reported once at build and once live with its difference and common mode; open, shorted to itself and a volt apart, silent; the output high every time.
+- `board/tests/edge_encoder_pairs.rs`, on `boards/projects/edge-ec32-ds2.toml`: the open collector, `A` and `B`, no index, `JP2`/`JP3` closed and `JP5` open: `P9` and `P10` high at every count, `U25`'s pairs `2`/`1` and `6`/`7` reported and no other; the push-pull single-ended case reports its three wired pairs; the line driver's pairs count and nothing is reported.
+- `board/tests/pair_watch.rs`, the engine alone: a part declaring a pair and nothing else, on a scripted bench. A pair moved to 0.1 V apart, then 0.05 V, a volt and 0 V is reported once, with its first reading in the band (the once-per-pair rule, which `Diagnostics`' dedupe alone would not hold); a pair held 0.1 V apart against a ground nothing holds is silent at build and reported once the ground is held at 0.25 V, its common mode 0.8 V, with neither input moving (the reference watched).
+- `board/tests/edge_project_live.rs`: `edge-ec32-ds2.toml` as it stands, nothing on `J20` and its jumpers open, raises no `PairInBand` (item 4's open board).
+- `board/tests/pin_declarations.rs`: a pair against a pin the part does not have, against itself, or with a band of zero or no number, refused by both routes, naming the pin. `board/src/assembly.rs`: a member's pair renamed onto the assembly's pins.
+- The models' unit tests: each stage's port at both levels, the open collector's declarations, the stage names, `with_complements()` the line driver; the `am26lv32`'s pin table declaring its four pairs. `board/src/diagnostics.rs`: the finding in plain words.
+
+**Open.**
+
+- A common-mode offset and a broken leg, as faults (§17's open item, the open collector taken from it).
+- The open collector's saturation voltage and leakage, and the encoder's supply pin (its red wire): no figure, and `J20` has no supply pin.
+- MaD's: `mad-machine`'s `encoder_output` option (`MIGRATING-MAD.md` §3), and the carrier change that would read the real encoder — a pull-up on each `+` to the encoder's supply and each `-` leg held between the output's levels, the rail keeping `U25`'s inputs inside SLLS202H §6.3's −0.3 V to 5.5 V common mode and ±5.8 V differential and §6.1's −4 V to 8 V absolute (the encoder on 5 V, or a divider or clamp on each leg from 12–24 V) — or an encoder with line-driver outputs (§6). Not yet checked on the machine. The `am26lv32` declares no limits on its inputs, so embsim does not check those ranges.
