@@ -843,8 +843,27 @@ impl LiveEdgeFault {
     /// The window covers the drive about to be applied: `seen` has not yet
     /// counted it.
     fn window_open(&self) -> bool {
+        self.covers_edge(self.seen)
+    }
+
+    /// The window covers the matching drive with this zero-based index.
+    fn covers_edge(&self, edge: u64) -> bool {
         let end = self.after_edges.saturating_add(self.edge_count);
-        self.seen >= self.after_edges && self.seen < end
+        edge >= self.after_edges && edge < end
+    }
+
+    /// The stuck or contending source is held: the matching drive in effect
+    /// — the last one counted — was covered by the window. The source turns
+    /// on with the first covered drive and off with the first drive after
+    /// the window, the same edges suppression starts and stops on, so a
+    /// stuck source never fights the drive it replaces and never leaves the
+    /// hidden pin's net floating. Before any matching drive, a window that
+    /// opens at edge zero already holds the idle net.
+    fn source_held(&self) -> bool {
+        match self.seen.checked_sub(1) {
+            Some(last) => self.covers_edge(last),
+            None => self.window_open(),
+        }
     }
 
     /// A pin target counts that pin. A net target counts every drive on its net.
@@ -5409,9 +5428,11 @@ impl EngineCore {
     /// The log records the drive the component asked for. A level fault
     /// whose window is open may publish a different one: float and stuck
     /// hide the drives they count, contention leaves them. The window is
-    /// read before the drive counts, the terminals are synced to that
-    /// window, the drive counts, and the terminals are synced again so a
-    /// window that just closed releases its source on this same edge.
+    /// read before the drive counts; then the drive counts and the
+    /// terminals are synced to it, and the edge resolves once. A stuck
+    /// source therefore turns on in the same pass that first hides the pin
+    /// and off in the same pass that next publishes it: no intermediate
+    /// state where both drive the net, or neither does.
     fn apply_drive(&mut self, seq: u64, endpoint: EndpointId, drive: Option<Drive>) {
         debug_assert_eq!(seq, self.next_drive_seq, "drives apply in sequence");
         self.next_drive_seq += 1;
@@ -5430,14 +5451,11 @@ impl EngineCore {
             }
         }
         dirty |= self.resolver.set_drive(endpoint, effective);
-        let synced = self.sync_edge_terminals();
-        if dirty || synced {
-            self.resolve_and_publish_dirty();
-        }
         if let Some(net) = net {
             self.tick_edge_faults(endpoint, net);
         }
-        if self.sync_edge_terminals() {
+        dirty |= self.sync_edge_terminals();
+        if dirty {
             self.resolve_and_publish_dirty();
         }
         self.arm_finite_train(endpoint);
@@ -5470,8 +5488,9 @@ impl EngineCore {
         dirty
     }
 
-    /// Hold each stuck or contending terminal at its window's voltage, and
-    /// release it outside the window. A float has no terminal.
+    /// Hold each stuck or contending terminal at its window's voltage while
+    /// the drive in effect is a covered one ([`LiveEdgeFault::source_held`]),
+    /// and release it otherwise. A float has no terminal.
     fn sync_edge_terminals(&mut self) -> bool {
         let mut dirty = false;
         for index in 0..self.edge_faults.len() {
@@ -5479,7 +5498,7 @@ impl EngineCore {
             let Some(terminal) = fault.terminal else {
                 continue;
             };
-            let drive = if fault.window_open() {
+            let drive = if fault.source_held() {
                 match fault.kind {
                     EdgeFaultKind::Stuck(volts) | EdgeFaultKind::Contention(volts) => {
                         TerminalDrive::Volts(volts)
@@ -7693,51 +7712,88 @@ mod tests {
         (applied, seen, handle)
     }
 
+    /// The distinct readings a sense log saw, with repeats of the same
+    /// reading collapsed.
+    fn distinct_states(states: &[NetState]) -> Vec<NetState> {
+        let mut out: Vec<NetState> = Vec::new();
+        for state in states {
+            if out.last() != Some(state) {
+                out.push(*state);
+            }
+        }
+        out
+    }
+
+    /// Every [`Finding::Contention`] the engine reported.
+    fn contention_findings(handle: &EngineHandle) -> Vec<Finding> {
+        handle
+            .findings()
+            .into_iter()
+            .filter(|finding| matches!(finding, Finding::Contention { .. }))
+            .collect()
+    }
+
     /// A pin-target stuck window hides that pin's drives and holds the net at
-    /// the stuck volts instead; the requested drives stay in the log.
+    /// the stuck volts instead; the requested drives stay in the log. The
+    /// stuck source replaces the pin's drive on exactly the covered edges, so
+    /// the net never floats and nothing fights.
     #[rstest]
     fn an_edge_fault_stuck_holds_the_net_over_the_named_pins_drives() {
         behaviour!(Test {
             id: "engine.edge-fault-stuck-window",
             covers: Some("board/src/engine.rs#EngineCore::sync_edge_terminals"),
-            given: "one pin driven high six times, whose second and third drives are inside a window stuck at 0 V",
+            given: "one pin driven high six times, whose third and fourth drives are inside a window stuck at 0 V",
         });
         expect!(
             "named-pin-edges-stuck",
             "the log records all six requested drives, and the net sits at 0 V \
              in the window, then follows the high drives that come after it",
         );
+        expect!(
+            "stuck-replaces-the-drive",
+            "the net goes straight from high to 0 V and back to high, never \
+             floating, and no contention is reported",
+            "the stuck source turns on with the first hidden drive and off with the \
+             first drive after the window, so it never fights the pin it replaces \
+             and never leaves the net undriven",
+        );
         let _clock = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let script = [3.3, 3.2, 3.1, 3.0, 2.9, 2.8];
-        let (applied, seen, _handle) =
+        let (applied, seen, handle) =
             run_edge_fault_script(super::EdgeFaultKind::Stuck(0.0), 2, 2, &script);
         assert_eq!(applied, script);
+        let expected = [
+            NetState::Driven(Level::High),
+            NetState::Analog(0.0),
+            NetState::Driven(Level::High),
+        ];
+        let driven_readings = || {
+            let states = seen.lock().unwrap();
+            let first = states
+                .iter()
+                .position(|state| matches!(state, NetState::Driven(_)))
+                .unwrap_or(states.len());
+            distinct_states(&states[first..])
+        };
         assert!(
-            wait_for(
-                || {
-                    let states = seen.lock().unwrap();
-                    // The stuck reading sits between driven-high readings. The
-                    // last covered drive stays hidden once the window closes,
-                    // so the net may float until the next drive arrives.
-                    let stuck = states
-                        .iter()
-                        .position(|state| *state == NetState::Analog(0.0))
-                        .is_some_and(|at| {
-                            states[..at].contains(&NetState::Driven(Level::High))
-                                && states[at..].contains(&NetState::Driven(Level::High))
-                        });
-                    stuck && matches!(states.last(), Some(NetState::Driven(Level::High)))
-                },
-                Duration::from_secs(5),
-            ),
-            "the window must hold the net low between high readings; saw {:?}",
+            wait_for(|| driven_readings() == expected, Duration::from_secs(5)),
+            "once driven, the net must read high, then the stuck 0 V, then high, \
+             and never float; saw {:?}",
             seen.lock().unwrap(),
+        );
+        // A stuck pin's drive is hidden, not fought: the pin still driving
+        // beside the stuck source would report contention.
+        assert_eq!(
+            contention_findings(&handle),
+            Vec::<Finding>::new(),
+            "a stuck window must replace the pin's drive, not contend with it",
         );
     }
 
     /// A stuck window that opens at the first edge holds the net before any
-    /// drive, where a float would leave it floating.
+    /// drive, where a float would leave it floating, and keeps holding it
+    /// until the first drive after the window.
     #[rstest]
     fn an_edge_fault_stuck_from_edge_zero_holds_the_idle_net() {
         behaviour!(Test {
@@ -7750,23 +7806,31 @@ mod tests {
             "the net sits at 3.3 V \
              before the pin first drives, then follows the third, low, drive once the window closes",
         );
+        expect!(
+            "idle-stuck-never-floats",
+            "the net goes straight from 3.3 V to low, never floating, and no \
+             contention is reported",
+        );
         let _clock = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let script = [0.0, 0.1, 0.2];
-        let (applied, seen, _handle) =
+        let (applied, seen, handle) =
             run_edge_fault_script(super::EdgeFaultKind::Stuck(3.3), 0, 2, &script);
         assert_eq!(applied, script);
+        let expected = [NetState::Analog(3.3), NetState::Driven(Level::Low)];
         assert!(
             wait_for(
-                || {
-                    let states = seen.lock().unwrap();
-                    states.first() == Some(&NetState::Analog(3.3))
-                        && matches!(states.last(), Some(NetState::Driven(Level::Low)))
-                },
+                || distinct_states(&seen.lock().unwrap()) == expected,
                 Duration::from_secs(5),
             ),
-            "the idle net must sit at the stuck volts, then go low; saw {:?}",
+            "the idle net must sit at the stuck volts, then go low, and never \
+             float; saw {:?}",
             seen.lock().unwrap(),
+        );
+        assert_eq!(
+            contention_findings(&handle),
+            Vec::<Finding>::new(),
+            "a stuck window must replace the pin's drive, not contend with it",
         );
     }
 
@@ -7777,17 +7841,22 @@ mod tests {
         behaviour!(Test {
             id: "engine.edge-fault-contention-window",
             covers: Some("board/src/engine.rs#LiveEdgeFault::suppresses"),
-            given: "one pin driven high six times, whose second and third drives are inside a window contending at 0 V",
+            given: "one pin driven high six times, whose third and fourth drives are inside a window contending at 0 V",
         });
         expect!(
             "named-pin-edges-contend",
             "the log records all six requested drives, and the net sits at \
              the ideal source's 0 V in the window, then follows the high drives once it clears",
         );
+        expect!(
+            "contention-reported",
+            "the pin's high drive losing to the ideal source is reported as a \
+             contention finding naming the pin",
+        );
         let _clock = lock_clock();
         virtual_clock::init(0.0, 1_000_000);
         let script = [3.3, 3.2, 3.1, 3.0, 2.9, 2.8];
-        let (applied, seen, _handle) =
+        let (applied, seen, handle) =
             run_edge_fault_script(super::EdgeFaultKind::Contention(0.0), 2, 2, &script);
         assert_eq!(applied, script);
         assert!(
@@ -7811,6 +7880,14 @@ mod tests {
             ),
             "the window must sit at the ideal source's volts between high readings; saw {:?}",
             seen.lock().unwrap(),
+        );
+        assert_eq!(
+            contention_findings(&handle),
+            vec![Finding::Contention {
+                net: "N0".to_string(),
+                drivers: vec![PinRef::new("DRV", "A")],
+            }],
+            "the losing pin must be reported once",
         );
     }
 
