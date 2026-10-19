@@ -23,6 +23,15 @@ cargo test -p embsim-board --test stepped_clock --test ads122u04_stepped
 # its own binary; live reads at a settled instant, rule 9).
 cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_determinism
 
+# The W25Q128JV's data-out on a bus it shares (stepped, own binary; every
+# read after a virtual settle, rule 9): on a bench with no pull-up the line
+# floats through a read's instruction and address and carries the data from
+# the first clock after them; on the P2-EC32MB with the flash select switch
+# closed, where every pulse of the card's clock selects the flash, a master
+# clocking the card with the clock idling high reads its CMD0 and CMD8
+# replies, the flash decodes no instruction, and the card alone drives P58.
+cargo test -p embsim-board --test shared_spi_bus
+
 # The MaD machine's three boards as a project with an encoder on the
 # carrier's J20 (stepped, own binary; every read after a virtual settle,
 # rule 9): the encoder's pairs counted at P9/P10/P11 through U25, and a

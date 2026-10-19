@@ -43,6 +43,7 @@ use crate::engine::{
 use crate::event_log::EventLog;
 use crate::limits::LimitWatch;
 use crate::net::{Amps, Net, NetId, NetState, NetVolts, PinRef, TheveninDrive, Volts};
+use crate::pairs::PairWatch;
 use crate::registry::{parse_passive_value, JumperState, PassiveKind};
 
 /// How many rounds the build-time fixed point runs before it gives up and
@@ -601,6 +602,12 @@ struct LintInputs {
     /// build observes them over its snapshot, the live engine after every
     /// pass ([`LimitWatch`]).
     limits: Vec<LimitWatch>,
+    /// One watch per declared differential pair
+    /// ([`crate::DifferentialPair`]), on its inputs' global nets and their
+    /// reference's, with the part's own slots: the build observes and
+    /// judges them over its snapshot, the live engine after every pass and
+    /// as its clock moves on ([`PairWatch`]).
+    pairs: Vec<PairWatch>,
 }
 
 /// Output of the shared assembly pass: the merged net table, the populated
@@ -961,6 +968,23 @@ impl System {
                 diagnostics.report(finding);
             }
         }
+        // The declared pairs, over the same snapshot: the state the system
+        // rests in before its first wake, so a pair inside its band here
+        // spends time there, and is judged at once.
+        for mut watch in lints.pairs {
+            watch.observe(&nets);
+            if !watch.is_pending() {
+                continue;
+            }
+            let own = watch.own();
+            let applied = watch
+                .nets()
+                .into_iter()
+                .any(|net| resolver.reached_beyond(nets.len(), net, &own));
+            if let Some(finding) = watch.judge(applied) {
+                diagnostics.report(finding);
+            }
+        }
         let cluster_roots = resolver.cluster_roots(nets.len());
         let escalated_solves = resolver.escalated_solves();
         let currents = resolver.current_table();
@@ -1011,6 +1035,7 @@ impl System {
             quiescence_timeout,
         );
         engine.watch_limits(lints.limits);
+        engine.watch_pairs(lints.pairs);
         let link = engine.link();
 
         let mut attached: Vec<(String, Box<dyn Component>)> = Vec::new();
@@ -1516,6 +1541,10 @@ impl System {
                         }
                     }
                     PartClass::Registered { pins, branches } => {
+                        // The part's slots, in the resolver's table: its
+                        // input ports among them are its own bias
+                        // (`PairWatch`).
+                        let first_slot = resolver.slot_count();
                         for pin in pins {
                             let key = (bi, PinRef::new(record.reference.clone(), pin.number));
                             if detached.contains(&key) {
@@ -1538,6 +1567,7 @@ impl System {
                                 endpoints.insert(key, endpoint);
                             }
                         }
+                        let own_slots = first_slot..resolver.slot_count();
                         // The component's declared branches, by the pin
                         // names its facade gives them (number or alias).
                         let path = format!("{bname}.{}", record.reference);
@@ -1595,6 +1625,32 @@ impl System {
                                 net,
                                 reference,
                                 limits,
+                            ));
+                        }
+                        // The pins that declare a differential pair, for
+                        // the engine to watch (a detached input or
+                        // reference drops the pair out, as for limits).
+                        for pin in pins.iter() {
+                            let Some(pair) = pin.pair else { continue };
+                            let (Some(a), Some(b)) = (net_of(pin.number), net_of(pair.inverting))
+                            else {
+                                continue;
+                            };
+                            let inverting = number_of(pair.inverting).expect("validated at build");
+                            let reference = match pin.reference {
+                                Some(named) => match net_of(named) {
+                                    Some(net) => Some(net),
+                                    None => continue,
+                                },
+                                None => None,
+                            };
+                            lints.pairs.push(PairWatch::new(
+                                path.clone(),
+                                (pin.number, inverting),
+                                (a, b),
+                                reference,
+                                pair,
+                                own_slots.clone(),
                             ));
                         }
                         // The lints' view of the part: its pins on their
@@ -1703,6 +1759,7 @@ impl System {
         for (bench, pin_nets) in self.bench.iter().zip(&bench_pin_nets) {
             let mut eps = Vec::new();
             let pins = bench.component.pins();
+            let first_slot = resolver.slot_count();
             for (pin, &net) in pins.iter().zip(pin_nets) {
                 let pin_ref = PinRef::new(bench.name.clone(), pin.number);
                 let endpoint = add_pin_descriptor(&mut resolver, net, pin, &pin_ref);
@@ -1715,6 +1772,7 @@ impl System {
                 eps.push(endpoint);
             }
             bench_endpoints.push(eps);
+            let own_slots = first_slot..resolver.slot_count();
             // The bench component's declared branches. A bench pin is never
             // detached (the fault algebra names board pins), so every
             // declared branch registers.
@@ -1732,6 +1790,21 @@ impl System {
                     net,
                     reference,
                     limits,
+                ));
+            }
+            for (pin, &net) in pins.iter().zip(pin_nets) {
+                let Some(pair) = pin.pair else { continue };
+                let Some(inverting) = position_of(pair.inverting) else {
+                    continue;
+                };
+                let reference = pin.reference.and_then(net_of);
+                lints.pairs.push(PairWatch::new(
+                    bench.name.clone(),
+                    (pin.number, pins[inverting].number),
+                    (net, pin_nets[inverting]),
+                    reference,
+                    pair,
+                    own_slots.clone(),
                 ));
             }
             lints.parts.push(PartLint {

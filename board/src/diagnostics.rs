@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::net::{Ohms, PinRef, Volts};
+use crate::net::{Level, Ohms, PinRef, Volts};
 
 // ============================================================
 // Findings
@@ -321,6 +321,36 @@ pub enum Finding {
         /// words; empty for nothing more.
         note: String,
     },
+    /// A part's differential input pair ([`crate::DifferentialPair`]) spent
+    /// time with its difference inside the band its datasheet guarantees no
+    /// level in, while a source other than the part's own input ports
+    /// reached an input — a driver, a ground, a rail: a common-mode voltage
+    /// applied. The part's model gives the pair its declared fail-safe
+    /// level there, which the datasheet does not promise. The part declares
+    /// the pair; the engine watches it and raises this once per pair, with
+    /// the first such reading: at build over the settled snapshot, or live
+    /// when the engine's clock moves on with the pair still in its band (a
+    /// pair that passes through the band at one instant spends no time
+    /// there, and one that enters it at an instant the clock never moves on
+    /// from is not judged). A pair only the part's own ports reach (open,
+    /// shorted, terminated) raises nothing.
+    PairInBand {
+        /// The part, as `Board.Reference`.
+        part: String,
+        /// The pair's non-inverting input, by number.
+        pin: String,
+        /// Its inverting input, by number.
+        inverting: String,
+        /// The difference, the non-inverting input minus the inverting one.
+        volts: Volts,
+        /// The common-mode voltage: the two inputs' mean against the
+        /// inputs' declared reference.
+        common_mode: Volts,
+        /// The band's half-width the part declares.
+        band: Volts,
+        /// The level the part's output took: its declared fail-safe.
+        output: Level,
+    },
     /// The build-time fixed point did not settle within its bound: after
     /// `passes` rounds of replaying the drives components issued in response
     /// to the states they were delivered, some component was still changing
@@ -550,6 +580,24 @@ impl fmt::Display for Finding {
                     write!(f, ": {note}")
                 }
             }
+            Self::PairInBand {
+                part,
+                pin,
+                inverting,
+                volts,
+                common_mode,
+                band,
+                output,
+            } => write!(
+                f,
+                "pair {part}.{pin}/{part}.{inverting} reads {volts} V apart, inside its \
+                 ±{band} V band, with a common-mode voltage of {common_mode} V applied: no \
+                 level is guaranteed there, and its output takes the fail-safe {}",
+                match output {
+                    Level::High => "high",
+                    Level::Low => "low",
+                }
+            ),
             Self::BuildNotSettled { passes, nets } if nets.is_empty() => {
                 write!(f, "the build did not settle in {passes} passes")
             }
@@ -965,6 +1013,20 @@ mod tests {
             note: String::new(),
         },
         "pin B.U1.VCC is at 3.7 V, above its recommended 3 V to 3.6 V"
+    )]
+    #[case::pair_in_band(
+        Finding::PairInBand {
+            part: "EDGE.U25".into(),
+            pin: "2".into(),
+            inverting: "1".into(),
+            volts: 0.0025,
+            common_mode: 0.00125,
+            band: 0.2,
+            output: Level::High,
+        },
+        "pair EDGE.U25.2/EDGE.U25.1 reads 0.0025 V apart, inside its ±0.2 V band, with a \
+         common-mode voltage of 0.00125 V applied: no level is guaranteed there, and its output \
+         takes the fail-safe high"
     )]
     fn a_finding_prints_in_plain_words(#[case] finding: Finding, #[case] line: &str) {
         behaviour!(Test {
