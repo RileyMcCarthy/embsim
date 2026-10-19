@@ -75,7 +75,8 @@ without a model is a way past an integrated circuit.
 **Rule 2 — One interface.** Between a node and the engine there is exactly
 this: static facts declared once on `PinDecl` (its role, idle drive, clamps,
 input port, capacitance, thresholds with hysteresis, reference and supply
-pins, `can_source` and `can_sink`) and on `Component::branches()` (nonlinear
+pins, declared limits, a differential pair, `can_source` and `can_sink`)
+and on `Component::branches()` (nonlinear
 elements as branches between two of the part's pins); one per-instant
 message, `Drive`, with three
 encodings — `Thevenin { volts, ohms }`, `Current { amps }`, `Periodic { hi,

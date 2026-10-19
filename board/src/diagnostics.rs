@@ -331,8 +331,9 @@ pub enum Finding {
     /// the first such reading: at build over the settled snapshot, or live
     /// when the engine's clock moves on with the pair still in its band (a
     /// pair that passes through the band at one instant spends no time
-    /// there). A pair only the part's own ports reach (open, shorted,
-    /// terminated) raises nothing.
+    /// there, and one that enters it at an instant the clock never moves on
+    /// from is not judged). A pair only the part's own ports reach (open,
+    /// shorted, terminated) raises nothing.
     PairInBand {
         /// The part, as `Board.Reference`.
         part: String,

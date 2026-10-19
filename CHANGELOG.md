@@ -39,7 +39,9 @@ the one before it promised, and says so here under **Breaking**.
   the engine's clock moves on, naming the pair, the difference, the common
   mode and the fail-safe level the part's output took. An open, shorted or
   terminated pair, which only the part's own ports reach, and a pair whose
-  two legs change at one instant raise nothing. The `am26lv32` declares its
+  two legs change at one instant raise nothing; live, a pair that enters
+  its band at a run's last instant, with the clock never moving on, is not
+  judged. The `am26lv32` declares its
   four pairs (SLLS202H Table 8-1, §8.4.1): a single-ended encoder on the
   Edge carrier's `J20` with its `-` legs grounded is reported on `U25`'s
   pairs, the fail-safe high its outputs keep.

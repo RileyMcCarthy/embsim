@@ -98,8 +98,10 @@
 //!   0 V there, as the line driver and the isolators assume.
 //! - **Not modelled**: propagation delay (`t_PLH`/`t_PHL` 20 ns max, §6.6)
 //!   and skew, the enable and disable times, the common-mode input range
-//!   (−0.3 V to 5.5 V, §6.3), the output current limit (±25 mA absolute,
-//!   §6.1), supply current, ESD and thermals.
+//!   (−0.3 V to 5.5 V, §6.3) and the differential one (±5.8 V, §6.3), the
+//!   inputs' absolute maximum (−4 V to 8 V on an input, ±12 V across a
+//!   pair, §6.1), the output current limit (±25 mA absolute, §6.1), supply
+//!   current, ESD and thermals.
 
 use std::sync::{Arc, Mutex};
 

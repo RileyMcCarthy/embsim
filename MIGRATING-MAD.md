@@ -1044,6 +1044,14 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   levels — `board/tests/encoder_output_stages.rs` counts an open collector
   through an AM26LV32 with 4.7 kΩ to 5 V and each `-` leg at 2.5 V from two
   10 kΩ — or the machine would need an encoder with line-driver outputs.
+  The pull-up's rail must keep `U25`'s inputs inside their ratings:
+  SLLS202H §6.3 recommends −0.3 V to 5.5 V common mode and ±5.8 V across a
+  pair, and §6.1's absolute maximum is −4 V to 8 V on an input and ±12 V
+  across a pair (read: SLLS202H p. 4). The encoder on 5 V keeps them; from
+  its 12 V or 24 V a 4.7 kΩ pull-up straight to the supply would hold a
+  released `+` leg near 8.9 V or 17.5 V against `U25`'s 12 kΩ typical
+  input (inferred), past 8 V, so each leg would need a divider or a clamp.
+  embsim's `am26lv32` checks neither range (its *Not modelled*).
   The encoder's supply has no pin on `J20` either.
 - **The drive's ready output.** `mad-machine` has no pin for the servo
   drive's ready line, `SC_SRDY` (`J21.6`, the firmware's `SERVO_RDY` on

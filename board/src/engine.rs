@@ -5287,7 +5287,8 @@ impl EngineCore {
     /// one after the other pass through the band and out of it before
     /// this runs. A pair a source other than its part's own input ports
     /// reaches is reported, once ([`Finding::PairInBand`]). Nothing to do
-    /// while no observation waits.
+    /// while no observation waits. Only here: an observation the clock
+    /// never moves on from is never judged (`crate::pairs`).
     fn judge_pairs(&mut self) {
         if !self.pairs_pending {
             return;

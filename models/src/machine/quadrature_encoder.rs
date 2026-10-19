@@ -96,7 +96,12 @@
 //! reports as `embsim_board::Finding::PairInBand`. On today's Edge board an
 //! open-collector encoder's `P9` and `P10` therefore stay high at every
 //! count; a pull-up on each `+` to the encoder's supply and each `-` held
-//! between the output's two levels would read it.
+//! between the output's two levels would read it, the pull-up's rail
+//! keeping the receiver's inputs inside their ratings (SLLS202H §6.3:
+//! −0.3 V to 5.5 V common mode, ±5.8 V across a pair; §6.1, absolute:
+//! −4 V to 8 V on an input) — the encoder on 5 V, or a divider or clamp on
+//! each leg from a 12–24 V supply. The receiver's model checks neither
+//! range.
 //!
 //! ## Not modeled
 //!

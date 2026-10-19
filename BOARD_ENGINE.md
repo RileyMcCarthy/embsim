@@ -164,6 +164,9 @@ raises `Finding::PairInBand` once, naming the pair and the fail-safe its
 output took; a pair only its own ports reach (open, shorted, terminated)
 rests at their bias and raises nothing, and one that passes through the
 band at one instant (two legs published together) spends no time there.
+Live, the judgement waits for the clock: a pair that enters its band at
+the run's last instant, or while the clock never moves again, is not
+reported.
 
 There are no pin kinds (`NODES.md` §11 and §12 item 5): what a
 pin reads and drives follows from its role and its declarations. A pin is

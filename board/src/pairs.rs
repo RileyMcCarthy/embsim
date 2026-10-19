@@ -13,9 +13,16 @@
 //! bias and is the part's fail-safe to decide; anything else is a
 //! common-mode voltage applied, inside a band the datasheet gives no level
 //! in. The judgement walks the pair's clusters, so it runs only for a pair
-//! that has stayed in its band past an instant and has not been reported:
+//! that has stayed in its band past an instant and has not been reported
+//! (a silent one, resting at its own bias, again each time its nets move):
 //! a valid pair costs one subtraction per pass that moves it, and a
 //! reported one nothing.
+//!
+//! Live, a pair is judged only when the clock moves on: one that enters
+//! its band at the run's last instant, or while the clock never moves
+//! again, is not judged, and the findings read then do not name it.
+//! Judging when the findings are read, from another thread at any point in
+//! an instant, could catch a line driver's pair between its two legs.
 
 use std::ops::Range;
 

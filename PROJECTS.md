@@ -2505,7 +2505,12 @@ output rests at `U25`'s own bias, and a sinking one leaves its pair, the
 `-` leg on `EN_GND` through `JP2`/`JP3`, no difference. Reading it needs a
 pull-up on each `+` to the encoder's supply and each `-` held between the
 output's two levels, or an encoder with line-driver outputs
-(`board/tests/encoder_output_stages.rs` counts one so).
+(`board/tests/encoder_output_stages.rs` counts one so). The pull-up's rail
+must keep `U25`'s inputs inside their ratings — SLLS202H §6.3: −0.3 V to
+5.5 V common mode, ±5.8 V across a pair; §6.1, absolute: −4 V to 8 V on an
+input, ±12 V across a pair — which the encoder on 5 V does and a pull-up
+straight to its 12 V or 24 V does not (each leg would need a divider or a
+clamp); the `am26lv32` model checks neither range.
 
 The gantry, the sample and the strain gauge have no pins: they are the
 link from the shaft to the load cell, MaD's code moved into the kind

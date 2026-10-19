@@ -78,6 +78,12 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
         "the Edge board runs its AM26LV32 from 5 volts, inside its 6 volt absolute maximum \
          but above its recommended range, where its open-input bias is not characterised"
     );
+    expect!(
+        "receiver-pairs-silent",
+        "none of U25's four input pairs is reported inside its 0.2 volt band",
+        "with nothing on the carrier's encoder connector and its ground jumpers open, each \
+         pair rests at the receiver's own input bias, the fail-safe its datasheet guarantees"
+    );
     let path: PathBuf = [
         env!("CARGO_MANIFEST_DIR"),
         "..",
@@ -130,6 +136,12 @@ fn the_seated_module_and_the_add_on_run_from_the_carriers_rails() {
         }],
         "{findings:?}"
     );
+
+    let in_band: Vec<&Finding> = findings
+        .iter()
+        .filter(|finding| matches!(finding, Finding::PairInBand { .. }))
+        .collect();
+    assert!(in_band.is_empty(), "{in_band:?}");
 
     let stalled: Vec<Finding> = findings
         .into_iter()
