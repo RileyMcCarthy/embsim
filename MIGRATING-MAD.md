@@ -42,9 +42,10 @@ kinds. The Rust below is MaD's to write and is marked
 its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
 
 *Revised 2026-10-19, against MaD's `main` and MaD #264: steps 0 to 7 are
-done in MaD, and step 8a, the `mad-machine` kind, is MaD #264, a draft
-(section 5). Section 3's `src/machine.rs`, section 4's machine entries and
-wires, and section 6's machine questions now follow the kind as built,
+done in MaD (step 3's record in `NODES.md` waits on embsim #133), and step
+8a, the `mad-machine` kind, is built in MaD #264, a draft (section 5).
+Section 3's `src/machine.rs`, section 4's machine entries and wires, and
+section 6's machine questions now follow the kind as built,
 `SIL/mad-catalog/src/machine.rs` at #264's `b4d0e131b`.*
 
 ## 1. Where MaD ends up
@@ -100,11 +101,11 @@ project crate does not fork a model.
 |---|---|---|---|
 | E1 | *shipped:* `am26lv32`, the AM26LV32 line receiver's kind, placing `U25` by its part number `AM26LV32IDR`, beside the AM26LS31 line driver's `am26ls31`. MaD's schematic owes the matching fix: `U25`'s `Manufacturer_Part_Number` and value set to `AM26LV32IDR` in `Hardware/EdgeBoard/KiCad` | the Edge carrier's encoder pairs (`U25`, `J20`), beside the servo step and direction pairs (`U24`, `J21`); until the schematic fix, a netlist exported from MaD names `AM26LS32CD` and `check` refuses `EDGE` naming `U25` | 9 |
 | E2 | the `ads122u04` model applying `GAIN` and `VREF` from the firmware's register writes, `VREF = AVDD` read as the sensed `AVDD − AVSS`. *Built 2026-10-08* (`NODES.md` §15): every conversion reads the register file — the multiplexer, the gain (the PGA's bypass included), the reference — and a held reset or a lost supply returns it to its defaults; MaD's start-up bytes, sent to the add-on as `boards/projects/ds2-addon.toml` builds it, give the force path the code the firmware expects (`board/tests/ads122u04_registers.rs`) | `mad-emulator` registers the converter pre-configured (gain 128, `VREF` the 3.3 V excitation); the kind starts as the chip leaves reset, so without this the force path reads about 79 times low | 9 |
-| E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component"). *Built 2026-10-08* (`NODES.md` §16): members' pins renamed onto the assembly's, returns it declares (`DRIVE_GND`, `ENC_GND`), members' wakes through it in the order added, the links between them code on the engine's time; `PROJECTS.md` §10, "MaD's plant", is the machine as one | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8 |
+| E3 | `embsim_board::Assembly`: one component hosting several of embsim's models (`PROJECTS.md` §10, "Adding a bench component"). *Built 2026-10-08* (`NODES.md` §16): members' pins renamed onto the assembly's, returns it declares (`DRIVE_GND`, `ENC_GND`), members' wakes through it in the order added, the links between them code on the engine's time; `PROJECTS.md` §10, "MaD's plant", is the machine as one | the machine is embsim's `StepperMotor`, `QuadratureEncoder` and `EndSwitch` models and MaD's gantry, sample and strain gauge on one carriage | 8a (built: MaD #264, a draft) |
 | E4 | `chrome-cdp`, the host the board's clock meters. *Built 2026-10-09, in no release yet* (`NODES.md` §19; the kind's contract is `PROJECTS.md` §5, `chrome-cdp`, and [`examples/chrome-ping`](examples/chrome-ping) is a project with one): a bench kind in the `embsim` command's set (`embsim_cdp::catalog`; `embsim_cdp::CdpNode` from Rust) on `host-serial`'s four pins, `TX`, `RX`, `VIO` and `GND`, driven and read the same way, so a project swaps one for the other without touching a wire. At its first slice, the board held there, it launches the host's Chrome (or attaches to one) and holds every page and dedicated worker from birth. Each quantum (1 ms) it grants each page's clock what the page is owed with `Emulation.setVirtualTimePolicy`, puts what the page wrote on the line, and in one evaluation hands the page the board's bytes and reads its clock, all over one DevTools connection, so no second channel races the grants; when a worker owns the port's transferred stream, the next grant waits until it has read what it was handed. The page's `navigator.serial` is a shim the node owns, by Chrome's rules (a `close()` refused while a stream is locked, a replug that hands out a new `SerialPort`): the host's half of the line, the port, its USB ids, `connect` and `disconnect`, an unplug and a replug (`__embsim.link`), so MaD's e2e installs no serial fake of its own. The first answer, the `qemu-vm` and `chrome-vm` kinds, was built and withdrawn (§18) | the user's rule (§18): the ISS runs with the app in a Chrome whose clock the board's meters, and with no host that keeps wall time. Unmetered, the app's 2000 ms response timeout fired at 200 ms of the board's time; metered, at 2000 | 1b, 10, 11 |
 | E5 | *not blocking:* a P2 flash-layout option on `w25q128jv` (a program laid out behind stage-1 when the board is built) and a `dir` option on `sd-card` (a FAT16 card holding a directory) | until then MaD writes both images with two make targets (step 4) | none |
-| E6 | complementary outputs on `embsim_models::machine::QuadratureEncoder`. *Built 2026-10-09* (`NODES.md` §17): `Config::with_complements()` declares `A-`, `B-` and, with an index, `Z-`, each driven to the inverse of its leg in the same publish; `board/tests/edge_encoder_pairs.rs` counts the quadrature at `P9`/`P10` through `U25` with `JP2`, `JP3` and `JP5` open | the carrier's `J20` takes an RS-422 encoder and `U25` reads differences: a single-ended encoder on `A+`/`B+` with `JP2`/`JP3` grounding `A−`/`B−` gives no differential for its low, which `U25` reads as its fail-safe high (SLLS202H §8.4.1), so `P9` and `P10` never move (section 6, "The encoder through `U25`") | 8 (the machine's pins), 9 (the encoder case) |
-| E8 | the encoder's output stage, and a differential pair read inside its band reported. *Built 2026-10-18, in no release yet* (`NODES.md` §20): `quadrature_encoder::OutputStage` on `Config::output` — `PushPull` (the default), `Rs422` (`with_complements()`), `NpnOpenCollector` (each output sinks to the encoder's ground while low and is released while high, no pull-up of its own) — named for a kind's option by `OutputStage::NAMES` (`push-pull`, `rs422`, `npn-open-collector`); `PinDecl::with_pair` and `Finding::PairInBand`, which the `am26lv32` declares on its four pairs: a pair that spends time inside ±200 mV with a common-mode voltage applied is reported once, naming the pair and the fail-safe high its output took. `board/tests/edge_encoder_pairs.rs` runs the open collector on `edge-ec32-ds2.toml` with `JP2`/`JP3` closed: `P9` and `P10` never move, and the run names `U25`'s pairs `2`/`1` and `6`/`7` | the machine's encoder is an NPN open collector (section 6, "The encoder through `U25`"); the user's decision is `mad-machine`'s `encoder_output` option, `rs422` by default so the e2e keeps counting, `npn-open-collector` for the real encoder, whose stuck `P9`/`P10` the finding explains | 8 (the machine's pins and option) |
+| E6 | complementary outputs on `embsim_models::machine::QuadratureEncoder`. *Built 2026-10-09* (`NODES.md` §17): `Config::with_complements()` declares `A-`, `B-` and, with an index, `Z-`, each driven to the inverse of its leg in the same publish; `board/tests/edge_encoder_pairs.rs` counts the quadrature at `P9`/`P10` through `U25` with `JP2`, `JP3` and `JP5` open | the carrier's `J20` takes an RS-422 encoder and `U25` reads differences: a single-ended encoder on `A+`/`B+` with `JP2`/`JP3` grounding `A−`/`B−` gives no differential for its low, which `U25` reads as its fail-safe high (SLLS202H §8.4.1), so `P9` and `P10` never move (section 6, "The encoder through `U25`") | 8a (the machine's pins; built: MaD #264, a draft), 9 (the encoder case) |
+| E8 | the encoder's output stage, and a differential pair read inside its band reported. *Built 2026-10-18, in no release yet* (`NODES.md` §20): `quadrature_encoder::OutputStage` on `Config::output` — `PushPull` (the default), `Rs422` (`with_complements()`), `NpnOpenCollector` (each output sinks to the encoder's ground while low and is released while high, no pull-up of its own) — named for a kind's option by `OutputStage::NAMES` (`push-pull`, `rs422`, `npn-open-collector`); `PinDecl::with_pair` and `Finding::PairInBand`, which the `am26lv32` declares on its four pairs: a pair that spends time inside ±200 mV with a common-mode voltage applied is reported once, naming the pair and the fail-safe high its output took. `board/tests/edge_encoder_pairs.rs` runs the open collector on `edge-ec32-ds2.toml` with `JP2`/`JP3` closed: `P9` and `P10` never move, and the run names `U25`'s pairs `2`/`1` and `6`/`7` | the machine's encoder is an NPN open collector (section 6, "The encoder through `U25`"); the user's decision is `mad-machine`'s `encoder_output` option, `rs422` by default so the e2e keeps counting, `npn-open-collector` for the real encoder, whose stuck `P9`/`P10` the finding explains | 8a (the machine's pins and option; built: MaD #264, a draft) |
 | E7 | *not blocking:* a control surface for `run`, such as `--control <port>` serving `embsim-ui`'s actions, a host kind registering `<NAME>/link/unplug` and `<NAME>/link/plug` | three of the e2e's scenarios (B5's reconnect, M11's idle drop and its mid-test drop) pull the host's cable. A `chrome-cdp` takes that from the page, on its own binding, so they wait on nothing; a project whose host is a `host-serial` has no way to pull it | none |
 
 ## 3. The catalog crate, `SIL/mad-catalog`
@@ -250,8 +251,9 @@ fn board(&self, spec: &BoardSpec) -> Result<CatalogBoard, ProjectError> {
 }
 ```
 
-The scenario lines stay in the project files: the DS2's `JP1`/`JP2` and its
-`~RESET` strap are how a bench is set up, not what the board is.
+The scenario lines stay in the project files: the DS2's `JP1`/`JP2`, and
+the `~RESET` strap a board made before `R10` takes, are how a bench is set
+up, not what the board is.
 
 ### `src/iss.rs`: `mad-p2iss`
 
@@ -713,9 +715,10 @@ state = "closed"
 part = "DS2.JP2"
 state = "closed"
 
-[[pin_short]]            # the bench's ~RESET strap: the stock board leaves
-a = "DS2.U1.3"           # U1's reset on a net of its own
-b = "DS2.U1.13"
+# No ~RESET strap: the DS2's netlist has R10, the 10 kOhm pull-up on U1's
+# ~RESET, which reads Pulled(High) with no strap (MaD #244). A board made
+# before R10 floats ~RESET (Hardware/DS2Addon/readme.md) and takes
+# [[pin_short]] a = "DS2.U1.3", b = "DS2.U1.13", as mad-emulator's bench does.
 ```
 
 `SIL/mad-serial-boot.toml` is the same file with three differences:
@@ -786,10 +789,13 @@ with `feat/embsim-catalogs` merged (MaD's CI gates embsim pin bumps).
 0.2.0). *Done when:* MaD's CI is green on the bump, with `mad-emulator`
 unchanged.
 
-**1b. The metered host on `mad-emulator`.** E4 is built (`NODES.md` §19);
-once a release ships it, the pin bump that brings it puts the e2e, the
-nightly and a playground in the one valid configuration, long before steps
-2–9 move the machine onto a project. `mad-emulator` places an
+**1b. The metered host on `mad-emulator`.** *Done: MaD #155, #161 and
+#166, as #245 lists steps 0–1b; `SIL/MaDSim/src/host.rs`, added in #155,
+builds the `chrome-cdp` host through `embsim_cdp::catalog` (read: MaD
+`main`).* E4 is built (`NODES.md` §19); once a release ships it, the pin
+bump that brings it puts the e2e, the nightly and a playground in the one
+valid configuration, long before steps 2–9 move the machine onto a
+project. `mad-emulator` places an
 `embsim_cdp::CdpNode` (`Settings::new(Browse::Launch(..))`, 2 Mbaud, the
 DevTools port fixed, headless but for the playground) where its host is
 today, on
@@ -887,8 +893,8 @@ firmware off the P2-EC32MB's own flash inside the package, the module
 powered from its fingers, and reads the firmware's first console line on
 `P62` (the chain `p2iss/tests/rom_boot_net.rs` proves on bare nets).
 
-**3. Measure.** *Done in MaD #245 (`iss_speed`, every mode stepped);
-the record in `NODES.md` §13 is embsim #133.*
+**3. Measure.** *MaD's side done in #245 (`iss_speed`, every mode
+stepped); the record in `NODES.md` §13 waits on embsim #133, open.*
 The two costs `NODES.md` §13 review item 10 left open: the
 firmware's boot off the flash, and every pad on a net. *Files:*
 `p2iss/examples/iss_speed.rs`. *Done when:* both numbers, with the command
@@ -962,8 +968,9 @@ now that step 2 is done. `MaDSim/src/iss_description.rs`,
 `system_description.rs` and `main.rs` lose what moved (section 3's table)
 only at step 11.
 
-**8a. `mad-machine`** (section 3). *Done: MaD #264, a draft, which pins
-`SIL/embsim` to embsim `main` at `f81ac20` (E8, embsim #134).* *Files:*
+**8a. `mad-machine`** (section 3). *Built in MaD #264, a draft, not
+merged, which pins `SIL/embsim` to embsim `main` at `f81ac20` (E8, embsim
+#134).* *Files:*
 `SIL/mad-catalog/src/machine.rs`, `src/boards.rs` (the kind beside the
 boards), `src/lib.rs`, `tests/machine.rs`, `SIL/mad-catalog/Cargo.toml`
 (`embsim-models` and `models`). *Done when:*
@@ -1020,7 +1027,11 @@ The machine's entries are section 4's as revised for the kind as built
 `loop_volts` (an option the kind does not take refuses the file), no
 `ENC_Z±` wires, each `NAME_COM` wired to `5V_IO` and each loop's pin 1 to
 `GND_IO` in place of the `NAME-` wires, and `MACHINE.SRDY` to
-`EDGE.J21.6`.
+`EDGE.J21.6`. With no index, `U25`'s third pair (`ZI±`, `J20.9`/`J20.10`,
+`JP5` open) is open, as its fourth (`4A`/`4B`, no-connects) is: an open
+pair rests at `U25`'s own bias and reads its fail-safe high, and neither is
+reported (`board/tests/edge_encoder_pairs.rs`, whose open-collector case
+leaves `ZI±` the same way and holds `open-pairs-silent`).
 *Needs:* E1, E2 and E6 (the encoder's pairs). The first pin bump past
 0.2.0 brings E2 (embsim 0.3.0) and changes
 `embsim_models::ads122u04::Config`, which no longer has `vref_mv` or
@@ -1107,9 +1118,13 @@ the tree.
 ## 6. Questions for MaD
 
 These are the machine's and the board's, not embsim's; `NODES.md` §13
-("Open") keeps the list. The machine's four (the loop supply, `JP1`, the
-encoder, the ready output) are answered here by the kind as built, MaD
-#264; `NODES.md` §13 still lists them as written then.
+("Open") keeps the list. The machine's four are answered here by the kind
+as built, MaD #264: the encoder by the user's decision, and the loop
+supply, `JP1` and the ready output by defaults #264 lists as not yet
+settled by the user. `NODES.md` still describes them as written then, in
+§13's mapping table (the `BenchMachine` row), review item 2 and "Open"
+list, and in §16's "Open"; embsim #133 is editing §13, so they wait for
+embsim #140, after it lands.
 
 - **The ISS with a host that keeps wall time — answered.** The user's rule
   (2026-10-09, `NODES.md` §18) is that the firmware on the ISS runs with
@@ -1124,9 +1139,11 @@ encoder, the ready output) are answered here by the kind as built, MaD
   `e2e/hw-read-save-config.mjs`, uses the same fake `navigator.serial`
   over node-serialport. Moving it onto Chrome's real Web Serial, granted
   ahead by Chrome policy, is MaD's to do (`NODES.md` §18, "Open").
-- **The loop supply — answered.** The carrier's `5V_IO`/`GND_IO`, the
-  user's answer as MaD #264 records it ("The loops come from the
-  carrier's 5V_IO, as the user said earlier"). `5V_IO` is the isolated
+- **The loop supply — answered, by default.** The carrier's
+  `5V_IO`/`GND_IO`. MaD #264 gives it twice: its deviations call it the
+  user's answer ("The loops come from the carrier's 5V_IO, as the user
+  said earlier"), and its list of defaults the user has not settled
+  includes it, with the rest states below. `5V_IO` is the isolated
   DC/DC `IC3`'s output, on `J5.1`–`J8.1`, and `GND_IO` its return, on
   `J5.3`–`J8.3` (read: `board/tests/fixtures/mad_edge.net`). `mad-machine`
   has no `loop_volts`: each contact's `NAME_COM` is a pin the file wires to

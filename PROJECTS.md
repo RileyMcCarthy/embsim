@@ -2477,7 +2477,7 @@ contacts and the drive's ready output:
 | Member | What it is | Its pins, as the machine's |
 |---|---|---|
 | `DRIVE` | `StepperMotor`, 8192 steps a millimetre (`STEPS_PER_MM`), `DIR` low forward, enable active low, no load loss (`BenchMachine::build`'s conventions) | `STEP`, `DIR`, `ENA`, against `DRIVE_GND`, a return the assembly declares |
-| `READY` | MaD's own: the drive's ready output, one sink-only pin held at 0 V behind embsim's 25 Ω bench default (`DEFAULT_PUSH_PULL_IMPEDANCE`), the level the firmware reads as not ready (below) | `SRDY`, against `DRIVE_GND` |
+| `READY` | MaD's own: the drive's ready output, one sink-only pin held at 0 V behind embsim's 25 Ω bench default (`DEFAULT_PUSH_PULL_IMPEDANCE`), the level the firmware reads as not ready (below) | `SRDY`, declared against `DRIVE_GND` and, an output, not measured against it: a drive's volts stay in the engine's frame (`Assembly::reference`) |
 | `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, its output stage the kind's `encoder_output` option (below); no stage has an index | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-` (`rs422`, the default) or `ENC_A+`, `ENC_B+` (`npn-open-collector`, `push-pull`), against `ENC_GND`, another return |
 | `UPPER`, `LOWER` | `EndSwitch`, each normally closed: the upper closed at or below 100 mm (`TRAVEL_MM`, `ActuationSense::Decreasing`) and open past it, the lower closed at or above 0 mm (`Increasing`) and open below it | `UPPER_COM`, `UPPER+`; `LOWER_COM`, `LOWER+`: the model's `COM` and `NO` |
 | `DOOR`, `ESD_U`, `ESD_L`, `ESD_A` | `EndSwitch` contacts no carriage moves, each holding its rest: the door closed, the three emergency stops open | `DOOR_COM`, `DOOR+`, … `ESD_A_COM`, `ESD_A+` |
