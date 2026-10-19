@@ -22,7 +22,7 @@ resolver = "2"
 # Shared package metadata. A crate opts in with `version.workspace = true`,
 # `license.workspace = true`, etc.
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Minimum supported Rust version. Determined empirically: gimli 0.34 (pulled in
 # by tools/memory-inspect) requires rustc 1.88, and 1.88 builds the whole
@@ -42,11 +42,11 @@ libc = "0.2"
 object = "0.40"
 gimli = "0.34"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 serde_json = "1"
 # A synchronous WebSocket, client side, no TLS: embsim-cdp's DevTools
 # connection (Chrome's DevTools is on loopback).
-tungstenite = { version = "0.29", default-features = false }
+tungstenite = { version = "0.30", default-features = false }
 toml_edit = "0.22"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
