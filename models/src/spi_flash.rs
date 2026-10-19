@@ -255,12 +255,16 @@ impl SpiNorFlash {
     /// impedance (§4.1 "Chip Select (/CS)", p.9: "When /CS is high the
     /// device is deselected and the Serial Data Output … pins are at high
     /// impedance"). Selected, it stays so while the master shifts the
-    /// instruction and any address in: in standard SPI the part reads data
-    /// or status out on DO and nothing else (§4.2 "Serial Data Input, Output
-    /// and IOs"), and a Read Data shifts its first byte out once the 24-bit
-    /// address is in, its timing diagram drawing DO at high impedance until
-    /// then (§8.2.6 "Read Data (03h)"). An instruction this model does not
-    /// implement, a write, a program and an erase never drive it.
+    /// instruction and any address in: "Standard SPI also uses the
+    /// unidirectional DO (output) to read data or status from the device"
+    /// (§4.2 "Serial Data Input, Output and IOs (DI, DO and IO0, IO1, IO2,
+    /// IO3)", p.9). A Read Data shifts its first byte out once the 24-bit
+    /// address is in, and Figure 14 draws DO at high impedance through the
+    /// instruction and the address (§8.2.6 "Read Data (03h)", p.28); Figure
+    /// 8a draws it so through a Read Status Register's instruction (§8.2.4,
+    /// p.25). An instruction this model does not implement, a write, a
+    /// program and an erase never drive it (Figure 7, Write Disable, p.25:
+    /// DO at high impedance throughout).
     ///
     /// DO starts driving on the edge that presents the first output bit,
     /// which this model presents on the rising edge (module docs), half a

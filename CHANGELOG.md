@@ -55,8 +55,8 @@ the one before it promised, and says so here under **Breaking**.
   selected, which on a P2-EC32MB with its flash select switch closed held
   `P58` high through every low half of the card's clock (the card's clock
   is the flash's `/CS` there, and the flash's DO is the card's MISO), so a
-  host read `$FF` for every byte the card sent and the card never
-  initialised. `SpiNorFlash::miso` reads the line released while the part
+  host that sampled MISO before each rising edge read `$FF` for every byte
+  the card sent and the card never initialised. `SpiNorFlash::miso` reads the line released while the part
   is not driving it.
 
 ## [0.4.0] - 2026-10-12
