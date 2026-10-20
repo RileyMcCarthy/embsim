@@ -1051,7 +1051,11 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   its 12 V or 24 V a 4.7 kΩ pull-up straight to the supply would hold a
   released `+` leg near 8.9 V or 17.5 V against `U25`'s 12 kΩ typical
   input (inferred), past 8 V, so each leg would need a divider or a clamp.
-  embsim's `am26lv32` checks neither range (its *Not modelled*).
+  embsim's `am26lv32` declares the input range on each `A` and `B`
+  (`AM26LV32_INPUT_LIMITS`), so such a leg raises
+  `Finding::PinAboveRecommended` on its `U25` pin, naming the 8 V absolute
+  maximum (`board/tests/am26lv32_receiver.rs`); the ±5.8 V / ±12 V
+  differential ratings are not checked.
   The encoder's supply has no pin on `J20` either.
 - **The drive's ready output.** `mad-machine` has no pin for the servo
   drive's ready line, `SC_SRDY` (`J21.6`, the firmware's `SERVO_RDY` on
