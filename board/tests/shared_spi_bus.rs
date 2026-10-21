@@ -316,6 +316,86 @@ fn a_read_leaves_do_floating_until_its_first_data_bit() {
 // The module's shared bus
 // ============================================================
 
+/// A powered P2-EC32MB with its flash select switch closed, `flash` as
+/// `U301` and `card` in `J301`, and the master on the four shared fingers:
+/// its `CLK` on `P61` (the card's clock, the flash's `/CS`), its `CS` on
+/// `P60` (the card's chip select, the flash's clock), `DI` on `P59` and `DO`
+/// on `P58`. Returned with the module's power tree settled.
+fn module_bench(
+    flash: SpiNorFlashComponent,
+    card: SdCardComponent,
+    suite: MutexGuard<'static, ()>,
+) -> Bench {
+    let flash_slot = Mutex::new(Some(flash));
+    let card_slot = Mutex::new(Some(card));
+    let mut registry = ec32mb_registry();
+    registry.register(FLASH_PART, move |_decl| {
+        Box::new(
+            flash_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("U301 is built once"),
+        )
+    });
+    registry.register(SOCKET_PART, move |_decl| {
+        Box::new(
+            card_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("J301 is built once"),
+        )
+    });
+    let board = Board::from_netlist(netlist::parse(NETLIST).expect("parses"), &registry)
+        .expect("the module builds with a card and a live flash");
+
+    let handles = Arc::new(Mutex::new(MasterPins::default()));
+    let finger = |pin: u32| format!("{MODULE}.J203.{pin}");
+    let harness = Harness::new()
+        // 5 V and 0 V into the module's fingers (`p2_ec32mb.net`: 41/42
+        // and 43/44/45); everything else is the module's own power tree.
+        .power(ep("CARRIER.5V"), ep(&finger(41)), 5.0)
+        .power(ep("CARRIER.5Vb"), ep(&finger(42)), 5.0)
+        .power(ep("CARRIER.GND"), ep(&finger(43)), 0.0)
+        .power(ep("CARRIER.GNDb"), ep(&finger(44)), 0.0)
+        .power(ep("CARRIER.GNDc"), ep(&finger(45)), 0.0)
+        // P61, the card's clock; P60, its chip select; P59, MOSI; P58, MISO.
+        .connect_str("MASTER.CLK", &finger(51))
+        .expect("endpoints parse")
+        .connect_str("MASTER.CS", &finger(52))
+        .expect("endpoints parse")
+        .connect_str("MASTER.DI", &finger(53))
+        .expect("endpoints parse")
+        .connect_str("MASTER.DO", &finger(54))
+        .expect("endpoints parse");
+    let system = System::new()
+        .board(MODULE, board)
+        .component("MASTER", Box::new(BitBangMaster::new(Arc::clone(&handles))))
+        .harness(harness)
+        .scenario(Scenario::default().switch(
+            &format!("{MODULE}.{FLASH_SELECT_SWITCH}"),
+            FLASH_SELECT_POLE,
+            JumperState::Closed,
+        ));
+    let bench = Bench::start(system, handles, suite);
+    virtual_clock::wait_virtual_ns(POWER_UP_NS);
+    bench
+}
+
+/// Every `Contention` finding on `P58` or on the card's side of `R304`.
+fn p58_fights(bench: &Bench) -> Vec<Finding> {
+    bench
+        .system
+        .findings()
+        .into_iter()
+        .filter(|f| {
+            matches!(f, Finding::Contention { net, .. }
+                if net.ends_with(".P2_IO58") || net.ends_with(".Net-(J301-DAT0_MISO)"))
+        })
+        .collect()
+}
+
 /// One byte each way in SPI mode 3, the mode the P2's SD driver uses
 /// (flexspin's `sdmm.cc`: the clock idles high): the falling edge, on which
 /// the card presents its bit; the master's bit on MOSI; the master's sample
@@ -396,62 +476,9 @@ fn the_card_answers_on_the_bus_it_shares_with_a_selected_flash() {
     let flash = SpiNorFlashComponent::new(SpiNorFlash::blank(16 * 1024 * 1024))
         .with_pins(&SPI_FLASH_PINS_BY_FUNCTION);
     let flash_view: FlashView = flash.view();
-    let flash_slot = Mutex::new(Some(flash));
     let card = SdCardComponent::new(SdCard::blank(64 * BLOCK_LEN));
     let card_handle = card.card();
-    let card_slot = Mutex::new(Some(card));
-    let mut registry = ec32mb_registry();
-    registry.register(FLASH_PART, move |_decl| {
-        Box::new(
-            flash_slot
-                .lock()
-                .unwrap()
-                .take()
-                .expect("U301 is built once"),
-        )
-    });
-    registry.register(SOCKET_PART, move |_decl| {
-        Box::new(
-            card_slot
-                .lock()
-                .unwrap()
-                .take()
-                .expect("J301 is built once"),
-        )
-    });
-    let board = Board::from_netlist(netlist::parse(NETLIST).expect("parses"), &registry)
-        .expect("the module builds with a card and a live flash");
-
-    let handles = Arc::new(Mutex::new(MasterPins::default()));
-    let finger = |pin: u32| format!("{MODULE}.J203.{pin}");
-    let harness = Harness::new()
-        // 5 V and 0 V into the module's fingers (`p2_ec32mb.net`: 41/42
-        // and 43/44/45); everything else is the module's own power tree.
-        .power(ep("CARRIER.5V"), ep(&finger(41)), 5.0)
-        .power(ep("CARRIER.5Vb"), ep(&finger(42)), 5.0)
-        .power(ep("CARRIER.GND"), ep(&finger(43)), 0.0)
-        .power(ep("CARRIER.GNDb"), ep(&finger(44)), 0.0)
-        .power(ep("CARRIER.GNDc"), ep(&finger(45)), 0.0)
-        // P61, the card's clock; P60, its chip select; P59, MOSI; P58, MISO.
-        .connect_str("MASTER.CLK", &finger(51))
-        .expect("endpoints parse")
-        .connect_str("MASTER.CS", &finger(52))
-        .expect("endpoints parse")
-        .connect_str("MASTER.DI", &finger(53))
-        .expect("endpoints parse")
-        .connect_str("MASTER.DO", &finger(54))
-        .expect("endpoints parse");
-    let system = System::new()
-        .board(MODULE, board)
-        .component("MASTER", Box::new(BitBangMaster::new(Arc::clone(&handles))))
-        .harness(harness)
-        .scenario(Scenario::default().switch(
-            &format!("{MODULE}.{FLASH_SELECT_SWITCH}"),
-            FLASH_SELECT_POLE,
-            JumperState::Closed,
-        ));
-    let bench = Bench::start(system, Arc::clone(&handles), suite);
-    virtual_clock::wait_virtual_ns(POWER_UP_NS);
+    let bench = module_bench(flash, card, suite);
 
     let pins = bench.handles.lock().expect("master pins");
     // `disk_initialize`: the card deselected, the clock idling high, then
@@ -486,18 +513,90 @@ fn the_card_answers_on_the_bus_it_shares_with_a_selected_flash() {
         Vec::<u8>::new(),
         "the flash saw no clock edge while selected"
     );
-    let fights: Vec<Finding> = bench
-        .system
-        .findings()
-        .into_iter()
-        .filter(|f| {
-            matches!(f, Finding::Contention { net, .. }
-                if net.ends_with(".P2_IO58") || net.ends_with(".Net-(J301-DAT0_MISO)"))
-        })
-        .collect();
+    let fights = p58_fights(&bench);
     assert!(
         fights.is_empty(),
         "P58 and the card's side of R304 are the card's: {fights:?}"
     );
+    bench.finish();
+}
+
+#[test]
+fn a_card_that_has_had_no_command_stays_off_the_flash_read() {
+    behaviour!(Test {
+        id: "ec32mb.card-silent-before-cmd0",
+        covers: Some("models/src/sd_card.rs#SdCard::in_spi_mode"),
+        given: "a powered P2-EC32MB with its flash select switch closed, a card that has \
+                had no command in its socket, and a master reading the flash over the \
+                shared pins",
+    });
+    expect!(
+        "flash-byte",
+        "the master reads the addressed byte from the flash"
+    );
+    expect!(
+        "no-fight-on-miso",
+        "nothing fights the flash on the shared data line",
+        "a card powers up in SD mode and only takes SPI mode from a reset command sent \
+         with its chip select asserted, so until then selecting it does not drive its data-out"
+    );
+    expect!(
+        "card-still-in-sd-mode",
+        "the card has taken no command and is still out of SPI mode"
+    );
+
+    let suite = suite_lock();
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+
+    let mut image = vec![0x00; 16 * 1024 * 1024];
+    // Mostly zeros, so a card driving its idle ones would disagree with it.
+    image[0x20] = 0x21;
+    let flash = SpiNorFlashComponent::new(SpiNorFlash::with_image(image))
+        .with_pins(&SPI_FLASH_PINS_BY_FUNCTION);
+    let card = SdCardComponent::new(SdCard::blank(64 * BLOCK_LEN));
+    let card_handle = card.card();
+    let bench = module_bench(flash, card, suite);
+
+    let pins = bench.handles.lock().expect("master pins");
+    // The master's CLK is the flash's /CS here, and its CS the flash's clock.
+    let (flash_cs, flash_clk, di, dout) = (
+        pins.clk.as_ref().unwrap(),
+        pins.cs.as_ref().unwrap(),
+        pins.di.as_ref().unwrap(),
+        pins.dout.as_ref().unwrap(),
+    );
+    // SPI mode 0 on the flash: its clock idles low, which holds the card
+    // selected for the whole read.
+    drive_and_settle(flash_cs, Level::High);
+    drive_and_settle(flash_clk, Level::Low);
+    drive_and_settle(flash_cs, Level::Low);
+    // Read Data at $000020.
+    for byte in [0x03u8, 0x00, 0x00, 0x20] {
+        for i in (0..8).rev() {
+            drive_and_settle(di, level((byte >> i) & 1 != 0));
+            drive_and_settle(flash_clk, Level::High);
+            drive_and_settle(flash_clk, Level::Low);
+        }
+    }
+    let mut got = 0u8;
+    for _ in 0..8 {
+        drive_and_settle(flash_clk, Level::High);
+        drive_and_settle(flash_clk, Level::Low);
+        let bit = level_of(dout.net_report()).is_none_or(|l| l == Level::High);
+        got = (got << 1) | u8::from(bit);
+    }
+    drive_and_settle(flash_cs, Level::High);
+    drop(pins);
+
+    assert_eq!(got, 0x21, "the byte at $000020, MSB first");
+    let fights = p58_fights(&bench);
+    assert!(
+        fights.is_empty(),
+        "a card with no command leaves P58 to the flash: {fights:?}"
+    );
+    let card = card_handle.lock().expect("card");
+    assert_eq!(card.commands, Vec::<u8>::new(), "the card took no frame");
+    assert!(!card.in_spi_mode(), "the card is still in SD mode");
+    drop(card);
     bench.finish();
 }

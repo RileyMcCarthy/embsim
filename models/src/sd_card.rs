@@ -93,6 +93,12 @@ pub struct SdCard {
     /// Chip select, as the adapter has resolved it. Commands only run when
     /// asserted. Active-low wiring is the adapter's business, not the card's.
     pub selected: bool,
+    /// True once the card has taken `CMD0` with chip select asserted, which is
+    /// what moves a card from SD mode, where it powers up, into SPI mode.
+    /// Before that its SPI data-out is not an output at all; see
+    /// [`SdCard::in_spi_mode`]. Only a power cycle would clear it, and this
+    /// model has none.
+    spi_mode: bool,
     /// Set when the host sends `CMD55`, so the next command is an ACMD.
     app_cmd: bool,
     /// A `CMD24` whose R1 response is still draining: the block it is waiting
@@ -150,6 +156,7 @@ impl SdCard {
             // of step with an adapter — [`crate::sd_card_component`] starts its
             // wire deselected, and the two would disagree until the first edge.
             selected: false,
+            spi_mode: false,
             app_cmd: false,
             pending_write: None,
             multi_write: None,
@@ -228,6 +235,18 @@ impl SdCard {
             // they take bytes in, exactly as `xfer_inner` returns.
             _ => 0xFF,
         }
+    }
+
+    /// Whether the card has entered SPI mode: it has taken `CMD0` while
+    /// selected.
+    ///
+    /// A card powers up in SD mode, where `DAT0` (SPI's data-out) is not
+    /// driven in response to chip select. An adapter that puts this card on
+    /// a bus keeps its data-out released until this is true, so a card that
+    /// shares its lines with another part (the P2-EC32MB's socket and flash)
+    /// does not drive them before its host has talked to it.
+    pub fn in_spi_mode(&self) -> bool {
+        self.spi_mode
     }
 
     /// Exchange one byte: the host shifts `mosi` in, the card shifts one out.
@@ -431,8 +450,13 @@ impl SdCard {
             // ACMD other -- accept and report ready.
             (true, _) => self.out.push_back(R1_READY),
 
-            // CMD0 GO_IDLE_STATE
-            (false, 0) => self.out.push_back(R1_IDLE),
+            // CMD0 GO_IDLE_STATE. Taken with chip select asserted (the only
+            // way a command reaches here), it is also what puts the card in
+            // SPI mode.
+            (false, 0) => {
+                self.spi_mode = true;
+                self.out.push_back(R1_IDLE);
+            }
 
             // CMD8 SEND_IF_COND -- an SDv2 card echoes the check pattern in an
             // R7 (R1 + 4 bytes). Answering this is what makes the host treat
