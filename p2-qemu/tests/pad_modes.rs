@@ -40,7 +40,9 @@ use embsim_board::{
     digital_drive, AttachError, Component, ComponentNetIo, EndpointRef, Finding, Harness, Level,
     NetState, PinDecl, System,
 };
-use embsim_boards::p2::{P2Package, P2_PULL_15K_OHMS};
+use embsim_boards::p2::{
+    P2Package, P2_PULL_15K_OHMS, P_HIGH_15K, P_INVERT_IN, P_INVERT_OUTPUT, P_LOW_FLOAT,
+};
 use embsim_core::virtual_clock;
 use embsim_p2_qemu::{P2Qemu, P2QemuHandle};
 
@@ -257,5 +259,124 @@ fn a_pad_pulling_its_net_high_reads_the_sink_holding_it_low() {
         .collect();
     assert_eq!(fights, Vec::<Finding>::new());
     assert_eq!(system.escalated_solves(), 0, "projections only");
+    drop(system);
+}
+
+/// The inverting guest, hand-assembled the same way (the encodings are
+/// [`PROGRAM`]'s, with new operands):
+///
+/// ```text
+///         org     0
+///         wrpin   ##P_HIGH_15K | P_LOW_FLOAT | P_INVERT_OUTPUT, #0
+///                                       ' FF80002B FC0E0000  ($5700)
+///         drvl    #0                    ' FD640058
+///         wrpin   ##P_INVERT_OUTPUT, #1 ' FF800020 FC0C0001  ($4000)
+///         drvh    #1                    ' FD640259
+///         wrpin   ##P_INVERT_IN, #2     ' FF800040 FC0C0002  ($8000)
+///         testp   #1 wc                 ' FD740240
+///   if_c  mov     pa, #"1"              ' C607EC31
+///   if_nc mov     pa, #"0"              ' 3607EC30
+///         wypin   pa, #62               ' FC27EC3E
+///         testp   #2 wc                 ' FD740440
+///   if_c  mov     pa, #"1"              ' C607EC31
+///   if_nc mov     pa, #"0"              ' 3607EC30
+///         wypin   pa, #62               ' FC27EC3E
+///         jmp     #\16                  ' FD800010  (to itself)
+/// ```
+///
+/// - `P0`: a 15 kΩ `HHH`, a floating `LLL`, the output inverted, `OUT` = 0
+///   — the pad drives high, so it is a 15 kΩ pull-up on its net.
+/// - `P1`: fast both ways, the output inverted, `OUT` = 1 — the pad drives
+///   its net low, and a fast pad reads the level its own output drives:
+///   `testp #1` reads 0.
+/// - `P2`: `DIR` clear, the input inverted, on a net a bench pin holds low
+///   — `testp #2` reads 1.
+const INVERTING: [u32; 17] = [
+    0xFF80_002B,
+    0xFC0E_0000,
+    0xFD64_0058,
+    0xFF80_0020,
+    0xFC0C_0001,
+    0xFD64_0259,
+    0xFF80_0040,
+    0xFC0C_0002,
+    0xFD74_0240,
+    0xC607_EC31,
+    0x3607_EC30,
+    0xFC27_EC3E,
+    0xFD74_0440,
+    0xC607_EC31,
+    0x3607_EC30,
+    0xFC27_EC3E,
+    0xFD80_0010,
+];
+
+#[test]
+#[ignore = "needs qemu-system-p2 (embsim qemu install); CI's p2-qemu-boot job runs it"]
+fn a_pad_whose_word_inverts_drives_and_reads_the_inverse() {
+    // The words the guest writes are the package's constants.
+    assert_eq!(
+        P_HIGH_15K | P_LOW_FLOAT | P_INVERT_OUTPUT,
+        (0x2B << 9) | 0x100
+    );
+    assert_eq!(P_INVERT_OUTPUT, 0x20 << 9);
+    assert_eq!(P_INVERT_IN, 0x40 << 9);
+
+    let image: Vec<u8> = INVERTING.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p2 = P2Qemu::with_boot_rom(&image, &[]).expect("qemu-system-p2 starts");
+    let handle = p2.handle();
+
+    virtual_clock::init(0.0, 160_000_000);
+
+    let system = System::new()
+        .component("P2", Box::new(P2Package::new(p2)))
+        .component("SINK", Box::new(Sink::new()))
+        .harness(supplies(
+            Harness::new()
+                .connect_str("SINK.A", "P2.P2")
+                .expect("the pad is a bench endpoint"),
+            "P2",
+        ))
+        .start()
+        .expect("the bench starts");
+
+    wait_for(
+        || handle.console(DEBUG_TX).len() >= 2 || handle.halted(),
+        Duration::from_secs(30),
+    );
+    let state = chip(&system, "P2", &handle);
+
+    assert_eq!(
+        handle.console(DEBUG_TX),
+        "01",
+        "P1 (fast, inverted, OUT = 1) reads its own low; P2 (input inverted) reads the low \
+         net as 1: {state}"
+    );
+    assert_eq!(
+        system.net_state("P2.P0"),
+        Some(NetState::Pulled(Level::High, P2_PULL_15K_OHMS)),
+        "a 15 kΩ HHH with the output inverted and OUT = 0 is a pull-up: {state}"
+    );
+    assert_eq!(
+        system.net_state("P2.P1"),
+        Some(NetState::Driven(Level::Low)),
+        "a fast pad with the output inverted and OUT = 1 drives low: {state}"
+    );
+    assert_eq!(
+        system.net_state("P2.P2"),
+        Some(NetState::Driven(Level::Low)),
+        "the sink holds P2 low; the input inversion drives nothing: {state}"
+    );
+    assert_eq!(
+        handle.publishes(),
+        2,
+        "drvl on P0 and drvh on P1 are the guest's only pad changes: {state}"
+    );
+    let fights: Vec<Finding> = system
+        .findings()
+        .into_iter()
+        .filter(|f| matches!(f, Finding::Contention { .. }))
+        .collect();
+    assert_eq!(fights, Vec::<Finding>::new());
     drop(system);
 }

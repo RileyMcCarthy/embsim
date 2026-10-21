@@ -74,6 +74,17 @@ the one before it promised, and says so here under **Breaking**.
   host that sampled MISO before each rising edge read `$FF` for every byte
   the card sent and the card never initialised. `SpiNorFlash::miso` reads the line released while the part
   is not driving it.
+- **A P2 pad honours its mode word's `P_INVERT_OUTPUT` and
+  `P_INVERT_IN`** (`embsim_boards::p2::pad_output_level` and
+  `pad_input_level`, new, with the two constants): in a logic-mode word
+  with `O` set the pad drives the inverse of `OUT`, through the `HHH`/`LLL`
+  mode of the level it drives, and with `I` set its `IN` reads the inverse
+  of its net. `pad_drive` read `OUT` as the level, so the word flexspin's
+  SD driver writes on `P58` (a 15 kΩ pull, the output inverted, `OUT` = 0)
+  was a 15 kΩ pull-down on the line the flash and the card share where
+  silicon pulls it up. p2-qemu's pad bus decodes both bits the same way. A
+  core that makes `IN` from `P2Pads::on_pad_sense` applies
+  `pad_input_level`.
 
 ## [0.4.0] - 2026-10-12
 

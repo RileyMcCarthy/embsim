@@ -35,7 +35,8 @@ use embsim_board::{
 use embsim_boards::p2::{
     bank_of, bank_pin_name, pin_name, P2Core, P2Package, P2Pads, P2ResetState, PadDrive,
     StartState, NUM_PADS, P2_FAST_OHMS, P2_FAST_SINK_POINTS, P2_FAST_SOURCE_POINTS,
-    P2_RESTART_DELAY_NS, P2_VDD_MAX_VOLTS, P2_VDD_MIN_VOLTS, P_HIGH_FAST, P_LOW_FAST,
+    P2_PULL_15K_OHMS, P2_RESTART_DELAY_NS, P2_VDD_MAX_VOLTS, P2_VDD_MIN_VOLTS, P_HIGH_15K,
+    P_HIGH_FAST, P_INVERT_OUTPUT, P_LOW_15K, P_LOW_FAST, P_LOW_FLOAT,
 };
 use embsim_core::virtual_clock::{self, ClockMode};
 use rstest::rstest;
@@ -247,18 +248,29 @@ impl P2Core for Recorder {
     }
 }
 
-/// A core that drives one pad high, fast, the moment it is started, the
-/// way a guest's `drvh` does: through the bank table the package hands it.
+/// A core that drives one pad the moment it is started, the way a
+/// guest's `wrpin` and then `drvh`/`drvl` do: `DIR` set, its `OUT` bit
+/// and its `WRPIN` word through the bank table the package hands it.
 struct PadDriver {
     pin: u8,
+    word: u32,
+    out: bool,
     pads: Option<P2Pads>,
     handle: Option<PinHandle>,
 }
 
 impl PadDriver {
+    /// Driven high, fast.
     fn on(pin: u8) -> Self {
+        Self::with_word(pin, P_HIGH_FAST | P_LOW_FAST, true)
+    }
+
+    /// Driven with `OUT` = `out` in the mode `word` configures.
+    fn with_word(pin: u8, word: u32, out: bool) -> Self {
         Self {
             pin,
+            word,
+            out,
             pads: None,
             handle: None,
         }
@@ -274,7 +286,7 @@ impl P2Core for PadDriver {
 
     fn start(&mut self) {
         let banks = self.pads.as_ref().expect("attached").bank_supplies();
-        let drive = match banks.pad_drive(self.pin, P_HIGH_FAST | P_LOW_FAST, true, true) {
+        let drive = match banks.pad_drive(self.pin, self.word, true, self.out) {
             PadDrive::Thevenin(drive) => Some(drive),
             PadDrive::Released | PadDrive::CurrentSource(_) => None,
         };
@@ -1407,6 +1419,97 @@ fn a_pad_drives_high_at_its_banks_supply_and_nothing_in_an_unpowered_bank() {
             }
         );
         let _ = P2_FAST_OHMS;
+        drop(system);
+    }
+}
+
+/// A logic-mode word with `O` set (`P_INVERT_OUTPUT`) drives the inverse
+/// of `OUT`, through the drive mode of the level it drives: the word
+/// flexspin's SD driver writes on `P58` — a 15 kΩ pull, the output
+/// inverted, `OUT` = 0 — is a 15 kΩ pull-up on the net, not a pull-down.
+#[rstest]
+fn a_pad_whose_word_inverts_its_output_drives_the_inverse_of_out() {
+    behaviour!(Test {
+        id: "p2-package.pad-invert-output",
+        covers: Some("boards/src/p2.rs#pad_output_level"),
+        given: "a P2 package out of reset, its P58 bank at 3.3 volts, around a core driving \
+                P58 with a logic-mode pin word whose output-invert bit is set, nothing else \
+                on the net",
+    });
+    expect!(
+        "pull-up-with-out-low",
+        "with 15 kilohm pulls both ways and the output bit low, the net is pulled high \
+         through 15 kilohms",
+        "the invert bit makes the pad drive high while the output bit is low, and the \
+         drive mode that applies is the high one"
+    );
+    expect!(
+        "released-with-out-high",
+        "with a 15 kilohm pull-up, a floating low mode and the output bit high, the net \
+         floats",
+        "the pad drives low, and its low mode is to float"
+    );
+    expect!(
+        "fast-low-with-out-high",
+        "with the fast mode both ways and the output bit high, the pad holds the net low",
+        "inverted, a high output bit is a low output"
+    );
+
+    let _lock = suite_lock();
+    let pin: u8 = 58;
+    let net = format!("P2.{}", pin_name(pin));
+    for (word, out, expected) in [
+        (
+            P_HIGH_15K | P_LOW_15K | P_INVERT_OUTPUT,
+            false,
+            NetState::Pulled(Level::High, P2_PULL_15K_OHMS),
+        ),
+        (
+            P_HIGH_15K | P_LOW_FLOAT | P_INVERT_OUTPUT,
+            true,
+            NetState::Floating,
+        ),
+        (
+            P_HIGH_FAST | P_LOW_FAST | P_INVERT_OUTPUT,
+            true,
+            NetState::Driven(Level::Low),
+        ),
+    ] {
+        // Each bench from virtual zero.
+        stepped();
+        let package = P2Package::new(PadDriver::with_word(pin, word, out));
+        let handle = package.handle();
+        let harness = grounded(Harness::new())
+            .power(ep("BENCH.RESN"), ep("P2.RESN"), 3.3)
+            .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+            .power(
+                ep("BENCH.VIO"),
+                ep(&format!("P2.{}", bank_pin_name(bank_of(pin)))),
+                3.3,
+            );
+        let tick = Tick::at(P2_RESTART_DELAY_NS + 1_000);
+        let fired = Arc::clone(&tick.fired);
+        let system = System::new()
+            .component("P2", Box::new(package))
+            .component("TICK", Box::new(tick))
+            .harness(harness)
+            .start()
+            .expect("the bench starts");
+        assert!(
+            wait_for(|| fired.lock().unwrap().is_some(), SETTLE),
+            "the bench runs past the core's start"
+        );
+        assert_eq!(
+            handle.start_state(),
+            StartState::Started {
+                at_ns: P2_RESTART_DELAY_NS
+            }
+        );
+        assert_eq!(
+            state(&system, &net),
+            expected,
+            "{net} with word {word:#06x} and OUT = {out}"
+        );
         drop(system);
     }
 }
