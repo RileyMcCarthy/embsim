@@ -60,6 +60,14 @@
 //!   supply rises above 3.6 V, noting that the open-input bias Figure 9-2
 //!   draws is not characterised there ([`AM26LV32_SUPPLY_NOTE`]). The Edge
 //!   board runs `U25` from `SC_5V`, so it is raised there.
+//! - **Input range** — §6.3 Recommended Operating Conditions: common-mode
+//!   input voltage `V_IC` −0.3 V to 5.5 V; §6.1 Absolute Maximum Ratings:
+//!   `V_I` −4 V to 8 V on an input (both page 4). Each `A` and `B` input
+//!   **declares** −0.3 V to 5.5 V recommended and the 8 V absolute maximum
+//!   against `GND` ([`AM26LV32_INPUT_LIMITS`]), and the engine raises
+//!   [`embsim_board::Finding::PinAboveRecommended`] once each time an input
+//!   rises above 5.5 V — an open-collector encoder's leg pulled up to 12 V,
+//!   say ([`AM26LV32_INPUT_NOTE`]).
 //!
 //! # The band, and what the engine says about it
 //!
@@ -97,11 +105,12 @@
 //!   drive it above 0 V in the engine's frame — exact while `GND` sits at
 //!   0 V there, as the line driver and the isolators assume.
 //! - **Not modelled**: propagation delay (`t_PLH`/`t_PHL` 20 ns max, §6.6)
-//!   and skew, the enable and disable times, the common-mode input range
-//!   (−0.3 V to 5.5 V, §6.3) and the differential one (±5.8 V, §6.3), the
-//!   inputs' absolute maximum (−4 V to 8 V on an input, ±12 V across a
-//!   pair, §6.1), the output current limit (±25 mA absolute, §6.1), supply
-//!   current, ESD and thermals.
+//!   and skew, the enable and disable times, the input range's floor (an
+//!   input below −0.3 V recommended, or −4 V absolute, is not reported: the
+//!   engine checks above a declared range only), the differential input
+//!   range (±5.8 V recommended, §6.3; ±12 V absolute, §6.1), the output
+//!   current limit (±25 mA absolute, §6.1), supply current, ESD and
+//!   thermals.
 
 use std::sync::{Arc, Mutex};
 
@@ -207,16 +216,53 @@ pub const AM26LV32_VCC_LIMITS: PinLimits = PinLimits {
     note: AM26LV32_SUPPLY_NOTE,
 };
 
+/// The lowest an input is recommended at: −0.3 V against `GND`, the
+/// common-mode input voltage `V_IC` minimum (SLLS202H §6.3, Recommended
+/// Operating Conditions, page 4). Declared, not checked: the engine
+/// reports only above a range ([`embsim_board::PinLimits`]).
+pub const AM26LV32_INPUT_MIN_VOLTS: Volts = -0.3;
+
+/// The highest an input is recommended at: 5.5 V against `GND`, the
+/// common-mode input voltage `V_IC` maximum (SLLS202H §6.3, page 4) — the
+/// range §1 and §8.4.1 give the receiver's ±200 mV sensitivity over.
+pub const AM26LV32_INPUT_MAX_VOLTS: Volts = 5.5;
+
+/// An input's absolute maximum rating: `V_I` 8 V against `GND` (SLLS202H
+/// §6.1, Absolute Maximum Ratings, page 4; its −4 V minimum is not
+/// declared, the engine checking only above).
+pub const AM26LV32_INPUT_ABS_MAX_VOLTS: Volts = 8.0;
+
+/// What an input above [`AM26LV32_INPUT_MAX_VOLTS`] costs, as the finding
+/// says it: SLLS202H specifies the thresholds and the fail-safe only over
+/// the common-mode input range (§6.3, §8.4.1). The finding names the 8 V
+/// absolute maximum (§6.1) from the declaration itself.
+pub const AM26LV32_INPUT_NOTE: &str =
+    "the receiver's thresholds are specified only over its -0.3 V to 5.5 V common-mode input range";
+
+/// Each `A` and `B` input's declared operating limits, against `GND`: the
+/// recommended −0.3 V to 5.5 V (SLLS202H §6.3, `V_IC`) and the 8 V absolute
+/// maximum (§6.1, `V_I`), which the engine checks against the input's
+/// solved net ([`embsim_board::PinLimits`]). The ±5.8 V recommended and
+/// ±12 V absolute differential ratings are not declared: a limit is on one
+/// pin, against its reference.
+pub const AM26LV32_INPUT_LIMITS: PinLimits = PinLimits {
+    recommended: (AM26LV32_INPUT_MIN_VOLTS, AM26LV32_INPUT_MAX_VOLTS),
+    absolute_max: Some(AM26LV32_INPUT_ABS_MAX_VOLTS),
+    note: AM26LV32_INPUT_NOTE,
+};
+
 // ============================================================
 // Pin table
 // ============================================================
 
 /// A differential input: an analog reader measured against `GND`, with
-/// its own port.
+/// its own port and the input range it declares
+/// ([`AM26LV32_INPUT_LIMITS`]).
 const fn input(number: &'static str, name: &'static str, port: InputPort) -> PinDecl {
     PinDecl::analog(number)
         .with_input(port)
         .with_reference("8")
+        .with_limits(AM26LV32_INPUT_LIMITS)
         .with_name(name)
 }
 
