@@ -728,6 +728,8 @@ fn a_block_written_over_nets_reads_back_over_nets() {
     let (bench, card) = spi_bench(SdCard::blank(CARD_CAPACITY));
     let pins = bench.handles.lock().expect("master pins");
     open_bus(&pins);
+    // A card answers in SPI mode only after CMD0 with chip select asserted.
+    assert_eq!(net_command(&pins, 0, 0, 1), vec![0x01], "CMD0 reports idle");
 
     // Write block 3.
     assert_eq!(net_command(&pins, 24, 3, 1), vec![0x00], "CMD24 accepted");
@@ -909,6 +911,8 @@ fn a_fat16_image_built_in_memory_reads_back_over_the_wire() {
     let (bench, _card) = spi_bench(SdCard::with_image(image.clone()));
     let pins = bench.handles.lock().expect("master pins");
     open_bus(&pins);
+    // A card answers in SPI mode only after CMD0 with chip select asserted.
+    assert_eq!(net_command(&pins, 0, 0, 1), vec![0x01], "CMD0 reports idle");
 
     assert_eq!(
         net_command(&pins, 17, 0, 1),
