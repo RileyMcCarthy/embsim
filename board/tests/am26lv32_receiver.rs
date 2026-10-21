@@ -23,7 +23,9 @@ use embsim_board::{
 };
 use embsim_boards::catalog::StandardCatalog;
 use embsim_core::virtual_clock::{self, ClockMode};
-use embsim_models::am26lv32::{AM26LV32_SUPPLY_NOTE, AM26LV32_VID_THRESHOLD_VOLTS};
+use embsim_models::am26lv32::{
+    AM26LV32_INPUT_NOTE, AM26LV32_SUPPLY_NOTE, AM26LV32_VID_THRESHOLD_VOLTS,
+};
 use rstest::rstest;
 use vibes_behaviour::{behaviour, expect, Test};
 
@@ -63,10 +65,24 @@ const R_OL: f64 = 100.0;
 /// The receiver, every pin on a net of its own, and the two loads when
 /// `loaded`.
 fn netlist_text(loaded: bool) -> String {
+    netlist_text_pulled_up(loaded, false)
+}
+
+/// The open-collector encoder's pull-up on `1A` (`MIGRATING-MAD.md` §6):
+/// 4.7 kΩ from the `PU` net, which the scenario holds at the pull-up's
+/// rail.
+const PULL_UP_OHMS: f64 = 4_700.0;
+
+/// [`netlist_text`], with [`PULL_UP_OHMS`] from a `PU` net of its own to
+/// `1A` when `pulled_up`.
+fn netlist_text_pulled_up(loaded: bool, pulled_up: bool) -> String {
     let mut comps = String::from(
         "    (comp (ref \"U1\") (value \"AM26LV32IDR\") (libsource (lib \"Interface\") (part \"AM26LV32IDR\")))\n",
     );
     let extra = |net: &str| -> String {
+        if pulled_up && net == "1A" {
+            return " (node (ref \"R3\") (pin \"1\"))".to_string();
+        }
         if !loaded {
             return String::new();
         }
@@ -96,7 +112,7 @@ fn netlist_text(loaded: bool) -> String {
         ("15", "4B"),
         ("16", "VCC"),
     ];
-    let nets: String = pins
+    let mut nets: String = pins
         .iter()
         .enumerate()
         .map(|(code, (pin, net))| {
@@ -107,6 +123,15 @@ fn netlist_text(loaded: bool) -> String {
             )
         })
         .collect();
+    if pulled_up {
+        comps.push_str(&format!(
+            "    (comp (ref \"R3\") (value \"{PULL_UP_OHMS}\") (libsource (lib \"Device\") (part \"R\")))\n"
+        ));
+        nets.push_str(&format!(
+            "    (net (code \"{}\") (name \"PU\") (node (ref \"R3\") (pin \"2\")))\n",
+            pins.len() + 1
+        ));
+    }
     if loaded {
         comps.push_str(&format!(
             "    (comp (ref \"R1\") (value \"{Y1_LOAD_OHMS}\") (libsource (lib \"Device\") (part \"R\")))\n\
@@ -132,7 +157,13 @@ fn system_shorted(
     held: &[(&str, Volts)],
     shorts: &[(&str, &str)],
 ) -> System {
-    let parsed = netlist::parse(&netlist_text(loaded)).expect("the bench netlist parses");
+    system_from(&netlist_text(loaded), vcc, held, shorts)
+}
+
+/// The bench `text` describes, at `vcc`, with the scenario's held nets and
+/// shorts.
+fn system_from(text: &str, vcc: Volts, held: &[(&str, Volts)], shorts: &[(&str, &str)]) -> System {
+    let parsed = netlist::parse(text).expect("the bench netlist parses");
     let board = Board::from_netlist(parsed, &StandardCatalog::base_registry())
         .expect("the catalog places the receiver by its number");
     let mut scenario = Scenario::default().net_stuck("B.GND", 0.0);
@@ -493,5 +524,88 @@ fn the_engine_reports_an_am26lv32_pair_read_inside_its_band_with_a_common_mode_a
         );
         assert_eq!(*band, AM26LV32_VID_THRESHOLD_VOLTS, "{path}");
         assert_eq!(*output, Level::High, "{path}");
+    }
+}
+
+/// The datasheet's input range, written out (SLLS202H §6.3, Recommended
+/// Operating Conditions: `V_IC` −0.3 V to 5.5 V; §6.1, Absolute Maximum
+/// Ratings: `V_I` 8 V max).
+const VI_MIN: Volts = -0.3;
+const VI_MAX: Volts = 5.5;
+const VI_ABS_MAX: Volts = 8.0;
+
+/// `1A` at rest under the pull-up to `rail`: the pull-up against the input's
+/// own port, 12 kΩ to 0.83 V (SLLS202H §6.5, Figure 9-2).
+fn pulled_up_volts(rail: Volts) -> Volts {
+    let (r_in, v_bias) = (12_000.0, 0.83);
+    v_bias + (rail - v_bias) * r_in / (r_in + PULL_UP_OHMS)
+}
+
+#[rstest]
+#[case::to_5_volts(5.0, false)]
+#[case::to_12_volts(12.0, true)]
+fn the_engine_reports_an_am26lv32_input_pulled_up_above_its_recommended_range(
+    #[case] rail: Volts,
+    #[case] over: bool,
+) {
+    behaviour!(Test {
+        id: "am26lv32.input-range",
+        covers: Some("models/src/am26lv32.rs#AM26LV32_INPUT_LIMITS"),
+        given: "an enabled AM26LV32 from the catalog, its 1A input released under a 4.7 \
+                kilohm pull-up to 5 or 12 volts, as an open-collector encoder leaves it, and \
+                1B held at 0.5 volts",
+    });
+    expect!(
+        "over-range-finding",
+        "under the 12 volt pull-up, 1A rests near 8.9 volts and is reported once at build \
+         and once live, beyond its 8 volt absolute maximum",
+        "each input declares SLLS202H's minus 0.3 to 5.5 volt common-mode input range and its 8 \
+         volt absolute maximum, and the engine checks the solved input against them"
+    );
+    expect!(
+        "in-range-silent",
+        "under the 5 volt pull-up, 1A rests near 3.8 volts and no pin is reported above its \
+         range"
+    );
+    let held = [("G", 3.3), ("NG", 3.3), ("1B", 0.5), ("PU", rail)];
+    let text = netlist_text_pulled_up(false, true);
+    let a = pulled_up_volts(rail);
+    let built = {
+        let _lock = suite_lock();
+        system_from(&text, 3.3, &held, &[])
+            .build()
+            .expect("the bench builds")
+    };
+    let (states, live) = run_system(system_from(&text, 3.3, &held, &[]), &["1A", "1Y"]);
+    let a_live = volts(states[0], "1A");
+    assert!((a_live - a).abs() < 1e-6, "1A {a_live} V, not {a}");
+    assert_eq!(states[1], NetState::Driven(Level::High), "1Y");
+    for (path, findings) in [
+        ("build", built.diagnostics().findings().to_vec()),
+        ("live", live),
+    ] {
+        let reported = supply_findings(&findings);
+        if !over {
+            assert!(reported.is_empty(), "{path}: {findings:?}");
+            continue;
+        }
+        let [Finding::PinAboveRecommended {
+            part,
+            pin,
+            volts,
+            min,
+            max,
+            absolute_max,
+            note,
+        }] = reported.as_slice()
+        else {
+            panic!("{path}: one limit finding, not {findings:?}");
+        };
+        assert_eq!((part.as_str(), pin.as_str()), ("B.U1", "2"), "{path}");
+        assert!((volts - a).abs() < 1e-6, "{path}: {volts} V, not {a}");
+        assert_eq!((*min, *max), (VI_MIN, VI_MAX), "{path}");
+        assert_eq!(*absolute_max, Some(VI_ABS_MAX), "{path}");
+        assert!(*volts > VI_ABS_MAX, "{path}: {volts} V");
+        assert_eq!(note, AM26LV32_INPUT_NOTE, "{path}");
     }
 }
