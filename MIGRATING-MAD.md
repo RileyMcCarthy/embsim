@@ -1033,19 +1033,21 @@ where `mad-emulator` gives it the debug build on the bare chip's
 - `IC14` as drawn passes nothing to the drive (section 6), so a scenario
   that needs the carriage to move fails on the board as drawn unless the
   machine's carrier is bodged there and the file says so;
-- the production image in `mad.toml` reports a processor-core fault in
-  every state read from 1.24 s to 1.8 s of board time, while the core
-  says all 8 cogs run (measured, MaD #278). The firmware raises it while
-  one of its cog channels has not reported itself running, and enabling
-  motion needs it clear. Eight running cogs mean every channel was
-  launched, so the causes that fit are a stall in the main cog's loop
-  before its next cog-manager pass (a channel reports running only from
-  that pass), a stack canary mismatch, or a stalled CONTROL cog keeping an
-  early reading; a lock the manager could not create fits poorly, since
-  that channel stops before its cog starts (inferred; read: MaD's
-  `dev_cogManager.c`, `Main/MaD.c`). The core fault is first in the
-  firmware's order, so it also hides a watchdog fault. Why it stands is
-  MaD's to find before the motion scenarios run here.
+- the production image's first state read falls inside the cog manager's
+  start-up window, so it reads a processor-core fault until about 1.31 s
+  of board time: a channel reports running only from cog 0's second
+  100 ms pass, and by then all seven channels run with their locks and
+  canaries intact (measured from hub RAM, MaD #278; read: MaD's
+  `dev_cogManager.c`, `Main/MaD.c`). After that, with nothing on the
+  carrier's `J17`, `P22` (`GPI_3`, through `IC12`, `U8` and `R8`'s
+  pull-up) rests high and the firmware reads an emergency-stop power
+  fault (`ESD_POWER`) and refuses motion (read: MaD's
+  `HAL_GPIO_config.c`, `app_control.c`; `mad-emulator` pulls `P22` low on
+  its bench). MaD #278 closes `J17`'s loop in the project files, from
+  `5V_IO` to `GND_IO` as the switch loops take them, standing for a
+  powered emergency-stop circuit; with it the state reads unfaulted and
+  motion enables over `J1` on the production image (measured). What the
+  real machine has on `J17` is MaD's to confirm (section 6).
 
 *Needs:* E4 in the pinned embsim and step 9's cosim file.
 *Files:* `SIL/makefile`, `SIL/mad-catalog/tests/pty_protocol.rs`,
