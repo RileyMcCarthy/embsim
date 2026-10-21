@@ -29,7 +29,9 @@ cargo test -p embsim-board --test edgeboard --test sd_card_spi --test rs422_dete
 # the first clock after them; on the P2-EC32MB with the flash select switch
 # closed, where every pulse of the card's clock selects the flash, a master
 # clocking the card with the clock idling high reads its CMD0 and CMD8
-# replies, the flash decodes no instruction, and the card alone drives P58.
+# replies, the flash decodes no instruction, and the card alone drives P58;
+# and a master reading the flash there, which selects the card on every low
+# half of the flash's clock, finds a card that has had no CMD0 off P58.
 cargo test -p embsim-board --test shared_spi_bus
 
 # The MaD machine's three boards as a project with an encoder on the
