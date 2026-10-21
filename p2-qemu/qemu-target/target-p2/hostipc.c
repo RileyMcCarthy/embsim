@@ -10,8 +10,8 @@
  * in lockstep: one message pair crosses per STOP.
  *
  *   embsim -> qemu   RUN: run until cog clock H, with these net levels
- *                    (in_ext), these pads reading their own OUT (strong),
- *                    and these banks powered.
+ *                    (in_ext), these pads reading their own output level
+ *                    (strong), and these banks powered.
  *   qemu -> embsim   STOP: why (a pad's drive changed / H reached / the clock
  *                    word changed / nothing ran / a cog stalled / the console
  *                    tap filled), the stop instant in clocks, the new
