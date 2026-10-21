@@ -55,6 +55,15 @@ the one before it promised, and says so here under **Breaking**.
 
 ### Fixed
 
+- **An SD card leaves DO released until it has taken `CMD0` with chip
+  select asserted** (`SdCard::in_spi_mode`, new). A card powers up in SD
+  mode, and `SdCardComponent` drove DO whenever chip select was low, from
+  power-up. On a P2-EC32MB with its flash select switch closed, every low
+  half of the flash's clock (`P60`) selects the card, so each flash read
+  put the card on `P58` against the flash and the net report showed
+  contention on `P2_IO58`. A host that talks to the card without sending
+  `CMD0` first now reads nothing back, as from a real card.
+
 - **The W25Q128JV drives DO only while it shifts data, status or an ID
   out** (`SpiNorFlash::drives_do`, new): selected, DO stays at high
   impedance through the instruction and any address, and for an

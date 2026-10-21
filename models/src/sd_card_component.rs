@@ -42,7 +42,12 @@
 //! # Idle, and the pull-up the host is assuming
 //!
 //! A deselected card releases MISO — this adapter drives nothing at all rather
-//! than driving high, because that is what a real card does. Nothing then
+//! than driving high, because that is what a real card does. So does a card
+//! that has not yet taken `CMD0` with chip select asserted
+//! ([`SdCard::in_spi_mode`]): it powers up in SD mode, where chip select does
+//! not make DO an output, so selecting it does not put it on the line. On the
+//! P2-EC32MB that matters, because the card's chip select is the flash's clock
+//! and every flash read selects the card. Nothing then
 //! drives that net, so **the bench needs the pull-up the host firmware
 //! assumes**; SPI-mode SD drivers habitually enable one on the receive pin for
 //! exactly this reason. Modelled as a bench resistor rather than pretended
@@ -164,6 +169,9 @@ pub const SD_CARD_PINS_SPI_ONLY: [PinDecl; 4] = [
 struct Wire {
     clk_high: bool,
     selected: bool,
+    /// The card's [`SdCard::in_spi_mode`], copied after each byte it takes.
+    /// Until it is set, DO stays released whatever chip select does.
+    spi_mode: bool,
     /// The last level seen on DI. Sampled at the clock's rising edge; the host
     /// sets it up beforehand, so the engine delivers that sense first.
     mosi: bool,
@@ -262,13 +270,15 @@ impl SdCardComponent {
 }
 
 /// Put the bit the card is currently presenting on DO, or release the line
-/// when the card is not selected.
+/// when the card is not selected or has not yet entered SPI mode.
 ///
 /// A deselected card is genuinely high-impedance, so this drives `None` rather
 /// than a high level: whether the net then reads high is the bench's pull-up to
-/// decide, not this component's to assert.
+/// decide, not this component's to assert. A card fresh from power-up is in SD
+/// mode, where chip select does not make DO an output, so it releases the
+/// line too until it has taken `CMD0` while selected.
 fn drive_data_out(wire: &Wire, data_out: &PinHandle) {
-    if !wire.selected {
+    if !wire.selected || !wire.spi_mode {
         data_out.set_drive(None);
         return;
     }
@@ -375,7 +385,10 @@ impl Component for SdCardComponent {
                         wire.in_bits = 0;
                         // The card consumes the byte; what it returns is what
                         // has already been shifted out, bit by bit.
-                        card.lock().expect("card mutex").xfer(byte);
+                        let mut card = card.lock().expect("card mutex");
+                        card.xfer(byte);
+                        wire.spi_mode = card.in_spi_mode();
+                        drop(card);
                         counters.bytes.fetch_add(1, Ordering::Relaxed);
                     }
                     // Move to the next outgoing bit only after sampling, so a
