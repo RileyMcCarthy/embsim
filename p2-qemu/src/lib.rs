@@ -89,9 +89,12 @@
 //! released or a pull (at or above [`WEAK_DRIVE_OHMS`]) — a pad pulling a
 //! line high through 15 kΩ reads what the line resolved to, which is what
 //! makes an I2C slave's clock stretch and its ACK visible to the master
-//! driving through the pull mode. A pad driven fast keeps reading its own
-//! `OUT` bit, which is what p2core does and what keeps the two engines'
-//! state traces identical instruction for instruction.
+//! driving through the pull mode. A pad driven fast keeps reading the
+//! level its own output drives — its `OUT` bit, inverted when its word
+//! sets `P_INVERT_OUTPUT` — which is what p2core does and what keeps the
+//! two engines' state traces identical instruction for instruction. A
+//! word that sets `P_INVERT_IN` inverts what the pad's `IN` reads
+//! (`embsim_boards::p2::pad_input_level`).
 
 #![warn(missing_docs)]
 
@@ -518,8 +521,8 @@ struct Pads {
     /// value, and inventing one would hide the fault.
     in_ext: [u32; 2],
     /// Pads whose **published** drive is a strong source (under
-    /// [`WEAK_DRIVE_OHMS`]): these read their own `OUT` bit; every other pad
-    /// reads its net. Recomputed at each publish.
+    /// [`WEAK_DRIVE_OHMS`]): these read the level their own output drives;
+    /// every other pad reads its net. Recomputed at each publish.
     strong: [u32; 2],
 
     // ---- what each net was told -----------------------------------------

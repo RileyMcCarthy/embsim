@@ -234,13 +234,15 @@ The guest-facing bus, in `qemu-target/target-p2/hostipc.c`:
   `P2_FAST_OHMS`, 17.99 Ω fitted to the datasheet's `Voh`/`Vol` table,
   1.5 k / 15 k / 150 kΩ, float; the current-source modes are not mapped and
   present nothing), and a `WRPIN` on a driven pad republishes it at its new
-  strength. A bank reads the guest's own `OUT` bit where the pad's published
-  drive is fast, and the **net** everywhere else — released pads and pads
-  pulling through a resistive mode alike. That is why the ROM can use P61 as
-  both a strap and a chip select and float P58 to read the flash, and why a
-  pad pulling a line high through 15 kΩ reads the sink holding it low
-  (`tests/pad_modes.rs`) — the read an I2C master's clock stretch and ACK
-  depend on.
+  strength. A bank reads the level the pad's own output drives (`OUT`, or
+  its inverse under `P_INVERT_OUTPUT`) where the pad's published drive is
+  fast, and the **net** everywhere else — released pads and pads pulling
+  through a resistive mode alike. A word with `P_INVERT_IN` then inverts what
+  the bank reads (`embsim_boards::p2::pad_input_level`). That is why the ROM
+  can use P61 as both a strap and a chip select and float P58 to read the
+  flash, and why a pad pulling a line high through 15 kΩ reads the sink
+  holding it low (`tests/pad_modes.rs`) — the read an I2C master's clock
+  stretch and ACK depend on.
 - A pad's high is its bank's supply; a pad driven in a bank whose supply
   names no voltage presents nothing and the package reports the bank once;
   a supply that moves takes the pads driven in its bank with it at the
