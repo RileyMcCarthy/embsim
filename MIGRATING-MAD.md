@@ -56,6 +56,40 @@ its shape. Why each choice was made is [`NODES.md`](NODES.md) §13.*
 | the stepper, encoder, switches, gantry, sample and load cell, coupled by callbacks | the `mad-machine` bench component, one plant with electrical pins |
 | `make playground`, `e2e-emulator`, `playground-iss`, `playground-rom`, and the nightly | `embsim run mad-cosim.toml …` and `embsim run mad-serial-boot-cosim.toml …` (the playgrounds on their headed copies): the app in the host's Chrome, its clock metered by the board's over DevTools |
 
+*Revised 2026-10-21 (MaD #278, step 9):* every file's host is on the
+carrier's debug header `J1`, and the module's flash holds MaD's production
+build. The route below is the user's decision; section 6 has the board facts
+behind it.
+
+**The route to the firmware.** The user's decision: the app reaches the
+firmware over the carrier's debug header `J1` (`J1.1` = `P62`, `J1.2` =
+`P63`, `J1.3` = `RESn`, `J1.4` = `GND`) through a Prop Plug, with the
+**production** build (`pio run -e propeller2`). The app flashes over `J1`
+(MaD's `Software/Control/README.md`, "Firmware flashing", which covers
+flashing only). That build's MAIN channel receives on `P63` and transmits
+on `P62` at 2,000,000 baud (MaD's `HW_pins.h`, `HW_PIN_MAIN_RX`/`_TX`;
+`HAL_serial_config.c`, the row without
+`ENABLE_DEBUG_SERIAL`), and `J1`'s two lines go straight to the socket's
+fingers 50 and 49 (`mad_edge.net`). The Raspberry Pi's connector `J4` cannot
+be the route on this module: its `RPI_RX`/`RPI_TX` go only to the isolator
+`IC2`, whose carrier side is on `P52`–`P55`, and the P2-EC32MB has no edge
+finger for `P40`–`P57`, which it keeps for its PSRAMs
+(`boards/netlists/p2_ec32mb.net`, the header's no-connects). The
+`propeller2_debug` build's MAIN channel is `P53`/`P55`
+(`HW_PIN_RPI_RX`/`_TX`), so on the EC32MB it runs on the PSRAM's pins and a
+host on `J4` hears nothing (measured on MaD #278's first round). Nothing
+sits on `J4` in any of the four files.
+
+**Open: which image the machine runs.** By default MaD Control flashes a
+release's madEdge image, the `propeller2_debug` build, whose protocol is on
+`P53`/`P55` (read: MaD's `Software/Control/src/firmware/release.ts`,
+`pickFirmwareAsset`; the release job in `.github/workflows/ci.yml`); the
+single-port production build is the release's `-release.bin`, which the app
+flashes only as a local file. If the machine runs the madEdge image, the
+route needs revisiting, since that image's protocol cannot reach the chip
+on a P2-EC32MB (section 6). If it runs the production image, the app's
+default asset would need changing to match. The user is to confirm.
+
 Four project files, two machines each with two hosts. The user's rule for
 MaD's SIL (`NODES.md` §18) is that the firmware on the ISS runs with the
 control app in the host's Chrome, its page and workers held to the board's
@@ -64,16 +98,15 @@ that keeps wall time: every run of the app is a `-cosim` file. The stepped
 test sends the host's bytes itself, so the files it and `make check` load
 keep a `host-serial`, which needs no browser:
 
-- `SIL/mad.toml`: the machine as it runs, booting the firmware off the
-  module's flash, its host a `host-serial` on the Pi's connector. `make
-  check` and `mad-catalog/tests/mad.rs` load it (step 9).
+- `SIL/mad.toml`: the machine as it runs, booting the production firmware
+  off the module's flash, its host a `host-serial` on the debug header
+  `J1`. `make check` and `mad-catalog/tests/mad.rs` load it (step 9).
 - `SIL/mad-cosim.toml`: the same file with `HOST` a `chrome-cdp` on the same
   four pins and wires (section 4 shows the entry). The e2e suite and the
   playgrounds run it (steps 10 and 11).
-- `SIL/mad-serial-boot.toml`: the same boards with the module's option
-  switch set for a serial boot, an erased flash, and the host on the
-  carrier's debug header (`J1`: `P62`, `P63`, `RESn`, `GND`), checked by
-  `make check`.
+- `SIL/mad-serial-boot.toml`: the same boards and the same host with the
+  module's option switch set for a serial boot and an erased flash, checked
+  by `make check`.
 - `SIL/mad-serial-boot-cosim.toml`: that file with the `chrome-cdp` host.
   The browser flashes the firmware through it (`make playground-rom`
   today).
@@ -350,14 +383,17 @@ node with pins.
 ## 4. The project files
 
 `SIL/mad.toml`, as it would read. Every wire lands on a connector; the
-harness was checked against `mad_edge.net` (the nets of `J4`, `J9`–`J16`,
-`J20`, `J21` and `JP1`–`JP5` read from it).
+harness was checked against `mad_edge.net` (the nets of `J1`, `J9`–`J16`,
+`J20`, `J21` and `JP1`–`JP5` read from it). *Revised 2026-10-21:* the host
+on `J1` and the production image, as MaD #278 builds the file; the
+machine's lines below are the first draft's, which #139 revises.
 
 ```toml
 # The MaD tensile tester: the Edge carrier, the P2-EC32MB module in its
 # socket running the firmware on MaD's instruction-set simulator, the DS2
 # force-gauge add-on on the force cable, the machine on the carrier's
-# connectors, and the Raspberry Pi's serial port as a PTY.
+# connectors, and the Prop Plug's serial port on the debug header J1 as a
+# PTY.
 
 requires-embsim = "0.3"
 
@@ -379,8 +415,9 @@ kind = "p2"
 [board.model.options]
 core = "mad-p2iss"
 
-# Stage-1 and the propeller2_debug program, laid out by `make flash-image`:
-# the ROM boots the firmware off the module's flash.
+# Stage-1 and the production program (pio env propeller2), laid out by
+# `make flash-image`: the ROM boots the firmware off the module's flash. Its
+# MAIN channel is P63 receive, P62 transmit, the pins J1 carries.
 [[board.model]]
 value = "SPI Flash 16MB (128Mb)"
 kind = "w25q128jv"
@@ -425,7 +462,7 @@ a = "EDGE.J9"
 b = "DS2.J1"
 map = [["1", "1"], ["5", "2"], ["4", "3"], ["2", "4"], ["3", "5"]]
 
-# ---- Supplies: the bench's, and the Pi's side of the isolator IC2 ----------
+# ---- Supplies: the bench's ------------------------------------------------
 
 [[wire]]
 from = "BENCH.12V"
@@ -467,33 +504,26 @@ from = "BENCH.IOGND"
 to = "EDGE.J10.2"
 volts = 0.0
 
-[[wire]]                 # RPI_5V: IC2's Pi-side supply
-from = "PI.5V"
-to = "EDGE.J4.1"
-volts = 5.0
+# Nothing on J4, the Pi's connector: its line reaches IC2 and the carrier's
+# P52-P55 only, which the P2-EC32MB has no finger for (section 1).
 
-[[wire]]                 # RPI_GND
-from = "PI.GND"
-to = "EDGE.J4.6"
-volts = 0.0
+# ---- The host on the debug header -------------------------------------------
 
-# ---- The host on the Pi's connector ----------------------------------------
-
-[[wire]]                 # the Pi's I/O rail: its GPIO are 3.3 V
-from = "PI.3V3"
+[[wire]]                 # the adapter's rail: P62/P63's bank is 3.3 V
+from = "ADAPTER.3V3"
 to = "HOST.VIO"
 volts = 3.3
 
-[[wire]]
-from = "PI.GND"
-to = "HOST.GND"
+[[wire]]                 # the carrier's GND, J1.4
+from = "HOST.GND"
+to = "EDGE.J1.4"
 
-[[wire]]                 # RPI_RX: IC2's input INC, what the Pi sends
+[[wire]]                 # P63, the chip's receive pin
 from = "HOST.TX"
-to = "EDGE.J4.3"
+to = "EDGE.J1.2"
 
-[[wire]]                 # RPI_TX: IC2's output OUTA, what the Pi receives
-from = "EDGE.J4.2"
+[[wire]]                 # P62, the chip's transmit pin
+from = "EDGE.J1.1"
 to = "HOST.RX"
 
 # ---- The machine on the carrier's connectors -------------------------------
@@ -649,17 +679,19 @@ a = "DS2.U1.3"           # U1's reset on a net of its own
 b = "DS2.U1.13"
 ```
 
-`SIL/mad-serial-boot.toml` is the same file with three differences:
+`SIL/mad-serial-boot.toml` is the same file with two differences:
 
 - `S301` pole 2 closed (the `P59` pull-up `R302`, the serial strap
   `mad-emulator`'s `STRAP` stands in for today: the `Pull` that
   `run_iss_rom` wires to `P2.P59`, `MaDSim/src/main.rs`)
   and pole 3 open;
-- the `w25q128jv` entry without `image`: the module's flash erased;
-- the host on the carrier's debug header instead of the Pi's connector:
-  `HOST.TX` to `EDGE.J1.2` (`P63`, the chip's receive pin), `EDGE.J1.1`
-  (`P62`) to `HOST.RX`, `HOST.GND` to `EDGE.J1.4`, and `HOST.VIO` from a
-  `[[wire]]` at the adapter's 3.3 V.
+- the `w25q128jv` entry without `image`: the module's flash erased.
+
+The host is the same, on the same pins: the ROM's serial loader and the
+production build's protocol are both on `P62`/`P63`, so one adapter on `J1`
+flashes the firmware and then drives it. `J1.3` (`RESn`) stays unwired in
+both: no host kind has modem-control pins, the flash boot runs from
+power-up, and the ROM's serial boot answers without a reset.
 
 `SIL/mad-cosim.toml` and `SIL/mad-serial-boot-cosim.toml` are their bases
 with the `HOST` entry a `chrome-cdp` (E4) on the same four pins and the same
@@ -674,9 +706,16 @@ kind = "chrome-cdp"
 [component.options]
 baud = 2000000
 devtools_port = 9222
+granted = true
 usb_vendor_id = 0x0403
-usb_product_id = 0x6001
+usb_product_id = 0x6015
 ```
+
+`0403:6015` is an FTDI FT231X's, the chip in Parallax's USB adapters
+(inferred; the P2-EVAL's own Parallax FT231X reports it, measured), and the
+ids MaD's ROM route names today (`--usb-product-id 0x6015`, `make
+playground-rom`). `granted = true` grants the port to every origin, as the
+board route's `--granted` does today.
 
 The options are the kind's (`PROJECTS.md` §5). `check` launches nothing,
 but refuses the file on a machine where it finds no Chrome. `run` launches
@@ -905,31 +944,65 @@ brings E4 (on a machine with Chrome: section 4).
 `Config::default()` on that bump, and the firmware's own writes set the
 gain and the reference it set by hand. *Files:* `SIL/mad.toml`,
 `SIL/mad-cosim.toml`, `SIL/mad-serial-boot.toml`,
-`SIL/mad-serial-boot-cosim.toml`, `SIL/makefile`,
-`SIL/MaDSim/src/iss_description.rs` (the registration). *Done when:* `make
+`SIL/mad-serial-boot-cosim.toml`, `SIL/makefile` (`check`, and
+`p2image-production`: `flash-image` lays out the production program from
+here on, step 4's target with the other image),
+`SIL/MaDSim/src/iss_description.rs` (the registration),
+`.github/workflows/ci.yml` (the jobs that run `tests/mad.rs` build
+`pio run -e propeller2` too and keep it out of `.pio`). *Done when:* `make
 check` exits 0, and `SIL/mad-catalog/tests/mad.rs`, stepped, loading
-`mad.toml` (its `host-serial`), holds what `NODES.md` §13 review item 1
-proposed: a byte from the host reaches `P53`, a byte the firmware sends on
-`P55` reaches `HOST.RX`, `P19`–`P21` read inactive at rest, the drive is
-enabled, and the encoder's edges reach `P9` and `P10`. The
-encoder's case holds only with the pairs section 4 wires: a single-ended
-encoder on `A+`/`B+` with `JP2`/`JP3` closed leaves `P9` and `P10` high
-at every count, each low no differential at `U25`, which an AM26LV32 reads
-as its fail-safe high (SLLS202H §8.4.1, Table 8-1; section 6, "The encoder
-through `U25`"); `board/tests/edge_encoder_pairs.rs` shows both on
-`boards/projects/edge-ec32-ds2.toml`. The host's
-byte crosses `IC2` on the part's default state, not on a valid high
-(section 6): with `IC2`'s Pi side on `RPI_5V` its input thresholds are
-1.5 V and 3.5 V, so the host's 0 V low is a valid low and its 3.3 V high
-is an open input, for which an `ISO6742DWR`, without the `F` option,
-drives its default high (SLLSFJ6G's "INx open" row;
-`models/src/isolation/iso67xx.rs`, `an_undecidable_input_gets_the_default_output`).
-`IC2` alone on those rails, a `scripted-source` on `INC`, gave `P53`
-`Driven(High)` for 3.3 V and `Driven(Low)` for 0 V; the `ISO6742FDWR`
-gave `Driven(Low)` for both. That test builds the
-system from the file with `Project::load` and the set
-(`embsim_cli::shipped()` and `mad_catalog::register`), as
-`board/tests/edge_project_live.rs` builds its file.
+`mad.toml` (its `host-serial`), holds what the board as drawn does.
+
+*As built (MaD #278, 2026-10-21).* `NODES.md` §13 review item 1 proposed:
+a byte from the host reaches `P53`, a byte the firmware sends on `P55`
+reaches `HOST.RX`, `P19`–`P21` read inactive at rest, the drive is enabled,
+and the encoder's edges reach `P9` and `P10`. Three of those cannot hold as
+written, each for a reason of the board's:
+
+- **The host's line.** On the P2-EC32MB the Pi's line never reaches the
+  chip (section 1), so the route moved to `J1` and the production build,
+  and the line's check became a protocol round trip there: once the
+  firmware has booted off the flash, a ProtoEmb READ from `HOST.TX`
+  reaches the chip's own `P63`, falling once for every fall of its bits,
+  and the firmware's DATA answer on `P62` reaches `HOST.RX`, its check byte
+  intact, and decodes with MaD's generated Rust codec (the firmware
+  version, a string the program holds, and the machine's state: motion
+  disabled, no test running). The
+  production image prints its boot line on `P62` at the FlexC console's
+  default rate (230,400 baud, inferred) before its serial core takes the
+  pin at 2,000,000, so the host reads that line as framing errors
+  (measured). A request that lands before the serial core has armed its
+  receive interrupt would go unanswered (inferred), so the case asks again
+  every 20 ms of board time; the first request, at 1.226 s, was answered at
+  1.235 s (measured).
+- **The drive.** "The drive is enabled" is the wrong expectation for a
+  machine at rest: the firmware leaves `P6` (ENA) released after boot, as a
+  machine in DISABLED does (measured at 1.6 s on the debug image). And
+  `IC14`, the servo isolator, has its secondary ground pins on a net of
+  their own (section 6), so nothing it drives reaches the drive's `STEP`,
+  `DIR` or `ENA`, and `P5` reads its default high whatever `SRDY` says.
+  The case holds that, at rest.
+- **The encoder.** The carrier's own step path runs through `IC14`, so the
+  case drives the drive's inputs from the bench, with the chip held in
+  reset from `J1.3`; the encoder's pairs then reach `P9` and `P10` through
+  `U25` and `IC16` in the encoder's phase, each `-` leg the opposite of its
+  `+`. The encoder's case holds only with the pairs section 4 wires: a
+  single-ended encoder on `A+`/`B+` with `JP2`/`JP3` closed leaves `P9` and
+  `P10` high at every count, each low no differential at `U25`, which an
+  AM26LV32 reads as its fail-safe high (SLLS202H §8.4.1, Table 8-1;
+  section 6, "The encoder through `U25`"); `board/tests/edge_encoder_pairs.rs`
+  shows both on `boards/projects/edge-ec32-ds2.toml`.
+
+`P16`–`P21` read inactive at rest, as proposed. The test builds the system
+from the file with `Project::load` and the set (`embsim_cli::shipped()` and
+`mad_catalog::register`), as `board/tests/edge_project_live.rs` builds its
+file, with the clock's authority held from zero across the build, as
+`embsim run` holds it. MaD's `mad-catalog/tests/boot.rs` (step 8) keeps the
+`propeller2_debug` image: it is `p2iss/tests/ec32mb_flash_boot.rs`'s boot,
+which runs that image, said by a project file, and the debug build writes
+its log on `P62` for the whole run. Its console case passes with the
+production image too (measured, MaD #278): no request reaches the firmware
+there, and the core's summary keeps `P62` at the console's rate.
 
 **10. The e2e target.** The make target keeps its name and runs the tool
 on the cosim file, as step 1b ran `mad-emulator`:
@@ -942,7 +1015,41 @@ on the cosim file, as step 1b ran `mad-emulator`:
 `MaDSim/tests/pty_protocol.rs` (one protocol round trip on the host's PTY)
 moves to `SIL/mad-catalog/tests/pty_protocol.rs`, spawning `embsim run
 mad.toml --pty <path>`: a test of the line, not of the app, which needs no
-browser. *Needs:* E4 in the pinned embsim and step 9's cosim file.
+browser.
+
+On the project the app talks to the production build on `J1` (step 9),
+where `mad-emulator` gives it the debug build on the bare chip's
+`P53`/`P55`. Four things follow, for the suite to meet (inferred from step
+9's case; the e2e has not run on the project):
+
+- the port's USB ids are `0403:6015` (section 4), where `mad-emulator`'s
+  are `0403:6001`, and the e2e picks the board's port by those ids: on the
+  board route, `boardGrantedPort` in `Software/Control/e2e/fixtures.mjs`
+  takes the Connect screen's row whose text matches `403:6001` (read). Moving
+  the e2e onto `mad-cosim.toml` changes that match, or the twin's ids;
+- the production build has no debug log: what the run prints of the
+  firmware is the core's report, which keeps `P62`'s bytes as its console
+  (the boot line, then the protocol's bytes as text);
+- `IC14` as drawn passes nothing to the drive (section 6), so a scenario
+  that needs the carriage to move fails on the board as drawn unless the
+  machine's carrier is bodged there and the file says so;
+- the production image's first state read falls inside the cog manager's
+  start-up window, so it reads a processor-core fault until about 1.31 s
+  of board time: a channel reports running only from cog 0's second
+  100 ms pass, and by then all seven channels run with their locks and
+  canaries intact (measured from hub RAM, MaD #278; read: MaD's
+  `dev_cogManager.c`, `Main/MaD.c`). After that, with nothing on the
+  carrier's `J17`, `P22` (`GPI_3`, through `IC12`, `U8` and `R8`'s
+  pull-up) rests high and the firmware reads an emergency-stop power
+  fault (`ESD_POWER`) and refuses motion (read: MaD's
+  `HAL_GPIO_config.c`, `app_control.c`; `mad-emulator` pulls `P22` low on
+  its bench). MaD #278 closes `J17`'s loop in the project files, from
+  `5V_IO` to `GND_IO` as the switch loops take them, standing for a
+  powered emergency-stop circuit; with it the state reads unfaulted and
+  motion enables over `J1` on the production image (measured). What the
+  real machine has on `J17` is MaD's to confirm (section 6).
+
+*Needs:* E4 in the pinned embsim and step 9's cosim file.
 *Files:* `SIL/makefile`, `SIL/mad-catalog/tests/pty_protocol.rs`,
 `.github/workflows/ci.yml` (a `make check` step joins the e2e job, whose
 `make e2e-emulator` runs on the runner's own Chrome, headless, as embsim's
@@ -977,6 +1084,10 @@ the pin lists removed), the `p2iss` tests and examples that use them
 (`tests/level_pins.rs`, `protocol_on_levels.rs`, `rom_boot_net.rs`,
 `rom_serial_net.rs`, `sd_mount.rs`, `sd_node.rs`, `pty_protocol.rs`;
 `examples/iss_speed.rs`, `sd_probe.rs`) moved onto the core in the package.
+Those whose host is on `P53`/`P55` today (`protocol_on_levels.rs`,
+`pty_protocol.rs`) move to `P62`/`P63` and the production image as they go
+into the package: on the P2-EC32MB `P53`/`P55` are the PSRAM's (section 1).
+Both playgrounds then have their host on `J1`, the machine's one adapter.
 *Done when:* `make test` and the e2e suite pass with no `mad-emulator` in
 the tree.
 
@@ -998,12 +1109,43 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   `e2e/hw-read-save-config.mjs`, uses the same fake `navigator.serial`
   over node-serialport. Moving it onto Chrome's real Web Serial, granted
   ahead by Chrome policy, is MaD's to do (`NODES.md` §18, "Open").
+- **The route to the firmware — answered (2026-10-21).** The user's
+  decision: the app reaches the firmware over the carrier's debug header
+  `J1` (`P62`/`P63`, `RESn` on `J1.3`) through a Prop Plug, with the
+  production build (section 1). Which image the machine runs is still open
+  (section 1): the app flashes the madEdge image by default. The board
+  fact behind it: the P2-EC32MB has no edge finger for `P40`–`P57` (its
+  PSRAMs), so the carrier's `IC2`, the Pi connector `J4`'s isolator on
+  `P52`–`P55`, can never reach the chip (read: `boards/netlists/p2_ec32mb.net`;
+  MaD's `Hardware/EdgeBoard/KiCad`, schematic and PCB). The
+  `propeller2_debug` build's MAIN channel is `P53`/`P55` (MaD's
+  `HW_pins.h`), so a host on `J4` hears nothing from it (measured, MaD
+  #278's first round). The carrier's socket symbol names the plain P2-EC
+  (`MaD_Edge.kicad_sch`, `"Parallax : P2-EC"`), whose fingers carry those
+  pins (inferred: the EC32MB's header says they are unused there only
+  because its PSRAMs take them); embsim has no `p2-ec` kind or netlist, so
+  that module cannot be simulated today.
+- **`IC14`'s secondary ground — open.** `IC14` (ISO6741DWR), the servo
+  isolator that carries `STEP`, `DIR` and `ENA` out to the drive and
+  `SRDY` back to `P5`, has its secondary ground pins 9 and 15 on an unnamed
+  net that holds only `C26` pin 2, not on `EN_GND` (read: `mad_edge.net`,
+  `Net-(IC14-GND2_1)`, and `MaD_Edge.kicad_pcb`, the same pads on the same
+  net; `board/tests/edgeboard.rs`). As drawn, its secondary side has no
+  return: nothing it drives reaches the drive (`check` reports no source
+  reaching `MACHINE.STEP`, `DIR` and `ENA`), and `P5` reads its default
+  high whatever `SRDY` says (MaD's `tests/mad.rs`, the at-rest case).
+  Whether the machine's carrier is bodged there is not known; the user
+  will check. MaD's files keep the board as drawn. If it is bodged, the
+  bodge is a project line with its reason (a `[[pin_short]]` from `IC14`
+  pin 9 to an `EN_GND` pin), and step 9's at-rest case changes with it.
 - **The loop supply.** `loop_volts = 24.0` is the isolation test's bench
   figure. Does the real machine source its switch loops from a supply of
   its own, or from the carrier's `5V_IO`/`GND_IO` (`J5`–`J8`)?
 - **`JP1`'s position.** The file closes pads 1–2, `SC_ENA` from `IC14`'s
   TTL output; pads 2–3 put it on `Q1`'s open collector.
-- **The Pi's TX against `IC2`.** `IC2`'s Pi side is supplied from `RPI_5V`
+- **The Pi's TX against `IC2`.** *Moot for the route since 2026-10-21:
+  nothing sits on `J4` (above); it stays a finding about the board.*
+  `IC2`'s Pi side is supplied from `RPI_5V`
   (`J4.1`), so its `V_IH` is 3.5 V (0.7 × 5 V, SLLSFJ6G §7.3), above a
   Raspberry Pi's 3.3 V output. With the Pi's real rail on `HOST.VIO`,
   embsim reads the host's 3.3 V high as no valid level at `IC2`, an open
@@ -1011,9 +1153,12 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   default output for an open input is high, so a byte from the host still
   reaches `P53` (step 9): its highs ride the default state, not a
   guaranteed level, and the same board with the `F` part would hold `P53`
-  low. On the same side, `OUTA` drives the Pi's receive line (`RPI_TX`) at
-  5 V, above a Pi's 3.3 V GPIO. Both are findings about the board;
-  supplying `IC2`'s Pi side from the Pi's 3.3 V would clear both.
+  low (`IC2` alone on those rails, a `scripted-source` on `INC`, gave
+  `P53` `Driven(High)` for 3.3 V and `Driven(Low)` for 0 V; the
+  `ISO6742FDWR` gave `Driven(Low)` for both). On the same side, `OUTA`
+  drives the Pi's receive line (`RPI_TX`) at 5 V, above a Pi's 3.3 V GPIO.
+  Both are findings about the board; supplying `IC2`'s Pi side from the
+  Pi's 3.3 V would clear both. On the P2-EC32MB neither reaches the chip.
 - **The encoder through `U25` — answered (2026-10-18/19).** The machine's
   encoder is a Taiss 600 P/R incremental optical encoder (Amazon
   B07MX1SYXB, the user's): A and B as quadrature, an "NPN open collector
