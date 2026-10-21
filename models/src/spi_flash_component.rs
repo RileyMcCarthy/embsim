@@ -115,7 +115,8 @@ const fn input(number: &'static str, vcc: &'static str, gnd: &'static str) -> Pi
 /// The data-out pin: an output that idles **released**, because a
 /// deselected part's DO is at high impedance (W25Q128JV §4.1 "Chip Select
 /// (/CS)", p.9) and the part comes up deselected. The adapter drives it
-/// only while `~CS` is low ([`publish_do`]).
+/// only while the part shifts data, status or an ID out
+/// ([`SpiNorFlash::drives_do`], via [`publish_do`]); otherwise it is released.
 const fn data_out(number: &'static str) -> PinDecl {
     PinDecl::digital_out(number).with_name("DO").with_idle(None)
 }
