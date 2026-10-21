@@ -61,13 +61,14 @@ carrier's debug header `J1`, and the module's flash holds MaD's production
 build. The route below is the user's decision; section 6 has the board facts
 behind it.
 
-**The route to the firmware.** The app reaches the firmware over the
-carrier's debug header `J1` (`J1.1` = `P62`, `J1.2` = `P63`, `J1.3` =
-`RESn`, `J1.4` = `GND`) with the **production** build (`pio run -e
-propeller2`), as the machine is flashed and driven through a Prop Plug
-(MaD's `Software/Control/README.md`, "Firmware flashing"). That build's MAIN
-channel receives on `P63` and transmits on `P62` at 2,000,000 baud (MaD's
-`HW_pins.h`, `HW_PIN_MAIN_RX`/`_TX`; `HAL_serial_config.c`, the row without
+**The route to the firmware.** The user's decision: the app reaches the
+firmware over the carrier's debug header `J1` (`J1.1` = `P62`, `J1.2` =
+`P63`, `J1.3` = `RESn`, `J1.4` = `GND`) through a Prop Plug, with the
+**production** build (`pio run -e propeller2`). The app flashes over `J1`
+(MaD's `Software/Control/README.md`, "Firmware flashing", which covers
+flashing only). That build's MAIN channel receives on `P63` and transmits
+on `P62` at 2,000,000 baud (MaD's `HW_pins.h`, `HW_PIN_MAIN_RX`/`_TX`;
+`HAL_serial_config.c`, the row without
 `ENABLE_DEBUG_SERIAL`), and `J1`'s two lines go straight to the socket's
 fingers 50 and 49 (`mad_edge.net`). The Raspberry Pi's connector `J4` cannot
 be the route on this module: its `RPI_RX`/`RPI_TX` go only to the isolator
@@ -78,6 +79,16 @@ finger for `P40`–`P57`, which it keeps for its PSRAMs
 (`HW_PIN_RPI_RX`/`_TX`), so on the EC32MB it runs on the PSRAM's pins and a
 host on `J4` hears nothing (measured on MaD #278's first round). Nothing
 sits on `J4` in any of the four files.
+
+**Open: which image the machine runs.** By default MaD Control flashes a
+release's madEdge image, the `propeller2_debug` build, whose protocol is on
+`P53`/`P55` (read: MaD's `Software/Control/src/firmware/release.ts`,
+`pickFirmwareAsset`; the release job in `.github/workflows/ci.yml`); the
+single-port production build is the release's `-release.bin`, which the app
+flashes only as a local file. If the machine runs the madEdge image, the
+route needs revisiting, since that image's protocol cannot reach the chip
+on a P2-EC32MB (section 6). If it runs the production image, the app's
+default asset would need changing to match. The user is to confirm.
 
 Four project files, two machines each with two hosts. The user's rule for
 MaD's SIL (`NODES.md` §18) is that the firmware on the ISS runs with the
@@ -987,8 +998,11 @@ from the file with `Project::load` and the set (`embsim_cli::shipped()` and
 `mad_catalog::register`), as `board/tests/edge_project_live.rs` builds its
 file, with the clock's authority held from zero across the build, as
 `embsim run` holds it. MaD's `mad-catalog/tests/boot.rs` (step 8) keeps the
-`propeller2_debug` image: its subject is the core kind's report of the
-console on `P62`, which the production image gives over to the protocol.
+`propeller2_debug` image: it is `p2iss/tests/ec32mb_flash_boot.rs`'s boot,
+which runs that image, said by a project file, and the debug build writes
+its log on `P62` for the whole run. Its console case passes with the
+production image too (measured, MaD #278): no request reaches the firmware
+there, and the core's summary keeps `P62` at the console's rate.
 
 **10. The e2e target.** The make target keeps its name and runs the tool
 on the cosim file, as step 1b ran `mad-emulator`:
@@ -1005,13 +1019,14 @@ browser.
 
 On the project the app talks to the production build on `J1` (step 9),
 where `mad-emulator` gives it the debug build on the bare chip's
-`P53`/`P55`. Three things follow, for the suite to meet (inferred from step
+`P53`/`P55`. Four things follow, for the suite to meet (inferred from step
 9's case; the e2e has not run on the project):
 
 - the port's USB ids are `0403:6015` (section 4), where `mad-emulator`'s
-  are `0403:6001`; the e2e finds the board's port by the node's shim, not
-  by its ids, but `Software/Control/e2e/fixtures.mjs` names `0403:6001` in
-  its notes;
+  are `0403:6001`, and the e2e picks the board's port by those ids: on the
+  board route, `boardGrantedPort` in `Software/Control/e2e/fixtures.mjs`
+  takes the Connect screen's row whose text matches `403:6001` (read). Moving
+  the e2e onto `mad-cosim.toml` changes that match, or the twin's ids;
 - the production build has no debug log: what the run prints of the
   firmware is the core's report, which keeps `P62`'s bytes as its console
   (the boot line, then the protocol's bytes as text);
@@ -1020,9 +1035,17 @@ where `mad-emulator` gives it the debug build on the bare chip's
   machine's carrier is bodged there and the file says so;
 - the production image in `mad.toml` reports a processor-core fault in
   every state read from 1.24 s to 1.8 s of board time, while the core
-  says all 8 cogs run (measured, MaD #278). The firmware raises it when one
-  of its cog channels is not running, and enabling motion needs it clear;
-  why it stands is MaD's to find before the motion scenarios run here.
+  says all 8 cogs run (measured, MaD #278). The firmware raises it while
+  one of its cog channels has not reported itself running, and enabling
+  motion needs it clear. Eight running cogs mean every channel was
+  launched, so the causes that fit are a stall in the main cog's loop
+  before its next cog-manager pass (a channel reports running only from
+  that pass), a stack canary mismatch, or a stalled CONTROL cog keeping an
+  early reading; a lock the manager could not create fits poorly, since
+  that channel stops before its cog starts (inferred; read: MaD's
+  `dev_cogManager.c`, `Main/MaD.c`). The core fault is first in the
+  firmware's order, so it also hides a watchdog fault. Why it stands is
+  MaD's to find before the motion scenarios run here.
 
 *Needs:* E4 in the pinned embsim and step 9's cosim file.
 *Files:* `SIL/makefile`, `SIL/mad-catalog/tests/pty_protocol.rs`,
@@ -1086,8 +1109,9 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   ahead by Chrome policy, is MaD's to do (`NODES.md` §18, "Open").
 - **The route to the firmware — answered (2026-10-21).** The user's
   decision: the app reaches the firmware over the carrier's debug header
-  `J1` (`P62`/`P63`, `RESn` on `J1.3`) with the production build, as the
-  machine is flashed and driven through a Prop Plug (section 1). The board
+  `J1` (`P62`/`P63`, `RESn` on `J1.3`) through a Prop Plug, with the
+  production build (section 1). Which image the machine runs is still open
+  (section 1): the app flashes the madEdge image by default. The board
   fact behind it: the P2-EC32MB has no edge finger for `P40`–`P57` (its
   PSRAMs), so the carrier's `IC2`, the Pi connector `J4`'s isolator on
   `P52`–`P55`, can never reach the chip (read: `boards/netlists/p2_ec32mb.net`;
