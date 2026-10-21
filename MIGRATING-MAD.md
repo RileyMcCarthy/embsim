@@ -1207,7 +1207,11 @@ embsim #140, after it lands.
   its 12 V or 24 V a 4.7 kΩ pull-up straight to the supply would hold a
   released `+` leg near 8.9 V or 17.5 V against `U25`'s 12 kΩ typical
   input (inferred), past 8 V, so each leg would need a divider or a clamp.
-  embsim's `am26lv32` checks neither range (its *Not modelled*).
+  embsim's `am26lv32` declares the input range on each `A` and `B`
+  (`AM26LV32_INPUT_LIMITS`), so such a leg raises
+  `Finding::PinAboveRecommended` on its `U25` pin, naming the 8 V absolute
+  maximum (`board/tests/am26lv32_receiver.rs`); the ±5.8 V / ±12 V
+  differential ratings are not checked.
   The encoder's supply has no pin on `J20` either, and `mad-machine` has
   none. Built: MaD #264's `encoder_output` (section 3), `rs422` by
   default, `npn-open-collector` for the Taiss.

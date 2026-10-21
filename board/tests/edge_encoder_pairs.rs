@@ -222,6 +222,16 @@ impl Rig {
             stalled.is_empty(),
             "the engine stopped waiting for the case's thread: {stalled:?}"
         );
+        // `U25`'s inputs declare SLLS202H's input range: no wiring here
+        // takes one above it (its supply, from `SC_5V`, is reported).
+        let inputs_over: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| {
+                matches!(finding, Finding::PinAboveRecommended { part, pin, .. }
+                    if part == "EDGE.U25" && pin != "16")
+            })
+            .collect();
+        assert!(inputs_over.is_empty(), "{inputs_over:?}");
         self.system.shutdown();
         let start = Instant::now();
         while virtual_clock::registered_actors() > self.actors_before {
