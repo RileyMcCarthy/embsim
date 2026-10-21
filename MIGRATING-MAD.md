@@ -958,10 +958,12 @@ written, each for a reason of the board's:
   version, a string the program holds, and the machine's state: motion
   disabled, no test running). The
   production image prints its boot line on `P62` at the FlexC console's
-  230,400 baud before its serial core takes the pin at 2,000,000, so the
-  host reads that line as framing errors, and requests sent before the
-  serial core has armed its receive interrupt go unanswered: the case asks
-  again every 20 ms of board time.
+  default rate (230,400 baud, inferred) before its serial core takes the
+  pin at 2,000,000, so the host reads that line as framing errors
+  (measured). A request that lands before the serial core has armed its
+  receive interrupt would go unanswered (inferred), so the case asks again
+  every 20 ms of board time; the first request, at 1.226 s, was answered at
+  1.235 s (measured).
 - **The drive.** "The drive is enabled" is the wrong expectation for a
   machine at rest: the firmware leaves `P6` (ENA) released after boot, as a
   machine in DISABLED does (measured at 1.6 s on the debug image). And
