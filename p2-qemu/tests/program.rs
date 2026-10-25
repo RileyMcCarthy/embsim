@@ -43,32 +43,47 @@ fn run_to(horizon: u64) -> Run {
 }
 
 /// A `qemu-system-p2` that is this binary, acting as `mode` says.
+///
+/// One script, written once before anything is started, and a symbolic
+/// link to it per mode; the script reads its mode off the name it was
+/// started by. Writing a fresh script per call raced: a test thread
+/// starting a program forks while another is writing its script, the
+/// child inherits the open write descriptor until it execs, and starting
+/// that script meanwhile fails with ETXTBSY. Once the one script is
+/// written and closed nothing writes an executable again — a link has no
+/// writer.
 fn fake(mode: &str) -> QemuSystemP2 {
     use std::os::unix::fs::PermissionsExt;
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fake-qemu");
-    std::fs::create_dir_all(&dir).expect("scratch");
-    // One script per call: a test writing a script another is starting
-    // would find it busy.
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let script = dir.join(format!(
-        "qemu-system-p2-{}-{}-{}",
-        mode.replace([':', '='], "-"),
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let me = std::env::current_exe().expect("the test binary");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\n{ARGS}=\"$(printf '%s\\n' \"$@\")\"\n{MODE}='{mode}'\n\
-             export {ARGS} {MODE}\n\
-             exec '{}' --exact fake_qemu_system_p2 --ignored --nocapture --test-threads=1\n",
-            me.display()
-        ),
-    )
-    .expect("the script is writable");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("executable");
-    QemuSystemP2::at(script)
+    static SCRIPT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let script = SCRIPT.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("fake-qemu")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let script = dir.join("qemu-system-p2");
+        let me = std::env::current_exe().expect("the test binary");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{ARGS}=\"$(printf '%s\\n' \"$@\")\"\n{MODE}=\"${{0##*/qemu-system-p2.}}\"\n\
+                 export {ARGS} {MODE}\n\
+                 exec '{}' --exact fake_qemu_system_p2 --ignored --nocapture --test-threads=1\n",
+                me.display()
+            ),
+        )
+        .expect("the script is writable");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        script
+    });
+    let link = script.with_file_name(format!("qemu-system-p2.{mode}"));
+    match std::os::unix::fs::symlink(script, &link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("the link to the stand-in: {e}"),
+    }
+    QemuSystemP2::at(link)
 }
 
 /// Whether process `pid` is gone.
