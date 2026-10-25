@@ -102,8 +102,8 @@ keep a `host-serial`, which needs no browser:
   off the module's flash, its host a `host-serial` on the debug header
   `J1`. `make check` and `mad-catalog/tests/mad.rs` load it (step 9).
 - `SIL/mad-cosim.toml`: the same file with `HOST` a `chrome-cdp` on the same
-  four pins and wires (section 4 shows the entry). The e2e suite and the
-  playgrounds run it (steps 10 and 11).
+  four pins and wires (section 4 shows the entry). The e2e suite runs it
+  (step 10).
 - `SIL/mad-serial-boot.toml`: the same boards and the same host with the
   module's option switch set for a serial boot and an erased flash, checked
   by `make check`.
@@ -117,6 +117,17 @@ a project's options come from its file alone, so the playgrounds (step 11),
 where a person watches the app, run two copies of the `-cosim` files that
 differ from them in that one line: `SIL/mad-playground.toml` and
 `SIL/mad-serial-boot-playground.toml`.
+
+*Revised 2026-10-24 (MaD #291, step 11):* a fifth file,
+`SIL/mad-ic14-fixed-cosim.toml`, is `mad-cosim.toml` with one
+`[[pin_short]]`, from `IC14` pin 9 to `J21.8` (`EN_GND`), citing MaD #285
+as the board's fix (section 6, "`IC14`'s secondary ground"). That was the
+user's decision of 2026-10-23. The scenarios that move the carriage run on
+it, and `SIL/mad-playground.toml` is its headed copy, not `mad-cosim.toml`'s,
+so the playground's carriage moves. The as-drawn files keep the defect.
+MaD's `mad-catalog/tests/projects.rs` fails if the twin differs from
+`mad-cosim.toml` in anything but that one line. That makes seven files in
+all.
 
 ## 2. What embsim owes first
 
@@ -1091,6 +1102,46 @@ Both playgrounds then have their host on `J1`, the machine's one adapter.
 *Done when:* `make test` and the e2e suite pass with no `mad-emulator` in
 the tree.
 
+*Revised 2026-10-24 (MaD #291, #297): built, with one exception.*
+
+- **The motion set** runs on the twin with MaD #285 fixed (section 1),
+  under `make e2e-motion`. Per PR that is G2+G3+H2+I; nightly it is the
+  whole set, in three shards. The playgrounds run on the twin's headed copy
+  and on the serial boot's. `make playground-pty` is `embsim run mad.toml
+  --pty /tmp/tty.iss`.
+- **`JP1`** sits on pads 2–3 in all seven files; it was on pads 1–2. The
+  firmware never drives the enable pin `P6`, so `IC14` outputs its default
+  high, and only `Q1`'s open collector (pads 2–3) turns that into an active
+  enable. On pads 1–2 the enable line sat at 4.99 V and the drive never
+  enabled on the twin (measured, MaD #291). Section 6 keeps the question
+  of what the real carrier has.
+- **FW-ISS** runs on `mad-serial-boot-cosim.toml` (`make e2e-rom`). Two
+  faults in `p2iss`'s receive pins in the package kept the ROM from taking
+  the flasher's bytes there (MaD #297):
+  - The ROM sets `P63` to receive before it knows the rate. It writes the
+    rate only after it has measured the host's first `>`, so the pin now
+    holds its edges until the rate arrives.
+  - The guest runs up to 100 µs ahead of the board, so up to 20 bytes
+    arrived at once and overran the ROM's 16-byte ring. Each byte is now
+    handed over one frame after the last, on the guest's clock.
+
+  Nothing pulses `RESn`: the node has no DTR, and `J1.3` is unwired. The
+  ROM listens for 90 s of board time from the chip's start, and the probe
+  arrives within a second (measured). A RAM load's reply arrives garbled
+  until `p2iss`'s transmit pin reads busy (MaD #295). The flasher's flash
+  mode waits for no reply, so FW-ISS does not depend on it.
+- **The exception: SERVO-stall.** The scenario jams the carriage while the
+  board runs. Only `mad-emulator` has a jam, its `--jam-file`. The
+  project's machine has none: a file polled on the wall clock is not an
+  input a stepped kind can take (MaD's `mad-catalog/src/machine.rs`, "Not
+  modelled"). MaD #292 made SERVO-stall a per-PR gate, so `mad-emulator`
+  stays for that scenario alone (`make e2e-stall`, the debug image on the
+  bare chip). Its `--boot-rom` mode is gone. `P2Iss`'s `Component` impl,
+  `SerialLink`, the pin lists and the tests listed above stay with it. They
+  go, as this step says, once a project can jam the carriage. MaD #298
+  weighs the options: a hard stop in a fourth twin, a lever in board time,
+  or the latch tested in firmware unit tests alone.
+
 ## 6. Questions for MaD
 
 These are the machine's and the board's, not embsim's; `NODES.md` §13
@@ -1138,11 +1189,20 @@ These are the machine's and the board's, not embsim's; `NODES.md` §13
   will check. MaD's files keep the board as drawn. If it is bodged, the
   bodge is a project line with its reason (a `[[pin_short]]` from `IC14`
   pin 9 to an `EN_GND` pin), and step 9's at-rest case changes with it.
+  Meanwhile, by the user's decision (2026-10-23), the twin
+  `mad-ic14-fixed-cosim.toml` carries that line, citing MaD #285 as the
+  board's fix, and the motion set runs there (section 1, step 11).
+- **A jam for SERVO-stall — open (MaD #298).** The one scenario that keeps
+  `mad-emulator` in MaD's tree (step 11). Whether the machine gets a jam,
+  and in what form, is MaD's to decide.
 - **The loop supply.** `loop_volts = 24.0` is the isolation test's bench
   figure. Does the real machine source its switch loops from a supply of
   its own, or from the carrier's `5V_IO`/`GND_IO` (`J5`–`J8`)?
-- **`JP1`'s position.** The file closes pads 1–2, `SC_ENA` from `IC14`'s
-  TTL output; pads 2–3 put it on `Q1`'s open collector.
+- **`JP1`'s position.** The files close pads 2–3, `SC_ENA` on `Q1`'s open
+  collector, since MaD #291. On pads 1–2, `SC_ENA` comes from `IC14`'s TTL
+  output, which sits high because the firmware never drives `P6`, and the
+  drive never enables (measured on the #285-fixed twin, step 11). Which
+  pads the machine's carrier has closed is not confirmed.
 - **The Pi's TX against `IC2`.** *Moot for the route since 2026-10-21:
   nothing sits on `J4` (above); it stays a finding about the board.*
   `IC2`'s Pi side is supplied from `RPI_5V`
