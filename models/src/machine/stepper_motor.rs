@@ -189,6 +189,14 @@ const NS_PER_US: u64 = 1_000;
 /// engine one timer-wheel entry.
 pub const DEFAULT_OBSERVE_INTERVAL_US: u64 = 1_000;
 
+/// Travel (steps) under which a carriage with no commanded rate counts as
+/// settled: the coast still ahead of it (`|v| · τ · (1 − k_load)`) and its
+/// distance from the last published position both below this. A thousandth
+/// of a step is far finer than any encoder a drive step is divided into, and
+/// it is what lets the settled publish land on the target rather than on the
+/// half-step crossing before it.
+const SETTLED_STEPS: f64 = 1.0e-3;
+
 // ============================================================
 // Configuration
 // ============================================================
@@ -369,6 +377,9 @@ struct Plant {
     train_delivery_lag_ns: u64,
     /// Last position (rounded to whole steps) published to observers.
     emitted: i64,
+    /// The exact position (steps) last published, so a settled carriage is
+    /// published once at where it came to rest ([`MotorCore::observe`]).
+    published: f64,
     /// Last projected STEP level, for edge detection.
     step_level: Option<Level>,
     /// Last latched direction: `true` = forward. Held across a floating or
@@ -394,6 +405,7 @@ impl Plant {
             train_steps: 0,
             train_delivery_lag_ns: 0,
             emitted: 0,
+            published: 0.0,
             step_level: None,
             // Before DIR ever presents a level the drive assumes forward;
             // documented rather than guessed at read time.
@@ -762,16 +774,28 @@ impl MotorCore {
         }
     }
 
-    /// Sample the plant at `now_ns` and publish a position change when the
-    /// whole-step position moved. The observer runs with the plant lock
-    /// released, so a subscriber may read the shaft back without deadlocking.
+    /// Sample the plant at `now_ns` and publish its position when the
+    /// whole-step position moved, or once more when the carriage has settled
+    /// somewhere other than where it was last published. The observer runs
+    /// with the plant lock released, so a subscriber may read the shaft back
+    /// without deadlocking.
+    ///
+    /// The whole-step gate alone publishes the last time at a half-step
+    /// crossing, so a drive coarser than the encoder reading it would leave
+    /// that encoder resting up to half a drive step short. The settled publish
+    /// costs one emit per stop, never one per observation.
     fn observe(&self, now_ns: u64) {
         let emit = {
             let mut plant = self.plant.lock().unwrap();
             self.advance(&mut plant, now_ns);
             let rounded = plant.pos.round() as i64;
-            (rounded != plant.emitted).then(|| {
+            let coast = plant.vel.abs() * self.config.tau_s * (1.0 - self.config.load_loss);
+            let settled = plant.cmd == 0.0
+                && coast < SETTLED_STEPS
+                && (plant.pos - plant.published).abs() >= SETTLED_STEPS;
+            (rounded != plant.emitted || settled).then(|| {
                 plant.emitted = rounded;
+                plant.published = plant.pos;
                 plant.pos / self.config.steps_per_mm
             })
         };
@@ -865,7 +889,8 @@ impl MotorShaft {
 
     /// Subscribe to carriage position in millimetres, published whenever the
     /// whole-step position changes at the configured
-    /// [`Config::observe_interval_us`] cadence. Multiple subscribers are
+    /// [`Config::observe_interval_us`] cadence, and once more where the
+    /// carriage comes to rest. Multiple subscribers are
     /// appended, never overwritten.
     ///
     /// This is the seam a [`crate::machine::quadrature_encoder`] or an
@@ -1530,6 +1555,53 @@ mod tests {
             (seen[0] - 2.0).abs() < 0.01,
             "20 steps at 10 steps/mm is 2 mm, got {}",
             seen[0]
+        );
+    }
+
+    /// A drive coarser than the encoder reading it settles that encoder on
+    /// its target: 1024 steps at 1024 steps/mm read by an 8192 counts/mm
+    /// encoder rest at exactly 8192, not half a drive step (4 counts) short
+    /// at the last half-step crossing — and the settled publish is one emit
+    /// per stop, so a run publishes at most once per whole step plus once.
+    #[rstest]
+    fn a_coarse_drive_settles_its_encoder_on_the_target() {
+        const ENCODER_COUNTS_PER_MM: f64 = 8_192.0;
+        let core = enabled_core(Config {
+            steps_per_mm: 1_024.0,
+            ..lossless()
+        });
+        let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&seen);
+            core.on_position_mm
+                .subscribe(move |mm| sink.lock().unwrap().push(mm));
+        }
+
+        // 1024 edges at 10 kHz, observed at the default 1 kHz cadence through
+        // the move and a full second of settling after it.
+        let mut t = 0;
+        let mut next_observe = us(DEFAULT_OBSERVE_INTERVAL_US);
+        for _ in 0..1_024 {
+            t += us(100);
+            while next_observe <= t {
+                core.observe(next_observe);
+                next_observe += us(DEFAULT_OBSERVE_INTERVAL_US);
+            }
+            core.step_edge(t);
+        }
+        while next_observe <= t + us(1_000_000) {
+            core.observe(next_observe);
+            next_observe += us(DEFAULT_OBSERVE_INTERVAL_US);
+        }
+
+        let seen = seen.lock().unwrap();
+        let count =
+            (seen.last().expect("the move was published") * ENCODER_COUNTS_PER_MM).round() as i64;
+        assert_eq!(count, 8_192, "the encoder must rest on the target");
+        assert!(
+            seen.len() <= 1_024 + 1,
+            "at most one publication per whole step plus the settled one, got {}",
+            seen.len()
         );
     }
 
