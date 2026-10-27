@@ -55,7 +55,7 @@ clap = { version = "4.5", features = ["derive", "string"] }
 # Test harness: discrete case matrices (`#[rstest]`, `#[case]`, `#[values]`).
 # See TESTING.md. All workspace crates that ship tests take this as a
 # dev-dependency so failure names and filters stay consistent.
-rstest = "0.27"
+rstest = "0.28"
 # Property testing for continuous domains only (MNA ladders, buffer clamps).
 # Prefer rstest for enums / channel indices / OOR grids.
 proptest = "1"
