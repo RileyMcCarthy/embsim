@@ -1010,27 +1010,51 @@ fn outside(test: &str) -> PathBuf {
 /// The stand-in Cargo in `dir`, and the log it writes: `cargo metadata`
 /// goes to the real Cargo, all of it, or only `--no-deps` when `resolve`
 /// is false.
+///
+/// One script, written once before any test starts it, and a symbolic link
+/// to it in `dir`; the script logs beside the link it was started by and
+/// reads from the link's name how much of `cargo metadata` to hand on.
+/// Writing a script per test raced: a test thread starting `embsim` or
+/// `git` forks while another is writing its script, the child inherits the
+/// open write descriptor until it execs, and starting that script meanwhile
+/// fails with ETXTBSY. Once the one script is written and closed nothing
+/// writes an executable again — a link has no writer.
 fn logging_cargo_with(dir: &Path, resolve: bool) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let script = dir.join("cargo-log.sh");
-    let log = dir.join("cargo.log");
-    let pattern = if resolve {
-        "metadata*"
+    static SCRIPT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let script = SCRIPT.get_or_init(|| {
+        let at = std::env::temp_dir()
+            .join(format!("embsim-runner-{}", std::process::id()))
+            .join("stand-in-cargo");
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).expect("the directory can be made");
+        let script = at.join("cargo-log.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${{0%/*}}/cargo.log\"\n\
+                 case \"${{0##*/}}:$*\" in\n  \
+                 cargo-log.sh:metadata*|cargo-log-no-deps.sh:metadata\\ --no-deps*) exec \
+                 {cargo:?} \"$@\" ;;\nesac\nexit 101\n",
+                cargo = env!("CARGO"),
+            ),
+        )
+        .expect("the script is writable");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        script
+    });
+    let link = dir.join(if resolve {
+        "cargo-log.sh"
     } else {
-        "metadata\\ --no-deps*"
-    };
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\ncase \"$*\" in\n  {pattern}) exec \
-             {cargo:?} \"$@\" ;;\nesac\nexit 101\n",
-            cargo = env!("CARGO"),
-        ),
-    )
-    .expect("the script is writable");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("the script is executable");
-    (script, log)
+        "cargo-log-no-deps.sh"
+    });
+    match std::os::unix::fs::symlink(script, &link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => panic!("the link to the stand-in: {e}"),
+    }
+    (link, dir.join("cargo.log"))
 }
 
 /// [`logging_cargo_with`], every `cargo metadata` to the real Cargo.
