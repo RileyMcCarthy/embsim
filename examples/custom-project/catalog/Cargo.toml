@@ -21,6 +21,6 @@ embsim-core = { path = "../../../core" }
 [dev-dependencies]
 # The project's own test runs it as the runner does, in process.
 embsim-cli = { path = "../../../cli" }
-rstest = "0.27"
+rstest = "0.28"
 # embsim's behaviour ledger; a project of its own does not need it.
 vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }
