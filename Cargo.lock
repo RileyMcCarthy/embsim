@@ -1729,7 +1729,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vibes-behaviour"
 version = "0.1.0"
-source = "git+https://github.com/RileyMcCarthy/vibes.git#e1225c552a523d0ab4be9bce76d80354e7035828"
+source = "git+https://github.com/RileyMcCarthy/vibes.git#cab9e416d4633ca06e3e5c674eabdb75d6ff85a3"
 
 [[package]]
 name = "wait-timeout"
