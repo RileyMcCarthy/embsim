@@ -377,19 +377,22 @@ A project names the embsim release it is written for with
 section 2).
 
 The standard catalog's bench component kinds are `host-serial`, a host's
-serial port as a PTY on the host's own rail, and `scripted-source`, a pin
-driven through a list of steps (`PROJECTS.md` section 5). A project's own
+serial port as a PTY on the host's own rail, `prop-plug-reset`, the reset
+stage of a Parallax Prop Plug, and `scripted-source`, a pin driven through
+a list of steps (`PROJECTS.md` section 5). A project's own
 bench kind may be a plant made of several models — a drive turning an
 encoder and reaching an end switch — as one component with electrical
 pins, an `embsim_board::Assembly` (`PROJECTS.md` section 10, "A plant: an
 `Assembly`"). The `embsim` command's set adds `chrome-cdp`, the host's
-Chrome on the same four pins as `host-serial`: its pages' Web Serial is the
+Chrome on the same five pins as `host-serial`: its pages' Web Serial is the
 line, and every page's clock and every dedicated worker's advances only with
 the board's, a millisecond at a time over DevTools, so a web app's timeouts
 hold in board time against a board far slower than real time (`PROJECTS.md`
 section 5, `NODES.md` §19). The port is the page's main thread's: an app
 opens it there and transfers its streams to a worker, whose own
-`navigator.serial` is Chrome's. The line has no modem-control pins.
+`navigator.serial` is Chrome's. Of the modem-control lines only DTR is a
+pin, following the page's port as Chrome's does; `prop-plug-reset`, a
+Parallax Prop Plug's reset stage, turns its edges into a reset pulse.
 [`examples/chrome-ping`](examples/chrome-ping) is a project with one, and a
 Playwright harness that drives it.
 

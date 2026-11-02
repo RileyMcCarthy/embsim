@@ -1883,12 +1883,12 @@ fn modem_control_no_pin_carries_is_counted_and_reported() {
         id: "chrome-cdp.modem-control",
         covers: Some("cdp/src/node.rs#NodeStats::signals"),
         given: "a page that opens its port with hardware flow control, asserts DTR and RTS, \
-                then drops them, on a line with no modem-control pins",
+                then drops them, on a line whose only modem-control pin is DTR's",
     });
     expect!(
         "signals-counted",
-        "the node counts one setSignals call that asserted a signal, and the call that only \
-         dropped them is answered and not counted"
+        "the node counts one setSignals call that asserted a signal no pin carries, and the \
+         call that only dropped them is answered and not counted"
     );
     expect!(
         "flow-control-counted",
@@ -1896,8 +1896,8 @@ fn modem_control_no_pin_carries_is_counted_and_reported() {
     );
     expect!(
         "reported",
-        "the report says once that nothing on the board saw DTR and RTS, and that nothing \
-         paces the bytes"
+        "the report says once that nothing on the board saw RTS, and that nothing paces the \
+         bytes"
     );
 
     let _suite = suite_lock();
@@ -1960,7 +1960,7 @@ fn modem_control_no_pin_carries_is_counted_and_reported() {
     assert!(fake.seen().opened, "flow-control-counted");
     assert!(
         summary.iter().any(|line| line
-            == "1 setSignals call asserted DTR, RTS or a break, which no pin of the line carries"),
+            == "1 setSignals call asserted RTS or a break, which no pin of the line carries"),
         "signals-counted: {summary:?}"
     );
     assert!(
@@ -1970,7 +1970,7 @@ fn modem_control_no_pin_carries_is_counted_and_reported() {
     );
     assert!(
         looks.iter().any(|line| line
-            == "a page asserted DTR and RTS (setSignals): the line has no modem-control pins, \
+            == "a page asserted RTS (setSignals): the line has no RTS pin and sends no break, \
                 so nothing on the board saw it")
             && looks.iter().any(|line| line
                 == "a page opened the port with hardware flow control: the line has no RTS or \
@@ -1979,6 +1979,185 @@ fn modem_control_no_pin_carries_is_counted_and_reported() {
     );
     drop(actor);
     system.shutdown();
+}
+
+/// Every level a probe read, with the instant.
+type Levels = Arc<Mutex<Vec<(u64, Option<embsim_board::Level>)>>>;
+
+/// A probe on one logic line: every level it reads, with the instant.
+struct LevelProbe {
+    pins: [embsim_board::PinDecl; 1],
+    seen: Levels,
+}
+
+impl LevelProbe {
+    fn new() -> Self {
+        Self {
+            pins: [embsim_board::PinDecl::digital_in(
+                "IN",
+                embsim_board::jesd8c01_lvcmos_thresholds(embsim_board::DeadBand::Unknown),
+            )],
+            seen: Arc::default(),
+        }
+    }
+}
+
+impl embsim_board::Component for LevelProbe {
+    fn pins(&self) -> &[embsim_board::PinDecl] {
+        &self.pins
+    }
+
+    fn attach(
+        &mut self,
+        io: embsim_board::ComponentNetIo,
+    ) -> Result<(), embsim_board::AttachError> {
+        let receiver = embsim_board::DigitalReceiver::new(io.pin("IN")?);
+        let seen = Arc::clone(&self.seen);
+        io.on_sense("IN", move |sense| {
+            let level = receiver.read(&sense);
+            let mut seen = seen.lock().unwrap();
+            if seen.last().map(|&(_, last)| last) != Some(level) {
+                seen.push((virtual_clock::virtual_ns(), level));
+            }
+        })?;
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::factory_polarity(false)]
+#[case::inverted(true)]
+fn dtr_follows_the_port_on_its_pin(#[case] inverted: bool) {
+    use embsim_board::Level::{High, Low};
+    behaviour!(Test {
+        id: "chrome-cdp.dtr-pin",
+        covers: Some("cdp/src/node.rs#Meter::set_dtr"),
+        given: "a page opening its port, then dropping DTR, raising it and closing the port two \
+                milliseconds apart, probed on the DTR pin of an adapter with active-low DTR and \
+                of one that inverts it",
+    });
+    expect!(
+        "idle-deasserted",
+        "before the port is opened DTR is deasserted: the pin is high, or low on the \
+         inverting adapter"
+    );
+    expect!(
+        "open-asserts",
+        "opening the port asserts DTR",
+        "Chrome's open raises DTR with the line, as the operating system does"
+    );
+    expect!(
+        "set-signals-moves-it",
+        "each setSignals call moves DTR to the state it asks for"
+    );
+    expect!(
+        "close-deasserts",
+        "closing the port deasserts DTR",
+        "Chrome's close drops DTR, as the operating system's hang-up on close does"
+    );
+    expect!(
+        "page-spacing-kept",
+        "each change lands on the board as far from the last as the page spaced them by its \
+         own clock"
+    );
+    expect!("changes-counted", "the node counts every change of DTR");
+
+    let _suite = suite_lock();
+    let acts = vec![
+        (1.0, Act::GetPorts),
+        (3.0, Act::Open(115_200)),
+        (
+            5.0,
+            Act::Req(
+                "setSignals",
+                json!({ "signals": { "dataTerminalReady": false } }),
+            ),
+        ),
+        (
+            7.0,
+            Act::Req(
+                "setSignals",
+                json!({ "signals": { "dataTerminalReady": true } }),
+            ),
+        ),
+        (9.0, Act::Req("close", json!({}))),
+    ];
+    let fake = Fake::start(Script {
+        acts,
+        ..Script::default()
+    });
+    let node = node_with(&fake, 115_200, |settings| settings.invert_dtr = inverted);
+    let stats = node.stats();
+    let (peer, _) = peer(115_200);
+    let probe = LevelProbe::new();
+    let seen = Arc::clone(&probe.seen);
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let mut harness = embsim_board::Harness::new()
+        .connect(ep("PC.TX"), ep("PEER.RX"))
+        .connect(ep("PEER.TX"), ep("PC.RX"))
+        .connect(ep("PC.DTR"), ep("PROBE.IN"));
+    for name in ["PC", "PEER"] {
+        harness = harness
+            .power(
+                ep(&format!("BENCH.{name}3V3")),
+                ep(&format!("{name}.VIO")),
+                3.3,
+            )
+            .power(
+                ep(&format!("BENCH.{name}GND")),
+                ep(&format!("{name}.GND")),
+                0.0,
+            );
+    }
+    let system = embsim_board::System::new()
+        .component("PC", Box::new(node))
+        .component("PEER", peer)
+        .component("PROBE", Box::new(probe))
+        .harness(harness)
+        .hold_time()
+        .start()
+        .expect("the bench starts");
+    let actor = virtual_clock::register_actor("cdp-dtr-case");
+    system.release_time();
+    until(&stats, "the close", || {
+        fake.seen().replies.iter().any(|(name, _)| name == "close")
+    });
+    // At the first instant the pin may read floating once, before the
+    // engine has handed the node its rail: a line with no rail drives
+    // nothing.
+    let seen: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|&(at, level)| !(at == 0 && level.is_none()))
+        .collect();
+    let levels: Vec<_> = seen.iter().map(|&(_, level)| level).collect();
+    let (deasserted, asserted) = if inverted { (Low, High) } else { (High, Low) };
+    assert_eq!(
+        levels.first(),
+        Some(&Some(deasserted)),
+        "idle-deasserted: {seen:?}"
+    );
+    assert_eq!(
+        levels,
+        vec![
+            Some(deasserted),
+            Some(asserted),
+            Some(deasserted),
+            Some(asserted),
+            Some(deasserted)
+        ],
+        "open-asserts, set-signals-moves-it, close-deasserts: {seen:?}"
+    );
+    let at: Vec<u64> = seen.iter().skip(1).map(|&(at, _)| at).collect();
+    assert_eq!(
+        at.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>(),
+        vec![2 * MS, 2 * MS, 2 * MS],
+        "page-spacing-kept: {seen:?}"
+    );
+    assert_eq!(stats.dtr_changes(), 4, "changes-counted");
+    finish(system, actor);
 }
 
 #[test]

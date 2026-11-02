@@ -96,6 +96,31 @@
 //! measurements of the race this ordering closed). Every bank delivery
 //! gives the gate its chance, so the condition can never stall it.
 //!
+//! # A reset while the core runs
+//!
+//! `RESN` read low once the core runs resets the chip, as it reset it
+//! before the first START: the package asks the core to enter reset
+//! ([`P2Core::enter_reset`]), and a core that can boot again — the ROM run
+//! from its first instruction, as silicon's reset runs it — stops, releases
+//! every pad (a chip in reset floats every pin, as it does before its first
+//! START) and asks for no wake. The gate closes behind it: no wake reaches
+//! the core, the handle reads `Held` with the inputs that hold it, and the
+//! restart delay counts again from the instant the reset releases, exactly
+//! as for the first START — a release shorter than the delay starts
+//! nothing. At the end of the delay the core is started again
+//! ([`P2Core::start`]), the new START instant its clock counts from, and
+//! [`P2PackageHandle::resets`] lists the instants it was reset at. A wake
+//! the core asked for before the reset that lands after the new START is
+//! still delivered: the engine's wakes carry no epoch, so a core that
+//! restarts takes a wake it did not ask for as it takes a duplicate one,
+//! as a step forward from where its clock stands.
+//!
+//! A core that cannot boot again keeps running, as before: the reset is
+//! delivered to it as information ([`P2Pads::on_reset`]) and changes
+//! nothing else, and the package says so once (`tracing::warn`). The QEMU
+//! core is one (`embsim-p2-qemu`): its machine state has no entry that
+//! re-runs the ROM.
+//!
 //! # A brownout without a reset
 //!
 //! Once the core runs, the package watches its supply: `VDD` leaving its
@@ -104,8 +129,8 @@
 //! [`StartState::BrownoutWithoutReset`] (with a `tracing::warn`, once) and
 //! the core is held from that instant ([`P2Core::reset`]): no wake reaches
 //! it again, and its pads keep what they last published. A `RESN`
-//! asserted first is a reset the chip was told about, and the package
-//! delivers it to the core as information.
+//! asserted first is a reset the chip was told about (above), never a
+//! brownout.
 //!
 //! # Pads drive high at their bank's supply
 //!
@@ -182,12 +207,12 @@
 //!
 //! # What this package does not do
 //!
-//! - **A reset asserted after START.** A `RESN` that falls once the core
-//!   runs is delivered to the core as a reset state and changes nothing
-//!   else: a restart needs a core entry that re-runs the boot from the ROM
-//!   (the QEMU core's machine state, a native image's statics), which no
-//!   core has. The datasheet's own restart (Rebooting, p. 35) is the entry
-//!   it would implement.
+//! - **A reset asserted after START, for a core that cannot boot again.**
+//!   The package restarts a core that enters reset (above); one that cannot
+//!   — the QEMU core, whose machine state has no entry that re-runs the
+//!   ROM — runs on, the reset delivered as information. The guest's own
+//!   reset (`HUBSET` with bit 28 set; Rebooting, p. 35) is the core's to
+//!   carry out, not the package's: no pin moves.
 //! - **A bank supply changing after START.** A `VIO_a_b` that rises,
 //!   drops or moves once the core runs updates the [`BankSupplies`] table
 //!   and nothing else: a pad the core already drives keeps the drive it
@@ -989,6 +1014,12 @@ struct Gate {
     /// The instant `VDD` left its window after the START instant with
     /// `RESN` not asserted, and the inputs then: the core is held from it.
     brownout: Option<(u64, P2ResetState)>,
+    /// The instants the core entered reset while it ran, oldest first
+    /// ([`P2Core::enter_reset`]).
+    resets: Vec<u64>,
+    /// The core said it cannot boot again ([`P2Core::enter_reset`] returned
+    /// `false`): it is not asked again, and the package said so once.
+    cannot_restart: bool,
     /// The core's wake handler, however it registered it: through
     /// [`P2Pads::on_wake_ns`], or on the net I/O the package handed it
     /// ([`CoreWakes`]).
@@ -1192,7 +1223,26 @@ pub trait P2Core: Send + Sync {
     /// current virtual nanosecond is the START instant the core's clock
     /// counts from. Runs before any wake the core asked for is delivered,
     /// on the engine thread, inside the package's own wake.
+    ///
+    /// Called again after every reset the core entered
+    /// ([`Self::enter_reset`] returned `true`), at the START instant that
+    /// reset leads to: a boot from the ROM, the chip's state what its
+    /// reset leaves.
     fn start(&mut self) {}
+
+    /// `RESN` read low while this core ran: the chip is in reset (the
+    /// module docs, "A reset while the core runs"). A core that can boot
+    /// again stops executing, releases every pad it drives — a chip in
+    /// reset floats every pin — stops every drive it scheduled (a step
+    /// train, a transmitter's frames), and returns `true`: the package
+    /// delivers it no wake until it starts it again ([`Self::start`]) the
+    /// restart delay after the reset releases. A core that cannot returns
+    /// `false`, the default, and runs on with the reset delivered as
+    /// information ([`P2Pads::on_reset`]). Called on the engine thread at
+    /// the instant the package reads the reset, at most once per reset.
+    fn enter_reset(&mut self) -> bool {
+        false
+    }
 
     /// Stop executing: the chip left its operating conditions while this
     /// core ran — `VDD` out of its window with `RESN` not asserted, the
@@ -1227,6 +1277,10 @@ impl P2Core for Box<dyn P2Core> {
 
     fn start(&mut self) {
         (**self).start();
+    }
+
+    fn enter_reset(&mut self) -> bool {
+        (**self).enter_reset()
     }
 
     fn reset(&mut self) {
@@ -1391,7 +1445,8 @@ pub fn register_p2(
                 subject: format!("{board}.{}", decl.reference),
                 core: core_name.clone(),
                 package: Arc::clone(&handle),
-                started: false,
+                started: None,
+                resets_said: 0,
             });
             match ctor(decl) {
                 Ok(core) => {
@@ -1420,15 +1475,19 @@ fn and_list(items: &[String]) -> String {
     }
 }
 
-/// What a seated package says in a run: when its core started, and at the
-/// end the state of its gate and the core it holds.
+/// What a seated package says in a run: when its core started, each reset
+/// it entered and each START after one, and at the end the state of its
+/// gate and the core it holds.
 struct PackageReport {
     subject: String,
     core: String,
     /// Filled once the core is in the package; `None` for a core that
     /// could not be made, whose package refuses to attach.
     package: Arc<Mutex<Option<P2PackageHandle>>>,
-    started: bool,
+    /// The START instant last said.
+    started: Option<u64>,
+    /// The resets said so far.
+    resets_said: usize,
 }
 
 impl PackageReport {
@@ -1446,16 +1505,30 @@ impl Report for PackageReport {
     }
 
     fn look(&mut self, _now_ns: u64) -> Vec<String> {
-        if self.started {
+        let Some(handle) = self.handle() else {
             return Vec::new();
+        };
+        let mut said = Vec::new();
+        let resets = handle.resets();
+        for at in resets.iter().skip(self.resets_said) {
+            said.push(format!(
+                "the core was reset at {} (RESN asserted)",
+                instant(*at)
+            ));
         }
-        match self.handle().and_then(|handle| handle.started_at_ns()) {
-            Some(at) => {
-                self.started = true;
-                vec![format!("the core started at {}", instant(at))]
+        self.resets_said = resets.len();
+        if let Some(at) = handle.started_at_ns() {
+            if self.started != Some(at) {
+                let again = if self.started.is_some() || !resets.is_empty() {
+                    " again"
+                } else {
+                    ""
+                };
+                said.push(format!("the core started{again} at {}", instant(at)));
+                self.started = Some(at);
             }
-            None => Vec::new(),
         }
+        said
     }
 
     fn summary(&self) -> Vec<String> {
@@ -1478,7 +1551,13 @@ impl Report for PackageReport {
             }
             StartState::Held { reset } => format!("held in reset ({reset:?})"),
         };
-        vec![format!("core {:?}: {state}", self.core)]
+        let resets = handle.resets();
+        let resets = match resets.as_slice() {
+            [] => String::new(),
+            [at] => format!(", reset once, at {}", instant(*at)),
+            [.., last] => format!(", reset {} times, last at {}", resets.len(), instant(*last)),
+        };
+        vec![format!("core {:?}: {state}{resets}", self.core)]
     }
 }
 
@@ -1566,8 +1645,20 @@ impl P2PackageHandle {
         }
     }
 
+    /// The instants the core entered reset while it ran (`RESN` read low
+    /// after a START; the module docs, "A reset while the core runs"),
+    /// oldest first. Empty for a core that cannot boot again, which runs
+    /// on through a reset.
+    pub fn resets(&self) -> Vec<u64> {
+        self.gate
+            .lock()
+            .expect("start gate never poisoned")
+            .resets
+            .clone()
+    }
+
     /// The START instant, once the core was started (whether or not it
-    /// was held by a brownout since).
+    /// was held by a brownout since): the latest, after a reset.
     pub fn started_at_ns(&self) -> Option<u64> {
         match self.start_state() {
             StartState::Started { at_ns } => Some(at_ns),
@@ -1705,12 +1796,57 @@ impl<C: P2Core + 'static> P2Package<C> {
         }
     }
 
+    /// Follow a reset asserted while the core runs: `RESN` read low after
+    /// the START instant, before any brownout hold. A core that can boot
+    /// again ([`P2Core::enter_reset`] returns `true`) is held from this
+    /// instant as it was before its first START — the START instant
+    /// forgotten, the wakes it asked for before it dropped — so the gate
+    /// counts the restart delay again from the release ([`Self::
+    /// follow_reset`]) and starts it anew. A core that cannot runs on, and
+    /// the package says so once and asks it no more. Called on every
+    /// `RESN` and `VDD` delivery (the engine thread), before
+    /// [`Self::follow_reset`].
+    fn watch_reset(gate: &Mutex<Gate>, core: &Mutex<C>, reset: P2ResetState, now: u64) {
+        {
+            let gate = gate.lock().expect("start gate never poisoned");
+            if gate.started_at_ns.is_none()
+                || gate.brownout.is_some()
+                || gate.cannot_restart
+                || reset.resn != Some(Level::Low)
+            {
+                return;
+            }
+        }
+        let restarts = core.lock().expect("core never poisoned").enter_reset();
+        let mut gate = gate.lock().expect("start gate never poisoned");
+        if restarts {
+            let started_at_ns = gate.started_at_ns.take();
+            gate.released_at_ns = None;
+            gate.held_wakes.clear();
+            gate.held_periods.clear();
+            gate.resets.push(now);
+            tracing::info!(
+                ?started_at_ns,
+                at_ns = now,
+                "p2: RESN asserted while the core ran; the chip is in reset, and restarts 3 ms \
+                 after RESN releases"
+            );
+        } else {
+            gate.cannot_restart = true;
+            tracing::warn!(
+                at_ns = now,
+                "p2: RESN asserted while the core ran, and this core cannot boot again; the \
+                 reset is delivered to it as information and it runs on"
+            );
+        }
+    }
+
     /// Watch the running chip's supply: `VDD` leaving its window after the
     /// START instant while `RESN` is not asserted (it reads high or
     /// nothing) is a brownout without a reset. Record it once, say so, and
     /// hold the core ([`P2Core::reset`]): no wake reaches it again. A
-    /// `RESN` asserted first is a reset the chip was told about, and the
-    /// package does nothing with it after START but deliver it.
+    /// `RESN` asserted first is a reset the chip was told about
+    /// ([`Self::watch_reset`]), never a brownout.
     fn watch_brownout(gate: &Mutex<Gate>, core: &Mutex<C>, reset: P2ResetState, now: u64) {
         {
             let mut gate = gate.lock().expect("start gate never poisoned");
@@ -1885,8 +2021,9 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
         }
 
         // RESN and VDD: each sense updates its half, delivers the pair,
-        // and the gate follows it — a release starts the restart delay, a
-        // re-assertion inside it cancels it.
+        // and the gate follows it — a reset while the core runs holds it
+        // again, a release starts the restart delay, a re-assertion inside
+        // it cancels it.
         for (pin, is_resn) in [("RESN", true), ("VDD", false)] {
             let state = Arc::clone(&self.state);
             let reset = Arc::clone(&reset);
@@ -1909,6 +2046,7 @@ impl<C: P2Core + 'static> Component for P2Package<C> {
                     callback(snapshot);
                 }
                 let now = virtual_clock::virtual_ns();
+                Self::watch_reset(&gate, &core, snapshot, now);
                 Self::follow_reset(&gate, &state, &banks, &io_for_gate, now);
                 Self::watch_brownout(&gate, &core, snapshot, now);
             })?;

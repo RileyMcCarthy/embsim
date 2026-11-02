@@ -768,7 +768,7 @@ made by `embsim flash-image`.
 
 A `[[component]]` is a part with pins and no board. Its pins are its
 endpoints, `Name.Pin`, and its options are `[component.options]`. The
-standard catalog ships two kinds, and the `embsim` command's set a third,
+standard catalog ships three kinds, and the `embsim` command's set a fourth,
 `chrome-cdp`, in a catalog of its own, since it starts a process.
 
 **`host-serial`**: the host's end of a serial link, a PTY whose bytes are
@@ -781,6 +781,7 @@ opens the PTY's path and reads and writes it as it would a serial adapter.
 | `RX` | what the host receives: JESD8C.01's 0.8 V / 2.0 V pair against `GND`, the pair a 3.3 V LVCMOS input and a 5 V TTL input both take |
 | `VIO` | the host's I/O rail, against `GND`: wire the host's real rail (a Raspberry Pi's 3.3 V) |
 | `GND` | the host's ground |
+| `DTR` | the adapter's data-terminal-ready output, at `VIO` and the push-pull default like `TX`: a PTY carries no modem lines, so it stays deasserted — high, or low with `invert_dtr` |
 
 The pins are named from the host's side, so a wire reads `HOST.TX` to the
 board's receive pin.
@@ -788,6 +789,7 @@ board's receive pin.
 | Option | What it says |
 |---|---|
 | `baud` | required: the link's rate, framed 8N1. A host names its rate, and the kind invents none |
+| `invert_dtr` | `true`: the adapter inverts its `DTR` output, as an FTDI's EEPROM can, so `DTR` is high while asserted. By default it is active low, as a logic-level USB-UART's is from the factory |
 | `path` | the path the PTY is reached at (a symlink to it), relative to the project file; by default `.embsim/<name>.pty` beside it. A symlink already there (one an earlier run left) is replaced; a path holding anything else, a file or a directory, is refused before the system is built, and left as it is. The run removes the link when it ends, if it is still its own |
 
 `embsim run --pty PATH` sets `path` for the project's one `host-serial`,
@@ -820,6 +822,27 @@ sends nothing, and the summary says how many:
 HOST: 4 bytes the host wrote were shed: its line was unpowered (VIO read no voltage) or its queue was full
 ```
 
+**`prop-plug-reset`**: the reset stage of a Parallax Prop Plug, the USB
+adapter a Propeller's programming header takes
+(`embsim_models::prop_plug`): the adapter chip's DTR coupled through a
+series capacitor into an NPN whose open collector is the plug's `RES`. A
+rising edge on `DTR` sinks `RES` to `VSS` for 20 µs, the product page's
+typical, from the edge's instant; a rising edge inside a pulse starts it
+again; a falling edge does nothing, and the level `DTR` reads when the
+system starts is no edge. Between pulses `RES` is released: the target's
+own pull-up holds its reset high. It takes no options.
+
+| Pin | What it is |
+|---|---|
+| `DTR` | the input from the adapter's chip (wire a host's `DTR` to it), read through JESD8C.01's pair against `VSS` |
+| `RES` | the open collector on the plug's header: wire it to the target's reset (a Propeller's `RESn`) |
+| `VSS` | the plug's ground, which `RES` sinks to; a `VSS` that names no voltage sinks nothing |
+
+Which DTR state resets the target is the adapter's polarity, not the
+stage's: with a host's `DTR` active low, a rising edge is DTR deasserted;
+with `invert_dtr = true`, it is DTR asserted. At the end of a run it says
+how many pulses it sank and when the last began.
+
 **`scripted-source`**: one pin, `OUT`, driven through a list of steps
 (`embsim_board::ScriptedSource`). It is the smallest stimulus that lets a
 project do something over time: press a button, brown out a rail, sweep a
@@ -840,7 +863,7 @@ the host's Chrome on a host's serial line. Every page Chrome opens has Web
 Serial whose one port is this line, and every page's clock, and every
 dedicated worker's, is metered by the board's over the Chrome DevTools
 Protocol (`embsim_cdp::CdpNode`), so a web app's timeouts mean in board
-time what they say. Its pins are `host-serial`'s, the same four, so a
+time what they say. Its pins are `host-serial`'s, the same five, so a
 project swaps one kind for the other without touching a wire.
 [`examples/chrome-ping`](examples/chrome-ping) is a project with one, and
 a Playwright harness for it.
@@ -851,6 +874,7 @@ a Playwright harness for it.
 | `RX` | what the page reads: JESD8C.01's 0.8 V / 2.0 V pair against `GND` |
 | `VIO` | the host's I/O rail, against `GND` |
 | `GND` | the host's ground |
+| `DTR` | the adapter's data-terminal-ready output, at `VIO` and the push-pull default like `TX`, following the page's DTR (below): low while asserted, or high with `invert_dtr` |
 
 | Option | What it says |
 |---|---|
@@ -865,6 +889,7 @@ a Playwright harness for it.
 | `url` | a page to open once it is held: a URL (`http://`, `https://`, `file://`, `about:`, `data:`), or a file beside the project file. A launched Chrome opens it in its first tab; a browser the node attached to, in a new window. A page that does not open stops the run, saying why |
 | `usb_vendor_id`, `usb_product_id` | the adapter the port is, as `getInfo()` reports it and `requestPort()` filters match it (`0x0403`, `0x6001` for an FTDI FT232R). Without them the port has no USB ids |
 | `granted` | `true`: every origin may use the port without a prompt, as Chrome's `SerialAllowUsbDevicesForUrls` policy grants it, so `getPorts()` returns it at once. By default a page gets the port from `requestPort()`, which needs a user gesture (a harness's click), and keeps it for its origin |
+| `invert_dtr` | `true`: the adapter inverts its `DTR` output, as an FTDI's EEPROM can, so `DTR` is high while asserted. By default it is active low, as a logic-level USB-UART's is from the factory |
 
 Nothing starts at `check`. Chrome is launched, or attached to, at the
 node's first slice, a quantum after the run starts, with the board's clock
@@ -908,10 +933,18 @@ slice — fires `disconnect` for the port of every origin that may use it,
 asked for or not, and errors both streams with `NetworkError` "The device
 has been lost." once the page has read what the port's pipe already held;
 putting it back (`'plug'`) fires `connect` with a new `SerialPort`, the old
-one dead. The line has no modem-control pins: `setSignals()` (DTR, RTS, a
-break) is answered and reaches nothing, an open with hardware flow control
-opens with nothing to pace it, `getSignals()` reads every input inactive,
-and the report counts the first two. The port lives in the top frame's
+one dead. DTR is the line's `DTR` pin and follows the port as Chrome's does
+on Linux and macOS, where Chrome leaves the modem lines to the operating
+system: `open()` asserts it (the system raises DTR with the line),
+`setSignals({ dataTerminalReady })` from the page that holds the port sets
+it, and a close — the page's, its document going, a forgotten permission —
+or a pulled cable deasserts it (the system's hang-up on close, `HUPCL`, on
+by default). Each change lands at the slice the page asked in, and the
+report counts them. Not modelled: macOS holding a reopen until two seconds
+after DTR last dropped. The line has no other modem-control pin: RTS and a
+break in `setSignals()` are answered and reach nothing, an open with
+hardware flow control opens with nothing to pace it, `getSignals()` reads
+every input inactive, and the report counts the first two. The port lives in the top frame's
 `navigator.serial`; a frame's and a dedicated worker's own
 `navigator.serial` are Chrome's, so an app opens the port on its page's
 main thread and transfers the streams to a worker (the report says when a
@@ -1459,8 +1492,9 @@ alone.
 
 ### The rest
 
-- The standard catalog's bench component kinds are `host-serial` and
-  `scripted-source` (section 5); a host that must run on the board's clock,
+- The standard catalog's bench component kinds are `host-serial`,
+  `prop-plug-reset` and `scripted-source` (section 5); a host that must run
+  on the board's clock,
   a browser whose pages and workers the board's clock meters, is
   `chrome-cdp`, in the `embsim` command's set (section 5). There is no pace
   for `run` against wall time: `run` is stepped, so a quiet system's virtual
@@ -2056,7 +2090,9 @@ core's, and `held-in-reset` takes none. The seat returns the constructor
 the board build calls once per part; the `p2` kind wraps whatever it
 returns in `P2Package::new` (`embsim_boards::p2::register_p2`), so no core
 can skip the START gate. A core implements `P2Core` (`attach(P2Pads)`,
-`start`, `reset`) and drives its pads through
+`start`, `reset`, and `enter_reset` for a core that boots again after its
+`RESN` is pulled low while it runs: it releases its pads, stops, and is
+started anew 3 ms after the reset releases) and drives its pads through
 `P2Pads::bank_supplies().pad_drive(..)`, as QEMU's does. A constructor that
 cannot make its core returns the reason, and the package refuses to attach
 with it, so the system does not start.

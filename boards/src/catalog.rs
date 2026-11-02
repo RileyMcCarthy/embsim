@@ -81,6 +81,7 @@ use embsim_models::logic_gate::{
 };
 use embsim_models::opto::Opto;
 use embsim_models::oscillator::{self, Oscillator, TCXO_PINS_BY_FUNCTION, TCXO_PINS_NUMBERED};
+use embsim_models::prop_plug::{PropPlugReset, PropPlugResetHandle};
 use embsim_models::psram::{Psram, PsramComponent, PSRAM_PINS_BY_FUNCTION, PSRAM_PINS_SOP8};
 use embsim_models::pwl_library;
 use embsim_models::rail::{
@@ -323,6 +324,10 @@ fn component_kinds() -> Vec<KindInfo> {
         )
         .requires("baud", "115200", "the link's rate, framed 8N1"),
         KindInfo::new(
+            "prop-plug-reset",
+            "a Parallax Prop Plug's reset stage: a pulse sunk on RES at each rising edge on DTR",
+        ),
+        KindInfo::new(
             "scripted-source",
             "one pin, OUT, driven through a list of steps",
         )
@@ -391,10 +396,11 @@ impl Catalog for StandardCatalog {
     fn component(&self, request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
         match request.spec.kind.as_str() {
             "host-serial" => host_serial(request),
+            "prop-plug-reset" => prop_plug_reset(request),
             "scripted-source" => scripted_source(request),
             other => Err(ProjectError::message(format!(
                 "component {}: unknown kind {other:?}; the component kinds are \"host-serial\", \
-                 \"scripted-source\"",
+                 \"prop-plug-reset\", \"scripted-source\"",
                 request.spec.name
             ))),
         }
@@ -441,7 +447,9 @@ impl StandardCatalog {
 // ============================================================
 
 /// `host-serial`: the host's end of a serial link, a PTY whose bytes are
-/// levels on `TX` and `RX` at the host's own rail (`VIO` above `GND`).
+/// levels on `TX` and `RX` at the host's own rail (`VIO` above `GND`), and
+/// `DTR` deasserted (a PTY carries no modem lines; `invert_dtr = true` for
+/// an adapter that inverts it, as `chrome-cdp` takes it).
 fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
     let ComponentRequest {
         spec,
@@ -463,6 +471,7 @@ fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proj
         .filter(|baud| *baud > 0)
         .ok_or_else(|| error(format!("options.baud = {baud} is not a rate")))?;
     let path = options.string("path")?;
+    let invert_dtr = options.boolean("invert_dtr")?.unwrap_or(false);
     options.finish()?;
     let path = match path {
         Some(path) => dir.join(path),
@@ -489,7 +498,8 @@ fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proj
     }
     let text = path.to_string_lossy().into_owned();
     let pty = HostPty::open_on_rail(&text, baud)
-        .map_err(|err| error(format!("cannot open a PTY at {text}: {err}")))?;
+        .map_err(|err| error(format!("cannot open a PTY at {text}: {err}")))?
+        .with_dtr_inverted(invert_dtr);
     reports.add(HostSerialReport {
         subject: spec.name.clone(),
         path: text,
@@ -498,6 +508,54 @@ fn host_serial(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proj
         said: false,
     });
     Ok(Box::new(pty))
+}
+
+/// `prop-plug-reset`: a Parallax Prop Plug's reset stage
+/// ([`embsim_models::prop_plug`]): `DTR` from the adapter's chip, `RES` the
+/// open collector on the plug's header, `VSS` its ground. It takes no
+/// options: the pulse is the plug's typical.
+fn prop_plug_reset(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, ProjectError> {
+    let ComponentRequest {
+        spec,
+        options,
+        reports,
+        ..
+    } = request;
+    options.finish()?;
+    let stage = PropPlugReset::new();
+    reports.add(PropPlugResetReport {
+        subject: spec.name.clone(),
+        stage: stage.handle(),
+    });
+    Ok(Box::new(stage))
+}
+
+/// What a `prop-plug-reset` says at the end of a run: the pulses it sank.
+struct PropPlugResetReport {
+    subject: String,
+    stage: PropPlugResetHandle,
+}
+
+impl Report for PropPlugResetReport {
+    fn subject(&self) -> String {
+        self.subject.clone()
+    }
+
+    fn look(&mut self, _now_ns: u64) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn summary(&self) -> Vec<String> {
+        let pulses = self.stage.pulses();
+        vec![match self.stage.last_pulse_ns() {
+            Some(at) => format!(
+                "RES pulsed low {pulses} time{}, the last at {}",
+                if pulses == 1 { "" } else { "s" },
+                embsim_board::report::instant(at)
+            ),
+            None => "RES never pulsed".to_string(),
+        }]
+    }
 }
 
 /// An error about a bench component's entry.

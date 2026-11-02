@@ -103,6 +103,9 @@ pub struct Settings {
     /// Whether every origin may use the port without a prompt, as Chrome's
     /// `SerialAllowUsbDevicesForUrls` policy grants it.
     pub granted: bool,
+    /// Whether the adapter inverts its `DTR` output: high while DTR is
+    /// asserted ([`embsim_board::HostRailLine::set_dtr_inverted`]).
+    pub invert_dtr: bool,
 }
 
 impl Settings {
@@ -117,6 +120,7 @@ impl Settings {
             url: None,
             usb: UsbIds::default(),
             granted: false,
+            invert_dtr: false,
         }
     }
 }
@@ -160,6 +164,7 @@ pub struct NodeStats {
     mismatched_opens: AtomicU64,
     mismatched_bytes: AtomicU64,
     signals: AtomicU64,
+    dtr_changes: AtomicU64,
     flow_control_opens: AtomicU64,
     drain_waits: AtomicU64,
     drain_timeouts: AtomicU64,
@@ -214,6 +219,7 @@ impl Default for NodeStats {
             mismatched_opens: AtomicU64::new(0),
             mismatched_bytes: AtomicU64::new(0),
             signals: AtomicU64::new(0),
+            dtr_changes: AtomicU64::new(0),
             flow_control_opens: AtomicU64::new(0),
             drain_waits: AtomicU64::new(0),
             drain_timeouts: AtomicU64::new(0),
@@ -325,9 +331,13 @@ impl NodeStats {
         mismatched_opens,
         /// Bytes shed because of such an open (also in [`Self::shed`]).
         mismatched_bytes,
-        /// `setSignals` calls that asserted DTR, RTS or a break, which no
-        /// pin of the line carries.
+        /// `setSignals` calls that asserted RTS or a break, which no pin of
+        /// the line carries.
         signals,
+        /// Times DTR moved: asserted by an open or a `setSignals`,
+        /// deasserted by a `setSignals`, a close or a pulled cable — each a
+        /// level change on `DTR`.
+        dtr_changes,
         /// Opens that asked for hardware (RTS/CTS) flow control, which no
         /// pin of the line carries.
         flow_control_opens,
@@ -602,6 +612,7 @@ impl Component for CdpNode {
 
     fn attach(&mut self, io: ComponentNetIo) -> Result<(), AttachError> {
         let line = HostRailLine::attach(&io, self.framing, Arc::clone(&self.shutdown))?;
+        line.set_dtr_inverted(self.settings.invert_dtr);
         let capacity = line.bridge().tx_room();
         let meter = Arc::new(Meter {
             baud_hz: self.baud_hz,
@@ -1104,6 +1115,15 @@ impl Meter {
         }
     }
 
+    /// Assert or deassert DTR on the line's `DTR`, at this slice's
+    /// instant, counting each change.
+    fn set_dtr(&self, asserted: bool) {
+        if self.line.dtr() != asserted {
+            self.stats.add(&self.stats.dtr_changes, 1);
+            self.line.set_dtr(asserted);
+        }
+    }
+
     /// Pull or re-insert the cable.
     fn link(&self, state: &mut State, op: LinkOp) {
         match op {
@@ -1126,6 +1146,10 @@ impl Meter {
     /// that is out carries nothing ([`Released::Unplugged`]).
     fn release(&self, state: &mut State, why: Released) {
         state.owner = None;
+        // A port no one holds has DTR deasserted: a close drops it, as
+        // Chrome's closes do (the operating system's hang-up on close), and
+        // a pulled cable leaves no port to assert it.
+        self.set_dtr(false);
         let tx = state.tx.len() as u64;
         state.tx.clear();
         state.drains.clear();
@@ -1339,6 +1363,10 @@ impl Meter {
                     } else {
                         Listening::Mismatched
                     };
+                    drop(rx);
+                    // Opening a port asserts DTR, as Chrome's opens do: the
+                    // operating system raises DTR and RTS with the line.
+                    self.set_dtr(true);
                     ok(id, Value::Null)
                 }
             }
@@ -1374,20 +1402,23 @@ impl Meter {
                 ok(id, Value::Null)
             }
             "setSignals" => {
-                let asserted: Vec<&str> = [
-                    ("dataTerminalReady", "DTR"),
-                    ("requestToSend", "RTS"),
-                    ("break", "a break"),
-                ]
-                .into_iter()
-                .filter(|(key, _)| m["signals"][key] == true)
-                .map(|(_, name)| name)
-                .collect();
+                // DTR is the line's `DTR`; the page that holds the port
+                // moves it.
+                if holds {
+                    if let Some(dtr) = m["signals"]["dataTerminalReady"].as_bool() {
+                        self.set_dtr(dtr);
+                    }
+                }
+                let asserted: Vec<&str> = [("requestToSend", "RTS"), ("break", "a break")]
+                    .into_iter()
+                    .filter(|(key, _)| m["signals"][key] == true)
+                    .map(|(_, name)| name)
+                    .collect();
                 if !asserted.is_empty() {
                     self.stats.add(&self.stats.signals, 1);
                     let said = format!(
-                        "a page asserted {} (setSignals): the line has no modem-control pins, \
-                         so nothing on the board saw it",
+                        "a page asserted {} (setSignals): the line has no RTS pin and sends no \
+                         break, so nothing on the board saw it",
                         asserted.join(" and ")
                     );
                     tracing::warn!("chrome-cdp: {said}");
