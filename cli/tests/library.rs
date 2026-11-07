@@ -11,13 +11,18 @@
 //! - `lib-test-lamp`, a part kind for the lamp: an analog reader across its
 //!   two pins that records what it is handed;
 //! - `lib-test-core`, a P2 core: it records when it attached and the
-//!   virtual instant it was started at;
+//!   virtual instants it was started at, and boots again after a reset;
 //! - `lib-test-source`, a bench component: one pin, driving the volts its
 //!   option names behind 100 Ω, and a report saying so.
 //!
+//! A second project adds a Prop Plug's reset stage on the module's reset
+//! finger, its DTR raised by a scripted source, and runs the reset through
+//! to the run's report.
+//!
 //! The run is stepped inside the library (`TESTING.md` rule 9), so it ends
 //! at exactly the virtual instant asked for. Its own binary: the virtual
-//! clock is one per process.
+//! clock is one per process, and the two cases take a suite lock so one
+//! run's clock is never the other's.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -63,6 +68,11 @@ struct Seen {
     lamp: Vec<Option<f64>>,
     core_attached: bool,
     core_started_ns: Option<u64>,
+    /// Every instant the core was started at, the first and each after a
+    /// reset.
+    core_starts: Vec<u64>,
+    /// How many resets the core entered.
+    core_resets: usize,
 }
 
 type Shared = Arc<Mutex<Seen>>;
@@ -85,7 +95,8 @@ impl Component for Lamp {
     }
 }
 
-/// The core: it records when it attached and when it started.
+/// The core: it records when it attached and when it started, and it can
+/// boot again after a reset, as a core whose chip reruns its ROM can.
 struct TestCore {
     seen: Shared,
 }
@@ -97,7 +108,15 @@ impl P2Core for TestCore {
     }
 
     fn start(&mut self) {
-        self.seen.lock().unwrap().core_started_ns = Some(virtual_clock::virtual_ns());
+        let now = virtual_clock::virtual_ns();
+        let mut seen = self.seen.lock().unwrap();
+        seen.core_started_ns = Some(now);
+        seen.core_starts.push(now);
+    }
+
+    fn enter_reset(&mut self) -> bool {
+        self.seen.lock().unwrap().core_resets += 1;
+        true
     }
 }
 
@@ -328,14 +347,74 @@ to = "EC32.J203.45"
 volts = 0.0
 "#;
 
-/// The project file, in a directory of this test's own.
-fn project_file() -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("library");
+/// What the reset case adds to [`PROJECT`]: a Prop Plug's reset stage on
+/// the module's reset finger (J203 finger 46, RESn, through R201 to
+/// `P2_RESN`, which R100 pulls up), grounded on the fingers, and a source
+/// holding its DTR low from 6 ms and raising it at 7 ms, one rising edge.
+const RESET: &str = r#"
+[[component]]
+name = "PLUG"
+kind = "prop-plug-reset"
+
+[[component]]
+name = "DTR"
+kind = "scripted-source"
+[component.options]
+ohms = 100.0
+steps = [["6ms", 0.0], ["7ms", 3.3]]
+
+[[wire]]
+from = "DTR.OUT"
+to = "PLUG.DTR"
+
+[[wire]]
+from = "PLUG.RES"
+to = "EC32.J203.46"
+
+[[wire]]
+from = "PLUG.VSS"
+to = "EC32.J203.43"
+"#;
+
+/// `text` as a project file named `name`, in a directory of this test's
+/// own.
+fn project_file_of(name: &str, text: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("library-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the scratch directory can be made");
-    let path = dir.join("lib.toml");
-    std::fs::write(&path, PROJECT).expect("the project is writable");
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::write(&path, text).expect("the project is writable");
     path
+}
+
+/// The project file, in a directory of this test's own.
+fn project_file() -> PathBuf {
+    project_file_of("lib", PROJECT)
+}
+
+/// One run at a time: the virtual clock is process-global, and each run
+/// re-anchors it.
+static SUITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn suite_lock() -> std::sync::MutexGuard<'static, ()> {
+    SUITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        SUITE_LOCK.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// The test's two catalogs over the shipped set, sharing `seen`.
+fn set_with(seen: &Shared) -> CatalogSet {
+    let mut set = embsim_cli::shipped();
+    set.add(LibCatalog {
+        seen: Arc::clone(seen),
+    })
+    .expect("the catalog joins");
+    set.add_cores(LibCores {
+        seen: Arc::clone(seen),
+    })
+    .expect("the core joins");
+    set
 }
 
 /// The command over `set` with `args`, in this process: its exit status,
@@ -386,16 +465,9 @@ fn a_project_naming_a_catalogs_four_kinds_checks_and_runs_through_the_library() 
         "the run prints what the bench component and the processor report, each under its \
          name"
     );
+    let _suite = suite_lock();
     let seen: Shared = Arc::default();
-    let mut set = embsim_cli::shipped();
-    set.add(LibCatalog {
-        seen: Arc::clone(&seen),
-    })
-    .expect("the catalog joins");
-    set.add_cores(LibCores {
-        seen: Arc::clone(&seen),
-    })
-    .expect("the core joins");
+    let set = set_with(&seen);
     let project = project_file();
     let project = project.to_str().expect("the path is text");
 
@@ -434,4 +506,60 @@ fn a_project_naming_a_catalogs_four_kinds_checks_and_runs_through_the_library() 
     ] {
         assert!(out.contains(line), "{line:?} missing from:\n{out}");
     }
+}
+
+#[rstest]
+fn a_prop_plug_pulse_on_the_reset_finger_reboots_the_core_and_the_run_says_so() {
+    behaviour!(Test {
+        id: "cli.prop-plug-reset-reboots",
+        covers: Some("boards/src/p2.rs#PackageReport"),
+        given: "the same P2-EC32MB with a Prop Plug's reset stage on its reset finger, whose DTR \
+                is held low from 6 milliseconds and raised at 7, run for 15 milliseconds \
+                through the command's library",
+    });
+    expect!(
+        "plug-pulses",
+        "the raised DTR makes the plug pull the reset line low once, and its summary says when"
+    );
+    expect!(
+        "core-restarts",
+        "the core is reset once and started again 3 milliseconds after the plug lets the line \
+         go, two starts in all",
+        "a reset while the core runs holds it again, and the restart delay counts from the \
+         release"
+    );
+    expect!(
+        "report-says-reset",
+        "the run says when the core was reset and when it started again, in that order, and \
+         its summary counts the reset",
+        "a reset is only recorded while the core runs, so the start it follows is always a \
+         start again"
+    );
+    let _suite = suite_lock();
+    let seen: Shared = Arc::default();
+    let set = set_with(&seen);
+    let project = project_file_of("reset", &format!("{PROJECT}{RESET}"));
+    let project = project.to_str().expect("the path is text");
+
+    let (code, out, err) = embsim(&set, &["run", project, "--for", "15ms"]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}\n{out}");
+    assert!(
+        out.contains("PLUG: RES pulsed low 1 time, the last at 7.000000 ms"),
+        "plug-pulses:\n{out}"
+    );
+    let (starts, resets) = {
+        let seen = seen.lock().unwrap();
+        (seen.core_starts.clone(), seen.core_resets)
+    };
+    assert_eq!(resets, 1, "core-restarts: {starts:?}\n{out}");
+    assert_eq!(starts, vec![5_500_000, 10_020_000], "core-restarts:\n{out}");
+    let at = |line: &str| {
+        out.find(line)
+            .unwrap_or_else(|| panic!("report-says-reset: {line:?} missing from:\n{out}"))
+    };
+    let first = at("EC32.U100: the core started at 5.500000 ms");
+    let reset = at("EC32.U100: the core was reset at 7.000000 ms (RESN asserted)");
+    let again = at("EC32.U100: the core started again at 10.020000 ms");
+    assert!(first < reset && reset < again, "report-says-reset:\n{out}");
+    at("EC32.U100: core \"lib-test-core\": started at 10.020000 ms, reset once, at 7.000000 ms");
 }

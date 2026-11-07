@@ -38,7 +38,7 @@ use crate::net::{Level, TheveninDrive, Volts, DEFAULT_PUSH_PULL_IMPEDANCE};
 use crate::uart::{FramingError, UartFraming};
 use crate::{
     jesd8c01_lvcmos_thresholds, AttachError, Component, ComponentNetIo, DeadBand, PinDecl,
-    SerialLevelBridge,
+    PinHandle, SerialLevelBridge,
 };
 use embsim_core::serial_pty::Pty;
 
@@ -97,7 +97,7 @@ impl std::fmt::Debug for HostPtyCounters {
 
 /// The pins of a host whose I/O rail is its own `VIO` pin, against its own
 /// `GND` ([`HostPty::open_on_rail`], [`HostRailLine`]).
-pub const HOST_RAIL_PINS: [PinDecl; 4] = [
+pub const HOST_RAIL_PINS: [PinDecl; 5] = [
     // Driven at the sensed `VIO` above `GND`, through the bridge's ports;
     // released while `VIO` reads no voltage.
     PinDecl::digital_out("TX")
@@ -108,6 +108,14 @@ pub const HOST_RAIL_PINS: [PinDecl; 4] = [
     PinDecl::digital_in("RX", jesd8c01_lvcmos_thresholds(DeadBand::Unknown)).with_reference("GND"),
     PinDecl::power_in("VIO").with_reference("GND"),
     PinDecl::power_in("GND"),
+    // The adapter's data-terminal-ready output: `GND` while the host
+    // asserts DTR, `VIO` above it while it does not, or the other way round
+    // on an adapter configured to invert it ([`HostRailLine::set_dtr`],
+    // [`HostRailLine::set_dtr_inverted`]); released while `VIO` reads no
+    // voltage.
+    PinDecl::digital_out("DTR")
+        .with_idle(None)
+        .with_reference("GND"),
 ];
 
 /// What the host's rail pins last read: `VIO` against `GND`, and `GND` in
@@ -141,6 +149,15 @@ impl Rail {
 /// at `GND`, behind the push-pull default, and is released while `VIO`
 /// reads no voltage.
 ///
+/// `DTR` is the adapter's data-terminal-ready output at the same rail and
+/// strength. It is active low, as a logic-level USB-UART's modem outputs
+/// are from the factory (an FTDI FT231X's `DTR#`, the chip in Parallax's
+/// adapters, among them): low while the host asserts DTR
+/// ([`Self::set_dtr`]), high while it does not, which is how the line
+/// starts. An adapter whose configuration inverts it (an FTDI's EEPROM can)
+/// drives the other way round ([`Self::set_dtr_inverted`]). A host that has
+/// no DTR to give — a PTY carries no modem lines — leaves it deasserted.
+///
 /// What [`HostPty::open_on_rail`] attaches, and what any bench host whose
 /// bytes come from somewhere other than a PTY attaches the same way — a
 /// browser's Web Serial port (`embsim-cdp`) — so there is one copy of how a
@@ -151,6 +168,40 @@ impl Rail {
 pub struct HostRailLine {
     bridge: Arc<SerialLevelBridge>,
     rail_known: Arc<AtomicBool>,
+    dtr: Arc<DtrOutput>,
+}
+
+/// The `DTR` output: what the line last read of its rail, whether the host
+/// asserts DTR, and whether the adapter inverts it. `pin` is `None` for an
+/// owner whose pins have no `DTR`.
+#[derive(Debug)]
+struct DtrOutput {
+    pin: Option<PinHandle>,
+    state: Mutex<DtrState>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DtrState {
+    rail: Rail,
+    asserted: bool,
+    inverted: bool,
+}
+
+impl DtrOutput {
+    /// Put `DTR` at the level the host's DTR, the adapter's polarity and
+    /// the rail say: low while asserted (high, inverted), high while not
+    /// (low, inverted), released while the rail names no voltage.
+    fn publish(&self, state: &DtrState) {
+        let Some(pin) = self.pin.as_ref() else {
+            return;
+        };
+        let level = if state.asserted != state.inverted {
+            Level::Low
+        } else {
+            Level::High
+        };
+        pin.set_drive(state.rail.port(level));
+    }
 }
 
 impl HostRailLine {
@@ -182,11 +233,16 @@ impl HostRailLine {
         // Unpowered until `VIO` reads a voltage: a host with no rail
         // drives nothing.
         bridge.set_output_enabled(false);
+        // DTR starts deasserted: no port is open yet.
+        let dtr = Arc::new(DtrOutput {
+            pin: io.pin("DTR").ok(),
+            state: Mutex::new(DtrState::default()),
+        });
         for pin in ["VIO", "GND"] {
             let (rail, bridge) = (Arc::clone(&rail), Arc::clone(&bridge));
-            let rail_known = Arc::clone(&rail_known);
+            let (rail_known, dtr) = (Arc::clone(&rail_known), Arc::clone(&dtr));
             io.on_sense(pin, move |sense| {
-                let (powered, known) = {
+                let (powered, known, now) = {
                     let mut rail = rail.lock().expect("the rail reading is never poisoned");
                     if pin == "VIO" {
                         rail.vio = sense.volts;
@@ -195,10 +251,15 @@ impl HostRailLine {
                         rail.gnd = sense.volts;
                         rail.gnd_read = true;
                     }
-                    (rail.vio.is_some(), rail.vio_read && rail.gnd_read)
+                    (rail.vio.is_some(), rail.vio_read && rail.gnd_read, *rail)
                 };
                 bridge.set_output_enabled(powered);
                 bridge.ports_changed();
+                {
+                    let mut state = dtr.state.lock().expect("the DTR state is never poisoned");
+                    state.rail = now;
+                    dtr.publish(&state);
+                }
                 if known {
                     rail_known.store(true, Ordering::Release);
                 }
@@ -207,7 +268,50 @@ impl HostRailLine {
         // An idle asynchronous line still drives: without it the far end has no
         // reference against which the first start bit is a falling edge.
         bridge.idle();
-        Ok(Self { bridge, rail_known })
+        Ok(Self {
+            bridge,
+            rail_known,
+            dtr,
+        })
+    }
+
+    /// Assert or deassert DTR: `DTR` moves at once, at the line's rail
+    /// (released while `VIO` reads no voltage). Call it on the engine's
+    /// thread, at the instant the host does.
+    pub fn set_dtr(&self, asserted: bool) {
+        let mut state = self
+            .dtr
+            .state
+            .lock()
+            .expect("the DTR state is never poisoned");
+        if state.asserted != asserted {
+            state.asserted = asserted;
+            self.dtr.publish(&state);
+        }
+    }
+
+    /// Whether DTR is asserted.
+    pub fn dtr(&self) -> bool {
+        self.dtr
+            .state
+            .lock()
+            .expect("the DTR state is never poisoned")
+            .asserted
+    }
+
+    /// Whether the adapter inverts its `DTR` output: high while DTR is
+    /// asserted, low while it is not. Set it at attach, before the line's
+    /// first reading of its rail; a change moves the pin at once.
+    pub fn set_dtr_inverted(&self, inverted: bool) {
+        let mut state = self
+            .dtr
+            .state
+            .lock()
+            .expect("the DTR state is never poisoned");
+        if state.inverted != inverted {
+            state.inverted = inverted;
+            self.dtr.publish(&state);
+        }
     }
 
     /// The bridge the line's bytes go through: the owner transmits on it,
@@ -231,6 +335,8 @@ pub struct HostPty {
     /// Whether TX drives at the sensed `VIO` above `GND`
     /// ([`Self::open_on_rail`]) or at the crate's logic rail.
     on_rail: bool,
+    /// Whether the adapter inverts `DTR` ([`Self::with_dtr_inverted`]).
+    invert_dtr: bool,
     framing: UartFraming,
     /// Kept alive for the component's life: dropping it closes the PTY and
     /// removes the symlink.
@@ -273,7 +379,9 @@ impl HostPty {
     }
 
     /// Open a PTY at `symlink_path`, framed at `baud_hz`, for a host whose
-    /// I/O rail and ground are pins of its own: `TX`, `RX`, `VIO` and `GND`.
+    /// I/O rail and ground are pins of its own: `TX`, `RX`, `VIO` and `GND`,
+    /// and `DTR`, which stays deasserted: a PTY carries no modem lines, so
+    /// nothing a host program does reaches it.
     ///
     /// `TX` drives a high at `VIO` above `GND` and a low at `GND`, behind
     /// the push-pull default, and is released while `VIO` reads no voltage;
@@ -294,6 +402,7 @@ impl HostPty {
         Ok(Self {
             pins,
             on_rail,
+            invert_dtr: false,
             framing: UartFraming::new_8n1(baud_hz),
             pty: Pty::new(symlink_path)?,
             counters: Arc::new(HostPtyCounters {
@@ -307,6 +416,14 @@ impl HostPty {
             shutdown: Arc::new(AtomicBool::new(false)),
             pump: None,
         })
+    }
+
+    /// On the host's own rail, an adapter that inverts its `DTR` output:
+    /// the deasserted DTR a PTY leaves it at reads low
+    /// ([`HostRailLine::set_dtr_inverted`]).
+    pub fn with_dtr_inverted(mut self, inverted: bool) -> Self {
+        self.invert_dtr = inverted;
+        self
     }
 
     /// The path a host opens to reach this link.
@@ -336,6 +453,7 @@ impl Component for HostPty {
         // rail pins' first reading (`HostRailLine::rail_known`).
         let (bridge, rail_known) = if self.on_rail {
             let line = HostRailLine::attach(&io, self.framing, Arc::clone(&self.shutdown))?;
+            line.set_dtr_inverted(self.invert_dtr);
             (line.bridge, line.rail_known)
         } else {
             let bridge = Arc::new(SerialLevelBridge::new(

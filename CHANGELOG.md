@@ -17,8 +17,32 @@ the one before it promised, and says so here under **Breaking**.
   field, `pair`: an exhaustive `match` over findings needs an arm for it,
   and a `PinDecl` written as a struct literal names it (`pair: None`) — the
   constructors and `with_*` builders set it.
+- `HOST_RAIL_PINS` has a fifth pin, `DTR` (below): `host-serial` and
+  `chrome-cdp` declare it, and a component that declares
+  `HOST_RAIL_PINS` for a peer of its own gets it too. `embsim_cdp::
+  Settings` has a new field, `invert_dtr`.
 
 ### Added
+
+- **DTR is a pin.** The host kinds' `DTR` is the adapter's data-terminal-
+  ready output at the host's rail, active low by default and high while
+  asserted with `invert_dtr = true` (`HostRailLine::set_dtr`,
+  `set_dtr_inverted`). `chrome-cdp` moves it as Chrome does on Linux and
+  macOS: `open()` asserts DTR, `setSignals({ dataTerminalReady })` sets it,
+  a close or a pulled cable deasserts it, each at the slice the page asked
+  in; the report counts the changes. `host-serial`'s stays deasserted (a
+  PTY carries no modem lines).
+- **`prop-plug-reset`**, a bench component kind
+  (`embsim_models::prop_plug`): a Parallax Prop Plug's reset stage, a
+  20 µs pulse sunk on its open-collector `RES` at each rising edge of its
+  `DTR` input — what turns an app's DTR pulse into a Propeller reset.
+- **A reset while the P2's core runs.** `RESN` read low after the START
+  instant asks the core to enter reset (`P2Core::enter_reset`, default
+  `false`); a core that can boot again releases its pads and stops, the
+  package holds it as before its first START, and starts it anew 3 ms after
+  `RESN` rises. `P2PackageHandle::resets` lists the instants; the run's
+  report says each reset and each START after one. A core that cannot (the
+  QEMU core) runs on, the reset delivered as information, as before.
 
 - **The encoder's output stage** (`quadrature_encoder::OutputStage`,
   `Config::with_output`, [`NODES.md`](NODES.md) §20): `PushPull` (the

@@ -17,7 +17,9 @@
 //! ```
 //!
 //! It is a [`CdpNode`]: the pins of a host's serial line at its own rail
-//! (`TX`, `RX`, `VIO`, `GND`, as `host-serial` has them), Web Serial in
+//! (`TX`, `RX`, `VIO`, `GND` and `DTR`, as `host-serial` has them, `DTR`
+//! following the page's DTR and inverted by `invert_dtr = true`, as an
+//! adapter configured to invert it drives it), Web Serial in
 //! every page of the host's Chrome on the far side, every page's clock
 //! metered by the board's a quantum at a time. Building the project checks
 //! what can be checked without starting anything — the Chrome binary, the
@@ -165,6 +167,7 @@ fn chrome_cdp(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proje
         product: usb_id(&mut options, "usb_product_id")?,
     };
     let granted = options.boolean("granted")?.unwrap_or(false);
+    let invert_dtr = options.boolean("invert_dtr")?.unwrap_or(false);
     let url = options.string("url")?;
     let attach = options.string("attach")?;
     let chrome = options.string("chrome")?;
@@ -255,6 +258,7 @@ fn chrome_cdp(request: ComponentRequest<'_>) -> Result<Box<dyn Component>, Proje
     settings.url = url;
     settings.usb = usb;
     settings.granted = granted;
+    settings.invert_dtr = invert_dtr;
     let node = CdpNode::new(settings, baud).map_err(|why| error(why.to_string()))?;
     reports.add(CdpReport {
         subject: spec.name.clone(),
@@ -505,10 +509,16 @@ impl Report for CdpReport {
                 if stats.shared() == 1 { "" } else { "s" }
             ));
         }
+        if stats.dtr_changes() > 0 {
+            lines.push(format!(
+                "DTR moved {} time{}",
+                stats.dtr_changes(),
+                if stats.dtr_changes() == 1 { "" } else { "s" }
+            ));
+        }
         if stats.signals() > 0 {
             lines.push(format!(
-                "{} setSignals call{} asserted DTR, RTS or a break, which no pin of the line \
-                 carries",
+                "{} setSignals call{} asserted RTS or a break, which no pin of the line carries",
                 stats.signals(),
                 if stats.signals() == 1 { "" } else { "s" }
             ));

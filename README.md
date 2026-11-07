@@ -183,7 +183,7 @@ every pull request.
 | Timing | every edge at its own nanosecond; deterministic stepped clock; golden traces | RC delays as one pole with exact integer-ns crossings; rail soft-start instants; symmetric differential filters (5) | slew, setup/hold against slow edges, multi-pole transients, ringing |
 | Power | rails present or absent; enable trees as senses | rails as sources with soft-start and UVLO; supervisor with hysteresis; isolated domains; brown-out ordering (4) | regulator ripple, current limit, load transients |
 | Analog | ADS122U04 front end at settled values, its input, gain and reference the firmware's register writes; force and encoder plants; input ports stamped on senses (the AM26LV32's open-input bias); a single source into an analog reader delivered unsolved | RC settling at conversion instants (5) | noise, amplifier loops, oscillator start-up |
-| CPU | P2 on QEMU or p2core, instruction-accurate, verified against each other and silicon captures; hub-exec and cog-exec; HUBSET clock; inside the P2 package, any core — QEMU, an ISS, the native firmware — started 3 ms after `RESN` releases inside `VDD`'s window, its pads at their bank's supply and the `WRPIN` strengths (fast fitted to the datasheet), the crystal the rate on `XI`, a brownout without a reset reported and the core held | — (a `RESN` pulse after START re-running the boot is open: no core has the entry) | cycle-exact hub timing, interrupts until modelled |
+| CPU | P2 on QEMU or p2core, instruction-accurate, verified against each other and silicon captures; hub-exec and cog-exec; HUBSET clock; inside the P2 package, any core — QEMU, an ISS, the native firmware — started 3 ms after `RESN` releases inside `VDD`'s window, its pads at their bank's supply and the `WRPIN` strengths (fast fitted to the datasheet), the crystal the rate on `XI`, a brownout without a reset reported and the core held; `RESN` read low while the core runs holds it again and restarts it 3 ms after the release (`P2Core::enter_reset`), a core that cannot boot again kept running and the reset reported | a core that boots again in embsim itself: the QEMU node declines a reset, and MaD's ISS takes one | cycle-exact hub timing, interrupts until modelled |
 | Faults and what-ifs | shorts, detached pins, stuck nets, DNP, value overrides, jumper states | switch positions by name, declared leaks, capacitance on a harness (1, 5) | faults nobody injects; tolerances and corners |
 | Speed | 16 901 flash edges in 0.2 s; step trains as rates | a census and a solve benchmark as CI gates; nothing added to the fast path (0, 6) | a timestep, ever |
 
@@ -377,19 +377,22 @@ A project names the embsim release it is written for with
 section 2).
 
 The standard catalog's bench component kinds are `host-serial`, a host's
-serial port as a PTY on the host's own rail, and `scripted-source`, a pin
-driven through a list of steps (`PROJECTS.md` section 5). A project's own
+serial port as a PTY on the host's own rail, `prop-plug-reset`, the reset
+stage of a Parallax Prop Plug, and `scripted-source`, a pin driven through
+a list of steps (`PROJECTS.md` section 5). A project's own
 bench kind may be a plant made of several models — a drive turning an
 encoder and reaching an end switch — as one component with electrical
 pins, an `embsim_board::Assembly` (`PROJECTS.md` section 10, "A plant: an
 `Assembly`"). The `embsim` command's set adds `chrome-cdp`, the host's
-Chrome on the same four pins as `host-serial`: its pages' Web Serial is the
+Chrome on the same five pins as `host-serial`: its pages' Web Serial is the
 line, and every page's clock and every dedicated worker's advances only with
 the board's, a millisecond at a time over DevTools, so a web app's timeouts
 hold in board time against a board far slower than real time (`PROJECTS.md`
 section 5, `NODES.md` §19). The port is the page's main thread's: an app
 opens it there and transfers its streams to a worker, whose own
-`navigator.serial` is Chrome's. The line has no modem-control pins.
+`navigator.serial` is Chrome's. Of the modem-control lines only DTR is a
+pin, following the page's port as Chrome's does; `prop-plug-reset`, a
+Parallax Prop Plug's reset stage, turns its edges into a reset pulse.
 [`examples/chrome-ping`](examples/chrome-ping) is a project with one, and a
 Playwright harness that drives it.
 

@@ -39,6 +39,9 @@
 //!   open-collector output that sinks while the LED carries its threshold
 //! - [`oscillator`] — a clock oscillator (the EPSON TG2520SMN TCXO) whose
 //!   output is a rate published once at its start-up instant
+//! - [`prop_plug`] — the reset stage of a Parallax Prop Plug: its adapter's
+//!   DTR coupled into an NPN whose open collector sinks the target's reset
+//!   for a typical pulse on each rising edge
 //! - [`psram`] — the AP Memory APS6404L QSPI PSRAM in its SPI mode, on the
 //!   same shift engine as the flash
 //! - [`pwl_library`] — the diodes, LEDs, polarity FETs, transistor and
@@ -78,6 +81,7 @@ pub mod logic_gate;
 pub mod machine;
 pub mod opto;
 pub mod oscillator;
+pub mod prop_plug;
 pub mod psram;
 pub mod pwl_library;
 pub mod rail;

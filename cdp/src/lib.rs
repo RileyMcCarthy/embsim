@@ -12,9 +12,9 @@
 //! # The model
 //!
 //! [`CdpNode`] is a board [`Component`](embsim_board::Component) with a
-//! host's serial pins — `TX`, `RX`, and the `VIO` and `GND` of the rail its
-//! line signals at ([`embsim_board::HostRailLine`], the line `host-serial`
-//! has) — named from the host's side. On the far side of those pins is
+//! host's serial pins — `TX`, `RX`, `DTR`, and the `VIO` and `GND` of the
+//! rail its line signals at ([`embsim_board::HostRailLine`], the line
+//! `host-serial` has) — named from the host's side. On the far side of those pins is
 //! Chrome, launched or attached to at the node's first slice:
 //!
 //! - **Held from birth.** Every page and every dedicated worker attaches
@@ -71,9 +71,28 @@
 //! driver, Chrome's real Web Serial and a USB adapter are not in the byte
 //! path. The port is the page's: a worker's own `navigator.serial` is
 //! Chrome's, and an app that opens its port in a worker sees none (the
-//! report says when a worker asks). The line has no modem-control pins:
-//! DTR, RTS, a break and hardware flow control reach nothing, and the report
-//! counts them. A fresh browser context per scenario is the harness's job.
+//! report says when a worker asks). Of the modem-control lines only DTR is
+//! a pin, `DTR` (below); RTS, a break and hardware flow control reach
+//! nothing, and the report counts them. A fresh browser context per
+//! scenario is the harness's job.
+//!
+//! # DTR
+//!
+//! `DTR` is the adapter's data-terminal-ready output
+//! ([`embsim_board::HostRailLine::set_dtr`]): active low, as a logic-level
+//! USB-UART's is from the factory, or active high on an adapter whose
+//! configuration inverts it ([`Settings::invert_dtr`]). It follows the port
+//! as Chrome's does on Linux and macOS, where Chrome leaves the modem lines
+//! to the operating system: an `open()` asserts DTR (the system raises it
+//! with the line), `setSignals({ dataTerminalReady })` from the page that
+//! holds the port sets it, and a close — the page's, its document going, a
+//! forgotten permission — or a pulled cable deasserts it (the system's
+//! hang-up on close, `HUPCL`, set by default). Each change lands at the
+//! slice the page asked in, so a pulse the page times with its own clock
+//! reaches the board as long as the page held it, to the quantum. Not
+//! modelled: macOS holding a reopen until two seconds after DTR last
+//! dropped. A reset circuit that differentiates DTR (a Parallax Prop
+//! Plug's) is a node of its own on the board side of the pin.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

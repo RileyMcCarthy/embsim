@@ -1333,6 +1333,349 @@ fn a_core_rail_that_leaves_its_window_while_running_holds_the_core(
 }
 
 // ============================================================
+// A reset while the core runs
+// ============================================================
+
+/// A core that boots again: at each START it drives its pad high, fast,
+/// and asks for a wake every millisecond from there; entering reset it
+/// releases the pad and stops. It records every START, every reset it
+/// entered and every wake the package delivered it.
+struct Rebooting {
+    pin: u8,
+    pads: Option<P2Pads>,
+    pad: Option<PinHandle>,
+    started_at_ns: Arc<StdMutex<Vec<u64>>>,
+    reset_at_ns: Arc<StdMutex<Vec<u64>>>,
+    woke_at_ns: Arc<StdMutex<Vec<u64>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Rebooting {
+    fn on(pin: u8) -> Self {
+        Self {
+            pin,
+            pads: None,
+            pad: None,
+            started_at_ns: Arc::default(),
+            reset_at_ns: Arc::default(),
+            woke_at_ns: Arc::default(),
+            running: Arc::default(),
+        }
+    }
+}
+
+impl P2Core for Rebooting {
+    fn attach(&mut self, pads: P2Pads) -> Result<(), AttachError> {
+        use std::sync::atomic::Ordering;
+        self.pad = Some(pads.pad(self.pin)?);
+        let woke = Arc::clone(&self.woke_at_ns);
+        let running = Arc::clone(&self.running);
+        let arm = pads.clone();
+        pads.on_wake_ns(move |now| {
+            woke.lock().unwrap().push(now);
+            if running.load(Ordering::Relaxed) {
+                arm.schedule_at_ns(now + 1_000_000);
+            }
+        });
+        self.pads = Some(pads);
+        Ok(())
+    }
+
+    fn start(&mut self) {
+        use std::sync::atomic::Ordering;
+        let now = virtual_clock::virtual_ns();
+        self.started_at_ns.lock().unwrap().push(now);
+        self.running.store(true, Ordering::Relaxed);
+        let pads = self.pads.as_ref().expect("attached");
+        let drive =
+            match pads
+                .bank_supplies()
+                .pad_drive(self.pin, P_HIGH_FAST | P_LOW_FAST, true, true)
+            {
+                PadDrive::Thevenin(drive) => Some(drive),
+                PadDrive::Released | PadDrive::CurrentSource(_) => None,
+            };
+        self.pad.as_ref().expect("attached").set_drive(drive);
+        pads.schedule_at_ns(now);
+    }
+
+    fn enter_reset(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.reset_at_ns
+            .lock()
+            .unwrap()
+            .push(virtual_clock::virtual_ns());
+        self.running.store(false, Ordering::Relaxed);
+        self.pad.as_ref().expect("attached").release();
+        true
+    }
+}
+
+/// `RESN` pulsed low while a core that boots again runs: the package holds
+/// it through the reset with its pad released, and starts it anew the
+/// datasheet's 3 ms after `RESN` rises.
+#[rstest]
+fn a_reset_while_the_core_runs_starts_it_again_three_milliseconds_after_resn_rises() {
+    behaviour!(Test {
+        id: "p2-package.reset-while-running",
+        covers: Some("boards/src/p2.rs#P2Package::watch_reset"),
+        given: "a running P2 core that can boot again, woken every millisecond and driving one \
+                pad high, with RESN pulled low at six and a half milliseconds and released at \
+                eight",
+    });
+    expect!(
+        "core-told",
+        "the core is told it is in reset at the instant RESN falls, once"
+    );
+    expect!(
+        "held-in-reset",
+        "while RESN is low the package reports the core held, with the reset it reads"
+    );
+    expect!(
+        "no-wake-in-reset",
+        "no wake reaches the core from the reset until it starts again"
+    );
+    expect!(
+        "restarting",
+        "after RESN rises the package reports the release instant and the start it leads to"
+    );
+    expect!(
+        "started-again",
+        "the core is started again three milliseconds after RESN rises, and runs from there",
+        "the datasheet's RESN row: the Propeller restarts 3 ms after RESN goes from low to \
+         high, after a reset as after power-up"
+    );
+    expect!("reset-listed", "the package lists the instant of the reset");
+
+    let _lock = suite_lock();
+    stepped();
+    const MS: u64 = 1_000_000;
+    const FALL_AT_NS: u64 = 6_500_000;
+    const RISE_AT_NS: u64 = 8 * MS;
+    let pin: u8 = 2;
+    let core = Rebooting::on(pin);
+    let started_at = Arc::clone(&core.started_at_ns);
+    let reset_at = Arc::clone(&core.reset_at_ns);
+    let woke_at = Arc::clone(&core.woke_at_ns);
+    let package = P2Package::new(core);
+    let handle = package.handle();
+    let net = format!("P2.{}", pin_name(pin));
+    let probe_at = |at_ns: u64| {
+        let handle = handle.clone();
+        ReadAt::new(at_ns, move || handle.start_state())
+    };
+    let in_reset = probe_at(7 * MS);
+    let in_delay = probe_at(9 * MS);
+    let (in_reset_read, in_delay_read) = (Arc::clone(&in_reset.got), Arc::clone(&in_delay.got));
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component(
+            "RST",
+            Box::new(BenchLine::stepping(
+                Level::High,
+                &[(FALL_AT_NS, Level::Low), (RISE_AT_NS, Level::High)],
+            )),
+        )
+        .component("PROBE", Box::new(Probe::new()))
+        .component("IN_RESET", Box::new(in_reset))
+        .component("IN_DELAY", Box::new(in_delay))
+        .harness(grounded(
+            Harness::new()
+                .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+                .power(
+                    ep("BENCH.VIO"),
+                    ep(&format!("P2.{}", bank_pin_name(bank_of(pin)))),
+                    3.3,
+                )
+                .connect_str("RST.A", "P2.RESN")
+                .expect("endpoints parse")
+                .connect_str("PROBE.A", &net)
+                .expect("endpoints parse"),
+        ))
+        .start()
+        .expect("the bench starts");
+
+    let restart_ns = RISE_AT_NS + P2_RESTART_DELAY_NS;
+    assert!(
+        wait_for(
+            || woke_at
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&at| at >= restart_ns + 2 * MS),
+            SETTLE
+        ),
+        "the core runs again after the reset; {:?}, woken at {:?}",
+        handle.start_state(),
+        woke_at.lock().unwrap()
+    );
+    // While in reset: held, the reset as read.
+    let (_, in_reset_state) = in_reset_read.lock().unwrap().expect("read at 7 ms");
+    assert!(
+        matches!(
+            in_reset_state,
+            StartState::Held { reset } if reset.resn == Some(Level::Low)
+        ),
+        "{in_reset_state:?}"
+    );
+    let (_, in_delay_state) = in_delay_read.lock().unwrap().expect("read at 9 ms");
+    assert_eq!(
+        in_delay_state,
+        StartState::Restarting {
+            released_at_ns: RISE_AT_NS,
+            starts_at_ns: restart_ns,
+        }
+    );
+    assert_eq!(*reset_at.lock().unwrap(), vec![FALL_AT_NS]);
+    assert_eq!(
+        *started_at.lock().unwrap(),
+        vec![P2_RESTART_DELAY_NS, restart_ns]
+    );
+    let woke = woke_at.lock().unwrap().clone();
+    assert!(
+        woke.starts_with(&[3 * MS, 4 * MS, 5 * MS, 6 * MS, restart_ns, restart_ns + MS]),
+        "woken {woke:?}: nothing between the reset and the second start"
+    );
+    assert_eq!(
+        handle.start_state(),
+        StartState::Started { at_ns: restart_ns }
+    );
+    assert_eq!(handle.resets(), vec![FALL_AT_NS]);
+    assert!(
+        matches!(state(&system, &net), NetState::Analog(v) if (v - 3.3).abs() < 1e-9),
+        "{net} driven again after the restart; got {:?}",
+        state(&system, &net)
+    );
+    drop(system);
+}
+
+/// The pad of a core in reset floats: read on the net itself, at an instant
+/// inside the reset.
+#[rstest]
+fn the_pads_of_a_core_in_reset_float() {
+    behaviour!(Test {
+        id: "p2-package.reset-while-running-pads",
+        covers: Some("boards/src/p2.rs#P2Core::enter_reset"),
+        given: "a running P2 core that can boot again, driving one pad high in a bank at 3.3 \
+                volts, with RESN pulled low at six and a half milliseconds and held there",
+    });
+    expect!(
+        "pad-floats",
+        "a millisecond into the reset the pad's net is driven by nothing",
+        "a chip in reset floats every pin, as it does before its first start"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    let pin: u8 = 2;
+    let package = P2Package::new(Rebooting::on(pin));
+    let handle = package.handle();
+    let net = format!("P2.{}", pin_name(pin));
+    let tick = Tick::at(7_500_000);
+    let fired = Arc::clone(&tick.fired);
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component(
+            "RST",
+            Box::new(BenchLine::stepping(Level::High, &[(6_500_000, Level::Low)])),
+        )
+        .component("PROBE", Box::new(Probe::new()))
+        .component("TICK", Box::new(tick))
+        .harness(grounded(
+            Harness::new()
+                .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+                .power(
+                    ep("BENCH.VIO"),
+                    ep(&format!("P2.{}", bank_pin_name(bank_of(pin)))),
+                    3.3,
+                )
+                .connect_str("RST.A", "P2.RESN")
+                .expect("endpoints parse")
+                .connect_str("PROBE.A", &net)
+                .expect("endpoints parse"),
+        ))
+        .start()
+        .expect("the bench starts");
+    assert!(
+        wait_for(|| fired.lock().unwrap().is_some(), SETTLE),
+        "the tick inside the reset fires; {:?}",
+        handle.start_state()
+    );
+    assert_eq!(handle.resets(), vec![6_500_000]);
+    assert_eq!(state(&system, &net), NetState::Floating, "{net}");
+    drop(system);
+}
+
+/// A core that cannot boot again runs on through a reset: the package
+/// delivers the reset to it and holds nothing.
+#[rstest]
+fn a_core_that_cannot_boot_again_runs_on_through_a_reset() {
+    behaviour!(Test {
+        id: "p2-package.reset-unsupported-core-runs-on",
+        covers: Some("boards/src/p2.rs#P2Package::watch_reset"),
+        given: "a running P2 core with no way to boot again, woken every millisecond, VDD at \
+                1.8 volts, with RESN pulled low at six and a half milliseconds and held there",
+    });
+    expect!(
+        "still-woken",
+        "the core keeps being woken through the reset"
+    );
+    expect!(
+        "still-started",
+        "the package reports the core running from its first start, and lists no reset"
+    );
+
+    let _lock = suite_lock();
+    stepped();
+    const MS: u64 = 1_000_000;
+    let core = Ticking::until(10 * MS);
+    let woke_at = Arc::clone(&core.woke_at_ns);
+    let package = P2Package::new(core);
+    let handle = package.handle();
+    let system = System::new()
+        .component("P2", Box::new(package))
+        .component(
+            "RST",
+            Box::new(BenchLine::stepping(Level::High, &[(6_500_000, Level::Low)])),
+        )
+        .harness(grounded(
+            Harness::new()
+                .power(ep("BENCH.VDD"), ep("P2.VDD"), 1.8)
+                .connect_str("RST.A", "P2.RESN")
+                .expect("endpoints parse"),
+        ))
+        .start()
+        .expect("the bench starts");
+    assert!(
+        wait_for(|| woke_at.lock().unwrap().contains(&(9 * MS)), SETTLE),
+        "the core is woken past the reset; {:?}, woken at {:?}",
+        handle.start_state(),
+        woke_at.lock().unwrap()
+    );
+    assert!(
+        woke_at.lock().unwrap().starts_with(&[
+            3 * MS,
+            4 * MS,
+            5 * MS,
+            6 * MS,
+            7 * MS,
+            8 * MS,
+            9 * MS
+        ]),
+        "{:?}",
+        woke_at.lock().unwrap()
+    );
+    assert_eq!(
+        handle.start_state(),
+        StartState::Started {
+            at_ns: P2_RESTART_DELAY_NS
+        }
+    );
+    assert_eq!(handle.resets(), Vec::<u64>::new());
+    drop(system);
+}
+
+// ============================================================
 // Pads at their bank's supply
 // ============================================================
 
