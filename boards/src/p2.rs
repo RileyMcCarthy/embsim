@@ -1519,6 +1519,10 @@ impl Report for PackageReport {
         self.resets_said = resets.len();
         if let Some(at) = handle.started_at_ns() {
             if self.started != Some(at) {
+                // A reset is recorded only while the core runs, so a start
+                // after one always follows an earlier start, said or not:
+                // in a look that sees both, the reset line comes first and
+                // this one says "again" (cli/tests/library.rs pins it).
                 let again = if self.started.is_some() || !resets.is_empty() {
                     " again"
                 } else {

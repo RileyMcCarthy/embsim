@@ -2161,6 +2161,85 @@ fn dtr_follows_the_port_on_its_pin(#[case] inverted: bool) {
 }
 
 #[test]
+fn a_projects_invert_dtr_flips_the_pin_and_the_report_counts_its_moves() {
+    use embsim_board::Level::{High, Low};
+    behaviour!(Test {
+        id: "chrome-cdp.project-dtr",
+        covers: Some("cdp/src/catalog.rs#chrome_cdp"),
+        given: "a project's chrome-cdp component set for an adapter that inverts DTR, whose page \
+                opens its port and closes it two milliseconds later, probed on its DTR pin",
+    });
+    expect!(
+        "inverted-levels",
+        "DTR rests low, goes high when the port opens and low again when it closes",
+        "the inverting adapter's chip flips DTR, so deasserted reads low"
+    );
+    expect!(
+        "report-counts",
+        "the component's summary says DTR moved twice"
+    );
+
+    let _suite = suite_lock();
+    let acts = vec![
+        (1.0, Act::GetPorts),
+        (3.0, Act::Open(115_200)),
+        (5.0, Act::Req("close", json!({}))),
+    ];
+    let fake = Fake::start(Script {
+        acts,
+        ..Script::default()
+    });
+    let text = project_text(&fake.url, "invert_dtr = true");
+    let probe = LevelProbe::new();
+    let seen = Arc::clone(&probe.seen);
+    virtual_clock::init_mode(ClockMode::Stepped, 1_000_000);
+    let reports = Reports::new();
+    let system = Project::parse(&text)
+        .expect("the text is a project")
+        .instantiate_with(&set(), &reports)
+        .expect("the bench builds")
+        .component("PROBE", Box::new(probe))
+        .harness(embsim_board::Harness::new().connect(ep("PC.DTR"), ep("PROBE.IN")))
+        .hold_time()
+        .start()
+        .expect("the bench starts");
+    let reports = reports.take();
+    let actor = virtual_clock::register_actor("cdp-project-dtr-case");
+    system.release_time();
+    let started = Instant::now();
+    while !fake.seen().replies.iter().any(|(name, _)| name == "close") {
+        assert!(started.elapsed() < HANG, "the close was never answered");
+        virtual_clock::wait_virtual_ns(MS);
+    }
+    virtual_clock::wait_virtual_ns(MS);
+    // At the first instant the pin may read floating once, before the
+    // engine has handed the node its rail.
+    let levels: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|&&(at, level)| !(at == 0 && level.is_none()))
+        .map(|&(_, level)| level)
+        .collect();
+    assert_eq!(
+        levels,
+        vec![Some(Low), Some(High), Some(Low)],
+        "inverted-levels"
+    );
+    let report = reports
+        .iter()
+        .find(|report| report.subject() == "PC")
+        .expect("the component reports");
+    let summary = report.summary();
+    assert!(
+        summary.iter().any(|line| line == "DTR moved 2 times"),
+        "report-counts: {summary:?}"
+    );
+    drop(actor);
+    system.shutdown();
+}
+
+#[test]
 fn a_pulled_cable_carries_nothing_and_a_replugged_one_is_a_new_port() {
     behaviour!(Test {
         id: "chrome-cdp.unplug-replug",
@@ -2508,6 +2587,10 @@ fn set() -> CatalogSet {
 )]
 #[case::not_a_bool("baud = 9600\ngranted = \"yes\"", "options.granted is true or false")]
 #[case::unknown("baud = 9600\nparity = \"even\"", "unknown option \"parity\"")]
+#[case::dtr_not_a_bool(
+    "baud = 9600\ninvert_dtr = \"yes\"",
+    "options.invert_dtr is true or false"
+)]
 fn a_chrome_cdp_entry_that_cannot_be_built_is_refused_saying_why(
     #[case] options: &str,
     #[case] says: &str,
