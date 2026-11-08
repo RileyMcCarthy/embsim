@@ -1008,7 +1008,7 @@ pull requests.*
 - **The removals are MaD's, in two stages.** `p2iss` is MaD's crate
   (`SIL/p2iss`), not embsim's, and no embsim crate, test or example uses
   `P2Iss`, `SerialLink` or `SIL/MaDSim`.
-  - MaD #362, which closes MaD #298, removes `SIL/MaDSim`, its `members`
+  - MaD #362, part of MaD #298, removes `SIL/MaDSim`, its `members`
     entry, the `-p mad-emulator` of `ci.yml`'s `rustfmt (gating)` step and
     the `emulator-release` target.
   - A later MaD pull request, after MaD #350, removes `P2Iss`'s
