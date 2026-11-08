@@ -282,9 +282,8 @@ fn a_producer_that_catches_up_in_bulk_loses_almost_everything() {
 // timeout, a waveform view) needs the instants to be distinct and true. The ISS
 // stamped every edge in a 100 us slice identically when this was written
 // (MaD's `SIL/p2iss/src/lib.rs:1231` at `c7a2e59b4` re-arms at
-// `virtual_clock::virtual_ns()`, in the bare-chip `Component` MaD retires with
-// `mad-emulator`), so this is the property that decides whether that is a
-// latent bug or a live one.
+// `virtual_clock::virtual_ns()`, in the bare-chip `P2Iss` `Component`), so this
+// is the property that decides whether that is a latent bug or a live one.
 
 /// What the consumer observed: one virtual timestamp per transition.
 #[derive(Debug, Default)]

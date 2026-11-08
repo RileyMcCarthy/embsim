@@ -1,8 +1,8 @@
 # Moving MaD's SIL onto an embsim project
 
 MaD (`RileyMcCarthy/MaD`) is the tensile tester embsim was extracted from,
-and the first project to extend it. Its SIL today is `mad-emulator`
-(`SIL/MaDSim`), a Rust program that assembles the system by hand: the P2
+and the first project to extend it. Its SIL was `mad-emulator`
+(`SIL/MaDSim`), a Rust program that assembled the system by hand: the P2
 instruction-set simulator as a component on no board, the DS2 add-on, a
 PTY, bench pulls, the machine's parts coupled by callbacks, and an SD card
 node. This document is the plan for replacing it with what every embsim
@@ -808,7 +808,8 @@ its machine, implementing `embsim_boards::p2::P2Core`:
   board's `S301` straps the pin.
 
 `P2Iss` keeps its `Component` impl and its pin lists until `mad-emulator`
-retires (step 11), so nothing that runs today stops. *Files:*
+retires (step 11, and past it: see step 11's note), so nothing that runs
+today stops. *Files:*
 `p2iss/Cargo.toml` (adds `embsim-boards`), `p2iss/src/lib.rs`,
 `p2core/src/board.rs`. *Done when:* a new stepped test,
 `p2iss/tests/ec32mb_flash_boot.rs`, boots the ROM, stage-1 and the
@@ -993,23 +994,28 @@ the pin lists removed), the `p2iss` tests and examples that use them
 *Done when:* `make test` and the e2e suite pass with no `mad-emulator` in
 the tree.
 
-*Revised 2026-11-07 (MaD #298, #324): no scenario needs `mad-emulator`, and
-what is left of this step is MaD's alone.*
+*Revised 2026-11-07 (MaD #298, #324, #362): no scenario needs
+`mad-emulator`, and what is left of this step is MaD's alone, in two MaD
+pull requests.*
 
 - **SERVO-stall**, the last scenario only `mad-emulator` ran, runs on
   `mad-hard-stop-cosim.toml` (`make e2e-stall`): `mad-cosim.toml` with the
   machine's hard-stop option set (MaD #324).
 - **The playgrounds** run on the tool, through MaD's
-  `scripts/board-route.sh playground`: `make playground` on
+  `SIL/scripts/board-route.sh playground`: `make playground` on
   `mad-playground.toml`, `make playground-rom` on
   `mad-serial-boot-playground.toml`.
-- **The removals are a MaD pull request.** `p2iss` is MaD's crate
-  (`SIL/p2iss`), not embsim's, so the `Component` impl, `SerialLink`, the
-  pin lists and the tests that use them go with `SIL/MaDSim`, its `members`
-  entry, the `-p mad-emulator` of `ci.yml`'s `rustfmt (gating)` step and
-  the `emulator-release` target. No embsim crate, test or example uses any
-  of them. Embsim's comments that cited `SIL/MaDSim/src/wiring.rs` or
-  `p2iss`'s line numbers cite a MaD commit instead.
+- **The removals are MaD's, in two stages.** `p2iss` is MaD's crate
+  (`SIL/p2iss`), not embsim's, and no embsim crate, test or example uses
+  `P2Iss`, `SerialLink` or `SIL/MaDSim`.
+  - MaD #362, which closes MaD #298, removes `SIL/MaDSim`, its `members`
+    entry, the `-p mad-emulator` of `ci.yml`'s `rustfmt (gating)` step and
+    the `emulator-release` target.
+  - A later MaD pull request, after MaD #350, removes `P2Iss`'s
+    `Component` impl, `SerialLink`, the pin lists and the `p2iss` tests
+    that use them.
+- **Embsim's comments** that cited `SIL/MaDSim/src/wiring.rs` or `p2iss`'s
+  line numbers cite a MaD commit instead.
 - **Two more tests use `P2Iss`** than the list names:
   `tests/protocol_rx_overrun.rs`, whose twin on the core is
   `tests/package_rx_overrun.rs`, and `tests/rom_serial_window.rs`, which has

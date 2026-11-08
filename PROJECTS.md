@@ -2694,7 +2694,7 @@ QEMU:
 The MaD tensile tester (`RileyMcCarthy/MaD`, `SIL/`) is the consumer this
 section was designed against. Its SIL began as `mad-emulator`, a program
 that assembled the system by hand, which the project has replaced (MaD
-#298 removes it). As a project it is one catalog crate,
+#362, closing MaD #298, removes it). As a project it is one catalog crate,
 `SIL/mad-catalog`, adding four kinds; its own runner, `SIL/mad-runner`,
 both members of MaD's `SIL` workspace and built against its committed
 `SIL/Cargo.lock`, with embsim a path dependency through the `SIL/embsim`

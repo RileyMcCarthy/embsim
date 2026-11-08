@@ -5,8 +5,8 @@
 //!
 //! ## Signal lifecycle
 //!
-//! **Model / Peripheral signals** — registered at startup from wiring.rs via
-//! `register()`, immediately available for subscribing.
+//! **Model / Peripheral signals** — registered at startup, by whatever builds
+//! the system, via `register()`, immediately available for subscribing.
 //!
 //! **Firmware (C) signals** — discovered lazily from DWARF debug info. The
 //! full set of available firmware variables is stored in a separate catalog
