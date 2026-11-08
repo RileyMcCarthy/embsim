@@ -106,8 +106,9 @@
 //! 3. `DETERMINISM.md` (Phase D0 item (d)) is the authoritative statement of
 //! this rule; `BOARD_ENGINE.md` cross-references it.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
@@ -656,6 +657,11 @@ impl EngineLink {
     pub(crate) fn send(&self, command: Command) -> bool {
         match &self.tx {
             Some(tx) => {
+                // From one of this engine's own callbacks: onto its thread's
+                // queue, not through the channel back to itself.
+                let Some(command) = local_plane::push(self.plane_id(), command) else {
+                    return true;
+                };
                 if tx.send(command).is_err() {
                     tracing::debug!("net engine has shut down; command dropped");
                     false
@@ -684,9 +690,70 @@ impl EngineLink {
         }
     }
 
+    /// Which engine this link reaches: the address of the drive sequence
+    /// every clone of its live link shares ([`local_plane`]).
+    fn plane_id(&self) -> usize {
+        Arc::as_ptr(&self.drive_seq) as usize
+    }
+
     /// Reserve the next global drive sequence number.
     pub(crate) fn next_drive_seq(&self) -> u64 {
         self.drive_seq.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// The data plane of commands an engine's own callbacks send.
+///
+/// A node's sense and wake callbacks run on the engine thread, and what they
+/// publish (a drive, a stream write, a registration) is a data-plane
+/// command like any other thread's. Sent through the channel, each one
+/// crossed a lock-free queue and an allocation to reach the thread that sent
+/// it — on a bus clock, two or three per edge. Instead the engine thread
+/// keeps them in a queue of its own, which it drains with the channel
+/// ([`EngineCore::next_data_command`]). Nothing a node sees changes: drives
+/// apply in their enqueue sequence wherever they came from, and the order
+/// between one thread's commands and another's was never fixed (`DETERMINISM.md`
+/// T1).
+mod local_plane {
+    use super::{Command, RefCell, VecDeque};
+
+    thread_local! {
+        /// The engine this thread runs ([`super::EngineLink::plane_id`]) and
+        /// what its callbacks sent; `None` on every other thread.
+        static PLANE: RefCell<Option<(usize, VecDeque<Command>)>> = const { RefCell::new(None) };
+    }
+
+    /// Make the calling thread engine `id`'s.
+    pub(super) fn install(id: usize) {
+        PLANE.with(|plane| *plane.borrow_mut() = Some((id, VecDeque::new())));
+    }
+
+    /// Queue `command` if the calling thread is engine `id`'s; hand it back
+    /// otherwise.
+    pub(super) fn push(id: usize, command: Command) -> Option<Command> {
+        PLANE.with(|plane| match plane.borrow_mut().as_mut() {
+            Some((own, queue)) if *own == id => {
+                queue.push_back(command);
+                None
+            }
+            _ => Some(command),
+        })
+    }
+
+    /// The oldest command queued, if any. The queue is not borrowed past
+    /// the return, so handling the command may queue more.
+    pub(super) fn pop() -> Option<Command> {
+        PLANE.with(|plane| plane.borrow_mut().as_mut()?.1.pop_front())
+    }
+
+    /// Whether anything is queued.
+    pub(super) fn is_empty() -> bool {
+        PLANE.with(|plane| {
+            plane
+                .borrow()
+                .as_ref()
+                .is_none_or(|(_, queue)| queue.is_empty())
+        })
     }
 }
 
@@ -6088,7 +6155,7 @@ impl EngineCore {
                 if drained >= COMMAND_DRAIN_BATCH_MAX {
                     break;
                 }
-                match rx.try_recv() {
+                match Self::next_data_command(rx) {
                     Ok(command) => {
                         work += 1;
                         drained += 1;
@@ -6182,7 +6249,7 @@ impl EngineCore {
                 if stop {
                     return true;
                 }
-                if control > 0 {
+                if control > 0 || !local_plane::is_empty() {
                     return false;
                 }
                 match rx.recv_timeout(STEPPED_IDLE_POLL) {
@@ -6191,6 +6258,15 @@ impl EngineCore {
                     Err(RecvTimeoutError::Disconnected) => true,
                 }
             }
+        }
+    }
+
+    /// The next data-plane command: one this thread's own callbacks sent
+    /// first ([`local_plane`]), then the channel's.
+    fn next_data_command(rx: &Receiver<Command>) -> Result<Command, mpsc::TryRecvError> {
+        match local_plane::pop() {
+            Some(command) => Ok(command),
+            None => rx.try_recv(),
         }
     }
 
@@ -6370,16 +6446,21 @@ impl EngineHandle {
 
         let time_authority = virtual_clock::take_time_authority();
 
+        let drive_seq = Arc::new(AtomicU64::new(0));
+        let plane = Arc::as_ptr(&drive_seq) as usize;
         let join = std::thread::Builder::new()
             .name("embsim-board-net-engine".to_string())
-            .spawn(move || core.run(rx, control_rx))
+            .spawn(move || {
+                local_plane::install(plane);
+                core.run(rx, control_rx)
+            })
             .expect("failed to spawn the net-engine thread");
 
         Self {
             link: EngineLink {
                 tx: Some(tx),
                 control_tx: Some(control_tx),
-                drive_seq: Arc::new(AtomicU64::new(0)),
+                drive_seq,
                 pending_schedules,
                 states,
                 volts,

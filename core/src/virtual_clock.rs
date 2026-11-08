@@ -794,6 +794,7 @@ pub fn advance_to_ns(v_ns: u64) -> Result<(), AdvanceError> {
         .range(..=(v_ns, u64::MAX))
         .map(|(&key, _)| key)
         .collect();
+    let released = !due.is_empty();
     for key in due {
         let Some(Some(owner)) = sched.waits.remove(&key) else {
             continue; // an unregistered waiter: released, never accounted
@@ -806,16 +807,18 @@ pub fn advance_to_ns(v_ns: u64) -> Result<(), AdvanceError> {
         }
     }
     drop(sched);
-    // Unconditionally, even though most advances release nobody: a bus clock
-    // stops virtual time at every edge, so this broadcast wakes every parked
-    // actor thread twice per bit to do nothing, and skipping it when `due` is
-    // empty is an obvious-looking optimisation. It was measured: no
-    // throughput change at all (the co-simulation SD phase held 0.021x both
-    // ways), and the full embsim suite went from 4/4 green to flaking one
-    // timing-sensitive test per run or two. Some waiter depends on a
-    // broadcast it is not the registered owner of; until that is understood,
-    // the broadcast stays.
-    ADVANCED.notify_all();
+    // Only when this advance released a waiter. Every waiter on `ADVANCED`
+    // ([`park_until_virtual`]) sleeps until "now" reaches its own deadline,
+    // and that deadline sits in `waits` until the advance that reaches it
+    // takes it out, here: an advance that took nothing out moved no
+    // waiter's condition, and broadcasting it only wakes every parked
+    // thread to re-check and contend for this lock with the engine. A bus
+    // clock stops time at every edge, so that was a broadcast and a herd
+    // per edge. ([`init_mode`]'s epoch bump, the one other way a waiter is
+    // released, broadcasts for itself.)
+    if released {
+        ADVANCED.notify_all();
+    }
     apply_pace();
     Ok(())
 }
@@ -886,9 +889,13 @@ pub enum Quiescence {
 /// is the escape hatch for a wedged actor. Reaching it is a defect report
 /// ([`Quiescence::Stalled`]), and a run that hits it is not reproducible.
 pub fn await_quiescence(timeout: Duration) -> Quiescence {
-    let deadline = Instant::now() + timeout;
     let mut sched = lock_sched();
+    // The deadline is read off the wall clock only when there is something
+    // to wait for: the engine asks at every pass, and almost every pass
+    // finds every actor already parked.
+    let mut deadline = None;
     while sched.running > 0 {
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Quiescence::Stalled {

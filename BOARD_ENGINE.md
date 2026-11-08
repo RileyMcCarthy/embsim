@@ -40,7 +40,11 @@ lock-free paths:
 - **Drives are enqueued**, never applied inline: a pin drive is an MPSC message
   `(endpoint_id, new_drive, enqueue_seq)`. The engine thread dequeues,
   serializes, assigns the authoritative event order, resolves affected nets,
-  and updates `NetState`.
+  and updates `NetState`. A command sent from the engine thread itself (a
+  sense or wake callback's drive) skips the channel: it goes on the engine
+  thread's own local queue, which the engine drains ahead of the channel. It
+  is still applied in `enqueue_seq` order, and the re-entrancy contract below
+  holds unchanged — enqueued, resolved in a later iteration, never inline.
 - **Senses are delivered** from the engine thread with **no engine lock held**.
   The re-entrancy contract: a sense callback MAY drive a pin; that drive is
   enqueued and resolved in a later engine iteration — it is never resolved

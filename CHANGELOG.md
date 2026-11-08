@@ -77,6 +77,20 @@ the one before it promised, and says so here under **Breaking**.
   on its pin, naming the 8 V. The −0.3 V floor and the ±5.8 V / ±12 V
   differential ratings are not checked.
 
+### Changed
+
+- **A bus clock costs about half the host time it did.** Every edge of a
+  clock a node drives stops virtual time, and two engine costs rode on each
+  stop: every advance broadcast to every parked thread, which then fought
+  the engine for the scheduler lock, and every command a node's callback
+  sent crossed the channel back to the engine thread it was already on.
+  An advance now wakes threads only when it releases one, and the engine
+  thread keeps its own callbacks' commands in a queue of its own. Nothing a
+  node sees changes: the same waiters release at the same instants, and
+  drives apply in enqueue order as before. Measured on MaD's board, the
+  ROM's boot off the module's flash (a bit-banged SPI clock): 1.2 s of
+  virtual time in 17.4 s instead of 33.8 s, at 62% less CPU.
+
 ### Fixed
 
 - **An SD card leaves DO released until it has taken `CMD0` with chip
