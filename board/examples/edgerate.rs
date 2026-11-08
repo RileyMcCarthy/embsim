@@ -12,7 +12,8 @@
 //! This example was written to test whether the step clock could be carried as
 //! edges rather than as a rate, and it answered the wrong question. Cost is not
 //! why a step clock is a `Drive::Periodic` and not edges. **Correctness is**, and it was measured
-//! before this was written — `p2iss/src/pulse.rs:40`:
+//! before this was written — MaD's `SIL/p2iss/src/pulse.rs:41` at
+//! `c7a2e59b4`:
 //!
 //! > driving it edge by edge makes every step a wheel deadline, and any service
 //! > that arrives late collapses the edges it missed into one `set_drive` of the
@@ -198,5 +199,5 @@ fn main() {
     println!("  carry a count: a late consumer folds missed toggles into one");
     println!("  drive, and an even number of them is no change at all. Measured");
     println!("  at 1.5% of commanded distance surviving, at 20 mm/s.");
-    println!("  See p2iss/src/pulse.rs:40. Throughput does not fix it.");
+    println!("  See MaD's SIL/p2iss/src/pulse.rs:41 at c7a2e59b4. Throughput does not fix it.");
 }

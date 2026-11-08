@@ -47,7 +47,8 @@
 //! geometry from the consuming system description, not part constants. For the
 //! reference consumer they must match the firmware's own scale (MaD:
 //! 4 microsteps × 2048 steps/rev = 8192 counts/mm, `STEPS_PER_MM` in
-//! `SIL/MaDSim/src/wiring.rs`).
+//! `SIL/MaDSim/src/wiring.rs` at MaD `33676daaa`, and in
+//! `SIL/mad-catalog/src/machine.rs` since).
 //!
 //! ## The output stage
 //!

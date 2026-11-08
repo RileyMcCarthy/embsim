@@ -77,8 +77,9 @@
 //!
 //! - `τ` = [`DEFAULT_TAU_S`] (20 ms) and `k_load` = [`DEFAULT_LOAD_LOSS`]
 //!   (0.15) come from the reference consumer's hand-wired plant: MaD's
-//!   `SIL/MaDSim/src/wiring.rs`, `struct ServoPlant` with `SERVO_TAU_S =
-//!   0.020` and `SERVO_LOAD_LOSS = 0.15`. They were chosen there as the
+//!   `SIL/MaDSim/src/wiring.rs` (its last version, MaD `33676daaa`),
+//!   `struct ServoPlant` with `SERVO_TAU_S = 0.020` and
+//!   `SERVO_LOAD_LOSS = 0.15`. They were chosen there as the
 //!   headline plant-fidelity knobs — large enough that the firmware's
 //!   encoder-as-truth velocity servo has real dynamics to close against.
 //!   Both are `Config` fields here, because they describe *a* machine, not
@@ -148,11 +149,12 @@ use super::{require_fraction, require_positive, MachineConfigError};
 
 /// Motor + carriage velocity time constant (s) — the headline
 /// plant-fidelity knob. Larger is more sluggish, so the closed loop must work
-/// harder. Source: `SERVO_TAU_S` in MaD's `SIL/MaDSim/src/wiring.rs`.
+/// harder. Source: `SERVO_TAU_S` in MaD's `SIL/MaDSim/src/wiring.rs` at
+/// `33676daaa`.
 pub const DEFAULT_TAU_S: f64 = 0.020;
 
 /// Viscous load: fractional speed loss proportional to velocity. Source:
-/// `SERVO_LOAD_LOSS` in MaD's `SIL/MaDSim/src/wiring.rs`.
+/// `SERVO_LOAD_LOSS` in MaD's `SIL/MaDSim/src/wiring.rs` at `33676daaa`.
 pub const DEFAULT_LOAD_LOSS: f64 = 0.15;
 
 /// Quiet intervals after the last STEP edge before the commanded rate expires.
