@@ -9,6 +9,12 @@ node. This document is the plan for replacing it with what every embsim
 project has: a catalog crate of MaD's own kinds, a project file, and the
 `embsim` command ([`PROJECTS.md`](PROJECTS.md) §10).
 
+*Revised 2026-11-07: MaD has carried out steps 0 to 10, and the note under
+step 11 says what is left of it. `p2iss` and `SIL/MaDSim` are crates of
+MaD's SIL workspace, so no embsim code goes with `mad-emulator`. The status
+below is the plan's as written; its citations of `SIL/MaDSim` name MaD's
+tree before the retirement, which MaD `4bf392614` holds.*
+
 *Status, 2026-10-02, against embsim 0.2.0 (the runner MaD owns, and the
 embsim it holds through the submodule, are 2026-10-02's; `NODES.md` §13,
 "Packaging for the release"). A plan: nothing in MaD has changed. It was checked
@@ -986,6 +992,28 @@ the pin lists removed), the `p2iss` tests and examples that use them
 `examples/iss_speed.rs`, `sd_probe.rs`) moved onto the core in the package.
 *Done when:* `make test` and the e2e suite pass with no `mad-emulator` in
 the tree.
+
+*Revised 2026-11-07 (MaD #298, #324): no scenario needs `mad-emulator`, and
+what is left of this step is MaD's alone.*
+
+- **SERVO-stall**, the last scenario only `mad-emulator` ran, runs on
+  `mad-hard-stop-cosim.toml` (`make e2e-stall`): `mad-cosim.toml` with the
+  machine's hard-stop option set (MaD #324).
+- **The playgrounds** run on the tool, through MaD's
+  `scripts/board-route.sh playground`: `make playground` on
+  `mad-playground.toml`, `make playground-rom` on
+  `mad-serial-boot-playground.toml`.
+- **The removals are a MaD pull request.** `p2iss` is MaD's crate
+  (`SIL/p2iss`), not embsim's, so the `Component` impl, `SerialLink`, the
+  pin lists and the tests that use them go with `SIL/MaDSim`, its `members`
+  entry, the `-p mad-emulator` of `ci.yml`'s `rustfmt (gating)` step and
+  the `emulator-release` target. No embsim crate, test or example uses any
+  of them. Embsim's comments that cited `SIL/MaDSim/src/wiring.rs` or
+  `p2iss`'s line numbers cite a MaD commit instead.
+- **Two more tests use `P2Iss`** than the list names:
+  `tests/protocol_rx_overrun.rs`, whose twin on the core is
+  `tests/package_rx_overrun.rs`, and `tests/rom_serial_window.rs`, which has
+  no twin on the core yet.
 
 ## 6. Questions for MaD
 

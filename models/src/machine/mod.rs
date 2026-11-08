@@ -51,7 +51,8 @@
 //! provenance convention") requires: the governing equation, where each
 //! parameter came from, and what is deliberately **not** modeled. The
 //! reference consumer throughout is MaD's tensile tester — its hand-wired
-//! plant (`SIL/MaDSim/src/wiring.rs`) and its EdgeBoard schematic
+//! plant (`SIL/MaDSim/src/wiring.rs`, whose last version is MaD
+//! `33676daaa`) and its EdgeBoard schematic
 //! (`Hardware/EdgeBoard/KiCad/MaD_Edge_Sheet3.kicad_sch`) are the cited
 //! sources.
 

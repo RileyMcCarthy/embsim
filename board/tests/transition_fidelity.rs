@@ -1,11 +1,12 @@
 //! Can a voltage level carry a COUNT?
 //!
-//! `p2iss/src/pulse.rs:40` says no, and measured it: driving a step train edge
-//! by edge lost all but ~1.5% of the commanded distance at 20 mm/s, because a
-//! service arriving late "collapses the edges it missed into one `set_drive` of
-//! the final level — an even number of them is no change at all".
+//! MaD's `SIL/p2iss/src/pulse.rs:41` (at `c7a2e59b4`) says no, and measured
+//! it: driving a step train edge by edge lost all but ~1.5% of the commanded
+//! distance at 20 mm/s, because a service arriving late "collapses the edges
+//! it missed into one `set_drive` of the final level — an even number of them
+//! is no change at all".
 //!
-//! The mechanism is in the PRODUCER, not the engine. `pulse.rs:241`:
+//! The mechanism is in the PRODUCER, not the engine. `pulse.rs:243` there:
 //!
 //! ```text
 //! let step = state.advance(now_ns);   // works out N transitions were due
@@ -279,9 +280,11 @@ fn a_producer_that_catches_up_in_bulk_loses_almost_everything() {
 // counts (a step counter, an encoder) needs only order. A consumer that
 // MEASURES (a UART deframer recovering bit periods, a setup/hold check, a
 // timeout, a waveform view) needs the instants to be distinct and true. The ISS
-// stamps every edge in a 100 us slice identically today
-// (`p2iss/src/lib.rs:1259` re-arms at `virtual_clock::virtual_ns()`), so this
-// is the property that decides whether that is a latent bug or a live one.
+// stamped every edge in a 100 us slice identically when this was written
+// (MaD's `SIL/p2iss/src/lib.rs:1231` at `c7a2e59b4` re-arms at
+// `virtual_clock::virtual_ns()`, in the bare-chip `Component` MaD retires with
+// `mad-emulator`), so this is the property that decides whether that is a
+// latent bug or a live one.
 
 /// What the consumer observed: one virtual timestamp per transition.
 #[derive(Debug, Default)]

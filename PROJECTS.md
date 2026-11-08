@@ -2500,13 +2500,13 @@ same way, through the command's library: six steps from a
 ##### MaD's plant
 
 MaD's machine (`mad-machine`, [`MIGRATING-MAD.md`](MIGRATING-MAD.md) §3)
-is the plant the `Assembly` is for. `mad-emulator` builds it today as
-four components and a closure (`BenchMachine::build`,
-`MaDSim/src/iss_description.rs`): embsim's drive, encoder and two end
-switches, the drive's shaft moving the other three, each wired to bare
-processor pins, and the gantry, the sample and the strain gauge chained by
-more closures in `run_iss` (`MaDSim/src/main.rs`). As a kind, the same
-parts and the same closures are one component:
+is the plant the `Assembly` is for. `mad-emulator` built it as four
+components and a closure (`BenchMachine::build`,
+`MaDSim/src/iss_description.rs` at MaD `4bf392614`): embsim's drive,
+encoder and two end switches, the drive's shaft moving the other three,
+each wired to bare processor pins, and the gantry, the sample and the
+strain gauge chained by more closures in `run_iss` (`MaDSim/src/main.rs`).
+As a kind, the same parts and the same closures are one component:
 
 | Member | What it is | Its pins, as the machine's |
 |---|---|---|
@@ -2692,8 +2692,9 @@ QEMU:
 ### MaD, the first project to extend embsim
 
 The MaD tensile tester (`RileyMcCarthy/MaD`, `SIL/`) is the consumer this
-section was designed against. Its SIL today is `mad-emulator`, a program
-that assembles the system by hand. As a project it is one catalog crate,
+section was designed against. Its SIL began as `mad-emulator`, a program
+that assembled the system by hand, which the project has replaced (MaD
+#298 removes it). As a project it is one catalog crate,
 `SIL/mad-catalog`, adding four kinds; its own runner, `SIL/mad-runner`,
 both members of MaD's `SIL` workspace and built against its committed
 `SIL/Cargo.lock`, with embsim a path dependency through the `SIL/embsim`
@@ -2703,7 +2704,7 @@ submodule; and one file, `SIL/mad.toml`:
 |---|---|---|
 | `mad-edge` | board | the MaD Edge carrier, from its KiCad export; its module socket `J3` a `boundary` |
 | `mad-ds2` | board | the DS2 force-gauge add-on, from its KiCad export; its converter `U1` an `ads122u04` |
-| `mad-p2iss` | P2 core | MaD's instruction-set simulator, `p2iss::P2Iss`, once it implements `P2Core`, booting the ROM off the module's flash |
+| `mad-p2iss` | P2 core | MaD's instruction-set simulator in the P2's package, `p2iss::P2IssCore` (MaD's `SIL/p2iss/src/package.rs`, which implements `P2Core`), booting the ROM off the module's flash |
 | `mad-machine` | bench component | the machine: servo drive, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant: an `Assembly` ("MaD's plant", above) |
 
 [`MIGRATING-MAD.md`](MIGRATING-MAD.md) holds the file as it would read,
