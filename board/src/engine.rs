@@ -8,10 +8,11 @@
 //! - **Drives are enqueued**, never applied inline:
 //!   [`crate::component::PinHandle::set_drive`] reserves a global enqueue
 //!   sequence number and posts an MPSC message
-//!   `(endpoint id, new drive or release, enqueue seq)`. The engine dequeues,
-//!   re-serializes by that sequence (the authoritative event order, even when
-//!   two threads race the channel itself), resolves the affected nets, and
-//!   updates net state.
+//!   `(endpoint id, new drive or release, enqueue seq)` (from the engine's
+//!   own callbacks, onto its thread's queue instead: `local_plane`). The
+//!   engine dequeues, re-serializes by that sequence (the authoritative
+//!   event order, even when two threads race the channel itself), resolves
+//!   the affected nets, and updates net state.
 //! - **Senses are delivered** from the engine thread with **no engine lock
 //!   held**. Re-entrancy contract: a sense callback MAY drive a pin; that
 //!   drive is enqueued and resolved in a *later* engine iteration — never
@@ -6931,6 +6932,103 @@ mod tests {
         );
         assert_eq!(
             handle.net_state(NetId(0)),
+            Some(NetState::Driven(Level::High))
+        );
+    }
+
+    /// A sense callback on one engine driving a pin on ANOTHER engine's
+    /// link: the drive is not this thread's own ([`local_plane`] is keyed by
+    /// [`EngineLink::plane_id`]), so it goes through the other engine's
+    /// channel and lands there, in the order it was issued.
+    #[rstest]
+    fn a_drive_from_one_engines_callback_onto_another_engines_link_lands_on_that_engine() {
+        behaviour!(Test {
+            id: "engine.cross-engine-drive-goes-through-its-channel",
+            covers: Some("board/src/engine.rs#EngineLink::send"),
+            given: "two engines, and a sense on the first that, on seeing its net go high, drives a pin on the second engine high and then low",
+        });
+        expect!(
+            "lands-on-the-other-engine",
+            "the second engine's net is seen driven high and then low, in that order",
+            "what a sense sends skips the channel only when it is for the engine delivering that sense; a drive for another engine kept there would be applied to the wrong board",
+        );
+        expect!(
+            "first-engine-untouched",
+            "the first engine's net is seen to change only by its own drive",
+        );
+        // Engine A: one net, one pin the test drives.
+        let mut resolver_a = Resolver::new(1, Dsu::new(1));
+        let e_a = resolver_a.add_endpoint(0, PinRef::new("UA", "1"), None);
+        let engine_a = EngineHandle::spawn(
+            resolver_a,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
+        // Engine B: the same layout, so a drive misrouted onto A's thread
+        // would name an endpoint A also has, and show up on A's net.
+        let mut resolver_b = Resolver::new(1, Dsu::new(1));
+        let e_b = resolver_b.add_endpoint(0, PinRef::new("UB", "1"), None);
+        let engine_b = EngineHandle::spawn(
+            resolver_b,
+            nets(1),
+            Box::new(QuasiStaticMna),
+            EventLog::disabled(),
+            None,
+        );
+        let a_log = sense_log(&engine_a, NetId(0));
+        let b_log = sense_log(&engine_b, NetId(0));
+
+        let hb = crate::component::PinHandle::wired(NetId(0), Some(e_b), engine_b.link());
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let fired = Arc::clone(&fired);
+            engine_a.link().send(Command::RegisterSense {
+                net: NetId(0),
+                reference: None,
+                supply: None,
+                callback: Box::new(move |delivery: &Delivery| {
+                    if delivery.state == NetState::Driven(Level::High)
+                        && !fired.swap(true, Ordering::AcqRel)
+                    {
+                        hb.set_drive(Some(high()));
+                        hb.set_drive(Some(low()));
+                    }
+                }),
+            });
+        }
+
+        let ha = crate::component::PinHandle::wired(NetId(0), Some(e_a), engine_a.link());
+        ha.set_drive(Some(high()));
+
+        assert!(
+            wait_for(|| b_log.lock().unwrap().len() == 3, Duration::from_secs(5)),
+            "both drives must land on engine B; B saw {:?}, A saw {:?}",
+            b_log.lock().unwrap(),
+            a_log.lock().unwrap()
+        );
+        assert!(fired.load(Ordering::Acquire));
+        // Settled: nothing more arrives on either engine.
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            *b_log.lock().unwrap(),
+            vec![
+                NetState::Floating,
+                NetState::Driven(Level::High),
+                NetState::Driven(Level::Low),
+            ]
+        );
+        assert_eq!(
+            *a_log.lock().unwrap(),
+            vec![NetState::Floating, NetState::Driven(Level::High)]
+        );
+        assert_eq!(
+            engine_b.net_state(NetId(0)),
+            Some(NetState::Driven(Level::Low))
+        );
+        assert_eq!(
+            engine_a.net_state(NetId(0)),
             Some(NetState::Driven(Level::High))
         );
     }
