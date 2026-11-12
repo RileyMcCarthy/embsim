@@ -404,7 +404,8 @@ jobs:
         run: cargo test -p embsim-cli --test runner -- --ignored --nocapture
 
   # Single required status check for branch protection on `main`. Aggregates
-  # every gating job above (the advisory Behaviour ledger is not in it): fails if any FAILED/CANCELLED, passes when all succeeded.
+  # every gating job above (the advisory Behaviour ledger is not in it): fails
+  # if any FAILED/CANCELLED, passes when all succeeded.
   # Mark "CI Gate" as the required check so individual job renames don't leave
   # protection pointing at a missing context. Jobs are not path-filtered, so
   # none are "legitimately skipped" today — still use always() so a cancelled
