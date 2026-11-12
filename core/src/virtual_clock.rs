@@ -157,6 +157,7 @@ pub fn init(speed: f64, _freq: u32) {
 
 /// Compatibility wrapper: [`ClockMode::Stepped`] is `init(0.0, freq)`;
 /// [`ClockMode::FreeRunning`] is `init(speed, freq)`.
+/// `freq` is ignored, as [`init`]'s is.
 pub fn init_mode(mode: ClockMode, freq: u32) {
     match mode {
         ClockMode::Stepped => init(0.0, freq),
