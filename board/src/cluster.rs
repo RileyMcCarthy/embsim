@@ -248,15 +248,6 @@ pub enum Region {
     Active,
 }
 
-impl Region {
-    /// Whether the element conducts by its curve rather than its leakage —
-    /// [`Region::On`] or [`Region::Active`]. A regulator's ohmic segment is
-    /// [`Region::Off`] although it conducts.
-    pub fn is_on(self) -> bool {
-        self != Region::Off
-    }
-}
-
 /// One piecewise-linear element in a cluster: a branch from `a` to `b`
 /// ([`crate::Branch`], with its pins resolved to nodes). The branch current
 /// is reported positive from `a` to `b`.
