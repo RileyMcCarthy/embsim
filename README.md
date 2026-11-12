@@ -177,15 +177,15 @@ every pull request.
 | Area | Today | The plan adds | Not in scope |
 |---|---|---|---|
 | Node interface | one per-instant message, `Drive` — a Thevenin port, a current, or a periodic drive (the step clock, two ports and an integer-nanosecond schedule); one delivery, `Sense` — the node's voltage against the pin's declared reference, or none; a pin declared once as a `PinRole` plus its facts (thresholds with hysteresis and a dead-band policy, input port, clamps, reference, supply); every level projected by its receiver (`NODES.md` §11, §12 item 5) | a pin's declared capacitance stamped as its RC pole (5) | a second channel between nodes |
-| Connectivity | every net and pin from the vendor netlist, facade checked both ways; resistors as circuit edges; jumpers | switches, capacitors, diodes, FETs, regulators, oscillators, gates as nodes; unclassified part = build error (phases 1–4) | parasitics the netlist does not name |
-| DC operating point | drivers vs pulls, contention, floating, stuck rails, a nodal solve where sources compete | impedance-aware ranking (a 15 kΩ pull vs a sink is not contention), real rail voltages, ground as a declared terminal, LED lit, body diodes, the missing-pull-up lint (1, 3, 4) | current budgets, IR drop, thermal |
-| Protocols on wires | SPI on shared pins, UART as levels at real baud, step/dir as exact counts, RS-422 receivers, the ROM boot off the flash | I2C wired-AND with clock stretching and arbitration, the P2 pad reading the net in its pull modes (2, 6); CAN/USB only if a model is written | transaction-level bus models |
-| Timing | every edge at its own nanosecond; deterministic stepped clock; golden traces | RC delays as one pole with exact integer-ns crossings; rail soft-start instants; symmetric differential filters (5) | slew, setup/hold against slow edges, multi-pole transients, ringing |
-| Power | rails present or absent; enable trees as senses | rails as sources with soft-start and UVLO; supervisor with hysteresis; isolated domains; brown-out ordering (4) | regulator ripple, current limit, load transients |
+| Connectivity | every net and pin from the vendor netlist, facade checked both ways; resistors as circuit edges; jumpers; switches, diodes, FETs, regulators, oscillators and gates as nodes; an unclassified part is a build error | capacitors as nodes (5); a conductance a plant changes while the board runs (7) | parasitics the netlist does not name |
+| DC operating point | drivers vs pulls ranked by impedance (a 15 kΩ pull against a sink is not contention), contention, floating, stuck rails, rails at their real voltages, ground as a declared terminal, a nodal solve where sources compete, branch currents (an LED lit, body diodes), the missing-pull-up lint | — | current budgets, IR drop, thermal |
+| Protocols on wires | SPI on shared pins, UART as levels at real baud, step/dir as exact counts, RS-422 receivers, the ROM boot off the flash, the P2 pad as a pull in its resistive pin modes | I2C wired-AND with clock stretching and arbitration (6); CAN/USB only if a model is written | transaction-level bus models |
+| Timing | every edge at its own nanosecond; deterministic stepped clock; golden traces; a rail up at the end of its soft-start, a scheduled instant | RC delays as one pole with exact integer-ns crossings; symmetric differential filters (5) | slew, setup/hold against slow edges, multi-pole transients, ringing |
+| Power | rails as sources with soft-start and UVLO thresholds; enable trees as senses; a voltage detector with hysteresis holding reset while its rail is under threshold; isolated domains | — | regulator ripple, current limit, load transients |
 | Analog | ADS122U04 front end at settled values, its input, gain and reference the firmware's register writes; force and encoder plants; input ports stamped on senses (the AM26LV32's open-input bias); a single source into an analog reader delivered unsolved | RC settling at conversion instants (5) | noise, amplifier loops, oscillator start-up |
-| CPU | P2 on QEMU or p2core, instruction-accurate, verified against each other and silicon captures; hub-exec and cog-exec; HUBSET clock; inside the P2 package, any core — QEMU, an ISS, the native firmware — started 3 ms after `RESN` releases inside `VDD`'s window, its pads at their bank's supply and the `WRPIN` strengths (fast fitted to the datasheet), the crystal the rate on `XI`, a brownout without a reset reported and the core held; `RESN` read low while the core runs holds it again and restarts it 3 ms after the release (`P2Core::enter_reset`), a core that cannot boot again kept running and the reset reported | a core that boots again in embsim itself: the QEMU node declines a reset, and MaD's ISS takes one | cycle-exact hub timing, interrupts until modelled |
-| Faults and what-ifs | shorts, detached pins, stuck nets, DNP, value overrides, jumper states | switch positions by name, declared leaks, capacitance on a harness (1, 5) | faults nobody injects; tolerances and corners |
-| Speed | 16 901 flash edges in 0.2 s; step trains as rates | a census and a solve benchmark as CI gates; nothing added to the fast path (0, 6) | a timestep, ever |
+| CPU | P2 on QEMU or p2core, instruction-accurate, verified against each other and silicon captures; hub-exec and cog-exec; HUBSET clock; inside the P2 package, any core — QEMU or an ISS — started 3 ms after `RESN` releases inside `VDD`'s window, its pads at their bank's supply and the `WRPIN` strengths (fast fitted to the datasheet), the crystal the rate on `XI`, a brownout without a reset reported and the core held; `RESN` read low while the core runs holds it again and restarts it 3 ms after the release (`P2Core::enter_reset`), a core that cannot boot again kept running and the reset reported | a core that boots again in embsim itself: the QEMU node declines a reset, and MaD's ISS takes one | cycle-exact hub timing, interrupts until modelled |
+| Faults and what-ifs | shorts, detached pins, stuck nets, DNP, value overrides, jumper states, switch positions by reference and pole | declared leaks; capacitance on a harness (5) | faults nobody injects; tolerances and corners |
+| Speed | 16 901 flash edges in 0.2 s; step trains as rates; the cluster census and the ROM boot's zero escalated solves held by tests | the solve benchmark as a CI gate; nothing added to the fast path (6) | a timestep, ever |
 
 **Why it stays fast.** Nothing is integrated per tick: cost is per event, and a
 solve runs only where sources within a factor of ten disagree or an analog
@@ -519,8 +519,9 @@ cargo test -p embsim-board --release
 Determinism (the `determinism` CI job). In **stepped clock mode** the board
 engine is a discrete-event simulator in virtual time, and a scenario's engine
 event log — order *and* every timestamp — is identical across runs, across
-processes, and against a blessed golden trace. Free-running (the default) is
-unchanged and is held only to the event order:
+processes, and against a blessed golden trace. The suite asserts order and
+timestamps unpaced (speed 0); a paced run (speed > 0) counts on the same
+virtual counter and is held to the event order:
 
 ```bash
 cargo test -p embsim-board --test determinism -- --nocapture
@@ -537,8 +538,9 @@ cargo llvm-cov --workspace --summary-only
 ```
 
 **Test conventions** (required for new tests) live in [`TESTING.md`](TESTING.md):
-prefer `#[rstest]` + named `#[case]`s; peripheral free-function tests take
-`test_support::guard()` + `ensure_clock()`; assert virtual-time contracts and
+prefer `#[rstest]` + named `#[case]`s; a test that inits or re-anchors the
+process-global virtual clock lives in its own test binary or serializes
+behind `TEST_LOCK` (rules 5, 8 and 9); assert virtual-time contracts and
 clamps rather than flaky wall timing. Consumer repos (e.g. MaD) should re-run
 this suite against the pinned submodule commit on SIL-related PRs.
 

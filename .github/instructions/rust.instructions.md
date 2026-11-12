@@ -2,16 +2,15 @@
 applyTo: "**"
 ---
 
-Rust (embsim SIL framework). Overview: `README.md`; platform ABI contract:
-`CONTRACT.md`.
+Rust (embsim SIL framework). Overview: `README.md`; the design and its rules:
+`DESIGN.md`.
 
 - Generic crates stay **project-agnostic** — no consumer-specific constants,
   names, or paths. Consumer wiring belongs in the consumer's repo.
-- Scrutinise FFI `unsafe` boundaries: guard-before-deref (null/len/sign) on
-  every trampoline; symbol names verbatim from the firmware's HAL headers.
 - The tree is rustfmt-formatted and `cargo fmt --check` gates CI.
 - Public items need `///` docs; `cargo doc` runs with `-D warnings` in CI.
-- Peripheral state is process-global by design (one firmware per OS process) —
-  tests that touch shared globals serialize behind the crate's `TEST_LOCK`.
+- The virtual clock is process-global — tests that init or re-anchor it
+  serialize behind the crate's `TEST_LOCK` or live in their own test binary
+  (`TESTING.md` rule 5).
 
 Don't re-report Clippy or build errors.

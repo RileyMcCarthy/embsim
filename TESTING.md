@@ -2,7 +2,8 @@
 
 Every crate in this workspace is firmware-free and unit-testable. This document
 is the contract for **how** tests are written so coverage stays uniform across
-peripherals, models, board engine, runtime, and tools.
+the core, the models, the board engine, the boards and their projects, the
+CLI, the P2 core, chrome-cdp, and the tools.
 
 ## Running the suite
 
@@ -470,6 +471,11 @@ cargo llvm-cov --workspace --summary-only
    a speed: the wall time a stepped run takes is the engine's cost per edge
    times its edges, and the runner decides that.
 
+4. *(Unused. The rule on peripheral free-function tests went with the
+   peripherals crate in 0.2.0 and "assert contracts" moved up to 3; the
+   number is left empty so rules 5, 8 and 9 stay where other documents and
+   code cite them.)*
+
 5. **Board / process-global clock isolation.** Integration cases that must
    *not* see a pre-initialized clock live in their own `board/tests/*.rs`
    binary (see `clock_guard.rs`). The same applies in reverse to cases that
@@ -549,15 +555,15 @@ cargo llvm-cov --workspace --summary-only
 
 | Layer | Happy path | Edge | Parameterized |
 |-------|------------|------|----------------|
-| Peripherals | in-range I/O | OOR no-op, reset, max+1 panic | channel counts, baud/frame, pulse N×F |
-| Instance bind | free fn → bound bank | LIFO drop panic, inheritance | multi-bank isolation matrix |
+| Core | virtual-clock schedules, the serial PTY | re-anchor, a wall sleep while stepped | speed / frequency cases |
 | Models | protocol/state | clamp, invalid cmd | DR/gain tables, thresholds |
-| Runtime | full no-firmware run | missing symbols, ceilings | TooManyChannels per peripheral |
 | Board | drive/sense/stream | contention, facade mismatch | net truth table, drop policies |
-| Pin bridges | exact counts, GPIO both ways, encoder counts | slip, floating input, unbridged channel | polarity matrix, direction mapping, level projection |
+| Projects / catalog | a project file built and run through a catalog | unknown kind, refused project, mismatched mate | board kinds × part kinds |
+| CLI | the command as a user runs it, and as a library | failing run, bad arguments | subcommands |
 | Interface parts | the datasheet function table, on a real netlist | unpowered side, disabled output, open loop | variant/pinout matrix, fail-safe vs default-high |
 | Stepped clock | N-run + golden identity | wedged actor, held time-release | case matrix × {free-running, stepped} |
-| P2 trampolines | null/neg guards | bind routing | channel index grids |
+| P2 core | ROM boot, program load, lifecycle | a reset the core declines | pad modes, crystal / PLL settings |
+| chrome-cdp | a page metered against a stand-in DevTools endpoint | parent death | page fixtures |
 | Tools | parse/record/render | empty/unknown | DWARF flag matrices |
 
 ## Deferred features (no tests yet)
@@ -565,7 +571,6 @@ cargo llvm-cov --workspace --summary-only
 When these land, each needs a dedicated integration binary:
 
 - Live topology mutation after `System::start`
-- Dual-MCU firmware entry inversion (one image per process still applies)
 
 ## MaD pin bumps
 

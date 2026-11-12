@@ -74,7 +74,7 @@
 //! outside the window: the package invents no voltage for it.
 //!
 //! The gate is the package's, and it holds **every** core the same way —
-//! the QEMU core, an ISS, the native firmware image: a core's wake handler
+//! the QEMU core or an ISS: a core's wake handler
 //! and its schedules go through one entry point, the package's
 //! [`WakeGate`] behind the net I/O every core is handed
 //! ([`ComponentNetIo::with_wake_gate`]), whether the core schedules
