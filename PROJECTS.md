@@ -2499,21 +2499,34 @@ same way, through the command's library: six steps from a
 
 ##### MaD's plant
 
-MaD's machine (`mad-machine`, [`MIGRATING-MAD.md`](MIGRATING-MAD.md) §3)
-is the plant the `Assembly` is for. `mad-emulator` built it as four
-components and a closure (`BenchMachine::build`,
-`MaDSim/src/iss_description.rs` at MaD `4bf392614`): embsim's drive,
-encoder and two end switches, the drive's shaft moving the other three,
-each wired to bare processor pins, and the gantry, the sample and the
-strain gauge chained by more closures in `run_iss` (`MaDSim/src/main.rs`).
-As a kind, the same parts and the same closures are one component:
+MaD's machine is the plant the `Assembly` is for, and MaD has built it
+so: the `mad-machine` kind, MaD's `SIL/mad-catalog/src/machine.rs` (MaD
+#264, `1fb09bd69`; [`MIGRATING-MAD.md`](MIGRATING-MAD.md) §3). The table
+and the notes below are that file's module docs at MaD `718528901`.
+`mad-emulator` built the same parts as four components and a closure
+(`BenchMachine::build`, `MaDSim/src/iss_description.rs` at MaD
+`4bf392614`): embsim's drive, encoder and two end switches, the drive's
+shaft moving the other three, each wired to bare processor pins, and the
+gantry, the sample and the strain gauge chained by more closures in
+`run_iss` (`MaDSim/src/main.rs`). The kind is one component of the same
+parts and links, with four more contacts and the drive's ready output:
 
 | Member | What it is | Its pins, as the machine's |
 |---|---|---|
-| `DRIVE` | `StepperMotor`, 8192 steps a millimetre, `DIR` low forward, enable active low, no load loss (`BenchMachine::build`'s conventions) | `STEP`, `DIR`, `ENA`, measured against `DRIVE_GND`, a return the assembly declares |
-| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre, its output stage the kind's `encoder_output` option (below): by default `rs422`, with its index and its complements (`Config::with_complements`), each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it; or `npn-open-collector`, the real machine's encoder, `A` and `B` open collectors with no index | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-`, `ENC_Z+`, `ENC_Z-` (`rs422`) or `ENC_A+`, `ENC_B+` (`npn-open-collector`), against `ENC_GND`, another. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high and the run reports (`PairInBand`; `board/tests/edge_encoder_pairs.rs`) |
-| `UPPER`, `LOWER` | `EndSwitch`, closing at 100 mm (`TRAVEL_MM`) and at 0 mm | each contact's `COM` and `NO`: `NO` is the loop's `+` to the carrier, and the machine's loop supply reaches `COM` (`MIGRATING-MAD.md` §6, "The loop supply") |
-| `LOAD_CELL` | MaD's own: `LoadCellBridge` and `BridgeDrive` (`MaDSim/src/system_description.rs`) | `E+`, `E-` sensed, `S+`, `S-` driven |
+| `DRIVE` | `StepperMotor`, 8192 steps a millimetre by default (`STEPS_PER_MM`; the kind's `drive_steps_per_mm` option), `DIR` low forward, enable active high, no load loss | `STEP`, `DIR`, `ENA`, measured against `DRIVE_GND`, a return the assembly declares |
+| `READY` | MaD's own: the drive's ready output, one pin held sinking at 0 V behind embsim's 25 Ω bench default (`DEFAULT_PUSH_PULL_IMPEDANCE`), the level the firmware reads as not ready (below) | `SRDY`, declared against `DRIVE_GND` |
+| `ENCODER` | `QuadratureEncoder`, 8192 counts a millimetre by default (`encoder_counts_per_mm`), its output stage the kind's `encoder_output` option (below): by default `rs422`, each channel a pair, as the RS-422 encoder the carrier's `J20` takes presents it; `npn-open-collector`, the real machine's encoder; or `push-pull`. No stage has an index | `ENC_A+`, `ENC_A-`, `ENC_B+`, `ENC_B-` (`rs422`) or `ENC_A+`, `ENC_B+` (`push-pull`, `npn-open-collector`), against `ENC_GND`, another return. The carrier's receiver `U25` reads the pairs; a single-ended encoder on the `+` legs with the `-` legs grounded gives no differential for its low, which `U25` reads as its fail-safe high and the run reports (`PairInBand`; `board/tests/edge_encoder_pairs.rs`) |
+| `UPPER`, `LOWER` | `EndSwitch`, each a normally closed contact: the upper opens past 100 mm (`TRAVEL_MM`), the lower below 0 mm | `UPPER_COM`, `UPPER+`; `LOWER_COM`, `LOWER+`: `+` is the loop's `+` to the carrier, and a project file wires `COM` to the loop's supply, the carrier's `5V_IO` |
+| `DOOR`, `ESD_U`, `ESD_L`, `ESD_A` | `EndSwitch` contacts no carriage moves, each holding its rest: the door closed, the three emergency stops open | `DOOR_COM`, `DOOR+`, … `ESD_A_COM`, `ESD_A+` |
+| `LOAD_CELL` | MaD's own, from `mad-emulator`'s `LoadCellBridge` and `BridgeDrive`: `S+` and `S-` each behind 350 Ω, centred on the excitation sensed on `E+`/`E-` and scaled to it, released while either excitation pin reads nothing | `E+`, `E-` sensed, `S+`, `S-` driven |
+
+**The drive's ready output.** On the carrier `SC_SRDY` (`J21.6`) has a
+1 kΩ pull-up to `SC_5V` (`R25`) and reaches `P5` through the
+non-inverting isolator `IC14`'s channel D, so an output left open would
+read as ready. The kind therefore holds `SRDY` sinking, the firmware's
+inactive level for `SERVO_RDY`, where `mad-emulator`'s bench pull held
+`P5` (inferred from the netlist; MaD's module docs). No drive datasheet
+names the output, so the sink is embsim's stated default.
 
 **The encoder's output stage** is an option of its configuration
 (`quadrature_encoder::Config::with_output`, `OutputStage`, `NODES.md` §20):
@@ -2531,11 +2544,12 @@ let stage = options
     .and_then(OutputStage::from_name)
     .unwrap_or(OutputStage::Rs422);
 let config = quadrature_encoder::Config::new(STEPS_PER_MM).with_output(stage);
-// rs422: the index and its pairs; npn-open-collector: A and B, no index.
+// `Config::new` declares no index, so no stage has `Z`.
 ```
 
-On the Edge carrier as it is, an `npn-open-collector` encoder reads high at
-`P9` and `P10` at every count, and the run says why (`PairInBand` on
+On the Edge carrier of embsim's fixture
+(`board/tests/fixtures/mad_edge.net`), an `npn-open-collector` encoder reads
+high at `P9` and `P10` at every count, and the run says why (`PairInBand` on
 `U25`'s first two pairs): `J20`'s `+` legs have no pull-up, so a released
 output rests at `U25`'s own bias, and a sinking one leaves its pair, the
 `-` leg on `EN_GND` through `JP2`/`JP3`, no difference. Reading it needs a
@@ -2546,12 +2560,18 @@ must keep `U25`'s inputs inside their ratings — SLLS202H §6.3: −0.3 V to
 5.5 V common mode, ±5.8 V across a pair; §6.1, absolute: −4 V to 8 V on an
 input, ±12 V across a pair — which the encoder on 5 V does and a pull-up
 straight to its 12 V or 24 V does not (each leg would need a divider or a
-clamp); the `am26lv32` model checks neither range.
+clamp); the `am26lv32` model checks neither range. MaD's carrier as drawn
+since (v0.3, the netlist `mad-catalog` carries) has that pull-up and
+mid-level reference, so there the open collector's quadrature reaches `P9`
+and `P10` (MaD's module docs; inferred from the drawing, not yet checked
+on the machine).
 
 The gantry, the sample and the strain gauge have no pins: they are the
 link from the shaft to the load cell, MaD's code moved into the kind
-beside the others. In the kind's constructor (MaD's to write; the names
-are its):
+beside the others. The shape of the kind's constructor, as this guide
+sketched it before MaD wrote it (MaD's `assemble` is the code as built: it
+adds the `READY`, `DOOR` and `ESD_*` members of the table, puts `SRDY`
+under `DRIVE_GND`, and declares no index):
 
 ```rust,ignore
 fn machine(sample: Sample) -> Result<Assembly, AssemblyError> {
@@ -2583,10 +2603,14 @@ fn machine(sample: Sample) -> Result<Assembly, AssemblyError> {
 
 The engine sees one node with the machine's pins; the shaft, the
 carriage and the sample are inside it, and no net carries them. Its
-report (`CarriageTravel` today) is the kind's, added to `request.reports`.
+report (`CarriageTravel`) is the kind's, added to `request.reports`.
 The door and the emergency stops are contacts no carriage moves, members
-the same way, and the drive's ready output waits on MaD's answer
-(`MIGRATING-MAD.md` §6).
+the same way, and the drive's ready output is the `READY` member above.
+Beside `encoder_output` the kind takes `sample`, `drive_steps_per_mm`,
+`encoder_counts_per_mm` and `hard_stop_mm`, a carriage position the
+carriage cannot pass; what it leaves out (the encoder's supply, an index,
+pressing a stop or opening the door, a jam that comes and goes) is its
+module docs' "Not modelled".
 
 ### What a run prints about what a catalog built
 
@@ -2705,7 +2729,7 @@ submodule; and one file, `SIL/mad.toml`:
 | `mad-edge` | board | the MaD Edge carrier, from its KiCad export; its module socket `J3` a `boundary` |
 | `mad-ds2` | board | the DS2 force-gauge add-on, from its KiCad export; its converter `U1` an `ads122u04` |
 | `mad-p2iss` | P2 core | MaD's instruction-set simulator in the P2's package, `p2iss::P2IssCore` (MaD's `SIL/p2iss/src/package.rs`, which implements `P2Core`), booting the ROM off the module's flash |
-| `mad-machine` | bench component | the machine: servo drive, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant: an `Assembly` ("MaD's plant", above) |
+| `mad-machine` | bench component | the machine: servo drive and its ready output, encoder, end switches, door and emergency stops, gantry, sample and load cell, one plant: an `Assembly` ("MaD's plant", above) |
 
 [`MIGRATING-MAD.md`](MIGRATING-MAD.md) holds the file as it would read,
 the crate's contents, and the ordered changes on both sides, each with the
