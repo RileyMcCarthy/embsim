@@ -20,14 +20,25 @@ the decision record for why this is netlist-structural rather than SPICE.
 board/                    # embsim-board
 ├── src/netlist.rs        # KiCad s-expression netlist parser → ComponentDecl/NetDecl graph
 ├── src/component.rs      # Component trait, PinDecl, PinRole, Drive, ComponentNetIo
-├── src/registry.rs       # PartRegistry: identity → constructor; auto-classification tiers
+├── src/registry.rs       # PartRegistry: identity → class; auto-classification tiers
+├── src/kind.rs           # what a part kind is: the guide a catalog gives for each
+├── src/assembly.rs       # Assembly: one component made of several, behind one set of pins
 ├── src/engine.rs         # net-engine thread: drive queue, resolution, timer wheel, diagnostics
 ├── src/net.rs            # net state model, Thevenin drive resolution, digital projection
 ├── src/cluster.rs        # analog cluster extraction + quasi-static MNA solver (trait)
+├── src/limits.rs         # the engine's check of the operating limits pins declare
+├── src/pairs.rs          # the engine's watch on the differential pairs parts declare
+├── src/diagnostics.rs    # structured findings on a diagnostics bus, mirrored to `tracing`
+├── src/event_log.rs      # opt-in, append-only engine event log (determinism Oracle 1)
 ├── src/uart.rs           # UART framing codec (byte ↔ timed digital levels)
 ├── src/serial_levels.rs  # SerialLevelBridge: that codec on a pin (no byte route)
+├── src/host_pty.rs       # the host's end of a serial link, as a board component
+├── src/scripted_source.rs # a pin driven through a list of steps
 ├── src/board.rs          # Board::from_netlist(netlist, registry) → components + nets
 ├── src/system.rs         # System: boards + harnesses + scenario overrides + fault algebra
+├── src/project.rs        # Project: a system written down (the project file)
+├── src/survey.rs         # what a netlist still asks of a project
+├── src/report.rs         # what a run prints about what a catalog built
 └── tests/                # parser fixtures (per KiCad version), net truth tables, MNA hand-checks
 ```
 
@@ -715,15 +726,15 @@ pair, live when the engine's clock moves on).
   (`engine::tests::source_strength`).
 - MNA: hand-computed reference circuits (bridge, divider ladder, pull-up vs
   driver, source-free singular cluster) asserted to µV.
-- Pulse routes: routing through series passives, facing-`PulseSource`
-  detection, route invalidation on jumper/fault changes; serial-as-levels
-  bit clocks (`board/tests/serial_levels.rs`, determinism `serial_levels`).
-- Pin bridges: fake firmware driving the peripheral free functions with peer
-  components watching the pins — exact step counts, mid-train direction
-  reversal, GPIO in both directions at the channel's polarity, encoder counts
-  arriving, an asserted engine-event ceiling at a realistic step rate, and a
-  stepped-mode N-run identity over all of it
-  (`board/tests/{pulse_bridge,pulse_bridge_stepped,carriage_seam}.rs`).
+- Serial as levels: the framing codec's unit tests (`board/src/uart.rs`) and
+  UART bytes framed onto a net as timed edges, held to N-run identity and a
+  golden trace (the determinism suite's `serial_levels` case).
+- Levels and rates on a pin: every transition a producer emits at its own
+  instant reaches the consumer (`board/tests/transition_fidelity.rs`); a
+  receiver projects a voltage through its own thresholds and counts a clock
+  only where its phases cross them (`board/tests/receiver_projection.rs`);
+  levels and a rate-carried step train cross the isolation parts on the real
+  carrier netlist (`board/tests/isolation_bridge.rs`).
 - System: a two-component smoke board (fake MCU pin driver + fake sensor)
   exercising attach/schedule/diagnostics without any consumer firmware.
 - Whole machine: the reference consumer's three real boards — a vendor MCU
@@ -740,7 +751,8 @@ pair, live when the engine's clock moves on).
 - SPICE/transient analog simulation (trait seam reserved; not built).
 - Cycle-accurate MCU peripheral timing; emergent RX-FIFO overrun on a
   deleted byte pipe (serial is levels now; line faults are net effects —
-  level-era injectors land via #44 / PR #48, not a scenario byte-drop).
+  the level-era injector shipped as `Scenario::edge_fault`, not a scenario
+  byte-drop).
 - PCB physical effects (parasitics, thermal, EMC).
 - Auto-generating *plant* physics — transducer components expose parameterized
   primitives (e.g. bridge legs) for consumer physics models to drive.
