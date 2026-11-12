@@ -1,8 +1,8 @@
 //! embsim-core — Core infrastructure for embedded MCU simulation.
 //!
-//! Provides MCU-agnostic primitives shared by all platform crates:
+//! Provides MCU-agnostic primitives shared by the board engine and its nodes:
 //! - `virtual_clock` — one-counter virtual time (optional wall pacing)
-//! - `serial_pty` — PTY pair creation for host ↔ firmware serial communication
+//! - `serial_pty` — PTY pair creation for a host's end of a serial line
 //! - `event` — multi-subscriber callback primitive for model/peripheral events
 
 pub mod event;
