@@ -6,6 +6,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # The Vibes binding is an unpinned git dependency, so Dependabot bumps
+      # Cargo.lock alone every week, and the Behaviour ledger job's lockstep
+      # check fails every such PR (#149, #164). Vibes is bumped by hand, in
+      # both lockfiles at once (see the npm entry below).
+      - dependency-name: "vibes-behaviour"
 
   # Root npm is only the Vibes CLI (devDependency). Do not group with future
   # unrelated npm deps. Bumping vibes means refreshing BOTH package-lock.json
@@ -16,6 +22,9 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 2
+    ignore:
+      # The other half of the same lockstep: never bumped one-sided.
+      - dependency-name: "vibes"
 
   # GitHub Actions used by CI.
   - package-ecosystem: github-actions
