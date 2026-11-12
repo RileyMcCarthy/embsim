@@ -76,8 +76,9 @@ crate = "embsim-p2-qemu"
 allow = ["LGPL-2.1-or-later", "GPL-2.0-or-later"]
 
 [licenses.private]
-# embsim-minimal-example is `publish = false` and carries no license field;
-# skip license checks for unpublished workspace members.
+# The catalog template (cli/catalog-template) and the custom-project catalog
+# (examples/custom-project/catalog) are `publish = false` and carry no license
+# field; skip license checks for unpublished workspace members.
 ignore = true
 
 # ── Bans ──────────────────────────────────────────────────────────────────
