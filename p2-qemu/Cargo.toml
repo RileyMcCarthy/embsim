@@ -39,6 +39,5 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-embsim-models = { path = "../models" }
 rstest.workspace = true
 vibes-behaviour = { git = "https://github.com/RileyMcCarthy/vibes.git" }

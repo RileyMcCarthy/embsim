@@ -449,13 +449,6 @@ impl Variant {
             .collect()
     }
 
-    /// True when this variant carries `channel`.
-    pub fn has_channel(self, channel: Channel) -> bool {
-        self.pin_specs()
-            .iter()
-            .any(|spec| matches!(spec.role, Role::Input(c, _) if c == channel))
-    }
-
     /// Parse a variant out of an orderable part number, ignoring the package
     /// and reel suffix: `"ISO6741DWR"`, `"ISO6740FDWR"`, `"ISO6721BDR"`.
     ///

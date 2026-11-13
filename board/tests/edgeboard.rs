@@ -547,8 +547,8 @@ fn bench_straps_clear_the_domains_they_feed() {
 /// | gauge → MCU | `P0` (J3.40) | `INA` ← `OUTA` | `IFG_RX` on J9.2 |
 /// | `~DRDY` → MCU | `P1` (J3.39) | `INB` → `OUTB` | `IFG_INT` on J9.3 |
 ///
-/// The MCU-side pin numbers are the reason `mcu_component.rs`'s force-gauge
-/// channel is `{rx: P0, tx: P2}`: that is what this schematic wired.
+/// The MCU-side pin numbers are what this schematic wired: a force-gauge
+/// channel on this board is `{rx: P0, tx: P2}`.
 #[rstest]
 fn the_force_gauge_uart_crosses_the_isolator_between_socket_and_connector() {
     let board = edge_board();

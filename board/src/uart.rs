@@ -223,11 +223,6 @@ impl UartDecoder {
             .map(|start| start + self.framing.frame_ns())
     }
 
-    /// Whether a decoded frame is waiting, without advancing time.
-    pub fn has_pending(&self) -> bool {
-        !self.done.is_empty()
-    }
-
     /// Advance virtual time and take the next decoded frame, if any.
     pub fn poll(&mut self, now_ns: u64) -> Option<Result<u8, FramingError>> {
         if let Some(start) = self.frame_start_ns {

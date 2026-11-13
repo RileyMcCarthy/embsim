@@ -95,6 +95,7 @@ use embsim_board::{
 };
 
 use crate::isolation::supply_volts;
+use crate::machine::invert;
 
 // ============================================================
 // Datasheet constants
@@ -234,14 +235,6 @@ struct State {
 #[derive(Debug, Default)]
 struct Core {
     state: Mutex<State>,
-}
-
-/// The other level.
-fn invert(level: Level) -> Level {
-    match level {
-        Level::High => Level::Low,
-        Level::Low => Level::High,
-    }
 }
 
 /// An output port: high is `V_CC` behind [`AM26LS31_R_OH_OHMS`], low is
