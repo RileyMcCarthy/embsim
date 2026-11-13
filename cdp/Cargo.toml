@@ -24,8 +24,6 @@ libc.workspace = true
 serde_json.workspace = true
 # The WebSocket, synchronous, client side, no TLS (DevTools is on loopback).
 tungstenite = { workspace = true, features = ["handshake"] }
-# The kind's true/false options, read as the project file wrote them.
-toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -65,15 +65,6 @@
 //! - **Not seen:** whether an actor *will* register. New actors start runnable,
 //!   so registering one while time is mid-advance is a race the
 //!   scheduler cannot arbitrate. Register before the system starts.
-//!
-//! # Native firmware: preemption at HAL
-//!
-//! Host-compiled firmware is real machine code. The emulator is not in the
-//! instruction stream, so a cog that never waits (`LOCKTRY` spin, UART poll)
-//! would stay runnable forever and freeze stepped time. Platform trampolines
-//! call [`charge`] on every HAL entry; after [`DEFAULT_QUANTUM_US`] of charged
-//! work the cog parks through [`wait_virtual_us`]. Firmware stays free to
-//! spin. A cog that never hits HAL still cannot be stopped — that needs an ISS.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -103,14 +94,6 @@ static PACE_ANCHOR: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 const PACE_SLACK: Duration = Duration::from_millis(100);
 /// Being ahead by less than this is not worth a sleep syscall.
 const PACE_MIN_SLEEP: Duration = Duration::from_micros(50);
-
-/// Simulated clock frequency in Hz, supplied per-MCU by `init`.
-///
-/// Defaults to `0` (uninitialized) rather than any specific part's frequency,
-/// so a project that forgets to call `init` gets an obviously-wrong `0` from
-/// cycle math instead of silently inheriting another MCU's clock. Platform
-/// crates own their real frequency.
-static CLOCK_FREQ: AtomicU32 = AtomicU32::new(0);
 
 /// 1 once [`init`] has run.
 static INITIALIZED: AtomicU8 = AtomicU8::new(0);
@@ -145,13 +128,13 @@ pub enum ClockMode {
     Stepped,
 }
 
-/// Initialize the virtual clock: `now = 0`, frequency `freq`, pacing from
-/// `speed`. `speed <= 0` is **unpaced** (instant jumps). `speed > 0` sleeps
-/// after each [`advance_to`] so an interactive playground still feels scaled
-/// real-time.
+/// Initialize the virtual clock: `now = 0`, pacing from `speed`.
+/// `speed <= 0` is **unpaced** (instant jumps). `speed > 0` sleeps after each
+/// [`advance_to`] so an interactive playground still feels scaled real-time.
 ///
-pub fn init(speed: f64, freq: u32) {
-    CLOCK_FREQ.store(freq, Ordering::Relaxed);
+/// `_freq` is unused: the clock counts nanoseconds, and nothing reads a
+/// cycle count from it. The parameter stays so existing callers compile.
+pub fn init(speed: f64, _freq: u32) {
     {
         let mut sched = lock_sched();
         sched.now_ns = 0;
@@ -174,6 +157,7 @@ pub fn init(speed: f64, freq: u32) {
 
 /// Compatibility wrapper: [`ClockMode::Stepped`] is `init(0.0, freq)`;
 /// [`ClockMode::FreeRunning`] is `init(speed, freq)`.
+/// `freq` is ignored, as [`init`]'s is.
 pub fn init_mode(mode: ClockMode, freq: u32) {
     match mode {
         ClockMode::Stepped => init(0.0, freq),
@@ -192,12 +176,6 @@ pub fn mode() -> ClockMode {
             speed: numer as f64 / denom,
         }
     }
-}
-
-/// Always `true`: there is only the counter. Kept so existing engine/tests
-/// that branched on mode keep compiling while they switch to the single loop.
-pub fn is_stepped() -> bool {
-    true
 }
 
 /// True when jumps do not sleep (`speed <= 0`).
@@ -246,11 +224,6 @@ pub fn virtual_us() -> u64 {
     virtual_ns() / 1_000
 }
 
-/// Get virtual milliseconds elapsed since boot.
-pub fn virtual_ms() -> u64 {
-    virtual_us() / 1000
-}
-
 /// Convert a virtual duration to a wall sleep for **pacing only**.
 /// Unpaced clocks (`speed <= 0`) return 0.
 pub fn virtual_to_wall_us(virtual_wait_us: u64) -> u64 {
@@ -275,15 +248,6 @@ fn virtual_to_wall_ns(virtual_wait_ns: u64) -> u64 {
     let denom = SCALE_DENOM.load(Ordering::Relaxed) as u128;
     ((virtual_wait_ns as u128) * denom / numer as u128) as u64
 }
-
-/// Get the simulated clock frequency.
-pub fn clock_freq() -> u32 {
-    CLOCK_FREQ.load(Ordering::Relaxed)
-}
-
-/// HAL-proxy work that exhausts a cog's slice, after which [`charge`] parks.
-/// 1 ms, a common Renode quantum.
-pub const DEFAULT_QUANTUM_US: u64 = 1_000;
 
 // ============================================================
 // Waiting — the single chokepoint between virtual and wall time
@@ -354,7 +318,6 @@ pub fn wait_virtual_us(d_us: u64) {
 
 /// Park until `virtual_ns() + d_ns`. `d_ns == 0` returns immediately.
 pub fn wait_virtual_ns(d_ns: u64) {
-    SLICE_USED_US.set(0);
     if d_ns == 0 {
         return;
     }
@@ -371,7 +334,6 @@ pub fn wait_until(deadline_v_us: u64) {
 /// Park until virtual time reaches `deadline_v_ns`. Nanosecond form of
 /// [`wait_until`], with the same authority and idle-jump rules.
 pub fn wait_until_ns(deadline_v_ns: u64) {
-    SLICE_USED_US.set(0);
     park_until_virtual(deadline_v_ns);
 }
 
@@ -474,28 +436,6 @@ fn has_time_authority() -> bool {
     TIME_AUTHORITY.load(Ordering::Acquire) != 0
 }
 
-/// Account for guest work on this thread (one HAL call ≈ 1 µs of slice).
-///
-/// Native SIL executes host machine code, so the emulator is not in the
-/// instruction stream. Platform trampolines call this on HAL entry; after
-/// [`DEFAULT_QUANTUM_US`] of charged work the thread parks via
-/// [`wait_virtual_us`] so other actors and the engine can run.
-///
-/// No-op if this thread is not a registered [`Actor`] (unit tests, host
-/// tooling). A real [`wait_virtual_us`] / [`wait_until`] resets the slice.
-pub fn charge(us: u64) {
-    if us == 0 || THREAD_ACTOR.with(|slot| slot.get()).is_none() {
-        return;
-    }
-    let used = SLICE_USED_US.get().saturating_add(us);
-    if used < DEFAULT_QUANTUM_US {
-        SLICE_USED_US.set(used);
-        return;
-    }
-    SLICE_USED_US.set(0);
-    wait_virtual_us(used);
-}
-
 // ============================================================
 // Stepped mode: actor registry + the quiescence barrier
 // ============================================================
@@ -548,9 +488,6 @@ static QUIESCENT: Condvar = Condvar::new();
 thread_local! {
     /// Actor id bound to this thread by [`register_actor`], if any.
     static THREAD_ACTOR: Cell<Option<u64>> = const { Cell::new(None) };
-    /// HAL-proxy work charged against this thread's quantum. Reset by
-    /// [`wait_until`] / [`wait_virtual_us`] / actor drop.
-    static SLICE_USED_US: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Take the scheduler lock, recovering from poison. A thread that panicked
@@ -590,7 +527,6 @@ impl Actor {
 impl Drop for Actor {
     fn drop(&mut self) {
         THREAD_ACTOR.with(|slot| slot.set(None));
-        SLICE_USED_US.set(0);
         let quiescent = {
             let mut sched = lock_sched();
             if let Some(state) = sched.actors.remove(&self.id) {
@@ -927,19 +863,6 @@ fn running_actor_names(sched: &Sched) -> Vec<String> {
         .collect()
 }
 
-/// Get virtual cycle count (`virtual_ns * clock_freq / 1_000_000_000`).
-///
-/// Computed in `u128` and divided last so frequencies that are not a whole
-/// number of MHz keep full precision (the old `freq / 1_000_000` pre-divide
-/// silently truncated sub-MHz and fractional-MHz parts). Taking the source
-/// from nanoseconds rather than microseconds also means a cycle count no
-/// longer quantises to whole thousands of cycles at 1 GHz-class frequencies.
-pub fn virtual_cycles() -> u64 {
-    let ns = virtual_ns() as u128;
-    let freq = CLOCK_FREQ.load(Ordering::Relaxed) as u128;
-    (ns * freq / 1_000_000_000) as u64
-}
-
 // ============================================================
 // Tests
 // ============================================================
@@ -952,7 +875,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
-    /// The virtual clock mutates process-global mode / scale / frequency /
+    /// The virtual clock mutates process-global mode / scale /
     /// boot-offset / scheduler state, so every test that touches it must run
     /// serially. Recover from any panic-induced poisoning exactly like the
     /// `pulse_out` reference suite.
@@ -1205,16 +1128,6 @@ mod tests {
         set_scale(1.0);
     }
 
-    /// `init` stores the supplied clock frequency and `clock_freq` returns it.
-    #[rstest]
-    fn init_sets_clock_freq() {
-        let _g = lock_or_recover();
-        init(1.0, 180_000_000);
-        assert_eq!(clock_freq(), 180_000_000);
-        init(1.0, 320_000_000);
-        assert_eq!(clock_freq(), 320_000_000);
-    }
-
     /// `init` also applies the speed scale it is given (the scale feeds straight
     /// into the deterministic `virtual_to_wall_us` mapping).
     #[rstest]
@@ -1244,52 +1157,6 @@ mod tests {
             assert!(now >= last, "virtual_us went backwards: {now} < {last}");
             last = now;
         }
-    }
-
-    /// `virtual_ms` is monotonic and is exactly `virtual_us / 1000` ordering —
-    /// ms can never exceed the µs reading divided by 1000.
-    #[rstest]
-    fn virtual_ms_tracks_virtual_us() {
-        let _g = lock_or_recover();
-        init(1.0, 180_000_000);
-        let mut last_ms = virtual_ms();
-        for _ in 0..1000 {
-            let us = virtual_us();
-            let ms = virtual_ms();
-            assert!(ms >= last_ms, "virtual_ms went backwards");
-            // ms reading taken after us can only have advanced, so ms*1000 may
-            // exceed the earlier us; but ms must never exceed us/1000 + slack.
-            assert!(ms <= virtual_us() / 1000, "ms must not lead the us clock");
-            last_ms = ms;
-            let _ = us;
-        }
-    }
-
-    /// `virtual_cycles` is 0 whenever the configured frequency is 0 (the
-    /// uninitialized-frequency default), no matter how much virtual time has
-    /// elapsed.
-    #[rstest]
-    fn virtual_cycles_zero_when_freq_zero() {
-        let _g = lock_or_recover();
-        // Re-anchor with an explicit zero frequency.
-        init(1.0, 0);
-        assert_eq!(clock_freq(), 0);
-        assert_eq!(virtual_cycles(), 0, "no freq → no cycles");
-        // Even after advancing virtual time it stays zero.
-        for _ in 0..500 {
-            let _ = virtual_us();
-        }
-        assert_eq!(virtual_cycles(), 0);
-    }
-
-    /// With a non-zero frequency, cycles track `now * freq / 1e6`.
-    #[rstest]
-    fn virtual_cycles_grow_with_time_when_freq_nonzero() {
-        let _g = lock_or_recover();
-        init(0.0, 1_000_000);
-        assert_eq!(virtual_cycles(), 0);
-        wait_virtual_us(10);
-        assert_eq!(virtual_cycles(), 10);
     }
 
     /// [`wait_virtual_us`] is exactly the old inline
@@ -1439,11 +1306,10 @@ mod tests {
 
         advance_to(1_000).expect("forward advance");
         assert_eq!(virtual_us(), 1_000);
-        assert_eq!(virtual_ms(), 1);
         advance_to(1_000).expect("advancing to the same instant is allowed");
         assert_eq!(virtual_us(), 1_000);
         advance_to(2_500_000).expect("forward advance");
-        assert_eq!(virtual_cycles(), 2_500_000, "1 MHz × 2.5 s");
+        assert_eq!(virtual_us(), 2_500_000);
     }
 
     /// Time resolves below a microsecond, and the µs views round the way
@@ -1793,73 +1659,5 @@ mod tests {
             "re-anchored virtual_us should be small, got {after}"
         );
         let _ = before;
-    }
-
-    /// Host threads that are not actors must not be preempted.
-    #[rstest]
-    fn charge_is_a_no_op_without_an_actor() {
-        let _g = SteppedGuard::enter();
-        for _ in 0..10_000 {
-            charge(1);
-        }
-        assert_eq!(virtual_us(), 0);
-        assert_eq!(scheduler_state().running, 0);
-    }
-
-    /// A running actor is left alone until its HAL-proxy slice fills.
-    #[rstest]
-    fn charge_below_quantum_does_not_park() {
-        let _g = SteppedGuard::enter();
-        let gate = Arc::new(AtomicU64::new(0));
-        let actor_gate = Arc::clone(&gate);
-        let actor = std::thread::spawn(move || {
-            let _registration = register_actor("below-quantum");
-            for _ in 0..(DEFAULT_QUANTUM_US - 1) {
-                charge(1);
-            }
-            while actor_gate.load(Ordering::SeqCst) == 0 {
-                std::thread::yield_now();
-            }
-        });
-        assert!(
-            spin_until(|| scheduler_state().running == 1),
-            "the actor must register as runnable"
-        );
-        match await_quiescence(Duration::from_millis(50)) {
-            Quiescence::Stalled { actors } => {
-                assert_eq!(actors, vec!["below-quantum".to_string()])
-            }
-            other => panic!("a slice still open must hold the barrier, got {other:?}"),
-        }
-        gate.store(1, Ordering::SeqCst);
-        actor.join().expect("actor must exit once released");
-    }
-
-    /// Exhausting the slice parks the cog so the engine can advance.
-    #[rstest]
-    fn charge_exhausting_quantum_parks() {
-        let _g = SteppedGuard::enter();
-        let actor = std::thread::spawn(|| {
-            let _registration = register_actor("spinner");
-            for _ in 0..DEFAULT_QUANTUM_US {
-                charge(1);
-            }
-        });
-        assert!(
-            spin_until(|| {
-                let s = scheduler_state();
-                s.running == 1 || s.next_deadline_us() == Some(DEFAULT_QUANTUM_US)
-            }),
-            "the spinner must register or park"
-        );
-        match await_quiescence(Duration::from_secs(5)) {
-            Quiescence::Reached { next_deadline_ns } => {
-                assert_eq!(next_deadline_ns, Some(DEFAULT_QUANTUM_US * 1_000));
-            }
-            other => panic!("exhausting the slice must park, got {other:?}"),
-        }
-        advance_to(DEFAULT_QUANTUM_US).expect("engine can step to the park");
-        actor.join().expect("the cog resumes after the step");
-        assert_eq!(virtual_us(), DEFAULT_QUANTUM_US);
     }
 }

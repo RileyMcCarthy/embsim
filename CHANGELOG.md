@@ -21,6 +21,15 @@ the one before it promised, and says so here under **Breaking**.
   `chrome-cdp` declare it, and a component that declares
   `HOST_RAIL_PINS` for a peer of its own gets it too. `embsim_cdp::
   Settings` has a new field, `invert_dtr`.
+- Public items with no caller in embsim or MaD are gone.
+  `embsim_core::virtual_clock`: `charge`, `DEFAULT_QUANTUM_US`,
+  `clock_freq`, `virtual_cycles`, `virtual_ms` and `is_stepped` — the slice
+  accounting and cycle count of the native HAL path. `init` and `init_mode`
+  keep their `freq` argument and ignore it; read time with `virtual_ns` or
+  `virtual_us`. `embsim_board`: `registry::normalize_part_name` (an identity
+  function; `normalize_part` is the one that normalizes), `Region::is_on`
+  and `UartDecoder::has_pending`. `embsim_models`:
+  `isolation::iso67xx::Variant::has_channel`.
 
 ### Added
 

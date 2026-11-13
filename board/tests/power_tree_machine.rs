@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use embsim_board::{EndpointRef, Level, NetState, System, SystemHandle};
+use embsim_board::{Level, NetState, System, SystemHandle};
 use embsim_core::virtual_clock::{self, ClockMode};
 use embsim_models::rail::{AP62301_V_FB_VOLTS, UCC12040_RISE_NS, UCC12040_VISO_SEL_TO_VISO_VOLTS};
 use rstest::rstest;
@@ -34,11 +34,6 @@ fn wait_for(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
 }
 
 const SETTLE: Duration = Duration::from_secs(5);
-
-#[allow(dead_code)]
-fn ep(endpoint: &str) -> EndpointRef {
-    EndpointRef::parse(endpoint).expect("endpoint parses")
-}
 
 /// The voltage a live net reads, or a panic naming what it read instead.
 fn volts(system: &SystemHandle, net: &str) -> f64 {

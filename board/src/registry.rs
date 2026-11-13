@@ -876,13 +876,6 @@ pub fn normalize_part(decl: &ComponentDecl) -> String {
     decl.part.clone()
 }
 
-/// Backwards-compatible part-name normalization when no lib context is
-/// available (identity — rescue stripping needs the lib name; prefer
-/// [`normalize_part`]).
-pub fn normalize_part_name(part: &str) -> String {
-    part.to_string()
-}
-
 /// Parse a passive value field into base SI units (Ω / F / H).
 ///
 /// **First-token parsing.** The electrical value is the first token of the

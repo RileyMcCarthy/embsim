@@ -267,7 +267,6 @@ pub enum ClockMode { FreeRunning { speed: f64 }, Stepped }
 pub fn init(speed: f64, freq: u32);           // = init_mode(FreeRunning { speed }, freq)
 pub fn init_mode(mode: ClockMode, freq: u32); // re-anchors; panics entering Stepped with a leaked actor
 pub fn mode() -> ClockMode;
-pub fn is_stepped() -> bool;                  // one relaxed load
 
 pub fn wait_until(deadline_v_us: u64);        // body swapped; 12 call sites untouched
 pub fn wait_virtual_us(d_us: u64);            // = wait_until(now + d) when stepped
