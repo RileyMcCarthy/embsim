@@ -6,11 +6,23 @@ the board and models**: the engine as the time authority, an actor registry with
 a quiescence barrier, and the reference model component moved onto engine
 wakeups. A run's engine event log — event order **and every virtual timestamp**
 — is identical across runs, across processes, and against blessed golden traces,
-and CI gates it. D2 (firmware byte I/O) and D3 (T2) remain design only.
-Companion to [`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model") and
-[`CONTRACT.md`](CONTRACT.md) ("Waiting"). What each phase shipped, and the
-predictions in this document they corrected, are in
+and CI gates it. D2 and D3 were not built as written: both were designed
+around firmware linked natively against a Rust HAL, the path 0.2.0 removed —
+the firmware image now runs on an instruction-set simulator inside the
+processor's package, a board component. What D2 still owes is the in-process
+transport for a model's own byte path (the ADS122U04's model↔adapter
+socketpair) and the trace poller. Companion to
+[`BOARD_ENGINE.md`](BOARD_ENGINE.md) ("Execution model"). What each phase
+shipped, and the predictions in this document they corrected, are in
 [Recommendation and phasing](#recommendation-and-phasing).
+
+**Reading this document.** It is a design record, kept in the order it was
+written. Paths under `peripherals/`, `platforms/p2/`, `embsim-runtime` and
+`board/src/mcu.rs`, the `HAL_*` trampolines and `CONTRACT.md` belong to that
+native HAL path and no longer exist; where they are named inside the T0 and
+T1 sections they are left as the record. The parts that were only about that
+path — the T3 rationale, the T2 sketch and its blast radius — are collected
+under [Historical: the pre-0.2.0 native HAL path](#historical-the-pre-020-native-hal-path).
 
 **One-counter clock.** There is no Instant-based free-running mode. The
 counter is nanoseconds (`virtual_ns`); `virtual_us` is a truncating view of it
@@ -22,8 +34,8 @@ charged the kernel's sleep granularity to every nanosecond-scale edge —
 `speed <= 0` is instant). The T0 "sampled timestamps" baseline below is historical.
 
 The requirement this document answers is a consumer's, stated plainly: *"once
-it's all connected the SIL model runs deterministically."* Today it does not,
-and the gap is larger than a clock rewrite. This document says exactly what
+it's all connected the SIL model runs deterministically."* When this was
+written it did not, and the gap was larger than a clock rewrite. This document says exactly what
 "deterministically" can mean for embsim, which parts of it are cheap, which
 part is expensive, which part is out of scope, and how CI would prove any of
 it.
@@ -33,38 +45,33 @@ Two words are used precisely throughout:
 - **Consistent** — every observer agrees on one order of events. The engine is
   already consistent by construction (single-writer, enqueue-seq serialized).
 - **Reproducible** — running the same scenario twice produces the *same* order.
-  The engine is **not** reproducible today, and consistency does not imply it.
+  The engine was **not** reproducible before D1, and consistency does not
+  imply it.
 
 ## Contents
 
 1. [What determinism can mean here — the tier ladder](#the-tier-ladder)
 2. [T0: what is already determined, and what is not](#t0-the-honest-baseline)
 3. [T1: the concrete design](#t1-the-concrete-design)
-4. [T2: the sketch, and what it breaks](#t2-whole-system-schedule-determinism-sketch)
-5. [Proving it in CI](#proving-it-determinism-testing)
-6. [Recommendation and phasing](#recommendation-and-phasing)
+4. [Proving it in CI](#proving-it-determinism-testing)
+5. [Recommendation and phasing](#recommendation-and-phasing)
+6. [Historical: the pre-0.2.0 native HAL path](#historical-the-pre-020-native-hal-path)
+   (T3's rationale; [T2: the sketch, and what it breaks](#t2-whole-system-schedule-determinism-sketch))
 7. [Non-goals](#non-goals)
 
 ## The tier ladder
 
 | Tier | Guarantee | Holds for | Cost |
 |---|---|---|---|
-| **T0** (default mode) | Consistent event order; wall-clock-coupled timestamps | everything | shipped |
+| **T0** (the baseline before D1: a clock sampled from wall time; historical) | Consistent event order; wall-clock-coupled timestamps | everything | shipped, then replaced by the one counter |
 | **T1** | Engine is a pure discrete-event machine in virtual time; identical event trace for a fixed stimulus sequence | fully: systems whose only actors are engine-hosted components (board + models + faults + streams, scripted stimulus) — **shipped in D1**. partially: systems with firmware — removes wall-clock/host-load coupling, leaves the firmware's HAL-call order free; needs D2's transport | moderate; ~1 new core module + engine loop branch + transport seam |
-| **T2** | Whole-system schedule determinism: firmware threads are cooperatively scheduled actors, the HAL is the only yield surface, one runnable at a time under a deterministic policy | everything embsim runs natively | high; touches every trampoline + a virtual-cost policy decision |
-| **T3** | Instruction-level lockstep | n/a | out of scope — needs a P2 ISA core |
+| **T2** | Whole-system schedule determinism: firmware threads are cooperatively scheduled actors, the HAL is the only yield surface, one runnable at a time under a deterministic policy | everything embsim ran natively (historical) | high; touches every trampoline + a virtual-cost policy decision |
+| **T3** | Instruction-level lockstep | n/a | out of scope when written (historical) |
 
-**T3 is explicitly out of scope.** embsim's entire value proposition is running
-the *real compiled firmware* natively — the firmware `.a` from
-`pio run -e native_emulator` is host machine code, and the platform crate
-resolves its HAL symbols at link time (`CONTRACT.md`, "Why it exists"). Lockstep
-instruction determinism would require replacing that with a Propeller 2
-instruction-set simulator: a different project, an order of magnitude more
-work, and it would abandon the "test the code you ship" property. It is also
-already ruled out by `BOARD_ENGINE.md`'s stated fidelity boundary ("no
-cycle-accurate silicon emulation"). What T3 would buy over T2 — cycle-exact
-timing races *inside* one cog, hub-arbitration effects, `waitx` granularity —
-is real, but it is not the class of bug this machine's SIL suite is hunting.
+T2 and T3 were tiers for natively linked firmware. Since 0.2.0 there is none:
+the firmware runs on an instruction-level core, so the rationale that ruled T3
+out, and the T2 sketch, are under
+[Historical](#historical-the-pre-020-native-hal-path).
 
 ## T0: the honest baseline
 
@@ -132,9 +139,11 @@ numeric output.
 
 ### Not determined
 
-This is the T0 (free-running) baseline, and free-running is still the default —
-so every item below is still true of a default run. Which of them stepped mode
-fixes is noted inline; the rest are D2/D3.
+This is the T0 baseline as it was analysed before D1: a clock sampled from wall
+time, and firmware linked natively. It is historical — there is one counter now
+(the header), and a paced run differs from an unpaced one only in wall pacing.
+Which items stepped mode fixed is noted inline; the firmware-thread, serial-pump
+and `peripherals/` / `platforms/p2/` items describe crates removed in 0.2.0.
 
 - **Every virtual timestamp.** *(Fixed in stepped mode: `virtual_us` is the
   value the engine set.)* `virtual_clock::virtual_us`
@@ -202,7 +211,7 @@ fixes is noted inline; the rest are D2/D3.
   suite asserts the count stays at zero.
 
 The practical shape of T0: a scenario *usually* produces the same outcome and
-flakes when a threshold sits near a timing boundary. `TESTING.md` rule 4
+flakes when a threshold sits near a timing boundary. `TESTING.md` rule 3
 ("assert contracts, not wall flakiness") is the workaround, and its existence is
 the evidence that T0 is not enough.
 
@@ -305,13 +314,16 @@ and rejected:
   scenario regressions, free-running for `make playground` with the live trace
   UI and a human at the PTY.
 - The test matrix already pins the clock once per crate
-  (`peripherals/src/lib.rs::test_support::ensure_clock`), so mode-per-build
+  (`peripherals/src/lib.rs::test_support::ensure_clock` — removed with that
+  crate in 0.2.0), so mode-per-build
   would fragment it. Stepped-mode tests instead get their own test binaries,
   exactly as `board/tests/clock_guard.rs` already does for the
   uninitialized-clock path (`TESTING.md` rule 5).
 
 Free-running stays the **default**, so nothing about the interactive playground,
-the trace viewer, or the PTY-driven Playwright flow changes byte-for-byte.
+the trace viewer, or the PTY-driven Playwright flow changes byte-for-byte. (As
+designed and as D1 shipped it. The one-counter clock has since made a paced
+run the same counter with wall pacing — see the header.)
 
 **Landed as specified.** One refinement, for a reason the test matrix forced:
 the mode is immutable *for the lifetime of a run*, not of the process.
@@ -440,7 +452,10 @@ that answer it:
   free-running) and `QueueTransport` (an in-process ring, whose blocking read
   is a `wait_until`-style actor park). `McuComponent` selects by clock mode at
   attach; `Serial::init_channel_fd` gains a transport-installing sibling.
-  **This is the single largest piece of T1.** (Historical: the deleted byte
+  **This is the single largest piece of T1.** (The HAL-side seam went with
+  `embsim-peripherals` in 0.2.0 and was never built; the in-process transport
+  is still owed where a model keeps a byte pipe of its own — Phase D2.)
+  (Historical: the deleted byte
   route made `StreamTx::write` / `on_byte` the engine-side queue; that path is
   gone.)
 
@@ -507,87 +522,8 @@ two hold neither:
   a grep-able list.
 
 All three funnel into one private `park_wall_us`, the only `thread::sleep` in
-the workspace outside tests. `CONTRACT.md` ("Waiting") makes this binding on
-platform crates.
-
-## T2: whole-system schedule determinism (sketch)
-
-### What T1 does not give you
-
-Firmware cog threads (`peripherals/src/system.rs::start_thread`) are real,
-preemptively scheduled OS threads. Between two HAL calls a cog executes an
-unbounded, host-scheduled amount of native code. So at T1 the *engine* sees an
-identical trace only if the cogs happen to call the HAL in the same order —
-which is exactly what is not guaranteed. The reference consumer's firmware runs
-several cogs (its `dev_cogManager` allocates them), so:
-
-- **T1 buys, for a whole-machine scenario:** immunity to host load and wall
-  clock, virtual timestamps that are integers the scheduler chose, no timing
-  tolerance windows in tests, and high-probability *outcome* repeatability
-  (the cogs are loosely coupled through virtual-time-paced HAL calls).
-- **T1 does not buy:** trace identity, or reproducibility of a cog-to-cog race.
-
-### What T2 requires — CONTRACT.md additions
-
-1. **The HAL is the only scheduling boundary.** Every trampoline in
-   `platforms/p2/src/ffi.rs` becomes a yield point: on entry, release the run
-   token; the scheduler picks the next runnable actor by a deterministic rule
-   (e.g. lowest cog id among those at the earliest virtual deadline); the
-   resumed thread reacquires the token before touching peripheral state.
-2. **A one-runnable-at-a-time token**, owned by a cooperative scheduler in
-   `embsim-peripherals` (`instance`/`system`) or `embsim-core`.
-   `HAL_system_startThread` *registers* a thread on a run queue instead of
-   racing it into existence.
-3. **A virtual-cost policy for code between HAL calls.** With no instruction
-   counting, the scheduler must charge *something*. This is the hardest honest
-   problem in T2 and needs a recorded decision **before** any code:
-   - charge zero (all firmware compute is instantaneous) — simple and
-     deterministic, but a busy-wait loop that today makes progress in virtual
-     time becomes an infinite loop;
-   - charge a fixed cost per HAL call;
-   - additionally make repeated `HAL_time_getUs`/`getCycles` reads advance by an
-     epsilon so spin-until-timeout loops terminate.
-
-   **Recommendation:** fixed per-HAL-call cost *plus* the `HAL_time_*` epsilon.
-   It is the only combination under which existing firmware idioms terminate.
-4. **CONTRACT.md must promise:** no trampoline blocks on a host primitive
-   except through the scheduler; every blocking HAL receive
-   (`HAL_serial_recieveDataTimeout`) is a park with a virtual deadline;
-   `HAL_time_waitMs`/`waitUs` are parks (they nearly are already); no
-   firmware-visible use of `Instant`.
-
-### What breaks
-
-- Blocking HAL receive loops that rely on real fd readiness
-  (`Serial::receive_data_timeout`'s `Instant` deadline + EAGAIN sleep) must be
-  rewritten against the `QueueTransport`.
-- `Emulator::run`'s "call the entry on the caller's thread" flow: the main
-  thread becomes just another registered actor, or entry-mode
-  (`McuBuilder::entry`, already delivered) becomes mandatory in stepped mode.
-- **Firmware that busy-waits on a memory flag written by another cog, with no
-  HAL call in the loop, deadlocks** under a cooperative scheduler. This is the
-  one way T2 can turn a working SIL run into a hang. Mitigations: the
-  `NoRunnableActor` finding naming the parked set, and a documented escape
-  hatch (a HAL no-op yield the firmware can call). Note this pattern is
-  *already* fragile — an optimizing `native_emulator` build may hoist the flag
-  read out of the loop entirely; T0's preemption merely hides it.
-- HAL locks (`peripherals/src/lock.rs`) must park through the scheduler. That
-  is partly a *benefit*: with one runnable at a time and a wait-for graph,
-  deadlock detection (including the cross-cog ABBA case the consumer's locking
-  rules exist to prevent) becomes mechanical rather than aspirational.
-
-### Blast radius per crate (rough LoC touched, tests included)
-
-| Crate | T1 | T2 |
-|---|---|---|
-| `embsim-core` | new: `ClockMode`, `NOW_US`, `wait_until`, actor registry, `advance_to` — ~250–400 | scheduler run queue + run token — ~300–500 |
-| `embsim-board` | stepped branch in `EngineCore::run`, unbounded drain, disable stall watchdog, `next_virtual_deadline`, event log, `cluster_sources` order fix — ~300 in `engine.rs` | resume points visible to the engine — small |
-| `embsim-peripherals` | `serial::Transport` seam + `QueueTransport`; all `sleep_virtual_us` → `wait_until` (`timer.rs`, `serial.rs`, `pulse_out.rs`) — ~400, **the bulk of T1** | `system.rs::start_thread` cooperative registration; `lock.rs` parks through the scheduler — ~400 |
-| `embsim-models` | `protocol_loop` and the component pump replaced by engine wakeups — ~200, mostly *deletion* | none beyond T1 |
-| `platforms/p2` | 2 sleep sites in `ffi.rs` — ~20 | **every** trampoline gains yield accounting — the largest T2 diff |
-| `embsim-runtime` | mode plumbed through `EmulatorBuilder`; PTY guard — ~80 | entry-on-caller-thread flow reworked — ~100 |
-| `tools/trace` | poller becomes a wheel entry — ~80 | none |
-| consumer (MaD) | pick the mode in `MaDSim`; the system description is unchanged; Playwright stays free-running | firmware may need explicit yield points |
+the workspace outside tests. (`CONTRACT.md` made this binding on platform
+crates; both went with the native HAL path in 0.2.0.)
 
 ## Proving it: determinism testing
 
@@ -784,7 +720,9 @@ call sites rather than a rewrite spread over five crates.)
   the paced-stream / `stream_drop` pair; D1 originally shipped five),
   cross-process identity, and the free-running-vs-stepped contrast; and the
   `determinism` CI job.
-  Free-running remains the default and is behaviorally unchanged. See
+  At D1 free-running remained the default and was behaviorally unchanged; the
+  one-counter clock has since made a paced run the same counter with wall
+  pacing (the header). See
   [What D1 measured](#what-d1-measured) and
   [Deviations from the design doc](#deviations-from-the-design-doc).
   **Deliberately deferred, as planned:** the serial queue transport, the two
@@ -793,13 +731,19 @@ call sites rather than a rewrite spread over five crates.)
   `QueueTransport`, the PTY exclusion rule, virtualized wall deadlines. After
   this, a whole-machine scenario (firmware + EdgeBoard + DS2 Addon + gantry) is
   free of wall-clock and host-load coupling, with the firmware's internal
-  interleaving still free.
+  interleaving still free. **Not built as written:** the `serial::Transport`
+  seam and the firmware half belonged to the native HAL path removed in 0.2.0.
+  Still open under this name: the in-process transport for a model's own byte
+  pipe (the ADS122U04's model↔adapter socketpair,
+  `models/src/ads122u04_component.rs`) and the trace poller.
 - **Phase D3 — T2, only on demand.** Cooperative firmware scheduling. **Do not
   build speculatively.** The trigger is a concrete reproducibility failure that
   D2 surfaces but cannot reproduce — e.g. a cog-to-cog race in the protocol
   layer or a static queue. Record the virtual-cost decision (T2 §3) before
-  writing code.
-- **Never — T3.** Instruction-level lockstep.
+  writing code. **Historical:** there are no natively linked firmware threads
+  to schedule since 0.2.0.
+- **Never — T3.** Instruction-level lockstep. **Historical:** see
+  [Historical](#historical-the-pre-020-native-hal-path).
 
 ### D0 review rule: no unordered iteration on an engine path
 
@@ -987,7 +931,7 @@ wall-clock field by construction. The poller moves with D2, when the seam exists
 Concretely, for the reference machine (`MaDSim` + EdgeBoard + DS2 Addon +
 force path + gantry):
 
-- **T0 (today).** Scenario suites that usually pass. Timing-boundary flakes
+- **T0 (before D1).** Scenario suites that usually pass. Timing-boundary flakes
   papered over with tolerance windows. A bench bug reproduced by patience.
 - **T1 (D1 + D2).** The bench-bug suite becomes *exactly* repeatable: the
   floating `~RESET` case, the crossed-TX/RX harness, the unstrapped AVDD case,
@@ -1005,7 +949,9 @@ force path + gantry):
   scenario under N different deterministic schedules and look for a
   disagreement. That is the real prize, and the reason T2 is worth its cost
   *when* a race demands it.
-- **T3.** Nothing this machine needs.
+- **T3.** Judged as nothing this machine needs when this was written; its
+  firmware has since moved onto an instruction-level core
+  ([Historical](#historical-the-pre-020-native-hal-path)).
 
 ### The host's Chrome, metered (`chrome-cdp`)
 
@@ -1053,13 +999,118 @@ Serial, the OS's driver and a USB adapter are not in the byte path: the
 port is the node's shim, which follows Chrome's rules but not Chrome's
 code.
 
+## Historical: the pre-0.2.0 native HAL path
+
+Everything in this section was written for embsim 0.1.0, which linked a
+project's firmware C against Rust stand-ins for its HAL (`embsim-peripherals`,
+`platforms/p2`, `embsim-runtime`, with `CONTRACT.md` as the ABI between them).
+0.2.0 removed that path: the real firmware image runs on an instruction-set
+simulator inside the processor's package, a board component
+([`CHANGELOG.md`](CHANGELOG.md), 0.2.0; [`README.md`](README.md)). None of the
+crates, files or trampolines named below exist, and nothing here is planned
+work. It is kept because the T0 and T1 sections above, and the phase records,
+refer to it. A non-goal this document used to list, "instruction-level
+Propeller 2 emulation", is withdrawn for the same reason.
+
+### T3, as it was ruled out
+
+**T3 is explicitly out of scope.** embsim's entire value proposition is running
+the *real compiled firmware* natively — the firmware `.a` from
+`pio run -e native_emulator` is host machine code, and the platform crate
+resolves its HAL symbols at link time (`CONTRACT.md`, "Why it exists"). Lockstep
+instruction determinism would require replacing that with a Propeller 2
+instruction-set simulator: a different project, an order of magnitude more
+work, and it would abandon the "test the code you ship" property. It is also
+already ruled out by `BOARD_ENGINE.md`'s stated fidelity boundary ("no
+cycle-accurate silicon emulation"). What T3 would buy over T2 — cycle-exact
+timing races *inside* one cog, hub-arbitration effects, `waitx` granularity —
+is real, but it is not the class of bug this machine's SIL suite is hunting.
+
+### T2: whole-system schedule determinism (sketch)
+
+#### What T1 does not give you
+
+Firmware cog threads (`peripherals/src/system.rs::start_thread`) are real,
+preemptively scheduled OS threads. Between two HAL calls a cog executes an
+unbounded, host-scheduled amount of native code. So at T1 the *engine* sees an
+identical trace only if the cogs happen to call the HAL in the same order —
+which is exactly what is not guaranteed. The reference consumer's firmware runs
+several cogs (its `dev_cogManager` allocates them), so:
+
+- **T1 buys, for a whole-machine scenario:** immunity to host load and wall
+  clock, virtual timestamps that are integers the scheduler chose, no timing
+  tolerance windows in tests, and high-probability *outcome* repeatability
+  (the cogs are loosely coupled through virtual-time-paced HAL calls).
+- **T1 does not buy:** trace identity, or reproducibility of a cog-to-cog race.
+
+#### What T2 requires — CONTRACT.md additions
+
+1. **The HAL is the only scheduling boundary.** Every trampoline in
+   `platforms/p2/src/ffi.rs` becomes a yield point: on entry, release the run
+   token; the scheduler picks the next runnable actor by a deterministic rule
+   (e.g. lowest cog id among those at the earliest virtual deadline); the
+   resumed thread reacquires the token before touching peripheral state.
+2. **A one-runnable-at-a-time token**, owned by a cooperative scheduler in
+   `embsim-peripherals` (`instance`/`system`) or `embsim-core`.
+   `HAL_system_startThread` *registers* a thread on a run queue instead of
+   racing it into existence.
+3. **A virtual-cost policy for code between HAL calls.** With no instruction
+   counting, the scheduler must charge *something*. This is the hardest honest
+   problem in T2 and needs a recorded decision **before** any code:
+   - charge zero (all firmware compute is instantaneous) — simple and
+     deterministic, but a busy-wait loop that today makes progress in virtual
+     time becomes an infinite loop;
+   - charge a fixed cost per HAL call;
+   - additionally make repeated `HAL_time_getUs`/`getCycles` reads advance by an
+     epsilon so spin-until-timeout loops terminate.
+
+   **Recommendation:** fixed per-HAL-call cost *plus* the `HAL_time_*` epsilon.
+   It is the only combination under which existing firmware idioms terminate.
+4. **CONTRACT.md must promise:** no trampoline blocks on a host primitive
+   except through the scheduler; every blocking HAL receive
+   (`HAL_serial_recieveDataTimeout`) is a park with a virtual deadline;
+   `HAL_time_waitMs`/`waitUs` are parks (they nearly are already); no
+   firmware-visible use of `Instant`.
+
+#### What breaks
+
+- Blocking HAL receive loops that rely on real fd readiness
+  (`Serial::receive_data_timeout`'s `Instant` deadline + EAGAIN sleep) must be
+  rewritten against the `QueueTransport`.
+- `Emulator::run`'s "call the entry on the caller's thread" flow: the main
+  thread becomes just another registered actor, or entry-mode
+  (`McuBuilder::entry`, already delivered) becomes mandatory in stepped mode.
+- **Firmware that busy-waits on a memory flag written by another cog, with no
+  HAL call in the loop, deadlocks** under a cooperative scheduler. This is the
+  one way T2 can turn a working SIL run into a hang. Mitigations: the
+  `NoRunnableActor` finding naming the parked set, and a documented escape
+  hatch (a HAL no-op yield the firmware can call). Note this pattern is
+  *already* fragile — an optimizing `native_emulator` build may hoist the flag
+  read out of the loop entirely; T0's preemption merely hides it.
+- HAL locks (`peripherals/src/lock.rs`) must park through the scheduler. That
+  is partly a *benefit*: with one runnable at a time and a wait-for graph,
+  deadlock detection (including the cross-cog ABBA case the consumer's locking
+  rules exist to prevent) becomes mechanical rather than aspirational.
+
+#### Blast radius per crate (rough LoC touched, tests included)
+
+| Crate | T1 | T2 |
+|---|---|---|
+| `embsim-core` | new: `ClockMode`, `NOW_US`, `wait_until`, actor registry, `advance_to` — ~250–400 | scheduler run queue + run token — ~300–500 |
+| `embsim-board` | stepped branch in `EngineCore::run`, unbounded drain, disable stall watchdog, `next_virtual_deadline`, event log, `cluster_sources` order fix — ~300 in `engine.rs` | resume points visible to the engine — small |
+| `embsim-peripherals` | `serial::Transport` seam + `QueueTransport`; all `sleep_virtual_us` → `wait_until` (`timer.rs`, `serial.rs`, `pulse_out.rs`) — ~400, **the bulk of T1** | `system.rs::start_thread` cooperative registration; `lock.rs` parks through the scheduler — ~400 |
+| `embsim-models` | `protocol_loop` and the component pump replaced by engine wakeups — ~200, mostly *deletion* | none beyond T1 |
+| `platforms/p2` | 2 sleep sites in `ffi.rs` — ~20 | **every** trampoline gains yield accounting — the largest T2 diff |
+| `embsim-runtime` | mode plumbed through `EmulatorBuilder`; PTY guard — ~80 | entry-on-caller-thread flow reworked — ~100 |
+| `tools/trace` | poller becomes a wheel entry — ~80 | none |
+| consumer (MaD) | pick the mode in `MaDSim`; the system description is unchanged; Playwright stays free-running | firmware may need explicit yield points |
+
 ## Non-goals
 
 - Deterministic host-PTY or browser-driven E2E (structurally impossible;
   flagged and excluded instead). A metered browser (`chrome-cdp`, above)
   bounds a run to within a slice; it does not make it bit-identical.
 - Cross-architecture bit-identical floats without quantization.
-- Instruction-level Propeller 2 emulation.
 - Deterministic *wall* runtime. Stepped mode is faster or slower than real time
   by construction; how long a scenario takes on the host is not a guarantee and
   must never be asserted.

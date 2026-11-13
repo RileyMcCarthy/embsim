@@ -1163,7 +1163,7 @@ mod tests {
     /// `sleep(virtual_to_wall_us(d))` shape it replaced: a zero span never
     /// sleeps, and a non-zero span parks for at least the scaled wall
     /// equivalent. Only the lower bound is asserted — a host may always
-    /// oversleep (`TESTING.md` rule 4).
+    /// oversleep (`TESTING.md` rule 3).
     #[rstest]
     #[case::zero_at_1x(1.0, 0)]
     #[case::zero_at_10x(10.0, 0)]

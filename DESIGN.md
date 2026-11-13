@@ -6,8 +6,7 @@ every part of it obeys, the limits it holds to on purpose, and the test a
 proposal has to pass before it is in scope. The plan that carries the design
 out is [`NODES.md`](NODES.md); the engine's internals are
 [`BOARD_ENGINE.md`](BOARD_ENGINE.md); the determinism contract is
-[`DETERMINISM.md`](DETERMINISM.md); the firmware ABI is
-[`CONTRACT.md`](CONTRACT.md).
+[`DETERMINISM.md`](DETERMINISM.md).
 
 ## 1. What embsim is
 

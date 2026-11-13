@@ -467,6 +467,7 @@ project's firmware C against Rust implementations of its HAL, with
 emulated peripherals, device models and a virtual clock, extracted from
 the MaD tensile tester.
 
+[Unreleased]: https://github.com/RileyMcCarthy/embsim/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RileyMcCarthy/embsim/compare/v0.1.0...v0.2.0

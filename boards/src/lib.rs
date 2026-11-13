@@ -12,8 +12,8 @@
 //!
 //! - [`ec32mb`] — the Parallax P2-EC32MB Propeller 2 module
 //! - [`p2`] — the Propeller 2 package as a node: the 86-pin facade around
-//!   a core (QEMU, an instruction-set simulator, the native firmware) or
-//!   around no core at all, held in reset
+//!   a core (QEMU, an instruction-set simulator) or around no core at all,
+//!   held in reset
 //! - [`catalog`] — [`catalog::StandardCatalog`], the board kinds, part kinds
 //!   and bench component kinds a project file names
 //!   ([`embsim_board::Project`]), and the base registry that places every
